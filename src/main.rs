@@ -86,6 +86,11 @@ struct Args {
 enum Command {
     /// Run interactive setup wizard
     Setup,
+    /// Manage Finch-native provider authentication
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommand,
+    },
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
@@ -176,6 +181,59 @@ enum Command {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
     },
+}
+
+#[derive(Parser, Debug)]
+enum AuthCommand {
+    /// Show local, secret-free authentication status without network access
+    Status {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        credential: String,
+    },
+    /// Start Finch-native ChatGPT device login
+    Login {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        credential: String,
+        /// Copy the one-time code to the clipboard
+        #[arg(long)]
+        copy: bool,
+        /// Explicitly open the sign-in URL in the default browser
+        #[arg(long)]
+        open: bool,
+    },
+    /// Revoke a named ChatGPT credential and retain a local tombstone
+    Logout {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        credential: String,
+    },
+    /// Recover an interrupted local mutation as a signed-out tombstone
+    Recover {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        credential: String,
+    },
+}
+
+fn parse_credential_reference(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+    {
+        return Err(
+            "credential reference must use 1-128 ASCII letters, digits, '-', '_', or ':'"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Parser, Debug)]
@@ -730,6 +788,9 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Setup) => {
             return run_setup().await;
+        }
+        Some(Command::Auth { auth_command }) => {
+            return run_auth_command(auth_command).await;
         }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
@@ -2504,6 +2565,78 @@ async fn run_setup() -> Result<()> {
     Ok(())
 }
 
+async fn run_auth_command(command: AuthCommand) -> Result<()> {
+    use finch::cli::chatgpt_auth::{
+        render_status_line, save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let service = ChatGptAuthService::production()?;
+    match command {
+        AuthCommand::Status {
+            provider: _,
+            credential,
+        } => {
+            let status = service.status(&credential)?;
+            println!("{}", render_status_line(&status)?);
+        }
+        AuthCommand::Login {
+            provider: _,
+            credential,
+            copy,
+            open,
+        } => {
+            let cancel = command_cancellation();
+            let metadata = service
+                .login(
+                    &credential,
+                    DeviceLoginPresentation {
+                        copy_code: copy,
+                        open_browser: open,
+                    },
+                    cancel,
+                )
+                .await?;
+            let account = metadata.account.clone().unwrap_or_default();
+            let config = load_config().context(
+                "ChatGPT login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
+            )?;
+            save_named_credential(config, metadata)?;
+            println!("ChatGPT login saved credential {credential} for account {account}.");
+        }
+        AuthCommand::Logout {
+            provider: _,
+            credential,
+        } => {
+            let metadata = service.logout(&credential, command_cancellation()).await?;
+            let config = load_config()?;
+            save_named_credential(config, metadata)?;
+            println!("ChatGPT credential {credential} was revoked and signed out.");
+        }
+        AuthCommand::Recover {
+            provider: _,
+            credential,
+        } => {
+            let metadata = service.recover(&credential)?;
+            let config = load_config()?;
+            save_named_credential(config, metadata)?;
+            println!("Recovered ChatGPT credential {credential} as signed_out; run `finch auth login chatgpt --credential {credential}` to sign in again.");
+        }
+    }
+    Ok(())
+}
+
+fn command_cancellation() -> tokio_util::sync::CancellationToken {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let signal = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
+    cancel
+}
+
 /// Show this node's identity and capabilities
 async fn run_node_info() -> Result<()> {
     use finch::node::NodeInfo;
@@ -3051,7 +3184,7 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{register_query_vm_tools, Args};
+    use super::{register_query_vm_tools, Args, AuthCommand, Command};
     use clap::Parser;
     use std::sync::Arc;
 
@@ -3063,6 +3196,79 @@ mod tests {
         assert!(Args::try_parse_from(["finch", "library", "verify"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "heal"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "build", "--all"]).is_err());
+    }
+
+    #[test]
+    fn chatgpt_auth_cli_parses_exact_status_login_logout_and_rejects_unsafe_references() {
+        let status = Args::try_parse_from([
+            "finch",
+            "auth",
+            "status",
+            "chatgpt",
+            "--credential",
+            "chatgpt:work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Status { credential, .. }
+            }) if credential == "chatgpt:work"
+        ));
+
+        let login = Args::try_parse_from([
+            "finch",
+            "auth",
+            "login",
+            "--credential",
+            "chatgpt:personal",
+            "--copy",
+            "--open",
+        ])
+        .unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    credential,
+                    copy: true,
+                    open: true,
+                    ..
+                }
+            }) if credential == "chatgpt:personal"
+        ));
+
+        let logout = Args::try_parse_from(["finch", "auth", "logout"]).unwrap();
+        assert!(matches!(
+            logout.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Logout { credential, .. }
+            }) if credential == "chatgpt:default"
+        ));
+
+        let recover = Args::try_parse_from([
+            "finch",
+            "auth",
+            "recover",
+            "chatgpt",
+            "--credential",
+            "chatgpt:work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Recover { credential, .. }
+            }) if credential == "chatgpt:work"
+        ));
+
+        for hostile in ["../codex", "chatgpt/work", "chatgpt work", ""] {
+            assert!(
+                Args::try_parse_from(["finch", "auth", "status", "--credential", hostile,])
+                    .is_err()
+            );
+        }
+        assert!(Args::try_parse_from(["finch", "auth", "login", "openai"]).is_err());
     }
 
     #[test]

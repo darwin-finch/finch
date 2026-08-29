@@ -1,0 +1,85 @@
+name: Issue 201 ChatGPT Auth
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "src/oauth/**"
+      - "src/config/**"
+      - "src/providers/chatgpt_oauth.rs"
+      - "src/providers/model_catalog.rs"
+      - "src/providers/openai_jwks.rs"
+      - "src/cli/chatgpt_auth.rs"
+      - "src/cli/setup_wizard.rs"
+      - "src/main.rs"
+      - "docs/OAUTH.md"
+      - ".github/issue-201-windows-probe/**"
+      - ".github/workflows/issue-201-chatgpt-auth.yml"
+
+jobs:
+  focused-auth:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check focused formatting
+        run: >-
+          rustfmt --edition 2021 --check
+          src/oauth/mod.rs src/oauth/file_store.rs src/oauth/tests.rs
+          src/providers/chatgpt_oauth.rs src/providers/openai_jwks.rs
+          src/cli/chatgpt_auth.rs src/cli/setup_wizard.rs src/main.rs
+      - name: Compile library and binary tests
+        run: cargo test --no-run
+      - name: Provider-neutral OAuth regressions
+        run: "cargo test --lib oauth::"
+      - name: OpenAI signed-token regressions
+        run: "cargo test --lib providers::chatgpt_oauth::"
+      - name: JWKS authority regressions
+        run: "cargo test --lib providers::openai_jwks::"
+      - name: Auth UX regressions
+        run: "cargo test --lib cli::chatgpt_auth::"
+      - name: Scriptable auth parser regressions
+        run: "cargo test --bin finch chatgpt_auth_cli_"
+      - name: Shared setup auth regressions
+        run: cargo test --lib cli::setup_wizard::tests::setup_
+      - name: ChatGPT chooser, catalogue, and cancellation regressions
+        run: |
+          cargo test --lib cli::setup_wizard::tests::test_known_models_for_returns_list_for_all_providers -- --exact
+          cargo test --lib cli::setup_wizard::tests::chooser_keeps_chatgpt_subscription_distinct_from_openai_platform -- --exact
+          cargo test --lib cli::setup_wizard::tests::chatgpt_configuration_has_no_api_key_input_buffer_or_render_path -- --exact
+          cargo test --lib cli::setup_wizard::tests::test_api_key_provider_starts_on_api_key_field -- --exact
+          cargo test --lib cli::setup_wizard::tests::cancelled_or_unusable_setup_never_returns_a_config_or_tries_another_account -- --exact
+          cargo test --lib cli::setup_wizard::tests::setup_final_validation_preserves_cause_and_compensates_every_owned_generation -- --exact
+          cargo test --lib providers::model_catalog::tests::chatgpt_subscription_fallback_is_pinned_and_separate_from_platform -- --exact
+      - name: Setup entry-point reuse regression
+        run: cargo test --lib cli::setup_wizard::tests::first_run_command_and_repl
+      - name: Zero-process and zero-socket auth status regression
+        run: >-
+          cargo test --test no_external_provider_binary_test
+          test_hostile_codex_on_path_is_never_spawned_by_cli_boundaries
+
+  windows-verifier-compile:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile exact OAuth and OpenAI verifier sources on Windows
+        run: cargo check --manifest-path .github/issue-201-windows-probe/Cargo.toml

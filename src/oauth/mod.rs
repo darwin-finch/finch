@@ -5,6 +5,7 @@
 //! scope, token shape, or account claim. Those belong to [`OAuthDialect`].
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -297,6 +298,13 @@ pub struct OAuthTokenRecord {
     pub mutation_pending: bool,
 }
 
+/// Generation-bound result of one successful credential CAS. Kept crate-local
+/// so setup compensation can never identify a record by name alone.
+pub(crate) struct OAuthCredentialCommit {
+    pub(crate) credential: ProviderCredential,
+    pub(crate) generation: String,
+}
+
 impl fmt::Debug for OAuthTokenRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -354,6 +362,7 @@ impl OAuthTokenRecord {
 }
 
 /// Strict provider dialect boundary. Implementations own every provider fact.
+#[async_trait]
 pub trait OAuthDialect: Send + Sync {
     fn descriptor(&self) -> &OAuthDialectDescriptor;
     /// Fail before client construction when required cryptographic or protocol
@@ -375,12 +384,13 @@ pub trait OAuthDialect: Send + Sync {
     ) -> Result<OAuthHttpRequest>;
     fn refresh_request(&self, refresh_token: &str) -> Result<OAuthHttpRequest>;
     fn revoke_request(&self, token: &str) -> Result<OAuthHttpRequest>;
-    fn validate_tokens(
+    async fn validate_tokens(
         &self,
         status: StatusCode,
         body: Value,
         previous: Option<&OAuthTokenRecord>,
         context: &TokenValidationContext,
+        cancel: &CancellationToken,
     ) -> Result<OAuthTokenRecord>;
 }
 
@@ -530,14 +540,40 @@ where
 
     /// Start a device authorization without persisting transient codes.
     pub async fn begin_device_authorization(&self) -> Result<DeviceAuthorization> {
+        self.begin_device_authorization_cancellable(CancellationToken::new())
+            .await
+    }
+
+    /// Start device authorization with caller-owned cancellation authority.
+    pub async fn begin_device_authorization_cancellable(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<DeviceAuthorization> {
         let request = self.dialect.device_authorization_request()?;
-        let (status, body) = self.post_form(request).await?;
+        let (status, body) = self.post_form_cancellable(request, &cancel).await?;
         let pending = self
             .dialect
             .parse_device_authorization(status, body)
             .context("OAuth device authorization response is incompatible")?;
         validate_device_authorization(&pending, self.dialect.descriptor())?;
         Ok(pending)
+    }
+
+    /// Reject any conflicting local record before a device authorization
+    /// request is allowed to leave the process. Only a missing record or an
+    /// exact, durable revoked tombstone may be replaced.
+    pub fn preflight_reauthentication(&self, reference: &str) -> Result<()> {
+        self.reauthentication_generation(reference).map(|_| ())
+    }
+
+    /// Validate a loaded record's complete immutable dialect authority.
+    pub(crate) fn validate_existing_binding(&self, record: &OAuthTokenRecord) -> Result<()> {
+        self.validate_record_binding(record)
+    }
+
+    /// Validate an active record before projecting it into public config.
+    pub(crate) fn validate_active_reuse(&self, record: &OAuthTokenRecord) -> Result<()> {
+        self.validate_record(record, None)
     }
 
     /// Poll until terminal state, persist exactly one validated account, and
@@ -548,6 +584,18 @@ where
         pending: &DeviceAuthorization,
         cancel: CancellationToken,
     ) -> Result<ProviderCredential> {
+        Ok(self
+            .finish_device_authorization_commit(reference, pending, cancel)
+            .await?
+            .credential)
+    }
+
+    pub(crate) async fn finish_device_authorization_commit(
+        &self,
+        reference: &str,
+        pending: &DeviceAuthorization,
+        cancel: CancellationToken,
+    ) -> Result<OAuthCredentialCommit> {
         validate_reference(reference)?;
         validate_device_authorization(pending, self.dialect.descriptor())?;
         pending.claim_completion()?;
@@ -572,29 +620,40 @@ where
                 }
                 DevicePoll::Denied => bail!("OAuth device authorization was denied"),
                 DevicePoll::Expired => bail!("OAuth device authorization expired"),
-                DevicePoll::Tokens(body) => self.dialect.validate_tokens(
-                    StatusCode::OK,
-                    body,
-                    None,
-                    &TokenValidationContext::Device,
-                )?,
+                DevicePoll::Tokens(body) => {
+                    self.dialect
+                        .validate_tokens(
+                            StatusCode::OK,
+                            body,
+                            None,
+                            &TokenValidationContext::Device,
+                            &cancel,
+                        )
+                        .await?
+                }
                 DevicePoll::AuthorizationCode(grant) => {
                     let request = self.dialect.authorization_code_request(&grant)?;
                     let (status, body) =
                         self.post_device_request(request, &cancel, deadline).await?;
-                    self.dialect.validate_tokens(
-                        status,
-                        body,
-                        None,
-                        &TokenValidationContext::Device,
-                    )?
+                    self.dialect
+                        .validate_tokens(
+                            status,
+                            body,
+                            None,
+                            &TokenValidationContext::Device,
+                            &cancel,
+                        )
+                        .await?
                 }
             };
             self.validate_record(&tokens, None)?;
             ensure_device_authorization_active(&cancel, deadline)?;
             self.store
                 .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
-            return Ok(tokens.provider_credential(reference));
+            return Ok(OAuthCredentialCommit {
+                credential: tokens.provider_credential(reference),
+                generation: tokens.generation.clone(),
+            });
         }
     }
 
@@ -660,6 +719,7 @@ where
         reference: &str,
         pending: PendingBrowserAuthorization,
         callback_url: &str,
+        cancel: CancellationToken,
     ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
         if Utc::now() >= pending.expires_at {
@@ -707,17 +767,22 @@ where
             redirect_uri: pending.redirect_uri.clone(),
         };
         let request = self.dialect.authorization_code_request(&grant)?;
-        let (status, body) = self.post_form(request).await?;
-        let tokens = self.dialect.validate_tokens(
-            status,
-            body,
-            None,
-            &TokenValidationContext::Browser {
-                expected_nonce: pending.nonce.clone(),
-                redirect_uri: pending.redirect_uri.clone(),
-            },
-        )?;
+        let (status, body) = self.post_form_cancellable(request, &cancel).await?;
+        let tokens = self
+            .dialect
+            .validate_tokens(
+                status,
+                body,
+                None,
+                &TokenValidationContext::Browser {
+                    expected_nonce: pending.nonce.clone(),
+                    redirect_uri: pending.redirect_uri.clone(),
+                },
+                &cancel,
+            )
+            .await?;
         self.validate_record(&tokens, None)?;
+        ensure_not_cancelled(&cancel)?;
         if Utc::now() >= pending.expires_at {
             bail!("OAuth browser authorization expired before token persistence");
         }
@@ -727,7 +792,11 @@ where
     }
 
     /// Refresh with a crash marker and generation-checked token rotation.
-    pub async fn refresh(&self, reference: &str) -> Result<ProviderCredential> {
+    pub async fn refresh(
+        &self,
+        reference: &str,
+        cancel: CancellationToken,
+    ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
         let current = self
             .store
@@ -747,14 +816,19 @@ where
         self.store
             .compare_and_swap(reference, Some(&current.generation), &marker)?;
         let request = self.dialect.refresh_request(refresh)?;
-        let (status, body) = self.post_form(request).await?;
-        let refreshed = self.dialect.validate_tokens(
-            status,
-            body,
-            Some(&current),
-            &TokenValidationContext::Refresh,
-        )?;
+        let (status, body) = self.post_form_cancellable(request, &cancel).await?;
+        let refreshed = self
+            .dialect
+            .validate_tokens(
+                status,
+                body,
+                Some(&current),
+                &TokenValidationContext::Refresh,
+                &cancel,
+            )
+            .await?;
         self.validate_record(&refreshed, Some(&current))?;
+        ensure_not_cancelled(&cancel)?;
         self.store
             .compare_and_swap(reference, Some(&marker.generation), &refreshed)
             .context("refreshed OAuth credential lost its local generation commit")?;
@@ -762,7 +836,11 @@ where
     }
 
     /// Revoke remotely, then retain a durable local tombstone.
-    pub async fn revoke(&self, reference: &str) -> Result<ProviderCredential> {
+    pub async fn revoke(
+        &self,
+        reference: &str,
+        cancel: CancellationToken,
+    ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
         let current = self
             .store
@@ -779,7 +857,8 @@ where
         marker.mutation_pending = true;
         self.store
             .compare_and_swap(reference, Some(&current.generation), &marker)?;
-        self.post_revoke(request).await?;
+        self.post_revoke(request, &cancel).await?;
+        ensure_not_cancelled(&cancel)?;
         let mut tombstone = current.clone();
         tombstone.access_token.clear();
         tombstone.refresh_token = None;
@@ -817,6 +896,35 @@ where
         Ok(tombstone.provider_credential(reference))
     }
 
+    /// Locally tombstone an exact bound credential without transmitting it.
+    /// Setup uses this only as compensation for a newly-issued credential when
+    /// a later account in the same config transaction fails.
+    pub fn tombstone_local_generation(
+        &self,
+        reference: &str,
+        expected_generation: &str,
+    ) -> Result<ProviderCredential> {
+        validate_reference(reference)?;
+        let current = self
+            .store
+            .load(reference)?
+            .context("named OAuth credential is missing")?;
+        self.validate_record_binding(&current)?;
+        if current.generation != expected_generation {
+            bail!("OAuth compensation generation changed; current credential was left untouched");
+        }
+        let mut tombstone = current.clone();
+        tombstone.access_token.clear();
+        tombstone.refresh_token = None;
+        tombstone.id_token = None;
+        tombstone.generation = random_secret(24);
+        tombstone.revoked = true;
+        tombstone.mutation_pending = false;
+        self.store
+            .compare_and_swap(reference, Some(&current.generation), &tombstone)?;
+        Ok(tombstone.provider_credential(reference))
+    }
+
     fn validate_record(
         &self,
         record: &OAuthTokenRecord,
@@ -827,6 +935,8 @@ where
             bail!("OAuth token binding does not match the selected provider dialect");
         }
         if record.account.trim().is_empty()
+            || record.account.len() > 256
+            || record.account.chars().any(char::is_control)
             || record.access_token.trim().is_empty()
             || record.generation.trim().is_empty()
             || record.expires_at <= Utc::now()
@@ -858,6 +968,8 @@ where
     fn validate_mutable_record(&self, record: &OAuthTokenRecord) -> Result<()> {
         self.validate_record_binding(record)?;
         if record.account.trim().is_empty()
+            || record.account.len() > 256
+            || record.account.chars().any(char::is_control)
             || record.access_token.trim().is_empty()
             || record.generation.trim().is_empty()
             || record.revoked
@@ -887,6 +999,15 @@ where
     }
 
     async fn post_form(&self, request: OAuthHttpRequest) -> Result<(StatusCode, Value)> {
+        self.post_form_cancellable(request, &CancellationToken::new())
+            .await
+    }
+
+    async fn post_form_cancellable(
+        &self,
+        request: OAuthHttpRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(StatusCode, Value)> {
         let descriptor = self.dialect.descriptor();
         let url = validate_endpoint(&request.endpoint, descriptor.allow_insecure_loopback)?;
         if !descriptor.allowed_origins.contains(&origin(&url)?) {
@@ -897,7 +1018,9 @@ where
             OAuthRequestBody::Form(fields) => builder.form(&fields),
             OAuthRequestBody::Json(value) => builder.json(&value),
         };
-        tokio::time::timeout(self.timeout, async {
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("OAuth request was cancelled"),
+            result = tokio::time::timeout(self.timeout, async {
             let response = builder.send().await.context("OAuth request failed")?;
             if response.status().is_redirection() {
                 bail!("OAuth endpoint redirect was rejected");
@@ -907,12 +1030,15 @@ where
             let body =
                 serde_json::from_slice(&bytes).context("OAuth response was malformed JSON")?;
             Ok((status, body))
-        })
-        .await
-        .context("OAuth request timed out")?
+            }) => result.context("OAuth request timed out")?,
+        }
     }
 
-    async fn post_revoke(&self, request: OAuthHttpRequest) -> Result<()> {
+    async fn post_revoke(
+        &self,
+        request: OAuthHttpRequest,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         let descriptor = self.dialect.descriptor();
         let url = validate_endpoint(&request.endpoint, descriptor.allow_insecure_loopback)?;
         if !descriptor.allowed_origins.contains(&origin(&url)?) {
@@ -923,7 +1049,9 @@ where
             OAuthRequestBody::Form(fields) => builder.form(&fields),
             OAuthRequestBody::Json(value) => builder.json(&value),
         };
-        tokio::time::timeout(self.timeout, async {
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("OAuth credential revocation was cancelled"),
+            result = tokio::time::timeout(self.timeout, async {
             let response = builder
                 .send()
                 .await
@@ -937,9 +1065,8 @@ where
                 bail!("OAuth provider rejected credential revocation (HTTP {status})");
             }
             Ok(())
-        })
-        .await
-        .context("OAuth request timed out")?
+            }) => result.context("OAuth request timed out")?,
+        }
     }
 
     async fn post_device_request(
@@ -967,6 +1094,13 @@ fn ensure_device_authorization_active(
     }
     if tokio::time::Instant::now() >= deadline {
         bail!("OAuth device authorization expired");
+    }
+    Ok(())
+}
+
+fn ensure_not_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        bail!("OAuth operation was cancelled before credential persistence");
     }
     Ok(())
 }
@@ -1043,7 +1177,7 @@ fn validate_device_authorization(
     Ok(())
 }
 
-fn validate_reference(reference: &str) -> Result<()> {
+pub(crate) fn validate_reference(reference: &str) -> Result<()> {
     if reference.is_empty()
         || reference.len() > 128
         || !reference

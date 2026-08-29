@@ -28,6 +28,19 @@ impl FileOAuthCredentialStore {
         secure_directory::open_or_create_private_directory(&self.root)
     }
 
+    /// Read without creating the credential root, lock file, or any other
+    /// filesystem object. Atomic descriptor-relative replacement makes an
+    /// unlocked read of the opened record a consistent snapshot.
+    pub fn load_existing(&self, reference: &str) -> Result<Option<OAuthTokenRecord>> {
+        validate_reference(reference)?;
+        let directory = match secure_directory::open_private_directory(&self.root) {
+            Ok(directory) => directory,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.read_locked(&directory, reference)
+    }
+
     fn record_name(reference: &str) -> Result<String> {
         validate_reference(reference)?;
         Ok(format!(
@@ -168,6 +181,14 @@ mod secure_directory {
     use std::path::{Component, Path, PathBuf};
 
     pub(super) fn open_or_create_private_directory(path: &Path) -> Result<File> {
+        open_private_directory_with_mode(path, true)
+    }
+
+    pub(super) fn open_private_directory(path: &Path) -> Result<File> {
+        open_private_directory_with_mode(path, false)
+    }
+
+    fn open_private_directory_with_mode(path: &Path, create: bool) -> Result<File> {
         if !path.is_absolute() {
             bail!("OAuth credential directory must be absolute");
         }
@@ -203,7 +224,7 @@ mod secure_directory {
             let final_component = index + 1 == components.len();
             let next = match open_directory_at(&directory, component) {
                 Ok(next) => next,
-                Err(nix::errno::Errno::ENOENT) => {
+                Err(nix::errno::Errno::ENOENT) if create => {
                     mkdirat(
                         Some(directory.as_raw_fd()),
                         component.as_os_str(),
@@ -317,6 +338,9 @@ mod secure_directory {
     pub(super) fn open_or_create_private_directory(_path: &Path) -> Result<File> {
         bail!("descriptor-anchored OAuth credential persistence is not yet supported on this platform")
     }
+    pub(super) fn open_private_directory(_path: &Path) -> Result<File> {
+        bail!("descriptor-anchored OAuth credential persistence is not yet supported on this platform")
+    }
     pub(super) fn open_file_at(_: &File, _: &str, _: bool, _: bool) -> Result<File> {
         unreachable!()
     }
@@ -356,6 +380,17 @@ mod tests {
             revoked: false,
             mutation_pending: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_load_of_missing_root_is_read_only() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("missing").join("oauth");
+        let store = FileOAuthCredentialStore::new(root.clone());
+        assert!(store.load_existing("chatgpt:default").unwrap().is_none());
+        assert!(!root.exists());
+        assert!(!temporary.path().join("missing").exists());
     }
 
     #[test]

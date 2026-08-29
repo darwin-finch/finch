@@ -1,6 +1,7 @@
 // CLI module
 // Public interface for command-line interface
 
+pub mod chatgpt_auth;
 pub mod command_autocomplete;
 mod commands;
 mod conversation;
