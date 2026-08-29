@@ -4968,7 +4968,7 @@ mod handler_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn websocket_disconnect_fences_start_bind_and_turn_enqueue_races() {
+    async fn effect_audit_websocket_disconnect_fences_start_bind_and_turn_enqueue_races() {
         use crate::brain::store::{BrainRunStatus, BrainStore};
         use crate::server::BrainLifecycleService;
         use futures::SinkExt;
