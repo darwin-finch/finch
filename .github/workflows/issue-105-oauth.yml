@@ -23,7 +23,7 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Check focused formatting
-        run: cargo fmt --check -- src/oauth/mod.rs src/oauth/file_store.rs src/oauth/tests.rs src/providers/chatgpt_oauth.rs
+        run: rustfmt --edition 2021 --check src/oauth/mod.rs src/oauth/file_store.rs src/oauth/tests.rs src/providers/chatgpt_oauth.rs
       - name: Compile library tests
         run: cargo test --lib --no-run
       - name: Provider-neutral OAuth regressions
