@@ -23,6 +23,28 @@ use crate::config::constants::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
 ///
 /// Returns Ok(()) if daemon is ready, error otherwise.
 pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
+    ensure_daemon_access_allowed()?;
+    ensure_daemon_running_after_isolation_gate(bind_address).await
+}
+
+fn ensure_daemon_access_allowed() -> Result<()> {
+    let supervisor_marker = std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
+        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_FD").is_some()
+        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_BACKUP_FD").is_some();
+    let no_auto_spawn = std::env::var("FINCH_BRAIN_TEST_NO_AUTO_SPAWN").as_deref() == Ok("1");
+    if !supervisor_marker && !no_auto_spawn {
+        return Ok(());
+    }
+    if supervisor_marker {
+        crate::brain::isolated_test_proof()
+            .context("invalid Brain test supervisor authority at daemon lifecycle gate")?;
+    }
+    anyhow::bail!(
+        "daemon discovery, reuse, and auto-spawn are disabled by the Brain test supervisor"
+    );
+}
+
+async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) -> Result<()> {
     let bind = bind_address.unwrap_or(DEFAULT_BIND);
     let base_url = format!("http://{}", bind);
 
@@ -94,6 +116,7 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
 /// - Unix: Standard spawn with log file redirection
 /// - Windows: Uses CREATE_NO_WINDOW flag to avoid console
 pub fn spawn_daemon(bind_address: &str) -> Result<()> {
+    ensure_daemon_access_allowed()?;
     let exe_path =
         std::env::current_exe().context("Failed to determine current executable path")?;
 
@@ -204,5 +227,29 @@ mod tests {
         // Non-existent server should fail health check
         let result = health_check_succeeds("http://127.0.0.1:99999").await;
         assert!(!result);
+    }
+
+    #[test]
+    fn test_isolation_gate_denies_before_probe_reuse_or_spawn() {
+        // The permanent Brain-isolation CI gate supplies authenticated test authority.
+        if std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_none() {
+            return;
+        }
+        let error = ensure_daemon_access_allowed().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discovery, reuse, and auto-spawn are disabled"),
+            "unexpected isolation-gate error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_isolation_gate_also_denies_direct_detached_spawn() {
+        // The permanent Brain-isolation CI gate supplies authenticated test authority.
+        if std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_none() {
+            return;
+        }
+        assert!(ensure_daemon_access_allowed().is_err());
     }
 }

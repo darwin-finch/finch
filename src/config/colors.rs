@@ -611,9 +611,7 @@ mod tests {
             }
             for (index, style) in styles.iter().enumerate() {
                 assert!(
-                    styles[index + 1..]
-                        .iter()
-                        .all(|other| style.bg != other.bg),
+                    styles[index + 1..].iter().all(|other| style.bg != other.bg),
                     "{theme:?} reused transcript background {:?}",
                     style.bg
                 );

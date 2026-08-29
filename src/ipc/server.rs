@@ -12,9 +12,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::ipc::brain_codec::{
-    decode_approval_audience, decode_brain_submission, decode_environment, encode_approval_audience,
-    encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_handoff,
-    encode_run, encode_runner_lease, encode_schedule, encode_snapshot,
+    decode_approval_audience, decode_brain_submission, decode_environment,
+    encode_approval_audience, encode_attachment, encode_brain_submission_outcome, encode_event,
+    encode_run, encode_runner_handoff, encode_runner_lease, encode_schedule, encode_snapshot,
 };
 use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
@@ -61,11 +61,10 @@ impl BrainRpcService {
         let lease = self
             .lifecycle
             .acquire_runner(brain, subject, environment, lease_id, ttl_ms)?;
-        if let Err(error) = self.runners.claim_connection_lease(
-            self.connection_id,
-            brain,
-            lease.lease_id,
-        ) {
+        if let Err(error) =
+            self.runners
+                .claim_connection_lease(self.connection_id, brain, lease.lease_id)
+        {
             // Never release a renewed durable lease merely because rebinding
             // lost a race with another still-live connection.
             if !reconnecting_lease {
@@ -102,15 +101,13 @@ pub(crate) fn test_turn_control_client(
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
 ) -> finch_ipc_capnp::brain_turn_control::Client {
-    capnp_rpc::new_client(
-        BrainTurnControlImpl {
-            server,
-            brain,
-            request_seq,
-            expected_audience,
-            expected_connection_id,
-        },
-    )
+    capnp_rpc::new_client(BrainTurnControlImpl {
+        server,
+        brain,
+        request_seq,
+        expected_audience,
+        expected_connection_id,
+    })
 }
 
 #[cfg(test)]
@@ -120,8 +117,13 @@ pub(crate) async fn request_test_turn_approval_with_client(
 ) -> Result<serde_json::Value> {
     let mut call = control.request_approval_request();
     let crate::server::RunnerTurnEvent::ApprovalRequested {
-        approval_id, approval_kind, subject, audience, detail,
-    } = event else {
+        approval_id,
+        approval_kind,
+        subject,
+        audience,
+        detail,
+    } = event
+    else {
         anyhow::bail!("test reverse control accepts only approval requests");
     };
     let mut encoded = call.get().init_event();
@@ -153,7 +155,8 @@ pub(crate) async fn request_test_turn_approval(
             expected_connection_id,
         ),
         event,
-    ).await
+    )
+    .await
 }
 
 /// Reverse capability scoped to one daemon-authenticated ProgramRun. The
@@ -180,11 +183,8 @@ struct BrainRunnerControlImpl {
 
 impl BrainRunnerControlImpl {
     fn validate_lease(&self) -> anyhow::Result<()> {
-        self.runners.require_connection_lease(
-            self.connection_id,
-            &self.brain,
-            self.lease_id,
-        )?;
+        self.runners
+            .require_connection_lease(self.connection_id, &self.brain, self.lease_id)?;
         let snapshot = self.lifecycle.snapshot(&self.brain)?;
         anyhow::ensure!(
             snapshot
@@ -216,11 +216,19 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
                 .map_err(anyhow::Error::from)
                 .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
         };
-        let parent_run_id = match params.get_parent_run_id().map_err(anyhow::Error::from).and_then(parse_uuid) {
+        let parent_run_id = match params
+            .get_parent_run_id()
+            .map_err(anyhow::Error::from)
+            .and_then(parse_uuid)
+        {
             Ok(value) => crate::brain::store::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let task_id = match params.get_task_id().map_err(anyhow::Error::from).and_then(parse_uuid) {
+        let task_id = match params
+            .get_task_id()
+            .map_err(anyhow::Error::from)
+            .and_then(parse_uuid)
+        {
             Ok(value) => value,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -436,23 +444,28 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(connection_id) => connection_id,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let registration = match self.server.brain_approvals().register_for_connection_with_authority(
-            self.request_seq,
-            approval_id.clone(),
-            audience.clone(),
-            connection_id,
-            || self.server.brain_store().begin_run_approval_for_connection(
-                &self.brain,
-                audience.attachment_id,
-                connection_id,
+        let registration = match self
+            .server
+            .brain_approvals()
+            .register_for_connection_with_authority(
                 self.request_seq,
                 approval_id.clone(),
-                approval_kind.clone(),
-                subject.clone(),
                 audience.clone(),
-                detail.clone(),
-            ),
-        ) {
+                connection_id,
+                || {
+                    self.server.brain_store().begin_run_approval_for_connection(
+                        &self.brain,
+                        audience.attachment_id,
+                        connection_id,
+                        self.request_seq,
+                        approval_id.clone(),
+                        approval_kind.clone(),
+                        subject.clone(),
+                        audience.clone(),
+                        detail.clone(),
+                    )
+                },
+            ) {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -543,11 +556,9 @@ impl brain_service::Server for BrainRpcService {
             attachment.attachment_id,
             attachment_connection_id,
         ) {
-            let _ = self.lifecycle.detach(
-                &brain,
-                attachment.attachment_id,
-                attachment_connection_id,
-            );
+            let _ =
+                self.lifecycle
+                    .detach(&brain, attachment.attachment_id, attachment_connection_id);
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
         encode_attachment(results.get().init_attachment(), &attachment);
@@ -577,15 +588,14 @@ impl brain_service::Server for BrainRpcService {
         ) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        let attachment = match self.lifecycle.acknowledge(
-            &brain,
-            attachment_id,
-            connection_id,
-            params.get_seq(),
-        ) {
-            Ok(attachment) => attachment,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
+        let attachment =
+            match self
+                .lifecycle
+                .acknowledge(&brain, attachment_id, connection_id, params.get_seq())
+            {
+                Ok(attachment) => attachment,
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            };
         encode_attachment(results.get().init_attachment(), &attachment);
         Promise::ok(())
     }
@@ -613,11 +623,7 @@ impl brain_service::Server for BrainRpcService {
         ) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        if let Err(error) = self.lifecycle.detach(
-            &brain,
-            attachment_id,
-            connection_id,
-        ) {
+        if let Err(error) = self.lifecycle.detach(&brain, attachment_id, connection_id) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
         self.runners.release_connection_attachment(
@@ -663,14 +669,9 @@ impl brain_service::Server for BrainRpcService {
         let lifecycle = self.lifecycle.clone();
         Promise::from_future(async move {
             let outcome = lifecycle
-                .submit(
-                &brain,
-                attachment_id,
-                connection_id,
-                kind,
-            )
-            .await
-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                .submit(&brain, attachment_id, connection_id, kind)
+                .await
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
             encode_brain_submission_outcome(
                 results.get().init_outcome(),
                 &outcome.accepted,
@@ -706,11 +707,7 @@ impl brain_service::Server for BrainRpcService {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
         let receiver = pry!(params.get_receiver());
-        let watch = match self.lifecycle.watch(
-            &brain,
-            attachment_id,
-            connection_id,
-        ) {
+        let watch = match self.lifecycle.watch(&brain, attachment_id, connection_id) {
             Ok(watch) => watch,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -721,12 +718,10 @@ impl brain_service::Server for BrainRpcService {
         let transport_connection_id = self.connection_id;
         Promise::from_future(async move {
             let mut initial = receiver.on_message_request();
-            let initial_result = encode_snapshot(
-                initial.get().init_message().init_snapshot(),
-                &snapshot,
-            )
-            .map_err(|error| capnp::Error::failed(error.to_string()))
-            .and_then(|()| Ok(initial));
+            let initial_result =
+                encode_snapshot(initial.get().init_message().init_snapshot(), &snapshot)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))
+                    .and_then(|()| Ok(initial));
             let initial_error = match initial_result {
                 Ok(initial) => initial.send().promise.await.err(),
                 Err(error) => Some(error),
@@ -821,11 +816,10 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
-        if let Err(error) = self.runners.require_connection_lease(
-            self.connection_id,
-            &brain,
-            lease_id,
-        ) {
+        if let Err(error) =
+            self.runners
+                .require_connection_lease(self.connection_id, &brain, lease_id)
+        {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
         if let Err(error) = self.lifecycle.release_runner(&brain, lease_id) {
@@ -917,11 +911,10 @@ impl brain_service::Server for BrainRpcService {
             Ok(lease) => lease,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        if let Err(error) = self.runners.claim_connection_lease(
-            self.connection_id,
-            &brain,
-            lease.lease_id,
-        ) {
+        if let Err(error) =
+            self.runners
+                .claim_connection_lease(self.connection_id, &brain, lease.lease_id)
+        {
             let _ = self.lifecycle.release_runner(&brain, lease.lease_id);
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1116,12 +1109,10 @@ impl brain_service::Server for BrainRpcService {
         ) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        match self.lifecycle.cancel_schedule(
-            &brain,
-            attachment_id,
-            connection_id,
-            schedule_id,
-        ) {
+        match self
+            .lifecycle
+            .cancel_schedule(&brain, attachment_id, connection_id, schedule_id)
+        {
             Ok(cancelled) => {
                 results.get().set_cancelled(cancelled);
                 Promise::ok(())
@@ -1349,10 +1340,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
         mut results: finch_daemon::QueryResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let messages = pry!(
-            super::brain_codec::decode_messages(pry!(p.get_messages()))
-                .map_err(|error| capnp::Error::failed(error.to_string()))
-        );
+        let messages = pry!(super::brain_codec::decode_messages(pry!(p.get_messages()))
+            .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let server = Arc::clone(&self.server);
 
@@ -1393,10 +1382,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
         _results: finch_daemon::QueryStreamResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let messages = pry!(
-            super::brain_codec::decode_messages(pry!(p.get_messages()))
-                .map_err(|error| capnp::Error::failed(error.to_string()))
-        );
+        let messages = pry!(super::brain_codec::decode_messages(pry!(p.get_messages()))
+            .map_err(|error| capnp::Error::failed(error.to_string())));
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let receiver = pry!(p.get_receiver());
         let server = Arc::clone(&self.server);
@@ -1450,10 +1437,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         r.send().promise.await?;
                     }
                     Ok(StreamChunk::ResponseMetadata { model }) => {
-                        crate::generators::validate_response_model(&model)
-                            .map_err(|_| capnp::Error::failed(
-                                "IPC response model metadata was invalid".into(),
-                            ))?;
+                        crate::generators::validate_response_model(&model).map_err(|_| {
+                            capnp::Error::failed("IPC response model metadata was invalid".into())
+                        })?;
                         let mut r = receiver.on_chunk_request();
                         r.get()
                             .init_chunk()
@@ -1565,15 +1551,11 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let broker = self.server.brain_runners().clone();
         let server = Arc::clone(&self.server);
-        let registration_id = match broker.register_for_connection(
-            self.connection_id,
-            brain.clone(),
-            lease_id,
-            tx,
-        ) {
-            Ok(registration_id) => registration_id,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
+        let registration_id =
+            match broker.register_for_connection(self.connection_id, brain.clone(), lease_id, tx) {
+                Ok(registration_id) => registration_id,
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            };
         let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
         let queued_brain = brain.clone();
         let registered_brain = brain.clone();
@@ -1617,15 +1599,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
         if let Err(error) = encode_checkpoint(response.reborrow().init_checkpoint(), &checkpoint) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        let control: finch_ipc_capnp::brain_runner_control::Client = capnp_rpc::new_client(
-            BrainRunnerControlImpl {
+        let control: finch_ipc_capnp::brain_runner_control::Client =
+            capnp_rpc::new_client(BrainRunnerControlImpl {
                 lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
                 runners: self.server.brain_runners().clone(),
                 connection_id: self.connection_id,
                 brain: brain.clone(),
                 lease_id,
-            },
-        );
+            });
         response.set_control(control);
         Promise::ok(())
     }
@@ -1672,12 +1653,8 @@ fn attachment_role_from_capnp(
     role: finch_ipc_capnp::BrainAttachmentRole,
 ) -> crate::brain::store::AttachmentRole {
     match role {
-        finch_ipc_capnp::BrainAttachmentRole::Runner => {
-            crate::brain::store::AttachmentRole::Runner
-        }
-        finch_ipc_capnp::BrainAttachmentRole::Driver => {
-            crate::brain::store::AttachmentRole::Driver
-        }
+        finch_ipc_capnp::BrainAttachmentRole::Runner => crate::brain::store::AttachmentRole::Runner,
+        finch_ipc_capnp::BrainAttachmentRole::Driver => crate::brain::store::AttachmentRole::Driver,
         finch_ipc_capnp::BrainAttachmentRole::Consultant => {
             crate::brain::store::AttachmentRole::Consultant
         }
@@ -1948,15 +1925,13 @@ fn decode_runner_turn_result(
         .map_err(|error| error.to_string())?;
     let commit_ack = if result.get_has_commit_ack() {
         let capability = result.get_commit_ack().map_err(|error| error.to_string())?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::server::RunnerTurnCommitNotice,
-        >();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerTurnCommitNotice>();
         tokio::task::spawn_local(async move {
             while let Some(notice) = rx.recv().await {
                 let mut call = capability.committed_request();
-                call.get().set_status(crate::ipc::brain_codec::run_status_to_capnp(
-                    notice.status,
-                ));
+                call.get()
+                    .set_status(crate::ipc::brain_codec::run_status_to_capnp(notice.status));
                 call.get().set_detail(&notice.detail);
                 if let Err(error) = call.send().promise.await {
                     tracing::warn!(%error, "could not acknowledge committed Brain turn to runner");
@@ -1998,9 +1973,8 @@ fn decode_runner_effect_records(
     encoded
         .iter()
         .map(|record| {
-            let (execution_id, entry) =
-                crate::ipc::checkpoint_codec::decode_effect_record(record)
-                    .map_err(|error| error.to_string())?;
+            let (execution_id, entry) = crate::ipc::checkpoint_codec::decode_effect_record(record)
+                .map_err(|error| error.to_string())?;
             Ok(crate::server::RunnerEffectRecord {
                 execution_id,
                 entry,
@@ -2096,20 +2070,24 @@ mod tests {
                 Err(error) => return capnp::capability::Promise::err(error),
             };
             let request_seq = request.get_request_seq();
-            let audience = match request.get_approval_audience()
+            let audience = match request
+                .get_approval_audience()
                 .map_err(anyhow::Error::new)
                 .and_then(super::decode_approval_audience)
             {
                 Ok(audience) => audience,
-                Err(error) => return capnp::capability::Promise::err(
-                    capnp::Error::failed(error.to_string()),
-                ),
+                Err(error) => {
+                    return capnp::capability::Promise::err(capnp::Error::failed(error.to_string()))
+                }
             };
             let control = match request.get_control() {
                 Ok(control) => control,
                 Err(error) => return capnp::capability::Promise::err(error),
             };
-            let failed_tx = self.failed_tx.take().expect("runner received more than one turn");
+            let failed_tx = self
+                .failed_tx
+                .take()
+                .expect("runner received more than one turn");
             capnp::capability::Promise::from_future(async move {
                 let mut call = control.request_approval_request();
                 crate::ipc::client::encode_brain_turn_event(
@@ -2166,99 +2144,161 @@ mod tests {
             let socket_path = temp.path().join("finch.sock");
             let _socket_path = crate::ipc::transport::set_test_sock_path(socket_path.clone());
             let store = crate::brain::store::BrainStore::with_root(
-                "box.local", Some(temp.path().join("brains")),
+                "box.local",
+                Some(temp.path().join("brains")),
             );
-            let server = std::sync::Arc::new(crate::server::AgentServer::for_brain_protocol_test(
-                store.clone(),
-                crate::brain::credential::BrainCredentialAuthority::ephemeral([91; 32]),
-                "test-password".into(),
-                temp.path(),
-            ).unwrap());
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([91; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
             let shutdown = tokio_util::sync::CancellationToken::new();
-            let server_task = tokio::task::spawn_local(super::start_ipc_server(
-                server.clone(), shutdown.clone(),
-            ));
+            let server_task =
+                tokio::task::spawn_local(super::start_ipc_server(server.clone(), shutdown.clone()));
             tokio::time::timeout(std::time::Duration::from_millis(250), async {
                 while !socket_path.exists() {
                     tokio::task::yield_now().await;
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
 
-            let participant = crate::ipc::IpcClient::connect_path(socket_path.clone()).await.unwrap();
-            let attachment = participant.brain_attach(
-                "shared", "alice", crate::brain::store::AttachmentRole::Driver, None,
-            ).await.unwrap();
-            let mut participant_events = participant.brain_watch("shared", &attachment).await.unwrap();
+            let participant = crate::ipc::IpcClient::connect_path(socket_path.clone())
+                .await
+                .unwrap();
+            let attachment = participant
+                .brain_attach(
+                    "shared",
+                    "alice",
+                    crate::brain::store::AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut participant_events = participant
+                .brain_watch("shared", &attachment)
+                .await
+                .unwrap();
             participant_events.recv().await.unwrap().unwrap();
 
-            let runner = crate::ipc::IpcClient::connect_path(socket_path.clone()).await.unwrap();
+            let runner = crate::ipc::IpcClient::connect_path(socket_path.clone())
+                .await
+                .unwrap();
             let snapshot = runner.brain_snapshot("shared").await.unwrap();
-            runner.brain_claim_runner_identity("runner@box.local/socket").await.unwrap();
-            let lease = runner.brain_acquire_runner(
-                "shared", "runner@box.local/socket", &snapshot.environment, None, 60_000,
-            ).await.unwrap();
+            runner
+                .brain_claim_runner_identity("runner@box.local/socket")
+                .await
+                .unwrap();
+            let lease = runner
+                .brain_acquire_runner(
+                    "shared",
+                    "runner@box.local/socket",
+                    &snapshot.environment,
+                    None,
+                    60_000,
+                )
+                .await
+                .unwrap();
             let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
             let callback: super::finch_ipc_capnp::brain_runner::Client =
-                capnp_rpc::new_client(SocketApprovalRunner { failed_tx: Some(failed_tx) });
-            runner.register_test_brain_runner_client("shared", lease.lease_id, callback)
-                .await.unwrap();
+                capnp_rpc::new_client(SocketApprovalRunner {
+                    failed_tx: Some(failed_tx),
+                });
+            runner
+                .register_test_brain_runner_client("shared", lease.lease_id, callback)
+                .await
+                .unwrap();
 
-            let run = participant.brain_start_speculative(
-                "shared", &attachment, "request approval".into(),
-            ).await.unwrap();
+            let run = participant
+                .brain_start_speculative("shared", &attachment, "request approval".into())
+                .await
+                .unwrap();
             tokio::time::timeout(std::time::Duration::from_millis(250), async {
                 loop {
                     let current = store.snapshot("shared").unwrap();
-                    if current.events.iter().any(|event| matches!(
-                        &event.kind,
-                        crate::brain::store::BrainEventKind::ApprovalRequested {
-                            approval_id, ..
-                        } if approval_id == "socket-approval"
-                    )) {
-                        assert_eq!(store.inspect_run("shared", run.run_id).unwrap().status,
-                            crate::brain::store::BrainRunStatus::AwaitingApproval);
+                    if current.events.iter().any(|event| {
+                        matches!(
+                            &event.kind,
+                            crate::brain::store::BrainEventKind::ApprovalRequested {
+                                approval_id, ..
+                            } if approval_id == "socket-approval"
+                        )
+                    }) {
+                        assert_eq!(
+                            store.inspect_run("shared", run.run_id).unwrap().status,
+                            crate::brain::store::BrainRunStatus::AwaitingApproval
+                        );
                         break;
                     }
                     tokio::task::yield_now().await;
                 }
-            }).await.expect("reverse approval did not become durable");
+            })
+            .await
+            .expect("reverse approval did not become durable");
 
             let old_connection = attachment.connection_id.unwrap();
             drop(participant_events);
             drop(participant);
-            let error = tokio::time::timeout(
-                std::time::Duration::from_millis(250), failed_rx,
-            ).await.expect("physical IPC loss did not fail approval promptly").unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_millis(250), failed_rx)
+                .await
+                .expect("physical IPC loss did not fail approval promptly")
+                .unwrap();
             assert!(error.contains("approval audience disconnected"), "{error}");
             tokio::time::timeout(std::time::Duration::from_millis(250), async {
-                while store.require_connection(
-                    "shared", attachment.attachment_id, old_connection,
-                ).is_ok() {
+                while store
+                    .require_connection("shared", attachment.attachment_id, old_connection)
+                    .is_ok()
+                {
                     tokio::task::yield_now().await;
                 }
-            }).await.expect("physical IPC loss did not detach exact generation");
+            })
+            .await
+            .expect("physical IPC loss did not detach exact generation");
 
-            let replacement = crate::ipc::IpcClient::connect_path(socket_path).await.unwrap();
-            let replacement_attachment = replacement.brain_attach(
-                "shared", "alice", crate::brain::store::AttachmentRole::Driver,
-                Some(attachment.attachment_id),
-            ).await.unwrap();
+            let replacement = crate::ipc::IpcClient::connect_path(socket_path)
+                .await
+                .unwrap();
+            let replacement_attachment = replacement
+                .brain_attach(
+                    "shared",
+                    "alice",
+                    crate::brain::store::AttachmentRole::Driver,
+                    Some(attachment.attachment_id),
+                )
+                .await
+                .unwrap();
             let replacement_connection = replacement_attachment.connection_id.unwrap();
-            let mut replacement_events = replacement.brain_watch(
-                "shared", &replacement_attachment,
-            ).await.unwrap();
+            let mut replacement_events = replacement
+                .brain_watch("shared", &replacement_attachment)
+                .await
+                .unwrap();
             replacement_events.recv().await.unwrap().unwrap();
-            assert!(store.require_connection(
-                "shared", replacement_attachment.attachment_id, replacement_connection,
-            ).is_ok());
+            assert!(store
+                .require_connection(
+                    "shared",
+                    replacement_attachment.attachment_id,
+                    replacement_connection,
+                )
+                .is_ok());
             assert_eq!(store.snapshot("shared").unwrap().runner_lease, Some(lease));
             let terminal = store.snapshot("shared").unwrap();
-            assert_eq!(terminal.events.iter().filter(|event| matches!(
-                event.kind,
-                crate::brain::store::BrainEventKind::RunStatusChanged {
-                    run_id, status, ..
-                } if run_id == run.run_id && status.is_terminal()
-            )).count(), 1);
+            assert_eq!(
+                terminal
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        crate::brain::store::BrainEventKind::RunStatusChanged {
+                            run_id, status, ..
+                        } if run_id == run.run_id && status.is_terminal()
+                    ))
+                    .count(),
+                1
+            );
 
             drop(replacement_events);
             drop(replacement);
@@ -2275,9 +2315,9 @@ mod tests {
             Ok(_) => panic!("connectionless restored turn registered an approval"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains(
-            "approval audience has no live connection generation"
-        ));
+        assert!(error
+            .to_string()
+            .contains("approval audience has no live connection generation"));
     }
 
     struct BrainTestDaemon {
@@ -2467,21 +2507,12 @@ mod tests {
                     connection_id: uuid::Uuid::new_v4(),
                 });
             let ipc = crate::ipc::IpcClient::from_test_client(daemon);
-            let target = crate::brain::remote::RemoteBrainTarget::local(
-                "shared",
-                "127.0.0.1:1",
-            )
-            .unwrap();
-            let mut driver = crate::brain::remote::AttachedBrainClient::local(
-                target.clone(),
-                ipc.clone(),
-            );
+            let target =
+                crate::brain::remote::RemoteBrainTarget::local("shared", "127.0.0.1:1").unwrap();
+            let mut driver =
+                crate::brain::remote::AttachedBrainClient::local(target.clone(), ipc.clone());
             driver
-                .attach(
-                    "alice",
-                    crate::brain::store::AttachmentRole::Driver,
-                    None,
-                )
+                .attach("alice", crate::brain::store::AttachmentRole::Driver, None)
                 .await
                 .unwrap();
             let mut events = driver.watch().await.unwrap();
@@ -2501,11 +2532,7 @@ mod tests {
 
             let mut consultant = crate::brain::remote::AttachedBrainClient::local(target, ipc);
             consultant
-                .attach(
-                    "bob",
-                    crate::brain::store::AttachmentRole::Consultant,
-                    None,
-                )
+                .attach("bob", crate::brain::store::AttachmentRole::Consultant, None)
                 .await
                 .unwrap();
             let mut consultant_events = consultant.watch().await.unwrap();
@@ -2679,6 +2706,69 @@ mod tests {
         assert_eq!(error.effect_journal, vec![expected_effect]);
     }
 
+    #[test]
+    fn supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path() {
+        if std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() != Ok("1") {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let proof = crate::brain::isolated_test_proof().unwrap();
+            let prepared = super::prepare_ipc_listener().await.unwrap();
+            assert!(!prepared.remove_on_shutdown);
+
+            let store =
+                crate::brain::store::BrainStore::with_root("box.local", Some(proof.root.clone()));
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([92; 32]),
+                    "test-password".into(),
+                    &proof.home,
+                )
+                .unwrap(),
+            );
+
+            let moved = proof.socket_root.with_file_name(format!(
+                "{}.moved-{}",
+                proof.socket_root.file_name().unwrap().to_string_lossy(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            let replacement = proof.home.join(".finch");
+            let sentinel = replacement.join("ipc-swap-sentinel");
+            let attacker_socket = replacement.join("daemon.sock");
+            std::fs::write(&sentinel, b"outside-must-not-change").unwrap();
+            std::fs::write(&attacker_socket, b"not-a-socket").unwrap();
+            std::fs::rename(&proof.socket_root, &moved).unwrap();
+            std::os::unix::fs::symlink(&replacement, &proof.socket_root).unwrap();
+
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            shutdown.cancel();
+            super::serve_ipc_listener(server, shutdown, prepared)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"outside-must-not-change"
+            );
+            assert_eq!(std::fs::read(&attacker_socket).unwrap(), b"not-a-socket");
+            assert!(std::fs::symlink_metadata(&attacker_socket)
+                .unwrap()
+                .file_type()
+                .is_file());
+
+            std::fs::remove_file(&proof.socket_root).unwrap();
+            std::fs::rename(&moved, &proof.socket_root).unwrap();
+            std::fs::remove_file(sentinel).unwrap();
+            std::fs::remove_file(attacker_socket).unwrap();
+        }));
+    }
+
     #[tokio::test]
     async fn eval_forth_uses_typed_signatures_and_runtime() {
         let (stack, output) = execute_typed_forth_ipc(
@@ -2711,8 +2801,38 @@ pub async fn start_ipc_server(
     server: Arc<AgentServer>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let path = crate::ipc::transport::sock_path();
+    let prepared = prepare_ipc_listener().await?;
+    serve_ipc_listener(server, shutdown, prepared).await
+}
 
+struct PreparedIpcListener {
+    path: std::path::PathBuf,
+    listener: UnixListener,
+    remove_on_shutdown: bool,
+}
+
+async fn prepare_ipc_listener() -> Result<PreparedIpcListener> {
+    // A supervised daemon must consume the short, private socket path sealed
+    // into its authenticated proof. The supervisor already bound the listener;
+    // the child performs no pathname operation at startup or shutdown.
+    if let Some(proof) = crate::brain::isolated_test_proof_if_present()? {
+        let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
+            .map(std::path::PathBuf::from)
+            .context("supervised daemon is missing its sealed IPC socket path")?;
+        anyhow::ensure!(
+            path == proof.ipc_socket,
+            "supervised daemon IPC path is not parent-authorized"
+        );
+        let listener = proof.duplicate_ipc_listener()?;
+        listener.set_nonblocking(true)?;
+        return Ok(PreparedIpcListener {
+            path,
+            listener: UnixListener::from_std(listener)?,
+            remove_on_shutdown: false,
+        });
+    }
+
+    let path = crate::ipc::transport::sock_path();
     // Remove only a stale socket. Blind unlinking lets a second daemon replace
     // the pathname while the original listener continues serving through its
     // open file descriptor.
@@ -2740,8 +2860,24 @@ pub async fn start_ipc_server(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
     let listener = UnixListener::bind(&path)?;
+    Ok(PreparedIpcListener {
+        path,
+        listener,
+        remove_on_shutdown: true,
+    })
+}
+
+async fn serve_ipc_listener(
+    server: Arc<AgentServer>,
+    shutdown: tokio_util::sync::CancellationToken,
+    prepared: PreparedIpcListener,
+) -> Result<()> {
+    let PreparedIpcListener {
+        path,
+        listener,
+        remove_on_shutdown,
+    } = prepared;
     tracing::info!(path = %path.display(), "IPC server listening");
 
     let local = tokio::task::LocalSet::new();
@@ -2767,7 +2903,7 @@ pub async fn start_ipc_server(
             }
         })
         .await;
-    if path.exists() {
+    if remove_on_shutdown && path.exists() {
         std::fs::remove_file(&path)?;
     }
     Ok(())
@@ -2790,9 +2926,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServ
     let result = RpcSystem::new(Box::new(network), Some(daemon_client.client))
         .await
         .map_err(anyhow::Error::from);
-    let attachments = server
-        .brain_runners()
-        .disconnect_connection(connection_id);
+    let attachments = server.brain_runners().disconnect_connection(connection_id);
     let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
     for (brain, attachment_id, attachment_connection_id) in attachments {
         let _ = lifecycle.detach(&brain, attachment_id, attachment_connection_id);

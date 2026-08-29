@@ -264,15 +264,14 @@ pub fn compile_lisp_with_functions(
         .iter()
         .filter(|form| !is_macro_definition(&form.value))
         .map(|form| {
-            expand_template_macros(source_id, source, form, &macros, &mut expansion_budget)
-                .map(|expanded| {
-                    SourceForm {
-                        value: expanded.value,
-                        span: form.span.clone(),
-                        source: expanded.source,
-                        expansion: expanded.expansion,
-                    }
-                })
+            expand_template_macros(source_id, source, form, &macros, &mut expansion_budget).map(
+                |expanded| SourceForm {
+                    value: expanded.value,
+                    span: form.span.clone(),
+                    source: expanded.source,
+                    expansion: expanded.expansion,
+                },
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expressions = flatten_top_level_begins(expressions);
@@ -601,12 +600,10 @@ fn expand_template_macros(
                 .cloned()
                 .zip(expression.children.iter().skip(1).cloned())
                 .collect::<HashMap<_, _>>();
-            let expanded = substitute_macro_template(
-                &definition.template,
-                &bindings,
-                expression.span.clone(),
-            );
-            let mut expanded = expand_template_macros(source_id, source, &expanded, macros, budget)?;
+            let expanded =
+                substitute_macro_template(&definition.template, &bindings, expression.span.clone());
+            let mut expanded =
+                expand_template_macros(source_id, source, &expanded, macros, budget)?;
             let mut origin = definition.definition_origin.clone();
             origin.expansion = expanded.expansion.map(Box::new);
             expanded.expansion = Some(origin);
@@ -636,14 +633,11 @@ fn substitute_macro_template(
     generated_span: Range<usize>,
 ) -> SpannedVal {
     match template {
-        Val::Symbol(name) => bindings
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| SpannedVal {
-                value: template.clone(),
-                span: generated_span,
-                children: Vec::new(),
-            }),
+        Val::Symbol(name) => bindings.get(name).cloned().unwrap_or_else(|| SpannedVal {
+            value: template.clone(),
+            span: generated_span,
+            children: Vec::new(),
+        }),
         Val::List(items) => {
             let children = items
                 .iter()
@@ -865,7 +859,8 @@ impl Compiler<'_> {
             );
         }
         let body_sources = self.current_form_suffix_sources(definition.body);
-        let result_type = self.compile_begin(definition.body, body_sources.as_deref(), &mut child)?;
+        let result_type =
+            self.compile_begin(definition.body, body_sources.as_deref(), &mut child)?;
         if let Some(expected) = &declared_return {
             if !declared_type_accepts(expected, &result_type) {
                 return Err(vec![self.error(
@@ -1000,8 +995,12 @@ impl Compiler<'_> {
                 return self.compile_closure_call(
                     &items[0],
                     &items[1..],
-                    source_children.as_deref().and_then(|children| children.first()),
-                    source_children.as_deref().and_then(|children| children.get(1..)),
+                    source_children
+                        .as_deref()
+                        .and_then(|children| children.first()),
+                    source_children
+                        .as_deref()
+                        .and_then(|children| children.get(1..)),
                     builder,
                 )
             }
@@ -1009,98 +1008,134 @@ impl Compiler<'_> {
         match operator {
             "begin" => self.compile_begin(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "let" => self.compile_let(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "if" => self.compile_if(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "match" => self.compile_match(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "match-variant" => self.compile_variant_match(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "match-option" => self.compile_match_option(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "match-result" => self.compile_match_result(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "try" => self.compile_try(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "while" => self.compile_while(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "break" => self.compile_loop_exit("break", &items[1..], builder),
             "continue" => self.compile_loop_exit("continue", &items[1..], builder),
             "lambda" => self.compile_lambda(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "defer" => self.compile_defer(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "defer-cpu" => self.compile_defer_cpu(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "task-poll" => self.compile_cpu_task_operation(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
                 false,
             ),
             "task-join" => self.compile_cpu_task_operation(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
                 true,
             ),
             "task-cancel" => self.compile_cpu_task_cancel(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "fiber-next" => self.compile_fiber_operation(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
                 "fiber-next",
             ),
             "fiber-join" => self.compile_fiber_operation(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
                 "fiber-join",
             ),
             "fiber-cancel" => self.compile_fiber_operation(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
                 "fiber-cancel",
             ),
@@ -1110,43 +1145,59 @@ impl Compiler<'_> {
             "empty-map" => self.compile_empty_map(&items[1..], builder),
             "finch-record-literal" => self.compile_record_value(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "record-get" => self.compile_record_get(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "record-set" => self.compile_record_set(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "variant" => self.compile_variant_value(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
             "variant-get" => self.compile_variant_get(
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
                 builder,
             ),
-            _ if builder.resolve(operator).is_some() => {
-                self.compile_closure_call(
-                    &items[0],
-                    &items[1..],
-                    source_children.as_deref().and_then(|children| children.first()),
-                    source_children.as_deref().and_then(|children| children.get(1..)),
-                    builder,
-                )
-            }
+            _ if builder.resolve(operator).is_some() => self.compile_closure_call(
+                &items[0],
+                &items[1..],
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.first()),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
+                builder,
+            ),
             _ => self.compile_named_call(
                 operator,
                 &items[1..],
-                source_children.as_deref().and_then(|children| children.get(1..)),
-                source_children.as_deref().and_then(|children| children.first()),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.get(1..)),
+                source_children
+                    .as_deref()
+                    .and_then(|children| children.first()),
                 builder,
             ),
         }
@@ -1232,9 +1283,7 @@ impl Compiler<'_> {
             ]);
         }
         if let Some(suspension) = suspension {
-            if *suspension.yield_type != Type::Unit
-                || *suspension.resume_type != Type::Unit
-            {
+            if *suspension.yield_type != Type::Unit || *suspension.resume_type != Type::Unit {
                 return Err(vec![self.error(
                     "E-YIELD-003",
                     "CPU tasks may yield only unit timeslices; use defer for produced values",
@@ -1310,13 +1359,11 @@ impl Compiler<'_> {
             )]);
         }
         match &expressions[0] {
-            Val::Symbol(mode) if mode == ":cpu" => {
-                self.compile_defer_cpu(
-                    &expressions[1..],
-                    expression_sources.and_then(|sources| sources.get(1..)),
-                    builder,
-                )
-            }
+            Val::Symbol(mode) if mode == ":cpu" => self.compile_defer_cpu(
+                &expressions[1..],
+                expression_sources.and_then(|sources| sources.get(1..)),
+                builder,
+            ),
             Val::Symbol(mode) if mode == ":fiber" => self.compile_defer_fiber(
                 &expressions[1..],
                 expression_sources.and_then(|sources| sources.get(1..)),
@@ -1352,10 +1399,9 @@ impl Compiler<'_> {
             builder,
         )?;
         let Type::Fiber(yield_type, result_type) = fiber_type else {
-            return Err(vec![self.error(
-                "E-FIBER-024",
-                format!("{operation} requires fiber<Y,R>"),
-            )]);
+            return Err(vec![
+                self.error("E-FIBER-024", format!("{operation} requires fiber<Y,R>"))
+            ]);
         };
         builder.stack.pop();
         let (instruction, result) = match operation {
@@ -1583,16 +1629,14 @@ impl Compiler<'_> {
         let mut record_fields = Vec::with_capacity(fields.len());
         for (index, field) in fields.iter().enumerate() {
             let Val::List(parts) = field else {
-                return Err(vec![self.error(
-                    "E-RECORD-001",
-                    "record fields must be (name value) pairs",
-                )]);
+                return Err(vec![
+                    self.error("E-RECORD-001", "record fields must be (name value) pairs")
+                ]);
             };
             let [Val::Symbol(name), value] = parts.as_slice() else {
-                return Err(vec![self.error(
-                    "E-RECORD-001",
-                    "record fields must be (name value) pairs",
-                )]);
+                return Err(vec![
+                    self.error("E-RECORD-001", "record fields must be (name value) pairs")
+                ]);
             };
             if record_fields.iter().any(|(existing, _)| existing == name) {
                 return Err(vec![self.error(
@@ -1641,7 +1685,9 @@ impl Compiler<'_> {
         };
         let tag = tag.strip_prefix(':').unwrap_or(tag);
         let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
-            return Err(vec![self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))]);
+            return Err(vec![
+                self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))
+            ]);
         };
         match (payload_type, rest) {
             (None, []) => {}
@@ -1700,7 +1746,8 @@ impl Compiler<'_> {
             variant,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
+        )?
+        else {
             return Err(vec![self.error(
                 "E-VARIANT-005",
                 "variant-get requires a statically typed variant value",
@@ -1708,7 +1755,9 @@ impl Compiler<'_> {
         };
         let tag = tag.strip_prefix(':').unwrap_or(tag);
         let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
-            return Err(vec![self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))]);
+            return Err(vec![
+                self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))
+            ]);
         };
         let payload_type = payload_type.clone();
         builder.stack.pop();
@@ -1720,9 +1769,7 @@ impl Compiler<'_> {
             },
             self.origin(format!("variant-get/{tag}")),
         );
-        Ok(Type::Option(Box::new(
-            payload_type.unwrap_or(Type::Unit),
-        )))
+        Ok(Type::Option(Box::new(payload_type.unwrap_or(Type::Unit))))
     }
 
     /// Project a statically named field. Dynamic lookup belongs to the managed
@@ -1743,11 +1790,11 @@ impl Compiler<'_> {
             record,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
-            return Err(vec![self.error(
-                "E-RECORD-004",
-                "record-get requires a typed record",
-            )]);
+        )?
+        else {
+            return Err(vec![
+                self.error("E-RECORD-004", "record-get requires a typed record")
+            ]);
         };
         let field_type = self.compile_expression_at(
             &expressions[1],
@@ -1756,14 +1803,14 @@ impl Compiler<'_> {
         )?;
         if field_type != Type::String {
             return Err(vec![self.error(
-                "E-RECORD-004", "record-get field name must be a literal string",
+                "E-RECORD-004",
+                "record-get field name must be a literal string",
             )]);
         }
         let Some((_, value_type)) = fields.iter().find(|(name, _)| name == field) else {
-            return Err(vec![self.error(
-                "E-RECORD-005",
-                format!("record has no field '{field}'"),
-            )]);
+            return Err(vec![
+                self.error("E-RECORD-005", format!("record has no field '{field}'"))
+            ]);
         };
         let value_type = value_type.clone();
         builder.stack.pop();
@@ -1797,10 +1844,11 @@ impl Compiler<'_> {
             record,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
-            return Err(vec![self.error(
-                "E-RECORD-004", "record-set requires a typed record",
-            )]);
+        )?
+        else {
+            return Err(vec![
+                self.error("E-RECORD-004", "record-set requires a typed record")
+            ]);
         };
         let value_type = self.compile_expression_at(
             value,
@@ -1817,17 +1865,20 @@ impl Compiler<'_> {
         )?;
         if field_type != Type::String {
             return Err(vec![self.error(
-                "E-RECORD-007", "record-set field name must be a literal string",
+                "E-RECORD-007",
+                "record-set field name must be a literal string",
             )]);
         }
         let Some((_, expected)) = fields.iter().find(|(name, _)| name == field) else {
-            return Err(vec![self.error(
-                "E-RECORD-005", format!("record has no field '{field}'"),
-            )]);
+            return Err(vec![
+                self.error("E-RECORD-005", format!("record has no field '{field}'"))
+            ]);
         };
         if expected != &value_type {
             return Err(vec![VmDiagnostic::type_mismatch(
-                expected.clone(), value_type, Some(self.origin("record-set")),
+                expected.clone(),
+                value_type,
+                Some(self.origin("record-set")),
             )]);
         }
         builder.stack.pop();
@@ -2003,7 +2054,8 @@ impl Compiler<'_> {
             option_expression,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
+        )?
+        else {
             return Err(vec![self.error(
                 "E-LISP-MATCH-002",
                 "match-option requires an option<T> expression",
@@ -2177,9 +2229,7 @@ impl Compiler<'_> {
             return self.compile_record_match(expressions, expression_sources, builder);
         }
         if expressions[1..].iter().all(|arm| {
-            arm_marker(arm).is_some_and(|marker| {
-                !matches!(marker.as_str(), "true" | "false" | "_")
-            })
+            arm_marker(arm).is_some_and(|marker| !matches!(marker.as_str(), "true" | "false" | "_"))
         }) {
             return self.compile_variant_match(expressions, expression_sources, builder);
         }
@@ -2211,7 +2261,8 @@ impl Compiler<'_> {
             variant_expression,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
+        )?
+        else {
             return Err(vec![self.error(
                 "E-LISP-MATCH-014",
                 "variant patterns require a statically typed closed variant",
@@ -2235,10 +2286,9 @@ impl Compiler<'_> {
             };
             let tag = marker.strip_prefix(':').unwrap_or(marker);
             let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
-                return Err(vec![self.error(
-                    "E-VARIANT-002",
-                    format!("variant has no tag '{tag}'"),
-                )]);
+                return Err(vec![
+                    self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))
+                ]);
             };
             if !seen.insert(tag.to_string()) {
                 return Err(vec![self.error(
@@ -2265,9 +2315,7 @@ impl Compiler<'_> {
             }
             parsed.push((tag.to_string(), payload_type.clone(), binding, body_start));
         }
-        if seen.len() != variants.len()
-            || variants.iter().any(|(tag, _)| !seen.contains(tag))
-        {
+        if seen.len() != variants.len() || variants.iter().any(|(tag, _)| !seen.contains(tag)) {
             return Err(vec![self.error(
                 "E-LISP-MATCH-014",
                 "variant match must cover every declared tag exactly once",
@@ -2278,18 +2326,21 @@ impl Compiler<'_> {
         let variant_local = builder.allocate_local(variant_type.clone());
         builder.stack.pop();
         builder.emit(
-            Instruction::LocalSet { index: variant_local },
+            Instruction::LocalSet {
+                index: variant_local,
+            },
             self.origin("match/variant"),
         );
         let branch_stack = builder.stack.clone();
         let merge_block = builder.new_block();
         let mut merged: Option<(Type, Vec<Type>)> = None;
 
-        for (arm_index, (tag, payload_type, binding, body_start)) in
-            parsed.into_iter().enumerate()
+        for (arm_index, (tag, payload_type, binding, body_start)) in parsed.into_iter().enumerate()
         {
             builder.emit(
-                Instruction::LocalGet { index: variant_local },
+                Instruction::LocalGet {
+                    index: variant_local,
+                },
                 self.origin(format!("match/variant/{tag}")),
             );
             builder.emit(
@@ -2338,7 +2389,13 @@ impl Compiler<'_> {
                         Instruction::LocalSet { index },
                         self.origin(binding.clone()),
                     );
-                    scope.insert(binding, Binding::Local { index, ty: payload_type });
+                    scope.insert(
+                        binding,
+                        Binding::Local {
+                            index,
+                            ty: payload_type,
+                        },
+                    );
                 }
             } else {
                 builder.emit(Instruction::Drop, self.origin("match/variant/unit"));
@@ -2368,7 +2425,9 @@ impl Compiler<'_> {
                 merged = Some((arm_type, arm_stack));
             }
             builder.emit(
-                Instruction::Jump { target: merge_block },
+                Instruction::Jump {
+                    target: merge_block,
+                },
                 self.origin(format!("match/variant/{tag}-end")),
             );
 
@@ -2416,7 +2475,8 @@ impl Compiler<'_> {
             record_expression,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
+        )?
+        else {
             return Err(vec![self.error(
                 "E-LISP-MATCH-012",
                 "record pattern requires a statically typed record value",
@@ -2481,10 +2541,9 @@ impl Compiler<'_> {
             }
             let Some((_, field_type)) = record_fields.iter().find(|(name, _)| name == &field)
             else {
-                return Err(vec![self.error(
-                    "E-RECORD-005",
-                    format!("record has no field '{field}'"),
-                )]);
+                return Err(vec![
+                    self.error("E-RECORD-005", format!("record has no field '{field}'"))
+                ]);
             };
             parsed.push((field, binding.clone(), field_type.clone()));
         }
@@ -2545,7 +2604,9 @@ impl Compiler<'_> {
                 },
                 self.origin(format!("match/record/{field}")),
             );
-            builder.stack.push(Type::Option(Box::new(field_type.clone())));
+            builder
+                .stack
+                .push(Type::Option(Box::new(field_type.clone())));
             builder.stack.pop();
             builder.emit(
                 Instruction::Call {
@@ -2591,7 +2652,8 @@ impl Compiler<'_> {
             list_expression,
             expression_sources.and_then(|sources| sources.first()),
             builder,
-        )? else {
+        )?
+        else {
             return Err(vec![self.error(
                 "E-LISP-MATCH-013",
                 "empty/cons patterns require a typed list value",
@@ -2790,29 +2852,28 @@ impl Compiler<'_> {
                 "boolean match requires exactly (true body...) and (false body...) arms",
             )]);
         }
-        let parse_arm = |arm: &Val,
-                         expected: bool|
-         -> Result<(Vec<Val>, Vec<Val>), Vec<VmDiagnostic>> {
-            let Val::List(items) = arm else {
-                return Err(vec![self.error(
-                    "E-LISP-MATCH-010",
-                    "boolean match arms must be (true body...) and (false body...)",
-                )]);
+        let parse_arm =
+            |arm: &Val, expected: bool| -> Result<(Vec<Val>, Vec<Val>), Vec<VmDiagnostic>> {
+                let Val::List(items) = arm else {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-010",
+                        "boolean match arms must be (true body...) and (false body...)",
+                    )]);
+                };
+                let [Val::Bool(found), body @ ..] = items.as_slice() else {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-010",
+                        "boolean match arms must be (true body...) and (false body...)",
+                    )]);
+                };
+                if *found != expected || body.is_empty() {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-010",
+                        "boolean match arms must be (true body...) and (false body...)",
+                    )]);
+                }
+                Ok((items.clone(), body.to_vec()))
             };
-            let [Val::Bool(found), body @ ..] = items.as_slice() else {
-                return Err(vec![self.error(
-                    "E-LISP-MATCH-010",
-                    "boolean match arms must be (true body...) and (false body...)",
-                )]);
-            };
-            if *found != expected || body.is_empty() {
-                return Err(vec![self.error(
-                    "E-LISP-MATCH-010",
-                    "boolean match arms must be (true body...) and (false body...)",
-                )]);
-            }
-            Ok((items.clone(), body.to_vec()))
-        };
 
         let (true_items, true_body) = parse_arm(&arms[0], true)?;
         let (false_items, false_body) = parse_arm(&arms[1], false)?;
@@ -2838,7 +2899,9 @@ impl Compiler<'_> {
         builder.stack.push(true_type.clone());
         let true_stack = builder.stack.clone();
         builder.emit(
-            Instruction::Jump { target: merge_block },
+            Instruction::Jump {
+                target: merge_block,
+            },
             self.origin("match/true-end"),
         );
 
@@ -2857,7 +2920,9 @@ impl Compiler<'_> {
             )]);
         }
         builder.emit(
-            Instruction::Jump { target: merge_block },
+            Instruction::Jump {
+                target: merge_block,
+            },
             self.origin("match/false-end"),
         );
         builder.switch_to(merge_block, true_stack);
@@ -2985,7 +3050,9 @@ impl Compiler<'_> {
                     result = Some((ty, stack));
                 }
                 builder.emit(
-                    Instruction::Jump { target: merge_block },
+                    Instruction::Jump {
+                        target: merge_block,
+                    },
                     self.origin("match/int-arm-end"),
                 );
                 builder.switch_to(next_block, branch_stack.clone());
@@ -3009,7 +3076,9 @@ impl Compiler<'_> {
                     result = Some((ty, stack));
                 }
                 builder.emit(
-                    Instruction::Jump { target: merge_block },
+                    Instruction::Jump {
+                        target: merge_block,
+                    },
                     self.origin("match/default-end"),
                 );
             }
@@ -3205,12 +3274,13 @@ impl Compiler<'_> {
                 "try requires exactly one result<T,E> expression",
             )]);
         };
-        let (return_ok_type, return_error_type) = builder.return_result.clone().ok_or_else(|| {
-            vec![self.error(
-                "E-RESULT-TRY-002",
-                "try is valid only inside a typed definition returning result<T,E>",
-            )]
-        })?;
+        let (return_ok_type, return_error_type) =
+            builder.return_result.clone().ok_or_else(|| {
+                vec![self.error(
+                    "E-RESULT-TRY-002",
+                    "try is valid only inside a typed definition returning result<T,E>",
+                )]
+            })?;
         let result_type = self.compile_expression_at(
             expression,
             expression_sources.and_then(|sources| sources.first()),
@@ -3537,10 +3607,7 @@ impl Compiler<'_> {
                 },
                 origin.clone(),
             );
-            builder.merge_suspension(
-                Some(&SuspensionSignature::one_way(Type::Unit)),
-                &origin,
-            )?;
+            builder.merge_suspension(Some(&SuspensionSignature::one_way(Type::Unit)), &origin)?;
             builder.emit(
                 Instruction::Constant {
                     value: TypedValue::Unit,
@@ -4070,7 +4137,10 @@ fn parse_record_type(name: &str) -> Option<Type> {
         {
             return None;
         }
-        parsed.push((field_name.to_string(), parse_type_name(field_type.trim()).ok()?));
+        parsed.push((
+            field_name.to_string(),
+            parse_type_name(field_type.trim()).ok()?,
+        ));
     }
     Some(Type::Record(parsed))
 }
@@ -4390,11 +4460,21 @@ mod tests {
             })
             .expect("expanded say effect");
         let span = emitted.origin.span.as_ref().expect("macro call-site span");
-        assert_eq!(&source[span.start_byte..span.end_byte], "(announce \"hello\")");
-        let expansion = emitted.origin.expansion.as_ref().expect("macro definition ancestry");
+        assert_eq!(
+            &source[span.start_byte..span.end_byte],
+            "(announce \"hello\")"
+        );
+        let expansion = emitted
+            .origin
+            .expansion
+            .as_ref()
+            .expect("macro definition ancestry");
         assert_eq!(expansion.word.as_deref(), Some("macro announce"));
         let template = expansion.span.as_ref().expect("template span");
-        assert_eq!(&source[template.start_byte..template.end_byte], "(say text)");
+        assert_eq!(
+            &source[template.start_byte..template.end_byte],
+            "(say text)"
+        );
     }
 
     #[test]
@@ -4407,7 +4487,12 @@ mod tests {
             .values()
             .flat_map(|block| block.instructions.iter())
             .find(|located| {
-                matches!(located.instruction, Instruction::Constant { value: TypedValue::Int(41) })
+                matches!(
+                    located.instruction,
+                    Instruction::Constant {
+                        value: TypedValue::Int(41)
+                    }
+                )
             })
             .expect("macro-substituted argument constant");
         let span = argument.origin.span.as_ref().expect("caller argument span");
@@ -4438,7 +4523,11 @@ mod tests {
                 matches!(located.instruction, Instruction::Call { ref function } if function == "+")
             })
             .expect("expanded arithmetic call");
-        let twice = call.origin.expansion.as_ref().expect("outer macro ancestry");
+        let twice = call
+            .origin
+            .expansion
+            .as_ref()
+            .expect("outer macro ancestry");
         assert_eq!(twice.word.as_deref(), Some("macro twice"));
         let inc = twice.expansion.as_ref().expect("nested macro ancestry");
         assert_eq!(inc.word.as_deref(), Some("macro inc"));
@@ -4654,8 +4743,7 @@ mod tests {
             vec![TypedValue::Int(2)]
         );
         assert_eq!(
-            run("(unwrap (record-get (unwrap (list-uncons (list 4 8))) \"head\"))")
-                .unwrap(),
+            run("(unwrap (record-get (unwrap (list-uncons (list 4 8))) \"head\"))").unwrap(),
             vec![TypedValue::Int(4)]
         );
         assert_eq!(
@@ -4673,8 +4761,7 @@ mod tests {
             vec![TypedValue::Int(5)]
         );
         assert_eq!(
-            run("(match (empty-list int) (empty 42) (cons head tail (begin tail head)))")
-                .unwrap(),
+            run("(match (empty-list int) (empty 42) (cons head tail (begin tail head)))").unwrap(),
             vec![TypedValue::Int(42)]
         );
 
@@ -4685,16 +4772,16 @@ mod tests {
             &core_vocabulary(),
         )
         .expect_err("list pattern arms must merge to one type");
-        assert!(mismatched_arms.iter().any(|error| error.code == "E-TYPE-002"));
+        assert!(mismatched_arms
+            .iter()
+            .any(|error| error.code == "E-TYPE-002"));
     }
 
     #[test]
     fn try_returns_an_err_from_the_enclosing_typed_definition() {
-        let stack = run(
-            "(define (fail-fast) : result<dynamic,string> \
+        let stack = run("(define (fail-fast) : result<dynamic,string> \
                 (begin (try (err \"no\")) (err \"unreachable\"))) \
-             (fail-fast)",
-        )
+             (fail-fast)")
         .expect("try must compile as typed result propagation");
         assert_eq!(
             stack,
@@ -4715,7 +4802,10 @@ mod tests {
         let module = compile_lisp("try-ok.lisp", source, Vec::new(), &core_vocabulary())
             .expect("successful try must leave the unwrapped payload for the next expression");
         assert_eq!(
-            module.module.functions["keep-going"].signature.output.values,
+            module.module.functions["keep-going"]
+                .signature
+                .output
+                .values,
             vec![Type::result(Type::Int, Type::String)],
             "the declared result contract remains visible to callers"
         );
@@ -4731,13 +4821,8 @@ mod tests {
 
     #[test]
     fn rejects_try_outside_a_typed_result_definition() {
-        let errors = compile_lisp(
-            "try.lisp",
-            "(try (ok 7))",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .expect_err("top-level try has no typed result return target");
+        let errors = compile_lisp("try.lisp", "(try (ok 7))", Vec::new(), &core_vocabulary())
+            .expect_err("top-level try has no typed result return target");
         assert!(errors.iter().any(|error| error.code == "E-RESULT-TRY-002"));
     }
 
@@ -4790,11 +4875,9 @@ mod tests {
             vec![TypedValue::Int(42)]
         );
         assert_eq!(
-            run(
-                "(match { :name \"Ada\" :age 37 } \
+            run("(match { :name \"Ada\" :age 37 } \
                    (record ((name who) (age years)) \
-                     (begin who (+ years 5))))",
-            )
+                     (begin who (+ years 5))))",)
             .unwrap(),
             vec![TypedValue::Int(42)]
         );
@@ -4910,8 +4993,7 @@ mod tests {
     #[test]
     fn safely_projects_closed_variant_tags() {
         assert_eq!(
-            run("(unwrap (variant-get (variant variant{none|some(int)} :some 42) :some))")
-                .unwrap(),
+            run("(unwrap (variant-get (variant variant{none|some(int)} :some 42) :some))").unwrap(),
             vec![TypedValue::Int(42)]
         );
         assert_eq!(
@@ -4920,8 +5002,7 @@ mod tests {
             vec![TypedValue::Bool(false)]
         );
         assert_eq!(
-            run("(is-some (variant-get (variant variant{none|some(int)} :none) :none))")
-                .unwrap(),
+            run("(is-some (variant-get (variant variant{none|some(int)} :none) :none))").unwrap(),
             vec![TypedValue::Bool(true)]
         );
     }
@@ -4932,21 +5013,21 @@ mod tests {
             run("(match (variant variant{none|some(int)} :some 41) \
                          (none 0) \
                          (some value (+ value 1)))")
-                .unwrap(),
+            .unwrap(),
             vec![TypedValue::Int(42)]
         );
         assert_eq!(
             run("(match (variant variant{idle|busy(string)} :idle) \
                          (idle 7) \
                          (busy message (begin message 0)))")
-                .unwrap(),
+            .unwrap(),
             vec![TypedValue::Int(7)]
         );
         assert_eq!(
             run("(match-variant (variant variant{some(int)|none} :some 21) \
                                  (some value (* value 2)) \
                                  (none 0))")
-                .unwrap(),
+            .unwrap(),
             vec![TypedValue::Int(42)]
         );
     }
@@ -4993,11 +5074,9 @@ mod tests {
     #[test]
     fn accepts_fixed_record_return_annotations() {
         assert_eq!(
-            run(
-                "(define (person) : record{name:string,age:int} \
+            run("(define (person) : record{name:string,age:int} \
                  { :name \"Ada\" :age 37 }) \
-                 (unwrap (record-get (person) \"age\"))"
-            )
+                 (unwrap (record-get (person) \"age\"))")
             .unwrap(),
             vec![TypedValue::Int(37)]
         );
@@ -5045,10 +5124,7 @@ mod tests {
                 ("name".into(), Type::String),
                 (
                     "meta".into(),
-                    Type::Map(
-                        Box::new(Type::String),
-                        Box::new(Type::list(Type::Int)),
-                    ),
+                    Type::Map(Box::new(Type::String), Box::new(Type::list(Type::Int)),),
                 ),
             ])
         );
@@ -5220,7 +5296,11 @@ mod tests {
             .iter()
             .find(|error| error.code == "E-NAME-001")
             .expect("unbound argument diagnostic");
-        let span = unbound.primary.as_ref().and_then(|origin| origin.span.as_ref()).unwrap();
+        let span = unbound
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .unwrap();
         assert_eq!(&source[span.start_byte..span.end_byte], "missing");
 
         let source = "(+ 1 (unknown 2))";
@@ -5230,7 +5310,11 @@ mod tests {
             .iter()
             .find(|error| error.code == "E-LINK-002")
             .expect("unknown nested call diagnostic");
-        let span = unknown.primary.as_ref().and_then(|origin| origin.span.as_ref()).unwrap();
+        let span = unknown
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .unwrap();
         assert_eq!(&source[span.start_byte..span.end_byte], "unknown");
     }
 

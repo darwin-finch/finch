@@ -17,6 +17,228 @@ pub use stats::{WorkStats, WorkTracker};
 
 use crate::models::model_selector::{ModelSelection, ModelSelector};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::sync::Arc;
+
+/// Opaque disposable state owned by worker-node integration tests.
+///
+/// Construction rejects a temporary parent inside the user's Finch state,
+/// so test seams cannot silently fall back to `~/.finch`.
+#[doc(hidden)]
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct IsolatedNodeTestState {
+    directory: Arc<tempfile::TempDir>,
+    descriptor: Arc<std::fs::File>,
+    // Every clone shares this process-local creation lock. The integration
+    // seam never coordinates through a mutable pathname in the state root.
+    identity_lock: Arc<std::sync::Mutex<()>>,
+}
+
+#[cfg(unix)]
+impl IsolatedNodeTestState {
+    pub fn new() -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        use nix::fcntl::{open, OFlag};
+        use nix::sys::stat::Mode;
+        use std::os::fd::FromRawFd as _;
+
+        let temporary_parent = std::env::temp_dir()
+            .canonicalize()
+            .context("could not canonicalize the node-test temporary parent")?;
+        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let home = home
+            .canonicalize()
+            .context("Cannot canonicalize home directory")?;
+        let user_state = home.join(".finch");
+        let user_state = user_state.canonicalize().unwrap_or(user_state);
+        anyhow::ensure!(
+            !temporary_parent.starts_with(&user_state),
+            "node-test temporary parent overlaps the user Finch state"
+        );
+        let directory = tempfile::Builder::new()
+            .prefix("finch-node-test.")
+            .tempdir_in(&temporary_parent)
+            .context("create disposable node-test state")?;
+        let descriptor = unsafe {
+            std::fs::File::from_raw_fd(
+                open(
+                    directory.path(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .context("pin disposable node-test state")?,
+            )
+        };
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let pinned = nix::sys::stat::fstat(descriptor.as_raw_fd())?;
+        let named = std::fs::symlink_metadata(directory.path())?;
+        anyhow::ensure!(
+            named.is_dir()
+                && !named.file_type().is_symlink()
+                && pinned.st_dev as u64 == named.dev()
+                && pinned.st_ino as u64 == named.ino(),
+            "disposable node-test state identity changed while pinning"
+        );
+        Ok(Self {
+            directory: Arc::new(directory),
+            descriptor: Arc::new(descriptor),
+            identity_lock: Arc::new(std::sync::Mutex::new(())),
+        })
+    }
+
+    pub fn load_node_info(&self, has_teacher_api: bool) -> anyhow::Result<NodeInfo> {
+        let _guard = self
+            .identity_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("isolated node identity lock poisoned"))?;
+        NodeInfo::load_from_state_directory(has_teacher_api, &self.descriptor)
+    }
+
+    pub fn node_id_exists(&self) -> anyhow::Result<bool> {
+        use nix::fcntl::AtFlags;
+        use nix::sys::stat::fstatat;
+        use std::os::fd::AsRawFd as _;
+        match fstatat(
+            Some(self.descriptor.as_raw_fd()),
+            "node_id",
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => Ok(true),
+            Err(nix::errno::Errno::ENOENT) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn seed_node_id_fixture(&self, contents: &[u8]) -> anyhow::Result<()> {
+        use nix::fcntl::{openat, OFlag};
+        use nix::sys::stat::Mode;
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let fd = openat(
+            Some(self.descriptor.as_raw_fd()),
+            "node_id",
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let stat = nix::sys::stat::fstat(file.as_raw_fd())?;
+        anyhow::ensure!(
+            nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode)
+                .contains(nix::sys::stat::SFlag::S_IFREG)
+                && stat.st_nlink == 1,
+            "node identity fixture must be one regular file"
+        );
+        file.write_all(contents)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn node_id_fixture_equals(&self, expected: &[u8]) -> anyhow::Result<bool> {
+        use nix::fcntl::{openat, OFlag};
+        use nix::sys::stat::Mode;
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let fd = openat(
+            Some(self.descriptor.as_raw_fd()),
+            "node_id",
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let stat = nix::sys::stat::fstat(file.as_raw_fd())?;
+        anyhow::ensure!(
+            nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode)
+                .contains(nix::sys::stat::SFlag::S_IFREG)
+                && stat.st_nlink == 1,
+            "node identity fixture must be one regular file"
+        );
+        let mut contents = Vec::new();
+        file.take((1 << 20) + 1).read_to_end(&mut contents)?;
+        anyhow::ensure!(
+            contents.len() <= 1 << 20,
+            "node identity fixture is too large"
+        );
+        Ok(contents == expected)
+    }
+
+    pub fn symlink_node_id_fixture(&self, target: &std::path::Path) -> anyhow::Result<()> {
+        use nix::unistd::symlinkat;
+        use std::os::fd::AsRawFd as _;
+        symlinkat(target, Some(self.descriptor.as_raw_fd()), "node_id")?;
+        Ok(())
+    }
+
+    pub fn hardlink_node_id_fixture(&self, source: &std::path::Path) -> anyhow::Result<()> {
+        use nix::fcntl::AtFlags;
+        use nix::unistd::linkat;
+        use std::os::fd::AsRawFd as _;
+        linkat(
+            None,
+            source,
+            Some(self.descriptor.as_raw_fd()),
+            std::path::Path::new("node_id"),
+            AtFlags::empty(),
+        )?;
+        Ok(())
+    }
+
+    pub fn fifo_node_id_fixture(&self) -> anyhow::Result<()> {
+        use nix::libc;
+        use std::os::fd::AsRawFd as _;
+        let name = std::ffi::CString::new("node_id")?;
+        let result = unsafe { libc::mkfifoat(self.descriptor.as_raw_fd(), name.as_ptr(), 0o600) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    pub fn swap_root_fixture(&self) -> anyhow::Result<IsolatedNodeRootSwap> {
+        let original = self.directory.path().to_path_buf();
+        let moved = original.with_extension(format!("moved-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::rename(&original, &moved)?;
+        std::fs::create_dir(&original)?;
+        std::fs::write(original.join("external-sentinel"), b"keep external")?;
+        Ok(IsolatedNodeRootSwap { original, moved })
+    }
+
+    pub(crate) fn descriptor(&self) -> &std::fs::File {
+        &self.descriptor
+    }
+}
+
+#[doc(hidden)]
+#[cfg(unix)]
+pub struct IsolatedNodeRootSwap {
+    original: std::path::PathBuf,
+    moved: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl IsolatedNodeRootSwap {
+    pub fn pinned_node_id_exists(&self) -> bool {
+        self.moved.join("node_id").is_file()
+    }
+
+    pub fn replacement_node_id_exists(&self) -> bool {
+        self.original.join("node_id").exists()
+    }
+
+    pub fn external_sentinel_unchanged(&self) -> bool {
+        std::fs::read(self.original.join("external-sentinel"))
+            .is_ok_and(|contents| contents == b"keep external")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IsolatedNodeRootSwap {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.original);
+        let _ = std::fs::rename(&self.moved, &self.original);
+    }
+}
 
 /// Collect basic machine specs for registry metadata.
 ///
@@ -91,6 +313,17 @@ impl NodeInfo {
     pub fn load(has_teacher_api: bool) -> anyhow::Result<Self> {
         Ok(Self {
             identity: NodeIdentity::load_or_create()?,
+            capabilities: NodeCapabilities::detect(has_teacher_api),
+        })
+    }
+
+    /// Load node information using an explicit Finch state directory.
+    pub(crate) fn load_from_state_directory(
+        has_teacher_api: bool,
+        directory: &std::fs::File,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            identity: NodeIdentity::load_or_create_in(directory)?,
             capabilities: NodeCapabilities::detect(has_teacher_api),
         })
     }

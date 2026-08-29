@@ -1,0 +1,243 @@
+name: Removed SSH surface contract
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: removed-ssh-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  absence-contract:
+    name: SSH absence contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Reject restoration of the removed SSH surface
+        run: python scripts/check_no_ssh_surface.py
+      - name: Run SSH absence regressions
+        run: python scripts/test_no_ssh_surface.py
+
+  dependency-graph:
+    name: Dependency graph (${{ matrix.target }}, ${{ matrix.feature_name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+        feature_name: [default, no-default-features]
+        include:
+          - feature_name: default
+            cargo_args: ""
+          - feature_name: no-default-features
+            cargo_args: --no-default-features
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Resolve metadata for the target without compiling it
+        shell: bash
+        run: |
+          cargo metadata --format-version 1 --filter-platform '${{ matrix.target }}' \
+            ${{ matrix.cargo_args }} > metadata.json
+          jq -e '
+            [.packages[].name]
+            | all(. != "rsa" and . != "russh" and . != "russh-cryptovec" and . != "russh-keys")
+          ' metadata.json
+      - name: Prove the generated lock and feature graph exclude SSH and RSA packages
+        shell: bash
+        run: |
+          cargo generate-lockfile
+          if grep -Eq '^name = "(rsa|russh|russh-cryptovec|russh-keys)"$' Cargo.lock; then
+            echo 'A removed SSH or RSA package returned to Cargo.lock' >&2
+            grep -nE '^name = "(rsa|russh|russh-cryptovec|russh-keys)"$' Cargo.lock >&2
+            exit 1
+          fi
+          cargo tree --edges normal --prefix none --format '{p}' \
+            --target '${{ matrix.target }}' ${{ matrix.cargo_args }} > dependency-tree.txt
+          if grep -Eq '^(rsa|russh|russh-cryptovec|russh-keys) v' dependency-tree.txt; then
+            echo 'A removed SSH or RSA package returned to the resolved feature graph' >&2
+            grep -E '^(rsa|russh|russh-cryptovec|russh-keys) v' dependency-tree.txt >&2
+            exit 1
+          fi
+      - name: Explain Windows scope
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: echo 'Windows is dependency-resolution and static-contract probe-only; Finch native Windows runtime support is not claimed.'
+
+  public-api-absence:
+    name: Downstream API absence (${{ matrix.os }}, ${{ matrix.feature_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        feature_name: [default, no-default-features]
+        include:
+          - feature_name: default
+            probe_args: ""
+          - feature_name: no-default-features
+            probe_args: --no-default-features
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install Cap'n Proto (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Compile a positive control, then require the specific removed-API diagnostic
+        run: python3 scripts/check_removed_ssh_api.py ${{ matrix.probe_args }}
+
+  supported-platforms:
+    name: Compile and test (${{ matrix.os }}, ${{ matrix.feature_name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        feature_name: [default, no-default-features]
+        include:
+          - feature_name: default
+            cargo_args: ""
+          - feature_name: no-default-features
+            cargo_args: --no-default-features
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install Cap'n Proto (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Compile all targets
+        run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
+      - name: Test all targets
+        run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+
+  release-builds:
+    name: Release build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install Cap'n Proto (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+  ssh-advisory-audit:
+    name: SSH advisory audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run full audit and retain independent batch findings
+        id: full-audit
+        shell: bash
+        run: |
+          set +e
+          cargo audit --json > audit.json
+          audit_status=$?
+          set -e
+          if (( audit_status != 0 && audit_status != 1 )); then
+            echo "cargo-audit exited unexpectedly with status ${audit_status}" >&2
+            exit 1
+          fi
+          test -s audit.json
+          audit_bytes=$(wc -c < audit.json)
+          if (( audit_bytes > 10485760 )); then
+            echo "cargo-audit JSON exceeded the 10 MiB inspection bound: ${audit_bytes}" >&2
+            exit 1
+          fi
+          jq -e 'type == "object" and (.vulnerabilities.list | type == "array")' audit.json >/dev/null
+          echo "exit_code=${audit_status}" >> "$GITHUB_OUTPUT"
+      - name: Prove the three issue 186 advisories are absent without ignores
+        shell: bash
+        run: |
+          python3 scripts/check_no_ssh_surface.py
+          jq -r '.vulnerabilities.list[]? | [.advisory.id, .package.name, .package.version] | @tsv' audit.json
+          jq -e '
+            [.vulnerabilities.list[]?]
+            | all(
+                .advisory.id != "RUSTSEC-2026-0154"
+                and .advisory.id != "RUSTSEC-2026-0153"
+                and .advisory.id != "RUSTSEC-2023-0071"
+                and .package.name != "russh"
+                and .package.name != "russh-cryptovec"
+                and .package.name != "rsa"
+              )
+          ' audit.json
+      - name: Report full-audit outcome
+        shell: bash
+        run: |
+          echo "Full cargo-audit exit code: ${{ steps.full-audit.outputs.exit_code }}"
+          echo 'Inherited advisories remain owned by independent issue 150 batches.'

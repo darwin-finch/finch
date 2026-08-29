@@ -12,6 +12,10 @@
 
 set -euo pipefail
 
+script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+source "$(dirname "$script_path")/lib/brain_test_isolation.sh"
+brain_test_isolation_reexec_launcher "$script_path" "$@"
+
 finch_bin="${FINCH_BIN:-target/debug/finch}"
 
 if [[ ! -x "$finch_bin" ]]; then

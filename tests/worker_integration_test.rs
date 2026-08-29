@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 // Integration tests for the foreign workload acceptance path:
 // HTTP endpoints exposed by every finch worker node.
 //
@@ -7,10 +9,9 @@
 // are tested WITHOUT a running daemon: we build a minimal Axum Router
 // containing only those handlers and drive it with tower::ServiceExt::oneshot().
 //
-// Tests that require State<Arc<AgentServer>> (health_check, the /v1/messages
-// body-size guards) are tested against a real daemon on 127.0.0.1:11435.
-// Those tests detect whether the daemon is available and skip gracefully
-// if it is not, so CI never fails because of a missing daemon.
+// Stateful HTTP and binary lifecycle coverage lives in
+// daemon_integration_test.rs, where each case owns a disposable HOME and a
+// kernel-assigned endpoint. This file never discovers or contacts a daemon.
 
 use axum::{
     body::Body,
@@ -19,60 +20,114 @@ use axum::{
     Router,
 };
 use serde_json::Value;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 use tower::ServiceExt; // provides .oneshot()
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a minimal router containing only the two stateless node handlers.
-/// No AgentServer state required — the handlers load config independently.
-fn node_test_router() -> Router {
-    use finch::server::{handle_node_info, handle_node_stats};
-    Router::new()
-        .route("/v1/node/info", get(handle_node_info))
-        .route("/v1/node/stats", get(handle_node_stats))
+#[derive(Debug, PartialEq, Eq)]
+enum UserNodeIdSnapshot {
+    Missing,
+    File {
+        contents: Vec<u8>,
+        modified: std::time::SystemTime,
+        length: u64,
+    },
+    Symlink(PathBuf),
 }
 
-/// Returns true when a finch daemon is accepting connections on the default port.
-async fn daemon_is_available() -> bool {
-    reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-        .get("http://127.0.0.1:11435/health")
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+fn user_node_id_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("the test runner must expose a HOME to snapshot")
+        .join(".finch/node_id")
 }
 
-/// Return the bearer token used by the locally configured daemon, if model
-/// endpoint authentication is enabled. These tests intentionally exercise
-/// request parsing *after* authentication: rejecting an unauthenticated body
-/// before parsing it is the desired DoS-resistant server behavior.
-fn daemon_authorization() -> Option<Option<String>> {
-    let config = finch::config::load_config().ok()?;
-    if !config.server.auth_enabled {
-        return Some(None);
+fn snapshot_user_node_id(path: &Path) -> UserNodeIdSnapshot {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => UserNodeIdSnapshot::Symlink(
+            std::fs::read_link(path).expect("the user node_id symlink must remain inspectable"),
+        ),
+        Ok(metadata) => {
+            assert!(
+                metadata.is_file(),
+                "user node_id has an unexpected file type"
+            );
+            UserNodeIdSnapshot::File {
+                contents: std::fs::read(path)
+                    .expect("the user node_id must remain readable for comparison"),
+                modified: metadata
+                    .modified()
+                    .expect("the user node_id modification time must be readable"),
+                length: metadata.len(),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UserNodeIdSnapshot::Missing,
+        Err(error) => panic!("could not snapshot the user node_id: {error}"),
     }
-    config
-        .server
-        .api_keys
-        .first()
-        .map(|key| Some(format!("Bearer {key}")))
+}
+
+struct IsolatedNodeState {
+    state: finch::node::IsolatedNodeTestState,
+    user_node_id: PathBuf,
+    user_before: UserNodeIdSnapshot,
+}
+
+impl IsolatedNodeState {
+    fn new() -> Self {
+        let state =
+            finch::node::IsolatedNodeTestState::new().expect("create disposable node state parent");
+        let user_node_id = user_node_id_path();
+        let user_before = snapshot_user_node_id(&user_node_id);
+        Self {
+            state,
+            user_node_id,
+            user_before,
+        }
+    }
+
+    fn assert_user_node_id_unchanged(&self) {
+        assert_eq!(
+            snapshot_user_node_id(&self.user_node_id),
+            self.user_before,
+            "worker integration tests must not mutate the user node_id"
+        );
+    }
+}
+
+/// Build a minimal router containing only the two stateless node handlers.
+/// No AgentServer state is required, and there is deliberately no ambient
+/// HOME fallback: every caller must provide a disposable state directory.
+fn node_test_router(state: &finch::node::IsolatedNodeTestState) -> Router {
+    use finch::server::{
+        handle_node_info_from_state_directory, handle_node_stats_from_state_directory,
+    };
+    let info_state = state.clone();
+    let stats_state = state.clone();
+    Router::new()
+        .route(
+            "/v1/node/info",
+            get(move || handle_node_info_from_state_directory(info_state.clone(), false)),
+        )
+        .route(
+            "/v1/node/stats",
+            get(move || handle_node_stats_from_state_directory(stats_state.clone())),
+        )
 }
 
 /// Convenience wrapper: GET a path on the node_test_router via oneshot.
-async fn oneshot_get(path: &str) -> axum::response::Response {
+async fn oneshot_get(
+    state: &finch::node::IsolatedNodeTestState,
+    path: &str,
+) -> axum::response::Response {
     let req = Request::builder()
         .method("GET")
         .uri(path)
         .body(Body::empty())
         .expect("failed to build request");
 
-    node_test_router()
+    node_test_router(state)
         .oneshot(req)
         .await
         .expect("oneshot failed")
@@ -94,7 +149,8 @@ async fn body_json(resp: axum::response::Response) -> Value {
 /// identity.id and capabilities.ram_gb.
 #[tokio::test]
 async fn test_node_info_endpoint_format() {
-    let resp = oneshot_get("/v1/node/info").await;
+    let state = IsolatedNodeState::new();
+    let resp = oneshot_get(&state.state, "/v1/node/info").await;
 
     assert_eq!(
         resp.status(),
@@ -120,13 +176,16 @@ async fn test_node_info_endpoint_format() {
         json["capabilities"].get("ram_gb").is_some(),
         "capabilities must have 'ram_gb' field; got: {json}"
     );
+    assert!(state.state.node_id_exists().unwrap());
+    state.assert_user_node_id_unchanged();
 }
 
 /// /v1/node/stats must return 200 with a JSON object containing
 /// the queries_processed counter field.
 #[tokio::test]
 async fn test_node_stats_endpoint_format() {
-    let resp = oneshot_get("/v1/node/stats").await;
+    let state = IsolatedNodeState::new();
+    let resp = oneshot_get(&state.state, "/v1/node/stats").await;
 
     assert_eq!(
         resp.status(),
@@ -140,13 +199,15 @@ async fn test_node_stats_endpoint_format() {
         json.get("queries_processed").is_some(),
         "stats must have 'queries_processed' field; got: {json}"
     );
+    state.assert_user_node_id_unchanged();
 }
 
 /// /v1/node/info must include all required fields for network advertisement:
 /// id, name (in identity), ram_gb, os, version (in capabilities).
 #[tokio::test]
 async fn test_node_info_has_required_fields() {
-    let resp = oneshot_get("/v1/node/info").await;
+    let state = IsolatedNodeState::new();
+    let resp = oneshot_get(&state.state, "/v1/node/info").await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
@@ -176,14 +237,16 @@ async fn test_node_info_has_required_fields() {
         caps.get("version").and_then(|v| v.as_str()).is_some(),
         "capabilities.version must be a string; got: {caps}"
     );
+    state.assert_user_node_id_unchanged();
 }
 
 /// Calling /v1/node/info twice must return the same node id.
-/// Node identity is stable across calls (persisted to ~/.finch/node_id).
+/// Node identity is stable inside the fixture's disposable state.
 #[tokio::test]
 async fn test_node_info_stable_id() {
-    let resp1 = oneshot_get("/v1/node/info").await;
-    let resp2 = oneshot_get("/v1/node/info").await;
+    let state = IsolatedNodeState::new();
+    let resp1 = oneshot_get(&state.state, "/v1/node/info").await;
+    let resp2 = oneshot_get(&state.state, "/v1/node/info").await;
 
     assert_eq!(resp1.status(), StatusCode::OK);
     assert_eq!(resp2.status(), StatusCode::OK);
@@ -202,24 +265,26 @@ async fn test_node_info_stable_id() {
         id1, id2,
         "node id must be stable across requests (expected same UUID twice)"
     );
+    state.assert_user_node_id_unchanged();
 }
 
 /// 20 concurrent GET /v1/node/info requests must all succeed.
 /// Verifies the handler is race-condition-free (config and file I/O are
 /// read-only, but concurrent access still exercises locking paths).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_foreign_requests() {
-    use finch::server::{handle_node_info, handle_node_stats};
-
     const CONCURRENCY: usize = 20;
+    let state = IsolatedNodeState::new();
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
 
     let handles: Vec<_> = (0..CONCURRENCY)
         .map(|_| {
+            let isolated_state = state.state.clone();
+            let start = std::sync::Arc::clone(&start);
             tokio::spawn(async move {
+                start.wait().await;
                 // Each task builds its own router — oneshot consumes the service.
-                let router: Router = Router::new()
-                    .route("/v1/node/info", get(handle_node_info))
-                    .route("/v1/node/stats", get(handle_node_stats));
+                let router = node_test_router(&isolated_state);
 
                 let req = Request::builder()
                     .method("GET")
@@ -232,147 +297,119 @@ async fn test_concurrent_foreign_requests() {
         })
         .collect();
 
-    let mut success_count = 0usize;
+    let mut identities = Vec::with_capacity(CONCURRENCY);
     for handle in handles {
         let result = handle.await.expect("task panicked");
         match result {
             Ok(resp) => {
-                if resp.status() == StatusCode::OK {
-                    success_count += 1;
-                }
+                assert_eq!(resp.status(), StatusCode::OK);
+                identities.push(body_json(resp).await["identity"]["id"].clone());
             }
             Err(e) => panic!("oneshot returned error: {e}"),
         }
     }
 
     assert_eq!(
-        success_count, CONCURRENCY,
+        identities.len(),
+        CONCURRENCY,
         "all {CONCURRENCY} concurrent requests must return 200"
     );
+    assert!(
+        identities.windows(2).all(|pair| pair[0] == pair[1]),
+        "all concurrent requests must observe one stable isolated identity"
+    );
+    assert!(state.state.node_id_exists().unwrap());
+    state.assert_user_node_id_unchanged();
 }
 
-// ---------------------------------------------------------------------------
-// Daemon-based tests (require a running daemon on 127.0.0.1:11435)
-// ---------------------------------------------------------------------------
-
-/// /health must return 200 with {"status": "healthy", ...}.
 #[tokio::test]
-async fn test_health_endpoint() {
-    if !daemon_is_available().await {
-        println!("Skipping test_health_endpoint: no daemon running on 127.0.0.1:11435");
-        return;
-    }
+async fn test_corrupt_isolated_node_identity_fails_without_user_mutation() {
+    let state = IsolatedNodeState::new();
+    state
+        .state
+        .seed_node_id_fixture(b"not valid node identity JSON")
+        .unwrap();
 
-    let resp = reqwest::Client::new()
-        .get("http://127.0.0.1:11435/health")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .expect("request failed");
+    let response = oneshot_get(&state.state, "/v1/node/info").await;
 
-    assert!(
-        resp.status().is_success(),
-        "/health should return 2xx; got {}",
-        resp.status()
-    );
-
-    let json: Value = resp.json().await.expect("body is not JSON");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
-        json["status"].as_str(),
-        Some("healthy"),
-        "health.status must be 'healthy'; got: {json}"
+        state
+            .state
+            .node_id_fixture_equals(b"not valid node identity JSON")
+            .unwrap(),
+        true,
+        "a corrupt isolated identity must fail closed instead of being replaced"
     );
+    state.assert_user_node_id_unchanged();
 }
 
-/// POST /v1/messages with syntactically invalid JSON must return 422
-/// (Axum's JSON extractor returns 422 Unprocessable Entity for parse errors).
-/// A 400 Bad Request is also acceptable if the router rejects before parsing.
 #[tokio::test]
-async fn test_malformed_json_rejected() {
-    if !daemon_is_available().await {
-        println!("Skipping test_malformed_json_rejected: no daemon running on 127.0.0.1:11435");
-        return;
-    }
+async fn test_node_identity_fifo_fails_without_blocking_or_external_mutation() {
+    let state = IsolatedNodeState::new();
+    state.state.fifo_node_id_fixture().unwrap();
 
-    let Some(authorization) = daemon_authorization() else {
-        // An authenticated daemon without a local configured key is not a
-        // usable test target. Do not weaken the endpoint just for this test.
-        println!("Skipping test_malformed_json_rejected: daemon API key unavailable");
-        return;
-    };
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        oneshot_get(&state.state, "/v1/node/info"),
+    )
+    .await
+    .expect("nonregular node identity must fail without blocking");
 
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post("http://127.0.0.1:11435/v1/messages")
-        .header("Content-Type", "application/json")
-        .body(r#"{"bad": json"#); // deliberately broken JSON
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", authorization);
-    }
-    let resp = request
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .expect("request failed");
-
-    let status = resp.status().as_u16();
-    assert!(
-        status == 400 || status == 422,
-        "malformed JSON should return 400 or 422, got {status}"
-    );
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    state.assert_user_node_id_unchanged();
 }
 
-/// POST /v1/messages with a body larger than 4 MB must be rejected.
-/// Axum's DefaultBodyLimit either returns 413 or resets the connection —
-/// both are acceptable rejection behaviors.
 #[tokio::test]
-async fn test_oversized_payload_rejected() {
-    if !daemon_is_available().await {
-        println!("Skipping test_oversized_payload_rejected: no daemon running on 127.0.0.1:11435");
-        return;
-    }
-
-    let Some(authorization) = daemon_authorization() else {
-        println!("Skipping test_oversized_payload_rejected: daemon API key unavailable");
-        return;
-    };
-
-    // 5 MB of ASCII zeroes — well above the 4 MB limit
-    let oversized_body = "0".repeat(5 * 1024 * 1024);
-
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post("http://127.0.0.1:11435/v1/messages")
-        .header("Content-Type", "application/json")
-        .body(oversized_body);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", authorization);
-    }
-    let result = request
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
-
-    match result {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            assert!(
-                status == 413 || status == 400,
-                "5 MB body should be rejected with 413 or 400, got {status}"
-            );
+async fn test_node_identity_symlinks_fail_before_external_mutation() {
+    for existing_target in [true, false] {
+        let state = IsolatedNodeState::new();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("external-node-id");
+        if existing_target {
+            std::fs::write(&target, b"keep external").unwrap();
         }
-        Err(e) => {
-            // Axum may reset the connection rather than sending 413 — acceptable
-            let msg = e.to_string();
-            assert!(
-                msg.contains("connection")
-                    || msg.contains("reset")
-                    || msg.contains("closed")
-                    || msg.contains("BodyWrite"),
-                "unexpected error for oversized payload: {e}"
-            );
+        state.state.symlink_node_id_fixture(&target).unwrap();
+
+        let response = oneshot_get(&state.state, "/v1/node/info").await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        if existing_target {
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep external");
+        } else {
+            assert!(!target.exists());
         }
+        state.assert_user_node_id_unchanged();
     }
+}
+
+#[tokio::test]
+async fn test_node_identity_hardlink_fails_before_external_mutation() {
+    let state = IsolatedNodeState::new();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("external-node-id");
+    std::fs::write(&target, b"keep external").unwrap();
+    state.state.hardlink_node_id_fixture(&target).unwrap();
+
+    let response = oneshot_get(&state.state, "/v1/node/info").await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep external");
+    state.assert_user_node_id_unchanged();
+}
+
+#[tokio::test]
+async fn test_node_identity_root_swap_stays_on_pinned_directory() {
+    let state = IsolatedNodeState::new();
+    let swap = state.state.swap_root_fixture().unwrap();
+
+    let response = oneshot_get(&state.state, "/v1/node/info").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(swap.pinned_node_id_exists());
+    assert!(!swap.replacement_node_id_exists());
+    assert!(swap.external_sentinel_unchanged());
+    state.assert_user_node_id_unchanged();
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +452,11 @@ fn test_node_capabilities_detect_plausible() {
 fn test_node_info_summary_format() {
     use finch::node::NodeInfo;
 
-    let info = NodeInfo::load(false).expect("NodeInfo::load failed");
+    let state = IsolatedNodeState::new();
+    let info = state
+        .state
+        .load_node_info(false)
+        .expect("isolated NodeInfo load failed");
     let summary = info.summary();
 
     assert!(!summary.is_empty(), "summary must not be empty");
@@ -427,4 +468,5 @@ fn test_node_info_summary_format() {
         summary.contains("RAM"),
         "summary must mention RAM; got: {summary}"
     );
+    state.assert_user_node_id_unchanged();
 }

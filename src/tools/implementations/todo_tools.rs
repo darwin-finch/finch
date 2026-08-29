@@ -406,7 +406,11 @@ mod tests {
     #[test]
     fn todo_read_description_rejects_speculative_probes() {
         let tool = TodoReadTool::new(make_list());
-        assert!(tool.description().contains("only immediately before todo_write"));
-        assert!(tool.description().contains("merely to discover whether a list exists"));
+        assert!(tool
+            .description()
+            .contains("only immediately before todo_write"));
+        assert!(tool
+            .description()
+            .contains("merely to discover whether a list exists"));
     }
 }

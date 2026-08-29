@@ -118,6 +118,8 @@ The source contains ONNX Runtime and Candle loaders. Historical backend experime
   service advertisement is enabled
 - **Direct typed programs:** `finch --forth`, `finch --lisp`, and `finch --exec`
 
+Brain and daemon tests must use the isolated launchers and kernel-assigned endpoints.
+
 ## Technology Stack
 
 - **Language:** Rust (memory safety, performance, Apple Silicon support)
@@ -186,10 +188,20 @@ fn load_config() -> Result<Config> {
 - **Stubs must have tests** confirming they return errors (not panic)
 
 ```bash
-cargo test                          # all tests
-cargo test --lib tools::permissions # specific module
-cargo test -- --nocapture           # with output
+./scripts/test_brains.sh cargo test                          # all tests
+./scripts/test_brains.sh cargo test --lib tools::permissions # specific module
+./scripts/test_brains.sh cargo test -- --nocapture           # with output
 ```
+
+Never launch Brain, daemon, server, TUI, or live tests directly. Use
+`scripts/test_brains.sh` or a launcher that re-executes through it. Test
+daemons must bind `127.0.0.1:0`, use a disposable HOME/socket, and remain in the
+Rust test supervisor's owned process group. Launchers never signal PIDs; the
+supervisor terminates, proves quiescence, and reaps the group before HOME
+cleanup. Trusted test code must not enable job control or call `setsid`,
+`setpgid`, or `CommandExt::process_group`; the isolation self-test scans the
+supervised launchers and daemon paths for these escape APIs. Isolated tests
+reject daemon discovery, reuse, and auto-spawn.
 
 ### Logging
 

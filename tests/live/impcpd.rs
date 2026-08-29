@@ -8,7 +8,7 @@
 // These are the tests that unit tests _cannot_ cover — they depend on the LLM
 // actually following the instruction format.
 //
-// Run: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_impcpd
+// Run: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_impcpd
 
 use finch::claude::Message;
 use finch::planning::{CritiqueItem, IMPCPD_METHODOLOGY};

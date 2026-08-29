@@ -80,6 +80,7 @@ pub mod generators; // Unified generator interface
 pub mod graph; // Execution graph — causal trace of query turns
 pub mod ipc; // Cap'n Proto IPC layer (CLI ↔ daemon over Unix socket)
 pub mod license;
+pub mod lisp; // Scheme-flavoured Lisp dialect and crypto primitives
 pub mod llms; // Generic LLM abstraction (Phase 1)
 pub mod local; // Local generation system
 pub mod logging; // Conversation logging for LoRA training
@@ -90,17 +91,16 @@ pub mod monitoring; // System monitoring (memory, CPU)
 pub mod network; // Lotus Network device registration and membership
 pub mod node; // Node identity and work statistics (distributed worker)
 pub mod node_name; // Per-machine cute name (e.g. "tiny-bird"), persisted to ~/.finch/node_name
+pub mod oauth; // Provider-neutral OAuth 2 authorization and credential lifecycle
 pub mod planning; // IMPCPD iterative plan refinement loop
 pub mod poset; // Co-Forth poset VM — partially-ordered task graph with 3D renderer
 pub mod programs; // Persistent shared Forth/Lisp program vocabulary
 pub mod providers; // Multi-provider LLM support
-pub mod review; // Local reviewed-changeset projection
-pub mod samples;   // Sample spreadsheet generator (finch samples)
-pub mod lisp;      // Scheme-flavoured Lisp dialect with async SSH + crypto
-pub mod ssh;       // SSH client (russh) — sessions referenced from Lisp
 pub mod registry; // Migration-only legacy Co-Forth peer registry
+pub mod review; // Local reviewed-changeset projection
 pub mod router;
 pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
+pub mod samples; // Sample spreadsheet generator (finch samples)
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system

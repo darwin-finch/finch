@@ -671,9 +671,9 @@ impl BrainCredentialAuthority {
             .expect("Brain credential revocation lock poisoned");
         if revoked.contains(&claims.invitation_id)
             || claims
-            .delegation_chain
-            .iter()
-            .any(|ancestor| revoked.contains(ancestor))
+                .delegation_chain
+                .iter()
+                .any(|ancestor| revoked.contains(ancestor))
         {
             anyhow::bail!("Brain invitation delegator has been revoked");
         }
@@ -760,9 +760,7 @@ pub fn verify_portable_invitation(
 /// authenticity. Remote clients use this only to ensure an authenticated
 /// issuer's JSON response exactly matches the opaque token it returned; the
 /// daemon remains the authority that verifies the HMAC.
-pub(crate) fn decode_unverified_credential_claims(
-    token: &str,
-) -> Result<BrainCredentialClaims> {
+pub(crate) fn decode_unverified_credential_claims(token: &str) -> Result<BrainCredentialClaims> {
     let mut parts = token.split('.');
     let prefix = parts.next().unwrap_or_default();
     let payload = parts
@@ -1047,7 +1045,10 @@ mod tests {
         let authority = BrainCredentialAuthority::ephemeral([19; 32]);
         let token = authority.issue(request(1_000), 10_000).unwrap();
         let verified = authority.verify(&token, 10_100).unwrap();
-        assert_eq!(decode_unverified_credential_claims(&token).unwrap(), verified);
+        assert_eq!(
+            decode_unverified_credential_claims(&token).unwrap(),
+            verified
+        );
 
         let mut parts = token.split('.').collect::<Vec<_>>();
         parts[2] = "not-the-real-signature";

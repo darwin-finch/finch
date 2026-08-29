@@ -93,6 +93,8 @@ tracing-log = "0.2"  # Bridge log crate → tracing (Phase 3.5)
 # Time and hashing
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+ring = "0.17"
+zeroize = { version = "1.8", features = ["derive"] }
 zip = "2"
 uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 
@@ -123,9 +125,7 @@ calamine = "0.26"           # xlsx / xls / ods reading (pure Rust, no Excel need
 rust_xlsxwriter = "0.80"    # xlsx writing (pure Rust, no Excel needed)
 csv = "1.3"                 # CSV and TSV parsing
 
-# Lisp dialect + SSH integration
-russh = "0.44"
-russh-keys = "0.44"
+# Cryptographic primitives used by Brain credentials and peer transport
 hmac = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"

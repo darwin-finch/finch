@@ -14,9 +14,11 @@ pub mod model_catalog;
 pub mod types;
 
 // Provider implementations
+pub mod chatgpt_oauth;
 pub mod claude;
 pub mod gemini;
 pub mod openai;
+pub mod openai_jwks;
 
 // Provider factory
 pub mod factory;

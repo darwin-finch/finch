@@ -21,9 +21,7 @@ pub(super) struct McpVocabularyBinding {
     pub output_schema: Option<Value>,
 }
 
-pub(super) fn adapt_mcp_descriptor(
-    descriptor: &McpToolDescriptor,
-) -> Result<McpVocabularyBinding> {
+pub(super) fn adapt_mcp_descriptor(descriptor: &McpToolDescriptor) -> Result<McpVocabularyBinding> {
     validate_component("server", &descriptor.server)?;
     validate_component("tool", &descriptor.tool)?;
     let schema = descriptor
@@ -227,7 +225,9 @@ fn validate_schema_value(schema: &Value, value: &Value, path: &str, depth: usize
             let properties = schema
                 .get("properties")
                 .and_then(Value::as_object)
-                .ok_or_else(|| anyhow::anyhow!("MCP output object schema at {path} has no properties"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("MCP output object schema at {path} has no properties")
+                })?;
             if let Some(required) = schema.get("required").and_then(Value::as_array) {
                 for name in required.iter().filter_map(Value::as_str) {
                     if !value.contains_key(name) {

@@ -82,7 +82,10 @@ impl BrainLifecycleService {
 
     #[cfg(test)]
     pub(crate) fn push_test_event(
-        &self, brain: &str, sender: &str, kind: BrainEventKind,
+        &self,
+        brain: &str,
+        sender: &str,
+        kind: BrainEventKind,
     ) -> anyhow::Result<crate::brain::store::BrainEvent> {
         self.store.push(brain, sender, kind)
     }
@@ -104,10 +107,7 @@ impl BrainLifecycleService {
         self.store.snapshot(brain)
     }
 
-    pub fn initialization(
-        &self,
-        brain: &str,
-    ) -> Result<crate::brain::store::BrainInitialization> {
+    pub fn initialization(&self, brain: &str) -> Result<crate::brain::store::BrainInitialization> {
         self.store.initialization(brain)
     }
 
@@ -120,12 +120,8 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         next_due_ms: u64,
     ) -> Result<BrainSchedule> {
-        self.store.schedule_initialization(
-            brain,
-            attachment_id,
-            connection_id,
-            next_due_ms,
-        )
+        self.store
+            .schedule_initialization(brain, attachment_id, connection_id, next_due_ms)
     }
 
     pub fn schedule_initialization_with_receipt(
@@ -137,7 +133,11 @@ impl BrainLifecycleService {
         receipt: Option<crate::brain::store::BrainMutationReceipt>,
     ) -> Result<BrainSchedule> {
         self.store.schedule_initialization_with_receipt(
-            brain, attachment_id, connection_id, next_due_ms, receipt,
+            brain,
+            attachment_id,
+            connection_id,
+            next_due_ms,
+            receipt,
         )
     }
 
@@ -416,10 +416,16 @@ impl BrainLifecycleService {
         receipt: Option<crate::brain::store::BrainMutationReceipt>,
     ) -> Result<bool> {
         let attachment = self.connection(brain, attachment_id, connection_id)?;
-        ensure!(attachment.role == AttachmentRole::Driver,
-            "only a Brain driver can cancel a schedule");
+        ensure!(
+            attachment.role == AttachmentRole::Driver,
+            "only a Brain driver can cancel a schedule"
+        );
         self.store.cancel_schedule_with_receipt(
-            brain, &attachment.subject, attachment.attachment_id, schedule_id, receipt,
+            brain,
+            &attachment.subject,
+            attachment.attachment_id,
+            schedule_id,
+            receipt,
         )
     }
 
@@ -535,7 +541,9 @@ impl BrainLifecycleService {
         // Validate the exact generation before deriving any run authority. A
         // stale socket must not cancel work started by its replacement.
         let ordinary = self.store.retire_connection_and_owned_active_runs(
-            brain, attachment_id, connection_id,
+            brain,
+            attachment_id,
+            connection_id,
         )?;
         let snapshot = self.store.snapshot(brain)?;
         let brain_id = snapshot.brain_id;
@@ -608,12 +616,15 @@ impl BrainLifecycleService {
         // release only waits for that run, even if the runner never replies.
         for run_id in reserved {
             self.runners.abort_run(brain, run_id);
-            match self.store.complete_reserved_run_cancellation_on_disconnect(
-                brain, "daemon", run_id,
-            ) {
+            match self
+                .store
+                .complete_reserved_run_cancellation_on_disconnect(brain, "daemon", run_id)
+            {
                 Ok(true) => {}
                 Ok(false) | Err(_) => self.store.schedule_reserved_cancellation_retry(
-                    brain.to_string(), "daemon".into(), run_id,
+                    brain.to_string(),
+                    "daemon".into(),
+                    run_id,
                 ),
             }
         }
@@ -668,21 +679,33 @@ impl BrainLifecycleService {
             .store
             .accept_speculative_run(brain, &attachment.subject, attachment_id, prompt)
             .map_err(BrainSubmissionError::State)?;
-        if let Err(error) = self.store.bind_run_connection(
-            brain, run.run_id, attachment_id, connection_id,
-        ) {
+        if let Err(error) =
+            self.store
+                .bind_run_connection(brain, run.run_id, attachment_id, connection_id)
+        {
             self.runners.fence_run_cancellation(brain, run.run_id);
             let detail = "initiating Brain connection disconnected".to_string();
             match self.store.terminalize_run_with_result_if_active(
-                brain, "daemon", run.run_id, run.request_seq,
-                BrainRunStatus::Failed, detail.clone(),
+                brain,
+                "daemon",
+                run.run_id,
+                run.request_seq,
+                BrainRunStatus::Failed,
+                detail.clone(),
             ) {
                 Ok(Some(_)) => {}
-                Ok(None) if self.store.inspect_run(brain, run.run_id)
-                    .is_ok_and(|current| current.status.is_terminal()) => {}
+                Ok(None)
+                    if self
+                        .store
+                        .inspect_run(brain, run.run_id)
+                        .is_ok_and(|current| current.status.is_terminal()) => {}
                 Ok(None) | Err(_) => self.store.schedule_disconnect_terminalization_retry(
-                    brain.to_string(), "daemon".into(), run.run_id, run.request_seq,
-                    BrainRunStatus::Failed, detail,
+                    brain.to_string(),
+                    "daemon".into(),
+                    run.run_id,
+                    run.request_seq,
+                    BrainRunStatus::Failed,
+                    detail,
                 ),
             }
             self.runners.abort_run(brain, run.run_id);
@@ -752,8 +775,8 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         kind: BrainEventKind,
         can_approve: bool,
-         mutation: Option<crate::brain::store::BrainMutationReceipt>,
-     ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        mutation: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
         if let BrainEventKind::SpeculativePrompt { text } = kind {
             return self
                 .start_speculative(brain, attachment_id, connection_id, text)
@@ -801,9 +824,8 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         run_id: RunId,
     ) -> Result<BrainRun> {
-        self.cancel_run_with_receipt(
-            brain, attachment_id, connection_id, run_id, None,
-        ).await
+        self.cancel_run_with_receipt(brain, attachment_id, connection_id, run_id, None)
+            .await
     }
 
     pub async fn cancel_run_with_receipt(
@@ -821,9 +843,17 @@ impl BrainLifecycleService {
         );
         let mutation_id = receipt.as_ref().map(|receipt| receipt.mutation_id);
         let reserved = match receipt {
-            Some(receipt) => Some(self.store.reserve_run_cancellation(
-                brain, &attachment.subject, attachment_id, run_id, receipt,
-            ).await?),
+            Some(receipt) => Some(
+                self.store
+                    .reserve_run_cancellation(
+                        brain,
+                        &attachment.subject,
+                        attachment_id,
+                        run_id,
+                        receipt,
+                    )
+                    .await?,
+            ),
             None => None,
         };
         let run = match &reserved {
@@ -837,8 +867,10 @@ impl BrainLifecycleService {
         if run.status == BrainRunStatus::Cancelled {
             return Ok(run);
         }
-        ensure!(!run.status.is_terminal() || run.status == BrainRunStatus::Interrupted,
-            "Brain run has already finished");
+        ensure!(
+            !run.status.is_terminal() || run.status == BrainRunStatus::Interrupted,
+            "Brain run has already finished"
+        );
         let owner = self.clone();
         let brain = brain.to_string();
         let sender = attachment.subject;
@@ -849,13 +881,7 @@ impl BrainLifecycleService {
         // cancellation reply.
         tokio::spawn(async move {
             owner
-                .reconcile_reserved_run_cancellation(
-                    brain,
-                    sender,
-                    run,
-                    reserved,
-                    mutation_id,
-                )
+                .reconcile_reserved_run_cancellation(brain, sender, run, reserved, mutation_id)
                 .await
         })
         .await
@@ -870,18 +896,25 @@ impl BrainLifecycleService {
         reserved: Option<crate::brain::store::BrainRunCancellationReservation>,
         mutation_id: Option<uuid::Uuid>,
     ) -> Result<BrainRun> {
-        let needs_runner_reconciliation = reserved.as_ref()
+        let needs_runner_reconciliation = reserved
+            .as_ref()
             .is_some_and(|reserved| reserved.needs_runner_cancel);
         if let Some(mutation_id) = mutation_id {
             self.store.mark_run_cancellation_dispatching(
-                &brain, &sender, run.run_id, mutation_id,
+                &brain,
+                &sender,
+                run.run_id,
+                mutation_id,
             )?;
         }
         if matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
-        ) || needs_runner_reconciliation {
-            self.store.reserve_run_publication_cancellation(&brain, run.run_id).await?;
+        ) || needs_runner_reconciliation
+        {
+            self.store
+                .reserve_run_publication_cancellation(&brain, run.run_id)
+                .await?;
             let snapshot = self.snapshot(&brain)?;
             let lease = match snapshot
                 .runner_lease
@@ -889,34 +922,51 @@ impl BrainLifecycleService {
             {
                 Some(lease) => lease,
                 None => {
-                    self.store.clear_run_cancellation(&brain, run.run_id).await?;
+                    self.store
+                        .clear_run_cancellation(&brain, run.run_id)
+                        .await?;
                     anyhow::bail!("named Brain '{brain}' has no live runner");
                 }
             };
             // Cancellation at the runner is idempotent by RunId: `false`
             // means the run is already absent there, which reconciles the
             // durable cancellation intent just as safely as `true`.
-            if let Err(error) = self.runners.cancel_run(&brain, lease.lease_id, run.run_id).await {
+            if let Err(error) = self
+                .runners
+                .cancel_run(&brain, lease.lease_id, run.run_id)
+                .await
+            {
                 let current = self.inspect_run(&brain, run.run_id)?;
                 if current.status == BrainRunStatus::Cancelled {
                     return Ok(current);
                 }
-                self.store.clear_run_cancellation(&brain, run.run_id).await?;
+                self.store
+                    .clear_run_cancellation(&brain, run.run_id)
+                    .await?;
                 return Err(error);
             }
         }
         if let Some(mutation_id) = mutation_id {
             self.store.mark_run_cancellation_reconciled(
-                &brain, &sender, run.run_id, mutation_id,
-             )?;
+                &brain,
+                &sender,
+                run.run_id,
+                mutation_id,
+            )?;
         }
-        let publication = self.store.acquire_run_publication(&brain, run.run_id).await?;
+        let publication = self
+            .store
+            .acquire_run_publication(&brain, run.run_id)
+            .await?;
         let transition = match reserved {
-            Some(_) => self.store.complete_reserved_run_cancellation(
-                &brain, &sender, run.run_id,
-            ),
+            Some(_) => self
+                .store
+                .complete_reserved_run_cancellation(&brain, &sender, run.run_id),
             None => self.store.transition_run(
-                &brain, &sender, run.run_id, BrainRunStatus::Cancelled,
+                &brain,
+                &sender,
+                run.run_id,
+                BrainRunStatus::Cancelled,
                 Some("cancelled by initiating driver".into()),
             ),
         };
@@ -1029,20 +1079,11 @@ impl BrainLifecycleService {
             ttl_ms,
             mutation,
         )?;
-        self.expire_runner_handoff(
-            brain.to_owned(),
-            handoff.handoff_id,
-            handoff.expires_ms,
-        );
+        self.expire_runner_handoff(brain.to_owned(), handoff.handoff_id, handoff.expires_ms);
         Ok(handoff)
     }
 
-    fn expire_runner_handoff(
-        &self,
-        brain: String,
-        handoff_id: RunnerHandoffId,
-        expires_ms: u64,
-    ) {
+    fn expire_runner_handoff(&self, brain: String, handoff_id: RunnerHandoffId, expires_ms: u64) {
         let store = self.store.clone();
         tokio::spawn(async move {
             loop {
@@ -1103,9 +1144,8 @@ impl BrainLifecycleService {
         sender: &str,
         receipt: Option<crate::brain::store::BrainMutationReceipt>,
     ) -> Result<()> {
-        self.store.cancel_runner_handoff_with_receipt(
-            brain, handoff_id, sender, receipt,
-        )?;
+        self.store
+            .cancel_runner_handoff_with_receipt(brain, handoff_id, sender, receipt)?;
         self.store.remove_if_unused(brain)?;
         Ok(())
     }
@@ -1269,12 +1309,7 @@ mod tests {
 
         let accepted = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            service.start_speculative(
-                "shared",
-                driver_id,
-                connection_id,
-                "look ahead".into(),
-            ),
+            service.start_speculative("shared", driver_id, connection_id, "look ahead".into()),
         )
         .await
         .expect("speculative acceptance must not wait for runner completion")
@@ -1301,7 +1336,11 @@ mod tests {
             tokio::spawn(async move {
                 service
                     .cancel_run_with_receipt(
-                        "shared", driver_id, connection_id, run_id, Some(receipt),
+                        "shared",
+                        driver_id,
+                        connection_id,
+                        run_id,
+                        Some(receipt),
                     )
                     .await
             })
@@ -1336,11 +1375,18 @@ mod tests {
             .unwrap();
         service.detach("shared", driver_id, connection_id).unwrap();
         tokio::task::yield_now().await;
-        assert_eq!(service.inspect_run("shared", run_id).unwrap().status,
-            BrainRunStatus::Cancelled);
-        assert!(cancel.response_tx.send(Ok(true)).is_err(),
-            "exact runner cancellation wait survived initiating disconnect");
-        assert_eq!(cancelling.await.unwrap().unwrap().status, BrainRunStatus::Cancelled);
+        assert_eq!(
+            service.inspect_run("shared", run_id).unwrap().status,
+            BrainRunStatus::Cancelled
+        );
+        assert!(
+            cancel.response_tx.send(Ok(true)).is_err(),
+            "exact runner cancellation wait survived initiating disconnect"
+        );
+        assert_eq!(
+            cancelling.await.unwrap().unwrap().status,
+            BrainRunStatus::Cancelled
+        );
         assert!(accepted.result.is_none());
         let snapshot = service.snapshot("shared").unwrap();
         assert_eq!(
@@ -1362,35 +1408,59 @@ mod tests {
                         | BrainEventKind::Result { .. }
                 )
         }));
-        assert_eq!(snapshot.events.iter().filter(|event| {
-            event.mutation.as_ref() == Some(&receipt)
-        }).count(), 1);
-        assert_eq!(snapshot.events.iter().filter(|event| matches!(
-            event.kind,
-            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
-                if event_run_id == run_id && status.is_terminal()
-        )).count(), 1);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| { event.mutation.as_ref() == Some(&receipt) })
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                        if event_run_id == run_id && status.is_terminal()
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_cancellation_reservation_fences_disconnect_before_owner_spawn() {
         let service = service();
-        let driver = service.attach(
-            "shared", "alice", AttachmentRole::Driver, None,
-        ).unwrap();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
         let connection_id = driver.connection_id.unwrap();
-        let _watch = service.watch(
-            "shared", driver.attachment_id, connection_id,
-        ).unwrap();
-        let prompt = service.store.push(
-            "shared", "alice", BrainEventKind::SpeculativePrompt {
-                text: "pause at durable reservation".into(),
-            },
-        ).unwrap();
-        let run = service.store.start_run(
-            "shared", "alice", crate::brain::store::BrainRunKind::Speculative,
-            prompt.seq, driver.attachment_id, BrainRunStatus::Running,
-        ).unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let prompt = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::SpeculativePrompt {
+                    text: "pause at durable reservation".into(),
+                },
+            )
+            .unwrap();
+        let run = service
+            .store
+            .start_run(
+                "shared",
+                "alice",
+                crate::brain::store::BrainRunKind::Speculative,
+                prompt.seq,
+                driver.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
         let receipt = crate::brain::store::BrainMutationReceipt {
             mutation_id: uuid::Uuid::new_v4(),
             attachment_id: driver.attachment_id,
@@ -1398,21 +1468,35 @@ mod tests {
             environment_generation: service.store.environment().generation,
             command_sha256: "barrier-cancel".into(),
         };
-        let (reserved, release) = service.store
+        let (reserved, release) = service
+            .store
             .pause_after_cancellation_reservation_for_test();
         let reserving = {
             let store = service.store.clone();
             let receipt = receipt.clone();
             tokio::spawn(async move {
-                store.reserve_run_cancellation(
-                    "shared", "alice", driver.attachment_id, run.run_id, receipt,
-                ).await
+                store
+                    .reserve_run_cancellation(
+                        "shared",
+                        "alice",
+                        driver.attachment_id,
+                        run.run_id,
+                        receipt,
+                    )
+                    .await
             })
         };
         tokio::task::spawn_blocking(move || reserved.recv())
-            .await.unwrap().unwrap();
-        assert!(service.store.run_cancellation_reserved("shared", run.run_id).unwrap());
-        service.detach("shared", driver.attachment_id, connection_id).unwrap();
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(service
+            .store
+            .run_cancellation_reserved("shared", run.run_id)
+            .unwrap());
+        service
+            .detach("shared", driver.attachment_id, connection_id)
+            .unwrap();
         release.send(()).unwrap();
         reserving.await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_millis(250), async {
@@ -1421,28 +1505,51 @@ mod tests {
             {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("durable cancellation reservation lost its disconnect owner");
-        assert!(service.store.terminalize_run_with_result_if_active(
-            "shared", "runner", run.run_id, prompt.seq, BrainRunStatus::Failed,
-            "late turn response".into(),
-        ).unwrap().is_none());
-        let snapshot = service.snapshot("shared").unwrap();
-        assert_eq!(snapshot.events.iter().filter(|event| {
-            event.mutation.as_ref() == Some(&receipt)
-        }).count(), 1);
-        assert!(!snapshot.events.iter().any(|event| {
-            event.run_id == Some(run.run_id) && matches!(
-                event.kind,
-                BrainEventKind::Program { .. }
-                    | BrainEventKind::EffectRecorded { .. }
-                    | BrainEventKind::Result { .. }
+        })
+        .await
+        .expect("durable cancellation reservation lost its disconnect owner");
+        assert!(service
+            .store
+            .terminalize_run_with_result_if_active(
+                "shared",
+                "runner",
+                run.run_id,
+                prompt.seq,
+                BrainRunStatus::Failed,
+                "late turn response".into(),
             )
+            .unwrap()
+            .is_none());
+        let snapshot = service.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| { event.mutation.as_ref() == Some(&receipt) })
+                .count(),
+            1
+        );
+        assert!(!snapshot.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(
+                    event.kind,
+                    BrainEventKind::Program { .. }
+                        | BrainEventKind::EffectRecorded { .. }
+                        | BrainEventKind::Result { .. }
+                )
         }));
-        assert_eq!(snapshot.events.iter().filter(|event| matches!(
-            event.kind,
-            BrainEventKind::RunStatusChanged { run_id, status, .. }
-                if run_id == run.run_id && status.is_terminal()
-        )).count(), 1);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    BrainEventKind::RunStatusChanged { run_id, status, .. }
+                        if run_id == run.run_id && status.is_terminal()
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1627,7 +1734,10 @@ mod tests {
             .unwrap();
         submitting.await.unwrap().unwrap();
         let snapshot = service.snapshot("shared").unwrap();
-        assert_eq!(service.inspect_run("shared", run_id).unwrap().status, BrainRunStatus::Cancelled);
+        assert_eq!(
+            service.inspect_run("shared", run_id).unwrap().status,
+            BrainRunStatus::Cancelled
+        );
         assert!(!snapshot.events.iter().any(|event| {
             event.run_id == Some(run_id)
                 && matches!(
@@ -1686,23 +1796,13 @@ mod tests {
         let driver_connection = driver.connection_id.unwrap();
 
         assert!(service
-            .schedule_initialization(
-                "shared",
-                driver.attachment_id,
-                driver_connection,
-                1_000,
-            )
+            .schedule_initialization("shared", driver.attachment_id, driver_connection, 1_000,)
             .is_err());
         let _watch = service
             .watch("shared", driver.attachment_id, driver_connection)
             .unwrap();
         let schedule = service
-            .schedule_initialization(
-                "shared",
-                driver.attachment_id,
-                driver_connection,
-                1_000,
-            )
+            .schedule_initialization("shared", driver.attachment_id, driver_connection, 1_000)
             .unwrap();
         assert!(schedule.module_identity.is_some());
         assert!(service.snapshot("shared").unwrap().runs.is_empty());
@@ -1712,11 +1812,7 @@ mod tests {
             .unwrap();
         let consultant_connection = consultant.connection_id.unwrap();
         let _consultant_watch = service
-            .watch(
-                "shared",
-                consultant.attachment_id,
-                consultant_connection,
-            )
+            .watch("shared", consultant.attachment_id, consultant_connection)
             .unwrap();
         assert!(service
             .schedule_initialization(
@@ -1739,24 +1835,14 @@ mod tests {
             .activate_connection("shared", runner.attachment_id, runner_connection)
             .unwrap();
         assert!(service
-            .schedule_initialization(
-                "shared",
-                runner.attachment_id,
-                runner_connection,
-                2_500,
-            )
+            .schedule_initialization("shared", runner.attachment_id, runner_connection, 2_500,)
             .is_err());
 
         service
             .detach("shared", driver.attachment_id, driver_connection)
             .unwrap();
         assert!(service
-            .schedule_initialization(
-                "shared",
-                driver.attachment_id,
-                driver_connection,
-                3_000,
-            )
+            .schedule_initialization("shared", driver.attachment_id, driver_connection, 3_000,)
             .is_err());
     }
 
@@ -1812,13 +1898,22 @@ mod tests {
             environment_generation: environment.generation,
             command_sha256: "cancel-run".into(),
         };
-        assert!(service.cancel_run_with_receipt(
-            "shared", attachment.attachment_id, connection_id, run.run_id,
-            Some(stale_receipt),
-        ).await.is_err());
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(20), rx.recv(),
-        ).await.is_err(), "stale cancellation reached the runner");
+        assert!(service
+            .cancel_run_with_receipt(
+                "shared",
+                attachment.attachment_id,
+                connection_id,
+                run.run_id,
+                Some(stale_receipt),
+            )
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv(),)
+                .await
+                .is_err(),
+            "stale cancellation reached the runner"
+        );
 
         assert!(service
             .cancel_run(
@@ -2034,10 +2129,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            registration.wait().await.unwrap()["choice"],
-            "approve_once"
-        );
+        assert_eq!(registration.wait().await.unwrap()["choice"], "approve_once");
     }
 
     #[tokio::test]
@@ -2127,11 +2219,13 @@ mod tests {
                 created.schedule_id,
             )
             .unwrap());
-        assert!(!service
-            .inspect_schedule("shared", created.schedule_id)
-            .unwrap()
-            .unwrap()
-            .active);
+        assert!(
+            !service
+                .inspect_schedule("shared", created.schedule_id)
+                .unwrap()
+                .unwrap()
+                .active
+        );
     }
 
     #[tokio::test]
@@ -2173,12 +2267,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        let maximum = crate::vm::EffectSet::from_requirement(
-            crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::VmRead,
-                selector: crate::vm::ResourceSelector::None,
-            },
-        );
+        let maximum = crate::vm::EffectSet::from_requirement(crate::vm::CapabilityRequirement {
+            capability: crate::vm::CapabilityKind::VmRead,
+            selector: crate::vm::ResourceSelector::None,
+        });
         let broader = maximum.union(&crate::vm::EffectSet::from_requirement(
             crate::vm::CapabilityRequirement {
                 capability: crate::vm::CapabilityKind::NetworkConnect,

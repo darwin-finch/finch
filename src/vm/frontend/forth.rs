@@ -347,10 +347,7 @@ pub fn compile_forth_with_functions(
         for (nested_name, nested_function) in &compiled.module.functions {
             if nested_name != &compiled.module.entry {
                 functions.insert(nested_name.clone(), nested_function.clone());
-                local_vocabulary.insert(
-                    nested_name.clone(),
-                    nested_function.signature.clone(),
-                );
+                local_vocabulary.insert(nested_name.clone(), nested_function.signature.clone());
             }
         }
         let actual_output = function.signature.output.values.clone();
@@ -823,7 +820,11 @@ fn lower_forth_ast_body_with_locals(
                 emit(
                     &mut blocks,
                     current,
-                    Instruction::MakeVariant { variants, tag, payload_type },
+                    Instruction::MakeVariant {
+                        variants,
+                        tag,
+                        payload_type,
+                    },
                     origin,
                 );
                 token_index += 1;
@@ -876,9 +877,9 @@ fn lower_forth_ast_body_with_locals(
                 .or_else(|| record_literals.last().and_then(|_| word.strip_suffix(':')))
             {
                 if field.is_empty()
-                    || !field
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+                    || !field.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || character == '_' || character == '-'
+                    })
                 {
                     return Err(vec![control_error(
                         "E-RECORD-001",
@@ -955,7 +956,8 @@ fn lower_forth_ast_body_with_locals(
                 let Some(Token {
                     value: TokenValue::String(field),
                     ..
-                }) = tokens.get(token_index.wrapping_sub(1)) else {
+                }) = tokens.get(token_index.wrapping_sub(1))
+                else {
                     return Err(vec![control_error(
                         "E-RECORD-004",
                         "record-get requires a literal string field name immediately before it",
@@ -1004,7 +1006,8 @@ fn lower_forth_ast_body_with_locals(
                 let Some(Token {
                     value: TokenValue::String(field),
                     ..
-                }) = tokens.get(token_index.wrapping_sub(1)) else {
+                }) = tokens.get(token_index.wrapping_sub(1))
+                else {
                     return Err(vec![control_error(
                         "E-RECORD-007",
                         "record-set requires a literal string field name immediately before it",
@@ -1036,7 +1039,9 @@ fn lower_forth_ast_body_with_locals(
                 let replacement = &stack[stack.len() - 2];
                 if expected != replacement {
                     return Err(vec![VmDiagnostic::type_mismatch(
-                        expected.clone(), replacement.clone(), Some(origin),
+                        expected.clone(),
+                        replacement.clone(),
+                        Some(origin),
                     )]);
                 }
                 let record_type = fields.clone();
@@ -2315,8 +2320,9 @@ fn lower_forth_ast_body_with_locals(
                             Some(origin),
                         )]);
                     };
-                    let concrete_signature = instantiate_signature_types(signature, &stack, &origin)
-                        .map_err(|diagnostic| vec![diagnostic])?;
+                    let concrete_signature =
+                        instantiate_signature_types(signature, &stack, &origin)
+                            .map_err(|diagnostic| vec![diagnostic])?;
                     apply_signature_types(signature, &mut stack, &origin)
                         .map_err(|diagnostic| vec![diagnostic])?;
                     effects = effects.union(&signature.effects);
@@ -2493,10 +2499,7 @@ struct ForthDefinitionAst {
     origin: SourceOrigin,
 }
 
-fn parse_forth_module(
-    source_id: &str,
-    source: &str,
-) -> Result<ForthModuleAst, Vec<VmDiagnostic>> {
+fn parse_forth_module(source_id: &str, source: &str) -> Result<ForthModuleAst, Vec<VmDiagnostic>> {
     let tokens = tokenize(source_id, source)?;
     let mut definitions = Vec::new();
     let mut main_atoms = Vec::new();
@@ -2733,9 +2736,16 @@ fn parse_input_stack_types(
     let mut saw_unnamed = false;
     for token in tokens {
         let TokenValue::Word(spelling) = &token.value else {
-            return Err(vec![definition_error(source_id, source, token, "stack type must be an identifier")]);
+            return Err(vec![definition_error(
+                source_id,
+                source,
+                token,
+                "stack type must be an identifier",
+            )]);
         };
-        let named = (!spelling.starts_with("record{")).then(|| spelling.split_once(':')).flatten();
+        let named = (!spelling.starts_with("record{"))
+            .then(|| spelling.split_once(':'))
+            .flatten();
         let (name, type_spelling) = match named {
             Some((name, type_spelling)) if !name.is_empty() && !type_spelling.is_empty() => {
                 saw_named = true;
@@ -2747,13 +2757,25 @@ fn parse_input_stack_types(
             }
         };
         let ty = super::lisp::parse_type_name(type_spelling).map_err(|_| {
-            vec![definition_error(source_id, source, token, format!("unknown stack type '{type_spelling}'"))]
+            vec![definition_error(
+                source_id,
+                source,
+                token,
+                format!("unknown stack type '{type_spelling}'"),
+            )]
         })?;
         if let Some(name) = name {
-            if !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            if !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
                 || locals.iter().any(|local: &LocalBinding| local.name == name)
             {
-                return Err(vec![definition_error(source_id, source, token, format!("invalid or duplicate input name '{name}'"))]);
+                return Err(vec![definition_error(
+                    source_id,
+                    source,
+                    token,
+                    format!("invalid or duplicate input name '{name}'"),
+                )]);
             }
             locals.push(LocalBinding {
                 name: name.to_string(),
@@ -2989,7 +3011,11 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         // until the next `"""`; use it for model/user prose that would make
         // ordinary escaping needlessly fragile.
         if source[start..].starts_with("s\"\"\"") || source[start..].starts_with("\"\"\"") {
-            cursor += if source[start..].starts_with("s\"\"\"") { 4 } else { 3 };
+            cursor += if source[start..].starts_with("s\"\"\"") {
+                4
+            } else {
+                3
+            };
             let (value, end) = read_raw_string(
                 source_id,
                 source,
@@ -3210,7 +3236,9 @@ fn read_json_object(
                 '"' => in_string = true,
                 '{' => depth += 1,
                 '}' => {
-                    depth = depth.checked_sub(1).expect("JSON object starts at an opening brace");
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("JSON object starts at an opening brace");
                     if depth == 0 {
                         let end = cursor + character.len_utf8();
                         let value = serde_json::from_str(&source[start..end]).map_err(|error| {
@@ -3671,9 +3699,13 @@ mod tests {
         )
         .expect("record closure should compile");
         let mut stack = Vec::new();
-        Interpreter::new(&closure_field, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut stack)
-            .expect("record closure should execute");
+        Interpreter::new(
+            &closure_field,
+            DenyCapabilities,
+            InterpreterConfig::default(),
+        )
+        .execute(&mut stack)
+        .expect("record closure should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
@@ -3908,9 +3940,10 @@ mod tests {
             .find(|function| function.name.starts_with("quote$"))
             .expect("captured quotation hidden function");
         assert_eq!(quote.captures, vec![Type::Int, Type::Int]);
-        assert!(quote.blocks.values().any(|block| block.instructions.iter().any(
-            |located| matches!(located.instruction, Instruction::CaptureGet { index: 0 })
-        )));
+        assert!(quote.blocks.values().any(|block| block
+            .instructions
+            .iter()
+            .any(|located| matches!(located.instruction, Instruction::CaptureGet { index: 0 }))));
         let mut stack = Vec::new();
         Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
             .execute(&mut stack)
@@ -3948,11 +3981,13 @@ mod tests {
             .blocks
             .values()
             .flat_map(|block| &block.instructions)
-            .find(|located| {
-                matches!(&located.instruction, Instruction::CapabilityRequest { .. })
-            })
+            .find(|located| matches!(&located.instruction, Instruction::CapabilityRequest { .. }))
             .expect("say lowers to a capability request");
-        let span = say.origin.span.as_ref().expect("quotation body source span");
+        let span = say
+            .origin
+            .span
+            .as_ref()
+            .expect("quotation body source span");
         assert_eq!(&source[span.start_byte..span.end_byte], "say");
     }
 
@@ -4071,7 +4106,10 @@ mod tests {
         )
         .expect("record type signature should compile");
         assert_eq!(
-            module.module.functions["identity-person"].signature.input.values,
+            module.module.functions["identity-person"]
+                .signature
+                .input
+                .values,
             vec![record]
         );
     }
@@ -4090,7 +4128,10 @@ mod tests {
         )
         .expect("variant type signature should compile");
         assert_eq!(
-            module.module.functions["identity-result"].signature.input.values,
+            module.module.functions["identity-result"]
+                .signature
+                .input
+                .values,
             vec![variant]
         );
     }
@@ -4191,13 +4232,8 @@ mod tests {
     #[test]
     fn definition_diagnostics_retain_original_module_spans() {
         let source = "\\ module prelude\n\n: broken ( S -- S int ! pure )\n  \"oops\" 2 +\n;\n";
-        let errors = compile_forth(
-            "module-span.forth",
-            source,
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap_err();
+        let errors =
+            compile_forth("module-span.forth", source, Vec::new(), &core_vocabulary()).unwrap_err();
         assert_eq!(errors[0].code, "E-TYPE-002");
         let span = errors[0]
             .primary
@@ -4382,13 +4418,8 @@ mod tests {
         .unwrap_err();
         assert!(mixed.iter().any(|error| error.code == "E-LIST-003"));
 
-        let unclosed = compile_forth(
-            "input.forth",
-            "[ 1",
-            Vec::new(),
-            &core_vocabulary(),
-        )
-        .unwrap_err();
+        let unclosed =
+            compile_forth("input.forth", "[ 1", Vec::new(), &core_vocabulary()).unwrap_err();
         assert!(unclosed.iter().any(|error| error.code == "E-LIST-004"));
     }
 

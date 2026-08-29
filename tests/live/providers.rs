@@ -4,8 +4,8 @@
 // asserts the response is non-empty. These are the simplest possible end-to-end
 // checks — useful for confirming a new API key works.
 //
-// Run all: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_
-// Run one: FINCH_LIVE_TESTS=1 ANTHROPIC_API_KEY=sk-ant-... cargo test -- --include-ignored live_claude_minimal
+// Run all: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_
+// Run one: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 ANTHROPIC_API_KEY=... cargo test -- --include-ignored live_claude_minimal
 
 use finch::claude::Message;
 use finch::providers::ProviderRequest;

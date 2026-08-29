@@ -315,10 +315,7 @@ impl TypedValue {
                 yield_type,
                 result_type,
                 ..
-            } => Type::Fiber(
-                Box::new(yield_type.clone()),
-                Box::new(result_type.clone()),
-            ),
+            } => Type::Fiber(Box::new(yield_type.clone()), Box::new(result_type.clone())),
             Self::Stream { element_type, .. } => Type::Stream(Box::new(element_type.clone())),
             Self::Resource { kind, .. } => Type::Resource(kind.clone()),
             Self::Dynamic { .. } => Type::Dynamic,

@@ -141,7 +141,10 @@ impl Tool for RestartTool {
             .unwrap_or("./target/release/finch");
 
         let binary_path = std::fs::canonicalize(binary_path).with_context(|| {
-            format!("Binary not found at '{}'. Did you forget to build it?", binary_path)
+            format!(
+                "Binary not found at '{}'. Did you forget to build it?",
+                binary_path
+            )
         })?;
         let metadata = std::fs::metadata(&binary_path)?;
         if !metadata.is_file() {
@@ -276,8 +279,7 @@ mod tests {
             )
             .await;
         let intent = deferred_frontend_restart_from_tool_result(&result).unwrap();
-        let encoded: serde_json::Value =
-            serde_json::from_str(result.as_ref().unwrap()).unwrap();
+        let encoded: serde_json::Value = serde_json::from_str(result.as_ref().unwrap()).unwrap();
 
         assert_eq!(intent.reason, "exercise the durable Brain restart path");
         assert_eq!(intent.binary_path, std::fs::canonicalize(binary).unwrap());

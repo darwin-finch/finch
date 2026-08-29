@@ -1,0 +1,136 @@
+name: Brain isolation security
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue-56-brain-isolation.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'schema/**'
+      - 'src/**'
+      - 'scripts/**'
+      - 'tests/**'
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/issue-56-brain-isolation.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'schema/**'
+      - 'src/**'
+      - 'scripts/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brain-isolation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  isolation-boundaries:
+    name: Isolation boundaries (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install capnproto (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y capnproto ripgrep
+
+    - name: Install capnproto (macOS)
+      if: runner.os == 'macOS'
+      run: brew install capnp ripgrep
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+
+    - name: Cache Cargo state
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: issue-56-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check bins and tests
+      timeout-minutes: 25
+      run: cargo check --lib --bins --tests
+
+    - name: Reject external provider binaries
+      timeout-minutes: 15
+      run: cargo test --test no_external_provider_binary_test -- --nocapture
+
+    - name: Build isolation supervisor
+      timeout-minutes: 40
+      run: |
+        cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
+        cargo build --bin finch-test-supervisor
+        cargo build --release --bin finch-test-supervisor
+        install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
+        install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+
+    - name: Reject self-issued proof authority
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        -- --nocapture
+
+    - name: Validate offset-independent concurrent proof reads
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        -- --nocapture
+
+    - name: Reject rewritten proof at the production constructor
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
+        -- --nocapture
+
+    - name: Reject fixture traversal before external mutation
+      timeout-minutes: 15
+      run: |
+        ./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture
+
+    - name: Exercise real Brain and server paths behind the guard
+      timeout-minutes: 25
+      run: |
+        ./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored --nocapture
+
+    - name: Keep worker node identity inside disposable state
+      timeout-minutes: 15
+      run: |
+        tests/worker_node_isolation_contract.sh
+        ./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture
+
+    - name: Exercise the complete synthetic isolation harness
+      timeout-minutes: 15
+      run: ./scripts/test_brain_isolation.sh

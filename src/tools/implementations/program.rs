@@ -134,7 +134,10 @@ fn vocabulary_surfaces(
         return (
             format!("({} arguments)", entry.name),
             format!("arguments {}", entry.name),
-            format!("Inspect the signature and construct its single typed argument before calling {}.", entry.name),
+            format!(
+                "Inspect the signature and construct its single typed argument before calling {}.",
+                entry.name
+            ),
         );
     }
     (
@@ -964,13 +967,13 @@ mod tests {
             live_output: None,
             poset: None,
         };
-        let result: Value = serde_json::from_str(
-            &tool.execute(json!({}), &context).await.unwrap(),
-        )
-        .unwrap();
+        let result: Value =
+            serde_json::from_str(&tool.execute(json!({}), &context).await.unwrap()).unwrap();
 
         assert!(result.get("vocabulary").is_none());
-        assert!(result["vocabulary_count"].as_u64().is_some_and(|count| count > 0));
+        assert!(result["vocabulary_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
         assert!(result["typed_vocabulary_count"]
             .as_u64()
             .is_some_and(|count| count > 0));
@@ -1062,7 +1065,8 @@ mod tests {
 
         for tool in [&legacy as &dyn Tool, &canonical as &dyn Tool] {
             let result: Value = serde_json::from_str(
-                &tool.execute(json!({"name": "while"}), &context)
+                &tool
+                    .execute(json!({"name": "while"}), &context)
                     .await
                     .unwrap(),
             )
@@ -1130,7 +1134,11 @@ mod tests {
         )
         .unwrap();
         let matches = operator["core_matches"].as_array().unwrap();
-        assert_eq!(matches.len(), 1, "exact symbolic lookup must not match every example");
+        assert_eq!(
+            matches.len(),
+            1,
+            "exact symbolic lookup must not match every example"
+        );
         assert_eq!(matches[0]["name"], "*");
         assert_eq!(matches[0]["forth"], "a b *");
     }
@@ -1261,9 +1269,9 @@ mod tests {
             .iter()
             .any(|entry| {
                 entry["name"] == "map{"
-                    && entry["languages"]
-                        .as_array()
-                        .is_some_and(|languages| languages.iter().any(|language| language == "forth"))
+                    && entry["languages"].as_array().is_some_and(|languages| {
+                        languages.iter().any(|language| language == "forth")
+                    })
             }));
 
         let list_result: Value = serde_json::from_str(
@@ -1279,13 +1287,9 @@ mod tests {
             .iter()
             .any(|entry| entry["name"] == "list{"));
 
-        let bracket_list_result: Value = serde_json::from_str(
-            &tool
-                .execute(json!({"query": "["}), &context)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let bracket_list_result: Value =
+            serde_json::from_str(&tool.execute(json!({"query": "["}), &context).await.unwrap())
+                .unwrap();
         assert!(bracket_list_result["syntax_matches"]
             .as_array()
             .unwrap()
@@ -1298,7 +1302,11 @@ mod tests {
         let runtime = Arc::new(ProgramRuntime::new());
         let tool = SubmitProgramTool::new(runtime);
         let schema = tool.input_schema();
-        assert!(!schema.properties.as_object().unwrap().contains_key("effect"));
+        assert!(!schema
+            .properties
+            .as_object()
+            .unwrap()
+            .contains_key("effect"));
         assert!(!schema.required.iter().any(|field| field == "effect"));
         let context = ToolContext {
             conversation: None,

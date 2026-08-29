@@ -265,7 +265,9 @@ pub(crate) enum BrainRemoteCommandKind {
         delivery_policy: BrainScheduleDeliveryPolicy,
     },
     CancelSchedule(ScheduleId),
-    ScheduleInitialization { next_due_ms: u64 },
+    ScheduleInitialization {
+        next_due_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,9 +436,7 @@ fn schedule_policy_kind_to_capnp(
     policy: &BrainScheduleDeliveryPolicy,
 ) -> finch_ipc_capnp::BrainSchedulePolicyKind {
     match policy {
-        BrainScheduleDeliveryPolicy::Coalesce => {
-            finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce
-        }
+        BrainScheduleDeliveryPolicy::Coalesce => finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce,
         BrainScheduleDeliveryPolicy::BoundedCatchUp { .. } => {
             finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp
         }
@@ -510,7 +510,9 @@ pub(super) fn decode_brain_submission(
     use finch_ipc_capnp::brain_submission::Which;
 
     Ok(match reader.which()? {
-        Which::Prompt(value) => BrainEventKind::Prompt { text: text(value?)? },
+        Which::Prompt(value) => BrainEventKind::Prompt {
+            text: text(value?)?,
+        },
         Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
             text: text(value?)?,
         },
@@ -718,9 +720,7 @@ pub(crate) fn encode_brain_remote_envelope(
                 BrainRemoteReply::HandoffRequested { handoff, .. } => {
                     encode_runner_handoff(builder.init_handoff_requested(), handoff)
                 }
-                BrainRemoteReply::HandoffCancelled { .. } => {
-                    builder.set_handoff_cancelled(())
-                }
+                BrainRemoteReply::HandoffCancelled { .. } => builder.set_handoff_cancelled(()),
                 BrainRemoteReply::RunCancelled { run, .. } => {
                     encode_run(builder.init_run_cancelled(), run)
                 }
@@ -871,12 +871,10 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     request_id,
                     schedule: decode_schedule(schedule?)?,
                 },
-                ReplyWhich::ScheduleCancelled(cancelled) => {
-                    BrainRemoteReply::ScheduleCancelled {
-                        request_id,
-                        cancelled,
-                    }
-                }
+                ReplyWhich::ScheduleCancelled(cancelled) => BrainRemoteReply::ScheduleCancelled {
+                    request_id,
+                    cancelled,
+                },
                 ReplyWhich::InitializationScheduled(schedule) => {
                     BrainRemoteReply::InitializationScheduled {
                         request_id,
@@ -1231,9 +1229,7 @@ pub(crate) fn decode_schedule(
 ) -> anyhow::Result<BrainSchedule> {
     let policy = reader.get_delivery_policy()?;
     let delivery_policy = match policy.get_kind()? {
-        finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce => {
-            BrainScheduleDeliveryPolicy::Coalesce
-        }
+        finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce => BrainScheduleDeliveryPolicy::Coalesce,
         finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp => {
             BrainScheduleDeliveryPolicy::BoundedCatchUp {
                 max_catch_up: policy.get_max_catch_up(),
@@ -1243,13 +1239,9 @@ pub(crate) fn decode_schedule(
     };
     Ok(BrainSchedule {
         schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
-        initiating_attachment_id: AttachmentId(parse_uuid(
-            reader.get_initiating_attachment_id()?,
-        )?),
+        initiating_attachment_id: AttachmentId(parse_uuid(reader.get_initiating_attachment_id()?)?),
         created_by: text(reader.get_created_by()?)?,
-        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(
-            reader.get_grant_ceiling()?,
-        )?,
+        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
         next_due_ms: reader.get_next_due_ms(),
@@ -1300,9 +1292,7 @@ fn decode_schedule_due(
         run: decode_run(reader.get_run()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
-        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(
-            reader.get_grant_ceiling()?,
-        )?,
+        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(reader.get_grant_ceiling()?)?,
         due_at_ms: reader.get_due_at_ms(),
         first_missed_at_ms: reader.get_first_missed_at_ms(),
         missed_count: reader.get_missed_count(),
@@ -1339,32 +1329,41 @@ pub(super) fn encode_event(
         BrainEventKind::MutationRecorded { outcome } => {
             let mut recorded = builder.init_mutation_recorded();
             match outcome {
-                crate::brain::store::BrainMutationOutcome::RunCancellationReserved { run_id } =>
-                    recorded.set_run_cancellation_reserved(&run_id.0.to_string()),
-                crate::brain::store::BrainMutationOutcome::RunAlreadyCancelled { run_id } =>
-                    recorded.set_run_already_cancelled(&run_id.0.to_string()),
-                crate::brain::store::BrainMutationOutcome::RunCancellationNoop { run_id } =>
-                    recorded.set_run_cancellation_noop(&run_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::RunCancellationReserved { run_id } => {
+                    recorded.set_run_cancellation_reserved(&run_id.0.to_string())
+                }
+                crate::brain::store::BrainMutationOutcome::RunAlreadyCancelled { run_id } => {
+                    recorded.set_run_already_cancelled(&run_id.0.to_string())
+                }
+                crate::brain::store::BrainMutationOutcome::RunCancellationNoop { run_id } => {
+                    recorded.set_run_cancellation_noop(&run_id.0.to_string())
+                }
                 crate::brain::store::BrainMutationOutcome::RunCancellationDispatching {
-                    run_id, mutation_id,
+                    run_id,
+                    mutation_id,
                 } => {
                     let mut progress = recorded.init_run_cancellation_dispatching();
                     progress.set_run_id(&run_id.0.to_string());
                     progress.set_mutation_id(&mutation_id.to_string());
                 }
                 crate::brain::store::BrainMutationOutcome::RunCancellationReconciled {
-                    run_id, mutation_id,
+                    run_id,
+                    mutation_id,
                 } => {
                     let mut progress = recorded.init_run_cancellation_reconciled();
                     progress.set_run_id(&run_id.0.to_string());
                     progress.set_mutation_id(&mutation_id.to_string());
                 }
-                crate::brain::store::BrainMutationOutcome::ScheduleCancellationNoop { schedule_id } =>
-                    recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string()),
-                crate::brain::store::BrainMutationOutcome::HandoffCancellationNoop { handoff_id } =>
-                    recorded.set_handoff_cancellation_noop(&handoff_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::ScheduleCancellationNoop {
+                    schedule_id,
+                } => recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::HandoffCancellationNoop {
+                    handoff_id,
+                } => recorded.set_handoff_cancellation_noop(&handoff_id.0.to_string()),
                 crate::brain::store::BrainMutationOutcome::ApprovalDecisionDelivered {
-                    request_seq, approval_id, mutation_id,
+                    request_seq,
+                    approval_id,
+                    mutation_id,
                 } => {
                     let mut progress = recorded.init_approval_decision_delivered();
                     progress.set_request_seq(*request_seq);
@@ -1551,9 +1550,11 @@ pub(super) fn decode_event(
             use crate::brain::store::BrainMutationOutcome;
             use finch_ipc_capnp::brain_mutation_outcome::Which as Outcome;
             let outcome = match recorded?.which()? {
-                Outcome::RunCancellationReserved(value) => BrainMutationOutcome::RunCancellationReserved {
-                    run_id: RunId(parse_uuid(value?)?),
-                },
+                Outcome::RunCancellationReserved(value) => {
+                    BrainMutationOutcome::RunCancellationReserved {
+                        run_id: RunId(parse_uuid(value?)?),
+                    }
+                }
                 Outcome::RunAlreadyCancelled(value) => BrainMutationOutcome::RunAlreadyCancelled {
                     run_id: RunId(parse_uuid(value?)?),
                 },
@@ -1574,12 +1575,16 @@ pub(super) fn decode_event(
                         mutation_id: parse_uuid(progress.get_mutation_id()?)?,
                     }
                 }
-                Outcome::ScheduleCancellationNoop(value) => BrainMutationOutcome::ScheduleCancellationNoop {
-                    schedule_id: crate::brain::store::ScheduleId(parse_uuid(value?)?),
-                },
-                Outcome::HandoffCancellationNoop(value) => BrainMutationOutcome::HandoffCancellationNoop {
-                    handoff_id: RunnerHandoffId(parse_uuid(value?)?),
-                },
+                Outcome::ScheduleCancellationNoop(value) => {
+                    BrainMutationOutcome::ScheduleCancellationNoop {
+                        schedule_id: crate::brain::store::ScheduleId(parse_uuid(value?)?),
+                    }
+                }
+                Outcome::HandoffCancellationNoop(value) => {
+                    BrainMutationOutcome::HandoffCancellationNoop {
+                        handoff_id: RunnerHandoffId(parse_uuid(value?)?),
+                    }
+                }
                 Outcome::ApprovalDecisionDelivered(progress) => {
                     let progress = progress?;
                     BrainMutationOutcome::ApprovalDecisionDelivered {
@@ -1772,7 +1777,7 @@ pub(super) fn decode_event(
                     command_sha256: text(mutation.get_command_sha256()?)?,
                 })
             })
-             .transpose()?,
+            .transpose()?,
         kind,
     })
 }
@@ -1827,11 +1832,9 @@ mod tests {
 
         let encoded = capnp::serialize::write_message_to_words(&message);
         let mut cursor = std::io::Cursor::new(encoded);
-        let decoded = capnp::serialize::read_message(
-            &mut cursor,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let decoded =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .unwrap();
         let root = decoded
             .get_root::<finch_ipc_capnp::json_value::Reader<'_>>()
             .unwrap();
@@ -1877,11 +1880,9 @@ mod tests {
 
         let encoded = capnp::serialize::write_message_to_words(&message);
         let mut cursor = std::io::Cursor::new(encoded);
-        let decoded = capnp::serialize::read_message(
-            &mut cursor,
-            capnp::message::ReaderOptions::new(),
-        )
-        .unwrap();
+        let decoded =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .unwrap();
         let request = decoded
             .get_root::<finch_ipc_capnp::brain_turn_request::Reader<'_>>()
             .unwrap();
@@ -1949,11 +1950,9 @@ mod tests {
             .unwrap();
             let encoded = capnp::serialize::write_message_to_words(&message);
             let mut cursor = std::io::Cursor::new(encoded);
-            let decoded = capnp::serialize::read_message(
-                &mut cursor,
-                capnp::message::ReaderOptions::new(),
-            )
-            .unwrap();
+            let decoded =
+                capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                    .unwrap();
             let root = decoded
                 .get_root::<finch_ipc_capnp::brain_submission::Reader<'_>>()
                 .unwrap();
@@ -2081,9 +2080,7 @@ mod tests {
                     output: Vec::new(),
                     origin: crate::vm::SourceOrigin::generated("say"),
                 },
-                state: crate::vm::EffectJournalState::Acknowledged {
-                    values: Vec::new(),
-                },
+                state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
             },
             BrainEventKind::Result {
                 request_seq: 5,
@@ -2103,9 +2100,7 @@ mod tests {
             if is_result {
                 event.run_id = Some(RunId(uuid::Uuid::new_v4()));
             }
-            let expected = BrainWireMessage::Event {
-                event,
-            };
+            let expected = BrainWireMessage::Event { event };
             let encoded = encode_brain_wire_message(&expected).unwrap();
             assert_eq!(decode_brain_wire_message(&encoded).unwrap(), expected);
         }
@@ -2263,10 +2258,7 @@ mod tests {
                 handoff,
             }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::HandoffCancelled { request_id: 5 }),
-            BrainRemoteEnvelope::Reply(BrainRemoteReply::RunCancelled {
-                request_id: 6,
-                run,
-            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::RunCancelled { request_id: 6, run }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::ScheduleCreated {
                 request_id: 7,
                 schedule: schedule.clone(),
@@ -2400,18 +2392,21 @@ mod tests {
                 }],
                 runner_lease: Some(lease),
                 runner_handoff: None,
-                runs: vec![BrainRun {
-                    run_id: RunId(uuid::Uuid::new_v4()),
-                    kind: BrainRunKind::Interactive,
-                    parent_run_id: None,
-                    request_seq: 1,
-                    initiating_attachment_id: attachment_id,
-                    initiated_by: "alice@laptop.local".into(),
-                    status: BrainRunStatus::Completed,
-                    started_ms: 100,
-                    updated_ms: 200,
-                    detail: None,
-                }, scheduled_run],
+                runs: vec![
+                    BrainRun {
+                        run_id: RunId(uuid::Uuid::new_v4()),
+                        kind: BrainRunKind::Interactive,
+                        parent_run_id: None,
+                        request_seq: 1,
+                        initiating_attachment_id: attachment_id,
+                        initiated_by: "alice@laptop.local".into(),
+                        status: BrainRunStatus::Completed,
+                        started_ms: 100,
+                        updated_ms: 200,
+                        detail: None,
+                    },
+                    scheduled_run,
+                ],
                 tasks: vec![task],
                 schedules: vec![schedule],
                 pending_schedule_dues: vec![pending_due],

@@ -57,9 +57,7 @@ pub enum ControlEffect {
 /// value supplied when execution continues. The first protocol version is
 /// one-way, so source frontends infer `unit` for `resume_type`, but retaining
 /// it in the contract avoids a later incompatible function-type change.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SuspensionSignature {
     pub yield_type: Box<Type>,
     pub resume_type: Box<Type>,

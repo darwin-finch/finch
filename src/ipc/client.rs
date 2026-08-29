@@ -100,6 +100,10 @@ impl IpcClient {
             .await
             .with_context(|| format!("IPC connect failed: {}", path.display()))?;
 
+        Self::from_stream(stream).await
+    }
+
+    pub(crate) async fn from_stream(stream: tokio::net::UnixStream) -> Result<Self> {
         let (reader, writer) = stream.into_split();
         let network = twoparty::VatNetwork::new(
             reader.compat(),
@@ -673,9 +677,8 @@ impl IpcClient {
             .map_err(map_runner_registration_error)?;
         let response = reply.get()?;
         let control: brain_runner_control::Client = response.get_control()?;
-        let (subagent_control, mut subagent_rx) = mpsc::unbounded_channel::<
-            crate::runtime::scheduler::AgentBrainControlRequest,
-        >();
+        let (subagent_control, mut subagent_rx) =
+            mpsc::unbounded_channel::<crate::runtime::scheduler::AgentBrainControlRequest>();
         tokio::task::spawn_local(async move {
             while let Some(request) = subagent_rx.recv().await {
                 match request {
@@ -712,9 +715,9 @@ impl IpcClient {
                             {
                                 let mut params = call.get();
                                 params.set_run_id(&run_id.0.to_string());
-                                params.set_status(
-                                    crate::ipc::brain_codec::run_status_to_capnp(status),
-                                );
+                                params.set_status(crate::ipc::brain_codec::run_status_to_capnp(
+                                    status,
+                                ));
                                 params.set_detail(&detail);
                             }
                             let reply = call.send().promise.await?;
@@ -844,9 +847,8 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(control) => control,
             Err(error) => return Promise::err(error),
         };
-        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::server::RunnerProgramControlRequest,
-        >();
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerProgramControlRequest>();
         tokio::task::spawn_local(async move {
             while let Some(request) = control_rx.recv().await {
                 match request {
@@ -943,9 +945,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         let result = async {
                             let mut call = control.cancel_schedule_request();
                             call.get().set_schedule_id(&schedule_id.0.to_string());
-                            Ok::<_, capnp::Error>(
-                                call.send().promise.await?.get()?.get_cancelled(),
-                            )
+                            Ok::<_, capnp::Error>(call.send().promise.await?.get()?.get_cancelled())
                         }
                         .await
                         .map_err(|error| error.to_string());
@@ -1190,13 +1190,15 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
-                crate::server::RunnerCancelRequest {
-                    brain,
-                    run_id,
-                    response_tx,
-                },
-            ))
+            .send(
+                crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
+                    crate::server::RunnerCancelRequest {
+                        brain,
+                        run_id,
+                        response_tx,
+                    },
+                ),
+            )
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
@@ -1235,12 +1237,19 @@ impl brain_runner::Server for BrainRunnerImpl {
                 .map_err(anyhow::Error::new)
                 .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
         };
-        let brain_id = match request.get_brain_id().map_err(anyhow::Error::new).and_then(parse_uuid)
+        let brain_id = match request
+            .get_brain_id()
+            .map_err(anyhow::Error::new)
+            .and_then(parse_uuid)
         {
             Ok(value) => crate::brain::store::BrainId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let run_id = match request.get_run_id().map_err(anyhow::Error::new).and_then(parse_uuid) {
+        let run_id = match request
+            .get_run_id()
+            .map_err(anyhow::Error::new)
+            .and_then(parse_uuid)
+        {
             Ok(value) => crate::brain::store::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -1404,12 +1413,8 @@ fn attachment_role_to_capnp(
     role: crate::brain::store::AttachmentRole,
 ) -> finch_ipc_capnp::BrainAttachmentRole {
     match role {
-        crate::brain::store::AttachmentRole::Runner => {
-            finch_ipc_capnp::BrainAttachmentRole::Runner
-        }
-        crate::brain::store::AttachmentRole::Driver => {
-            finch_ipc_capnp::BrainAttachmentRole::Driver
-        }
+        crate::brain::store::AttachmentRole::Runner => finch_ipc_capnp::BrainAttachmentRole::Runner,
+        crate::brain::store::AttachmentRole::Driver => finch_ipc_capnp::BrainAttachmentRole::Driver,
         crate::brain::store::AttachmentRole::Consultant => {
             finch_ipc_capnp::BrainAttachmentRole::Consultant
         }
@@ -1512,9 +1517,7 @@ fn decode_stream_response_metadata(
     })
 }
 
-fn decode_unknown_stream_chunk(
-    _error: capnp::NotInSchema,
-) -> Option<anyhow::Result<StreamChunk>> {
+fn decode_unknown_stream_chunk(_error: capnp::NotInSchema) -> Option<anyhow::Result<StreamChunk>> {
     // Stream metadata is additive. Older clients ignore newer union members
     // while continuing to decode the text/tool/usage chunks they understand.
     None
@@ -1652,6 +1655,36 @@ mod tests {
         }
     }
 
+    async fn connect_isolated_live_socket() -> Result<IpcClient> {
+        let proof = crate::brain::isolated_test_proof()?;
+        let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!("FINCH_TEST_IPC_SOCKET must name the owned test daemon socket")
+            })?;
+        anyhow::ensure!(
+            path == proof.ipc_socket,
+            "IPC path is not parent-authorized"
+        );
+        #[cfg(unix)]
+        let before = crate::brain::validate_isolated_test_socket(&proof, &path)?;
+        let stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("IPC connect failed: {}", path.display()))?;
+        #[cfg(unix)]
+        crate::brain::authenticate_isolated_test_peer(&stream)?;
+        let client = IpcClient::from_stream(stream).await?;
+        #[cfg(unix)]
+        {
+            let after = crate::brain::validate_isolated_test_socket(&proof, &path)?;
+            anyhow::ensure!(
+                before == after,
+                "test IPC socket identity changed during connect"
+            );
+        }
+        Ok(client)
+    }
+
     #[test]
     fn ipc_protocol_handshake_accepts_only_the_current_generation() {
         ensure_compatible_protocol(crate::ipc::IPC_PROTOCOL_VERSION).unwrap();
@@ -1713,14 +1746,12 @@ mod tests {
             .get_root_as_reader::<finch_ipc_capnp::stream_chunk::Reader<'_>>()
             .unwrap();
         let model = match reader.which().unwrap() {
-            Which::ResponseMetadata(metadata) => match decode_stream_response_metadata(
-                metadata.unwrap(),
-            )
-            .unwrap()
-            {
-                StreamChunk::ResponseMetadata { model } => model,
-                _ => panic!("expected response metadata"),
-            },
+            Which::ResponseMetadata(metadata) => {
+                match decode_stream_response_metadata(metadata.unwrap()).unwrap() {
+                    StreamChunk::ResponseMetadata { model } => model,
+                    _ => panic!("expected response metadata"),
+                }
+            }
             _ => panic!("expected response metadata"),
         };
         assert_eq!(model, "gpt-5.6-sol-served");
@@ -1746,9 +1777,8 @@ mod tests {
     }
 
     struct BlockingBrainRunner {
-        started: std::cell::RefCell<
-            Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
-        >,
+        started:
+            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
         cancellations: std::rc::Rc<
             std::cell::RefCell<
                 std::collections::HashMap<
@@ -1837,9 +1867,9 @@ mod tests {
 
     /// Connect to the live daemon socket and verify ping round-trip.
     ///
-    /// Requires a running daemon with the IPC socket at `~/.finch/daemon.sock`.
+    /// Requires an owned daemon socket named by `FINCH_TEST_IPC_SOCKET`.
     /// Run with:
-    ///   cargo test --lib ipc::client::tests::test_ipc_ping -- --ignored --nocapture
+    ///   ./scripts/test_brains.sh cargo test --lib ipc::client::tests::test_ipc_ping -- --ignored --nocapture
     /// capnp-rpc uses spawn_local internally so we need a LocalSet.
     #[test]
     #[ignore]
@@ -1850,7 +1880,7 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         rt.block_on(local.run_until(async {
-            let client = IpcClient::connect()
+            let client = connect_isolated_live_socket()
                 .await
                 .expect("IPC connect — is `finch daemon` running?");
 
@@ -1871,7 +1901,7 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         rt.block_on(local.run_until(async {
-            let client = IpcClient::connect()
+            let client = connect_isolated_live_socket()
                 .await
                 .expect("IPC connect — start the rebuilt Finch daemon first");
             let brain = format!("bootstrap-smoke-{}", uuid::Uuid::new_v4().simple());
@@ -1879,13 +1909,7 @@ mod tests {
             let subject = format!("smoke@localhost/frontend-{}", uuid::Uuid::new_v4());
             client.brain_claim_runner_identity(&subject).await.unwrap();
             let lease = client
-                .brain_acquire_runner(
-                    &brain,
-                    &subject,
-                    &snapshot.environment,
-                    None,
-                    30_000,
-                )
+                .brain_acquire_runner(&brain, &subject, &snapshot.environment, None, 30_000)
                 .await
                 .unwrap();
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1927,7 +1951,7 @@ mod tests {
             drop(_bootstrap);
             drop(client);
 
-            let replacement = IpcClient::connect().await.unwrap();
+            let replacement = connect_isolated_live_socket().await.unwrap();
             replacement
                 .brain_claim_runner_identity(&subject)
                 .await
@@ -1995,10 +2019,8 @@ mod tests {
         }));
     }
 
-    /// Exercise the complete local named-Brain lifecycle capability against a
-    /// running daemon. The fixed Brain name is intended to be archived after
-    /// the smoke test; this test is ignored so ordinary unit suites remain
-    /// hermetic.
+    /// Exercise the complete local named-Brain lifecycle capability against an
+    /// explicitly owned daemon socket.
     #[test]
     #[ignore]
     fn test_brain_service_lifecycle() {
@@ -2008,21 +2030,21 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         rt.block_on(local.run_until(async {
-            let client = IpcClient::connect()
+            let client = connect_isolated_live_socket()
                 .await
                 .expect("IPC connect — is `finch daemon` running?");
-            let brain = "codex-ipc-smoke-20260824";
-            let snapshot = client.brain_snapshot(brain).await.unwrap();
+            let brain = format!("codex-ipc-smoke-{}", uuid::Uuid::new_v4().simple());
+            let snapshot = client.brain_snapshot(&brain).await.unwrap();
             let attachment = client
                 .brain_attach(
-                    brain,
+                    &brain,
                     "codex-smoke@localhost",
                     crate::brain::store::AttachmentRole::Driver,
                     None,
                 )
                 .await
                 .unwrap();
-            let mut incoming = client.brain_watch(brain, &attachment).await.unwrap();
+            let mut incoming = client.brain_watch(&brain, &attachment).await.unwrap();
             let initial = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
                 .await
                 .unwrap()
@@ -2035,7 +2057,7 @@ mod tests {
 
             let relay = client
                 .brain_submit(
-                    brain,
+                    &brain,
                     &attachment,
                     crate::brain::store::BrainEventKind::ParticipantMessage {
                         text: "human-only collaboration message".into(),
@@ -2062,7 +2084,7 @@ mod tests {
 
             let outcome = client
                 .brain_submit(
-                    brain,
+                    &brain,
                     &attachment,
                     crate::brain::store::BrainEventKind::Prompt {
                         text: "queue this smoke-test turn".into(),
@@ -2077,10 +2099,10 @@ mod tests {
             assert!(outcome.result.is_none());
             assert!(outcome.accepted.seq > relay.accepted.seq);
             let run = outcome.run.unwrap();
-            let inspected = client.brain_inspect_run(brain, run.run_id).await.unwrap();
+            let inspected = client.brain_inspect_run(&brain, run.run_id).await.unwrap();
             assert_eq!(inspected.run_id, run.run_id);
             let cancelled = client
-                .brain_cancel_run(brain, &attachment, run.run_id)
+                .brain_cancel_run(&brain, &attachment, run.run_id)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2088,11 +2110,11 @@ mod tests {
                 crate::brain::store::BrainRunStatus::Cancelled
             );
             let acknowledged = client
-                .brain_acknowledge(brain, &attachment, outcome.accepted.seq)
+                .brain_acknowledge(&brain, &attachment, outcome.accepted.seq)
                 .await
                 .unwrap();
             assert_eq!(acknowledged.acknowledged_seq, outcome.accepted.seq);
-            client.brain_detach(brain, &acknowledged).await.unwrap();
+            client.brain_detach(&brain, &acknowledged).await.unwrap();
         }));
     }
 
@@ -2107,7 +2129,7 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         rt.block_on(local.run_until(async {
-            let client = IpcClient::connect()
+            let client = connect_isolated_live_socket()
                 .await
                 .expect("IPC connect — is `finch daemon` running?");
             let brain = format!("codex-cancel-{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -2181,16 +2203,23 @@ mod tests {
             let outcome = submission.await.unwrap().unwrap();
             assert_eq!(outcome.run.unwrap().run_id, run_id);
             assert_eq!(
-                client.brain_inspect_run(&brain, run_id).await.unwrap().status,
+                client
+                    .brain_inspect_run(&brain, run_id)
+                    .await
+                    .unwrap()
+                    .status,
                 crate::brain::store::BrainRunStatus::Cancelled
             );
-            client.brain_release_runner(&brain, lease.lease_id).await.unwrap();
+            client
+                .brain_release_runner(&brain, lease.lease_id)
+                .await
+                .unwrap();
             client.brain_detach(&brain, &attachment).await.unwrap();
         }));
     }
 
     #[test]
-    #[ignore = "requires a running Finch daemon on the default local socket"]
+    #[ignore = "requires an owned daemon at FINCH_TEST_IPC_SOCKET"]
     fn test_brain_runner_lease_cannot_be_hijacked_by_another_ipc_connection() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2198,8 +2227,8 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         rt.block_on(local.run_until(async {
-            let owner = IpcClient::connect().await.unwrap();
-            let intruder = IpcClient::connect().await.unwrap();
+            let owner = connect_isolated_live_socket().await.unwrap();
+            let intruder = connect_isolated_live_socket().await.unwrap();
             let brain = format!("codex-runner-authority-{}", uuid::Uuid::new_v4());
             let subject = "owner/frontend-authority";
             let snapshot = owner.brain_snapshot(&brain).await.unwrap();
@@ -2207,13 +2236,7 @@ mod tests {
             owner.brain_claim_runner_identity(subject).await.unwrap();
             assert!(intruder.brain_claim_runner_identity(subject).await.is_err());
             let lease = owner
-                .brain_acquire_runner(
-                    &brain,
-                    subject,
-                    &snapshot.environment,
-                    None,
-                    60_000,
-                )
+                .brain_acquire_runner(&brain, subject, &snapshot.environment, None, 60_000)
                 .await
                 .unwrap();
 
@@ -2245,7 +2268,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running Finch daemon on the default local socket"]
+    #[ignore = "requires an owned daemon at FINCH_TEST_IPC_SOCKET"]
     fn test_brain_attachment_cannot_be_replayed_by_another_ipc_connection() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2253,8 +2276,8 @@ mod tests {
             .unwrap();
         let local = tokio::task::LocalSet::new();
         rt.block_on(local.run_until(async {
-            let owner = IpcClient::connect().await.unwrap();
-            let intruder = IpcClient::connect().await.unwrap();
+            let owner = connect_isolated_live_socket().await.unwrap();
+            let intruder = connect_isolated_live_socket().await.unwrap();
             let brain = format!("codex-attachment-authority-{}", uuid::Uuid::new_v4());
             let attachment = owner
                 .brain_attach(
@@ -2266,14 +2289,12 @@ mod tests {
                 .await
                 .unwrap();
             let mut owner_watch = owner.brain_watch(&brain, &attachment).await.unwrap();
-            let initial = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                owner_watch.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let initial =
+                tokio::time::timeout(std::time::Duration::from_secs(2), owner_watch.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
             assert!(matches!(
                 initial,
                 crate::brain::store::BrainWireMessage::Snapshot { .. }
@@ -2295,13 +2316,11 @@ mod tests {
                 .is_err());
             assert!(intruder.brain_detach(&brain, &attachment).await.is_err());
             let mut forged_watch = intruder.brain_watch(&brain, &attachment).await.unwrap();
-            let watch_error = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                forged_watch.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let watch_error =
+                tokio::time::timeout(std::time::Duration::from_secs(2), forged_watch.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(watch_error.is_err());
 
             let accepted = owner
