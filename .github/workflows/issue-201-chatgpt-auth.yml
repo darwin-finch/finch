@@ -45,13 +45,13 @@ jobs:
       - name: Compile library and binary tests
         run: cargo test --no-run
       - name: Provider-neutral OAuth regressions
-        run: cargo test --lib oauth::
+        run: "cargo test --lib oauth::"
       - name: OpenAI signed-token regressions
-        run: cargo test --lib providers::chatgpt_oauth::
+        run: "cargo test --lib providers::chatgpt_oauth::"
       - name: JWKS authority regressions
-        run: cargo test --lib providers::openai_jwks::
+        run: "cargo test --lib providers::openai_jwks::"
       - name: Auth UX regressions
-        run: cargo test --lib cli::chatgpt_auth::
+        run: "cargo test --lib cli::chatgpt_auth::"
       - name: Shared setup auth regressions
         run: cargo test --lib cli::setup_wizard::tests::setup_
       - name: Setup entry-point reuse regression
