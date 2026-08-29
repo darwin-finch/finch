@@ -3430,6 +3430,15 @@ mod tests {
                     cancelled.status,
                     crate::brain::store::BrainRunStatus::Cancelled
                 );
+                let submission = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    submission,
+                )
+                .await
+                .expect("real runner cancellation did not quiesce the provider turn")
+                .unwrap()
+                .unwrap();
+                assert_eq!(submission.run.unwrap().run_id, run.run_id);
                 event_tx.send(crate::cli::repl_event::ReplEvent::Shutdown).unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
                     .await
@@ -3437,27 +3446,26 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 finish_release.notify_one();
-
-                let submission = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    submission,
-                )
-                .await
-                .expect("cancelled submission did not reconcile after runner disconnect")
-                .unwrap()
-                .unwrap();
-                assert_eq!(submission.run.unwrap().run_id, run.run_id);
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
                 let snapshot = loop {
                     let snapshot = store.snapshot("shared").unwrap();
                     if snapshot.effect_audits.first().is_some_and(|audit| {
-                        matches!(audit.state, crate::runtime::effect_log::EffectAuditState::Terminal { .. })
+                        matches!(
+                            audit.state,
+                            crate::runtime::effect_log::EffectAuditState::Terminal {
+                                outcome:
+                                    crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                                        ref outcome_kind
+                                    }
+                            } if outcome_kind == "acknowledged"
+                        )
                     }) {
                         break snapshot;
                     }
                     assert!(
                         tokio::time::Instant::now() < deadline,
-                        "late authoritative effect finish was not durably reconciled"
+                        "late authoritative effect finish was not durably acknowledged; state={:?}",
+                        snapshot.effect_audits.first().map(|audit| &audit.state)
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 };
@@ -3470,12 +3478,28 @@ mod tests {
                             ref outcome_kind
                         }
                     } if outcome_kind == "acknowledged"));
+                assert_eq!(
+                    snapshot
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            event.kind,
+                            crate::brain::store::BrainEventKind::EffectAuditTransition {
+                                transition:
+                                    crate::runtime::effect_log::EffectAuditTransition::Finish { .. }
+                            }
+                        ))
+                        .count(),
+                    1,
+                    "cancel, quiescence, disconnect, and late finish produced multiple terminal receipts"
+                );
                 assert!(!snapshot.events.iter().any(|event| matches!(
                     event.kind,
                     crate::brain::store::BrainEventKind::ToolResult { .. }
                         | crate::brain::store::BrainEventKind::Result { .. }
                         | crate::brain::store::BrainEventKind::Program { .. }
                         | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
+                        | crate::brain::store::BrainEventKind::EffectRecorded { .. }
                 )));
                 assert!(conversation.read().await.get_messages().is_empty());
             })
