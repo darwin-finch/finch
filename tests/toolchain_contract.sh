@@ -108,6 +108,36 @@ for workflow in "${authoritative_workflows[@]}"; do
   fi
 done
 
+ci_workflow=".github/workflows/ci.yml"
+windows_contract=$(awk '
+  /^  windows-format-contract:$/ { in_job = 1 }
+  in_job && /^  [[:alnum:]_-]+:$/ && $1 != "windows-format-contract:" { exit }
+  in_job { print }
+' "$ci_workflow")
+if [[ "$windows_contract" != *'runs-on: windows-2025'* ]] \
+  || [[ "$windows_contract" != *'dtolnay/rust-toolchain@1.98.0'* ]] \
+  || [[ "$windows_contract" != *'rustc 1.98.0'* ]] \
+  || [[ "$windows_contract" != *'rustfmt 1.9.0-'* ]] \
+  || [[ "$windows_contract" != *'cargo fmt --all -- --check'* ]]; then
+  echo "$ci_workflow must keep a narrow Windows Rust 1.98/rustfmt contract job" >&2
+  exit 1
+fi
+
+if grep -Eq 'cargo (build|check|clippy|run|test)' <<<"$windows_contract"; then
+  echo "$ci_workflow must not compile or run Finch in its Windows formatting contract" >&2
+  exit 1
+fi
+
+if awk '
+  /matrix:/ { in_matrix = 1 }
+  in_matrix && /steps:/ { in_matrix = 0 }
+  in_matrix && /windows-/ { found = 1 }
+  END { exit !found }
+' "$ci_workflow"; then
+  echo "$ci_workflow must not claim unsupported Windows Finch build/test coverage" >&2
+  exit 1
+fi
+
 actual_rustc=$(rustc --version)
 if [[ "$actual_rustc" != "rustc $expected_toolchain "* ]]; then
   echo "expected rustc $expected_toolchain, found: $actual_rustc" >&2

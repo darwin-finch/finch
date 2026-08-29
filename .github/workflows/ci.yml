@@ -27,6 +27,27 @@ jobs:
     - name: Verify pinned toolchain and clean-checkout formatting
       run: tests/toolchain_contract.sh
 
+  windows-format-contract:
+    name: Toolchain and formatting contract (Windows)
+    runs-on: windows-2025
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+      with:
+        components: rustfmt
+
+    - name: Verify pinned Rust and rustfmt versions
+      shell: pwsh
+      run: |
+        if (-not ((rustc --version) -like "rustc 1.98.0 *")) { exit 1 }
+        if (-not ((rustfmt --version) -like "rustfmt 1.9.0-*")) { exit 1 }
+
+    - name: Verify clean-checkout formatting
+      run: cargo fmt --all -- --check
+
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
     runs-on: ${{ matrix.os }}
@@ -47,12 +68,6 @@ jobs:
           - os: macos-14
             feature_name: no-default-features
             cargo_args: --no-default-features
-          - os: windows-2025
-            feature_name: default
-            cargo_args: ""
-          - os: windows-2025
-            feature_name: no-default-features
-            cargo_args: --no-default-features
 
     steps:
     - name: Checkout code
@@ -65,10 +80,6 @@ jobs:
     - name: Install capnproto (macOS)
       if: runner.os == 'macOS'
       run: brew install capnp
-
-    - name: Install capnproto (Windows)
-      if: runner.os == 'Windows'
-      run: choco install capnproto -y --no-progress
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
