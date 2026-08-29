@@ -10,9 +10,9 @@ ready. See [Current limitations](#current-limitations) before relying on it.
 
 ## Quick start from source
 
-The most reliable way to try the current code is to build a clean checkout. Supported CI targets
-are Apple Silicon macOS and x86-64 Linux. Install Rustup, Git, and the Cap'n Proto compiler first;
-the checkout selects the repository-pinned Rust 1.98.0 toolchain.
+The most reliable way to try the current code is to build a clean checkout. Release artifacts target
+Apple Silicon macOS and x86-64 Linux; CI additionally checks Windows. Install Rustup, Git, and the
+Cap'n Proto compiler first; the checkout selects the repository-pinned Rust 1.98.0 toolchain.
 
 macOS (Apple Silicon):
 
