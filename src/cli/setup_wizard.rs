@@ -9354,7 +9354,6 @@ mod tests {
             &mut state,
             &profile,
             discovered_catalog(&profile, &["stale-model"]),
-            None,
         );
         let generation_before = match state.sections.get(&WizardSection::Models) {
             Some(SectionState::Models {
