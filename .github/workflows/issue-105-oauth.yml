@@ -27,6 +27,6 @@ jobs:
       - name: Compile library tests
         run: cargo test --lib --no-run
       - name: Provider-neutral OAuth regressions
-        run: cargo test --lib oauth::
+        run: "cargo test --lib oauth::"
       - name: ChatGPT OAuth adapter regressions
-        run: cargo test --lib providers::chatgpt_oauth::
+        run: "cargo test --lib providers::chatgpt_oauth::"
