@@ -374,11 +374,16 @@ pub trait OAuthCredentialStore: Send + Sync {
 /// refresh, recovery, and logout. It never refreshes or contacts a provider.
 pub struct StoredOAuthCredentialResolver<S> {
     store: Arc<S>,
+    descriptor: OAuthDialectDescriptor,
 }
 
 impl<S> StoredOAuthCredentialResolver<S> {
-    pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<S>, descriptor: &OAuthDialectDescriptor) -> Result<Self> {
+        descriptor.validate()?;
+        Ok(Self {
+            store,
+            descriptor: descriptor.clone(),
+        })
     }
 }
 
@@ -404,7 +409,8 @@ where
             .store
             .load(reference)?
             .context("named OAuth credential secret is missing; sign in explicitly")?;
-        if record.provider != credential.provider
+        if !record_matches_descriptor(&record, &self.descriptor)
+            || record.provider != credential.provider
             || record.kind != credential.kind
             || record.issuer != credential.issuer
             || record.audience != credential.audience
@@ -701,6 +707,7 @@ where
             .store
             .load(reference)?
             .context("named OAuth credential is missing")?;
+        self.validate_record_binding(&current)?;
         let token = current
             .refresh_token
             .as_deref()
@@ -731,6 +738,7 @@ where
             .store
             .load(reference)?
             .context("named OAuth credential is missing")?;
+        self.validate_record_binding(&current)?;
         if !current.mutation_pending {
             bail!("OAuth credential has no interrupted mutation to recover");
         }
@@ -751,17 +759,8 @@ where
         record: &OAuthTokenRecord,
         previous: Option<&OAuthTokenRecord>,
     ) -> Result<()> {
-        let descriptor = self.dialect.descriptor();
-        if record.dialect_id != descriptor.dialect_id
-            || record.protocol_revision != descriptor.protocol_revision
-            || record.provider != descriptor.provider
-            || (record.kind != descriptor.credential_kind
-                && Some(record.kind) != descriptor.browser_credential_kind)
-            || record.issuer != descriptor.issuer
-            || record.audience != descriptor.audience
-            || record.client_id != descriptor.client_id
-            || !descriptor.scopes.is_subset(&record.scopes)
-        {
+        self.validate_record_binding(record)?;
+        if !self.dialect.descriptor().scopes.is_subset(&record.scopes) {
             bail!("OAuth token binding does not match the selected provider dialect");
         }
         if record.account.trim().is_empty()
@@ -780,6 +779,13 @@ where
             {
                 bail!("OAuth refresh changed the bound account identity");
             }
+        }
+        Ok(())
+    }
+
+    fn validate_record_binding(&self, record: &OAuthTokenRecord) -> Result<()> {
+        if !record_matches_descriptor(record, self.dialect.descriptor()) {
+            bail!("OAuth token binding does not match the selected provider dialect");
         }
         Ok(())
     }
@@ -809,6 +815,21 @@ where
         .await
         .context("OAuth request timed out")?
     }
+}
+
+fn record_matches_descriptor(
+    record: &OAuthTokenRecord,
+    descriptor: &OAuthDialectDescriptor,
+) -> bool {
+    record.dialect_id == descriptor.dialect_id
+        && record.protocol_revision == descriptor.protocol_revision
+        && record.provider == descriptor.provider
+        && (record.kind == descriptor.credential_kind
+            || Some(record.kind) == descriptor.browser_credential_kind)
+        && record.issuer == descriptor.issuer
+        && record.audience == descriptor.audience
+        && record.client_id == descriptor.client_id
+        && descriptor.scopes.is_subset(&record.scopes)
 }
 
 fn bounded_poll_interval(advertised: Duration) -> Duration {

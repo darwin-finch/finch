@@ -659,7 +659,7 @@ fn saved_oauth_tokens_project_through_174_binding_and_resolve_only_exact_account
         .lock()
         .unwrap()
         .insert("chatgpt:work".into(), record);
-    let resolver = StoredOAuthCredentialResolver::new(store.clone());
+    let resolver = StoredOAuthCredentialResolver::new(store.clone(), &dialect.descriptor).unwrap();
     assert_eq!(
         resolver.resolve(&credential).unwrap().credential_name,
         "chatgpt:work"
@@ -669,4 +669,48 @@ fn saved_oauth_tokens_project_through_174_binding_and_resolve_only_exact_account
     let error = resolver.resolve(&wrong).unwrap_err().to_string();
     assert!(error.contains("metadata or lifecycle"));
     assert!(!error.contains("alpha-access-secret"));
+}
+
+#[tokio::test]
+async fn foreign_dialect_cannot_resolve_revoke_or_recover_a_stored_token() {
+    let server = FakeServer::start().await;
+    let alpha = SyntheticDialect::new(&server.origin, "alpha");
+    let beta = SyntheticDialect::new(&server.origin, "beta");
+    let mut record = alpha
+        .validate_tokens(
+            StatusCode::OK,
+            token_body("alpha", "account-one", "refresh-one"),
+            None,
+            &TokenValidationContext::Device,
+        )
+        .unwrap();
+    let credential = record.provider_credential("chatgpt:work");
+    let store = Arc::new(MemoryStore::default());
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert("chatgpt:work".into(), record.clone());
+
+    let resolver = StoredOAuthCredentialResolver::new(store.clone(), &beta.descriptor).unwrap();
+    assert!(resolver.resolve(&credential).is_err());
+    let client = OAuthClient::new(Arc::new(beta), store.clone()).unwrap();
+    assert!(client.revoke("chatgpt:work").await.is_err());
+    assert_eq!(server.request_count("/beta/revoke"), 0);
+    assert_eq!(
+        store.0.lock().unwrap()["chatgpt:work"].generation,
+        record.generation
+    );
+
+    record.mutation_pending = true;
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert("chatgpt:work".into(), record.clone());
+    assert!(client
+        .recover_interrupted_as_revoked("chatgpt:work")
+        .is_err());
+    let unchanged = &store.0.lock().unwrap()["chatgpt:work"];
+    assert!(unchanged.mutation_pending && !unchanged.revoked);
 }
