@@ -10723,18 +10723,26 @@ mod tests {
 
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert!(snapshot.effect_audits.iter().any(|entry|
-            entry.intent.identity == unbegun
+        assert!(snapshot
+            .effect_audits
+            .iter()
+            .any(|entry| entry.intent.identity == unbegun
                 && matches!(entry.state,
                     crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
-                    })));
-        assert!(snapshot.effect_audits.iter().any(|entry|
-            entry.intent.identity == begun
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted {
+                            ref outcome_kind, ..
+                        }
+                    } if outcome_kind == "abandoned_not_applied")));
+        assert!(snapshot
+            .effect_audits
+            .iter()
+            .any(|entry| entry.intent.identity == begun
                 && matches!(entry.state,
                     crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
-                    })));
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted {
+                            ref outcome_kind, ..
+                        }
+                    } if outcome_kind == "uncertain_process_loss")));
     }
 
     #[test]

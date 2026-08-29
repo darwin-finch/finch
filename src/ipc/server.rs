@@ -3901,8 +3901,8 @@ mod tests {
                 );
                 assert!(matches!(replayed.effect_audits[0].state,
                     crate::runtime::effect_log::EffectAuditState::Terminal {
-                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
-                            ref outcome_kind
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted {
+                            ref outcome_kind, ..
                         }
                     } if outcome_kind == "acknowledged"));
                 assert!(!snapshot.events.iter().any(|event| matches!(
