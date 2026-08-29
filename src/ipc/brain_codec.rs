@@ -946,7 +946,9 @@ pub(super) fn encode_snapshot(
     for (index, task) in snapshot.tasks.iter().enumerate() {
         encode_task(tasks.reborrow().get(index as u32), task);
     }
-    let mut audits = builder.reborrow().init_effect_audits(snapshot.effect_audits.len() as u32);
+    let mut audits = builder
+        .reborrow()
+        .init_effect_audits(snapshot.effect_audits.len() as u32);
     for (index, audit) in snapshot.effect_audits.iter().enumerate() {
         audits.set(index as u32, &serde_json::to_string(audit)?);
     }
@@ -991,10 +993,14 @@ pub(super) fn decode_snapshot(
         .iter()
         .map(decode_task)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let effect_audits = reader.get_effect_audits()?.iter().map(|encoded| {
-        let encoded = encoded?.to_str()?;
-        serde_json::from_str(encoded).map_err(anyhow::Error::from)
-    }).collect::<anyhow::Result<Vec<_>>>()?;
+    let effect_audits = reader
+        .get_effect_audits()?
+        .iter()
+        .map(|encoded| {
+            let encoded = encoded?.to_str()?;
+            serde_json::from_str(encoded).map_err(anyhow::Error::from)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(BrainSnapshot {
         brain_id: parse_brain_id(reader.get_brain_id()?)?,
         name: text(reader.get_name()?)?,

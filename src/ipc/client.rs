@@ -769,9 +769,8 @@ struct BrainRunnerImpl {
 fn effect_audit_reservation_proxy(
     reservation: finch_ipc_capnp::brain_effect_reservation::Client,
 ) -> crate::server::RunnerEffectAuditReservation {
-    let (tx, mut rx) = mpsc::unbounded_channel::<
-        crate::server::RunnerEffectAuditReservationRequest,
-    >();
+    let (tx, mut rx) =
+        mpsc::unbounded_channel::<crate::server::RunnerEffectAuditReservationRequest>();
     tokio::task::spawn_local(async move {
         let Some(request) = rx.recv().await else {
             return;
@@ -809,8 +808,7 @@ fn effect_audit_reservation_proxy(
 fn host_effect_permit_proxy(
     permit: finch_ipc_capnp::brain_host_effect_permit::Client,
 ) -> crate::server::RunnerHostEffectPermit {
-    let (tx, mut rx) =
-        mpsc::unbounded_channel::<crate::server::RunnerHostEffectFinishRequest>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::server::RunnerHostEffectFinishRequest>();
     tokio::task::spawn_local(async move {
         let Some(request) = rx.recv().await else {
             return;
@@ -847,8 +845,7 @@ fn host_effect_permit_proxy(
 fn program_effect_audit_proxy(
     control: finch_ipc_capnp::brain_program_control::Client,
 ) -> crate::server::RunnerEffectAuditControl {
-    let (tx, mut rx) =
-        mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
     tokio::task::spawn_local(async move {
         while let Some(request) = rx.recv().await {
             let crate::server::RunnerEffectAuditControlRequest::Reserve {
@@ -880,8 +877,7 @@ fn program_effect_audit_proxy(
 fn turn_effect_audit_proxy(
     control: finch_ipc_capnp::brain_turn_control::Client,
 ) -> crate::server::RunnerEffectAuditControl {
-    let (tx, mut rx) =
-        mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
     tokio::task::spawn_local(async move {
         while let Some(request) = rx.recv().await {
             let crate::server::RunnerEffectAuditControlRequest::Reserve {
@@ -1844,7 +1840,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 4);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 5);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1853,29 +1849,29 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 3,
+                protocol_version: 4,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 3"));
-            assert!(error.contains("requires 4"));
+            assert!(error.contains("protocol 4"));
+            assert!(error.contains("requires 5"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 4,
+                protocol_version: 5,
                 query_calls: std::rc::Rc::clone(&new_daemon_calls),
             });
             let request = daemon.ping_request();
             let reply = request.send().promise.await.unwrap();
             let protocol_version = reply.get().unwrap().get_protocol_version();
-            let error = ensure_protocol_generation(protocol_version, 3)
+            let error = ensure_protocol_generation(protocol_version, 4)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 4"));
-            assert!(error.contains("requires 3"));
+            assert!(error.contains("protocol 5"));
+            assert!(error.contains("requires 4"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);
         }));
