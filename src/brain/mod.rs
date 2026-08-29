@@ -114,10 +114,13 @@ fn duplicate_validated_ipc_listener(
         );
         Ok(value)
     };
+    // macOS can return ENOPROTOOPT for repeated SO_ACCEPTCONN queries on an
+    // inherited AF_UNIX listener. Listening is an availability property; the
+    // signed inode, stream type, and kernel pathname below authenticate the
+    // exact supervisor-created socket without relying on that advisory option.
     anyhow::ensure!(
-        socket_option(nix::libc::SO_TYPE)? == nix::libc::SOCK_STREAM
-            && socket_option(nix::libc::SO_ACCEPTCONN)? != 0,
-        "supervisor IPC descriptor is not a listening Unix stream socket"
+        socket_option(nix::libc::SO_TYPE)? == nix::libc::SOCK_STREAM,
+        "supervisor IPC descriptor is not a Unix stream socket"
     );
     let stat = nix::sys::stat::fstat(fd)?;
     anyhow::ensure!(

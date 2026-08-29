@@ -96,7 +96,7 @@ brain_test_isolation_is_active() {
   # the sealed backups. Bash may use a low descriptor while reading a script,
   # so the parent shell independently checks the backups that production will
   # restore instead of treating Bash's transient low descriptors as authority.
-  perl -MSocket=SOL_SOCKET,SO_TYPE,SO_ACCEPTCONN,SOCK_STREAM,sockaddr_in,inet_ntoa,unpack_sockaddr_un -e '
+  perl -MSocket=SOL_SOCKET,SO_TYPE,SOCK_STREAM,sockaddr_in,inet_ntoa,unpack_sockaddr_un -e '
     sub verify_listener {
       my ($fd, $expected) = @_;
       open(my $socket, "<&$fd") or return 0;
@@ -111,9 +111,7 @@ brain_test_isolation_is_active() {
       my ($fd, $expected_path, $expected_identity) = @_;
       open(my $socket, "<&$fd") or return 0;
       my $type = getsockopt($socket, SOL_SOCKET, SO_TYPE);
-      my $accepting = getsockopt($socket, SOL_SOCKET, SO_ACCEPTCONN);
       return 0 unless defined($type) && unpack("i", $type) == SOCK_STREAM;
-      return 0 unless defined($accepting) && unpack("i", $accepting) != 0;
       my $name = getsockname($socket);
       return 0 unless defined($name) && unpack_sockaddr_un($name) eq $expected_path;
       my @stat = stat($socket);
