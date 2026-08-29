@@ -2429,7 +2429,7 @@ fn decode_runner_turn_event(
 mod tests {
     use super::{
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-        require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
+        require_approval_connection, BrainRpcService, BrainRunnerControlImpl, FinchDaemonImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
 
@@ -2794,7 +2794,7 @@ mod tests {
             Ok(crate::generators::GeneratorResponse {
                 text: String::new(),
                 content_blocks: Vec::new(),
-                tool_uses: vec![crate::tools::types::ToolUse {
+                tool_uses: vec![crate::generators::ToolUse {
                     id: "effect-tool".into(),
                     name: "submit_program".into(),
                     input: self.input.clone(),
