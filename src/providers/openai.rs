@@ -24,6 +24,8 @@ use crate::config::ReasoningEffort;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const ZAI_MAX_IMAGE_BYTES: usize = 5_000_000;
+const ZAI_MAX_IMAGE_URL_BYTES: usize = 8 * 1024;
 const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -36,9 +38,55 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 enum TransportRule {
     /// Current official OpenAI Chat Completions contract for GPT-5.6.
     CanonicalGpt56ChatCompletions,
+    /// Z.ai's documented GLM-5.3-Flash Chat Completions dialect.
+    ZaiGlm53Flash,
     /// Historical OpenAI-compatible shape used by xAI, Groq, Mistral, Ollama,
     /// remote Finch, custom endpoints, and pre-GPT-5.6 OpenAI models.
     CompatibleChatCompletions,
+}
+
+impl TransportRule {
+    fn is_strict(self) -> bool {
+        matches!(
+            self,
+            Self::CanonicalGpt56ChatCompletions | Self::ZaiGlm53Flash
+        )
+    }
+
+    fn exposes_reasoning_content(self) -> bool {
+        self == Self::ZaiGlm53Flash
+    }
+}
+
+fn validate_terminal_reason(
+    rule: TransportRule,
+    reason: &str,
+    has_tool_calls: bool,
+    stream: bool,
+) -> Result<()> {
+    let boundary = if stream { "stream" } else { "response" };
+    match reason {
+        "stop" if !has_tool_calls => Ok(()),
+        "tool_calls" if has_tool_calls => Ok(()),
+        "stop" => anyhow::bail!("OpenAI {boundary} stopped despite containing function calls"),
+        "tool_calls" => {
+            anyhow::bail!("OpenAI {boundary} reported function calls without any call items")
+        }
+        "length" => anyhow::bail!("OpenAI {boundary} reached its output-token limit"),
+        "content_filter" if rule == TransportRule::CanonicalGpt56ChatCompletions => {
+            anyhow::bail!("OpenAI {boundary} was stopped by content filtering")
+        }
+        "sensitive" if rule == TransportRule::ZaiGlm53Flash => {
+            anyhow::bail!("Z.ai {boundary} was stopped by sensitive-content filtering")
+        }
+        "model_context_window_exceeded" if rule == TransportRule::ZaiGlm53Flash => {
+            anyhow::bail!("Z.ai {boundary} exceeded the model context window")
+        }
+        "network_error" if rule == TransportRule::ZaiGlm53Flash => {
+            anyhow::bail!("Z.ai {boundary} ended with a provider network error")
+        }
+        _ => anyhow::bail!("OpenAI {boundary} returned an unknown terminal status"),
+    }
 }
 
 /// Parse an API error body and return a human-friendly message with hints.
@@ -71,7 +119,27 @@ fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
     format!("API error {}{}: {}", status, hint, msg)
 }
 
-fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
+fn validate_image_source(source: &ImageSource, rule: TransportRule) -> Result<OpenAIImageUrl> {
+    if rule == TransportRule::ZaiGlm53Flash && source.source_type == "url" {
+        if source.data.len() > ZAI_MAX_IMAGE_URL_BYTES {
+            anyhow::bail!("Z.ai image URL exceeded the 8 KiB limit");
+        }
+        let parsed =
+            reqwest::Url::parse(&source.data).context("Z.ai image URL was not an absolute URL")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            anyhow::bail!(
+                "Z.ai image URL must be an absolute HTTP(S) URL without credentials or a fragment"
+            );
+        }
+        return Ok(OpenAIImageUrl {
+            url: source.data.clone(),
+        });
+    }
     if source.source_type != "base64" {
         anyhow::bail!("OpenAI images must use a base64 source");
     }
@@ -80,20 +148,60 @@ fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
         "image/jpeg" => validate_jpeg,
         _ => anyhow::bail!("OpenAI image media type is unsupported; expected PNG or JPEG"),
     };
-    let max_base64_bytes = MAX_IMAGE_BYTES.div_ceil(3).saturating_mul(4);
+    let image_limit = if rule == TransportRule::ZaiGlm53Flash {
+        ZAI_MAX_IMAGE_BYTES
+    } else {
+        MAX_IMAGE_BYTES
+    };
+    let max_base64_bytes = image_limit.div_ceil(3).saturating_mul(4);
     if source.data.len() > max_base64_bytes {
-        anyhow::bail!("OpenAI image exceeded the 8 MB encoded-image limit");
+        anyhow::bail!("provider image exceeded its encoded-image limit");
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&source.data)
         .context("OpenAI image contained invalid base64")?;
-    if bytes.len() > MAX_IMAGE_BYTES {
+    if bytes.len() >= image_limit && rule == TransportRule::ZaiGlm53Flash {
+        anyhow::bail!("Z.ai image must be smaller than 5 MB");
+    }
+    if bytes.len() > image_limit {
         anyhow::bail!("OpenAI image exceeded the 8 MB encoded-image limit");
     }
     validator(&bytes)?;
     Ok(OpenAIImageUrl {
         url: format!("data:{};base64,{}", source.media_type, source.data),
     })
+}
+
+fn validate_zai_function_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("Z.ai function name must match ^[a-zA-Z0-9_-]+$ and contain 1 to 64 bytes");
+    }
+    Ok(())
+}
+
+fn validate_zai_tool_schema(schema: &crate::tools::types::ToolInputSchema) -> Result<()> {
+    if schema.schema_type != "object" {
+        anyhow::bail!("Z.ai function parameters must declare an object JSON Schema");
+    }
+    let properties = schema
+        .properties
+        .as_object()
+        .context("Z.ai function schema properties were not an object")?;
+    let mut required = std::collections::BTreeSet::new();
+    for name in &schema.required {
+        if !required.insert(name.as_str()) {
+            anyhow::bail!("Z.ai function schema contained a duplicate required property");
+        }
+        if !properties.contains_key(name) {
+            anyhow::bail!("Z.ai function schema required a property it did not define");
+        }
+    }
+    Ok(())
 }
 
 fn validate_png(bytes: &[u8]) -> Result<()> {
@@ -300,7 +408,7 @@ async fn read_api_error(
         }
         body.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
     }
-    if rule == TransportRule::CanonicalGpt56ChatCompletions {
+    if rule.is_strict() {
         // Upstream error bodies can reflect prompts or tool arguments. They are
         // deliberately consumed with a bound but never surfaced or logged.
         return friendly_api_error(status, "response body redacted");
@@ -321,13 +429,12 @@ async fn read_bounded_response_body(response: reqwest::Response) -> Result<Vec<u
     Ok(body)
 }
 
-fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
+fn validate_strict_response_shape(value: &serde_json::Value, rule: TransportRule) -> Result<()> {
     let root = value
         .as_object()
         .context("OpenAI response was not a JSON object")?;
-    reject_unknown_keys(
-        root,
-        &[
+    let response_fields = match rule {
+        TransportRule::CanonicalGpt56ChatCompletions => vec![
             "id",
             "object",
             "created",
@@ -337,8 +444,21 @@ fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
             "service_tier",
             "system_fingerprint",
         ],
-        "response",
-    )?;
+        TransportRule::ZaiGlm53Flash => vec![
+            "id",
+            "request_id",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "web_search",
+        ],
+        TransportRule::CompatibleChatCompletions => unreachable!("strict response rule"),
+    };
+    reject_unknown_keys(root, &response_fields, "response")?;
+    if rule == TransportRule::ZaiGlm53Flash {
+        validate_zai_usage_and_search(root)?;
+    }
     let choices = root
         .get("choices")
         .and_then(serde_json::Value::as_array)
@@ -347,20 +467,22 @@ fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
         let choice = choice
             .as_object()
             .context("OpenAI response choice was not an object")?;
-        reject_unknown_keys(
-            choice,
-            &["index", "message", "finish_reason", "logprobs"],
-            "response choice",
-        )?;
+        let choice_fields: &[&str] = if rule == TransportRule::ZaiGlm53Flash {
+            &["index", "message", "finish_reason"]
+        } else {
+            &["index", "message", "finish_reason", "logprobs"]
+        };
+        reject_unknown_keys(choice, choice_fields, "response choice")?;
         let message = choice
             .get("message")
             .and_then(serde_json::Value::as_object)
             .context("OpenAI response choice omitted a valid message")?;
-        reject_unknown_keys(
-            message,
-            &["role", "content", "tool_calls", "refusal", "annotations"],
-            "response message",
-        )?;
+        let message_fields = if rule == TransportRule::ZaiGlm53Flash {
+            vec!["role", "content", "tool_calls", "reasoning_content"]
+        } else {
+            vec!["role", "content", "tool_calls", "refusal", "annotations"]
+        };
+        reject_unknown_keys(message, &message_fields, "response message")?;
         if message.get("refusal").is_some_and(|value| !value.is_null()) {
             anyhow::bail!("OpenAI response contained an unsupported refusal item");
         }
@@ -384,7 +506,60 @@ fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
                     .and_then(serde_json::Value::as_object)
                     .context("OpenAI response tool call omitted a function object")?;
                 reject_unknown_keys(function, &["name", "arguments"], "tool function")?;
+                if rule == TransportRule::ZaiGlm53Flash {
+                    let name = function
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .context("Z.ai response tool call omitted a function name")?;
+                    validate_zai_function_name(name)?;
+                }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_zai_usage_and_search(root: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    if let Some(usage) = root.get("usage") {
+        let usage = usage.as_object().context("Z.ai usage was not an object")?;
+        reject_unknown_keys(
+            usage,
+            &[
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+                "total_tokens",
+            ],
+            "usage",
+        )?;
+        if let Some(details) = usage.get("prompt_tokens_details") {
+            let details = details
+                .as_object()
+                .context("Z.ai prompt token details was not an object")?;
+            reject_unknown_keys(details, &["cached_tokens"], "prompt token details")?;
+        }
+    }
+    if let Some(search) = root.get("web_search") {
+        let search = search
+            .as_array()
+            .context("Z.ai web_search was not an array")?;
+        for item in search {
+            let item = item
+                .as_object()
+                .context("Z.ai web_search item was not an object")?;
+            reject_unknown_keys(
+                item,
+                &[
+                    "title",
+                    "content",
+                    "link",
+                    "media",
+                    "icon",
+                    "refer",
+                    "publish_date",
+                ],
+                "web search item",
+            )?;
         }
     }
     Ok(())
@@ -420,13 +595,12 @@ fn reject_unknown_keys(
     Ok(())
 }
 
-fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
+fn validate_strict_chunk_shape(value: &serde_json::Value, rule: TransportRule) -> Result<()> {
     let root = value
         .as_object()
         .context("OpenAI stream event was not a JSON object")?;
-    reject_unknown_keys(
-        root,
-        &[
+    let event_fields = match rule {
+        TransportRule::CanonicalGpt56ChatCompletions => vec![
             "id",
             "object",
             "created",
@@ -436,8 +610,21 @@ fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
             "choices",
             "usage",
         ],
-        "event",
-    )?;
+        TransportRule::ZaiGlm53Flash => vec![
+            "id",
+            "request_id",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "web_search",
+        ],
+        TransportRule::CompatibleChatCompletions => unreachable!("strict stream rule"),
+    };
+    reject_unknown_keys(root, &event_fields, "event")?;
+    if rule == TransportRule::ZaiGlm53Flash {
+        validate_zai_usage_and_search(root)?;
+    }
     let choices = root
         .get("choices")
         .and_then(serde_json::Value::as_array)
@@ -446,16 +633,21 @@ fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
         let choice = choice
             .as_object()
             .context("OpenAI stream choice was not an object")?;
-        reject_unknown_keys(
-            choice,
-            &["index", "delta", "finish_reason", "logprobs"],
-            "choice",
-        )?;
+        let choice_fields: &[&str] = if rule == TransportRule::ZaiGlm53Flash {
+            &["index", "delta", "finish_reason"]
+        } else {
+            &["index", "delta", "finish_reason", "logprobs"]
+        };
+        reject_unknown_keys(choice, choice_fields, "choice")?;
         let delta = choice
             .get("delta")
             .and_then(serde_json::Value::as_object)
             .context("OpenAI stream choice omitted a valid delta object")?;
-        reject_unknown_keys(delta, &["role", "content", "tool_calls"], "delta")?;
+        let mut delta_fields = vec!["role", "content", "tool_calls"];
+        if rule.exposes_reasoning_content() {
+            delta_fields.push("reasoning_content");
+        }
+        reject_unknown_keys(delta, &delta_fields, "delta")?;
         if let Some(tool_calls) = delta.get("tool_calls") {
             let tool_calls = tool_calls
                 .as_array()
@@ -474,6 +666,12 @@ fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
                         .as_object()
                         .context("OpenAI stream function delta was not an object")?;
                     reject_unknown_keys(function, &["name", "arguments"], "function delta")?;
+                    if rule == TransportRule::ZaiGlm53Flash {
+                        if let Some(name) = function.get("name").and_then(serde_json::Value::as_str)
+                        {
+                            validate_zai_function_name(name)?;
+                        }
+                    }
                 }
             }
         }
@@ -481,16 +679,30 @@ fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result<Vec<StreamChunk>> {
+fn strict_stream_data(
+    state: &mut CanonicalStreamState,
+    data: &str,
+    rule: TransportRule,
+) -> Result<Vec<StreamChunk>> {
     if state.done {
         anyhow::bail!("OpenAI stream sent data after its terminal marker");
     }
     let value: serde_json::Value =
         serde_json::from_str(data).context("OpenAI stream contained malformed JSON")?;
-    validate_canonical_chunk_shape(&value)?;
+    validate_strict_chunk_shape(&value, rule)?;
     let chunk: OpenAIStreamChunk = serde_json::from_value(value)
         .context("OpenAI stream event did not match the documented schema")?;
-    if chunk.object.as_deref() != Some("chat.completion.chunk") {
+    let object_valid = match rule {
+        TransportRule::CanonicalGpt56ChatCompletions => {
+            chunk.object.as_deref() == Some("chat.completion.chunk")
+        }
+        TransportRule::ZaiGlm53Flash => chunk
+            .object
+            .as_deref()
+            .is_none_or(|object| object == "chat.completion.chunk"),
+        TransportRule::CompatibleChatCompletions => unreachable!("strict parser rule"),
+    };
+    if !object_valid {
         anyhow::bail!("OpenAI stream contained an unknown event object");
     }
     if let Some(id) = &state.response_id {
@@ -520,11 +732,18 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
             model: chunk.model.clone(),
         });
     }
-    let usage_seen_in_chunk = chunk.usage.is_some();
-    if let Some(usage) = chunk.usage {
-        if !chunk.choices.is_empty() {
-            anyhow::bail!("OpenAI stream attached usage to a choice chunk");
-        }
+    let usage = chunk.usage;
+    let usage_seen_in_chunk = usage.is_some();
+    if rule == TransportRule::CanonicalGpt56ChatCompletions
+        && usage_seen_in_chunk
+        && !chunk.choices.is_empty()
+    {
+        anyhow::bail!("OpenAI stream attached usage to a choice chunk");
+    }
+    if chunk.choices.is_empty() {
+        let Some(usage) = usage else {
+            anyhow::bail!("OpenAI stream chunk had neither a choice nor usage");
+        };
         if state.terminal_reason.is_none() {
             anyhow::bail!("OpenAI stream reported usage before terminal status");
         }
@@ -535,11 +754,6 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         output.push(StreamChunk::Usage {
             input_tokens: usage.prompt_tokens,
         });
-    }
-    if chunk.choices.is_empty() {
-        if !usage_seen_in_chunk {
-            anyhow::bail!("OpenAI stream chunk had neither a choice nor usage");
-        }
         return Ok(output);
     }
     if chunk.choices.len() != 1 || chunk.choices[0].index != 0 {
@@ -560,6 +774,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     if choice.delta.role.is_none()
         && choice.delta.content.is_none()
         && choice.delta.tool_calls.is_none()
+        && choice.delta.reasoning_content.is_none()
         && choice.finish_reason.is_none()
     {
         anyhow::bail!("OpenAI stream returned an empty non-terminal delta");
@@ -623,29 +838,31 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         if state.terminal_reason.replace(reason.clone()).is_some() {
             anyhow::bail!("OpenAI stream sent duplicate terminal status");
         }
-        match reason.as_str() {
-            "stop" if state.tool_calls.is_empty() => {}
-            "tool_calls" if !state.tool_calls.is_empty() => {}
-            "stop" => anyhow::bail!("OpenAI stream stopped despite containing function calls"),
-            "tool_calls" => {
-                anyhow::bail!("OpenAI stream reported function calls without any call items")
-            }
-            "length" => anyhow::bail!("OpenAI stream reached its output-token limit"),
-            "content_filter" => anyhow::bail!("OpenAI stream was stopped by content filtering"),
-            _ => anyhow::bail!("OpenAI stream returned an unknown terminal status"),
+        validate_terminal_reason(rule, reason, !state.tool_calls.is_empty(), true)?;
+    }
+    if let Some(usage) = usage {
+        if state.terminal_reason.is_none() {
+            anyhow::bail!("OpenAI stream reported usage before terminal status");
         }
+        if state.usage_seen {
+            anyhow::bail!("OpenAI stream reported duplicate usage");
+        }
+        state.usage_seen = true;
+        output.push(StreamChunk::Usage {
+            input_tokens: usage.prompt_tokens,
+        });
     }
     Ok(output)
 }
 
-fn mark_canonical_done(state: &mut CanonicalStreamState) -> Result<()> {
+fn mark_strict_done(state: &mut CanonicalStreamState, rule: TransportRule) -> Result<()> {
     if state.done {
         anyhow::bail!("OpenAI stream sent duplicate terminal marker");
     }
     if state.terminal_reason.is_none() {
         anyhow::bail!("OpenAI stream ended before terminal status");
     }
-    if !state.usage_seen {
+    if rule == TransportRule::CanonicalGpt56ChatCompletions && !state.usage_seen {
         anyhow::bail!("OpenAI stream ended without its requested usage chunk");
     }
     state.done = true;
@@ -679,8 +896,9 @@ fn sse_line_prefix_exceeds_limit(buffer: &[u8]) -> bool {
     }
 }
 
-fn spawn_canonical_stream_parser(
+fn spawn_strict_stream_parser(
     response: reqwest::Response,
+    rule: TransportRule,
 ) -> mpsc::Receiver<Result<StreamChunk>> {
     let (tx, rx) = mpsc::channel(100);
     tokio::spawn(async move {
@@ -795,7 +1013,7 @@ fn spawn_canonical_stream_parser(
                 };
                 let data = data.strip_prefix(' ').unwrap_or(data);
                 if data == "[DONE]" {
-                    if let Err(error) = mark_canonical_done(&mut state) {
+                    if let Err(error) = mark_strict_done(&mut state, rule) {
                         if !tx.is_closed() {
                             let _ = tx.send(Err(error)).await;
                         }
@@ -811,7 +1029,7 @@ fn spawn_canonical_stream_parser(
                     }
                     continue;
                 }
-                match canonical_stream_data(&mut state, data) {
+                match strict_stream_data(&mut state, data, rule) {
                     Ok(chunks) => {
                         for chunk in chunks {
                             if tx.send(Ok(chunk)).await.is_err() {
@@ -903,6 +1121,48 @@ fn finalize_tool_calls(
         .collect()
 }
 
+fn parse_nonstream_tool_arguments(
+    arguments: serde_json::Value,
+    rule: TransportRule,
+) -> Result<serde_json::Value> {
+    let strict = |encoded: &str| -> Result<serde_json::Value> {
+        if encoded.len() > MAX_TOOL_ARGUMENT_BYTES {
+            anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+        }
+        let value: serde_json::Value = serde_json::from_str(encoded)
+            .context("OpenAI returned malformed JSON function arguments")?;
+        if !value.is_object() {
+            anyhow::bail!("OpenAI function arguments were not a JSON object");
+        }
+        Ok(value)
+    };
+    match rule {
+        TransportRule::CanonicalGpt56ChatCompletions => {
+            let encoded = arguments
+                .as_str()
+                .context("OpenAI function arguments were not a JSON string")?;
+            strict(encoded)
+        }
+        TransportRule::ZaiGlm53Flash => match arguments {
+            serde_json::Value::String(encoded) => strict(&encoded),
+            value @ serde_json::Value::Object(_) => {
+                if serde_json::to_vec(&value)?.len() > MAX_TOOL_ARGUMENT_BYTES {
+                    anyhow::bail!("Z.ai function arguments exceeded the 1 MiB limit");
+                }
+                Ok(value)
+            }
+            _ => anyhow::bail!("Z.ai function arguments were not a JSON object or string"),
+        },
+        TransportRule::CompatibleChatCompletions => match arguments {
+            serde_json::Value::String(encoded) => {
+                Ok(serde_json::from_str(&encoded).unwrap_or_else(|_| serde_json::json!({})))
+            }
+            serde_json::Value::Object(_) => Ok(arguments),
+            _ => Ok(serde_json::json!({})),
+        },
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// OpenAI API provider
@@ -917,6 +1177,7 @@ pub struct OpenAIProvider {
     provider_name: String,
     reasoning_effort: Option<ReasoningEffort>,
     canonical_openai_endpoint: bool,
+    canonical_zai_endpoint: bool,
 }
 
 impl OpenAIProvider {
@@ -974,6 +1235,18 @@ impl OpenAIProvider {
             "/openai/v1/models",
             "openai/gpt-oss-120b".to_string(),
             "groq".to_string(),
+        )
+    }
+
+    /// Create a Z.ai GLM-5.3-Flash provider using Z.ai's explicit dialect.
+    pub fn new_zai(api_key: String) -> Result<Self> {
+        Self::new(
+            api_key,
+            "https://api.z.ai/api/paas/v4".to_string(),
+            "/chat/completions",
+            "/models",
+            "glm-5.3-flash".to_string(),
+            "zai".to_string(),
         )
     }
 
@@ -1056,6 +1329,9 @@ impl OpenAIProvider {
         let canonical_openai_endpoint = provider_name == "openai"
             && endpoints.chat_url == "https://api.openai.com/v1/chat/completions"
             && endpoints.models_url == "https://api.openai.com/v1/models";
+        let canonical_zai_endpoint = provider_name == "zai"
+            && endpoints.chat_url == "https://api.z.ai/api/paas/v4/chat/completions"
+            && endpoints.models_url == "https://api.z.ai/api/paas/v4/models";
 
         Ok(Self {
             client,
@@ -1065,10 +1341,16 @@ impl OpenAIProvider {
             provider_name,
             reasoning_effort: None,
             canonical_openai_endpoint,
+            canonical_zai_endpoint,
         })
     }
 
     fn transport_rule(&self, model: &str) -> TransportRule {
+        // Z.ai is a first-class dialect, never a permissive OpenAI-compatible
+        // alias. Model validity is checked while constructing the request.
+        if self.provider_name == "zai" {
+            return TransportRule::ZaiGlm53Flash;
+        }
         if self.canonical_openai_endpoint && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
             return TransportRule::CanonicalGpt56ChatCompletions;
         }
@@ -1082,6 +1364,9 @@ impl OpenAIProvider {
         } else {
             request.model.clone()
         };
+        if self.provider_name == "zai" && model != "glm-5.3-flash" {
+            anyhow::bail!("Z.ai's strict Finch transport currently supports only glm-5.3-flash");
+        }
         let rule = self.transport_rule(&model);
 
         let mut messages: Vec<OpenAIMessage> = Vec::new();
@@ -1090,7 +1375,9 @@ impl OpenAIProvider {
             messages.push(OpenAIMessage::Regular {
                 role: match rule {
                     TransportRule::CanonicalGpt56ChatCompletions => "developer",
-                    TransportRule::CompatibleChatCompletions => "system",
+                    TransportRule::ZaiGlm53Flash | TransportRule::CompatibleChatCompletions => {
+                        "system"
+                    }
                 }
                 .to_string(),
                 content: OpenAIMessageContent::Text(system.clone()),
@@ -1102,7 +1389,7 @@ impl OpenAIProvider {
         for msg in &request.messages {
             match msg.role.as_str() {
                 "assistant" => {
-                    if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                    if rule.is_strict() {
                         for block in &msg.content {
                             match block {
                                 ContentBlock::Text { .. } => {}
@@ -1142,22 +1429,26 @@ impl OpenAIProvider {
                         .content
                         .iter()
                         .filter_map(|b| match b {
-                            ContentBlock::ToolUse { id, name, input } => {
-                                let arguments = serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                Some(OpenAIRequestToolCall {
-                                    id: id.clone(),
-                                    tool_type: "function".to_string(),
-                                    function: OpenAIRequestFunction {
-                                        name: name.clone(),
-                                        arguments,
-                                    },
-                                })
-                            }
+                            ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
                             _ => None,
                         })
-                        .collect();
-                    if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                        .map(|(id, name, input)| {
+                            if rule == TransportRule::ZaiGlm53Flash {
+                                validate_zai_function_name(name)?;
+                            }
+                            let arguments = serde_json::to_string(input)
+                                .context("function-call arguments could not be serialized")?;
+                            Ok(OpenAIRequestToolCall {
+                                id: id.clone(),
+                                tool_type: "function".to_string(),
+                                function: OpenAIRequestFunction {
+                                    name: name.clone(),
+                                    arguments,
+                                },
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if rule.is_strict() {
                         for call in &tool_calls {
                             if call.id.is_empty() || call.function.name.is_empty() {
                                 anyhow::bail!(
@@ -1190,7 +1481,7 @@ impl OpenAIProvider {
                     });
                 }
                 _ => {
-                    if rule == TransportRule::CanonicalGpt56ChatCompletions && msg.role != "user" {
+                    if rule.is_strict() && msg.role != "user" {
                         anyhow::bail!("OpenAI request contained an unsupported message role");
                     }
                     // user/developer messages: keep ordered multimodal content for canonical
@@ -1213,9 +1504,10 @@ impl OpenAIProvider {
                                 tool_results.push((tool_use_id.clone(), content.clone()));
                             }
                             ContentBlock::Image { source } => match rule {
-                                TransportRule::CanonicalGpt56ChatCompletions => {
+                                TransportRule::CanonicalGpt56ChatCompletions
+                                | TransportRule::ZaiGlm53Flash => {
                                     content_parts.push(OpenAIContentPart::ImageUrl {
-                                        image_url: validate_image_source(source)?,
+                                        image_url: validate_image_source(source, rule)?,
                                     });
                                 }
                                 TransportRule::CompatibleChatCompletions => {
@@ -1223,7 +1515,7 @@ impl OpenAIProvider {
                                 }
                             },
                             ContentBlock::ToolUse { .. } => {
-                                if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                                if rule.is_strict() {
                                     anyhow::bail!(
                                         "OpenAI user message contained an unsupported content block"
                                     );
@@ -1232,10 +1524,7 @@ impl OpenAIProvider {
                         }
                     }
 
-                    if rule == TransportRule::CanonicalGpt56ChatCompletions
-                        && !content_parts.is_empty()
-                        && !tool_results.is_empty()
-                    {
+                    if rule.is_strict() && !content_parts.is_empty() && !tool_results.is_empty() {
                         anyhow::bail!(
                             "OpenAI user messages cannot mix tool results with user content"
                         );
@@ -1243,6 +1532,13 @@ impl OpenAIProvider {
 
                     let content = match rule {
                         TransportRule::CanonicalGpt56ChatCompletions => {
+                            if content_parts.is_empty() {
+                                None
+                            } else {
+                                Some(OpenAIMessageContent::Parts(content_parts))
+                            }
+                        }
+                        TransportRule::ZaiGlm53Flash => {
                             if content_parts.is_empty() {
                                 None
                             } else {
@@ -1263,9 +1559,7 @@ impl OpenAIProvider {
 
                     // One tool message per result (OpenAI requires separate messages)
                     for (tool_call_id, content) in tool_results {
-                        if rule == TransportRule::CanonicalGpt56ChatCompletions
-                            && !outstanding_tool_ids.remove(&tool_call_id)
-                        {
+                        if rule.is_strict() && !outstanding_tool_ids.remove(&tool_call_id) {
                             anyhow::bail!(
                                 "OpenAI tool result references an unknown function call ID"
                             );
@@ -1283,46 +1577,46 @@ impl OpenAIProvider {
                 }
             }
         }
-        if rule == TransportRule::CanonicalGpt56ChatCompletions && !outstanding_tool_ids.is_empty()
-        {
+        if rule.is_strict() && !outstanding_tool_ids.is_empty() {
             anyhow::bail!("OpenAI request contained function calls without matching results");
         }
 
         // Convert tools to OpenAI format if present
-        let tools = request.tools.as_ref().map(|tool_defs| {
-            tool_defs
-                .iter()
-                .map(|tool| {
-                    // Convert ToolInputSchema to Value
-                    let parameters = match serde_json::to_value(&tool.input_schema) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to convert tool schema for '{}': {}",
-                                tool.name,
-                                e
-                            );
-                            serde_json::json!({})
+        let tools = request
+            .tools
+            .as_ref()
+            .map(|tool_defs| {
+                if rule == TransportRule::ZaiGlm53Flash && tool_defs.len() > 128 {
+                    anyhow::bail!("Z.ai accepts at most 128 function definitions");
+                }
+                tool_defs
+                    .iter()
+                    .map(|tool| {
+                        if rule == TransportRule::ZaiGlm53Flash {
+                            validate_zai_function_name(&tool.name)?;
+                            validate_zai_tool_schema(&tool.input_schema)?;
                         }
-                    };
-
-                    OpenAITool {
-                        tool_type: "function".to_string(),
-                        function: OpenAIFunction {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters,
-                        },
-                    }
-                })
-                .collect()
-        });
+                        let parameters = serde_json::to_value(&tool.input_schema)
+                            .context("tool schema could not be serialized")?;
+                        Ok(OpenAITool {
+                            tool_type: "function".to_string(),
+                            function: OpenAIFunction {
+                                name: tool.name.clone(),
+                                description: tool.description.clone(),
+                                parameters,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
 
         let openai_request = OpenAIRequest {
             model,
             messages,
             max_tokens: (rule == TransportRule::CompatibleChatCompletions)
-                .then_some(request.max_tokens),
+                .then_some(request.max_tokens)
+                .or_else(|| (rule == TransportRule::ZaiGlm53Flash).then_some(request.max_tokens)),
             max_completion_tokens: (rule == TransportRule::CanonicalGpt56ChatCompletions)
                 .then_some(request.max_tokens),
             temperature: request.temperature,
@@ -1333,8 +1627,13 @@ impl OpenAIProvider {
                 && rule == TransportRule::CanonicalGpt56ChatCompletions)
                 .then_some(OpenAIStreamOptions {
                     include_usage: true,
-                    include_obfuscation: false,
+                    include_obfuscation: Some(false),
                 }),
+            thinking: (rule == TransportRule::ZaiGlm53Flash).then_some(ZaiThinking {
+                thinking_type: "enabled",
+                clear_thinking: true,
+            }),
+            tool_stream: (rule == TransportRule::ZaiGlm53Flash && request.stream).then_some(true),
         };
         Self::validate_request_payload(&openai_request)?;
         Ok(openai_request)
@@ -1346,8 +1645,18 @@ impl OpenAIProvider {
         response: OpenAIResponse,
         rule: TransportRule,
     ) -> Result<ProviderResponse> {
-        if rule == TransportRule::CanonicalGpt56ChatCompletions {
-            if response.object.as_deref() != Some("chat.completion") {
+        if rule.is_strict() {
+            let object_valid = match rule {
+                TransportRule::CanonicalGpt56ChatCompletions => {
+                    response.object.as_deref() == Some("chat.completion")
+                }
+                TransportRule::ZaiGlm53Flash => response
+                    .object
+                    .as_deref()
+                    .is_none_or(|object| object == "chat.completion"),
+                TransportRule::CompatibleChatCompletions => unreachable!("strict response rule"),
+            };
+            if !object_valid {
                 anyhow::bail!("OpenAI returned an unknown response object");
             }
             validate_canonical_actual_model(&response.model)?;
@@ -1379,7 +1688,8 @@ impl OpenAIProvider {
             for tool_call in tool_calls {
                 if tool_call.tool_type == "function" {
                     let input = match rule {
-                        TransportRule::CanonicalGpt56ChatCompletions => {
+                        TransportRule::CanonicalGpt56ChatCompletions
+                        | TransportRule::ZaiGlm53Flash => {
                             if tool_call.id.is_empty()
                                 || tool_call.function.name.is_empty()
                                 || !call_ids.insert(tool_call.id.clone())
@@ -1388,20 +1698,10 @@ impl OpenAIProvider {
                                     "OpenAI returned an invalid or duplicate function call ID/name"
                                 );
                             }
-                            if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
-                                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
-                            }
-                            let input: serde_json::Value =
-                                serde_json::from_str(&tool_call.function.arguments)
-                                    .context("OpenAI returned malformed JSON function arguments")?;
-                            if !input.is_object() {
-                                anyhow::bail!("OpenAI function arguments were not a JSON object");
-                            }
-                            input
+                            parse_nonstream_tool_arguments(tool_call.function.arguments, rule)?
                         }
                         TransportRule::CompatibleChatCompletions => {
-                            serde_json::from_str(&tool_call.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}))
+                            parse_nonstream_tool_arguments(tool_call.function.arguments, rule)?
                         }
                     };
                     content.push(ContentBlock::ToolUse {
@@ -1409,13 +1709,13 @@ impl OpenAIProvider {
                         name: tool_call.function.name,
                         input,
                     });
-                } else if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                } else if rule.is_strict() {
                     anyhow::bail!("OpenAI returned an unknown tool-call type");
                 }
             }
         }
 
-        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+        if rule.is_strict() {
             let reason = choice
                 .finish_reason
                 .as_deref()
@@ -1423,21 +1723,7 @@ impl OpenAIProvider {
             let has_tool_calls = content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
-            match reason {
-                "stop" if !has_tool_calls => {}
-                "tool_calls" if has_tool_calls => {}
-                "stop" => {
-                    anyhow::bail!("OpenAI response stopped despite containing function calls")
-                }
-                "tool_calls" => {
-                    anyhow::bail!("OpenAI response reported function calls without any call items")
-                }
-                "length" => anyhow::bail!("OpenAI response reached its output-token limit"),
-                "content_filter" => {
-                    anyhow::bail!("OpenAI response was stopped by content filtering")
-                }
-                _ => anyhow::bail!("OpenAI returned an unknown terminal status"),
-            }
+            validate_terminal_reason(rule, reason, has_tool_calls, false)?;
         }
 
         Ok(ProviderResponse {
@@ -1486,11 +1772,11 @@ impl OpenAIProvider {
         }
 
         let openai_response: OpenAIResponse = match rule {
-            TransportRule::CanonicalGpt56ChatCompletions => {
+            TransportRule::CanonicalGpt56ChatCompletions | TransportRule::ZaiGlm53Flash => {
                 let body = read_bounded_response_body(response).await?;
                 let value: serde_json::Value =
                     serde_json::from_slice(&body).context("Failed to parse OpenAI API response")?;
-                validate_canonical_response_shape(&value)?;
+                validate_strict_response_shape(&value, rule)?;
                 serde_json::from_value(value)
                     .context("OpenAI response did not match the documented schema")?
             }
@@ -1500,7 +1786,7 @@ impl OpenAIProvider {
                 .context("Failed to parse OpenAI API response")?,
         };
 
-        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+        if rule.is_strict() {
             validate_canonical_actual_model(&openai_response.model)?;
         }
 
@@ -1526,8 +1812,11 @@ impl OpenAIProvider {
         if rule == TransportRule::CanonicalGpt56ChatCompletions {
             openai_request.stream_options = Some(OpenAIStreamOptions {
                 include_usage: true,
-                include_obfuscation: false,
+                include_obfuscation: Some(false),
             });
+        }
+        if rule == TransportRule::ZaiGlm53Flash {
+            openai_request.tool_stream = Some(true);
         }
         Self::validate_request_payload(&openai_request)?;
 
@@ -1554,16 +1843,16 @@ impl OpenAIProvider {
             anyhow::bail!("{}", msg);
         }
 
-        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+        if rule.is_strict() {
             let content_type = response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
             if !content_type.starts_with("text/event-stream") {
-                anyhow::bail!("OpenAI streaming response was not text/event-stream");
+                anyhow::bail!("OpenAI-compatible streaming response was not text/event-stream");
             }
-            return Ok(spawn_canonical_stream_parser(response));
+            return Ok(spawn_strict_stream_parser(response, rule));
         }
 
         // Compatible providers retain the permissive historical parser.
@@ -1735,6 +2024,7 @@ impl ProviderBackend for OpenAIProvider {
                 self.endpoints.chat_url == "https://api.groq.com/openai/v1/chat/completions"
                     && self.endpoints.models_url == "https://api.groq.com/openai/v1/models"
             }
+            "zai" => self.canonical_zai_endpoint,
             _ => false,
         };
         if !canonical_endpoints {
@@ -1814,14 +2104,36 @@ impl ProviderBackend for OpenAIProvider {
                     131_072,
                     Some(65_536),
                 ),
+                ("zai", "glm-5.3-flash") => (
+                    "https://docs.z.ai/guides/vlm/glm-5.3-flash; https://docs.z.ai/api-reference/llm/chat-completion",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::Low,
+                            ReasoningEffort::High,
+                            ReasoningEffort::Max,
+                        ],
+                        "2026-08-27",
+                        "https://docs.z.ai/guides/vlm/glm-5.3-flash",
+                    )
+                    .always_on(),
+                    1_000_000,
+                    Some(131_072),
+                ),
                 // Ollama and remote-daemon catalogs are deployment-specific;
                 // all optional capabilities remain unknown until attested.
                 _ => return ModelCapabilities::unknown(self.name(), model),
             };
+        let tested_on = if self.provider_name == "zai" {
+            "2026-08-27"
+        } else {
+            "2026-08-26"
+        };
         let mut capabilities = ModelCapabilities::static_metadata(
             self.name(),
             model,
-            "2026-08-26",
+            tested_on,
             source,
             streaming,
             tools,
@@ -1833,7 +2145,7 @@ impl ProviderBackend for OpenAIProvider {
         )
         .with_wire_protocol(
             WireProtocol::OpenAiChatCompletions,
-            "2026-08-26",
+            tested_on,
             "Finch OpenAI-compatible chat-completions adapter",
         );
         if self.provider_name == "openai" && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
@@ -1841,6 +2153,18 @@ impl ProviderBackend for OpenAIProvider {
                 CapabilitySupport::Supported,
                 "2026-08-27",
                 "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+            );
+        }
+        if self.provider_name == "zai" && model == "glm-5.3-flash" {
+            capabilities.image_input = ModelFeature::static_metadata(
+                CapabilitySupport::Supported,
+                "2026-08-27",
+                "https://docs.z.ai/guides/vlm/glm-5.3-flash",
+            );
+            capabilities.usage_reporting = ModelFeature::static_metadata(
+                CapabilitySupport::Supported,
+                "2026-08-27",
+                "https://docs.z.ai/api-reference/llm/chat-completion",
             );
         }
         capabilities
@@ -1871,12 +2195,24 @@ struct OpenAIRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ZaiThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct OpenAIStreamOptions {
     include_usage: bool,
-    include_obfuscation: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_obfuscation: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ZaiThinking {
+    #[serde(rename = "type")]
+    thinking_type: &'static str,
+    clear_thinking: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1984,6 +2320,8 @@ struct OpenAIResponseMessage {
     role: String,
     content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCall>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1998,7 +2336,7 @@ struct OpenAIToolCall {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAIToolFunction {
     name: String,
-    arguments: String, // JSON string
+    arguments: serde_json::Value,
 }
 
 // Streaming types
@@ -2039,6 +2377,13 @@ struct OpenAIDelta {
     role: Option<String>,
     content: Option<String>,
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+#[cfg(test)]
+fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result<Vec<StreamChunk>> {
+    strict_stream_data(state, data, TransportRule::CanonicalGpt56ChatCompletions)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2129,6 +2474,21 @@ mod tests {
         .unwrap()
         .with_reasoning_effort(ReasoningEffort::High);
         provider.canonical_openai_endpoint = true;
+        provider
+    }
+
+    fn zai_test_provider(base_url: String) -> OpenAIProvider {
+        let mut provider = OpenAIProvider::new_compatible(
+            "zai-test-secret".to_string(),
+            base_url,
+            "/chat/completions",
+            "/models",
+            "glm-5.3-flash".to_string(),
+            "zai".to_string(),
+        )
+        .unwrap()
+        .with_reasoning_effort(ReasoningEffort::Max);
+        provider.canonical_zai_endpoint = true;
         provider
     }
 
@@ -2235,6 +2595,35 @@ mod tests {
             .send_message_stream_once(
                 &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
                     .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        let mut complete = false;
+        let mut errors = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(StreamChunk::ContentBlockComplete(_)) => complete = true,
+                Err(error) => errors.push(error.to_string()),
+                _ => {}
+            }
+        }
+        (complete, errors)
+    }
+
+    async fn zai_stream_outcome(body: String) -> (bool, Vec<String>) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = zai_test_provider(server.url());
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash"),
             )
             .await
             .unwrap();
@@ -2983,19 +3372,23 @@ mod tests {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES]),
         };
-        assert!(!validate_image_source(&exact_limit)
-            .unwrap_err()
-            .to_string()
-            .contains("8 MB"));
+        assert!(
+            !validate_image_source(&exact_limit, TransportRule::CanonicalGpt56ChatCompletions)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MB")
+        );
         let over_limit = ImageSource {
             source_type: "base64".into(),
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES + 1]),
         };
-        assert!(validate_image_source(&over_limit)
-            .unwrap_err()
-            .to_string()
-            .contains("8 MB"));
+        assert!(
+            validate_image_source(&over_limit, TransportRule::CanonicalGpt56ChatCompletions)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MB")
+        );
         let mismatch = ProviderRequest::new(vec![crate::claude::Message::with_content(
             "user",
             vec![ContentBlock::tool_result(
@@ -3523,6 +3916,7 @@ mod tests {
                         role: huge.clone(),
                         content: Some("x".into()),
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     finish_reason: Some("stop".into()),
                 }],
@@ -3538,6 +3932,7 @@ mod tests {
                         role: "assistant".into(),
                         content: Some("x".into()),
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     finish_reason: Some(huge.clone()),
                 }],
@@ -4001,6 +4396,587 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn zai_glm_5_3_flash_serializes_its_exact_dialect() {
+        use crate::claude::types::{ContentBlock, Message};
+        use crate::tools::types::{ToolDefinition, ToolInputSchema};
+
+        let provider = zai_test_provider("https://api.z.ai/api/paas/v4".into());
+        assert_eq!(
+            provider.endpoints.chat_url,
+            "https://api.z.ai/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            provider.endpoints.models_url,
+            "https://api.z.ai/api/paas/v4/models"
+        );
+        let request = ProviderRequest::new(vec![Message::with_content(
+            "user",
+            vec![
+                ContentBlock::text("inspect"),
+                ContentBlock::image("image/png", VALID_PNG_BASE64),
+            ],
+        )])
+        .with_model("glm-5.3-flash")
+        .with_max_tokens(321)
+        .with_stream(true);
+        let wire = serde_json::to_value(provider.to_openai_request(&request).unwrap()).unwrap();
+        assert_eq!(wire["model"], "glm-5.3-flash");
+        assert_eq!(wire["max_tokens"], 321);
+        assert!(wire.get("max_completion_tokens").is_none());
+        assert_eq!(wire["reasoning_effort"], "max");
+        assert_eq!(wire["thinking"]["type"], "enabled");
+        assert_eq!(wire["thinking"]["clear_thinking"], true);
+        assert_eq!(wire["tool_stream"], true);
+        assert!(wire.get("stream_options").is_none());
+        assert_eq!(wire["messages"][0]["role"], "user");
+        assert_eq!(wire["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(wire["messages"][0]["content"][1]["type"], "image_url");
+
+        let continuation = ProviderRequest::new(vec![
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+            ),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::tool_result(
+                    "call-1".into(),
+                    "contents".into(),
+                    None,
+                )],
+            ),
+        ])
+        .with_model("glm-5.3-flash")
+        .with_tools(vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "Read one file".into(),
+            input_schema: ToolInputSchema::simple(vec![("path", "Path to read")]),
+        }]);
+        let wire =
+            serde_json::to_value(provider.to_openai_request(&continuation).unwrap()).unwrap();
+        assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(wire["messages"][0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(wire["messages"][1]["role"], "tool");
+        assert_eq!(wire["messages"][1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn zai_images_accept_safe_urls_and_enforce_the_documented_sub_5_mb_boundary() {
+        let provider = zai_test_provider("https://api.z.ai/api/paas/v4".into());
+        let url_request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image_url(
+                "https://images.example.test/screenshot.png?version=1",
+            )],
+        )])
+        .with_model("glm-5.3-flash");
+        let wire = serde_json::to_value(provider.to_openai_request(&url_request).unwrap()).unwrap();
+        assert_eq!(
+            wire["messages"][0]["content"][0]["image_url"]["url"],
+            "https://images.example.test/screenshot.png?version=1"
+        );
+
+        for invalid in [
+            "file:///tmp/private.png",
+            "https://user:secret@example.test/image.png",
+            "https://example.test/image.png#fragment",
+        ] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::image_url(invalid)],
+            )])
+            .with_model("glm-5.3-flash");
+            assert!(provider.to_openai_request(&request).is_err());
+        }
+
+        let exact_limit = ImageSource {
+            source_type: "base64".into(),
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(vec![0; ZAI_MAX_IMAGE_BYTES]),
+        };
+        assert!(
+            validate_image_source(&exact_limit, TransportRule::ZaiGlm53Flash)
+                .unwrap_err()
+                .to_string()
+                .contains("smaller than 5 MB")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zai_invalid_images_tools_and_model_fail_before_http() {
+        use crate::tools::types::{ToolDefinition, ToolInputSchema};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = zai_test_provider(format!("http://{}", listener.local_addr().unwrap()));
+        let invalid_image = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image_url("file:///tmp/private.png")],
+        )])
+        .with_model("glm-5.3-flash");
+        assert!(provider.send_message_once(&invalid_image).await.is_err());
+
+        for name in ["bad name".to_string(), String::new(), "x".repeat(65)] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::user("test")])
+                .with_model("glm-5.3-flash")
+                .with_tools(vec![ToolDefinition {
+                    name,
+                    description: "invalid name must not leave the process".into(),
+                    input_schema: ToolInputSchema::simple(vec![]),
+                }]);
+            assert!(provider.send_message_once(&request).await.is_err());
+        }
+        for input_schema in [
+            ToolInputSchema {
+                schema_type: "banana".into(),
+                properties: serde_json::json!({}),
+                required: vec![],
+            },
+            ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!("not-an-object"),
+                required: vec![],
+            },
+            ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({"present": {"type": "string"}}),
+                required: vec!["missing".into()],
+            },
+            ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({"duplicate": {"type": "string"}}),
+                required: vec!["duplicate".into(), "duplicate".into()],
+            },
+        ] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::user("test")])
+                .with_model("glm-5.3-flash")
+                .with_tools(vec![ToolDefinition {
+                    name: "valid_name".into(),
+                    description: "invalid schema must not leave the process".into(),
+                    input_schema,
+                }]);
+            assert!(provider.send_message_once(&request).await.is_err());
+        }
+        let wrong_model = ProviderRequest::new(vec![crate::claude::Message::user("test")])
+            .with_model("glm-undocumented");
+        assert!(provider.send_message_once(&wrong_model).await.is_err());
+
+        let custom_zai = OpenAIProvider::new_compatible(
+            "secret".into(),
+            "https://proxy.invalid".into(),
+            "/chat",
+            "/models",
+            "glm-5.3-flash".into(),
+            "zai".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            custom_zai.transport_rule("glm-5.3-flash"),
+            TransportRule::ZaiGlm53Flash,
+            "a provider identified as Z.ai must never downgrade to compatibility parsing"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), listener.accept())
+                .await
+                .is_err(),
+            "invalid Z.ai request reached the HTTP transport"
+        );
+    }
+
+    #[test]
+    fn zai_response_and_stream_allowlists_reject_openai_only_fields() {
+        for extra in [
+            serde_json::json!({"service_tier": "default"}),
+            serde_json::json!({"system_fingerprint": "fp"}),
+        ] {
+            let mut wire = serde_json::json!({
+                "id": "zai-1", "request_id": "request-1", "created": 1,
+                "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+            });
+            wire.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(validate_strict_response_shape(&wire, TransportRule::ZaiGlm53Flash).is_err());
+        }
+        for (location, field) in [
+            ("choice", "logprobs"),
+            ("message", "refusal"),
+            ("message", "annotations"),
+        ] {
+            let mut wire = serde_json::json!({
+                "id": "zai-1", "request_id": "request-1", "created": 1,
+                "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+            });
+            let target = if location == "choice" {
+                wire["choices"][0].as_object_mut().unwrap()
+            } else {
+                wire["choices"][0]["message"].as_object_mut().unwrap()
+            };
+            target.insert(field.into(), serde_json::Value::Null);
+            assert!(validate_strict_response_shape(&wire, TransportRule::ZaiGlm53Flash).is_err());
+        }
+
+        let mut state = CanonicalStreamState::default();
+        let foreign = r#"{"id":"zai-1","model":"glm-5.3-flash","service_tier":"default","choices":[{"index":0,"delta":{"content":"no"},"finish_reason":null}]}"#;
+        assert!(strict_stream_data(&mut state, foreign, TransportRule::ZaiGlm53Flash).is_err());
+    }
+
+    #[test]
+    fn zai_stream_terminal_and_tool_name_failures_are_exact() {
+        let mut state = CanonicalStreamState::default();
+        let malformed =
+            strict_stream_data(&mut state, "not-json", TransportRule::ZaiGlm53Flash).unwrap_err();
+        assert!(malformed.to_string().contains("malformed JSON"));
+
+        let mut state = CanonicalStreamState::default();
+        let invalid_name = r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"bad name","arguments":"{}"}}]},"finish_reason":null}]}"#;
+        assert!(
+            strict_stream_data(&mut state, invalid_name, TransportRule::ZaiGlm53Flash).is_err()
+        );
+
+        let mut state = CanonicalStreamState::default();
+        let terminal = r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        strict_stream_data(&mut state, terminal, TransportRule::ZaiGlm53Flash).unwrap();
+        assert!(
+            strict_stream_data(&mut state, terminal, TransportRule::ZaiGlm53Flash)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate terminal")
+        );
+        mark_strict_done(&mut state, TransportRule::ZaiGlm53Flash).unwrap();
+        assert!(mark_strict_done(&mut state, TransportRule::ZaiGlm53Flash).is_err());
+    }
+
+    #[tokio::test]
+    async fn zai_stream_http_boundary_rejects_eof_unknown_fields_and_payload_overflow() {
+        let partial = "data: {\"id\":\"zai-1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let (complete, errors) = zai_stream_outcome(partial.into()).await;
+        assert!(!complete);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("EOF before [DONE]")));
+
+        let (complete, errors) = zai_stream_outcome("event: mystery\n\n".into()).await;
+        assert!(!complete);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown SSE field")));
+
+        let oversized_line = format!("data: {}\n", "a".repeat(MAX_SSE_LINE_BYTES));
+        let (complete, errors) = zai_stream_outcome(oversized_line).await;
+        assert!(!complete);
+        assert!(errors.iter().any(|error| error.contains("line exceeded")));
+
+        let oversized_total = format!(":{}\n", "a".repeat(900_000)).repeat(5);
+        let (complete, errors) = zai_stream_outcome(oversized_total).await;
+        assert!(!complete);
+        assert!(errors.iter().any(|error| error.contains("total limit")));
+    }
+
+    #[tokio::test]
+    async fn zai_timeout_and_receiver_drop_release_the_transport() {
+        let (url, closed) = stalling_http_server(false).await;
+        let mut provider = zai_test_provider(url);
+        provider.client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to send request"));
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("timed-out Z.ai transport was not released")
+            .unwrap();
+
+        let (url, closed) = stalling_http_server(true).await;
+        let provider = zai_test_provider(url);
+        let receiver = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("dropped Z.ai receiver did not release transport")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn zai_error_response_is_bounded_and_redacted() {
+        let secret = "ZAI_PROMPT_IMAGE_TOOL_SECRET";
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"error":{{"message":"{secret}"}}}}"#))
+            .create_async()
+            .await;
+        let provider = zai_test_provider(server.url());
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user(secret)])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.len() < 256);
+        assert!(!error.contains(secret));
+        assert!(error.contains("redacted"));
+    }
+
+    #[test]
+    fn zai_glm_5_3_flash_reasoning_contract_is_exact_and_always_on() {
+        let provider = OpenAIProvider::new_zai("key".into()).unwrap();
+        let capabilities = provider.capabilities("glm-5.3-flash");
+        assert_eq!(
+            capabilities.reasoning.allowed_efforts,
+            Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ])
+        );
+        assert!(capabilities.reasoning.always_on);
+        assert_eq!(capabilities.context_window.max_tokens, Some(1_000_000));
+        assert!(capabilities.image_input.is_supported());
+        assert!(capabilities.usage_reporting.is_supported());
+        let invalid = provider
+            .clone()
+            .with_reasoning_effort(ReasoningEffort::Medium);
+        let error = match crate::providers::validate_provider_request(
+            &invalid,
+            &ProviderRequest::new(vec![]).with_model("glm-5.3-flash"),
+            false,
+        ) {
+            Ok(_) => panic!("medium reasoning must be rejected for GLM-5.3-Flash"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("allowed efforts: low, high, max"));
+    }
+
+    #[test]
+    fn zai_reasoning_stream_is_bounded_projection_not_visible_history() {
+        let mut state = CanonicalStreamState::default();
+        let chunks = strict_stream_data(
+            &mut state,
+            r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"private scratch"},"finish_reason":null}]}"#,
+            TransportRule::ZaiGlm53Flash,
+        )
+        .unwrap();
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::ResponseMetadata { model }] if model == "glm-5.3-flash"
+        ));
+        let chunks = strict_stream_data(
+            &mut state,
+            r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"content":"visible"},"finish_reason":"stop"}]}"#,
+            TransportRule::ZaiGlm53Flash,
+        )
+        .unwrap();
+        assert!(matches!(
+            chunks.as_slice(),
+            [StreamChunk::TextDelta(text)] if text == "visible"
+        ));
+        mark_strict_done(&mut state, TransportRule::ZaiGlm53Flash).unwrap();
+        assert_eq!(state.accumulated_text, "visible");
+    }
+
+    #[test]
+    fn zai_documented_nonstream_shape_accepts_object_tool_arguments_without_persisting_reasoning() {
+        let provider = OpenAIProvider::new_zai("key".into()).unwrap();
+        let wire = serde_json::json!({
+            "id": "zai-1",
+            "request_id": "request-1",
+            "created": 1,
+            "model": "glm-5.3-flash",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "private scratch",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": {"path": "README.md"}}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            "web_search": []
+        });
+        validate_strict_response_shape(&wire, TransportRule::ZaiGlm53Flash).unwrap();
+        let response: OpenAIResponse = serde_json::from_value(wire).unwrap();
+        let parsed = provider
+            .parse_response(response, TransportRule::ZaiGlm53Flash)
+            .unwrap();
+        assert_eq!(parsed.content.len(), 1);
+        assert!(matches!(
+            &parsed.content[0],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "call-1" && name == "read" && input["path"] == "README.md"
+        ));
+        assert!(!format!("{parsed:?}").contains("private scratch"));
+    }
+
+    #[test]
+    fn zai_documented_failure_terminal_reasons_fail_closed() {
+        for (reason, expected) in [
+            ("sensitive", "sensitive-content"),
+            ("model_context_window_exceeded", "context window"),
+            ("network_error", "network error"),
+        ] {
+            let error =
+                validate_terminal_reason(TransportRule::ZaiGlm53Flash, reason, false, false)
+                    .unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn zai_posts_to_its_exact_endpoint_with_bearer_auth_and_strict_dialect() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/paas/v4/chat/completions")
+            .match_header("authorization", "Bearer zai-test-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "glm-5.3-flash",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+                "max_tokens": 77,
+                "reasoning_effort": "max",
+                "thinking": {"type": "enabled", "clear_thinking": true}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": "zai-response-1",
+                    "request_id": "request-1",
+                    "created": 1,
+                    "model": "glm-5.3-flash",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello back",
+                            "reasoning_content": "private scratch"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let provider = zai_test_provider(format!("{}/api/paas/v4", server.url()));
+        let response = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash")
+                    .with_max_tokens(77),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.provider, "zai");
+        assert_eq!(response.model, "glm-5.3-flash");
+        assert_eq!(response.text(), "hello back");
+        assert!(!format!("{response:?}").contains("private scratch"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn zai_stream_uses_strict_parser_and_discards_reasoning_projection() {
+        let mut server = mockito::Server::new_async().await;
+        let events = [
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "private scratch"}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call-1", "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\""}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "function": {"arguments": "README.md\"}"}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+            }),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
+        let mock = server
+            .mock("POST", "/api/paas/v4/chat/completions")
+            .match_header("authorization", "Bearer zai-test-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "glm-5.3-flash",
+                "stream": true,
+                "tool_stream": true,
+                "thinking": {"type": "enabled", "clear_thinking": true}
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = zai_test_provider(format!("{}/api/paas/v4", server.url()));
+        let mut receiver = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("read it")])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+        assert!(chunks
+            .iter()
+            .all(|chunk| !format!("{chunk:?}").contains("private scratch")));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { id, name, input })
+                if id == "call-1" && name == "read" && input["path"] == "README.md"
+        )));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Usage { input_tokens: 3 })));
+        mock.assert_async().await;
     }
 
     #[test]

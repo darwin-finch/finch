@@ -29,6 +29,8 @@ authoritative.
 - [Configuration types](../src/config/settings.rs),
   [provider profiles](../src/config/provider.rs), and
   [configuration notes](../src/config/CONFIGURATION.md)
+- [Z.ai GLM-5.3-Flash transport](ZAI_TRANSPORT.md) — implemented contract; live conformance remains
+  gated by [#196](https://github.com/darwin-finch/finch/issues/196)
 - [HTTP route definitions](../src/server/handlers.rs)
 - [Tool execution and permissions](../src/tools/EXECUTION.md)
 - [Context assembly](../src/context/ASSEMBLY.md)

@@ -37,6 +37,7 @@ pub enum CredentialProvider {
     GoogleVertex,
     Mistral,
     Groq,
+    Zai,
 }
 
 impl CredentialProvider {
@@ -50,6 +51,7 @@ impl CredentialProvider {
             Self::GoogleVertex => "google_vertex",
             Self::Mistral => "mistral",
             Self::Groq => "groq",
+            Self::Zai => "zai",
         }
     }
 }
@@ -67,6 +69,7 @@ pub enum EndpointFamily {
     GoogleVertex,
     MistralApi,
     GroqApi,
+    ZaiApi,
     Custom,
 }
 
@@ -353,6 +356,13 @@ pub(crate) fn descriptor(provider: CredentialProvider) -> ProviderAuthDescriptor
             family: EndpointFamily::GroqApi,
             standard_origin: "https://api.groq.com",
         },
+        CredentialProvider::Zai => ProviderAuthDescriptor {
+            provider,
+            issuer: "zai",
+            kinds: API_KEY,
+            family: EndpointFamily::ZaiApi,
+            standard_origin: "https://api.z.ai",
+        },
     }
 }
 
@@ -617,6 +627,7 @@ mod tests {
             CredentialProvider::GoogleVertex,
             CredentialProvider::Mistral,
             CredentialProvider::Groq,
+            CredentialProvider::Zai,
         ];
         let kinds = [
             CredentialKind::ApiKey,

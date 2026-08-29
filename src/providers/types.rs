@@ -79,6 +79,10 @@ pub struct ReasoningCapability {
     /// `None` means unknown; an empty list means reasoning controls are
     /// explicitly unsupported.
     pub allowed_efforts: Option<Vec<ReasoningEffort>>,
+    /// Whether the provider always performs reasoning and does not expose an
+    /// off switch for this exact model/transport pair.
+    #[serde(default)]
+    pub always_on: bool,
     pub provenance: CapabilityProvenance,
 }
 
@@ -86,6 +90,7 @@ impl ReasoningCapability {
     pub fn unknown() -> Self {
         Self {
             allowed_efforts: None,
+            always_on: false,
             provenance: CapabilityProvenance::Unknown,
         }
     }
@@ -93,6 +98,7 @@ impl ReasoningCapability {
     pub fn unsupported(tested_on: &str, source: &str) -> Self {
         Self {
             allowed_efforts: Some(Vec::new()),
+            always_on: false,
             provenance: CapabilityProvenance::StaticMetadata {
                 tested_on: tested_on.to_string(),
                 source: source.to_string(),
@@ -107,11 +113,18 @@ impl ReasoningCapability {
     ) -> Self {
         Self {
             allowed_efforts: Some(efforts.into_iter().collect()),
+            always_on: false,
             provenance: CapabilityProvenance::StaticMetadata {
                 tested_on: tested_on.to_string(),
                 source: source.to_string(),
             },
         }
+    }
+
+    /// Mark reasoning as mandatory while preserving the exact effort set.
+    pub fn always_on(mut self) -> Self {
+        self.always_on = true;
+        self
     }
 
     pub fn support(&self) -> CapabilitySupport {

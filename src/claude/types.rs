@@ -79,6 +79,18 @@ impl ContentBlock {
         }
     }
 
+    /// Create a remotely hosted image content block for providers that
+    /// explicitly support URL image inputs.
+    pub fn image_url(url: impl Into<String>) -> Self {
+        Self::Image {
+            source: ImageSource {
+                source_type: "url".to_string(),
+                media_type: String::new(),
+                data: url.into(),
+            },
+        }
+    }
+
     /// Create a tool result content block
     pub fn tool_result(tool_use_id: String, content: String, is_error: Option<bool>) -> Self {
         Self::ToolResult {
