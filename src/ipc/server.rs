@@ -2714,6 +2714,187 @@ mod tests {
         count: usize,
     }
 
+    fn delayed_finish_effect_audit(
+        control: crate::server::RunnerEffectAuditControl,
+        finish_started: tokio::sync::oneshot::Sender<()>,
+        finish_release: std::sync::Arc<tokio::sync::Notify>,
+    ) -> crate::server::RunnerEffectAuditControl {
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            let Some(crate::server::RunnerEffectAuditControlRequest::Reserve {
+                execution_id,
+                effect,
+                response_tx,
+            }) = control_rx.recv().await
+            else {
+                return;
+            };
+            let reservation = match control.reserve(execution_id, effect).await {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    let _ = response_tx.send(Err(error));
+                    return;
+                }
+            };
+            let (reservation_tx, mut reservation_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = response_tx.send(Ok(crate::server::RunnerEffectAuditReservation::new(
+                reservation_tx,
+            )));
+            let Some(request) = reservation_rx.recv().await else {
+                return;
+            };
+            match request {
+                crate::server::RunnerEffectAuditReservationRequest::Begin { response_tx } => {
+                    let permit = match reservation.begin().await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let _ = response_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                    let (permit_tx, mut permit_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let _ =
+                        response_tx.send(Ok(crate::server::RunnerHostEffectPermit::new(permit_tx)));
+                    let Some(request) = permit_rx.recv().await else {
+                        return;
+                    };
+                    let _ = finish_started.send(());
+                    finish_release.notified().await;
+                    let result = permit.finish(request.outcome).await;
+                    let _ = request.response_tx.send(result);
+                }
+                crate::server::RunnerEffectAuditReservationRequest::NotApplied {
+                    reason,
+                    response_tx,
+                } => {
+                    let result = reservation.not_applied(reason).await;
+                    let _ = response_tx.send(result);
+                }
+            }
+        });
+        crate::server::RunnerEffectAuditControl::new(control_tx)
+    }
+
+    struct ProviderEffectTurnRunner {
+        task_output: std::path::PathBuf,
+        finish_started: Option<tokio::sync::oneshot::Sender<()>>,
+        finish_release: std::sync::Arc<tokio::sync::Notify>,
+        cancelled: tokio_util::sync::CancellationToken,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for ProviderEffectTurnRunner {
+        fn run_program(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("turn only".into()))
+        }
+
+        fn run_turn(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let control = match params
+                .get()
+                .and_then(|params| params.get_request())
+                .and_then(|request| request.get_control())
+            {
+                Ok(control) => control,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let task_output = self.task_output.clone();
+            let finish_started = self.finish_started.take().expect("turn invoked once");
+            let finish_release = std::sync::Arc::clone(&self.finish_release);
+            capnp::capability::Promise::from_future(async move {
+                use crate::tools::registry::Tool;
+
+                let audit = delayed_finish_effect_audit(
+                    crate::ipc::client::turn_effect_audit_proxy(control),
+                    finish_started,
+                    finish_release,
+                );
+                let query_states = crate::cli::repl_event::QueryStateManager::new();
+                let query_id = query_states.create_query(Vec::new()).await;
+                query_states.bind_effect_audit(query_id, audit).await;
+                let effect_audit = query_states
+                    .get_metadata(query_id)
+                    .await
+                    .and_then(|metadata| metadata.effect_audit)
+                    .expect("daemon audit capability survived the query boundary");
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                runtime
+                    .bind_task_output_root(&task_output)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let requirement = crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Write,
+                    crate::vm::FileSelector::parse("${task.output}/**")
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?,
+                );
+                runtime
+                    .grant_typed_capability(requirement.clone())
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let manifest_generation = runtime.manifest_generation();
+                let tool = crate::tools::implementations::program::SubmitProgramTool::new(runtime);
+                let context = crate::tools::types::ToolContext {
+                    conversation: None,
+                    save_models: None,
+                    batch_trainer: None,
+                    local_generator: None,
+                    tokenizer: None,
+                    repl_mode: None,
+                    plan_content: None,
+                    live_output: None,
+                    effect_audit: Some(effect_audit),
+                    poset: None,
+                };
+                let result = tool
+                    .execute(
+                        serde_json::json!({
+                            "language": "forth",
+                            "source": "s\" late.txt\" task-output-path s\" durable\" bytes task-output-file-write",
+                            "intent": "raw IPC provider effect audit",
+                            "declared_capabilities": [requirement],
+                            "manifest_generation": manifest_generation,
+                        }),
+                        &context,
+                    )
+                    .await
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let outcome: serde_json::Value = serde_json::from_str(&result)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                if outcome["status"] != "completed" {
+                    return Err(capnp::Error::failed(format!(
+                        "provider program failed: {outcome}"
+                    )));
+                }
+                Err(capnp::Error::disconnected(
+                    "synthetic frontend disconnect after late audit finish".into(),
+                ))
+            })
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.cancelled.cancel();
+            results.get().set_cancelled(true);
+            results.get().set_error("");
+            capnp::capability::Promise::ok(())
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("turn only".into()))
+        }
+    }
+
     impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
         fn run_program(
             &mut self,
@@ -3135,6 +3316,146 @@ mod tests {
                 }
             } if outcome_kind == "acknowledged")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publication() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let task_output = temp.path().join("task-output");
+                std::fs::create_dir_all(&task_output).unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let attachment = store
+                    .attach(
+                        "shared",
+                        "alice",
+                        crate::brain::store::AttachmentRole::Driver,
+                        None,
+                    )
+                    .unwrap();
+                let prompt = store
+                    .push(
+                        "shared",
+                        "alice",
+                        crate::brain::store::BrainEventKind::Prompt {
+                            text: "provider effect then cancel".into(),
+                        },
+                    )
+                    .unwrap();
+                let run = store
+                    .start_run(
+                        "shared",
+                        "alice",
+                        crate::brain::store::BrainRunKind::Interactive,
+                        prompt.seq,
+                        attachment.attachment_id,
+                        crate::brain::store::BrainRunStatus::Running,
+                    )
+                    .unwrap();
+                store
+                    .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+                    .unwrap();
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store.clone(),
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([48; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let (finish_started_tx, finish_started_rx) = tokio::sync::oneshot::channel();
+                let finish_release = std::sync::Arc::new(tokio::sync::Notify::new());
+                let cancelled = tokio_util::sync::CancellationToken::new();
+                let runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(ProviderEffectTurnRunner {
+                        task_output: task_output.clone(),
+                        finish_started: Some(finish_started_tx),
+                        finish_release: std::sync::Arc::clone(&finish_release),
+                        cancelled: cancelled.clone(),
+                    });
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                let request = crate::server::RunnerTurnRequest {
+                    brain: "shared".into(),
+                    run_id: run.run_id,
+                    request_seq: prompt.seq,
+                    prompt: "apply one provider effect".into(),
+                    context: Vec::new(),
+                    approval_audience: crate::brain::store::BrainApprovalAudience {
+                        brain_id: store.snapshot("shared").unwrap().brain_id,
+                        brain: "shared".into(),
+                        attachment_id: attachment.attachment_id,
+                        subject: "alice".into(),
+                        role: crate::brain::store::AttachmentRole::Driver,
+                        environment_generation: 1,
+                    },
+                    approval_connection_id: None,
+                    approval_tx: None,
+                    effect_audit: None,
+                    response_tx,
+                };
+                let forward = tokio::task::spawn_local(super::forward_test_runner_request(
+                    runner.clone(),
+                    std::sync::Arc::clone(&server),
+                    crate::server::RunnerRequest::Turn(request),
+                ));
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), finish_started_rx)
+                    .await
+                    .expect("physical effect did not reach its late finish boundary")
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(task_output.join("late.txt")).unwrap(),
+                    b"durable"
+                );
+                let mut cancel = runner.cancel_run_request();
+                cancel.get().set_brain("shared");
+                cancel.get().set_run_id(&run.run_id.0.to_string());
+                let cancelled_reply =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), cancel.send().promise)
+                        .await
+                        .expect("runner cancellation exceeded the teardown bound")
+                        .unwrap();
+                assert!(cancelled_reply.get().unwrap().get_cancelled());
+                assert!(cancelled.is_cancelled());
+                store
+                    .transition_run(
+                        "shared",
+                        "daemon",
+                        run.run_id,
+                        crate::brain::store::BrainRunStatus::Cancelled,
+                        Some("cancelled while host outcome was pending".into()),
+                    )
+                    .unwrap();
+                finish_release.notify_one();
+
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), forward)
+                        .await
+                        .expect("frontend disconnect reconciliation exceeded teardown bound")
+                        .unwrap()
+                );
+                assert!(response_rx.await.unwrap().is_err());
+                let snapshot = store.snapshot("shared").unwrap();
+                assert_eq!(snapshot.effect_audits.len(), 1);
+                assert!(matches!(snapshot.effect_audits[0].state,
+                    crate::runtime::effect_log::EffectAuditState::Terminal {
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                            ref outcome_kind
+                        }
+                    } if outcome_kind == "acknowledged"));
+                assert!(!snapshot.events.iter().any(|event| matches!(
+                    event.kind,
+                    crate::brain::store::BrainEventKind::ToolResult { .. }
+                        | crate::brain::store::BrainEventKind::Result { .. }
+                        | crate::brain::store::BrainEventKind::Program { .. }
+                )));
+            })
+            .await;
     }
 
     struct SocketApprovalRunner {

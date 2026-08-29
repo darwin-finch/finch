@@ -874,7 +874,7 @@ fn program_effect_audit_proxy(
     crate::server::RunnerEffectAuditControl::new(tx)
 }
 
-fn turn_effect_audit_proxy(
+pub(crate) fn turn_effect_audit_proxy(
     control: finch_ipc_capnp::brain_turn_control::Client,
 ) -> crate::server::RunnerEffectAuditControl {
     let (tx, mut rx) = mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
