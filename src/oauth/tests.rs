@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::EndpointFamily;
 use anyhow::{bail, Result};
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -130,7 +131,7 @@ async fn fake_handler(State(state): State<Arc<FakeState>>, request: Request) -> 
         });
     tokio::time::sleep(reply.delay).await;
     Response::builder()
-        .status(reply.status)
+        .status(reply.status.as_u16())
         .header("content-type", "application/json")
         .body(Body::from(reply.body.to_string()))
         .unwrap()

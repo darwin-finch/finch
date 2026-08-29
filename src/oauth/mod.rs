@@ -413,7 +413,7 @@ where
         }
         Ok(ResolvedCredential {
             credential_name: credential.name.clone(),
-            secret: ResolvedSecret::new(record.access_token)
+            secret: ResolvedSecret::new(record.access_token.clone())
                 .context("named OAuth credential contains unusable secret material")?,
         })
     }

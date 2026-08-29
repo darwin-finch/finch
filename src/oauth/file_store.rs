@@ -42,7 +42,7 @@ impl FileOAuthCredentialStore {
 
     fn read_locked(&self, directory: &File, reference: &str) -> Result<Option<OAuthTokenRecord>> {
         let name = Self::record_name(reference)?;
-        let mut file = match secure_directory::open_file_at(directory, &name, false, false) {
+        let file = match secure_directory::open_file_at(directory, &name, false, false) {
             Ok(file) => file,
             Err(error)
                 if error

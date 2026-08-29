@@ -600,7 +600,7 @@ mod tests {
             request.body,
             OAuthRequestBody::Json(json!({"client_id": OPENAI_PUBLIC_CLIENT_ID}))
         );
-        let pending = dialect
+        let _pending = dialect
             .parse_device_authorization(
                 StatusCode::OK,
                 json!({
@@ -657,7 +657,9 @@ mod tests {
                 match defect {
                     "issuer" => claims.issuer = "https://evil.example".into(),
                     "audience" => claims.audiences = BTreeSet::from(["other-client".into()]),
-                    "scope" => claims.scopes.remove("offline_access"),
+                    "scope" => {
+                        claims.scopes.remove("offline_access");
+                    }
                     "account" => claims.account_id.clear(),
                     _ => unreachable!(),
                 }
