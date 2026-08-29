@@ -1780,7 +1780,11 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
     let Some(current_profile) = model_catalog_profile(
         provider_id,
         name,
-        api_key.as_deref().unwrap_or(""),
+        if provider_id == "zai" {
+            ""
+        } else {
+            api_key.as_deref().unwrap_or("")
+        },
         persisted,
     ) else {
         return;
@@ -9170,6 +9174,7 @@ mod tests {
             crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None)
                 .unwrap();
         let mut reopened = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
+        reopened.current_section = WizardSection::Models;
         assert!(matches!(
             get_primary(&reopened),
             Some(ModelConfig::Remote {
