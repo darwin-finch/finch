@@ -44,13 +44,7 @@ impl FileOAuthCredentialStore {
         let name = Self::record_name(reference)?;
         let file = match secure_directory::open_file_at(directory, &name, false, false) {
             Ok(file) => file,
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                return Ok(None)
-            }
+            Err(error) if is_not_found(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
         validate_open_record(&file)?;
@@ -91,6 +85,15 @@ impl FileOAuthCredentialStore {
         }
         result
     }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        || error
+            .downcast_ref::<nix::errno::Errno>()
+            .is_some_and(|errno| *errno == nix::errno::Errno::ENOENT)
 }
 
 impl OAuthCredentialStore for FileOAuthCredentialStore {

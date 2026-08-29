@@ -550,7 +550,10 @@ where
         if descriptor.browser_credential_kind.is_none() {
             bail!("OAuth browser authorization is unsupported by this provider dialect revision");
         }
-        let mut url = validate_endpoint(&descriptor.authorization_endpoint, false)?;
+        let mut url = validate_endpoint(
+            &descriptor.authorization_endpoint,
+            descriptor.allow_insecure_loopback,
+        )?;
         let redirect = Url::parse(redirect_uri).context("OAuth redirect URI is invalid")?;
         if redirect.scheme() != "http" || !redirect.host_str().is_some_and(is_loopback_host) {
             bail!("OAuth browser callback must use an exact loopback HTTP redirect");
