@@ -3219,7 +3219,9 @@ mod tests {
             .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
             .unwrap();
         if fail_audit_batch {
-            store.fail_next_event_batch_for_test();
+            store
+                .fail_next_effect_audit_batch_for_test("shared")
+                .unwrap();
         }
 
         let (server_stream, mut peer_stream) = tokio::net::UnixStream::pair().unwrap();
@@ -3228,10 +3230,15 @@ mod tests {
             super::handle_connection_with_id(server_stream, handler_server, connection_id).await
         });
         tokio::task::yield_now().await;
-        // A valid first segment-count word followed by EOF forces a real
-        // Cap'n Proto partial-frame transport failure rather than a remote
-        // application exception choosing an error kind.
-        peer_stream.write_all(&0_u32.to_le_bytes()).await.unwrap();
+        // Declare one eight-byte segment, write only half its payload, then
+        // close. This is a real Cap'n Proto partial frame rather than a remote
+        // application exception choosing an error kind. RpcSystem is allowed
+        // to normalize peer EOF to Ok; bounded lifecycle teardown, not the
+        // method-level error value, owns reconciliation.
+        peer_stream
+            .write_all(&[0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
         peer_stream.shutdown().await.unwrap();
         drop(peer_stream);
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), handler)
@@ -3245,9 +3252,8 @@ mod tests {
     async fn effect_audit_partial_frame_connection_teardown_reconciles_before_and_after_begin() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (_temp, store, server, _connection_id, lease_id, result) =
+                let (_temp, store, server, _connection_id, lease_id, _result) =
                     partial_frame_connection_teardown_fixture(false).await;
-                assert!(result.is_err(), "partial Cap'n Proto frame must fail the RPC system");
                 assert!(!server.brain_runners().has_registration("shared", lease_id));
                 let states = store
                     .snapshot("shared")
@@ -3275,7 +3281,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn effect_audit_teardown_fsync_failure_keeps_connection_authority_fenced_until_retry() {
+    async fn effect_audit_teardown_transaction_failure_keeps_authority_fenced_until_retry() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (_temp, store, server, connection_id, lease_id, result) =
@@ -3498,6 +3504,7 @@ mod tests {
         crate::brain::store::BrainStore,
         std::sync::Arc<crate::server::AgentServer>,
         crate::brain::store::RunnerLeaseId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::server::RunnerRequest>,
         crate::runtime::effect_log::EffectAuditState,
         Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
     ) {
@@ -3554,7 +3561,7 @@ mod tests {
             .brain_runners()
             .claim_connection_lease(connection_id, "shared", lease.lease_id)
             .unwrap();
-        let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (callback_tx, callback_rx) = tokio::sync::mpsc::unbounded_channel();
         server
             .brain_runners()
             .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
@@ -3590,12 +3597,20 @@ mod tests {
         let state = store.snapshot("shared").unwrap().effect_audits[0]
             .state
             .clone();
-        (temp, store, server, lease.lease_id, state, permit)
+        (
+            temp,
+            store,
+            server,
+            lease.lease_id,
+            callback_rx,
+            state,
+            permit,
+        )
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn effect_audit_normal_return_abandons_only_unbegun_and_allows_late_finish() {
-        let (_temp, _store, _server, _lease_id, state, permit) =
+        let (_temp, _store, _server, _lease_id, _callback_rx, state, permit) =
             raw_normal_effect_state(false, false).await;
         assert!(permit.is_none());
         assert!(matches!(
@@ -3606,7 +3621,7 @@ mod tests {
             }
         ));
 
-        let (_temp, store, _server, _lease_id, state, permit) =
+        let (_temp, store, _server, _lease_id, _callback_rx, state, permit) =
             raw_normal_effect_state(true, false).await;
         assert!(matches!(
             state,
@@ -3628,7 +3643,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_teardown() {
-        let (_temp, store, server, lease_id, state, permit) =
+        let (_temp, store, server, lease_id, _callback_rx, state, permit) =
             raw_normal_effect_state(true, true).await;
         assert!(
             server.brain_runners().has_registration("shared", lease_id),
@@ -3870,21 +3885,26 @@ mod tests {
                             ref outcome_kind
                         }
                     } if outcome_kind == "acknowledged"));
-                assert_eq!(
-                    snapshot
-                        .events
-                        .iter()
-                        .filter(|event| matches!(
-                            event.kind,
-                            crate::brain::store::BrainEventKind::EffectAuditTransition {
-                                transition:
-                                    crate::runtime::effect_log::EffectAuditTransition::Finish { .. }
-                            }
-                        ))
-                        .count(),
-                    1,
-                    "cancel, quiescence, disconnect, and late finish produced multiple terminal receipts"
+                let restarted = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
                 );
+                let replayed = restarted.snapshot("shared").unwrap();
+                assert_eq!(
+                    replayed.effect_audits.len(),
+                    1,
+                    "restart/replay must reconstruct exactly one terminal audit identity"
+                );
+                assert_eq!(
+                    replayed.effect_audits[0].intent.identity,
+                    snapshot.effect_audits[0].intent.identity
+                );
+                assert!(matches!(replayed.effect_audits[0].state,
+                    crate::runtime::effect_log::EffectAuditState::Terminal {
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                            ref outcome_kind
+                        }
+                    } if outcome_kind == "acknowledged"));
                 assert!(!snapshot.events.iter().any(|event| matches!(
                     event.kind,
                     crate::brain::store::BrainEventKind::ToolResult { .. }

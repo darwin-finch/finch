@@ -5946,6 +5946,23 @@ impl BrainStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_effect_audit_batch_for_test(&self, name: &str) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .brain_id;
+        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage.active.fail_next_batch_before_commit_for_test();
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
     fn fail_event_batches_for_test(&self, count: usize) {
         self.fail_event_batches
             .store(count, std::sync::atomic::Ordering::SeqCst);
@@ -10666,7 +10683,9 @@ mod tests {
             0,
             "a different connection lease must not own these audit identities"
         );
-        store.fail_next_event_batch_for_test();
+        store
+            .fail_next_effect_audit_batch_for_test("shared")
+            .unwrap();
         assert!(store
             .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
             .is_err());

@@ -125,6 +125,8 @@ pub(crate) struct EffectAuditReplayArchive {
 /// removed only after their terminal replay fence is durable.
 pub(crate) struct EffectAuditActiveJournal {
     path: PathBuf,
+    #[cfg(test)]
+    fail_next_batch_before_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EffectAuditActiveJournal {
@@ -151,7 +153,13 @@ impl EffectAuditActiveJournal {
         if created {
             super::store::sync_directory(&directory)?;
         }
-        let journal = Self { path };
+        let journal = Self {
+            path,
+            #[cfg(test)]
+            fail_next_batch_before_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+        };
         anyhow::ensure!(
             journal.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
             "effect-audit active journal exceeds its durable byte bound"
@@ -298,12 +306,25 @@ impl EffectAuditActiveJournal {
                 ],
             )?;
         }
+        #[cfg(test)]
+        if self
+            .fail_next_batch_before_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected active effect-audit transaction failure before commit");
+        }
         transaction.commit()?;
         anyhow::ensure!(
             self.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
             "effect-audit active journal exceeded its durable byte bound"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_batch_before_commit_for_test(&self) {
+        self.fail_next_batch_before_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Delete superseded details only after `append_fence` durably committed.
