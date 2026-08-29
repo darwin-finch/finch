@@ -1854,7 +1854,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_aborts_dispatch_only_after_runner_ack_and_durable_terminalization() {
+    async fn effect_audit_cancellation_aborts_dispatch_only_after_ack_and_durable_terminalization()
+    {
         let service = service();
         let driver = service
             .attach("shared", "alice", AttachmentRole::Driver, None)
