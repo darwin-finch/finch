@@ -1428,7 +1428,11 @@ where
     let config = config_from_setup_result(result).with_credentials(credentials);
     if let Err(error) = config.validate() {
         let failures = compensate_chatgpt_setup(authenticator, &compensations);
-        let original = error.to_string();
+        // Config validation layers profile context over the exact authority
+        // mismatch. Preserve the complete, secret-free validation chain so the
+        // user can repair the signed credential instead of seeing only the
+        // generic profile incompatibility.
+        let original = format!("{error:#}");
         let context = if failures.is_empty() {
             format!("Signed ChatGPT credential does not match the setup provider graph: {original}")
         } else {
@@ -9395,7 +9399,7 @@ mod tests {
             root: root.clone(),
             fail_reference: None,
             invalid_final_reference: Some("chatgpt:b".into()),
-            replace_before_compensation: Some("chatgpt:b".into()),
+            replace_before_compensation: None,
         };
 
         let error = prepare_chatgpt_setup_config(
@@ -9416,19 +9420,19 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("compensation conflicts for chatgpt:b"),
+            error.contains("provider profile 'account-b' has incompatible credential 'chatgpt:b'"),
             "{error}"
         );
+        assert!(!error.contains("compensation conflicts"), "{error}");
         assert!(!error.contains("secret-access"), "{error}");
         assert!(!error.contains("secret-refresh"), "{error}");
 
         let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root);
-        let replaced = reopened.load("chatgpt:b").unwrap().unwrap();
-        assert!(!replaced.revoked && !replaced.mutation_pending);
-        assert_eq!(replaced.access_token, "external-replacement-sentinel");
-        let owned = reopened.load("chatgpt:a").unwrap().unwrap();
-        assert!(owned.revoked && !owned.mutation_pending);
-        assert!(owned.access_token.is_empty());
-        assert!(owned.refresh_token.is_none() && owned.id_token.is_none());
+        for reference in ["chatgpt:a", "chatgpt:b"] {
+            let owned = reopened.load(reference).unwrap().unwrap();
+            assert!(owned.revoked && !owned.mutation_pending);
+            assert!(owned.access_token.is_empty());
+            assert!(owned.refresh_token.is_none() && owned.id_token.is_none());
+        }
     }
 }
