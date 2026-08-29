@@ -3846,6 +3846,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 assert_eq!(submission.run.unwrap().run_id, run.run_id);
+                let conversation_before_late_finish = serde_json::to_value(
+                    conversation.read().await.get_messages(),
+                )
+                .unwrap();
                 event_tx.send(crate::cli::repl_event::ReplEvent::Shutdown).unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
                     .await
@@ -3913,7 +3917,11 @@ mod tests {
                         | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
                         | crate::brain::store::BrainEventKind::EffectRecorded { .. }
                 )));
-                assert!(conversation.read().await.get_messages().is_empty());
+                assert_eq!(
+                    serde_json::to_value(conversation.read().await.get_messages()).unwrap(),
+                    conversation_before_late_finish,
+                    "late effect completion must not append provider or ToolResult history"
+                );
             })
             .await;
     }
