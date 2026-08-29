@@ -3880,11 +3880,37 @@ pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
     Ok(Json(serde_json::to_value(&info)?))
 }
 
+/// Test seam for the production node-info response with explicit state.
+///
+/// This intentionally has no ambient-HOME fallback: integration fixtures
+/// must supply a disposable Finch state directory.
+#[doc(hidden)]
+pub async fn handle_node_info_from_state_directory(
+    state: crate::node::IsolatedNodeTestState,
+    has_teacher_api: bool,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::node::NodeInfo;
+
+    let info = NodeInfo::load_from_state_directory(has_teacher_api, state.path())?;
+    Ok(Json(serde_json::to_value(&info)?))
+}
+
 /// Handle GET /v1/node/stats — return this node's work statistics
 pub async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
     use crate::node::WorkTracker;
 
     let stats = WorkTracker::load_persisted()?;
+    Ok(Json(serde_json::to_value(&stats)?))
+}
+
+/// Test seam for the production node-stats response with explicit state.
+#[doc(hidden)]
+pub async fn handle_node_stats_from_state_directory(
+    state: crate::node::IsolatedNodeTestState,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use crate::node::WorkTracker;
+
+    let stats = WorkTracker::load_persisted_from_state_directory(state.path())?;
     Ok(Json(serde_json::to_value(&stats)?))
 }
 

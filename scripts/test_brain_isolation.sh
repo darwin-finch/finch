@@ -37,6 +37,7 @@ fake_home="$scratch/real-home"
 temp_parent="$scratch/temp-homes"
 mkdir -p "$fake_home/.finch/brains/existing" "$temp_parent"
 printf 'keep me\n' >"$fake_home/.finch/brains/existing/events.jsonl"
+printf 'keep node\n' >"$fake_home/.finch/node_id"
 
 run_isolated() {
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$supervisor" "$@"
@@ -406,6 +407,35 @@ else
   test "$?" -eq 70
 fi
 printf 'keep me\n' >"$fake_home/.finch/brains/existing/events.jsonl"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-manifest-guard
+if FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
+  run_isolated bash -c 'printf changed >"$FINCH_REAL_NODE_ID"'; then
+  exit 1
+else
+  test "$?" -eq 70
+fi
+printf 'keep node\n' >"$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-missing-stays-missing
+rm "$fake_home/.finch/node_id"
+run_isolated true
+test ! -e "$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-symlink-stays-unchanged
+printf 'symlink target\n' >"$scratch/node-id-target"
+ln -s "$scratch/node-id-target" "$fake_home/.finch/node_id"
+node_link_before="$(readlink "$fake_home/.finch/node_id")"
+node_target_before="$(shasum -a 256 "$scratch/node-id-target" | awk '{print $1}')"
+run_isolated true
+test -L "$fake_home/.finch/node_id"
+test "$(readlink "$fake_home/.finch/node_id")" = "$node_link_before"
+test "$(shasum -a 256 "$scratch/node-id-target" | awk '{print $1}')" = "$node_target_before"
+rm "$fake_home/.finch/node_id"
+printf 'keep node\n' >"$fake_home/.finch/node_id"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 # Manifest failures disclose only the parent-held digests, never path names or

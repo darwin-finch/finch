@@ -125,6 +125,21 @@ fn hash_manifest_stat(digest: &mut Sha256, relative: &Path, stat: &libc::stat) {
     digest.update(stat.st_size.to_ne_bytes());
 }
 
+fn hash_node_identity_times(digest: &mut Sha256, stat: &libc::stat) {
+    digest.update(stat.st_mtime.to_ne_bytes());
+    digest.update(stat.st_ctime.to_ne_bytes());
+    #[cfg(target_os = "linux")]
+    {
+        digest.update(stat.st_mtime_nsec.to_ne_bytes());
+        digest.update(stat.st_ctime_nsec.to_ne_bytes());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        digest.update(stat.st_mtimespec.tv_nsec.to_ne_bytes());
+        digest.update(stat.st_ctimespec.tv_nsec.to_ne_bytes());
+    }
+}
+
 fn hash_manifest_directory(
     directory: &mut nix::dir::Dir,
     relative: &Path,
@@ -314,6 +329,66 @@ fn manifest_digest(store: &Path, control_root: Option<&Path>) -> anyhow::Result<
         0,
         control_root,
     )?;
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn node_identity_digest(home: &Path) -> anyhow::Result<String> {
+    use nix::fcntl::{open, openat, readlinkat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
+
+    let finch = home.join(".finch");
+    let fd = match open(
+        &finch,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(hex::encode(Sha256::digest(b"missing"))),
+        Err(error) => return Err(error.into()),
+    };
+    let directory = unsafe { File::from_raw_fd(fd) };
+    let observed = match fstatat(
+        Some(directory.as_raw_fd()),
+        "node_id",
+        AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) => stat,
+        Err(nix::errno::Errno::ENOENT) => return Ok(hex::encode(Sha256::digest(b"missing"))),
+        Err(error) => return Err(error.into()),
+    };
+    let mut digest = Sha256::new();
+    hash_manifest_stat(&mut digest, Path::new("node_id"), &observed);
+    hash_node_identity_times(&mut digest, &observed);
+    let kind = SFlag::from_bits_truncate(observed.st_mode);
+    if kind.contains(SFlag::S_IFLNK) {
+        digest.update(b"link");
+        digest.update(readlinkat(Some(directory.as_raw_fd()), "node_id")?.as_encoded_bytes());
+    } else if kind.contains(SFlag::S_IFREG) {
+        digest.update(b"file");
+        let fd = openat(
+            Some(directory.as_raw_fd()),
+            "node_id",
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let opened = fstat(file.as_raw_fd())?;
+        anyhow::ensure!(
+            SFlag::from_bits_truncate(opened.st_mode).contains(SFlag::S_IFREG)
+                && opened.st_dev == observed.st_dev
+                && opened.st_ino == observed.st_ino,
+            "real node identity changed while opening"
+        );
+        let mut contents = Vec::new();
+        file.take((1 << 20) + 1).read_to_end(&mut contents)?;
+        anyhow::ensure!(
+            contents.len() <= 1 << 20,
+            "real node identity exceeds its size bound"
+        );
+        digest.update(contents);
+    } else {
+        digest.update(b"other");
+    }
     Ok(hex::encode(digest.finalize()))
 }
 
@@ -775,6 +850,7 @@ fn run() -> anyhow::Result<i32> {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
     let before = manifest_digest(&real_store, Some(isolated.path()))?;
+    let node_identity_before = node_identity_digest(&real_home)?;
     let socket_parent = if Path::new("/private/tmp").is_dir() {
         Path::new("/private/tmp")
     } else {
@@ -914,9 +990,14 @@ fn run() -> anyhow::Result<i32> {
     // Once the group is proven quiescent, always take the parent-held after
     // snapshot before propagating an observation error or removing HOME.
     let after = manifest_digest(&real_store, Some(isolated.path()))?;
+    let node_identity_after = node_identity_digest(&real_home)?;
     anyhow::ensure!(
         before == after,
         "real Brain store manifest changed (sha256={before} -> sha256={after})"
+    );
+    anyhow::ensure!(
+        node_identity_before == node_identity_after,
+        "real node identity changed (sha256={node_identity_before} -> sha256={node_identity_after})"
     );
     observation?;
     drop(proof);

@@ -117,11 +117,21 @@ impl WorkTracker {
 
     /// Load previously persisted stats (for cumulative totals across restarts)
     pub fn load_persisted() -> Result<WorkStats> {
-        let path = stats_path()?;
+        Self::load_persisted_from_path(&stats_path()?)
+    }
+
+    /// Load persisted statistics from an explicit Finch state directory.
+    pub(crate) fn load_persisted_from_state_directory(
+        state_directory: &std::path::Path,
+    ) -> Result<WorkStats> {
+        Self::load_persisted_from_path(&state_directory.join("work_stats.json"))
+    }
+
+    fn load_persisted_from_path(path: &std::path::Path) -> Result<WorkStats> {
         if !path.exists() {
             return Ok(WorkStats::new());
         }
-        let raw = std::fs::read_to_string(&path).context("Failed to read work stats")?;
+        let raw = std::fs::read_to_string(path).context("Failed to read work stats")?;
         serde_json::from_str(&raw).context("Failed to parse work stats")
     }
 }

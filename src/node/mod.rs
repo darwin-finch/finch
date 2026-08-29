@@ -17,6 +17,52 @@ pub use stats::{WorkStats, WorkTracker};
 
 use crate::models::model_selector::{ModelSelection, ModelSelector};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Opaque disposable state owned by worker-node integration tests.
+///
+/// Construction rejects a temporary parent inside the user's Finch state,
+/// so test seams cannot silently fall back to `~/.finch`.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct IsolatedNodeTestState {
+    directory: Arc<tempfile::TempDir>,
+}
+
+impl IsolatedNodeTestState {
+    pub fn new() -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+
+        let temporary_parent = std::env::temp_dir()
+            .canonicalize()
+            .context("could not canonicalize the node-test temporary parent")?;
+        let home = dirs::home_dir().context("Cannot determine home directory")?;
+        let home = home
+            .canonicalize()
+            .context("Cannot canonicalize home directory")?;
+        let user_state = home.join(".finch");
+        let user_state = user_state.canonicalize().unwrap_or(user_state);
+        anyhow::ensure!(
+            !temporary_parent.starts_with(&user_state),
+            "node-test temporary parent overlaps the user Finch state"
+        );
+        let directory = tempfile::Builder::new()
+            .prefix("finch-node-test.")
+            .tempdir_in(&temporary_parent)
+            .context("create disposable node-test state")?;
+        Ok(Self {
+            directory: Arc::new(directory),
+        })
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.directory.path()
+    }
+
+    pub fn load_node_info(&self, has_teacher_api: bool) -> anyhow::Result<NodeInfo> {
+        NodeInfo::load_from_state_directory(has_teacher_api, self.path())
+    }
+}
 
 /// Collect basic machine specs for registry metadata.
 ///
@@ -91,6 +137,17 @@ impl NodeInfo {
     pub fn load(has_teacher_api: bool) -> anyhow::Result<Self> {
         Ok(Self {
             identity: NodeIdentity::load_or_create()?,
+            capabilities: NodeCapabilities::detect(has_teacher_api),
+        })
+    }
+
+    /// Load node information using an explicit Finch state directory.
+    pub(crate) fn load_from_state_directory(
+        has_teacher_api: bool,
+        state_directory: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            identity: NodeIdentity::load_or_create_in(state_directory)?,
             capabilities: NodeCapabilities::detect(has_teacher_api),
         })
     }
