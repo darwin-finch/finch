@@ -107,6 +107,7 @@ where
             token_endpoint: format!("{auth_origin}/oauth/token"),
             revocation_endpoint: format!("{auth_origin}/oauth/revoke"),
             allowed_origins,
+            allowed_user_authorization_origins: BTreeSet::from([auth_origin.clone()]),
             allow_insecure_loopback,
         };
         descriptor.validate()?;

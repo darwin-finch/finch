@@ -54,6 +54,9 @@ pub struct OAuthDialectDescriptor {
     pub revocation_endpoint: String,
     /// Exact origins to which this dialect permits credential-bearing POSTs.
     pub allowed_origins: BTreeSet<String>,
+    /// Exact origins the user may be instructed to visit. These are separate
+    /// from token endpoints because some providers use a distinct UI origin.
+    pub allowed_user_authorization_origins: BTreeSet<String>,
     /// Test dialects may opt into loopback HTTP. Production dialects must not.
     pub allow_insecure_loopback: bool,
 }
@@ -80,6 +83,15 @@ impl OAuthDialectDescriptor {
             let origin = origin(&url)?;
             if !self.allowed_origins.contains(&origin) {
                 bail!("OAuth endpoint is outside its dialect's allowed origins");
+            }
+        }
+        if self.allowed_user_authorization_origins.is_empty() {
+            bail!("OAuth dialect has no allowed user authorization origin");
+        }
+        for allowed in &self.allowed_user_authorization_origins {
+            let url = validate_endpoint(allowed, self.allow_insecure_loopback)?;
+            if origin(&url)? != *allowed || url.path() != "/" || url.query().is_some() {
+                bail!("OAuth user authorization authority must be a normalized origin");
             }
         }
         Ok(())
@@ -462,7 +474,7 @@ where
             .dialect
             .parse_device_authorization(status, body)
             .context("OAuth device authorization response is incompatible")?;
-        validate_device_authorization(&pending)?;
+        validate_device_authorization(&pending, self.dialect.descriptor())?;
         Ok(pending)
     }
 
@@ -475,7 +487,7 @@ where
         cancel: CancellationToken,
     ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
-        validate_device_authorization(pending)?;
+        validate_device_authorization(pending, self.dialect.descriptor())?;
         if self.store.load(reference)?.is_some() {
             bail!(
                 "named OAuth credential already exists; replacement requires explicit confirmation"
@@ -799,12 +811,32 @@ async fn read_bounded(response: reqwest::Response, maximum: usize) -> Result<Vec
     Ok(body)
 }
 
-fn validate_device_authorization(pending: &DeviceAuthorization) -> Result<()> {
+fn validate_device_authorization(
+    pending: &DeviceAuthorization,
+    descriptor: &OAuthDialectDescriptor,
+) -> Result<()> {
     validate_secret_field(&pending.device_code, "device code")?;
     validate_secret_field(&pending.user_code, "user code")?;
-    validate_endpoint(&pending.verification_uri, false)?;
+    let verification = validate_endpoint(
+        &pending.verification_uri,
+        descriptor.allow_insecure_loopback,
+    )?;
+    if !descriptor
+        .allowed_user_authorization_origins
+        .contains(&origin(&verification)?)
+    {
+        bail!(
+            "OAuth device verification URI is outside the provider dialect's allowed user origin"
+        );
+    }
     if let Some(url) = &pending.verification_uri_complete {
-        validate_endpoint(url, false)?;
+        let complete = validate_endpoint(url, descriptor.allow_insecure_loopback)?;
+        if !descriptor
+            .allowed_user_authorization_origins
+            .contains(&origin(&complete)?)
+        {
+            bail!("OAuth complete verification URI is outside the provider dialect's allowed user origin");
+        }
     }
     if pending.expires_in.is_zero() || pending.expires_in > Duration::from_secs(30 * 60) {
         bail!("OAuth device authorization expiry is invalid");

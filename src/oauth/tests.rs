@@ -165,6 +165,9 @@ impl SyntheticDialect {
                 token_endpoint: format!("{origin}/{prefix}/token"),
                 revocation_endpoint: format!("{origin}/{prefix}/revoke"),
                 allowed_origins: BTreeSet::from([origin.into()]),
+                allowed_user_authorization_origins: BTreeSet::from(
+                    ["https://login.example".into()],
+                ),
                 allow_insecure_loopback: true,
             },
             prefix,
@@ -210,7 +213,11 @@ impl OAuthDialect for SyntheticDialect {
         Ok(DeviceAuthorization {
             device_code: body[&code_field].as_str().unwrap().into(),
             user_code: body[&user_field].as_str().unwrap().into(),
-            verification_uri: format!("https://login.example/{}/verify", self.prefix),
+            verification_uri: body
+                .get("verification_uri")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("https://login.example/{}/verify", self.prefix)),
             verification_uri_complete: None,
             expires_in: Duration::from_secs(2),
             interval: Duration::from_millis(10),
@@ -430,6 +437,28 @@ async fn device_denial_expiry_cancellation_and_timeout_are_terminal_without_pers
         .to_string()
         .contains("timed out"));
     assert!(store.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn device_response_cannot_substitute_user_verification_origin_or_persist() {
+    let server = FakeServer::start().await;
+    let mut hostile = device_body("alpha");
+    hostile["verification_uri"] = Value::String("https://evil.example/steal-code".into());
+    server.push("/alpha/device", StatusCode::OK, hostile);
+    let store = Arc::new(MemoryStore::default());
+    let client = OAuthClient::new(
+        Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+        store.clone(),
+    )
+    .unwrap();
+    let error = client
+        .begin_device_authorization()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("allowed user origin"));
+    assert!(store.0.lock().unwrap().is_empty());
+    assert_eq!(server.request_count("/alpha/poll"), 0);
 }
 
 #[tokio::test]
