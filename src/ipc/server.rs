@@ -2718,6 +2718,7 @@ mod tests {
         control: crate::server::RunnerEffectAuditControl,
         finish_started: tokio::sync::oneshot::Sender<()>,
         finish_release: std::sync::Arc<tokio::sync::Notify>,
+        physical_effects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> crate::server::RunnerEffectAuditControl {
         let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::task::spawn_local(async move {
@@ -2758,6 +2759,7 @@ mod tests {
                     let Some(request) = permit_rx.recv().await else {
                         return;
                     };
+                    physical_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = finish_started.send(());
                     finish_release.notified().await;
                     let result = permit.finish(request.outcome).await;
@@ -2775,123 +2777,63 @@ mod tests {
         crate::server::RunnerEffectAuditControl::new(control_tx)
     }
 
-    struct ProviderEffectTurnRunner {
-        task_output: std::path::PathBuf,
-        finish_started: Option<tokio::sync::oneshot::Sender<()>>,
-        finish_release: std::sync::Arc<tokio::sync::Notify>,
-        cancelled: tokio_util::sync::CancellationToken,
+    struct ProviderSubmitProgramGenerator {
+        input: serde_json::Value,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl super::finch_ipc_capnp::brain_runner::Server for ProviderEffectTurnRunner {
-        fn run_program(
-            &mut self,
-            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
-            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
-            capnp::capability::Promise::err(capnp::Error::unimplemented("turn only".into()))
-        }
-
-        fn run_turn(
-            &mut self,
-            params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
-            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
-            let control = match params
-                .get()
-                .and_then(|params| params.get_request())
-                .and_then(|request| request.get_control())
-            {
-                Ok(control) => control,
-                Err(error) => return capnp::capability::Promise::err(error),
-            };
-            let task_output = self.task_output.clone();
-            let finish_started = self.finish_started.take().expect("turn invoked once");
-            let finish_release = std::sync::Arc::clone(&self.finish_release);
-            capnp::capability::Promise::from_future(async move {
-                use crate::tools::registry::Tool;
-
-                let audit = delayed_finish_effect_audit(
-                    crate::ipc::client::turn_effect_audit_proxy(control),
-                    finish_started,
-                    finish_release,
-                );
-                let query_states = crate::cli::repl_event::QueryStateManager::new();
-                let query_id = query_states.create_query(Vec::new()).await;
-                query_states.bind_effect_audit(query_id, audit).await;
-                let effect_audit = query_states
-                    .get_metadata(query_id)
-                    .await
-                    .and_then(|metadata| metadata.effect_audit)
-                    .expect("daemon audit capability survived the query boundary");
-                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
-                runtime
-                    .bind_task_output_root(&task_output)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                let requirement = crate::vm::CapabilityRequirement::file(
-                    crate::vm::FileOperation::Write,
-                    crate::vm::FileSelector::parse("${task.output}/**")
-                        .map_err(|error| capnp::Error::failed(error.to_string()))?,
-                );
-                runtime
-                    .grant_typed_capability(requirement.clone())
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                let manifest_generation = runtime.manifest_generation();
-                let tool = crate::tools::implementations::program::SubmitProgramTool::new(runtime);
-                let context = crate::tools::types::ToolContext {
-                    conversation: None,
-                    save_models: None,
-                    batch_trainer: None,
-                    local_generator: None,
-                    tokenizer: None,
-                    repl_mode: None,
-                    plan_content: None,
-                    live_output: None,
-                    effect_audit: Some(effect_audit),
-                    poset: None,
-                };
-                let result = tool
-                    .execute(
-                        serde_json::json!({
-                            "language": "forth",
-                            "source": "s\" late.txt\" task-output-path s\" durable\" bytes task-output-file-write",
-                            "intent": "raw IPC provider effect audit",
-                            "declared_capabilities": [requirement],
-                            "manifest_generation": manifest_generation,
-                        }),
-                        &context,
-                    )
-                    .await
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                let outcome: serde_json::Value = serde_json::from_str(&result)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                if outcome["status"] != "completed" {
-                    return Err(capnp::Error::failed(format!(
-                        "provider program failed: {outcome}"
-                    )));
-                }
-                Err(capnp::Error::disconnected(
-                    "synthetic frontend disconnect after late audit finish".into(),
-                ))
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for ProviderSubmitProgramGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(call == 0, "provider continuation escaped cancellation");
+            Ok(crate::generators::GeneratorResponse {
+                text: String::new(),
+                content_blocks: Vec::new(),
+                tool_uses: vec![crate::tools::types::ToolUse {
+                    id: "effect-tool".into(),
+                    name: "submit_program".into(),
+                    input: self.input.clone(),
+                }],
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "effect-test".into(),
+                    model: "effect-test".into(),
+                    confidence: None,
+                    stop_reason: Some("tool_use".into()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                },
             })
         }
 
-        fn cancel_run(
-            &mut self,
-            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
-            mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
-            self.cancelled.cancel();
-            results.get().set_cancelled(true);
-            results.get().set_error("");
-            capnp::capability::Promise::ok(())
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
         }
 
-        fn project_memory(
-            &mut self,
-            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
-            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
-            capnp::capability::Promise::err(capnp::Error::unimplemented("turn only".into()))
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: true,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "effect-test"
         }
     }
 
@@ -3322,6 +3264,8 @@ mod tests {
     async fn effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publication() {
         tokio::task::LocalSet::new()
             .run_until(async {
+                use crate::tools::registry::Tool;
+
                 let temp = tempfile::tempdir().unwrap();
                 let task_output = temp.path().join("task-output");
                 std::fs::create_dir_all(&task_output).unwrap();
@@ -3329,36 +3273,6 @@ mod tests {
                     "box.local",
                     Some(temp.path().join("brains")),
                 );
-                let attachment = store
-                    .attach(
-                        "shared",
-                        "alice",
-                        crate::brain::store::AttachmentRole::Driver,
-                        None,
-                    )
-                    .unwrap();
-                let prompt = store
-                    .push(
-                        "shared",
-                        "alice",
-                        crate::brain::store::BrainEventKind::Prompt {
-                            text: "provider effect then cancel".into(),
-                        },
-                    )
-                    .unwrap();
-                let run = store
-                    .start_run(
-                        "shared",
-                        "alice",
-                        crate::brain::store::BrainRunKind::Interactive,
-                        prompt.seq,
-                        attachment.attachment_id,
-                        crate::brain::store::BrainRunStatus::Running,
-                    )
-                    .unwrap();
-                store
-                    .acquire_runner_lease("shared", "runner", 1, None, 300_000)
-                    .unwrap();
                 let server = std::sync::Arc::new(
                     crate::server::AgentServer::for_brain_protocol_test(
                         store.clone(),
@@ -3368,41 +3282,126 @@ mod tests {
                     )
                     .unwrap(),
                 );
+                let daemon: super::finch_ipc_capnp::finch_daemon::Client =
+                    capnp_rpc::new_client(FinchDaemonImpl::new(
+                        std::sync::Arc::clone(&server),
+                        uuid::Uuid::new_v4(),
+                    ));
+                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                let initial = ipc.brain_snapshot("shared").await.unwrap();
+                let runner_subject = "runner@box.local/frontend-audit";
+                ipc.brain_claim_runner_identity(runner_subject).await.unwrap();
+                let lease = ipc
+                    .brain_acquire_runner(
+                        "shared",
+                        runner_subject,
+                        &initial.environment,
+                        None,
+                        300_000,
+                    )
+                    .await
+                    .unwrap();
+
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                runtime.bind_task_output_root(&task_output).unwrap();
+                let requirement = crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Write,
+                    crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+                );
+                runtime
+                    .grant_typed_capability(requirement.clone())
+                    .unwrap();
+                let input = serde_json::json!({
+                    "language": "forth",
+                    "source": "s\" late.txt\" task-output-path s\" durable\" bytes task-output-file-write",
+                    "intent": "production IPC provider effect audit",
+                    "declared_capabilities": [requirement],
+                    "manifest_generation": runtime.manifest_generation(),
+                });
+                let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input,
+                        calls: std::sync::Arc::clone(&provider_calls),
+                    });
+                let submit_tool =
+                    crate::tools::implementations::program::SubmitProgramTool::new(
+                        std::sync::Arc::clone(&runtime),
+                    );
+                let definitions = vec![submit_tool.definition()];
+                let mut registry = crate::tools::registry::ToolRegistry::new();
+                registry.register(Box::new(submit_tool));
+                let permissions = crate::tools::permissions::PermissionManager::new()
+                    .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        registry,
+                        permissions,
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .unwrap(),
+                ));
+
                 let (finish_started_tx, finish_started_rx) = tokio::sync::oneshot::channel();
                 let finish_release = std::sync::Arc::new(tokio::sync::Notify::new());
-                let cancelled = tokio_util::sync::CancellationToken::new();
-                let runner: super::finch_ipc_capnp::brain_runner::Client =
-                    capnp_rpc::new_client(ProviderEffectTurnRunner {
-                        task_output: task_output.clone(),
-                        finish_started: Some(finish_started_tx),
-                        finish_release: std::sync::Arc::clone(&finish_release),
-                        cancelled: cancelled.clone(),
-                    });
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                let request = crate::server::RunnerTurnRequest {
-                    brain: "shared".into(),
-                    run_id: run.run_id,
-                    request_seq: prompt.seq,
-                    prompt: "apply one provider effect".into(),
-                    context: Vec::new(),
-                    approval_audience: crate::brain::store::BrainApprovalAudience {
-                        brain_id: store.snapshot("shared").unwrap().brain_id,
-                        brain: "shared".into(),
-                        attachment_id: attachment.attachment_id,
-                        subject: "alice".into(),
-                        role: crate::brain::store::AttachmentRole::Driver,
-                        environment_generation: 1,
-                    },
-                    approval_connection_id: None,
-                    approval_tx: None,
-                    effect_audit: None,
-                    response_tx,
-                };
-                let forward = tokio::task::spawn_local(super::forward_test_runner_request(
-                    runner.clone(),
-                    std::sync::Arc::clone(&server),
-                    crate::server::RunnerRequest::Turn(request),
-                ));
+                let finish_sender = std::sync::Arc::new(std::sync::Mutex::new(Some(
+                    finish_started_tx,
+                )));
+                let physical_effects =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut event_loop =
+                    crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                        generator,
+                        definitions,
+                        executor,
+                        runtime,
+                    );
+                let conversation = event_loop.conversation_for_test();
+                let wrapper_release = std::sync::Arc::clone(&finish_release);
+                let wrapper_effects = std::sync::Arc::clone(&physical_effects);
+                event_loop.set_effect_audit_test_wrapper(std::sync::Arc::new(move |control| {
+                    let finish_started = finish_sender
+                        .lock()
+                        .expect("finish sender lock poisoned")
+                        .take()
+                        .expect("provider turn reserved more than one host effect");
+                    delayed_finish_effect_audit(
+                        control,
+                        finish_started,
+                        std::sync::Arc::clone(&wrapper_release),
+                        std::sync::Arc::clone(&wrapper_effects),
+                    )
+                }));
+                let (event_tx, event_driver) =
+                    event_loop.start_named_brain_test_runner("shared".into());
+                let _bootstrap = ipc
+                    .register_brain_runner("shared", lease.lease_id, event_tx.clone())
+                    .await
+                    .unwrap();
+                let attachment = ipc
+                    .brain_attach(
+                        "shared",
+                        "alice",
+                        crate::brain::store::AttachmentRole::Driver,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let mut watch = ipc.brain_watch("shared", &attachment).await.unwrap();
+                let _initial_watch = watch.recv().await.unwrap().unwrap();
+                let submit_ipc = ipc.clone();
+                let submit_attachment = attachment.clone();
+                let submission = tokio::task::spawn_local(async move {
+                    submit_ipc
+                        .brain_submit(
+                            "shared",
+                            &submit_attachment,
+                            crate::brain::store::BrainEventKind::Prompt {
+                                text: "apply one provider effect".into(),
+                            },
+                        )
+                        .await
+                });
 
                 tokio::time::timeout(std::time::Duration::from_secs(2), finish_started_rx)
                     .await
@@ -3412,36 +3411,59 @@ mod tests {
                     std::fs::read(task_output.join("late.txt")).unwrap(),
                     b"durable"
                 );
-                let mut cancel = runner.cancel_run_request();
-                cancel.get().set_brain("shared");
-                cancel.get().set_run_id(&run.run_id.0.to_string());
-                let cancelled_reply =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), cancel.send().promise)
-                        .await
-                        .expect("runner cancellation exceeded the teardown bound")
-                        .unwrap();
-                assert!(cancelled_reply.get().unwrap().get_cancelled());
-                assert!(cancelled.is_cancelled());
-                store
-                    .transition_run(
-                        "shared",
-                        "daemon",
-                        run.run_id,
-                        crate::brain::store::BrainRunStatus::Cancelled,
-                        Some("cancelled while host outcome was pending".into()),
-                    )
+                assert_eq!(physical_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let run = store
+                    .snapshot("shared")
+                    .unwrap()
+                    .runs
+                    .into_iter()
+                    .find(|run| run.status == crate::brain::store::BrainRunStatus::Running)
+                    .expect("daemon did not create the active provider run");
+                let cancelled = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    ipc.brain_cancel_run("shared", &attachment, run.run_id),
+                )
+                .await
+                .expect("real daemon/IPC cancellation exceeded the teardown bound")
+                .unwrap();
+                assert_eq!(
+                    cancelled.status,
+                    crate::brain::store::BrainRunStatus::Cancelled
+                );
+                event_tx.send(crate::cli::repl_event::ReplEvent::Shutdown).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
+                    .await
+                    .expect("runner EventLoop disconnect exceeded the teardown bound")
+                    .unwrap()
                     .unwrap();
                 finish_release.notify_one();
 
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_secs(2), forward)
-                        .await
-                        .expect("frontend disconnect reconciliation exceeded teardown bound")
-                        .unwrap()
-                );
-                assert!(response_rx.await.unwrap().is_err());
-                let snapshot = store.snapshot("shared").unwrap();
+                let submission = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    submission,
+                )
+                .await
+                .expect("cancelled submission did not reconcile after runner disconnect")
+                .unwrap()
+                .unwrap();
+                assert_eq!(submission.run.unwrap().run_id, run.run_id);
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                let snapshot = loop {
+                    let snapshot = store.snapshot("shared").unwrap();
+                    if snapshot.effect_audits.first().is_some_and(|audit| {
+                        matches!(audit.state, crate::runtime::effect_log::EffectAuditState::Terminal { .. })
+                    }) {
+                        break snapshot;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "late authoritative effect finish was not durably reconciled"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                };
                 assert_eq!(snapshot.effect_audits.len(), 1);
+                assert_eq!(physical_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert!(matches!(snapshot.effect_audits[0].state,
                     crate::runtime::effect_log::EffectAuditState::Terminal {
                         outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
@@ -3453,7 +3475,9 @@ mod tests {
                     crate::brain::store::BrainEventKind::ToolResult { .. }
                         | crate::brain::store::BrainEventKind::Result { .. }
                         | crate::brain::store::BrainEventKind::Program { .. }
+                        | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
                 )));
+                assert!(conversation.read().await.get_messages().is_empty());
             })
             .await;
     }

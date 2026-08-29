@@ -417,6 +417,16 @@ pub struct EventLoop {
     llm_tx: mpsc::UnboundedSender<LlmRequest>,
     /// Receiver held until `run()` hands it off to `LlmLoop`.
     llm_rx: Option<mpsc::UnboundedReceiver<LlmRequest>>,
+    #[cfg(test)]
+    effect_audit_test_wrapper: Option<
+        Arc<
+            dyn Fn(
+                    crate::server::RunnerEffectAuditControl,
+                ) -> crate::server::RunnerEffectAuditControl
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 /// View mode for the REPL
@@ -1711,6 +1721,42 @@ mod deferred_proposal_tests {
 }
 
 impl EventLoop {
+    fn start_llm_worker(&mut self) {
+        let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
+        let llm_loop = LlmLoop::new(
+            llm_rx,
+            self.event_tx.clone(),
+            self.model_selection.generator_handle(),
+            Arc::clone(&self.qwen_gen),
+            Arc::clone(&self.router),
+            Arc::clone(&self.generator_state),
+            Arc::clone(&self.tool_definitions),
+            self.tool_coordinator.clone(),
+            Arc::clone(&self.program_runtime),
+            Arc::clone(&self.tool_call_history),
+            Arc::clone(&self.conversation),
+            Arc::clone(&self.query_states),
+            Arc::clone(&self.mode),
+            Arc::clone(&self.output_manager),
+            Arc::clone(&self.status_bar),
+            Arc::clone(&self.tui_renderer),
+            Arc::clone(&self.active_tool_uses),
+            self.memory_system.clone(),
+            Arc::clone(&self.current_graph),
+            Arc::clone(&self.active_persona),
+            self.session_label.clone(),
+            self.cwd.clone(),
+            self.context_lines,
+            self.max_verbatim_messages,
+            self.context_recall_k,
+            self.streaming_enabled,
+            self.enable_summarization,
+            self.auto_compact_enabled,
+            self.metrics_logger.clone(),
+        );
+        tokio::spawn(llm_loop.run());
+    }
+
     /// Create a new event loop with unified generators
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1819,8 +1865,16 @@ impl EventLoop {
             }
         });
 
-        // Spawn input handler task
+        // Unit-level production-boundary fixtures drive the event channel
+        // directly and must not install a competing terminal reader.
+        #[cfg(not(test))]
         let input_rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+        #[cfg(test)]
+        let input_rx = {
+            drop(quit_tx);
+            let (_input_tx, input_rx) = mpsc::unbounded_channel();
+            input_rx
+        };
 
         // Initialize plan content storage
         let plan_content = Arc::new(RwLock::new(None));
@@ -1945,7 +1999,113 @@ impl EventLoop {
             daemon_base_url,
             llm_tx,
             llm_rx: Some(llm_rx),
+            #[cfg(test)]
+            effect_audit_test_wrapper: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_named_brain_test_runner(
+        generator: Arc<dyn Generator>,
+        tool_definitions: Vec<ToolDefinition>,
+        tool_executor: Arc<Mutex<ToolExecutor>>,
+        program_runtime: Arc<crate::runtime::ProgramRuntime>,
+    ) -> Self {
+        let colors = crate::config::ColorScheme::default();
+        let output_manager = Arc::new(OutputManager::new(colors.clone()));
+        let status_bar = Arc::new(StatusBar::new());
+        let tui_renderer =
+            TuiRenderer::new_headless(Arc::clone(&output_manager), Arc::clone(&status_bar), colors);
+        let todo_list = Arc::new(tokio::sync::RwLock::new(
+            crate::tools::todo::TodoList::default(),
+        ));
+        let (_todo_writer, todo_target, todo_receiver) =
+            crate::tools::todo::todo_journal(Arc::clone(&todo_list));
+        let provider_resolver =
+            crate::runtime::scheduler::ProviderResolver::new(Arc::clone(&generator));
+        let agent_scheduler = crate::runtime::scheduler::AgentScheduler::new(
+            provider_resolver.clone(),
+            Arc::clone(&program_runtime),
+        );
+        Self::new(
+            Arc::new(RwLock::new(ConversationHistory::new())),
+            Arc::new(RwLock::new(crate::config::Persona::default())),
+            Arc::clone(&generator),
+            generator,
+            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+            Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+            tool_definitions,
+            tool_executor,
+            program_runtime,
+            tui_renderer,
+            output_manager,
+            status_bar,
+            false,
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            None,
+            None,
+            Arc::new(RwLock::new(ReplMode::Normal)),
+            None,
+            "audit-test".into(),
+            Vec::new(),
+            0,
+            None,
+            0,
+            0,
+            0,
+            todo_list,
+            todo_target,
+            todo_receiver,
+            false,
+            false,
+            None,
+            provider_resolver,
+            agent_scheduler,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_named_brain_test_runner(
+        mut self,
+        brain: String,
+    ) -> (
+        mpsc::UnboundedSender<ReplEvent>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        self.runner_brain = Some(brain);
+        self.home_runner_lease_active = true;
+        self.start_llm_worker();
+        let event_tx = self.event_tx.clone();
+        let driver = tokio::task::spawn_local(async move {
+            while let Some(event) = self.event_rx.recv().await {
+                if matches!(&event, ReplEvent::Shutdown) {
+                    break;
+                }
+                self.handle_event(event).await?;
+            }
+            Ok(())
+        });
+        (event_tx, driver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_effect_audit_test_wrapper(
+        &mut self,
+        wrapper: Arc<
+            dyn Fn(
+                    crate::server::RunnerEffectAuditControl,
+                ) -> crate::server::RunnerEffectAuditControl
+                + Send
+                + Sync,
+        >,
+    ) {
+        self.effect_audit_test_wrapper = Some(wrapper);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conversation_for_test(&self) -> Arc<RwLock<ConversationHistory>> {
+        Arc::clone(&self.conversation)
     }
 
     /// Run the event loop
@@ -2135,41 +2295,7 @@ impl EventLoop {
         // ── Spawn LLM worker loop ─────────────────────────────────────────────
         // Hand the receiver half of the channel to LlmLoop so it runs as its own
         // Tokio task, decoupled from TUI select! timing.
-        {
-            let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
-            let llm_loop = LlmLoop::new(
-                llm_rx,
-                self.event_tx.clone(),
-                self.model_selection.generator_handle(),
-                Arc::clone(&self.qwen_gen),
-                Arc::clone(&self.router),
-                Arc::clone(&self.generator_state),
-                Arc::clone(&self.tool_definitions),
-                self.tool_coordinator.clone(),
-                Arc::clone(&self.program_runtime),
-                Arc::clone(&self.tool_call_history),
-                Arc::clone(&self.conversation),
-                Arc::clone(&self.query_states),
-                Arc::clone(&self.mode),
-                Arc::clone(&self.output_manager),
-                Arc::clone(&self.status_bar),
-                Arc::clone(&self.tui_renderer),
-                Arc::clone(&self.active_tool_uses),
-                self.memory_system.clone(),
-                Arc::clone(&self.current_graph),
-                Arc::clone(&self.active_persona),
-                self.session_label.clone(),
-                self.cwd.clone(),
-                self.context_lines,
-                self.max_verbatim_messages,
-                self.context_recall_k,
-                self.streaming_enabled,
-                self.enable_summarization,
-                self.auto_compact_enabled,
-                self.metrics_logger.clone(),
-            );
-            tokio::spawn(llm_loop.run());
-        }
+        self.start_llm_worker();
 
         // Render interval (33ms ≈ 30fps) — smooth streaming without terminal flicker.
         // 60fps (16ms) caused visual artifacts on most terminal emulators; 30fps is the
@@ -4925,7 +5051,12 @@ Rules:\n\
                 },
             )
             .await;
-        if let Some(effect_audit) = request.effect_audit.clone() {
+        let mut effect_audit = request.effect_audit;
+        #[cfg(test)]
+        if let Some(wrapper) = &self.effect_audit_test_wrapper {
+            effect_audit = effect_audit.map(|control| wrapper(control));
+        }
+        if let Some(effect_audit) = effect_audit.clone() {
             self.query_states
                 .bind_effect_audit(query_id, effect_audit)
                 .await;
@@ -4954,7 +5085,7 @@ Rules:\n\
                 active_tool_ids: std::collections::HashSet::new(),
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
-                effect_audit: request.effect_audit,
+                effect_audit,
                 restart: None,
             },
         );

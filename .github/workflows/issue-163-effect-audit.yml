@@ -1,18 +1,41 @@
 name: Issue 163 durable effect audit
 
 on:
-  pull_request:
+  push:
+    branches:
+      - main
     paths:
       - ".github/workflows/issue-163-effect-audit.yml"
       - "schema/finch_ipc.capnp"
       - "src/brain/effect_audit_archive.rs"
       - "src/brain/mod.rs"
+      - "src/brain/remote.rs"
       - "src/brain/store.rs"
       - "src/cli/repl_event/**"
       - "src/ipc/**"
       - "src/runtime/effect_log.rs"
       - "src/runtime/mod.rs"
       - "src/server/brain_runner.rs"
+      - "src/server/brain_service.rs"
+      - "src/server/handlers.rs"
+      - "src/server/mod.rs"
+      - "src/tools/executor.rs"
+      - "src/tools/types.rs"
+      - "src/tools/implementations/program.rs"
+  pull_request:
+    paths:
+      - ".github/workflows/issue-163-effect-audit.yml"
+      - "schema/finch_ipc.capnp"
+      - "src/brain/effect_audit_archive.rs"
+      - "src/brain/mod.rs"
+      - "src/brain/remote.rs"
+      - "src/brain/store.rs"
+      - "src/cli/repl_event/**"
+      - "src/ipc/**"
+      - "src/runtime/effect_log.rs"
+      - "src/runtime/mod.rs"
+      - "src/server/brain_runner.rs"
+      - "src/server/brain_service.rs"
       - "src/server/handlers.rs"
       - "src/server/mod.rs"
       - "src/tools/executor.rs"
