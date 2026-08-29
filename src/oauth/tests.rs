@@ -867,7 +867,7 @@ async fn expired_refresh_revoke_crash_and_same_name_reauthentication_are_durable
         .finish_device_authorization("chatgpt:work", &pending, CancellationToken::new())
         .await
         .unwrap();
-    let replacement = &store.0.lock().unwrap()["chatgpt:work"];
+    let replacement = store.0.lock().unwrap()["chatgpt:work"].clone();
     assert!(!replacement.revoked && !replacement.mutation_pending);
     assert_eq!(replacement.refresh_token.as_deref(), Some("refresh-three"));
 
