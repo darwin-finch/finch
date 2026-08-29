@@ -509,9 +509,7 @@ where
 {
     pub fn new(dialect: Arc<D>, store: Arc<S>) -> Result<Self> {
         dialect.descriptor().validate()?;
-        dialect
-            .preflight()
-            .context("OAuth provider dialect is unavailable")?;
+        dialect.preflight()?;
         let http = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
