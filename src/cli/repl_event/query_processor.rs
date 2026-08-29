@@ -75,6 +75,10 @@ async fn execute_direct_wire_response(
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "VM program cancelled before audited submission"
+    );
     let projection = VmOutputProjection::new(output_manager, work_unit);
     let effect_event_tx = event_tx.clone();
     let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
@@ -377,6 +381,17 @@ async fn execute_wire_with_single_repair(
             output_unit,
         };
     }
+    if cancel.is_cancelled() {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+            effect_journal,
+            output_unit,
+        };
+    }
     metric.repair_attempted = true;
 
     // Keep the rejected result visibly live while the bounded corrective
@@ -387,8 +402,34 @@ async fn execute_wire_with_single_repair(
         "requesting one corrected ProgramSubmission from the provider…".to_string(),
     ));
     let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
-    let repair = generator.generate(repair_messages, None).await;
+    let repair = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            output_unit.set_transient_status(None);
+            metric.terminal_failure = true;
+            record_wire_metric(metrics_logger, &metric);
+            output_unit.set_complete();
+            return WireExecution {
+                source_for_history: source,
+                response: diagnostic,
+                effect_journal,
+                output_unit,
+            };
+        }
+        repair = generator.generate(repair_messages, None) => repair,
+    };
     output_unit.set_transient_status(None);
+    if cancel.is_cancelled() {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+            effect_journal,
+            output_unit,
+        };
+    }
     let Ok(repair) = repair else {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
@@ -1860,6 +1901,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct BlockingRepairGenerator {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+    }
+
     #[async_trait::async_trait]
     impl Generator for SingleRepairGenerator {
         async fn generate(
@@ -1912,6 +1958,43 @@ mod tests {
 
         fn name(&self) -> &str {
             "single-repair"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for BlockingRepairGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "blocking-repair"
         }
     }
 
@@ -2335,6 +2418,86 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::config::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    #[tokio::test]
+    async fn named_brain_effect_audit_cancel_before_repair_never_invokes_provider() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            output,
+            event_tx,
+            cancel,
+            generator.clone(),
+            &[crate::claude::Message::user("reply")],
+            source.clone(),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(execution.source_for_history, source);
+        assert!(execution.response.contains("E-WIRE-002"));
+    }
+
+    #[tokio::test]
+    async fn named_brain_effect_audit_cancel_drops_inflight_repair_without_continuation() {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(BlockingRepairGenerator {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = {
+            let runtime = Arc::clone(&runtime);
+            let output = Arc::clone(&output);
+            let generator = Arc::clone(&generator);
+            let cancel = cancel.clone();
+            let source = source.clone();
+            tokio::spawn(async move {
+                execute_wire_with_single_repair(
+                    runtime.as_ref(),
+                    output,
+                    event_tx,
+                    cancel,
+                    generator,
+                    &[crate::claude::Message::user("reply")],
+                    source,
+                    None,
+                    None,
+                )
+                .await
+            })
+        };
+        generator.started.notified().await;
+        cancel.cancel();
+        let execution = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("cancellation must abort repair generation promptly")
+            .unwrap();
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execution.source_for_history, source);
+        assert!(execution.response.contains("E-WIRE-002"));
+        assert!(event_rx.try_recv().is_err(), "no repaired VM continuation");
+        assert!(output.get_messages().iter().all(|message| !message
+            .format(&crate::config::ColorScheme::default())
+            .contains("VM program repair")));
     }
 
     #[test]
