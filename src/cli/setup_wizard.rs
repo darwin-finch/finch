@@ -9323,7 +9323,7 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(
-            format!("{error:#}").contains("authenticated endpoint origin mismatch"),
+            format!("{error:#}").contains("audience mismatch"),
             "{error:#}"
         );
         assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
