@@ -118,7 +118,7 @@ windows_contract=$(awk '
 windows_contract_is_narrow() {
   local contract="$1"
   local cargo_lines
-  cargo_lines=$(grep -E '(^|[^[:alnum:]_])cargo([^[:alnum:]_]|$)' <<<"$contract" || true)
+  cargo_lines=$(grep -Ei '(^|[^[:alnum:]_])cargo([^[:alnum:]_]|$)' <<<"$contract" || true)
 
   [[ "$contract" == *'runs-on: windows-2025'* ]] \
     && [[ "$contract" == *'dtolnay/rust-toolchain@1.98.0'* ]] \
@@ -140,6 +140,7 @@ windows_contract_mutations=(
   "${windows_contract/cargo fmt --all -- --check/cargo +1.98.0 test}"
   "${windows_contract/cargo fmt --all -- --check/cargo rustc}"
   "${windows_contract/cargo fmt --all -- --check/cargo doc}"
+  "${windows_contract/cargo fmt --all -- --check/CaRgO test}"
   "${windows_contract}"$'\n''      run: cargo check'
 )
 for mutation in "${windows_contract_mutations[@]}"; do
