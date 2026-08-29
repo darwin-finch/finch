@@ -51,6 +51,10 @@ pub struct VerifiedOpenAiClaims {
     pub account_is_fedramp: bool,
     pub scopes: BTreeSet<String>,
     pub nonce: Option<String>,
+    /// Signature-verified JWT `exp` authority.
+    pub expires_at: chrono::DateTime<Utc>,
+    /// Signature-verified JWT `nbf` authority when present.
+    pub not_before: Option<chrono::DateTime<Utc>>,
 }
 
 /// Injected JWS/JWKS verification boundary. Production enablement must supply
@@ -275,10 +279,7 @@ where
         context: &TokenValidationContext,
     ) -> Result<OAuthTokenRecord> {
         if !status.is_success() {
-            let code = body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
+            let code = safe_oauth_error_code(&body);
             bail!("ChatGPT token request failed (HTTP {status}, code {code})");
         }
         let access_token = required_string(&body, "access_token")?;
@@ -294,14 +295,17 @@ where
             .and_then(Value::as_str)
             .map(str::to_string);
         let claims = self.verifier.verify(id_token.as_deref(), &access_token)?;
+        let now = Utc::now();
         if claims.issuer != REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
             || claims.subject.trim().is_empty()
             || claims.account_id.trim().is_empty()
             || claims.chatgpt_plan_type.trim().is_empty()
             || !self.descriptor.scopes.is_subset(&claims.scopes)
+            || claims.expires_at <= now
+            || claims.not_before.is_some_and(|not_before| not_before > now)
         {
-            bail!("ChatGPT token issuer, audience, account, or scope validation failed");
+            bail!("ChatGPT token issuer, audience, account, scope, or lifetime validation failed");
         }
         match context {
             TokenValidationContext::Browser { expected_nonce, .. }
@@ -319,11 +323,6 @@ where
                 bail!("ChatGPT token refresh changed accounts");
             }
         }
-        let expires_in = body
-            .get("expires_in")
-            .and_then(Value::as_i64)
-            .unwrap_or(3600)
-            .clamp(60, 24 * 60 * 60);
         Ok(OAuthTokenRecord {
             dialect_id: self.descriptor.dialect_id.clone(),
             protocol_revision: self.descriptor.protocol_revision.clone(),
@@ -339,11 +338,27 @@ where
             access_token,
             refresh_token: Some(refresh_token),
             id_token,
-            expires_at: Utc::now() + TimeDelta::seconds(expires_in),
+            expires_at: claims.expires_at,
             generation: Uuid::new_v4().to_string(),
             revoked: false,
             mutation_pending: false,
         })
+    }
+}
+
+fn safe_oauth_error_code(body: &Value) -> &'static str {
+    match body.get("error").and_then(Value::as_str) {
+        Some("invalid_request") => "invalid_request",
+        Some("invalid_client") => "invalid_client",
+        Some("invalid_grant") => "invalid_grant",
+        Some("unauthorized_client") => "unauthorized_client",
+        Some("unsupported_grant_type") => "unsupported_grant_type",
+        Some("invalid_scope") => "invalid_scope",
+        Some("access_denied") => "access_denied",
+        Some("expired_token") => "expired_token",
+        Some("temporarily_unavailable") => "temporarily_unavailable",
+        Some("server_error") => "server_error",
+        _ => "unrecognized",
     }
 }
 
@@ -505,6 +520,8 @@ mod tests {
                 "api.connectors.invoke".into(),
             ]),
             nonce: None,
+            expires_at: Utc::now() + TimeDelta::hours(1),
+            not_before: None,
         }
     }
 
@@ -675,7 +692,15 @@ mod tests {
 
     #[test]
     fn openai_token_claim_mismatch_matrix_fails_before_record_creation() {
-        for defect in ["issuer", "audience", "scope", "account", "nonce"] {
+        for defect in [
+            "issuer",
+            "audience",
+            "scope",
+            "account",
+            "nonce",
+            "expired",
+            "not_before",
+        ] {
             let mut claims = claims();
             let context = if defect == "nonce" {
                 claims.nonce = Some("wrong".into());
@@ -691,6 +716,10 @@ mod tests {
                         claims.scopes.remove("offline_access");
                     }
                     "account" => claims.account_id.clear(),
+                    "expired" => claims.expires_at = Utc::now() - TimeDelta::minutes(1),
+                    "not_before" => {
+                        claims.not_before = Some(Utc::now() + TimeDelta::minutes(5));
+                    }
                     _ => unreachable!(),
                 }
                 TokenValidationContext::Device
@@ -719,5 +748,48 @@ mod tests {
             );
             assert!(!error.contains("secret"));
         }
+    }
+
+    #[test]
+    fn hostile_token_error_and_unsigned_lifetime_never_leak_or_extend_authority() {
+        let dialect = OpenAiChatGptOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(claims())),
+        )
+        .unwrap();
+        let marker = "refresh-secret-echo-marker";
+        let error = dialect
+            .validate_tokens(
+                StatusCode::BAD_REQUEST,
+                json!({"error": marker}),
+                None,
+                &TokenValidationContext::Device,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unrecognized"));
+        assert!(!error.contains(marker));
+
+        let mut short = claims();
+        short.expires_at = Utc::now() + TimeDelta::minutes(5);
+        let signed_expiry = short.expires_at;
+        let dialect = OpenAiChatGptOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(short)),
+        )
+        .unwrap();
+        let record = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                json!({
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                    "expires_in": 86400
+                }),
+                None,
+                &TokenValidationContext::Device,
+            )
+            .unwrap();
+        assert_eq!(record.expires_at, signed_expiry);
     }
 }
