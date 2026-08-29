@@ -1633,6 +1633,61 @@ impl BrainStore {
         self.terminalize_effect_audit_authority(grant, true)
     }
 
+    /// Durably reconcile every unresolved audit whose exact runner lease was
+    /// owned by a transport connection that has terminated. The caller keeps
+    /// those lease claims fenced until this single per-Brain batch succeeds.
+    pub(crate) fn reconcile_effect_audits_for_disconnected_leases(
+        &self,
+        name: &str,
+        lease_ids: &[RunnerLeaseId],
+    ) -> Result<usize> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let lease_ids = lease_ids
+            .iter()
+            .map(|lease_id| lease_id.0)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains
+            .get_mut(name)
+            .context("Brain was removed concurrently")?;
+        let unresolved = state
+            .effect_audits
+            .entries()
+            .values()
+            .filter_map(|entry| {
+                (lease_ids.contains(&entry.authority.runner_lease_id)
+                    && entry.authority.environment_generation == self.environment.generation)
+                    .then(|| match &entry.state {
+                        crate::runtime::effect_log::EffectAuditState::IntentAccepted => Some((
+                            entry.intent.identity,
+                            entry.authority.authority_id,
+                            crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied,
+                        )),
+                        crate::runtime::effect_log::EffectAuditState::AwaitingHostResult => Some((
+                            entry.intent.identity,
+                            entry.authority.authority_id,
+                            crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss,
+                        )),
+                        crate::runtime::effect_log::EffectAuditState::Terminal { .. } => None,
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        let transitions = unresolved
+            .iter()
+            .map(|(identity, authority_id, outcome)| {
+                crate::runtime::effect_log::EffectAuditTransition::Finish {
+                    identity: *identity,
+                    authority_id: *authority_id,
+                    outcome: outcome.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.append_effect_audit_transition_batch_locked(name, state, transitions)?;
+        Ok(unresolved.len())
+    }
+
     /// A normally returned runner can prove that accepted-but-unbegun
     /// reservations were never dispatched. Begun effects retain their
     /// detached permit so one late authoritative completion may still land.
@@ -5885,7 +5940,7 @@ impl BrainStore {
     }
 
     #[cfg(test)]
-    fn fail_next_event_batch_for_test(&self) {
+    pub(crate) fn fail_next_event_batch_for_test(&self) {
         self.fail_event_batches
             .store(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -10586,6 +10641,80 @@ mod tests {
                 crate::runtime::effect_log::EffectAuditState::Terminal {
                     outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
                 })));
+    }
+
+    #[test]
+    fn effect_audit_connection_teardown_batch_is_exact_idempotent_and_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, lease, grant) = audit_run_fixture(&store);
+        let unbegun = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(0, "unbegun"))
+            .unwrap();
+        let begun = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(1, "begun"))
+            .unwrap();
+        let _permit = store.begin_effect_audit(&grant, begun).unwrap();
+
+        assert_eq!(
+            store
+                .reconcile_effect_audits_for_disconnected_leases(
+                    "shared",
+                    &[RunnerLeaseId(uuid::Uuid::new_v4())],
+                )
+                .unwrap(),
+            0,
+            "a different connection lease must not own these audit identities"
+        );
+        store.fail_next_event_batch_for_test();
+        assert!(store
+            .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+            .is_err());
+        let failed = store.snapshot("shared").unwrap();
+        assert!(failed.effect_audits.iter().any(|entry| {
+            entry.intent.identity == unbegun
+                && matches!(
+                    entry.state,
+                    crate::runtime::effect_log::EffectAuditState::IntentAccepted
+                )
+        }));
+        assert!(failed.effect_audits.iter().any(|entry| {
+            entry.intent.identity == begun
+                && matches!(
+                    entry.state,
+                    crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+                )
+        }));
+
+        assert_eq!(
+            store
+                .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+                .unwrap(),
+            0,
+            "an exact teardown retry must not append duplicate terminal receipts"
+        );
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert!(snapshot.effect_audits.iter().any(|entry|
+            entry.intent.identity == unbegun
+                && matches!(entry.state,
+                    crate::runtime::effect_log::EffectAuditState::Terminal {
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+                    })));
+        assert!(snapshot.effect_audits.iter().any(|entry|
+            entry.intent.identity == begun
+                && matches!(entry.state,
+                    crate::runtime::effect_log::EffectAuditState::Terminal {
+                        outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+                    })));
     }
 
     #[test]

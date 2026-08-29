@@ -1849,28 +1849,41 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 Ok(registration_id) => registration_id,
                 Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
             };
+        let dispatch_admission = match broker.connection_dispatch_admission(self.connection_id) {
+            Ok(admission) => admission,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
         let queued_brain = brain.clone();
         let registered_brain = brain.clone();
         let registered_connection_id = self.connection_id;
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
+                // Deliberately no await may occur between dequeue and
+                // admission. The guard is acquired before spawning
+                // `forward_runner_request`, whose first Program/Turn action
+                // mints the run-scoped audit authority. Connection teardown
+                // therefore either rejects this queued request or waits for
+                // all authority it can create before taking the durable
+                // reconciliation snapshot.
+                let Some(dispatch_guard) = dispatch_admission.try_enter() else {
+                    // Teardown closed callback admission before taking its
+                    // durable audit snapshot. Dropping the receiver also
+                    // rejects every queued request without issuing authority.
+                    break;
+                };
                 let runner = runner.clone();
                 let server = Arc::clone(&server);
-                let broker = broker.clone();
-                let brain = registered_brain.clone();
                 tokio::task::spawn_local(async move {
-                    if forward_runner_request(
+                    let _dispatch_guard = dispatch_guard;
+                    forward_runner_request(
                         runner,
                         server,
                         request,
                         lease_id,
                         Some(crate::brain::store::ConnectionId(registered_connection_id)),
                     )
-                    .await
-                    {
-                        broker.unregister(&brain, registration_id);
-                    }
+                    .await;
                 });
             }
             broker.unregister(&registered_brain, registration_id);
@@ -1992,17 +2005,13 @@ fn decode_schedule_policy(
     }
 }
 
-fn runner_rpc_transport_disconnected(error: &capnp::Error) -> bool {
-    error.kind == capnp::ErrorKind::Disconnected
-}
-
 async fn forward_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
     request: crate::server::RunnerRequest,
     lease_id: crate::brain::store::RunnerLeaseId,
     connection_id: Option<crate::brain::store::ConnectionId>,
-) -> bool {
+) {
     match request {
         crate::server::RunnerRequest::Program(request) => {
             let audit_grant = match server.brain_store().issue_effect_audit_authority(
@@ -2014,7 +2023,7 @@ async fn forward_runner_request(
                 Ok(grant) => grant,
                 Err(error) => {
                     let _ = request.response_tx.send(Err(error.to_string().into()));
-                    return false;
+                    return;
                 }
             };
             let reconciliation_grant = audit_grant.clone();
@@ -2063,31 +2072,22 @@ async fn forward_runner_request(
                     });
                 payload.set_control(control);
             }
-            let (mut result, disconnected) = match call.send().promise.await {
-                Ok(reply) => (
-                    decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
-                    false,
-                ),
-                Err(error) => {
-                    let disconnected = runner_rpc_transport_disconnected(&error);
-                    (Err(error.to_string().into()), disconnected)
-                }
+            let mut result = match call.send().promise.await {
+                Ok(reply) => decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
+                Err(error) => Err(error.to_string().into()),
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
-            let reconciliation = if disconnected {
-                server
-                    .brain_store()
-                    .reconcile_effect_audit_authority(&reconciliation_grant)
-            } else {
-                server
-                    .brain_store()
-                    .abandon_unbegun_effect_audits(&reconciliation_grant)
-            };
+            // An individual RPC error cannot prove transport loss: remote
+            // exceptions may claim `Disconnected`, while a torn frame can
+            // surface another error kind. Only whole-connection teardown
+            // terminalizes begun permits as uncertain.
+            let reconciliation = server
+                .brain_store()
+                .abandon_unbegun_effect_audits(&reconciliation_grant);
             if let Err(error) = reconciliation {
                 result = Err(error.to_string().into());
             }
             let _ = request.response_tx.send(result);
-            disconnected
         }
         crate::server::RunnerRequest::Turn(request) => {
             let audit_grant = match server.brain_store().issue_effect_audit_authority(
@@ -2099,12 +2099,12 @@ async fn forward_runner_request(
                 Ok(grant) => grant,
                 Err(error) => {
                     let _ = request.response_tx.send(Err(error.to_string().into()));
-                    return false;
+                    return;
                 }
             };
             let reconciliation_grant = audit_grant.clone();
             let audit_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let (mut result, disconnected) = {
+            let mut result = {
                 let mut call = runner.run_turn_request();
                 let encoded = {
                     let mut payload = call.get().init_request();
@@ -2147,33 +2147,22 @@ async fn forward_runner_request(
                 };
                 match encoded {
                     Ok(()) => match call.send().promise.await {
-                        Ok(reply) => (
-                            decode_runner_turn_result(reply.get().and_then(|r| r.get_result())),
-                            false,
-                        ),
-                        Err(error) => {
-                            let disconnected = runner_rpc_transport_disconnected(&error);
-                            (Err(error.to_string().into()), disconnected)
+                        Ok(reply) => {
+                            decode_runner_turn_result(reply.get().and_then(|r| r.get_result()))
                         }
+                        Err(error) => Err(error.to_string().into()),
                     },
-                    Err(error) => (Err(error.into()), false),
+                    Err(error) => Err(error.into()),
                 }
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
-            let reconciliation = if disconnected {
-                server
-                    .brain_store()
-                    .reconcile_effect_audit_authority(&reconciliation_grant)
-            } else {
-                server
-                    .brain_store()
-                    .abandon_unbegun_effect_audits(&reconciliation_grant)
-            };
+            let reconciliation = server
+                .brain_store()
+                .abandon_unbegun_effect_audits(&reconciliation_grant);
             if let Err(error) = reconciliation {
                 result = Err(error.to_string().into());
             }
             let _ = request.response_tx.send(result);
-            disconnected
         }
         crate::server::RunnerRequest::ProjectMemory(request) => {
             let mut call = runner.project_memory_request();
@@ -2186,7 +2175,7 @@ async fn forward_runner_request(
                 payload.set_prompt(&request.prompt);
                 payload.set_source(&request.source);
             }
-            let (result, disconnected) = match call.send().promise.await {
+            let result = match call.send().promise.await {
                 Ok(reply) => match reply.get() {
                     Ok(reply) => {
                         let error = reply
@@ -2195,23 +2184,22 @@ async fn forward_runner_request(
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or("");
                         if error.is_empty() {
-                            (Ok(reply.get_inserted() as usize), false)
+                            Ok(reply.get_inserted() as usize)
                         } else {
-                            (Err(error.to_string()), false)
+                            Err(error.to_string())
                         }
                     }
-                    Err(error) => (Err(error.to_string()), false),
+                    Err(error) => Err(error.to_string()),
                 },
-                Err(error) => (Err(error.to_string()), true),
+                Err(error) => Err(error.to_string()),
             };
             let _ = request.response_tx.send(result);
-            disconnected
         }
         crate::server::RunnerRequest::Cancel(request) => {
             let mut call = runner.cancel_run_request();
             call.get().set_brain(&request.brain);
             call.get().set_run_id(&request.run_id.0.to_string());
-            let (result, disconnected) = match call.send().promise.await {
+            let result = match call.send().promise.await {
                 Ok(reply) => match reply.get() {
                     Ok(reply) => {
                         let error = reply
@@ -2220,17 +2208,16 @@ async fn forward_runner_request(
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or("");
                         if error.is_empty() {
-                            (Ok(reply.get_cancelled()), false)
+                            Ok(reply.get_cancelled())
                         } else {
-                            (Err(error.to_string()), false)
+                            Err(error.to_string())
                         }
                     }
-                    Err(error) => (Err(error.to_string()), false),
+                    Err(error) => Err(error.to_string()),
                 },
-                Err(error) => (Err(error.to_string()), true),
+                Err(error) => Err(error.to_string()),
             };
             let _ = request.response_tx.send(result);
-            disconnected
         }
     }
 }
@@ -2240,7 +2227,7 @@ pub(crate) async fn forward_test_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
     request: crate::server::RunnerRequest,
-) -> bool {
+) {
     let brain = match &request {
         crate::server::RunnerRequest::Program(request) => &request.brain,
         crate::server::RunnerRequest::Turn(request) => &request.brain,
@@ -2439,29 +2426,9 @@ fn decode_runner_turn_event(
 mod tests {
     use super::{
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-        require_approval_connection, runner_rpc_transport_disconnected, BrainRpcService,
-        BrainRunnerControlImpl, FinchDaemonImpl,
+        require_approval_connection, BrainRpcService, BrainRunnerControlImpl, FinchDaemonImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
-
-    #[test]
-    fn effect_audit_process_loss_uses_capnp_transport_kind_not_error_text() {
-        assert!(runner_rpc_transport_disconnected(
-            &capnp::Error::disconnected("application failed".into())
-        ));
-        assert!(!runner_rpc_transport_disconnected(&capnp::Error::failed(
-            "peer disconnected".into()
-        )));
-        assert!(!runner_rpc_transport_disconnected(
-            &capnp::Error::overloaded("peer disconnected".into())
-        ));
-        assert!(!runner_rpc_transport_disconnected(
-            &capnp::Error::unimplemented("peer disconnected".into())
-        ));
-        assert!(!runner_rpc_transport_disconnected(
-            &capnp::Error::from_kind(capnp::ErrorKind::BufferNotLargeEnough,)
-        ));
-    }
 
     #[test]
     fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
@@ -2948,6 +2915,7 @@ mod tests {
 
     struct EffectNormalRunner {
         begin: bool,
+        remote_disconnect_error: bool,
         permit_tx: Option<
             tokio::sync::oneshot::Sender<
                 Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
@@ -2970,6 +2938,7 @@ mod tests {
                 Err(error) => return capnp::capability::Promise::err(error),
             };
             let begin = self.begin;
+            let remote_disconnect_error = self.remote_disconnect_error;
             let permit_tx = self.permit_tx.take().expect("normal runner called twice");
             capnp::capability::Promise::from_future(async move {
                 let mut reserve = control.reserve_effect_request();
@@ -3008,6 +2977,11 @@ mod tests {
                     None
                 };
                 let _ = permit_tx.send(permit);
+                if remote_disconnect_error {
+                    return Err(capnp::Error::disconnected(
+                        "application exception with a misleading disconnected kind".into(),
+                    ));
+                }
                 results
                     .get()
                     .init_result()
@@ -3078,7 +3052,7 @@ mod tests {
                 crate::brain::store::BrainRunStatus::Running,
             )
             .unwrap();
-        store
+        let lease = store
             .acquire_runner_lease("shared", "runner", 1, None, 300_000)
             .unwrap();
         if mature_history {
@@ -3110,15 +3084,16 @@ mod tests {
         };
         let runner: super::finch_ipc_capnp::brain_runner::Client =
             capnp_rpc::new_client(EffectEofRunner { begin, count });
-        assert!(
-            super::forward_test_runner_request(
-                runner,
-                server,
-                crate::server::RunnerRequest::Program(request),
-            )
-            .await
-        );
+        super::forward_test_runner_request(
+            runner,
+            std::sync::Arc::clone(&server),
+            crate::server::RunnerRequest::Program(request),
+        )
+        .await;
         assert!(response_rx.await.unwrap().is_err());
+        store
+            .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+            .unwrap();
         store
             .snapshot("shared")
             .unwrap()
@@ -3126,6 +3101,350 @@ mod tests {
             .into_iter()
             .map(|entry| entry.state)
             .collect()
+    }
+
+    async fn partial_frame_connection_teardown_fixture(
+        fail_audit_batch: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::brain::store::BrainStore,
+        std::sync::Arc<crate::server::AgentServer>,
+        uuid::Uuid,
+        crate::brain::store::RunnerLeaseId,
+        anyhow::Result<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().join("brains")),
+        );
+        let attachment = store
+            .attach(
+                "shared",
+                "alice",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                crate::brain::store::BrainEventKind::Prompt {
+                    text: "partial frame".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                crate::brain::store::BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+            .unwrap();
+        let connection_id = uuid::Uuid::new_v4();
+        let grant = store
+            .issue_effect_audit_authority(
+                "shared",
+                run.run_id,
+                lease.lease_id,
+                Some(crate::brain::store::ConnectionId(connection_id)),
+            )
+            .unwrap();
+        store
+            .reserve_effect_audit(
+                &grant,
+                uuid::Uuid::new_v4(),
+                crate::vm::VmSideEffect {
+                    protocol_version: 1,
+                    sequence: 0,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    output: Vec::new(),
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "unbegun".into(),
+                    },
+                    origin: crate::vm::SourceOrigin::generated("partial-frame-unbegun"),
+                },
+            )
+            .unwrap();
+        let begun = store
+            .reserve_effect_audit(
+                &grant,
+                uuid::Uuid::new_v4(),
+                crate::vm::VmSideEffect {
+                    protocol_version: 1,
+                    sequence: 1,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    output: Vec::new(),
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "begun".into(),
+                    },
+                    origin: crate::vm::SourceOrigin::generated("partial-frame-begun"),
+                },
+            )
+            .unwrap();
+        let _permit = store.begin_effect_audit(&grant, begun).unwrap();
+        let server = std::sync::Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store.clone(),
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([49; 32]),
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap(),
+        );
+        let runners = server.brain_runners();
+        runners
+            .claim_connection_identity(connection_id, "runner@box.local/partial")
+            .unwrap();
+        runners
+            .claim_connection_lease(connection_id, "shared", lease.lease_id)
+            .unwrap();
+        let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
+        runners
+            .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
+            .unwrap();
+        if fail_audit_batch {
+            store.fail_next_event_batch_for_test();
+        }
+
+        let (server_stream, mut peer_stream) = tokio::net::UnixStream::pair().unwrap();
+        let handler_server = std::sync::Arc::clone(&server);
+        let handler = tokio::task::spawn_local(async move {
+            super::handle_connection_with_id(server_stream, handler_server, connection_id).await
+        });
+        tokio::task::yield_now().await;
+        // A valid first segment-count word followed by EOF forces a real
+        // Cap'n Proto partial-frame transport failure rather than a remote
+        // application exception choosing an error kind.
+        peer_stream.write_all(&0_u32.to_le_bytes()).await.unwrap();
+        peer_stream.shutdown().await.unwrap();
+        drop(peer_stream);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handler)
+            .await
+            .expect("partial-frame connection teardown exceeded two seconds")
+            .unwrap();
+        (temp, store, server, connection_id, lease.lease_id, result)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_partial_frame_connection_teardown_reconciles_before_and_after_begin() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_temp, store, server, _connection_id, lease_id, result) =
+                    partial_frame_connection_teardown_fixture(false).await;
+                assert!(result.is_err(), "partial Cap'n Proto frame must fail the RPC system");
+                assert!(!server.brain_runners().has_registration("shared", lease_id));
+                let states = store
+                    .snapshot("shared")
+                    .unwrap()
+                    .effect_audits
+                    .into_iter()
+                    .map(|entry| entry.state)
+                    .collect::<Vec<_>>();
+                assert!(states.iter().any(|state| matches!(
+                    state,
+                    crate::runtime::effect_log::EffectAuditState::Terminal {
+                        outcome:
+                            crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+                    }
+                )));
+                assert!(states.iter().any(|state| matches!(
+                    state,
+                    crate::runtime::effect_log::EffectAuditState::Terminal {
+                        outcome:
+                            crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+                    }
+                )));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_teardown_fsync_failure_keeps_connection_authority_fenced_until_retry() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (_temp, store, server, connection_id, lease_id, result) =
+                    partial_frame_connection_teardown_fixture(true).await;
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("could not reconcile effect audits"));
+                let replacement = uuid::Uuid::new_v4();
+                assert!(server
+                    .brain_runners()
+                    .claim_connection_identity(replacement, "runner@box.local/partial")
+                    .is_err());
+                assert!(server
+                    .brain_runners()
+                    .claim_connection_lease(replacement, "shared", lease_id)
+                    .is_err());
+                assert_eq!(
+                    store
+                        .reconcile_effect_audits_for_disconnected_leases("shared", &[lease_id])
+                        .unwrap(),
+                    2
+                );
+                server
+                    .brain_runners()
+                    .begin_connection_teardown(connection_id)
+                    .finish()
+                    .unwrap();
+                server
+                    .brain_runners()
+                    .claim_connection_identity(replacement, "runner@box.local/partial")
+                    .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_connection_teardown_closes_admission_and_drains_pre_snapshot_dispatch() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let attachment = store
+                    .attach(
+                        "shared",
+                        "alice",
+                        crate::brain::store::AttachmentRole::Driver,
+                        None,
+                    )
+                    .unwrap();
+                let prompt = store
+                    .push(
+                        "shared",
+                        "alice",
+                        crate::brain::store::BrainEventKind::Prompt {
+                            text: "queued teardown race".into(),
+                        },
+                    )
+                    .unwrap();
+                let run = store
+                    .start_run(
+                        "shared",
+                        "alice",
+                        crate::brain::store::BrainRunKind::Interactive,
+                        prompt.seq,
+                        attachment.attachment_id,
+                        crate::brain::store::BrainRunStatus::Running,
+                    )
+                    .unwrap();
+                let lease = store
+                    .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+                    .unwrap();
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store.clone(),
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([50; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let connection_id = uuid::Uuid::new_v4();
+                let runners = server.brain_runners();
+                runners
+                    .claim_connection_identity(connection_id, "runner@box.local/queued")
+                    .unwrap();
+                runners
+                    .claim_connection_lease(connection_id, "shared", lease.lease_id)
+                    .unwrap();
+                let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
+                runners
+                    .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
+                    .unwrap();
+                let admission = runners
+                    .connection_dispatch_admission(connection_id)
+                    .unwrap();
+                let queued_dispatch = admission
+                    .try_enter()
+                    .expect("live connection admits queued callback dispatch");
+                let run_id = run.run_id;
+                let lease_id = lease.lease_id;
+                let release = std::sync::Arc::new(tokio::sync::Notify::new());
+                let release_task = std::sync::Arc::clone(&release);
+                let queued_store = store.clone();
+                let queued = tokio::task::spawn_local(async move {
+                    let _queued_dispatch = queued_dispatch;
+                    release_task.notified().await;
+                    let grant = queued_store
+                        .issue_effect_audit_authority(
+                            "shared",
+                            run_id,
+                            lease_id,
+                            Some(crate::brain::store::ConnectionId(connection_id)),
+                        )
+                        .unwrap();
+                    queued_store
+                        .reserve_effect_audit(
+                            &grant,
+                            uuid::Uuid::new_v4(),
+                            crate::vm::VmSideEffect {
+                                protocol_version: 1,
+                                sequence: 0,
+                                requirement: crate::vm::CapabilityRequirement {
+                                    capability: crate::vm::CapabilityKind::SessionEmit,
+                                    selector: crate::vm::ResourceSelector::None,
+                                },
+                                output: Vec::new(),
+                                event: crate::vm::HostSideEffect::Emit {
+                                    text: "queued".into(),
+                                },
+                                origin: crate::vm::SourceOrigin::generated(
+                                    "queued-before-teardown",
+                                ),
+                            },
+                        )
+                        .unwrap()
+                });
+
+                let teardown = runners.begin_connection_teardown(connection_id);
+                assert!(
+                    admission.try_enter().is_none(),
+                    "teardown must reject new callback work before the audit snapshot"
+                );
+                release.notify_one();
+                teardown.wait_quiesced().await;
+                let identity = queued.await.unwrap();
+                assert_eq!(
+                    store
+                        .reconcile_effect_audits_for_disconnected_leases(
+                            "shared",
+                            &[lease_id],
+                        )
+                        .unwrap(),
+                    1
+                );
+                teardown.finish().unwrap();
+                let snapshot = store.snapshot("shared").unwrap();
+                assert!(snapshot.effect_audits.iter().any(|entry|
+                    entry.intent.identity == identity
+                        && matches!(entry.state,
+                            crate::runtime::effect_log::EffectAuditState::Terminal {
+                                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+                            })));
+                assert!(snapshot.effect_audits.iter().all(|entry| entry.state.is_terminal()));
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3173,9 +3492,12 @@ mod tests {
 
     async fn raw_normal_effect_state(
         begin: bool,
+        remote_disconnect_error: bool,
     ) -> (
         tempfile::TempDir,
         crate::brain::store::BrainStore,
+        std::sync::Arc<crate::server::AgentServer>,
+        crate::brain::store::RunnerLeaseId,
         crate::runtime::effect_log::EffectAuditState,
         Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
     ) {
@@ -3211,7 +3533,7 @@ mod tests {
                 crate::brain::store::BrainRunStatus::Running,
             )
             .unwrap();
-        store
+        let lease = store
             .acquire_runner_lease("shared", "runner", 1, None, 300_000)
             .unwrap();
         let server = std::sync::Arc::new(
@@ -3223,6 +3545,20 @@ mod tests {
             )
             .unwrap(),
         );
+        let connection_id = uuid::Uuid::new_v4();
+        server
+            .brain_runners()
+            .claim_connection_identity(connection_id, "runner@box.local/application-error")
+            .unwrap();
+        server
+            .brain_runners()
+            .claim_connection_lease(connection_id, "shared", lease.lease_id)
+            .unwrap();
+        let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
+        server
+            .brain_runners()
+            .register_for_connection(connection_id, "shared", lease.lease_id, callback_tx)
+            .unwrap();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = crate::server::RunnerProgramRequest {
             brain: "shared".into(),
@@ -3240,28 +3576,27 @@ mod tests {
         let runner: super::finch_ipc_capnp::brain_runner::Client =
             capnp_rpc::new_client(EffectNormalRunner {
                 begin,
+                remote_disconnect_error,
                 permit_tx: Some(permit_tx),
             });
-        assert!(
-            !super::forward_test_runner_request(
-                runner,
-                server,
-                crate::server::RunnerRequest::Program(request),
-            )
-            .await,
-            "normal application return must not be classified as transport EOF"
-        );
+        super::forward_test_runner_request(
+            runner,
+            std::sync::Arc::clone(&server),
+            crate::server::RunnerRequest::Program(request),
+        )
+        .await;
         assert!(response_rx.await.unwrap().is_err());
         let permit = permit_rx.await.unwrap();
         let state = store.snapshot("shared").unwrap().effect_audits[0]
             .state
             .clone();
-        (temp, store, state, permit)
+        (temp, store, server, lease.lease_id, state, permit)
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn effect_audit_normal_return_abandons_only_unbegun_and_allows_late_finish() {
-        let (_temp, _store, state, permit) = raw_normal_effect_state(false).await;
+        let (_temp, _store, _server, _lease_id, state, permit) =
+            raw_normal_effect_state(false, false).await;
         assert!(permit.is_none());
         assert!(matches!(
             state,
@@ -3271,7 +3606,8 @@ mod tests {
             }
         ));
 
-        let (_temp, store, state, permit) = raw_normal_effect_state(true).await;
+        let (_temp, store, _server, _lease_id, state, permit) =
+            raw_normal_effect_state(true, false).await;
         assert!(matches!(
             state,
             crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
@@ -3287,6 +3623,32 @@ mod tests {
                     ref outcome_kind
                 }
             } if outcome_kind == "acknowledged")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_remote_disconnected_exception_does_not_claim_transport_teardown() {
+        let (_temp, store, server, lease_id, state, permit) =
+            raw_normal_effect_state(true, true).await;
+        assert!(
+            server.brain_runners().has_registration("shared", lease_id),
+            "a remote method exception must not revoke the live callback registration"
+        );
+        assert!(matches!(
+            state,
+            crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+        ));
+        let permit = permit.expect("begun effect retains its detached completion authority");
+        let mut finish = permit.finish_request();
+        finish.get().init_outcome().init_acknowledged(0);
+        finish.send().promise.await.unwrap();
+        assert!(
+            matches!(store.snapshot("shared").unwrap().effect_audits[0].state,
+                crate::runtime::effect_log::EffectAuditState::Terminal {
+                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                        ref outcome_kind
+                    }
+                } if outcome_kind == "acknowledged")
         );
     }
 
@@ -3942,7 +4304,10 @@ mod tests {
         let lease = first
             .acquire_connection_runner("shared", subject, &environment, None, 60_000)
             .unwrap();
-        runners.disconnect_connection(first_connection);
+        runners
+            .begin_connection_teardown(first_connection)
+            .finish()
+            .unwrap();
 
         let replacement_connection = uuid::Uuid::new_v4();
         runners
@@ -4401,6 +4766,14 @@ async fn serve_ipc_listener(
 }
 
 async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServer>) -> Result<()> {
+    handle_connection_with_id(stream, server, uuid::Uuid::new_v4()).await
+}
+
+async fn handle_connection_with_id(
+    stream: tokio::net::UnixStream,
+    server: Arc<AgentServer>,
+    connection_id: uuid::Uuid,
+) -> Result<()> {
     let (reader, writer) = stream.into_split();
 
     let network = twoparty::VatNetwork::new(
@@ -4410,17 +4783,48 @@ async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServ
         Default::default(),
     );
 
-    let connection_id = uuid::Uuid::new_v4();
     let daemon_impl = FinchDaemonImpl::new(Arc::clone(&server), connection_id);
     let daemon_client: finch_daemon::Client = capnp_rpc::new_client(daemon_impl);
 
     let result = RpcSystem::new(Box::new(network), Some(daemon_client.client))
         .await
         .map_err(anyhow::Error::from);
-    let attachments = server.brain_runners().disconnect_connection(connection_id);
-    let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
-    for (brain, attachment_id, attachment_connection_id) in attachments {
-        let _ = lifecycle.detach(&brain, attachment_id, attachment_connection_id);
+    let teardown = server
+        .brain_runners()
+        .begin_connection_teardown(connection_id);
+    teardown.wait_quiesced().await;
+    let mut leases_by_brain =
+        std::collections::BTreeMap::<String, Vec<crate::brain::store::RunnerLeaseId>>::new();
+    for (brain, lease_id) in &teardown.runner_leases {
+        leases_by_brain
+            .entry(brain.clone())
+            .or_default()
+            .push(*lease_id);
     }
+    for (brain, lease_ids) in leases_by_brain {
+        server
+            .brain_store()
+            .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
+            .with_context(|| {
+                format!("could not reconcile effect audits for disconnected Brain '{brain}'")
+            })?;
+    }
+    let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+    for (brain, attachment_id, attachment_connection_id) in &teardown.attachments {
+        if let Err(error) = lifecycle.detach(brain, *attachment_id, *attachment_connection_id) {
+            // Audit durability is the authority-critical teardown phase. Once
+            // it succeeds, an attachment may already have been retired by an
+            // explicit detach or cancellation path. Cleanup is idempotent in
+            // effect and must not strand the lease/identity fence forever.
+            tracing::warn!(
+                brain,
+                attachment_id = %attachment_id.0,
+                connection_id = %attachment_connection_id.0,
+                %error,
+                "could not detach disconnected Brain attachment; releasing reconciled connection claims"
+            );
+        }
+    }
+    teardown.finish()?;
     result
 }

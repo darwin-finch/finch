@@ -4758,14 +4758,12 @@ mod handler_tests {
         .await
         .unwrap();
         assert_eq!(cancel.run_id, run_id);
-        assert!(
-            !crate::ipc::server::forward_test_runner_request(
-                runner,
-                server.clone(),
-                crate::server::RunnerRequest::Cancel(cancel),
-            )
-            .await
-        );
+        crate::ipc::server::forward_test_runner_request(
+            runner,
+            server.clone(),
+            crate::server::RunnerRequest::Cancel(cancel),
+        )
+        .await;
         assert_eq!(cancelled_rx.recv().await.unwrap(), run_id);
         tokio::time::timeout(std::time::Duration::from_millis(500), async {
             loop {
@@ -5141,14 +5139,12 @@ mod handler_tests {
             let (cancelled_tx, mut cancelled_rx) = tokio::sync::mpsc::unbounded_channel();
             let runner: crate::finch_ipc_capnp::brain_runner::Client =
                 capnp_rpc::new_client(CancelBeforeTurnRunner(cancelled_tx));
-            assert!(
-                !crate::ipc::server::forward_test_runner_request(
-                    runner,
-                    server.clone(),
-                    crate::server::RunnerRequest::Cancel(cancel),
-                )
-                .await
-            );
+            crate::ipc::server::forward_test_runner_request(
+                runner,
+                server.clone(),
+                crate::server::RunnerRequest::Cancel(cancel),
+            )
+            .await;
             assert_eq!(
                 tokio::time::timeout(std::time::Duration::from_secs(2), cancelled_rx.recv(),)
                     .await

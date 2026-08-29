@@ -369,6 +369,76 @@ struct ConnectionAuthority {
     identities: HashMap<String, uuid::Uuid>,
     leases: HashMap<(String, RunnerLeaseId), uuid::Uuid>,
     attachments: HashMap<(String, AttachmentId, ConnectionId), uuid::Uuid>,
+    dispatch: HashMap<uuid::Uuid, Arc<ConnectionDispatchAdmission>>,
+}
+
+#[derive(Default)]
+struct ConnectionDispatchState {
+    closed: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct ConnectionDispatchAdmission {
+    state: Mutex<ConnectionDispatchState>,
+    quiesced: tokio::sync::Notify,
+}
+
+pub(crate) struct ConnectionDispatchGuard {
+    admission: Arc<ConnectionDispatchAdmission>,
+}
+
+impl ConnectionDispatchAdmission {
+    pub(crate) fn try_enter(self: &Arc<Self>) -> Option<ConnectionDispatchGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("connection dispatch lock poisoned");
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        Some(ConnectionDispatchGuard {
+            admission: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("connection dispatch lock poisoned")
+            .closed = true;
+    }
+
+    async fn wait_quiesced(&self) {
+        loop {
+            let notified = self.quiesced.notified();
+            if self
+                .state
+                .lock()
+                .expect("connection dispatch lock poisoned")
+                .active
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ConnectionDispatchGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .expect("connection dispatch lock poisoned");
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            self.admission.quiesced.notify_waiters();
+        }
+    }
 }
 
 /// Registrations contain only Tokio channels and portable values. Cap'n Proto
@@ -380,6 +450,51 @@ pub struct BrainRunnerBroker {
     connection_authority: Arc<Mutex<ConnectionAuthority>>,
     inflight: Arc<Mutex<HashMap<(String, RunId), HashMap<uuid::Uuid, oneshot::Sender<()>>>>>,
     cancelled_before_dispatch: Arc<Mutex<std::collections::HashSet<(String, RunId)>>>,
+}
+
+/// Exact authority owned by one IPC connection while its teardown is being
+/// durably reconciled. Claims remain fenced until [`finish`](Self::finish)
+/// succeeds; dropping this value deliberately leaves them fenced.
+pub(crate) struct RunnerConnectionTeardown {
+    broker: BrainRunnerBroker,
+    connection_id: uuid::Uuid,
+    pub(crate) runner_leases: Vec<(String, RunnerLeaseId)>,
+    pub(crate) attachments: Vec<(String, AttachmentId, ConnectionId)>,
+    dispatch: Arc<ConnectionDispatchAdmission>,
+}
+
+impl RunnerConnectionTeardown {
+    pub(crate) async fn wait_quiesced(&self) {
+        self.dispatch.wait_quiesced().await;
+    }
+
+    pub(crate) fn finish(self) -> Result<()> {
+        anyhow::ensure!(
+            self.dispatch
+                .state
+                .lock()
+                .expect("connection dispatch lock poisoned")
+                .active
+                == 0,
+            "connection callback dispatch is not quiescent"
+        );
+        let mut authority = self
+            .broker
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        authority
+            .identities
+            .retain(|_, owner| *owner != self.connection_id);
+        authority
+            .leases
+            .retain(|_, owner| *owner != self.connection_id);
+        authority
+            .attachments
+            .retain(|_, owner| *owner != self.connection_id);
+        authority.dispatch.remove(&self.connection_id);
+        Ok(())
+    }
 }
 
 struct InflightRequest {
@@ -520,6 +635,15 @@ impl BrainRunnerBroker {
                 anyhow::bail!("runner subject is already claimed by another IPC connection")
             }
             _ => {
+                let dispatch = authority.dispatch.entry(connection_id).or_default();
+                anyhow::ensure!(
+                    !dispatch
+                        .state
+                        .lock()
+                        .expect("connection dispatch lock poisoned")
+                        .closed,
+                    "IPC connection is tearing down"
+                );
                 authority
                     .identities
                     .insert(subject.to_string(), connection_id);
@@ -559,6 +683,15 @@ impl BrainRunnerBroker {
                 anyhow::bail!("runner lease is owned by another IPC connection")
             }
             _ => {
+                let dispatch = authority.dispatch.entry(connection_id).or_default();
+                anyhow::ensure!(
+                    !dispatch
+                        .state
+                        .lock()
+                        .expect("connection dispatch lock poisoned")
+                        .closed,
+                    "IPC connection is tearing down"
+                );
                 authority.leases.insert(key, connection_id);
                 Ok(())
             }
@@ -666,7 +799,26 @@ impl BrainRunnerBroker {
         tx: mpsc::UnboundedSender<RunnerRequest>,
     ) -> Result<RunnerRegistrationId> {
         let brain = brain.into();
-        self.require_connection_lease(connection_id, &brain, lease_id)?;
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        anyhow::ensure!(
+            authority.leases.get(&(brain.clone(), lease_id)) == Some(&connection_id),
+            "runner lease is not owned by this IPC connection"
+        );
+        let dispatch = authority
+            .dispatch
+            .get(&connection_id)
+            .context("IPC connection has no dispatch authority")?;
+        anyhow::ensure!(
+            !dispatch
+                .state
+                .lock()
+                .expect("connection dispatch lock poisoned")
+                .closed,
+            "IPC connection is tearing down"
+        );
         let id = RunnerRegistrationId(uuid::Uuid::new_v4());
         self.registrations
             .write()
@@ -680,14 +832,28 @@ impl BrainRunnerBroker {
                     tx,
                 },
             );
+        drop(authority);
         Ok(id)
     }
 
-    pub(crate) fn disconnect_connection(
+    pub(crate) fn connection_dispatch_admission(
         &self,
         connection_id: uuid::Uuid,
-    ) -> Vec<(String, AttachmentId, ConnectionId)> {
-        let mut authority = self
+    ) -> Result<Arc<ConnectionDispatchAdmission>> {
+        self.connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned")
+            .dispatch
+            .get(&connection_id)
+            .cloned()
+            .context("IPC connection has no dispatch authority")
+    }
+
+    pub(crate) fn begin_connection_teardown(
+        &self,
+        connection_id: uuid::Uuid,
+    ) -> RunnerConnectionTeardown {
+        let authority = self
             .connection_authority
             .lock()
             .expect("runner connection-authority lock poisoned");
@@ -701,19 +867,31 @@ impl BrainRunnerBroker {
                 },
             )
             .collect();
-        authority
-            .identities
-            .retain(|_, owner| *owner != connection_id);
-        authority.leases.retain(|_, owner| *owner != connection_id);
-        authority
-            .attachments
-            .retain(|_, owner| *owner != connection_id);
+        let runner_leases = authority
+            .leases
+            .iter()
+            .filter_map(|((brain, lease_id), owner)| {
+                (*owner == connection_id).then(|| (brain.clone(), *lease_id))
+            })
+            .collect();
+        let dispatch = authority
+            .dispatch
+            .get(&connection_id)
+            .cloned()
+            .unwrap_or_default();
+        dispatch.close();
         drop(authority);
         self.registrations
             .write()
             .expect("runner broker lock poisoned")
             .retain(|_, registration| registration.connection_id != Some(connection_id));
-        attachments
+        RunnerConnectionTeardown {
+            broker: self.clone(),
+            connection_id,
+            runner_leases,
+            attachments,
+            dispatch,
+        }
     }
 
     /// Remove a registration only if it is still the connection that created
@@ -995,12 +1173,29 @@ mod tests {
             )
             .is_err());
 
-        let disconnected = broker.disconnect_connection(owner);
+        let teardown = broker.begin_connection_teardown(owner);
         assert_eq!(
-            disconnected,
+            teardown.attachments,
             vec![("brain".to_string(), attachment_id, attachment_connection_id,)]
         );
+        assert_eq!(
+            teardown.runner_leases,
+            vec![("brain".to_string(), lease_id)]
+        );
         assert!(!broker.has_registration("brain", lease_id));
+        assert!(broker
+            .claim_connection_lease(intruder, "brain", lease_id)
+            .is_err());
+        drop(teardown);
+        assert!(broker
+            .claim_connection_identity(intruder, "runner-a@box.local")
+            .is_err());
+        assert!(broker
+            .require_connection_lease(owner, "brain", lease_id)
+            .is_ok());
+
+        let teardown = broker.begin_connection_teardown(owner);
+        teardown.finish().unwrap();
         assert!(broker
             .require_connection_lease(owner, "brain", lease_id)
             .is_err());
