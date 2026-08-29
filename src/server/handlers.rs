@@ -1920,14 +1920,7 @@ async fn dispatch_named_brain_program(
                     drop(publication);
                     anyhow::bail!("named Brain run cancelled");
                 }
-                persist_named_brain_effect_journal(
-                    store,
-                    name,
-                    Some(run_id),
-                    request_seq,
-                    "runner",
-                    &failure.effect_journal,
-                )?;
+                validate_runner_effect_journal(&failure.effect_journal)?;
                 push_named_brain_run_result(
                     store,
                     name,
@@ -1953,14 +1946,7 @@ async fn dispatch_named_brain_program(
         drop(publication);
         anyhow::bail!("named Brain run cancelled");
     }
-    persist_named_brain_effect_journal(
-        store,
-        name,
-        Some(run_id),
-        request_seq,
-        "runner",
-        &outcome.effect_journal,
-    )?;
+    validate_runner_effect_journal(&outcome.effect_journal)?;
     store.commit_runner_runtime_for_run(
         name,
         run_id,
@@ -2050,14 +2036,7 @@ async fn dispatch_named_brain_turn(
                     &approval_audience,
                     failure.turn_events.clone(),
                 )?;
-                persist_named_brain_effect_journal(
-                    store,
-                    name,
-                    Some(run_id),
-                    request_seq,
-                    &lease.subject,
-                    &failure.effect_journal,
-                )?;
+                validate_runner_effect_journal(&failure.effect_journal)?;
                 push_named_brain_run_result(
                     store,
                     name,
@@ -2093,14 +2072,7 @@ async fn dispatch_named_brain_turn(
         &approval_audience,
         outcome.turn_events,
     )?;
-    persist_named_brain_effect_journal(
-        store,
-        name,
-        Some(run_id),
-        request_seq,
-        &lease.subject,
-        &outcome.effect_journal,
-    )?;
+    validate_runner_effect_journal(&outcome.effect_journal)?;
     let program = store.push_for_run(
         name,
         "provider",
@@ -2130,64 +2102,28 @@ async fn dispatch_named_brain_turn(
     Ok((result, commit_ack))
 }
 
-fn persist_named_brain_effect_journal(
-    store: &crate::brain::store::BrainStore,
-    name: &str,
-    run_id: Option<crate::brain::store::RunId>,
-    request_seq: u64,
-    sender: &str,
+/// Validate the runner's diagnostic VM journal without treating it as durable
+/// audit authority. Physical host effects are recorded synchronously through
+/// the daemon-issued reserve/begin/finish capability before this result can
+/// arrive. Publishing this caller-provided summary as `EffectRecorded` would
+/// both duplicate that canonical audit and let a runner forge provenance.
+fn validate_runner_effect_journal(
     records: &[crate::server::RunnerEffectRecord],
 ) -> anyhow::Result<()> {
-    let mut persisted = store
-        .snapshot(name)?
-        .events
-        .into_iter()
-        .filter_map(|event| match event.kind {
-            crate::brain::store::BrainEventKind::EffectRecorded {
-                request_seq,
-                execution_id,
-                effect,
-                state,
-            } => Some((
-                (execution_id, effect.sequence),
-                (request_seq, effect, state),
-            )),
-            _ => None,
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+    let mut observed = std::collections::HashMap::new();
 
     for record in records {
         let key = (record.execution_id, record.entry.effect.sequence);
-        if let Some((persisted_request, effect, state)) = persisted.get(&key) {
+        if let Some(entry) = observed.get(&key) {
             anyhow::ensure!(
-                *persisted_request == request_seq
-                    && effect == &record.entry.effect
-                    && state == &record.entry.state,
-                "runner changed effect journal record {}:{} for request {request_seq}",
+                entry == &record.entry,
+                "runner returned conflicting effect journal record {}:{}",
                 record.execution_id,
                 record.entry.effect.sequence,
             );
             continue;
         }
-        let kind = crate::brain::store::BrainEventKind::EffectRecorded {
-            request_seq,
-            execution_id: record.execution_id,
-            effect: record.entry.effect.clone(),
-            state: record.entry.state.clone(),
-        };
-        if let Some(run_id) = run_id {
-            store.push_for_run(name, sender, run_id, kind)?;
-        } else {
-            store.push(name, sender, kind)?;
-        }
-        persisted.insert(
-            key,
-            (
-                request_seq,
-                record.entry.effect.clone(),
-                record.entry.state.clone(),
-            ),
-        );
+        observed.insert(key, record.entry.clone());
     }
     Ok(())
 }
@@ -7153,27 +7089,10 @@ mod handler_tests {
     }
 
     #[test]
-    fn effect_journal_is_idempotent_and_rejects_conflicting_identity() {
+    fn runner_effect_journal_is_diagnostic_and_cannot_forge_audit_events() {
         let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let record = acknowledged_emit_effect("once");
-        persist_named_brain_effect_journal(
-            &store,
-            "shared",
-            None,
-            7,
-            "runner",
-            std::slice::from_ref(&record),
-        )
-        .unwrap();
-        persist_named_brain_effect_journal(
-            &store,
-            "shared",
-            None,
-            7,
-            "runner",
-            std::slice::from_ref(&record),
-        )
-        .unwrap();
+        validate_runner_effect_journal(&[record.clone(), record.clone()]).unwrap();
         assert_eq!(
             store
                 .snapshot("shared")
@@ -7182,26 +7101,17 @@ mod handler_tests {
                 .iter()
                 .filter(|event| matches!(event.kind, BrainEventKind::EffectRecorded { .. }))
                 .count(),
-            1
+            0,
+            "a caller-provided terminal summary is not durable audit authority"
         );
 
-        let error = persist_named_brain_effect_journal(
-            &store,
-            "shared",
-            None,
-            8,
-            "runner",
-            std::slice::from_ref(&record),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("changed effect journal record"));
-
+        let original = record.clone();
         let mut conflicting = record;
         conflicting.entry.state = crate::vm::EffectJournalState::Denied;
-        let error =
-            persist_named_brain_effect_journal(&store, "shared", None, 7, "runner", &[conflicting])
-                .unwrap_err();
-        assert!(error.to_string().contains("changed effect journal record"));
+        let error = validate_runner_effect_journal(&[original, conflicting]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting effect journal record"));
     }
 
     #[tokio::test]
@@ -7237,7 +7147,6 @@ mod handler_tests {
             )
             .unwrap();
         let effect_record = acknowledged_emit_effect("frontend completed");
-        let expected_effect = effect_record.clone();
         tokio::spawn(async move {
             let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
                 panic!("expected program request")
@@ -7314,58 +7223,33 @@ mod handler_tests {
             [crate::programs::ProgramValue::Int(42)]
         ));
         let snapshot = store.snapshot("shared").unwrap();
-        let effect_index = snapshot
+        assert!(snapshot.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::RuntimeCommitted {
+                    request_seq,
+                    ..
+                } if request_seq == run.request_seq && event.run_id == Some(run.run_id)
+            )
+        }));
+        assert!(!snapshot
             .events
             .iter()
-            .position(|event| {
-                matches!(
-                    &event.kind,
-                    BrainEventKind::EffectRecorded {
-                        request_seq,
-                        execution_id,
-                        effect,
-                        state,
-                    } if *request_seq == run.request_seq
-                        && event.run_id == Some(run.run_id)
-                        && *execution_id == expected_effect.execution_id
-                        && effect == &expected_effect.entry.effect
-                        && state == &expected_effect.entry.state
-                )
-            })
-            .expect("execute-once effect event");
-        let commit_index = snapshot
-            .events
-            .iter()
-            .position(|event| {
-                matches!(
-                    event.kind,
-                    BrainEventKind::RuntimeCommitted {
-                        request_seq,
-                        ..
-                    } if request_seq == run.request_seq && event.run_id == Some(run.run_id)
-                )
-            })
-            .expect("runtime commit event");
-        assert!(effect_index < commit_index);
+            .any(|event| matches!(event.kind, BrainEventKind::EffectRecorded { .. })));
 
         drop(restored);
         drop(store);
         let restarted =
             crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = restarted.snapshot("shared").unwrap();
         assert!(restarted
-            .snapshot("shared")
-            .unwrap()
             .events
             .iter()
-            .any(|event| {
-                matches!(
-                    &event.kind,
-                    BrainEventKind::EffectRecorded { execution_id, effect, state, .. }
-                        if *execution_id == expected_effect.execution_id
-                            && effect == &expected_effect.entry.effect
-                            && state == &expected_effect.entry.state
-                )
-            }));
+            .any(|event| matches!(event.kind, BrainEventKind::RuntimeCommitted { .. })));
+        assert!(!restarted
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, BrainEventKind::EffectRecorded { .. })));
     }
 
     #[tokio::test]
@@ -7402,7 +7286,6 @@ mod handler_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
         let effect_record = acknowledged_emit_effect("partial output before failure");
-        let expected_effect = effect_record.clone();
         tokio::spawn(async move {
             let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
                 panic!("expected full turn request")
@@ -7522,10 +7405,6 @@ mod handler_tests {
                     assert_eq!(event.sender, "runner@box.local");
                     Some(("approval_decided", approval_id.as_str()))
                 }
-                BrainEventKind::EffectRecorded { execution_id, .. } => {
-                    assert_eq!(*execution_id, expected_effect.execution_id);
-                    Some(("effect", ""))
-                }
                 BrainEventKind::Program { .. } if event.sender == "provider" => {
                     Some(("program", ""))
                 }
@@ -7539,7 +7418,6 @@ mod handler_tests {
                 ("approval_requested", "tool-1"),
                 ("approval_decided", "tool-1"),
                 ("result", "tool-1"),
-                ("effect", ""),
                 ("program", ""),
             ],
             "turn lifecycle must precede the final provider program in the canonical log"
@@ -7601,7 +7479,6 @@ mod handler_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
         let effect_record = acknowledged_emit_effect("partial output before failure");
-        let expected_effect = effect_record.clone();
         tokio::spawn(async move {
             let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
                 panic!("expected full turn request")
@@ -7659,36 +7536,20 @@ mod handler_tests {
             BrainEventKind::ApprovalDecided { approval_id, decision, .. }
                 if approval_id == "approval-1" && decision["choice"] == "allow_once"
         )));
-        assert!(snapshot.events.iter().any(|event| matches!(
-            &event.kind,
-            BrainEventKind::EffectRecorded {
-                request_seq,
-                execution_id,
-                effect,
-                state,
-            } if *request_seq == prompt_seq
-                && *execution_id == expected_effect.execution_id
-                && effect == &expected_effect.entry.effect
-                && state == &expected_effect.entry.state
-        )));
+        assert!(!snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, BrainEventKind::EffectRecorded { .. })));
 
         drop(store);
         let restarted =
             crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
-        assert!(restarted
+        assert!(!restarted
             .snapshot("shared")
             .unwrap()
             .events
             .iter()
-            .any(|event| {
-                matches!(
-                    &event.kind,
-                    BrainEventKind::EffectRecorded { execution_id, effect, state, .. }
-                        if *execution_id == expected_effect.execution_id
-                            && effect == &expected_effect.entry.effect
-                            && state == &expected_effect.entry.state
-                )
-            }));
+            .any(|event| { matches!(&event.kind, BrainEventKind::EffectRecorded { .. }) }));
     }
 
     #[tokio::test]
@@ -8123,7 +7984,6 @@ mod handler_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
         let effect_record = acknowledged_emit_effect("before failure");
-        let expected_effect = effect_record.clone();
         tokio::spawn(async move {
             let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
                 panic!("expected program request")
@@ -8153,25 +8013,12 @@ mod handler_tests {
         let failed = &store.snapshot("shared").unwrap().runs[0];
         assert_eq!(failed.status, crate::brain::store::BrainRunStatus::Failed);
         assert_eq!(failed.detail.as_deref(), Some("frontend execution failed"));
-        assert!(store
+        assert!(!store
             .snapshot("shared")
             .unwrap()
             .events
             .iter()
-            .any(|event| {
-                matches!(
-                    &event.kind,
-                    BrainEventKind::EffectRecorded {
-                        request_seq,
-                        execution_id,
-                        effect,
-                        state,
-                    } if *request_seq == request.seq
-                        && *execution_id == expected_effect.execution_id
-                        && effect == &expected_effect.entry.effect
-                        && state == &expected_effect.entry.state
-                )
-            }));
+            .any(|event| { matches!(&event.kind, BrainEventKind::EffectRecorded { .. }) }));
     }
 
     #[tokio::test]

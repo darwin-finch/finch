@@ -2151,21 +2151,24 @@ mod tests {
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
         let work_unit = output.start_work_unit("VM output");
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-
-        let outcome = execute_direct_wire_response(
+        let execution = execute_direct_wire_response(
             &runtime,
             output,
             work_unit,
             event_tx,
-            cancel,
+            cancel.clone(),
             "(begin (say \"before\") (yield) (say \"after\"))".to_string(),
             None,
-        )
-        .await
-        .unwrap();
+        );
+        let cancel_after_prefix = async {
+            let event = event_rx.recv().await.expect("first effect projection");
+            assert!(matches!(event, ReplEvent::VmEffect { .. }));
+            cancel.cancel();
+        };
+        let (outcome, ()) = tokio::join!(execution, cancel_after_prefix);
+        let outcome = outcome.unwrap();
 
         assert_eq!(
             outcome.status,
