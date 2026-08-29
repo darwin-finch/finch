@@ -1321,12 +1321,35 @@ where
     // an OAuth endpoint. Account identity remains deliberately unknown until a
     // signed token is returned.
     let mut preflight_credentials = result.credentials.clone();
-    for reference in &chatgpt_references {
-        if preflight_credentials
+    for reference in chatgpt_references {
+        let existing = preflight_credentials
             .iter()
-            .any(|credential| credential.name == *reference)
-        {
-            continue;
+            .find(|credential| credential.name == *reference);
+        if let Some(existing) = existing {
+            let exact_authority = existing.kind == crate::config::CredentialKind::OauthDevice
+                && existing.provider == crate::config::CredentialProvider::ChatgptSubscription
+                && existing.issuer == "openai-chatgpt"
+                && existing.audience
+                    == crate::config::AudienceBinding::standard(
+                        crate::config::EndpointFamily::ChatgptSubscription,
+                    )
+                && existing.secret_ref == format!("oauth-store:{reference}")
+                && crate::providers::chatgpt_oauth::chatgpt_required_scopes()
+                    .is_subset(&existing.scopes);
+            if !exact_authority {
+                // Preserve the hostile record so graph validation rejects it
+                // before the authenticator or any OAuth socket is reached.
+                continue;
+            }
+            let active = matches!(
+                existing.lifecycle,
+                crate::config::CredentialLifecycle::Active { expires_at, .. }
+                    if expires_at.is_none_or(|expiry| expiry > Utc::now())
+            );
+            if active {
+                continue;
+            }
+            preflight_credentials.retain(|credential| credential.name != *reference);
         }
         preflight_credentials.push(crate::config::ProviderCredential {
             name: reference.clone(),
@@ -1363,7 +1386,7 @@ where
             )
             .await
             .with_context(|| format!("ChatGPT login for named credential '{reference}' failed"))?;
-        credentials.retain(|existing| existing.name != reference);
+        credentials.retain(|existing| existing.name != *reference);
         credentials.push(credential);
     }
     let config = config_from_setup_result(result).with_credentials(credentials);
@@ -8770,5 +8793,79 @@ mod tests {
         .await
         .is_err());
         assert_eq!(authenticator.calls.lock().unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn setup_denial_and_expiry_are_terminal_without_config_or_account_fallback() {
+        let result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+        for terminal in [
+            "device authorization was denied",
+            "device authorization expired",
+        ] {
+            let authenticator = FakeChatGptSetupAuthenticator::default();
+            *authenticator.fail.lock().unwrap() = Some(terminal.into());
+            let error = prepare_chatgpt_setup_config(
+                &result,
+                &references,
+                &authenticator,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("ChatGPT login for named credential 'chatgpt:work' failed"));
+            assert_eq!(
+                authenticator.calls.lock().unwrap().as_slice(),
+                ["chatgpt:work"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_and_expired_same_name_metadata_are_replaced_only_by_exact_account_result() {
+        for lifecycle in [
+            crate::config::CredentialLifecycle::Revoked,
+            crate::config::CredentialLifecycle::Active {
+                expires_at: Some(Utc::now() - chrono::TimeDelta::minutes(1)),
+                refreshable: true,
+            },
+        ] {
+            let mut result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+                "chatgpt:work",
+                "work",
+                "gpt-5.6-sol",
+            )]);
+            let mut stale = chatgpt_setup_credential("chatgpt:work", "acct-old");
+            stale.lifecycle = lifecycle;
+            result.credentials = vec![stale];
+            let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+            let authenticator = FakeChatGptSetupAuthenticator::default();
+            let config = prepare_chatgpt_setup_config(
+                &result,
+                &references,
+                &authenticator,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                authenticator.calls.lock().unwrap().as_slice(),
+                ["chatgpt:work"]
+            );
+            assert_eq!(config.credentials().len(), 1);
+            assert_eq!(
+                config.credentials()[0].account.as_deref(),
+                Some("acct-work")
+            );
+            assert!(matches!(
+                config.credentials()[0].lifecycle,
+                crate::config::CredentialLifecycle::Active { .. }
+            ));
+        }
     }
 }

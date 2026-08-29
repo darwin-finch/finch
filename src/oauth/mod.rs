@@ -1105,7 +1105,7 @@ fn validate_device_authorization(
     Ok(())
 }
 
-fn validate_reference(reference: &str) -> Result<()> {
+pub(crate) fn validate_reference(reference: &str) -> Result<()> {
     if reference.is_empty()
         || reference.len() > 128
         || !reference

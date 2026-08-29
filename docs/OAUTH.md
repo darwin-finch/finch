@@ -21,6 +21,19 @@ strictly separate from the OpenAI Platform API-key provider:
   produce an actionable error; Finch must never relax issuer, audience,
   signature, nonce, account, scope, or origin checks to recover.
 
+Production token verification is pinned to issuer `https://auth.openai.com`,
+the exact discovery and JWKS paths on that origin, RS256, RSA signing keys, and
+an unambiguous `kid`. Both the ID token and access token must have valid
+signatures and matching subject/account/plan claims. The ID-token audience is
+the pinned public client; the separately checked access-token audience for the
+pinned compatibility fixture is `https://api.openai.com/v1`. That JWT claim is
+authorization-server metadata only: Finch still sends the subscription token
+exclusively to the separately bound `chatgpt.com/backend-api/codex` service and
+never to the Platform API. Discovery redirects, proxy/environment routing,
+header-selected keys, duplicate JSON fields or key IDs, algorithm confusion,
+oversized documents, stale/rotated keys, and issuer/JWKS substitution fail
+closed.
+
 The compatibility fixtures are pinned to OpenAI Codex commit
 `3e4707b34b16e139fcb7ad11ab8445993b62bba1`, specifically
 `codex-rs/login/src/device_code_auth.rs`, `codex-rs/login/src/server.rs`,
@@ -51,11 +64,27 @@ performing network activity.
 
 ## Current integration fence
 
-This initial slice deliberately does not expose a setup wizard or `finch auth`
-command and does not enable ChatGPT provider construction. The default OpenAI
-token verifier fails closed until an audited signature/JWKS implementation is
-wired for the pinned dialect. No real authorization or private service request
-is permitted from this slice. Remaining #105 work includes that verifier,
-setup/auth-command orchestration, complete direct subscription transport and
-stream conformance, secure platform credential-store integration, and opt-in
-live acceptance after independent review.
+`finch auth status chatgpt` is a read-only, secret-free local check; a missing
+store remains missing. `finch auth login chatgpt` starts device authorization,
+prints the accessible URL and one-time code, reports the countdown, and accepts
+`--copy` and explicit `--open`. `finch auth logout chatgpt` performs bounded
+revocation and retains a local tombstone. Every command accepts
+`--credential <stable-name>` (default `chatgpt:default`) so compatible model
+profiles can reuse one account while distinct references keep accounts
+isolated. Interrupted refresh/revoke state is reported as
+`recovery_required`, never as signed out.
+
+First-run setup, `finch setup`, and `/setup` use one post-wizard device ceremony.
+The complete secret-free graph is validated before OAuth begins; cancellation,
+denial, expiry, or an invalid sibling prevents config/persona save. The
+temporary account-unknown preflight record is never persisted. Only verified
+token metadata is written to `config.toml`; tokens remain in Finch's
+descriptor-anchored store.
+
+Browser PKCE remains disabled because the pinned browser protocol uses a
+Codex-only originator that Finch does not impersonate. Windows token persistence
+also remains fail-closed pending a descriptor/handle-anchored implementation;
+CI compiles the exact provider-neutral and verifier sources there. Direct
+ChatGPT subscription inference, catalog, streaming, allowance, and provenance
+transport remain #202. No live authorization is part of automated tests or
+this compatibility claim.

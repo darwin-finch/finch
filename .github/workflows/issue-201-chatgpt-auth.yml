@@ -13,6 +13,7 @@ on:
       - "src/cli/chatgpt_auth.rs"
       - "src/cli/setup_wizard.rs"
       - "src/main.rs"
+      - "docs/OAUTH.md"
       - ".github/issue-201-windows-probe/**"
       - ".github/workflows/issue-201-chatgpt-auth.yml"
 
@@ -52,6 +53,8 @@ jobs:
         run: "cargo test --lib providers::openai_jwks::"
       - name: Auth UX regressions
         run: "cargo test --lib cli::chatgpt_auth::"
+      - name: Scriptable auth parser regressions
+        run: "cargo test --bin finch chatgpt_auth_cli_"
       - name: Shared setup auth regressions
         run: cargo test --lib cli::setup_wizard::tests::setup_
       - name: Setup entry-point reuse regression

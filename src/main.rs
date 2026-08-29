@@ -189,14 +189,14 @@ enum AuthCommand {
     Status {
         #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default")]
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
         credential: String,
     },
     /// Start Finch-native ChatGPT device login
     Login {
         #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default")]
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
         credential: String,
         /// Copy the one-time code to the clipboard
         #[arg(long)]
@@ -209,9 +209,24 @@ enum AuthCommand {
     Logout {
         #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
         provider: String,
-        #[arg(long, default_value = "chatgpt:default")]
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
         credential: String,
     },
+}
+
+fn parse_credential_reference(value: &str) -> std::result::Result<String, String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+    {
+        return Err(
+            "credential reference must use 1-128 ASCII letters, digits, '-', '_', or ':'"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[derive(Parser, Debug)]
@@ -2545,9 +2560,8 @@ async fn run_setup() -> Result<()> {
 
 async fn run_auth_command(command: AuthCommand) -> Result<()> {
     use finch::cli::chatgpt_auth::{
-        save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
+        render_status_line, save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
     };
-    use finch::config::CredentialLifecycle;
     use tokio_util::sync::CancellationToken;
 
     let service = ChatGptAuthService::production()?;
@@ -2557,32 +2571,7 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
             credential,
         } => {
             let status = service.status(&credential)?;
-            match status.lifecycle {
-                CredentialLifecycle::Active {
-                    expires_at,
-                    refreshable,
-                } => println!(
-                    "chatgpt credential={} status=active account={} expires_at={} refreshable={}",
-                    status.credential_ref,
-                    status.account.as_deref().unwrap_or("unknown"),
-                    expires_at
-                        .map(|value| value.to_rfc3339())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    refreshable
-                ),
-                CredentialLifecycle::Revoked => {
-                    println!(
-                        "chatgpt credential={} status=signed_out",
-                        status.credential_ref
-                    )
-                }
-                CredentialLifecycle::LegacyAmbiguous => {
-                    println!(
-                        "chatgpt credential={} status=unusable",
-                        status.credential_ref
-                    )
-                }
-            }
+            println!("{}", render_status_line(&status));
         }
         AuthCommand::Login {
             provider: _,
@@ -3179,7 +3168,7 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{register_query_vm_tools, Args};
+    use super::{register_query_vm_tools, Args, AuthCommand, Command};
     use clap::Parser;
     use std::sync::Arc;
 
@@ -3191,6 +3180,63 @@ mod tests {
         assert!(Args::try_parse_from(["finch", "library", "verify"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "heal"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "build", "--all"]).is_err());
+    }
+
+    #[test]
+    fn chatgpt_auth_cli_parses_exact_status_login_logout_and_rejects_unsafe_references() {
+        let status = Args::try_parse_from([
+            "finch",
+            "auth",
+            "status",
+            "chatgpt",
+            "--credential",
+            "chatgpt:work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Status { credential, .. }
+            }) if credential == "chatgpt:work"
+        ));
+
+        let login = Args::try_parse_from([
+            "finch",
+            "auth",
+            "login",
+            "--credential",
+            "chatgpt:personal",
+            "--copy",
+            "--open",
+        ])
+        .unwrap();
+        assert!(matches!(
+            login.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login {
+                    credential,
+                    copy: true,
+                    open: true,
+                    ..
+                }
+            }) if credential == "chatgpt:personal"
+        ));
+
+        let logout = Args::try_parse_from(["finch", "auth", "logout"]).unwrap();
+        assert!(matches!(
+            logout.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Logout { credential, .. }
+            }) if credential == "chatgpt:default"
+        ));
+
+        for hostile in ["../codex", "chatgpt/work", "chatgpt work", ""] {
+            assert!(
+                Args::try_parse_from(["finch", "auth", "status", "--credential", hostile,])
+                    .is_err()
+            );
+        }
+        assert!(Args::try_parse_from(["finch", "auth", "login", "openai"]).is_err());
     }
 
     #[test]

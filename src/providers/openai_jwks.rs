@@ -182,7 +182,7 @@ impl OpenAiJwksVerifier {
 
         let claims_bytes = decode_segment(encoded_claims, "claims")?;
         reject_duplicate_json_fields(&claims_bytes, "signed token claims")?;
-        let claims: SignedClaims = serde_json::from_slice(&claims_bytes)
+        let mut claims: SignedClaims = serde_json::from_slice(&claims_bytes)
             .context("OpenAI signed token claims are malformed")?;
         claims.validate_signed_authority(&self.issuer)?;
         Ok(claims)
@@ -690,6 +690,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::Response;
+    use axum::http::StatusCode as AxumStatusCode;
     use axum::routing::get;
     use axum::Router;
     use ring::rand::SystemRandom;
@@ -705,6 +706,7 @@ mod tests {
     #[derive(Clone)]
     struct FixtureState {
         origin: String,
+        discovery_jwks_override: Arc<StdMutex<Option<String>>>,
         jwks: Arc<StdMutex<VecDeque<Value>>>,
         discovery_count: Arc<AtomicUsize>,
         jwks_count: Arc<AtomicUsize>,
@@ -733,6 +735,7 @@ mod tests {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let state = FixtureState {
                 origin: origin.clone(),
+                discovery_jwks_override: Arc::new(StdMutex::new(None)),
                 jwks: Arc::new(StdMutex::new(jwks.into())),
                 discovery_count: Arc::new(AtomicUsize::new(0)),
                 jwks_count: Arc::new(AtomicUsize::new(0)),
@@ -753,9 +756,15 @@ mod tests {
     async fn discovery(State(state): State<FixtureState>) -> Response<Body> {
         state.discovery_count.fetch_add(1, AtomicOrdering::SeqCst);
         tokio::time::sleep(state.delay).await;
+        let jwks_uri = state
+            .discovery_jwks_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| format!("{}{}", state.origin, JWKS_PATH));
         json_response(json!({
             "issuer": REQUIRED_TOKEN_ISSUER,
-            "jwks_uri": format!("{}{}", state.origin, JWKS_PATH),
+            "jwks_uri": jwks_uri,
         }))
     }
 
@@ -764,14 +773,14 @@ mod tests {
         tokio::time::sleep(state.delay).await;
         if state.redirect_jwks {
             return Response::builder()
-                .status(StatusCode::FOUND)
+                .status(AxumStatusCode::FOUND)
                 .header("location", "/attacker")
                 .body(Body::empty())
                 .unwrap();
         }
         if state.oversized {
             return Response::builder()
-                .status(StatusCode::OK)
+                .status(AxumStatusCode::OK)
                 .body(Body::from(vec![b'x'; MAX_DOCUMENT_BYTES + 1]))
                 .unwrap();
         }
@@ -785,7 +794,7 @@ mod tests {
                 .unwrap_or_else(|| json!({"keys": []}))
         };
         Response::builder()
-            .status(StatusCode::OK)
+            .status(AxumStatusCode::OK)
             .header("content-type", "application/json")
             .header("cache-control", "max-age=300")
             .body(Body::from(document.to_string()))
@@ -794,7 +803,7 @@ mod tests {
 
     fn json_response(value: Value) -> Response<Body> {
         Response::builder()
-            .status(StatusCode::OK)
+            .status(AxumStatusCode::OK)
             .header("content-type", "application/json")
             .body(Body::from(value.to_string()))
             .unwrap()
@@ -1074,9 +1083,11 @@ mod tests {
         let (identity, access) = claims("acct-one", required_scopes());
         let first_id = signed("key-one", &identity);
         let first_access = signed("key-one", &access);
+        let left_cancel = CancellationToken::new();
+        let right_cancel = CancellationToken::new();
         let (left, right) = tokio::join!(
-            verifier.verify(Some(&first_id), &first_access, &CancellationToken::new()),
-            verifier.verify(Some(&first_id), &first_access, &CancellationToken::new()),
+            verifier.verify(Some(&first_id), &first_access, &left_cancel),
+            verifier.verify(Some(&first_id), &first_access, &right_cancel),
         );
         left.unwrap();
         right.unwrap();
@@ -1091,6 +1102,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.state.jwks_count.load(AtomicOrdering::SeqCst), 2);
+
+        {
+            let mut cache = verifier.cache.lock().await;
+            cache.expires_at = Some(tokio::time::Instant::now());
+        }
+        verifier
+            .verify(
+                Some(&signed("key-two", &identity)),
+                &signed("key-two", &access),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(server.state.jwks_count.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(cache_lifetime(Some("public, max-age=0")), Duration::ZERO);
     }
 
     #[tokio::test]
@@ -1156,5 +1182,45 @@ mod tests {
                 .await
                 .is_err());
         }
+
+        for duplicate in [
+            br#"{"kid":"one","kid":"two"}"#.as_slice(),
+            br#"{"keys":[{"kid":"one","kid":"two"}]}"#.as_slice(),
+            br#"{"iss":"one","nested":{"aud":"a","aud":"b"}}"#.as_slice(),
+        ] {
+            assert!(reject_duplicate_json_fields(duplicate, "hostile fixture").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_cannot_proxy_or_substitute_the_pinned_jwks_authority() {
+        let attacker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_url = format!("http://{}/jwks", attacker.local_addr().unwrap());
+        let server = FixtureServer::start(vec![jwks("key-one")]).await;
+        *server.state.discovery_jwks_override.lock().unwrap() = Some(attacker_url);
+        let verifier = OpenAiJwksVerifier::for_test(
+            &server.origin,
+            REQUIRED_TOKEN_ISSUER,
+            OPENAI_PUBLIC_CLIENT_ID,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let (identity, access) = claims("acct-one", required_scopes());
+        assert!(verifier
+            .verify(
+                Some(&signed("key-one", &identity)),
+                &signed("key-one", &access),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed issuer or JWKS authority"));
+        assert_eq!(server.state.jwks_count.load(AtomicOrdering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), attacker.accept())
+                .await
+                .is_err()
+        );
     }
 }

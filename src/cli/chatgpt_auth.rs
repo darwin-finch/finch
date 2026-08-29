@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{CredentialLifecycle, CredentialProvider, ProviderCredential};
+use crate::config::{CredentialProvider, ProviderCredential};
 use crate::oauth::file_store::FileOAuthCredentialStore;
 use crate::oauth::{OAuthClient, OAuthCredentialStore, OAuthDialect, OAuthTokenRecord};
 use crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect;
@@ -33,7 +33,43 @@ pub fn default_chatgpt_oauth_store_root() -> Result<PathBuf> {
 pub struct ChatGptAuthStatus {
     pub credential_ref: String,
     pub account: Option<String>,
-    pub lifecycle: CredentialLifecycle,
+    pub state: ChatGptAuthState,
+}
+
+/// Local OAuth status without conflating an interrupted durable mutation with
+/// an intentional signed-out tombstone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatGptAuthState {
+    Active {
+        expires_at: chrono::DateTime<Utc>,
+        refreshable: bool,
+    },
+    SignedOut,
+    RecoveryRequired,
+}
+
+/// Render one stable, secret-free status line for scripts and interactive use.
+pub fn render_status_line(status: &ChatGptAuthStatus) -> String {
+    match &status.state {
+        ChatGptAuthState::Active {
+            expires_at,
+            refreshable,
+        } => format!(
+            "chatgpt credential={} status=active account={} expires_at={} refreshable={}",
+            status.credential_ref,
+            status.account.as_deref().unwrap_or("unknown"),
+            expires_at.to_rfc3339(),
+            refreshable
+        ),
+        ChatGptAuthState::SignedOut => format!(
+            "chatgpt credential={} status=signed_out",
+            status.credential_ref
+        ),
+        ChatGptAuthState::RecoveryRequired => format!(
+            "chatgpt credential={} status=recovery_required action=run_setup_to_reauthenticate",
+            status.credential_ref
+        ),
+    }
 }
 
 /// User-selected presentation actions. Opening a browser is never implicit.
@@ -183,6 +219,7 @@ where
     D: OAuthDialect + 'static,
     S: OAuthCredentialStore + 'static,
 {
+    crate::oauth::validate_reference(reference)?;
     let pending = client
         .begin_device_authorization_cancellable(cancel.clone())
         .await
@@ -223,12 +260,14 @@ fn status_from_record(
         Some(record) if record.provider == CredentialProvider::ChatgptSubscription => {
             ChatGptAuthStatus {
                 credential_ref: reference.to_string(),
-                account: Some(record.account),
-                lifecycle: if record.revoked || record.mutation_pending {
-                    CredentialLifecycle::Revoked
+                account: Some(record.account.clone()),
+                state: if record.mutation_pending {
+                    ChatGptAuthState::RecoveryRequired
+                } else if record.revoked {
+                    ChatGptAuthState::SignedOut
                 } else {
-                    CredentialLifecycle::Active {
-                        expires_at: Some(record.expires_at),
+                    ChatGptAuthState::Active {
+                        expires_at: record.expires_at,
                         refreshable: record.refresh_token.is_some(),
                     }
                 },
@@ -238,7 +277,7 @@ fn status_from_record(
         None => ChatGptAuthStatus {
             credential_ref: reference.to_string(),
             account: None,
-            lifecycle: CredentialLifecycle::Revoked,
+            state: ChatGptAuthState::SignedOut,
         },
     })
 }
@@ -313,14 +352,27 @@ fn open_browser(url: &str) -> Result<()> {
 /// Replace or append one secret-free named credential and save no token data
 /// to config.toml.
 pub fn save_named_credential(
-    mut config: crate::config::Config,
+    config: crate::config::Config,
     credential: ProviderCredential,
 ) -> Result<()> {
+    save_named_credential_with(config, credential, crate::config::Config::save)
+}
+
+fn save_named_credential_with<F>(
+    mut config: crate::config::Config,
+    credential: ProviderCredential,
+    save: F,
+) -> Result<()>
+where
+    F: FnOnce(&crate::config::Config) -> Result<()>,
+{
     let mut credentials = config.credentials().to_vec();
     credentials.retain(|existing| existing.name != credential.name);
     credentials.push(credential);
     config = config.with_credentials(credentials);
-    config.save()
+    save(&config).context(
+        "ChatGPT token remains safely stored, but config metadata could not be saved; run `finch auth status` and then `finch setup` to finish binding it",
+    )
 }
 
 #[cfg(test)]
@@ -394,6 +446,58 @@ mod tests {
         hostile.provider = CredentialProvider::OpenaiPlatform;
         let store = MemoryStore(Mutex::new(Some(hostile.clone())));
         assert!(status_from_store(&store, "chatgpt:work").is_err());
-        assert_eq!(store.0.lock().unwrap().as_ref(), Some(&hostile));
+        let stored = store.0.lock().unwrap();
+        let stored = stored.as_ref().unwrap();
+        assert_eq!(stored.provider, CredentialProvider::OpenaiPlatform);
+        assert_eq!(stored.access_token, "access-secret");
+        assert_eq!(stored.generation, hostile.generation);
+    }
+
+    #[test]
+    fn interrupted_mutation_restart_status_requires_recovery_without_secret_output() {
+        let mut interrupted = record();
+        interrupted.mutation_pending = true;
+        let status = status_from_record("chatgpt:work", Some(interrupted)).unwrap();
+        assert_eq!(status.state, ChatGptAuthState::RecoveryRequired);
+        let rendered = format!("{status:?}");
+        assert!(!rendered.contains("access-secret"));
+        assert!(!rendered.contains("refresh-secret"));
+        assert_eq!(
+            render_status_line(&status),
+            "chatgpt credential=chatgpt:work status=recovery_required action=run_setup_to_reauthenticate"
+        );
+    }
+
+    #[test]
+    fn script_status_lines_distinguish_active_and_signed_out_without_secrets() {
+        let active = status_from_record("chatgpt:work", Some(record())).unwrap();
+        let active_line = render_status_line(&active);
+        assert!(active_line.starts_with(
+            "chatgpt credential=chatgpt:work status=active account=acct-redacted expires_at="
+        ));
+        assert!(active_line.ends_with(" refreshable=true"));
+        assert!(!active_line.contains("access-secret"));
+        assert_eq!(
+            render_status_line(&status_from_record("chatgpt:work", None).unwrap()),
+            "chatgpt credential=chatgpt:work status=signed_out"
+        );
+    }
+
+    #[test]
+    fn config_save_failure_after_token_commit_is_actionable_and_keeps_token_record() {
+        let stored = record();
+        let store = MemoryStore(Mutex::new(Some(stored.clone())));
+        let credential = stored.provider_credential("chatgpt:work");
+        let error = save_named_credential_with(
+            crate::config::Config::with_providers(vec![]),
+            credential,
+            |_| anyhow::bail!("read-only config sentinel"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("token remains safely stored"));
+        assert!(error.contains("finch auth status"));
+        assert_eq!(store.0.lock().unwrap().as_ref(), Some(&stored));
+        assert!(!error.contains("access-secret"));
     }
 }
