@@ -1646,6 +1646,7 @@ mod tests {
             ipc_socket: home.join("safe.sock"),
             socket_root: home.clone(),
             socket_root_identity: (metadata.dev(), metadata.ino()),
+            ipc_listener_identity: (0, 0),
             home,
             root,
             brain_addr: String::new(),
