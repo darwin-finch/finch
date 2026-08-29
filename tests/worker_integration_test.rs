@@ -244,7 +244,7 @@ async fn test_node_info_has_required_fields() {
 }
 
 /// Calling /v1/node/info twice must return the same node id.
-/// Node identity is stable across calls (persisted to ~/.finch/node_id).
+/// Node identity is stable inside the fixture's disposable state.
 #[tokio::test]
 async fn test_node_info_stable_id() {
     let state = IsolatedNodeState::new();
@@ -274,15 +274,18 @@ async fn test_node_info_stable_id() {
 /// 20 concurrent GET /v1/node/info requests must all succeed.
 /// Verifies the handler is race-condition-free (config and file I/O are
 /// read-only, but concurrent access still exercises locking paths).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_foreign_requests() {
     const CONCURRENCY: usize = 20;
     let state = IsolatedNodeState::new();
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
 
     let handles: Vec<_> = (0..CONCURRENCY)
         .map(|_| {
             let isolated_state = state.state.clone();
+            let start = std::sync::Arc::clone(&start);
             tokio::spawn(async move {
+                start.wait().await;
                 // Each task builds its own router — oneshot consumes the service.
                 let router = node_test_router(&isolated_state);
 
