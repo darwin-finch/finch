@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Cap'n Proto
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Test durable reducer and log recovery
         run: cargo test --lib runtime::effect_log::tests -- --nocapture
       - name: Test named-Brain and Cap'n Proto audit boundary
