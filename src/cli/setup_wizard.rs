@@ -2429,6 +2429,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     else {
                         return Ok(false);
                     };
+                    let replaces_placeholder = matches!(
+                        primary_model,
+                        ModelConfig::Remote { api_key, model, .. }
+                            if api_key.is_empty() && model.is_empty()
+                    ) && tool_models.is_empty();
                     let persisted = editing_idx.and_then(|index| {
                         if index == 0 {
                             match primary_model {
@@ -2443,14 +2448,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     });
                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-                    let refresh_target = (*editing_idx).or_else(|| {
-                        (matches!(
-                            primary_model,
-                            ModelConfig::Remote { api_key, model, .. }
-                                if api_key.is_empty() && model.is_empty()
-                        ) && tool_models.is_empty())
-                        .then_some(0)
-                    });
+                    let refresh_target = (*editing_idx).or(replaces_placeholder.then_some(0));
                     let mut refresh_credentials = credentials.clone();
                     let selected_entry = if provider_id == "zai" {
                         let (credential, entry) = match staged_zai_setup_entries(
@@ -9352,7 +9350,7 @@ mod tests {
         let (_, entry) =
             zai_named_setup_entries("zai-stale", "glm-5.3-flash", "ZAI_API_KEY").unwrap();
         let profile = model_catalog_profile("zai", "zai-stale", "", Some(&entry)).unwrap();
-        inject_catalog_refresh(
+        install_completed_catalog_refresh(
             &mut state,
             &profile,
             discovered_catalog(&profile, &["stale-model"]),
