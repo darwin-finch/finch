@@ -724,6 +724,31 @@ async fn browser_pkce_state_nonce_and_redirect_are_correlated_before_persistence
         .finish_browser_authorization("chatgpt:browser-ipv6", pending, &callback)
         .await
         .unwrap();
+
+    let pending = client
+        .begin_browser_authorization("http://127.0.0.1:12345/callback", Duration::from_millis(30))
+        .unwrap();
+    let state = pending.state.clone();
+    let nonce = pending.nonce.clone();
+    server.push_delayed(
+        "/alpha/token",
+        StatusCode::OK,
+        json!({
+            "alpha_access": "late-access",
+            "alpha_account": "account-one",
+            "refresh": "late-refresh",
+            "nonce": nonce
+        }),
+        Duration::from_millis(100),
+    );
+    let callback = format!("http://127.0.0.1:12345/callback?code=secret-code&state={state}");
+    assert!(client
+        .finish_browser_authorization("chatgpt:browser-late", pending, &callback)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
+    assert!(!store.0.lock().unwrap().contains_key("chatgpt:browser-late"));
 }
 
 #[tokio::test]

@@ -668,6 +668,9 @@ where
             },
         )?;
         self.validate_record(&tokens, None)?;
+        if Utc::now() >= pending.expires_at {
+            bail!("OAuth browser authorization expired before token persistence");
+        }
         self.store
             .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
         Ok(tokens.provider_credential(reference))
