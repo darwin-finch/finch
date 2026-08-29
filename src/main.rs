@@ -86,6 +86,11 @@ struct Args {
 enum Command {
     /// Run interactive setup wizard
     Setup,
+    /// Manage Finch-native provider authentication
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommand,
+    },
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
@@ -175,6 +180,37 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum AuthCommand {
+    /// Show local, secret-free authentication status without network access
+    Status {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default")]
+        credential: String,
+    },
+    /// Start Finch-native ChatGPT device login
+    Login {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default")]
+        credential: String,
+        /// Copy the one-time code to the clipboard
+        #[arg(long)]
+        copy: bool,
+        /// Explicitly open the sign-in URL in the default browser
+        #[arg(long)]
+        open: bool,
+    },
+    /// Revoke a named ChatGPT credential and retain a local tombstone
+    Logout {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default")]
+        credential: String,
     },
 }
 
@@ -730,6 +766,9 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::Setup) => {
             return run_setup().await;
+        }
+        Some(Command::Auth { auth_command }) => {
+            return run_auth_command(auth_command).await;
         }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
@@ -2502,6 +2541,95 @@ async fn run_setup() -> Result<()> {
     println!("  Or start the daemon: finch daemon\n");
 
     Ok(())
+}
+
+async fn run_auth_command(command: AuthCommand) -> Result<()> {
+    use finch::cli::chatgpt_auth::{
+        save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
+    };
+    use finch::config::CredentialLifecycle;
+    use tokio_util::sync::CancellationToken;
+
+    let service = ChatGptAuthService::production()?;
+    match command {
+        AuthCommand::Status {
+            provider: _,
+            credential,
+        } => {
+            let status = service.status(&credential)?;
+            match status.lifecycle {
+                CredentialLifecycle::Active {
+                    expires_at,
+                    refreshable,
+                } => println!(
+                    "chatgpt credential={} status=active account={} expires_at={} refreshable={}",
+                    status.credential_ref,
+                    status.account.as_deref().unwrap_or("unknown"),
+                    expires_at
+                        .map(|value| value.to_rfc3339())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    refreshable
+                ),
+                CredentialLifecycle::Revoked => {
+                    println!(
+                        "chatgpt credential={} status=signed_out",
+                        status.credential_ref
+                    )
+                }
+                CredentialLifecycle::LegacyAmbiguous => {
+                    println!(
+                        "chatgpt credential={} status=unusable",
+                        status.credential_ref
+                    )
+                }
+            }
+        }
+        AuthCommand::Login {
+            provider: _,
+            credential,
+            copy,
+            open,
+        } => {
+            let cancel = command_cancellation();
+            let metadata = service
+                .login(
+                    &credential,
+                    DeviceLoginPresentation {
+                        copy_code: copy,
+                        open_browser: open,
+                    },
+                    cancel,
+                )
+                .await?;
+            let account = metadata.account.clone().unwrap_or_default();
+            let config = load_config().context(
+                "ChatGPT login succeeded, but Finch config is unavailable; rerun `finch setup` to bind the named credential",
+            )?;
+            save_named_credential(config, metadata)?;
+            println!("ChatGPT login saved credential {credential} for account {account}.");
+        }
+        AuthCommand::Logout {
+            provider: _,
+            credential,
+        } => {
+            let metadata = service.logout(&credential, command_cancellation()).await?;
+            let config = load_config()?;
+            save_named_credential(config, metadata)?;
+            println!("ChatGPT credential {credential} was revoked and signed out.");
+        }
+    }
+    Ok(())
+}
+
+fn command_cancellation() -> tokio_util::sync::CancellationToken {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let signal = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
+    cancel
 }
 
 /// Show this node's identity and capabilities
