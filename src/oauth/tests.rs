@@ -169,6 +169,7 @@ async fn fake_handler(State(state): State<Arc<FakeState>>, request: Request) -> 
 struct SyntheticDialect {
     descriptor: OAuthDialectDescriptor,
     prefix: &'static str,
+    refresh_kind_override: Option<CredentialKind>,
 }
 
 impl SyntheticDialect {
@@ -201,6 +202,7 @@ impl SyntheticDialect {
                 allow_insecure_loopback: true,
             },
             prefix,
+            refresh_kind_override: None,
         }
     }
 
@@ -240,18 +242,17 @@ impl OAuthDialect for SyntheticDialect {
         }
         let code_field = format!("{}_device", self.prefix);
         let user_field = format!("{}_user", self.prefix);
-        Ok(DeviceAuthorization {
-            device_code: body[&code_field].as_str().unwrap().into(),
-            user_code: body[&user_field].as_str().unwrap().into(),
-            verification_uri: body
-                .get("verification_uri")
+        DeviceAuthorization::issued(
+            body[&code_field].as_str().unwrap().into(),
+            body[&user_field].as_str().unwrap().into(),
+            body.get("verification_uri")
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("https://login.example/{}/verify", self.prefix)),
-            verification_uri_complete: None,
-            expires_in: Duration::from_secs(2),
-            interval: Duration::from_millis(10),
-        })
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
     }
 
     fn device_poll_request(&self, pending: &DeviceAuthorization) -> Result<OAuthHttpRequest> {
@@ -324,10 +325,14 @@ impl OAuthDialect for SyntheticDialect {
             dialect_id: self.descriptor.dialect_id.clone(),
             protocol_revision: self.descriptor.protocol_revision.clone(),
             provider: self.descriptor.provider,
-            kind: if matches!(context, TokenValidationContext::Browser { .. }) {
-                self.descriptor.browser_credential_kind.unwrap()
-            } else {
-                self.descriptor.credential_kind
+            kind: match context {
+                TokenValidationContext::Browser { .. } => {
+                    self.descriptor.browser_credential_kind.unwrap()
+                }
+                TokenValidationContext::Refresh => self
+                    .refresh_kind_override
+                    .unwrap_or_else(|| previous.unwrap().kind),
+                TokenValidationContext::Device => self.descriptor.credential_kind,
             },
             issuer: self.descriptor.issuer.clone(),
             audience: self.descriptor.audience.clone(),
@@ -415,6 +420,67 @@ async fn two_synthetic_dialects_share_device_core_without_provider_hard_coding()
 }
 
 #[tokio::test]
+async fn device_deadline_and_shared_completion_claim_cannot_be_restarted_or_duplicated() {
+    let server = FakeServer::start().await;
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    let store = Arc::new(MemoryStore::default());
+    let client = OAuthClient::new(dialect.clone(), store.clone()).unwrap();
+
+    let expired = DeviceAuthorization::issued(
+        "expired-device".into(),
+        "ABCD-EFGH".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(client
+        .finish_device_authorization("chatgpt:expired-start", &expired, CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
+    assert_eq!(server.request_count("/alpha/poll"), 0);
+    assert!(store.0.lock().unwrap().is_empty());
+
+    server.push_delayed(
+        "/alpha/poll",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "refresh-one"),
+        Duration::from_millis(30),
+    );
+    let pending = DeviceAuthorization::issued(
+        "shared-device".into(),
+        "IJKL-MNOP".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_secs(2),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let duplicate = pending.clone();
+    let first = client.finish_device_authorization(
+        "chatgpt:single-consumer",
+        &pending,
+        CancellationToken::new(),
+    );
+    let second = client.finish_device_authorization(
+        "chatgpt:single-consumer",
+        &duplicate,
+        CancellationToken::new(),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let rejected = first.err().or_else(|| second.err()).unwrap().to_string();
+    assert!(rejected.contains("already claimed"));
+    assert_eq!(server.request_count("/alpha/poll"), 1);
+    assert_eq!(server.request_count("/alpha/token"), 0);
+    assert_eq!(store.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn both_synthetic_dialects_share_refresh_and_revoke_lifecycle_without_fallback() {
     for prefix in ["alpha", "beta"] {
         let server = FakeServer::start().await;
@@ -449,11 +515,96 @@ async fn both_synthetic_dialects_share_refresh_and_revoke_lifecycle_without_fall
 }
 
 #[tokio::test]
+async fn refresh_preserves_browser_kind_and_empty_revocation_success_commits_tombstone() {
+    let server = FakeServer::start().await;
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    let store = Arc::new(MemoryStore::default());
+    let browser = dialect
+        .validate_tokens(
+            StatusCode::OK,
+            json!({
+                "alpha_access": "browser-access",
+                "alpha_account": "account-one",
+                "refresh": "browser-refresh",
+                "nonce": "browser-nonce"
+            }),
+            None,
+            &TokenValidationContext::Browser {
+                expected_nonce: "browser-nonce".into(),
+                redirect_uri: "http://127.0.0.1/callback".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(browser.kind, CredentialKind::OauthBrowserPkce);
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert("chatgpt:browser".into(), browser);
+    server.push(
+        "/alpha/token",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "browser-refresh-two"),
+    );
+    let client = OAuthClient::new(dialect, store.clone()).unwrap();
+    client.refresh("chatgpt:browser").await.unwrap();
+    assert_eq!(
+        store.0.lock().unwrap()["chatgpt:browser"].kind,
+        CredentialKind::OauthBrowserPkce
+    );
+
+    server.push_raw("/alpha/revoke", StatusCode::NO_CONTENT, String::new());
+    client.revoke("chatgpt:browser").await.unwrap();
+    let tombstone = store.0.lock().unwrap()["chatgpt:browser"].clone();
+    assert!(tombstone.revoked && !tombstone.mutation_pending);
+    assert!(tombstone.access_token.is_empty() && tombstone.refresh_token.is_none());
+    assert_eq!(server.request_count("/alpha/revoke"), 1);
+
+    let hostile_server = FakeServer::start().await;
+    let mut switching = SyntheticDialect::new(&hostile_server.origin, "alpha");
+    switching.refresh_kind_override = Some(CredentialKind::OauthDevice);
+    let browser = switching
+        .validate_tokens(
+            StatusCode::OK,
+            json!({
+                "alpha_access": "browser-access",
+                "alpha_account": "account-one",
+                "refresh": "browser-refresh",
+                "nonce": "browser-nonce"
+            }),
+            None,
+            &TokenValidationContext::Browser {
+                expected_nonce: "browser-nonce".into(),
+                redirect_uri: "http://127.0.0.1/callback".into(),
+            },
+        )
+        .unwrap();
+    let hostile_store = Arc::new(MemoryStore::default());
+    hostile_store
+        .0
+        .lock()
+        .unwrap()
+        .insert("chatgpt:kind-switch".into(), browser);
+    hostile_server.push(
+        "/alpha/token",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "browser-refresh-two"),
+    );
+    let hostile = OAuthClient::new(Arc::new(switching), hostile_store.clone()).unwrap();
+    assert!(hostile.refresh("chatgpt:kind-switch").await.is_err());
+    let pending = hostile_store.0.lock().unwrap()["chatgpt:kind-switch"].clone();
+    assert!(pending.mutation_pending);
+    assert_eq!(pending.kind, CredentialKind::OauthBrowserPkce);
+    assert_eq!(hostile_server.request_count("/alpha/token"), 1);
+}
+
+#[tokio::test]
 async fn malformed_and_oversized_oauth_responses_fail_before_follow_on_activity() {
-    for body in [
+    let hostile_bodies = [
         "{malformed-json".to_string(),
         json!({"padding": "x".repeat(MAX_AUTH_BODY_BYTES)}).to_string(),
-    ] {
+    ];
+    for body in hostile_bodies.clone() {
         let server = FakeServer::start().await;
         server.push_raw("/alpha/device", StatusCode::OK, body);
         let client = OAuthClient::new(
@@ -464,6 +615,119 @@ async fn malformed_and_oversized_oauth_responses_fail_before_follow_on_activity(
         assert!(client.begin_device_authorization().await.is_err());
         assert_eq!(server.request_count("/alpha/device"), 1);
         assert_eq!(server.request_count("/alpha/poll"), 0);
+    }
+
+    for body in hostile_bodies.clone() {
+        let server = FakeServer::start().await;
+        server.push_raw("/alpha/poll", StatusCode::OK, body);
+        let store = Arc::new(MemoryStore::default());
+        let client = OAuthClient::new(
+            Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+            store.clone(),
+        )
+        .unwrap();
+        let pending = DeviceAuthorization::issued(
+            "poll-device".into(),
+            "ABCD-EFGH".into(),
+            "https://login.example/alpha/verify".into(),
+            None,
+            Duration::from_secs(2),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(client
+            .finish_device_authorization("chatgpt:poll", &pending, CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(server.request_count("/alpha/poll"), 1);
+        assert_eq!(server.request_count("/alpha/token"), 0);
+        assert!(store.0.lock().unwrap().is_empty());
+    }
+
+    for body in hostile_bodies.clone() {
+        let server = FakeServer::start().await;
+        server.push(
+            "/alpha/poll",
+            StatusCode::OK,
+            json!({"authorization_code": "code-secret"}),
+        );
+        server.push_raw("/alpha/token", StatusCode::OK, body);
+        let store = Arc::new(MemoryStore::default());
+        let client = OAuthClient::new(
+            Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+            store.clone(),
+        )
+        .unwrap();
+        let pending = DeviceAuthorization::issued(
+            "code-device".into(),
+            "IJKL-MNOP".into(),
+            "https://login.example/alpha/verify".into(),
+            None,
+            Duration::from_secs(2),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(client
+            .finish_device_authorization("chatgpt:code", &pending, CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(server.request_count("/alpha/poll"), 1);
+        assert_eq!(server.request_count("/alpha/token"), 1);
+        assert!(store.0.lock().unwrap().is_empty());
+    }
+
+    for body in hostile_bodies.clone() {
+        let server = FakeServer::start().await;
+        let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+        let store = Arc::new(MemoryStore::default());
+        let initial = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                token_body("alpha", "account-one", "refresh-one"),
+                None,
+                &TokenValidationContext::Device,
+            )
+            .unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .insert("chatgpt:refresh-hostile".into(), initial);
+        server.push_raw("/alpha/token", StatusCode::OK, body);
+        let client = OAuthClient::new(dialect, store.clone()).unwrap();
+        assert!(client.refresh("chatgpt:refresh-hostile").await.is_err());
+        assert_eq!(server.request_count("/alpha/token"), 1);
+        assert!(store.0.lock().unwrap()["chatgpt:refresh-hostile"].mutation_pending);
+    }
+
+    for (status, body) in [
+        (StatusCode::BAD_REQUEST, "{malformed-json".to_string()),
+        (
+            StatusCode::OK,
+            json!({"padding": "x".repeat(MAX_AUTH_BODY_BYTES)}).to_string(),
+        ),
+    ] {
+        let server = FakeServer::start().await;
+        let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+        let store = Arc::new(MemoryStore::default());
+        let initial = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                token_body("alpha", "account-one", "refresh-one"),
+                None,
+                &TokenValidationContext::Device,
+            )
+            .unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .insert("chatgpt:revoke-hostile".into(), initial);
+        server.push_raw("/alpha/revoke", status, body);
+        let client = OAuthClient::new(dialect, store.clone()).unwrap();
+        assert!(client.revoke("chatgpt:revoke-hostile").await.is_err());
+        assert_eq!(server.request_count("/alpha/revoke"), 1);
+        assert!(store.0.lock().unwrap()["chatgpt:revoke-hostile"].mutation_pending);
     }
 }
 
@@ -529,8 +793,21 @@ async fn device_denial_expiry_cancellation_and_timeout_are_terminal_without_pers
     )
     .unwrap()
     .with_timeout(Duration::from_millis(10));
+    let timeout_pending = DeviceAuthorization::issued(
+        "timeout-device".into(),
+        "IJKL-MNOP".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_secs(2),
+        Duration::ZERO,
+    )
+    .unwrap();
     assert!(timed
-        .finish_device_authorization("chatgpt:timeout", &pending, CancellationToken::new())
+        .finish_device_authorization(
+            "chatgpt:timeout",
+            &timeout_pending,
+            CancellationToken::new()
+        )
         .await
         .unwrap_err()
         .to_string()
@@ -544,14 +821,15 @@ async fn delayed_device_poll_and_code_exchange_cannot_persist_after_terminal_sta
     let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
     let store = Arc::new(MemoryStore::default());
     let client = OAuthClient::new(dialect, store.clone()).unwrap();
-    let mut pending = DeviceAuthorization {
-        device_code: "device-secret".into(),
-        user_code: "ABCD-EFGH".into(),
-        verification_uri: "https://login.example/alpha/verify".into(),
-        verification_uri_complete: None,
-        expires_in: Duration::from_millis(30),
-        interval: Duration::ZERO,
-    };
+    let pending = DeviceAuthorization::issued(
+        "device-secret".into(),
+        "ABCD-EFGH".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_millis(30),
+        Duration::ZERO,
+    )
+    .unwrap();
     server.push_delayed(
         "/alpha/poll",
         StatusCode::OK,
@@ -583,7 +861,15 @@ async fn delayed_device_poll_and_code_exchange_cannot_persist_after_terminal_sta
         tokio::time::sleep(Duration::from_millis(30)).await;
         trigger.cancel();
     });
-    pending.expires_in = Duration::from_secs(2);
+    let pending = DeviceAuthorization::issued(
+        "device-secret".into(),
+        "ABCD-EFGH".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_secs(2),
+        Duration::ZERO,
+    )
+    .unwrap();
     assert!(client
         .finish_device_authorization("chatgpt:cancelled", &pending, cancel)
         .await
@@ -855,14 +1141,15 @@ async fn expired_refresh_revoke_crash_and_same_name_reauthentication_are_durable
         StatusCode::OK,
         token_body("alpha", "account-one", "refresh-three"),
     );
-    let pending = DeviceAuthorization {
-        device_code: "device-secret".into(),
-        user_code: "ABCD-EFGH".into(),
-        verification_uri: "https://login.example/alpha/verify".into(),
-        verification_uri_complete: None,
-        expires_in: Duration::from_secs(2),
-        interval: Duration::ZERO,
-    };
+    let pending = DeviceAuthorization::issued(
+        "device-secret".into(),
+        "ABCD-EFGH".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_secs(2),
+        Duration::ZERO,
+    )
+    .unwrap();
     client
         .finish_device_authorization("chatgpt:work", &pending, CancellationToken::new())
         .await
@@ -878,16 +1165,74 @@ async fn expired_refresh_revoke_crash_and_same_name_reauthentication_are_durable
     assert!(tombstone.access_token.is_empty() && tombstone.refresh_token.is_none());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn file_store_reopens_pending_revoke_and_recovers_durable_tombstone() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("oauth");
+    let server = FakeServer::start().await;
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    let initial = dialect
+        .validate_tokens(
+            StatusCode::OK,
+            token_body("alpha", "account-one", "refresh-one"),
+            None,
+            &TokenValidationContext::Device,
+        )
+        .unwrap();
+    let store = Arc::new(file_store::FileOAuthCredentialStore::new(root.clone()));
+    store
+        .compare_and_swap("chatgpt:file", None, &initial)
+        .unwrap();
+    server.push_delayed(
+        "/alpha/revoke",
+        StatusCode::NO_CONTENT,
+        json!({}),
+        Duration::from_millis(100),
+    );
+    let client = OAuthClient::new(dialect.clone(), store.clone())
+        .unwrap()
+        .with_timeout(Duration::from_millis(10));
+    assert!(client.revoke("chatgpt:file").await.is_err());
+    assert!(
+        store
+            .load("chatgpt:file")
+            .unwrap()
+            .unwrap()
+            .mutation_pending
+    );
+    drop(client);
+    drop(store);
+
+    let reopened = Arc::new(file_store::FileOAuthCredentialStore::new(root.clone()));
+    let recovery = OAuthClient::new(dialect, reopened.clone()).unwrap();
+    let metadata = recovery
+        .recover_interrupted_as_revoked("chatgpt:file")
+        .unwrap();
+    assert_eq!(metadata.lifecycle, CredentialLifecycle::Revoked);
+    drop(recovery);
+    drop(reopened);
+
+    let verified = file_store::FileOAuthCredentialStore::new(root)
+        .load("chatgpt:file")
+        .unwrap()
+        .unwrap();
+    assert!(verified.revoked && !verified.mutation_pending);
+    assert!(verified.access_token.is_empty() && verified.refresh_token.is_none());
+    assert_eq!(server.request_count("/alpha/revoke"), 1);
+}
+
 #[test]
 fn debug_and_errors_redact_transient_and_persisted_secrets() {
-    let pending = DeviceAuthorization {
-        device_code: "device-secret".into(),
-        user_code: "user-secret".into(),
-        verification_uri: "https://login.example/device".into(),
-        verification_uri_complete: Some("https://login.example/device?code=user-secret".into()),
-        expires_in: Duration::from_secs(60),
-        interval: Duration::from_secs(1),
-    };
+    let pending = DeviceAuthorization::issued(
+        "device-secret".into(),
+        "user-secret".into(),
+        "https://login.example/device".into(),
+        Some("https://login.example/device?code=user-secret".into()),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    )
+    .unwrap();
     let debug = format!("{pending:?}");
     assert!(!debug.contains("device-secret"));
     assert!(!debug.contains("user-secret"));

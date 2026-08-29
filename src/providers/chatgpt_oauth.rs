@@ -60,6 +60,7 @@ pub struct VerifiedOpenAiClaims {
 /// Injected JWS/JWKS verification boundary. Production enablement must supply
 /// an implementation pinned to the dialect's exact issuer and algorithms.
 pub trait OpenAiTokenVerifier: Send + Sync {
+    fn preflight(&self) -> Result<()>;
     fn verify(&self, id_token: Option<&str>, access_token: &str) -> Result<VerifiedOpenAiClaims>;
 }
 
@@ -68,9 +69,17 @@ pub trait OpenAiTokenVerifier: Send + Sync {
 pub struct OpenAiVerificationUnavailable;
 
 impl OpenAiTokenVerifier for OpenAiVerificationUnavailable {
-    fn verify(&self, _id_token: Option<&str>, _access_token: &str) -> Result<VerifiedOpenAiClaims> {
-        bail!("ChatGPT OAuth token verification is unavailable for this compatibility revision; update Finch rather than bypassing issuer or signature validation")
+    fn preflight(&self) -> Result<()> {
+        unavailable_verifier_error()
     }
+
+    fn verify(&self, _id_token: Option<&str>, _access_token: &str) -> Result<VerifiedOpenAiClaims> {
+        unavailable_verifier_error()
+    }
+}
+
+fn unavailable_verifier_error<T>() -> Result<T> {
+    bail!("ChatGPT OAuth token verification is unavailable for this compatibility revision; update Finch rather than bypassing issuer or signature validation")
 }
 
 /// Strict OpenAI-specific dialect; reusable OAuth state remains in `oauth`.
@@ -149,6 +158,10 @@ where
         &self.descriptor
     }
 
+    fn preflight(&self) -> Result<()> {
+        self.verifier.preflight()
+    }
+
     fn device_authorization_request(&self) -> Result<OAuthHttpRequest> {
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.device_authorization_endpoint.clone(),
@@ -182,14 +195,14 @@ where
                     .or_else(|| value.as_str()?.parse::<u64>().ok())
             })
             .context("ChatGPT device authorization response has invalid interval")?;
-        Ok(DeviceAuthorization {
+        DeviceAuthorization::issued(
             device_code,
             user_code,
-            verification_uri: format!("{}/codex/device", self.auth_origin),
-            verification_uri_complete: None,
-            expires_in: DEVICE_LIFETIME,
-            interval: Duration::from_secs(interval),
-        })
+            format!("{}/codex/device", self.auth_origin),
+            None,
+            DEVICE_LIFETIME,
+            Duration::from_secs(interval),
+        )
     }
 
     fn device_poll_request(&self, pending: &DeviceAuthorization) -> Result<OAuthHttpRequest> {
@@ -394,10 +407,16 @@ impl ChatGptSubscriptionService {
     pub fn validate_endpoint(&self, endpoint: &str) -> Result<()> {
         let requested = reqwest::Url::parse(endpoint)?;
         let required = reqwest::Url::parse(self.base_url)?;
+        let required_path = required.path().trim_end_matches('/');
+        let path_matches = requested.path() == required_path
+            || requested
+                .path()
+                .strip_prefix(required_path)
+                .is_some_and(|suffix| suffix.starts_with('/'));
         if requested.scheme() != "https"
             || requested.host_str() != Some("chatgpt.com")
             || requested.port_or_known_default() != required.port_or_known_default()
-            || !requested.path().starts_with("/backend-api/codex")
+            || !path_matches
             || requested.username() != ""
             || requested.password().is_some()
             || requested.fragment().is_some()
@@ -490,10 +509,32 @@ struct CatalogModelWire {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct NoopStore;
+
+    impl crate::oauth::OAuthCredentialStore for NoopStore {
+        fn load(&self, _reference: &str) -> Result<Option<OAuthTokenRecord>> {
+            Ok(None)
+        }
+
+        fn compare_and_swap(
+            &self,
+            _reference: &str,
+            _expected_generation: Option<&str>,
+            _replacement: &OAuthTokenRecord,
+        ) -> Result<()> {
+            bail!("unexpected credential persistence")
+        }
+    }
+
     #[derive(Clone)]
     struct FixedVerifier(VerifiedOpenAiClaims);
 
     impl OpenAiTokenVerifier for FixedVerifier {
+        fn preflight(&self) -> Result<()> {
+            Ok(())
+        }
+
         fn verify(
             &self,
             _id_token: Option<&str>,
@@ -558,6 +599,7 @@ mod tests {
             "https://api.openai.com/v1/models",
             "https://chatgpt.com.evil.example/backend-api/codex/models",
             "https://chatgpt.com/v1/models",
+            "https://chatgpt.com/backend-api/codexevil/models",
         ] {
             assert!(service.validate_endpoint(hostile).is_err(), "{hostile}");
         }
@@ -572,6 +614,24 @@ mod tests {
         assert!(service
             .validate_account_header(&platform, "acct-work")
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_production_verifier_fails_client_preflight_before_any_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let dialect =
+            OpenAiChatGptOAuthDialect::new(&origin, Arc::new(OpenAiVerificationUnavailable), true)
+                .unwrap();
+        let error = crate::oauth::OAuthClient::new(Arc::new(dialect), Arc::new(NoopStore))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("verification is unavailable"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

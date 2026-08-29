@@ -16,6 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -148,6 +149,48 @@ pub struct DeviceAuthorization {
     pub expires_in: Duration,
     #[zeroize(skip)]
     pub interval: Duration,
+    #[zeroize(skip)]
+    issued_deadline: tokio::time::Instant,
+    #[zeroize(skip)]
+    completion_claimed: Arc<AtomicBool>,
+}
+
+impl DeviceAuthorization {
+    /// Create locally-issued pending device authority whose expiry cannot be
+    /// restarted by delaying or cloning the completion call.
+    pub fn issued(
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        verification_uri_complete: Option<String>,
+        expires_in: Duration,
+        interval: Duration,
+    ) -> Result<Self> {
+        let issued_deadline = tokio::time::Instant::now()
+            .checked_add(expires_in)
+            .context("OAuth device authorization expiry is invalid")?;
+        Ok(Self {
+            device_code,
+            user_code,
+            verification_uri,
+            verification_uri_complete,
+            expires_in,
+            interval,
+            issued_deadline,
+            completion_claimed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn claim_completion(&self) -> Result<()> {
+        if self
+            .completion_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            bail!("OAuth device authorization completion was already claimed");
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for DeviceAuthorization {
@@ -313,6 +356,11 @@ impl OAuthTokenRecord {
 /// Strict provider dialect boundary. Implementations own every provider fact.
 pub trait OAuthDialect: Send + Sync {
     fn descriptor(&self) -> &OAuthDialectDescriptor;
+    /// Fail before client construction when required cryptographic or protocol
+    /// authority is unavailable for this dialect revision.
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
     fn device_authorization_request(&self) -> Result<OAuthHttpRequest>;
     fn parse_device_authorization(
         &self,
@@ -461,6 +509,9 @@ where
 {
     pub fn new(dialect: Arc<D>, store: Arc<S>) -> Result<Self> {
         dialect.descriptor().validate()?;
+        dialect
+            .preflight()
+            .context("OAuth provider dialect is unavailable")?;
         let http = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -501,8 +552,9 @@ where
     ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
         validate_device_authorization(pending, self.dialect.descriptor())?;
+        pending.claim_completion()?;
         let replacement_generation = self.reauthentication_generation(reference)?;
-        let deadline = tokio::time::Instant::now() + pending.expires_in;
+        let deadline = pending.issued_deadline;
         let mut interval = bounded_poll_interval(pending.interval);
         loop {
             tokio::select! {
@@ -729,10 +781,7 @@ where
         marker.mutation_pending = true;
         self.store
             .compare_and_swap(reference, Some(&current.generation), &marker)?;
-        let (status, _) = self.post_form(request).await?;
-        if !status.is_success() {
-            bail!("OAuth provider rejected credential revocation");
-        }
+        self.post_revoke(request).await?;
         let mut tombstone = current.clone();
         tombstone.access_token.clear();
         tombstone.refresh_token = None;
@@ -789,11 +838,12 @@ where
             bail!("OAuth token lifecycle or account binding is unusable");
         }
         if let Some(previous) = previous {
-            if previous.account != record.account
+            if previous.kind != record.kind
+                || previous.account != record.account
                 || previous.tenant != record.tenant
                 || previous.project != record.project
             {
-                bail!("OAuth refresh changed the bound account identity");
+                bail!("OAuth refresh changed the bound authorization or account identity");
             }
         }
         Ok(())
@@ -859,6 +909,36 @@ where
             let body =
                 serde_json::from_slice(&bytes).context("OAuth response was malformed JSON")?;
             Ok((status, body))
+        })
+        .await
+        .context("OAuth request timed out")?
+    }
+
+    async fn post_revoke(&self, request: OAuthHttpRequest) -> Result<()> {
+        let descriptor = self.dialect.descriptor();
+        let url = validate_endpoint(&request.endpoint, descriptor.allow_insecure_loopback)?;
+        if !descriptor.allowed_origins.contains(&origin(&url)?) {
+            bail!("OAuth request attempted endpoint substitution");
+        }
+        let builder = self.http.post(url);
+        let builder = match request.body {
+            OAuthRequestBody::Form(fields) => builder.form(&fields),
+            OAuthRequestBody::Json(value) => builder.json(&value),
+        };
+        tokio::time::timeout(self.timeout, async {
+            let response = builder
+                .send()
+                .await
+                .context("OAuth revocation request failed")?;
+            if response.status().is_redirection() {
+                bail!("OAuth endpoint redirect was rejected");
+            }
+            let status = response.status();
+            let _bounded_body = read_bounded(response, MAX_AUTH_BODY_BYTES).await?;
+            if !status.is_success() {
+                bail!("OAuth provider rejected credential revocation (HTTP {status})");
+            }
+            Ok(())
         })
         .await
         .context("OAuth request timed out")?
@@ -955,6 +1035,9 @@ fn validate_device_authorization(
     }
     if pending.expires_in.is_zero() || pending.expires_in > Duration::from_secs(30 * 60) {
         bail!("OAuth device authorization expiry is invalid");
+    }
+    if tokio::time::Instant::now() >= pending.issued_deadline {
+        bail!("OAuth device authorization expired");
     }
     if pending.interval > MAX_POLL_INTERVAL {
         bail!("OAuth device polling interval is invalid");
