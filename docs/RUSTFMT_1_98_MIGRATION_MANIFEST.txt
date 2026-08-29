@@ -30,6 +30,7 @@ src/server/brain_approval.rs
 src/server/brain_runner.rs
 src/server/brain_service.rs
 src/server/handlers.rs
+src/server/mod.rs
 src/tools/executor.rs
 src/tools/implementations/bash.rs
 src/tools/implementations/mod.rs

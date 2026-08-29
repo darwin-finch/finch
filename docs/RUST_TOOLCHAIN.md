@@ -23,17 +23,17 @@ tested compiler and the optional `rust-version` package field:
 
 ## Formatting migration status
 
-The clean checkout at `c40c325f44d83deb9227b65f8ab3cc77301eb92e` is not formatted by Rust
-1.98.0: a direct all-tracked-file audit emits a 51-file, 9,100-entry drift. Pinning alone therefore
+The clean checkout at `e8627479ada52997c7845d88027ffea1a6827706` is not formatted by Rust
+1.98.0: a direct all-tracked-file audit emits a 52-file, 9,104-entry drift. Pinning alone therefore
 cannot make `cargo fmt --all -- --check` pass.
 
-`RUSTFMT_1_98_MIGRATION_MANIFEST.txt` records that exact 51-file footprint, and
+`RUSTFMT_1_98_MIGRATION_MANIFEST.txt` records that exact 52-file footprint, and
 `tests/apply_issue_191_format_migration.sh --apply` refuses to proceed from a dirty checkout or if
 the resulting footprint differs. The one-time rewrite must be committed as an isolated mechanical
 commit containing only the Rust 1.98.0 formatter output.
 
 The audited manifest SHA-256 is
-`bb74c92f4169628def17988c68c45b290ce3a3e366b41ca04379ad3ce18f623f`.
-The sorted 299-file Rust blob preimage SHA-256 is
-`17d2467f2cba26c566c924a5921beb66f90bfea25bc524915be0d10a97490925`; after any rebase that
+`a9e4cc6250f6fcfe89fc4c5a45f2f871eb03753838c42026d0faae0d1cdddea4`.
+The sorted 304-file Rust blob preimage SHA-256 is
+`db2911ff9c8e252898363757cfadd2bde3350f2c9a10178914fdc2b8e330d5fa`; after any rebase that
 changes it, the footprint must be re-audited and both guards updated before formatting.

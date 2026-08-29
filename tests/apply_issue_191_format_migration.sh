@@ -12,8 +12,8 @@ cd "$repository_root"
 
 expected_toolchain="1.98.0"
 manifest="docs/RUSTFMT_1_98_MIGRATION_MANIFEST.txt"
-expected_manifest_sha256="bb74c92f4169628def17988c68c45b290ce3a3e366b41ca04379ad3ce18f623f"
-expected_rust_preimage_sha256="17d2467f2cba26c566c924a5921beb66f90bfea25bc524915be0d10a97490925"
+expected_manifest_sha256="a9e4cc6250f6fcfe89fc4c5a45f2f871eb03753838c42026d0faae0d1cdddea4"
+expected_rust_preimage_sha256="db2911ff9c8e252898363757cfadd2bde3350f2c9a10178914fdc2b8e330d5fa"
 
 actual_manifest_sha256=$(shasum -a 256 "$manifest" | awk '{print $1}')
 if [[ "$actual_manifest_sha256" != "$expected_manifest_sha256" ]]; then
