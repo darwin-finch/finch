@@ -121,6 +121,7 @@ impl WorkTracker {
     }
 
     /// Load persisted statistics from an explicit Finch state directory.
+    #[cfg(unix)]
     pub(crate) fn load_persisted_from_state_directory(
         directory: &std::fs::File,
     ) -> Result<WorkStats> {

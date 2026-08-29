@@ -160,6 +160,7 @@ impl NodeIdentity {
     ///
     /// Callers that already own an isolated state root should use this method
     /// instead of temporarily changing `HOME`.
+    #[cfg(unix)]
     pub(crate) fn load_or_create_in(directory: &std::fs::File) -> Result<Self> {
         use nix::fcntl::{openat, OFlag};
         use nix::sys::stat::{fstat, Mode, SFlag};

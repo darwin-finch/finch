@@ -17,6 +17,7 @@ pub use stats::{WorkStats, WorkTracker};
 
 use crate::models::model_selector::{ModelSelection, ModelSelector};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::sync::Arc;
 
 /// Opaque disposable state owned by worker-node integration tests.
@@ -24,6 +25,7 @@ use std::sync::Arc;
 /// Construction rejects a temporary parent inside the user's Finch state,
 /// so test seams cannot silently fall back to `~/.finch`.
 #[doc(hidden)]
+#[cfg(unix)]
 #[derive(Clone)]
 pub struct IsolatedNodeTestState {
     directory: Arc<tempfile::TempDir>,
@@ -33,10 +35,13 @@ pub struct IsolatedNodeTestState {
     identity_lock: Arc<std::sync::Mutex<()>>,
 }
 
+#[cfg(unix)]
 impl IsolatedNodeTestState {
     pub fn new() -> anyhow::Result<Self> {
         use anyhow::Context as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use nix::fcntl::{open, OFlag};
+        use nix::sys::stat::Mode;
+        use std::os::fd::FromRawFd as _;
 
         let temporary_parent = std::env::temp_dir()
             .canonicalize()
@@ -55,11 +60,16 @@ impl IsolatedNodeTestState {
             .prefix("finch-node-test.")
             .tempdir_in(&temporary_parent)
             .context("create disposable node-test state")?;
-        let descriptor = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(directory.path())
-            .context("pin disposable node-test state")?;
+        let descriptor = unsafe {
+            std::fs::File::from_raw_fd(
+                open(
+                    directory.path(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .context("pin disposable node-test state")?,
+            )
+        };
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::MetadataExt as _;
         let pinned = nix::sys::stat::fstat(descriptor.as_raw_fd())?;
@@ -175,12 +185,14 @@ impl IsolatedNodeTestState {
     }
 
     pub fn fifo_node_id_fixture(&self) -> anyhow::Result<()> {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifoat;
         use std::os::fd::AsRawFd as _;
-        let name = std::ffi::CString::new("node_id")?;
-        let result = unsafe { libc::mkfifoat(self.descriptor.as_raw_fd(), name.as_ptr(), 0o600) };
-        if result == -1 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        mkfifoat(
+            Some(self.descriptor.as_raw_fd()),
+            "node_id",
+            Mode::from_bits_truncate(0o600),
+        )?;
         Ok(())
     }
 
@@ -199,11 +211,13 @@ impl IsolatedNodeTestState {
 }
 
 #[doc(hidden)]
+#[cfg(unix)]
 pub struct IsolatedNodeRootSwap {
     original: std::path::PathBuf,
     moved: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl IsolatedNodeRootSwap {
     pub fn pinned_node_id_exists(&self) -> bool {
         self.moved.join("node_id").is_file()
@@ -214,10 +228,12 @@ impl IsolatedNodeRootSwap {
     }
 
     pub fn external_sentinel_unchanged(&self) -> bool {
-        std::fs::read(self.original.join("external-sentinel")).as_deref() == Ok(b"keep external")
+        std::fs::read(self.original.join("external-sentinel"))
+            .is_ok_and(|contents| contents == b"keep external")
     }
 }
 
+#[cfg(unix)]
 impl Drop for IsolatedNodeRootSwap {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.original);

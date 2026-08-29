@@ -14,6 +14,10 @@ if [[ -n "$ambient_calls" ]]; then
 fi
 
 for test_file in tests/worker_integration_test.rs tests/load_test.rs; do
+  grep -Fq '#![cfg(unix)]' "$test_file" || {
+    echo "$test_file must not compile the Unix descriptor seam on other targets" >&2
+    exit 1
+  }
   grep -Fq 'IsolatedNodeTestState' "$test_file" || {
     echo "$test_file must construct opaque disposable node state" >&2
     exit 1

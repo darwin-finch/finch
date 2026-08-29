@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Load tests — simulates high-concurrency workloads targeting 100K+ users.
 //!
 //! Fast tests run with:  cargo test --test load_test

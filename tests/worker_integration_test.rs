@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 // Integration tests for the foreign workload acceptance path:
 // HTTP endpoints exposed by every finch worker node.
 //
