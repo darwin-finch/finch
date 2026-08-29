@@ -1992,6 +1992,10 @@ fn decode_schedule_policy(
     }
 }
 
+fn runner_rpc_transport_disconnected(error: &capnp::Error) -> bool {
+    error.kind == capnp::ErrorKind::Disconnected
+}
+
 async fn forward_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
@@ -2064,7 +2068,10 @@ async fn forward_runner_request(
                     decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
                     false,
                 ),
-                Err(error) => (Err(error.to_string().into()), true),
+                Err(error) => {
+                    let disconnected = runner_rpc_transport_disconnected(&error);
+                    (Err(error.to_string().into()), disconnected)
+                }
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
             let reconciliation = if disconnected {
@@ -2144,7 +2151,10 @@ async fn forward_runner_request(
                             decode_runner_turn_result(reply.get().and_then(|r| r.get_result())),
                             false,
                         ),
-                        Err(error) => (Err(error.to_string().into()), true),
+                        Err(error) => {
+                            let disconnected = runner_rpc_transport_disconnected(&error);
+                            (Err(error.to_string().into()), disconnected)
+                        }
                     },
                     Err(error) => (Err(error.into()), false),
                 }
@@ -2429,9 +2439,29 @@ fn decode_runner_turn_event(
 mod tests {
     use super::{
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-        require_approval_connection, BrainRpcService, BrainRunnerControlImpl, FinchDaemonImpl,
+        require_approval_connection, runner_rpc_transport_disconnected, BrainRpcService,
+        BrainRunnerControlImpl, FinchDaemonImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
+
+    #[test]
+    fn effect_audit_process_loss_uses_capnp_transport_kind_not_error_text() {
+        assert!(runner_rpc_transport_disconnected(
+            &capnp::Error::disconnected("application failed".into())
+        ));
+        assert!(!runner_rpc_transport_disconnected(&capnp::Error::failed(
+            "peer disconnected".into()
+        )));
+        assert!(!runner_rpc_transport_disconnected(
+            &capnp::Error::overloaded("peer disconnected".into())
+        ));
+        assert!(!runner_rpc_transport_disconnected(
+            &capnp::Error::unimplemented("peer disconnected".into())
+        ));
+        assert!(!runner_rpc_transport_disconnected(
+            &capnp::Error::from_kind(capnp::ErrorKind::BufferNotLargeEnough,)
+        ));
+    }
 
     #[test]
     fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
