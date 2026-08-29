@@ -82,6 +82,7 @@ jobs:
     - name: Build isolation supervisor
       timeout-minutes: 40
       run: |
+        cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
         cargo build --bin finch-test-supervisor
         cargo build --release --bin finch-test-supervisor
         install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned

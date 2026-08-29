@@ -92,6 +92,10 @@ fn canonical_directory(label: &str, path: &Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
+fn unsigned_identity(device: u64, inode: u64) -> String {
+    format!("{device}:{inode}")
+}
+
 fn resolve_real_store(home: &Path) -> anyhow::Result<PathBuf> {
     let finch = home.join(".finch");
     if let Ok(metadata) = fs::symlink_metadata(&finch) {
@@ -358,8 +362,11 @@ fn create_proof(
     let ipc_listener_stat = nix::sys::stat::fstat(ipc_listener.as_raw_fd())?;
     writeln!(
         contents,
-        "{}:{}",
-        ipc_listener_stat.st_dev, ipc_listener_stat.st_ino
+        "{}",
+        unsigned_identity(
+            ipc_listener_stat.st_dev as u64,
+            ipc_listener_stat.st_ino as u64,
+        )
     )?;
     writeln!(contents, "{}", std::process::id())?;
     let supervisor_executable = std::env::current_exe()?.canonicalize()?;
@@ -1124,5 +1131,17 @@ fn main() {
             eprintln!("Brain test supervisor: {error:#}");
             std::process::exit(70);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signed_device_bits_serialize_as_parseable_u64_identity() {
+        let signed_device = -1_i32;
+        let encoded = super::unsigned_identity(signed_device as u64, 42);
+        let (device, inode) = encoded.split_once(':').unwrap();
+        assert_eq!(device.parse::<u64>().unwrap(), signed_device as u64);
+        assert_eq!(inode.parse::<u64>().unwrap(), 42);
     }
 }
