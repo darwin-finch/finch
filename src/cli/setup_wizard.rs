@@ -1756,6 +1756,7 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
     let Some(AddProviderStep::ConfigureRemote {
         provider_idx,
         name,
+        model,
         api_key,
         editing_idx,
         ..
