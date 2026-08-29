@@ -39,7 +39,7 @@ impl OAuthCredentialStore for MemoryStore {
 
 struct FakeReply {
     status: StatusCode,
-    body: Value,
+    body: String,
     delay: Duration,
 }
 
@@ -86,8 +86,22 @@ impl FakeServer {
             .or_default()
             .push_back(FakeReply {
                 status,
-                body,
+                body: body.to_string(),
                 delay,
+            });
+    }
+
+    fn push_raw(&self, path: &str, status: StatusCode, body: String) {
+        self.state
+            .replies
+            .lock()
+            .unwrap()
+            .entry(path.into())
+            .or_default()
+            .push_back(FakeReply {
+                status,
+                body,
+                delay: Duration::ZERO,
             });
     }
 
@@ -140,14 +154,14 @@ async fn fake_handler(State(state): State<Arc<FakeState>>, request: Request) -> 
         .and_then(VecDeque::pop_front)
         .unwrap_or(FakeReply {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: json!({"error": "unexpected_request"}),
+            body: json!({"error": "unexpected_request"}).to_string(),
             delay: Duration::ZERO,
         });
     tokio::time::sleep(reply.delay).await;
     Response::builder()
         .status(reply.status.as_u16())
         .header("content-type", "application/json")
-        .body(Body::from(reply.body.to_string()))
+        .body(Body::from(reply.body))
         .unwrap()
 }
 
@@ -392,6 +406,64 @@ async fn two_synthetic_dialects_share_device_core_without_provider_hard_coding()
         assert_eq!(credential.scopes, client.dialect.descriptor.scopes);
         assert_eq!(server.request_count(&format!("/{prefix}/poll")), 3);
         assert_eq!(store.0.lock().unwrap().len(), 1);
+        assert!(client
+            .finish_device_authorization("chatgpt:shared", &pending, CancellationToken::new())
+            .await
+            .is_err());
+        assert_eq!(server.request_count(&format!("/{prefix}/poll")), 3);
+    }
+}
+
+#[tokio::test]
+async fn both_synthetic_dialects_share_refresh_and_revoke_lifecycle_without_fallback() {
+    for prefix in ["alpha", "beta"] {
+        let server = FakeServer::start().await;
+        let dialect = Arc::new(SyntheticDialect::new(&server.origin, prefix));
+        let store = Arc::new(MemoryStore::default());
+        let record = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                token_body(prefix, "account-one", "refresh-one"),
+                None,
+                &TokenValidationContext::Device,
+            )
+            .unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .insert("chatgpt:account".into(), record);
+        server.push(
+            &format!("/{prefix}/token"),
+            StatusCode::OK,
+            token_body(prefix, "account-one", "refresh-two"),
+        );
+        server.push(&format!("/{prefix}/revoke"), StatusCode::OK, json!({}));
+        let client = OAuthClient::new(dialect, store.clone()).unwrap();
+        client.refresh("chatgpt:account").await.unwrap();
+        client.revoke("chatgpt:account").await.unwrap();
+        assert_eq!(server.request_count(&format!("/{prefix}/token")), 1);
+        assert_eq!(server.request_count(&format!("/{prefix}/revoke")), 1);
+        assert!(store.0.lock().unwrap()["chatgpt:account"].revoked);
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_oversized_oauth_responses_fail_before_follow_on_activity() {
+    for body in [
+        "{malformed-json".to_string(),
+        json!({"padding": "x".repeat(MAX_AUTH_BODY_BYTES)}).to_string(),
+    ] {
+        let server = FakeServer::start().await;
+        server.push_raw("/alpha/device", StatusCode::OK, body);
+        let client = OAuthClient::new(
+            Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+            Arc::new(MemoryStore::default()),
+        )
+        .unwrap();
+        assert!(client.begin_device_authorization().await.is_err());
+        assert_eq!(server.request_count("/alpha/device"), 1);
+        assert_eq!(server.request_count("/alpha/poll"), 0);
     }
 }
 
