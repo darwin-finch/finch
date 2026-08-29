@@ -5959,7 +5959,8 @@ impl BrainStore {
         self.with_effect_audit_storage_mut(name, brain_id, |storage| {
             storage.active.fail_next_batch_before_commit_for_test();
             Ok(())
-        })
+        })?;
+        Ok(())
     }
 
     #[cfg(test)]
