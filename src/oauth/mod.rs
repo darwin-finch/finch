@@ -501,11 +501,7 @@ where
     ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
         validate_device_authorization(pending, self.dialect.descriptor())?;
-        if self.store.load(reference)?.is_some() {
-            bail!(
-                "named OAuth credential already exists; replacement requires explicit confirmation"
-            );
-        }
+        let replacement_generation = self.reauthentication_generation(reference)?;
         let deadline = tokio::time::Instant::now() + pending.expires_in;
         let mut interval = bounded_poll_interval(pending.interval);
         loop {
@@ -547,7 +543,8 @@ where
                 }
             };
             self.validate_record(&tokens, None)?;
-            self.store.compare_and_swap(reference, None, &tokens)?;
+            self.store
+                .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
             return Ok(tokens.provider_credential(reference));
         }
     }
@@ -613,11 +610,7 @@ where
         if Utc::now() >= pending.expires_at {
             bail!("OAuth browser authorization expired");
         }
-        if self.store.load(reference)?.is_some() {
-            bail!(
-                "named OAuth credential already exists; replacement requires explicit confirmation"
-            );
-        }
+        let replacement_generation = self.reauthentication_generation(reference)?;
         let callback = Url::parse(callback_url).context("OAuth callback URL is invalid")?;
         let expected = Url::parse(&pending.redirect_uri)?;
         if callback.scheme() != expected.scheme()
@@ -661,7 +654,8 @@ where
             },
         )?;
         self.validate_record(&tokens, None)?;
-        self.store.compare_and_swap(reference, None, &tokens)?;
+        self.store
+            .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
         Ok(tokens.provider_credential(reference))
     }
 
@@ -675,7 +669,7 @@ where
         if current.mutation_pending {
             bail!("OAuth credential has an interrupted mutation; run credential recovery to tombstone it, then re-authenticate");
         }
-        self.validate_record(&current, None)?;
+        self.validate_refreshable_record(&current)?;
         let refresh = current
             .refresh_token
             .as_deref()
@@ -707,12 +701,17 @@ where
             .store
             .load(reference)?
             .context("named OAuth credential is missing")?;
-        self.validate_record_binding(&current)?;
+        self.validate_mutable_record(&current)?;
         let token = current
             .refresh_token
             .as_deref()
             .unwrap_or(&current.access_token);
         let request = self.dialect.revoke_request(token)?;
+        let mut marker = current.clone();
+        marker.generation = random_secret(24);
+        marker.mutation_pending = true;
+        self.store
+            .compare_and_swap(reference, Some(&current.generation), &marker)?;
         let (status, _) = self.post_form(request).await?;
         if !status.is_success() {
             bail!("OAuth provider rejected credential revocation");
@@ -725,7 +724,7 @@ where
         tombstone.revoked = true;
         tombstone.mutation_pending = false;
         self.store
-            .compare_and_swap(reference, Some(&current.generation), &tombstone)?;
+            .compare_and_swap(reference, Some(&marker.generation), &tombstone)?;
         Ok(tombstone.provider_credential(reference))
     }
 
@@ -781,6 +780,38 @@ where
             }
         }
         Ok(())
+    }
+
+    fn validate_refreshable_record(&self, record: &OAuthTokenRecord) -> Result<()> {
+        self.validate_mutable_record(record)?;
+        if record.refresh_token.as_deref().is_none_or(str::is_empty) {
+            bail!("OAuth credential cannot be refreshed");
+        }
+        Ok(())
+    }
+
+    fn validate_mutable_record(&self, record: &OAuthTokenRecord) -> Result<()> {
+        self.validate_record_binding(record)?;
+        if record.account.trim().is_empty()
+            || record.access_token.trim().is_empty()
+            || record.generation.trim().is_empty()
+            || record.revoked
+            || record.mutation_pending
+        {
+            bail!("OAuth token lifecycle or account binding is unusable");
+        }
+        Ok(())
+    }
+
+    fn reauthentication_generation(&self, reference: &str) -> Result<Option<String>> {
+        let Some(record) = self.store.load(reference)? else {
+            return Ok(None);
+        };
+        self.validate_record_binding(&record)?;
+        if !record.revoked || record.mutation_pending || record.generation.trim().is_empty() {
+            bail!("named OAuth credential already exists; revoke it before explicit re-authentication");
+        }
+        Ok(Some(record.generation.clone()))
     }
 
     fn validate_record_binding(&self, record: &OAuthTokenRecord) -> Result<()> {

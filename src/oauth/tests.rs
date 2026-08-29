@@ -591,6 +591,78 @@ async fn refresh_rotation_is_generation_checked_and_interruption_has_tombstone_r
     assert!(stored.revoked && stored.access_token.is_empty() && stored.refresh_token.is_none());
 }
 
+#[tokio::test]
+async fn expired_refresh_revoke_crash_and_same_name_reauthentication_are_durable() {
+    let server = FakeServer::start().await;
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    let store = Arc::new(MemoryStore::default());
+    let mut expired = dialect
+        .validate_tokens(
+            StatusCode::OK,
+            token_body("alpha", "account-one", "refresh-one"),
+            None,
+            &TokenValidationContext::Device,
+        )
+        .unwrap();
+    expired.expires_at = Utc::now() - TimeDelta::minutes(1);
+    store
+        .0
+        .lock()
+        .unwrap()
+        .insert("chatgpt:work".into(), expired);
+    server.push(
+        "/alpha/token",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "refresh-two"),
+    );
+    let client = OAuthClient::new(dialect.clone(), store.clone()).unwrap();
+    client.refresh("chatgpt:work").await.unwrap();
+    assert_eq!(server.request_count("/alpha/token"), 1);
+
+    server.push_delayed(
+        "/alpha/revoke",
+        StatusCode::OK,
+        json!({}),
+        Duration::from_millis(100),
+    );
+    let timed = OAuthClient::new(dialect.clone(), store.clone())
+        .unwrap()
+        .with_timeout(Duration::from_millis(10));
+    assert!(timed.revoke("chatgpt:work").await.is_err());
+    assert!(store.0.lock().unwrap()["chatgpt:work"].mutation_pending);
+    timed
+        .recover_interrupted_as_revoked("chatgpt:work")
+        .unwrap();
+    assert!(store.0.lock().unwrap()["chatgpt:work"].revoked);
+
+    server.push(
+        "/alpha/poll",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "refresh-three"),
+    );
+    let pending = DeviceAuthorization {
+        device_code: "device-secret".into(),
+        user_code: "ABCD-EFGH".into(),
+        verification_uri: "https://login.example/alpha/verify".into(),
+        verification_uri_complete: None,
+        expires_in: Duration::from_secs(2),
+        interval: Duration::ZERO,
+    };
+    client
+        .finish_device_authorization("chatgpt:work", &pending, CancellationToken::new())
+        .await
+        .unwrap();
+    let replacement = &store.0.lock().unwrap()["chatgpt:work"];
+    assert!(!replacement.revoked && !replacement.mutation_pending);
+    assert_eq!(replacement.refresh_token.as_deref(), Some("refresh-three"));
+
+    server.push("/alpha/revoke", StatusCode::OK, json!({}));
+    client.revoke("chatgpt:work").await.unwrap();
+    let tombstone = &store.0.lock().unwrap()["chatgpt:work"];
+    assert!(tombstone.revoked && !tombstone.mutation_pending);
+    assert!(tombstone.access_token.is_empty() && tombstone.refresh_token.is_none());
+}
+
 #[test]
 fn debug_and_errors_redact_transient_and_persisted_secrets() {
     let pending = DeviceAuthorization {
