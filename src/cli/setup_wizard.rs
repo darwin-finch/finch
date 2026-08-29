@@ -22,13 +22,13 @@ enum AddProviderStep {
     SelectAddType {
         selected: usize,
     },
-    // Cloud AI path — single dialog (provider, model, api key on one screen)
+    // Cloud AI path — provider-specific authentication input on one screen.
     ConfigureRemote {
         provider_idx: usize,        // index into CLOUD_PROVIDERS
         name: String,               // stable public name used by /model and API clients
         model: String,              // editable model name
-        api_key: String,            // editable API key
-        focused_field: usize,       // 0=Provider, 1=Name, 2=Model, 3=APIKey
+        api_key: Option<String>,    // absent for device-auth subscription providers
+        focused_field: usize,       // 0=Provider, 1=Name, 2=Model, 3=APIKey when present
         editing_idx: Option<usize>, // 0=primary, n=tool model index + 1
     },
     // Local model path — single dialog (backend, family, size, device on one screen)
@@ -84,6 +84,10 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "get key at console.groq.com",
     ),
 ];
+
+fn remote_api_key_input(provider: &str) -> Option<String> {
+    (!provider.eq_ignore_ascii_case("chatgpt")).then(String::new)
+}
 
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::compatibility;
@@ -494,6 +498,10 @@ impl ModelConfig {
             Self::Local { enabled, .. } => *enabled = value,
             Self::Remote { enabled, .. } => *enabled = value,
         }
+    }
+
+    fn accepts_api_key(&self) -> bool {
+        matches!(self, Self::Remote { provider, .. } if !provider.eq_ignore_ascii_case("chatgpt"))
     }
 
     #[allow(dead_code)]
@@ -1652,7 +1660,12 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         }
     });
     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-    let Some(current_profile) = model_catalog_profile(provider_id, name, api_key, persisted) else {
+    let Some(current_profile) = model_catalog_profile(
+        provider_id,
+        name,
+        api_key.as_deref().unwrap_or(""),
+        persisted,
+    ) else {
         return;
     };
     if generation != *catalog_generation
@@ -2016,8 +2029,13 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             *focused_field += 1;
                         }
                     }
-                    Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
-                        if *focused_field < 3 {
+                    Some(AddProviderStep::ConfigureRemote {
+                        api_key,
+                        focused_field,
+                        ..
+                    }) => {
+                        let last_field = if api_key.is_some() { 3 } else { 2 };
+                        if *focused_field < last_field {
                             *focused_field += 1;
                         }
                     }
@@ -2082,6 +2100,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
                             model,
+                            api_key,
                             focused_field,
                             ..
                         }) => {
@@ -2090,6 +2109,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     let new_idx = (*provider_idx + CLOUD_PROVIDERS.len() - 1)
                                         % CLOUD_PROVIDERS.len();
                                     *provider_idx = new_idx;
+                                    *api_key = remote_api_key_input(CLOUD_PROVIDERS[new_idx].0);
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
@@ -2174,6 +2194,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
                             model,
+                            api_key,
                             focused_field,
                             ..
                         }) => {
@@ -2181,6 +2202,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 0 => {
                                     let new_idx = (*provider_idx + 1) % CLOUD_PROVIDERS.len();
                                     *provider_idx = new_idx;
+                                    *api_key = remote_api_key_input(CLOUD_PROVIDERS[new_idx].0);
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
@@ -2240,9 +2262,12 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     });
                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-                    let Some(profile) =
-                        model_catalog_profile(provider_id, name, api_key, persisted)
-                    else {
+                    let Some(profile) = model_catalog_profile(
+                        provider_id,
+                        name,
+                        api_key.as_deref().unwrap_or(""),
+                        persisted,
+                    ) else {
                         *catalog_error = Some(format!(
                             "{} does not advertise model discovery; enter a model ID manually",
                             CLOUD_PROVIDERS[*provider_idx].1
@@ -2252,7 +2277,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     let selected_entry = provider_entry_from_remote_model(
                         provider_id,
                         name,
-                        api_key,
+                        api_key.as_deref().unwrap_or(""),
                         model,
                         persisted,
                     );
@@ -2360,9 +2385,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 *catalog_model_provenance = ModelSelectionProvenance::Manual;
                             }
                             3 => {
-                                api_key.push(c);
-                                *catalog_generation = catalog_generation.wrapping_add(1);
-                                *catalog_refresh = None;
+                                if let Some(api_key) = api_key.as_mut() {
+                                    api_key.push(c);
+                                    *catalog_generation = catalog_generation.wrapping_add(1);
+                                    *catalog_refresh = None;
+                                }
                             }
                             _ => {}
                         }
@@ -2393,9 +2420,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 };
                             }
                             3 => {
-                                api_key.pop();
-                                *catalog_generation = catalog_generation.wrapping_add(1);
-                                *catalog_refresh = None;
+                                if let Some(api_key) = api_key.as_mut() {
+                                    api_key.pop();
+                                    *catalog_generation = catalog_generation.wrapping_add(1);
+                                    *catalog_refresh = None;
+                                }
                             }
                             _ => {}
                         }
@@ -2446,8 +2475,12 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     provider_idx: selected,
                                     name: CLOUD_PROVIDERS[selected].0.to_string(),
                                     model: default_model,
-                                    api_key: String::new(),
-                                    focused_field: 3, // Start on API key field
+                                    api_key: remote_api_key_input(CLOUD_PROVIDERS[selected].0),
+                                    focused_field: if CLOUD_PROVIDERS[selected].0 == "chatgpt" {
+                                        1
+                                    } else {
+                                        3
+                                    },
                                     editing_idx: None,
                                 })
                             } else if selected == n_cloud {
@@ -2536,7 +2569,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     } else {
                                         name.trim().to_string()
                                     },
-                                    api_key,
+                                    api_key: api_key.unwrap_or_default(),
                                     model: resolved_model,
                                     enabled: true,
                                     persisted,
@@ -2657,6 +2690,21 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
             }
         } else if *editing_mode {
             // In API key editing mode
+            let accepts_api_key = if *selected_idx == 0 {
+                primary_model.accepts_api_key()
+            } else {
+                tool_models
+                    .get(*selected_idx - 1)
+                    .is_some_and(ModelConfig::accepts_api_key)
+            };
+            if !accepts_api_key {
+                *editing_mode = false;
+                *error = Some(
+                    "ChatGPT subscription uses a named Finch device credential, not an API key"
+                        .into(),
+                );
+                return Ok(false);
+            }
             match key.code {
                 KeyCode::Char(c) => {
                     if *selected_idx == 0 {
@@ -2760,7 +2808,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             provider_idx,
                             name: name.clone(),
                             model: model.clone(),
-                            api_key: api_key.clone(),
+                            api_key: if provider.eq_ignore_ascii_case("chatgpt") {
+                                None
+                            } else {
+                                Some(api_key.clone())
+                            },
                             focused_field: 1,
                             editing_idx: Some(*selected_idx),
                         });
@@ -4114,11 +4166,25 @@ fn render_models_section(
 
     // Show helpful hint when no key is configured
     let has_key = match primary_model {
+        ModelConfig::Remote {
+            provider,
+            api_key,
+            persisted,
+            ..
+        } if provider.eq_ignore_ascii_case("chatgpt") => {
+            matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
+        }
         ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
         ModelConfig::Local { .. } => true,
     };
 
-    let description_text = if has_key {
+    let description_text = if matches!(
+        primary_model,
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt")
+    ) {
+        "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
+            .to_string()
+    } else if has_key {
         format!(
             "Primary provider configured. Press A to add more providers ({} total).",
             1 + tool_models.len()
@@ -4169,12 +4235,15 @@ fn render_models_section(
             )
         }
         ModelConfig::Remote {
+            provider,
             name,
             api_key,
             model,
             ..
         } => {
-            let key_display = if api_key.is_empty() {
+            let key_display = if provider.eq_ignore_ascii_case("chatgpt") {
+                "Named device credential".to_string()
+            } else if api_key.is_empty() {
                 "[Not configured]".to_string()
             } else {
                 format!(
@@ -4257,7 +4326,14 @@ fn render_models_section(
     f.render_widget(list, chunks[2]);
 
     // Input panel (chunks[3]): bordered text box when in editing mode, dim hint otherwise
-    if editing_mode {
+    let selected_accepts_api_key = if selected_idx == 0 {
+        primary_model.accepts_api_key()
+    } else {
+        tool_models
+            .get(selected_idx - 1)
+            .is_some_and(ModelConfig::accepts_api_key)
+    };
+    if editing_mode && selected_accepts_api_key {
         // Show current API key in a bordered box so the user sees what they're typing
         let current_key = if selected_idx == 0 {
             match primary_model {
@@ -4274,6 +4350,14 @@ fn render_models_section(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Edit API Key")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        f.render_widget(panel, chunks[3]);
+    } else if editing_mode {
+        let panel = Paragraph::new("Named Finch device credential; no API key input").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("ChatGPT authentication")
                 .border_style(Style::default().fg(Color::Yellow)),
         );
         f.render_widget(panel, chunks[3]);
@@ -4457,7 +4541,7 @@ fn render_add_provider_overlay(
                 *provider_idx,
                 name,
                 model,
-                api_key,
+                api_key.as_deref(),
                 *focused_field,
                 editing_idx.is_some(),
                 catalog_source,
@@ -4596,7 +4680,7 @@ fn render_configure_remote_overlay(
     provider_idx: usize,
     name: &str,
     model: &str,
-    api_key: &str,
+    api_key: Option<&str>,
     focused_field: usize,
     editing: bool,
     catalog_source: &CatalogSource,
@@ -4642,25 +4726,35 @@ fn render_configure_remote_overlay(
 
     let provider_value = format!("{} ({})", provider_name, provider_id);
     let model_display = if model.is_empty() { "(default)" } else { model };
-    let key_display = if api_key.is_empty() {
-        String::new()
-    } else {
-        let visible: String = api_key.chars().take(12).collect();
-        format!("{}…", visible)
-    };
-
     let mut lines = vec![
         Line::from(""),
         make_row("Provider", &provider_value, focused_field == 0, false),
         make_row("Name", name, focused_field == 1, true),
         make_row("Model", model_display, focused_field == 2, true),
-        make_row("API Key", &key_display, focused_field == 3, true),
+    ];
+    if let Some(api_key) = api_key {
+        let key_display = if api_key.is_empty() {
+            String::new()
+        } else {
+            let visible: String = api_key.chars().take(12).collect();
+            format!("{}…", visible)
+        };
+        lines.push(make_row("API Key", &key_display, focused_field == 3, true));
+    } else {
+        lines.push(make_row(
+            "Auth",
+            "Finch-native device sign-in after save",
+            false,
+            false,
+        ));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "─".repeat(area.width as usize),
             Style::default().fg(Color::DarkGray),
         )),
-    ];
+    ]);
 
     // Hint line
     lines.push(Line::from(Span::styled(
@@ -6554,7 +6648,7 @@ mod tests {
         };
         *editing_name = name.to_string();
         *editing_model = model.to_string();
-        *editing_key = api_key.to_string();
+        *editing_key = Some(api_key.to_string());
         handle_models_input(state, key(KeyCode::Enter)).unwrap();
     }
 
@@ -6597,7 +6691,7 @@ mod tests {
             provider_idx,
             name: "grok".to_string(),
             model: CLOUD_PROVIDERS[provider_idx].2.to_string(),
-            api_key: String::new(),
+            api_key: Some(String::new()),
             focused_field,
             editing_idx: None,
         }
@@ -6793,7 +6887,7 @@ mod tests {
             provider_idx: claude_idx,
             name: "claude-work".to_string(),
             model: String::new(),
-            api_key: "claude-key".to_string(),
+            api_key: Some("claude-key".to_string()),
             focused_field: 0,
             editing_idx: None,
         });
@@ -6822,7 +6916,7 @@ mod tests {
                 provider_idx: openai_idx,
                 name: "openai-work".to_string(),
                 model: String::new(),
-                api_key: "openai-key".to_string(),
+                api_key: Some("openai-key".to_string()),
                 focused_field: 0,
                 editing_idx: None,
             });
@@ -6857,7 +6951,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: String::new(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7001,6 +7095,124 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_configuration_has_no_api_key_input_buffer_or_render_path() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                provider_idx: 0,
+                api_key: None,
+                focused_field: 1,
+                ..
+            })
+        ));
+
+        handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+        handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                api_key: None,
+                focused_field: 2,
+                ..
+            })
+        ));
+
+        handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
+        handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
+        handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+        for character in "sk-platform-must-not-cross".chars() {
+            handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+            handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+            handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+            handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
+            handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
+            handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
+            handle_models_input(&mut state, key(KeyCode::Up)).unwrap();
+        }
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                api_key: Some(key),
+                ..
+            }) if key == "sk-platform-must-not-cross"
+        ));
+        handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
+        let step = get_step(&state).unwrap();
+        assert!(matches!(
+            step,
+            AddProviderStep::ConfigureRemote {
+                provider_idx: 0,
+                api_key: None,
+                ..
+            }
+        ));
+
+        let backend = TestBackend::new(180, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_add_provider_overlay(
+                    frame,
+                    frame.area(),
+                    CoreMlConfig::default(),
+                    step,
+                    &CatalogSource::StaticFallback,
+                    false,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+        let rendered = test_buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Finch-native device sign-in after save"));
+        assert!(!rendered.contains("API Key"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-platform-must-not-cross"),
+            "{rendered}"
+        );
+
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            get_primary(&state),
+            Some(ModelConfig::Remote {
+                provider,
+                api_key,
+                ..
+            }) if provider == "chatgpt" && api_key.is_empty()
+        ));
+        state.current_section = WizardSection::Models;
+        let rendered = render_wizard_text(&state);
+        assert!(rendered.contains("Named device credential"), "{rendered}");
+        assert!(!rendered.contains("Paste your API key"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-platform-must-not-cross"),
+            "{rendered}"
+        );
+
+        if let Some(SectionState::Models { editing_mode, .. }) =
+            state.sections.get_mut(&WizardSection::Models)
+        {
+            *editing_mode = true;
+        }
+        handle_models_input(&mut state, key(KeyCode::Char('x'))).unwrap();
+        assert!(matches!(
+            get_primary(&state),
+            Some(ModelConfig::Remote {
+                provider,
+                api_key,
+                ..
+            }) if provider == "chatgpt" && api_key.is_empty()
+        ));
+        let rendered = render_wizard_text(&state);
+        assert!(rendered.contains("not an API key"), "{rendered}");
+        assert!(!rendered.contains("Edit API Key"), "{rendered}");
+    }
+
+    #[test]
     fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
         use ratatui::backend::TestBackend;
 
@@ -7034,7 +7246,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: "gateway-preview-model".to_string(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         };
@@ -7084,7 +7296,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: String::new(),
-            api_key: "sk-openai-test-key".to_string(),
+            api_key: Some("sk-openai-test-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7195,7 +7407,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: manual_model.to_string(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7254,7 +7466,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: manual_model.to_string(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7345,7 +7557,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: String::new(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7379,7 +7591,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: String::new(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7417,7 +7629,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: String::new(),
-            api_key: "openai-key".to_string(),
+            api_key: Some("openai-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7455,7 +7667,7 @@ mod tests {
             provider_idx: claude_idx,
             name: "claude".to_string(),
             model: fallback,
-            api_key: "test-key".to_string(),
+            api_key: Some("test-key".to_string()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7846,7 +8058,7 @@ mod tests {
             provider_idx: openai_idx,
             name: "openai".to_string(),
             model: first_model,
-            api_key: String::new(),
+            api_key: Some(String::new()),
             focused_field: 2, // Model field
             editing_idx: None,
         });
@@ -7870,7 +8082,7 @@ mod tests {
             provider_idx: claude_idx,
             name: "claude".to_string(),
             model: first_model,
-            api_key: String::new(),
+            api_key: Some(String::new()),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7892,7 +8104,7 @@ mod tests {
         handle_models_input(&mut state, key(KeyCode::Char('s'))).unwrap();
         handle_models_input(&mut state, key(KeyCode::Char('k'))).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { api_key, .. }) = get_step(&state) {
-            assert_eq!(api_key.as_str(), "sk");
+            assert_eq!(api_key.as_deref(), Some("sk"));
         } else {
             panic!("expected ConfigureRemote");
         }
@@ -7921,13 +8133,13 @@ mod tests {
             provider_idx: grok_idx,
             name: "grok".to_string(),
             model: "grok-code-fast-1".to_string(),
-            api_key: "abc".to_string(),
+            api_key: Some("abc".to_string()),
             focused_field: 3,
             editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Backspace)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { api_key, .. }) = get_step(&state) {
-            assert_eq!(api_key.as_str(), "ab");
+            assert_eq!(api_key.as_deref(), Some("ab"));
         } else {
             panic!("expected ConfigureRemote");
         }
@@ -7963,7 +8175,7 @@ mod tests {
             provider_idx: grok_idx,
             name: "grok".to_string(),
             model: "grok-code-fast-1".to_string(),
-            api_key: "xai-test-key".to_string(),
+            api_key: Some("xai-test-key".to_string()),
             focused_field: 3,
             editing_idx: None,
         });
@@ -8001,7 +8213,7 @@ mod tests {
             provider_idx: gemini_idx,
             name: "gemini".to_string(),
             model: canonical_model.to_string(),
-            api_key: "gemini-test-key-that-is-long-enough-123456".to_string(),
+            api_key: Some("gemini-test-key-that-is-long-enough-123456".to_string()),
             focused_field: 3,
             editing_idx: None,
         });
@@ -8036,7 +8248,7 @@ mod tests {
             provider_idx: claude_idx,
             name: "claude".to_string(),
             model: String::new(),
-            api_key: "sk-ant-key".to_string(),
+            api_key: Some("sk-ant-key".to_string()),
             focused_field: 3,
             editing_idx: None,
         });
@@ -8698,6 +8910,7 @@ mod tests {
     struct DurableSetupAuthenticator {
         root: std::path::PathBuf,
         fail_reference: Option<String>,
+        invalid_final_reference: Option<String>,
         replace_before_compensation: Option<String>,
     }
 
@@ -8784,8 +8997,12 @@ mod tests {
             let replacement = Self::token_record(reference);
             let generation = replacement.generation.clone();
             store.compare_and_swap(reference, expected, &replacement)?;
+            let mut credential = replacement.provider_credential(reference);
+            if self.invalid_final_reference.as_deref() == Some(reference) {
+                credential.issuer = "wrong-issuer".into();
+            }
             Ok(crate::cli::chatgpt_auth::EnsuredChatGptCredential {
-                credential: replacement.provider_credential(reference),
+                credential,
                 compensation: Some(crate::cli::chatgpt_auth::ChatGptCompensationHandle::issued(
                     reference, generation,
                 )),
@@ -8919,12 +9136,26 @@ mod tests {
         let authenticator = FakeChatGptSetupAuthenticator::default();
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
+        let save_root = tempfile::tempdir().unwrap();
+        let save_path = save_root.path().join("config.toml");
+        std::fs::write(&save_path, "unchanged-config-sentinel").unwrap();
+        let error = prepare_chatgpt_setup_config(&result, &references, &authenticator, cancel)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            prepare_chatgpt_setup_config(&result, &references, &authenticator, cancel)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("cancelled")
+            error.contains("was cancelled; setup was not saved"),
+            "{error}"
+        );
+        assert!(
+            error.contains("ChatGPT setup login was cancelled"),
+            "{error}"
+        );
+        assert!(!error.contains("access_token"), "{error}");
+        assert!(!error.contains("refresh_token"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(save_path).unwrap(),
+            "unchanged-config-sentinel"
         );
         assert_eq!(
             authenticator.calls.lock().unwrap().as_slice(),
@@ -9051,6 +9282,7 @@ mod tests {
         let failing = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: Some("chatgpt:b".into()),
+            invalid_final_reference: None,
             replace_before_compensation: None,
         };
         assert!(prepare_chatgpt_setup_config(
@@ -9074,6 +9306,7 @@ mod tests {
         let resumed = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: None,
+            invalid_final_reference: None,
             replace_before_compensation: None,
         };
         let config = prepare_chatgpt_setup_config(
@@ -9112,6 +9345,7 @@ mod tests {
         let racing = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: Some("chatgpt:c".into()),
+            invalid_final_reference: None,
             replace_before_compensation: Some("chatgpt:b".into()),
         };
         let error = prepare_chatgpt_setup_config(
@@ -9130,6 +9364,59 @@ mod tests {
         let external = reopened.load("chatgpt:b").unwrap().unwrap();
         assert!(!external.revoked && !external.mutation_pending);
         assert_eq!(external.access_token, "external-replacement-sentinel");
+        let owned = reopened.load("chatgpt:a").unwrap().unwrap();
+        assert!(owned.revoked && !owned.mutation_pending);
+        assert!(owned.access_token.is_empty());
+        assert!(owned.refresh_token.is_none() && owned.id_token.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_final_validation_preserves_cause_and_compensates_every_owned_generation() {
+        use crate::oauth::OAuthCredentialStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("oauth");
+        let result = setup_result_with_profiles(vec![
+            chatgpt_setup_profile("chatgpt:a", "account-a", "gpt-5.6-sol"),
+            chatgpt_setup_profile("chatgpt:b", "account-b", "gpt-5.6-sol"),
+        ]);
+        let references =
+            std::collections::BTreeSet::from(["chatgpt:a".to_string(), "chatgpt:b".to_string()]);
+        let authenticator = DurableSetupAuthenticator {
+            root: root.clone(),
+            fail_reference: None,
+            invalid_final_reference: Some("chatgpt:b".into()),
+            replace_before_compensation: Some("chatgpt:b".into()),
+        };
+
+        let error = prepare_chatgpt_setup_config(
+            &result,
+            &references,
+            &authenticator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Signed ChatGPT credential does not match the setup provider graph"),
+            "{error}"
+        );
+        assert!(
+            error.contains("credential 'chatgpt:b' issuer mismatch"),
+            "{error}"
+        );
+        assert!(
+            error.contains("compensation conflicts for chatgpt:b"),
+            "{error}"
+        );
+        assert!(!error.contains("secret-access"), "{error}");
+        assert!(!error.contains("secret-refresh"), "{error}");
+
+        let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root);
+        let replaced = reopened.load("chatgpt:b").unwrap().unwrap();
+        assert!(!replaced.revoked && !replaced.mutation_pending);
+        assert_eq!(replaced.access_token, "external-replacement-sentinel");
         let owned = reopened.load("chatgpt:a").unwrap().unwrap();
         assert!(owned.revoked && !owned.mutation_pending);
         assert!(owned.access_token.is_empty());
