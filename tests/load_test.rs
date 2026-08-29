@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Load tests — simulates high-concurrency workloads targeting 100K+ users.
 //!
 //! Fast tests run with:  cargo test --test load_test
@@ -9,8 +11,10 @@ use axum::{
     routing::get,
     Router,
 };
-use finch::node::WorkTracker;
-use finch::server::{handle_node_info, handle_node_stats};
+use finch::node::{IsolatedNodeTestState, WorkTracker};
+use finch::server::{
+    handle_node_info_from_state_directory, handle_node_stats_from_state_directory,
+};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -21,19 +25,27 @@ use tower::ServiceExt;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn node_test_router() -> Router {
+fn node_test_router(state: &IsolatedNodeTestState) -> Router {
+    let info_state = state.clone();
+    let stats_state = state.clone();
     Router::new()
-        .route("/v1/node/info", get(handle_node_info))
-        .route("/v1/node/stats", get(handle_node_stats))
+        .route(
+            "/v1/node/info",
+            get(move || handle_node_info_from_state_directory(info_state.clone(), false)),
+        )
+        .route(
+            "/v1/node/stats",
+            get(move || handle_node_stats_from_state_directory(stats_state.clone())),
+        )
 }
 
-async fn oneshot_get(path: &str) -> axum::response::Response {
+async fn oneshot_get(state: &IsolatedNodeTestState, path: &str) -> axum::response::Response {
     let req = Request::builder()
         .method("GET")
         .uri(path)
         .body(Body::empty())
         .expect("failed to build request");
-    node_test_router()
+    node_test_router(state)
         .oneshot(req)
         .await
         .expect("oneshot failed")
@@ -52,16 +64,18 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 /// 1000 concurrent GET /v1/node/info requests must all return 200.
 #[tokio::test]
-#[ignore] // I/O-heavy: reads ~/.finch/node_id 1000 times
+#[ignore] // I/O-heavy: reads one disposable node identity 1000 times
 async fn test_node_info_throughput_1000_concurrent() {
     const CONCURRENCY: usize = 1000;
+    let state = IsolatedNodeTestState::new().expect("create disposable node load-test state");
     let success_count = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::with_capacity(CONCURRENCY);
     for _ in 0..CONCURRENCY {
         let sc = Arc::clone(&success_count);
+        let state = state.clone();
         handles.push(tokio::spawn(async move {
-            let resp = oneshot_get("/v1/node/info").await;
+            let resp = oneshot_get(&state, "/v1/node/info").await;
             if resp.status() == StatusCode::OK {
                 sc.fetch_add(1, Ordering::Relaxed);
             }
@@ -81,16 +95,18 @@ async fn test_node_info_throughput_1000_concurrent() {
 
 /// 500 concurrent GET /v1/node/stats requests — all 200 with valid JSON shape.
 #[tokio::test]
-#[ignore] // I/O-heavy: reads ~/.finch/work_stats.json 500 times
+#[ignore] // I/O-heavy: reads disposable work statistics 500 times
 async fn test_node_stats_throughput_500_concurrent() {
     const CONCURRENCY: usize = 500;
+    let state = IsolatedNodeTestState::new().expect("create disposable node load-test state");
     let success_count = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::with_capacity(CONCURRENCY);
     for _ in 0..CONCURRENCY {
         let sc = Arc::clone(&success_count);
+        let state = state.clone();
         handles.push(tokio::spawn(async move {
-            let resp = oneshot_get("/v1/node/stats").await;
+            let resp = oneshot_get(&state, "/v1/node/stats").await;
             if resp.status() == StatusCode::OK {
                 let json = body_json(resp).await;
                 assert!(

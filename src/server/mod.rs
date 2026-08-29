@@ -25,6 +25,10 @@ pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };
+#[cfg(unix)]
+pub use handlers::{
+    handle_node_info_from_state_directory, handle_node_stats_from_state_directory,
+};
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::*;

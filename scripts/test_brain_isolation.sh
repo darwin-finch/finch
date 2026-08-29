@@ -37,6 +37,7 @@ fake_home="$scratch/real-home"
 temp_parent="$scratch/temp-homes"
 mkdir -p "$fake_home/.finch/brains/existing" "$temp_parent"
 printf 'keep me\n' >"$fake_home/.finch/brains/existing/events.jsonl"
+printf 'keep node\n' >"$fake_home/.finch/node_id"
 
 run_isolated() {
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$supervisor" "$@"
@@ -406,6 +407,77 @@ else
   test "$?" -eq 70
 fi
 printf 'keep me\n' >"$fake_home/.finch/brains/existing/events.jsonl"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-manifest-guard
+node_diagnostic="$scratch/node-manifest-diagnostic"
+node_status=0
+FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
+  run_isolated bash -c 'printf changed >"$FINCH_REAL_NODE_ID"' \
+  2>"$node_diagnostic" || node_status=$?
+test "$node_status" -eq 70
+if rg -q 'real-home|node_id|keep node|FINCH_REAL_NODE_ID' "$node_diagnostic"; then
+  echo 'node identity manifest diagnostic disclosed protected details' >&2
+  exit 1
+fi
+printf 'keep node\n' >"$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=combined-brain-and-node-after-snapshots
+combined_diagnostic="$scratch/combined-after-diagnostic"
+combined_status=0
+FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
+FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR=1 \
+FINCH_TEST_REPORT_NODE_AFTER=1 \
+  run_isolated bash -c '
+    printf changed >"$FINCH_REAL_NODE_ID"
+  ' >/dev/null 2>"$combined_diagnostic" || combined_status=$?
+test "$combined_status" -eq 70
+grep -Fxq 'FINCH_TEST_NODE_AFTER_OBSERVED' "$combined_diagnostic"
+printf 'keep node\n' >"$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=legacy-node-after-marker-has-no-path-authority
+external_marker_sentinel="$scratch/external-marker-sentinel"
+printf 'keep external marker\n' >"$external_marker_sentinel"
+FINCH_TEST_NODE_AFTER_MARKER="$fake_home/.finch/node_id" run_isolated true
+test "$(cat "$fake_home/.finch/node_id")" = 'keep node'
+FINCH_TEST_NODE_AFTER_MARKER="$external_marker_sentinel" run_isolated true
+test "$(cat "$external_marker_sentinel")" = 'keep external marker'
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-ancestor-swap-rejected
+moved_real_home="$scratch/real-home-moved"
+ancestor_status=0
+FINCH_REAL_HOME_PATH="$fake_home" FINCH_MOVED_REAL_HOME="$moved_real_home" \
+  run_isolated bash -c '
+    mv "$FINCH_REAL_HOME_PATH" "$FINCH_MOVED_REAL_HOME"
+    mkdir -p "$FINCH_REAL_HOME_PATH/.finch/brains"
+    printf attacker >"$FINCH_REAL_HOME_PATH/.finch/node_id"
+  ' >/dev/null 2>&1 || ancestor_status=$?
+test "$ancestor_status" -eq 70
+test "$(cat "$moved_real_home/.finch/node_id")" = 'keep node'
+rm -rf -- "$fake_home"
+mv "$moved_real_home" "$fake_home"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-missing-stays-missing
+rm "$fake_home/.finch/node_id"
+run_isolated true
+test ! -e "$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-symlink-stays-unchanged
+printf 'symlink target\n' >"$scratch/node-id-target"
+ln -s "$scratch/node-id-target" "$fake_home/.finch/node_id"
+node_link_before="$(readlink "$fake_home/.finch/node_id")"
+node_target_before="$(shasum -a 256 "$scratch/node-id-target" | awk '{print $1}')"
+run_isolated true
+test -L "$fake_home/.finch/node_id"
+test "$(readlink "$fake_home/.finch/node_id")" = "$node_link_before"
+test "$(shasum -a 256 "$scratch/node-id-target" | awk '{print $1}')" = "$node_target_before"
+rm "$fake_home/.finch/node_id"
+printf 'keep node\n' >"$fake_home/.finch/node_id"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 # Manifest failures disclose only the parent-held digests, never path names or
