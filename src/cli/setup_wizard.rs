@@ -239,6 +239,59 @@ fn zai_named_setup_entries(
     Ok((credential, profile))
 }
 
+fn staged_zai_setup_entries(
+    profile_name: &str,
+    model: &str,
+    environment_variable: &str,
+    persisted: Option<&ProviderEntry>,
+    credentials: &[crate::config::ProviderCredential],
+) -> Result<(crate::config::ProviderCredential, ProviderEntry)> {
+    let (candidate, new_profile) =
+        zai_named_setup_entries(profile_name, model, environment_variable)?;
+    let Some(
+        persisted @ ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Zai,
+            credential,
+            ..
+        },
+    ) = persisted
+    else {
+        return Ok((candidate, new_profile));
+    };
+    let mut updated = credentials
+        .iter()
+        .find(|existing| existing.name == credential.credential_ref)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Z.ai profile references missing credential '{}'; repair the named credential before editing setup",
+                credential.credential_ref
+            )
+        })?;
+    if updated.provider != crate::config::CredentialProvider::Zai {
+        anyhow::bail!(
+            "Z.ai profile credential '{}' has the wrong provider type; repair the named credential before editing setup",
+            credential.credential_ref
+        );
+    }
+    updated.secret_ref = candidate.secret_ref;
+    let profile = provider_entry_from_remote_model("zai", profile_name, "", model, Some(persisted));
+    Ok((updated, profile))
+}
+
+fn catalog_selection_identity(
+    profile: &ModelCatalogProfile,
+    provider: &str,
+    model: &str,
+) -> String {
+    let base = model_catalog::profile_cache_identity(profile);
+    if provider == "zai" {
+        format!("{base}:{}:{model}", model.len())
+    } else {
+        base
+    }
+}
+
 fn model_catalog_profile(
     provider: &str,
     profile_id: &str,
@@ -859,15 +912,15 @@ fn provider_entry_from_remote_model(
 fn named_catalog_refresh_config(
     primary_model: &ModelConfig,
     tool_models: &[ModelConfig],
-    editing_idx: usize,
+    editing_idx: Option<usize>,
     selected_entry: &ProviderEntry,
     credentials: Vec<crate::config::ProviderCredential>,
 ) -> crate::config::Config {
-    let providers = std::iter::once(primary_model)
+    let mut providers: Vec<_> = std::iter::once(primary_model)
         .chain(tool_models.iter())
         .enumerate()
         .filter_map(|(index, configured)| {
-            if index == editing_idx {
+            if Some(index) == editing_idx {
                 return Some(selected_entry.clone());
             }
             match configured {
@@ -892,6 +945,9 @@ fn named_catalog_refresh_config(
             }
         })
         .collect();
+    if editing_idx.is_none() {
+        providers.push(selected_entry.clone());
+    }
     crate::config::Config::with_providers(providers).with_credentials(credentials)
 }
 
@@ -1793,7 +1849,7 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         return;
     };
     if generation != *catalog_generation
-        || selection_identity != model_catalog::profile_cache_identity(&current_profile)
+        || selection_identity != catalog_selection_identity(&current_profile, provider_id, model)
     {
         return;
     }
@@ -2387,12 +2443,22 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     });
                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
+                    let refresh_target = (*editing_idx).or_else(|| {
+                        (matches!(
+                            primary_model,
+                            ModelConfig::Remote { api_key, model, .. }
+                                if api_key.is_empty() && model.is_empty()
+                        ) && tool_models.is_empty())
+                        .then_some(0)
+                    });
                     let mut refresh_credentials = credentials.clone();
-                    let selected_entry = if provider_id == "zai" && persisted.is_none() {
-                        let (credential, entry) = match zai_named_setup_entries(
+                    let selected_entry = if provider_id == "zai" {
+                        let (credential, entry) = match staged_zai_setup_entries(
                             name,
                             model,
                             api_key.as_deref().unwrap_or_default(),
+                            persisted,
+                            &refresh_credentials,
                         ) {
                             Ok(entries) => entries,
                             Err(error) => {
@@ -2400,9 +2466,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 return Ok(false);
                             }
                         };
-                        if refresh_credentials
-                            .iter()
-                            .any(|existing| existing.name == credential.name)
+                        if persisted.is_none()
+                            && refresh_credentials
+                                .iter()
+                                .any(|existing| existing.name == credential.name)
                         {
                             *catalog_error = Some(format!(
                                 "credential '{}' already exists; choose a unique profile name",
@@ -2410,6 +2477,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             ));
                             return Ok(false);
                         }
+                        refresh_credentials.retain(|existing| existing.name != credential.name);
                         refresh_credentials.push(credential);
                         entry
                     } else {
@@ -2442,7 +2510,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             named_catalog_refresh_config(
                                 primary_model,
                                 tool_models,
-                                editing_idx.unwrap_or(0),
+                                refresh_target,
                                 &selected_entry,
                                 refresh_credentials,
                             )
@@ -2462,7 +2530,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     let result_for_thread = Arc::clone(&result);
                     *catalog_generation = catalog_generation.wrapping_add(1);
                     let generation = *catalog_generation;
-                    let selection_identity = model_catalog::profile_cache_identity(&profile);
+                    let selection_identity =
+                        catalog_selection_identity(&profile, provider_id, model);
                     std::thread::spawn(move || {
                         let refreshed = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -2539,6 +2608,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             2 => {
                                 model.push(c);
                                 *catalog_model_provenance = ModelSelectionProvenance::Manual;
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             3 => {
                                 if let Some(api_key) = api_key.as_mut() {
@@ -2574,6 +2645,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 } else {
                                     ModelSelectionProvenance::Manual
                                 };
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             3 => {
                                 if let Some(api_key) = api_key.as_mut() {
@@ -2723,16 +2796,19 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 } else {
                                     name.trim().to_string()
                                 };
-                                if provider_id == "zai" && persisted.is_none() {
-                                    match zai_named_setup_entries(
+                                if provider_id == "zai" {
+                                    match staged_zai_setup_entries(
                                         &configured_name,
                                         &resolved_model,
                                         api_key.as_deref().unwrap_or_default(),
+                                        persisted.as_ref(),
+                                        &credentials,
                                     ) {
                                         Ok((credential, profile)) => {
-                                            if credentials
-                                                .iter()
-                                                .any(|existing| existing.name == credential.name)
+                                            if persisted.is_none()
+                                                && credentials.iter().any(|existing| {
+                                                    existing.name == credential.name
+                                                })
                                             {
                                                 *catalog_error = Some(format!(
                                                     "credential '{}' already exists; choose a unique profile name",
@@ -2772,7 +2848,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     *selected_idx = index;
                                 } else if matches!(
                                     primary_model,
-                                    ModelConfig::Remote { api_key: ref k, .. } if k.is_empty()
+                                    ModelConfig::Remote {
+                                        api_key: ref k,
+                                        model: ref primary_model_id,
+                                        ..
+                                    } if k.is_empty() && primary_model_id.is_empty()
                                 ) && tool_models.is_empty()
                                 {
                                     *primary_model = edited;
@@ -2794,7 +2874,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }) => {
                             let replace_primary = matches!(
                                 primary_model,
-                                ModelConfig::Remote { api_key, .. } if api_key.is_empty()
+                                ModelConfig::Remote { api_key, model, .. }
+                                    if api_key.is_empty() && model.is_empty()
                             ) && tool_models.is_empty();
                             if replace_primary {
                                 *primary_model = ModelConfig::Local {
@@ -2844,6 +2925,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 _ => {}
             }
             if let Some(credential) = credential_to_store {
+                state
+                    .credentials
+                    .retain(|existing| existing.name != credential.name);
                 state.credentials.push(credential);
             }
             return Ok(false);
@@ -5919,7 +6003,21 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CredentialResolver, ResolvedCredential};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingCredentialResolver(AtomicUsize);
+
+    impl CredentialResolver for CountingCredentialResolver {
+        fn resolve(
+            &self,
+            _credential: &crate::config::ProviderCredential,
+        ) -> Result<ResolvedCredential> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("resolver must not run before complete-graph preflight")
+        }
+    }
 
     #[test]
     fn models_tab_describes_model_setup() {
@@ -7079,7 +7177,7 @@ mod tests {
         let config = named_catalog_refresh_config(
             &primary,
             &[sibling],
-            0,
+            Some(0),
             &selected,
             vec![credential.clone()],
         );
@@ -7089,7 +7187,8 @@ mod tests {
             .to_string()
             .contains("missing"));
 
-        let valid = named_catalog_refresh_config(&primary, &[], 0, &selected, vec![credential]);
+        let valid =
+            named_catalog_refresh_config(&primary, &[], Some(0), &selected, vec![credential]);
         valid.validate().unwrap();
         assert_eq!(valid.providers[0].profile_name(), "renamed");
     }
@@ -9159,6 +9258,127 @@ mod tests {
         assert!(!temporary.path().join("catalog").exists());
     }
 
+    #[tokio::test]
+    async fn zai_append_refresh_preflights_existing_graph_before_resolution_or_socket() {
+        use crate::config::{
+            AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+            CredentialProvider, EndpointFamily, ProviderCredential,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let hostile_origin = format!("http://{}", listener.local_addr().unwrap());
+        let existing_profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: "existing-platform".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: Default::default(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: Some(hostile_origin),
+            chat_path: None,
+            models_path: None,
+            name: Some("existing".into()),
+            reasoning_effort: None,
+        };
+        let existing_credential = ProviderCredential {
+            name: "existing-platform".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: Default::default(),
+            secret_ref: "test:must-not-resolve".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        };
+        let primary = ModelConfig::Remote {
+            provider: "openai".into(),
+            name: "existing".into(),
+            api_key: String::new(),
+            model: "gpt-5.6-sol".into(),
+            enabled: true,
+            persisted: Some(existing_profile),
+        };
+        let (zai_credential, zai_profile) =
+            zai_named_setup_entries("zai-added", "glm-5.3-flash", "ZAI_API_KEY").unwrap();
+        let config = named_catalog_refresh_config(
+            &primary,
+            &[],
+            None,
+            &zai_profile,
+            vec![existing_credential, zai_credential],
+        );
+        assert_eq!(config.providers.len(), 2);
+        let resolver = CountingCredentialResolver(AtomicUsize::new(0));
+        let cache = tempfile::tempdir().unwrap();
+
+        let error =
+            model_catalog::refresh_from_config(&config, "zai-added", &resolver, cache.path())
+                .await
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("authenticated endpoint origin mismatch"),
+            "{error:#}"
+        );
+        assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn zai_model_edit_cancels_inflight_catalog_result_before_it_can_apply() {
+        let zai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "zai")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: zai_idx,
+            name: "zai-stale".into(),
+            model: "glm-5.3-flash".into(),
+            api_key: Some("ZAI_API_KEY".into()),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        let (_, entry) =
+            zai_named_setup_entries("zai-stale", "glm-5.3-flash", "ZAI_API_KEY").unwrap();
+        let profile = model_catalog_profile("zai", "zai-stale", "", Some(&entry)).unwrap();
+        inject_catalog_refresh(
+            &mut state,
+            &profile,
+            discovered_catalog(&profile, &["stale-model"]),
+            None,
+        );
+        let generation_before = match state.sections.get(&WizardSection::Models) {
+            Some(SectionState::Models {
+                catalog_generation, ..
+            }) => *catalog_generation,
+            _ => unreachable!(),
+        };
+
+        handle_models_input(&mut state, key(KeyCode::Char('x'))).unwrap();
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_refresh: None,
+                catalog_generation,
+                catalog_models,
+                ..
+            }) if *catalog_generation > generation_before
+                && !catalog_models.iter().any(|model| model == "stale-model")
+        ));
+    }
+
     #[test]
     fn zai_save_reopen_and_edit_preserve_environment_reference_only_ui() {
         let temporary = tempfile::tempdir().unwrap();
@@ -9205,7 +9425,71 @@ mod tests {
         assert!(overlay.contains("ZAI_API_KEY"), "{overlay}");
         assert!(!overlay.contains("Edit API Key"), "{overlay}");
 
-        handle_models_input(&mut reopened, key(KeyCode::Esc)).unwrap();
+        if let Some(SectionState::Models {
+            adding_provider:
+                Some(AddProviderStep::ConfigureRemote {
+                    api_key,
+                    focused_field,
+                    ..
+                }),
+            ..
+        }) = reopened.sections.get_mut(&WizardSection::Models)
+        {
+            *api_key = Some("not-a-valid-environment".into());
+            *focused_field = 3;
+        }
+        handle_models_input(
+            &mut reopened,
+            modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_refresh: None,
+                catalog_error: Some(error),
+                ..
+            }) if error.contains("environment-variable name")
+        ));
+        if let Some(SectionState::Models {
+            adding_provider: Some(AddProviderStep::ConfigureRemote { api_key, .. }),
+            ..
+        }) = reopened.sections.get_mut(&WizardSection::Models)
+        {
+            *api_key = Some("FINCH_ZAI_REPLACED_KEY".into());
+        }
+        handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+        assert_eq!(reopened.credentials.len(), 1);
+        assert_eq!(
+            reopened.credentials[0].secret_ref,
+            "env:FINCH_ZAI_REPLACED_KEY"
+        );
+        assert!(reopened
+            .credentials
+            .iter()
+            .all(|credential| credential.secret_ref != "env:ZAI_API_KEY"));
+
+        let replaced = build_setup_result(&reopened).unwrap();
+        config_from_setup_result_with_paths(&replaced, temporary.path().join("metrics-2"), None)
+            .save_to(&config_path)
+            .unwrap();
+        let loaded_replacement = crate::config::load_config_from_path_with_paths(
+            &config_path,
+            temporary.path().join("metrics-3"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded_replacement.credentials().len(), 1);
+        assert_eq!(
+            loaded_replacement.credentials()[0].secret_ref,
+            "env:FINCH_ZAI_REPLACED_KEY"
+        );
+        let mut reopened = WizardState::new_with_catalog_cache_dir(Some(&loaded_replacement), None);
+        reopened.current_section = WizardSection::Models;
+        assert!(matches!(
+            get_primary(&reopened),
+            Some(ModelConfig::Remote { api_key, .. }) if api_key == "FINCH_ZAI_REPLACED_KEY"
+        ));
         if let Some(SectionState::Models { editing_mode, .. }) =
             reopened.sections.get_mut(&WizardSection::Models)
         {
@@ -9214,7 +9498,7 @@ mod tests {
         handle_models_input(&mut reopened, key(KeyCode::Char('s'))).unwrap();
         assert!(matches!(
             get_primary(&reopened),
-            Some(ModelConfig::Remote { api_key, .. }) if api_key == "ZAI_API_KEY"
+            Some(ModelConfig::Remote { api_key, .. }) if api_key == "FINCH_ZAI_REPLACED_KEY"
         ));
         let rejected = render_wizard_text(&reopened);
         assert!(
