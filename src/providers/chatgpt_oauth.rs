@@ -34,6 +34,7 @@ const OPENAI_AUTH_ORIGIN: &str = "https://auth.openai.com";
 const CHATGPT_SERVICE_ORIGIN: &str = "https://chatgpt.com";
 pub const CHATGPT_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
+const CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 /// Signature-verified provider claims. The adapter does not parse an
@@ -44,6 +45,10 @@ pub struct VerifiedOpenAiClaims {
     pub audiences: BTreeSet<String>,
     pub subject: String,
     pub account_id: String,
+    /// Verified `https://api.openai.com/auth.chatgpt_plan_type` entitlement.
+    pub chatgpt_plan_type: String,
+    /// Verified `https://api.openai.com/auth.chatgpt_account_is_fedramp` routing claim.
+    pub account_is_fedramp: bool,
     pub scopes: BTreeSet<String>,
     pub nonce: Option<String>,
 }
@@ -93,17 +98,25 @@ where
             protocol_revision: CHATGPT_OAUTH_PROTOCOL_REVISION.into(),
             provider: CredentialProvider::ChatgptSubscription,
             credential_kind: CredentialKind::OauthDevice,
+            browser_credential_kind: None,
             // This is #174's locally enforced provider issuer descriptor. The
             // signed token issuer is independently required below.
             issuer: "openai-chatgpt".into(),
             audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
             client_id: OPENAI_PUBLIC_CLIENT_ID.into(),
-            scopes: BTreeSet::from(["openid".into(), "offline_access".into()]),
+            scopes: BTreeSet::from([
+                "openid".into(),
+                "profile".into(),
+                "email".into(),
+                "offline_access".into(),
+                "api.connectors.read".into(),
+                "api.connectors.invoke".into(),
+            ]),
             device_authorization_endpoint: format!(
                 "{auth_origin}/api/accounts/deviceauth/usercode"
             ),
             device_token_endpoint: format!("{auth_origin}/api/accounts/deviceauth/token"),
-            authorization_endpoint: format!("{auth_origin}/authorize"),
+            authorization_endpoint: format!("{auth_origin}/oauth/authorize"),
             token_endpoint: format!("{auth_origin}/oauth/token"),
             revocation_endpoint: format!("{auth_origin}/oauth/revoke"),
             allowed_origins,
@@ -285,6 +298,7 @@ where
             || !claims.audiences.contains(&self.descriptor.client_id)
             || claims.subject.trim().is_empty()
             || claims.account_id.trim().is_empty()
+            || claims.chatgpt_plan_type.trim().is_empty()
             || !self.descriptor.scopes.is_subset(&claims.scopes)
         {
             bail!("ChatGPT token issuer, audience, account, or scope validation failed");
@@ -480,7 +494,16 @@ mod tests {
             audiences: BTreeSet::from([OPENAI_PUBLIC_CLIENT_ID.into()]),
             subject: "subject-work".into(),
             account_id: "acct-work".into(),
-            scopes: BTreeSet::from(["openid".into(), "offline_access".into()]),
+            chatgpt_plan_type: "plus".into(),
+            account_is_fedramp: false,
+            scopes: BTreeSet::from([
+                "openid".into(),
+                "profile".into(),
+                "email".into(),
+                "offline_access".into(),
+                "api.connectors.read".into(),
+                "api.connectors.invoke".into(),
+            ]),
             nonce: None,
         }
     }
@@ -497,7 +520,7 @@ mod tests {
             account: "acct-work".into(),
             tenant: None,
             project: None,
-            scopes: BTreeSet::from(["openid".into(), "offline_access".into()]),
+            scopes: claims().scopes,
             access_token: "subscription-bearer".into(),
             refresh_token: Some("subscription-refresh".into()),
             id_token: None,
@@ -566,6 +589,13 @@ mod tests {
             .descriptor()
             .allowed_origins
             .contains("https://api.openai.com"));
+        assert_eq!(
+            dialect.descriptor().authorization_endpoint,
+            "https://auth.openai.com/oauth/authorize"
+        );
+        assert!(dialect.descriptor().browser_credential_kind.is_none());
+        assert_eq!(dialect.descriptor().scopes.len(), 6);
+        assert_eq!(CHATGPT_AUTH_CLAIM_NAMESPACE, "https://api.openai.com/auth");
         let error = dialect
             .validate_tokens(
                 StatusCode::OK,

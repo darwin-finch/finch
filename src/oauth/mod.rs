@@ -43,6 +43,7 @@ pub struct OAuthDialectDescriptor {
     pub protocol_revision: String,
     pub provider: CredentialProvider,
     pub credential_kind: CredentialKind,
+    pub browser_credential_kind: Option<CredentialKind>,
     pub issuer: String,
     pub audience: AudienceBinding,
     pub client_id: String,
@@ -546,6 +547,9 @@ where
         lifetime: Duration,
     ) -> Result<PendingBrowserAuthorization> {
         let descriptor = self.dialect.descriptor();
+        if descriptor.browser_credential_kind.is_none() {
+            bail!("OAuth browser authorization is unsupported by this provider dialect revision");
+        }
         let mut url = validate_endpoint(&descriptor.authorization_endpoint, false)?;
         let redirect = Url::parse(redirect_uri).context("OAuth redirect URI is invalid")?;
         if redirect.scheme() != "http" || !redirect.host_str().is_some_and(is_loopback_host) {
@@ -742,7 +746,8 @@ where
         if record.dialect_id != descriptor.dialect_id
             || record.protocol_revision != descriptor.protocol_revision
             || record.provider != descriptor.provider
-            || record.kind != descriptor.credential_kind
+            || (record.kind != descriptor.credential_kind
+                && Some(record.kind) != descriptor.browser_credential_kind)
             || record.issuer != descriptor.issuer
             || record.audience != descriptor.audience
             || record.client_id != descriptor.client_id

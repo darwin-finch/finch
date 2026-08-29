@@ -21,6 +21,16 @@ strictly separate from the OpenAI Platform API-key provider:
   produce an actionable error; Finch must never relax issuer, audience,
   signature, nonce, account, scope, or origin checks to recover.
 
+The compatibility fixtures are pinned to OpenAI Codex commit
+`3e4707b34b16e139fcb7ad11ab8445993b62bba1`, specifically
+`codex-rs/login/src/device_code_auth.rs`, `codex-rs/login/src/server.rs`,
+`codex-rs/login/src/auth/default_client.rs`, and
+`codex-rs/login/src/token_data.rs`. That browser flow uses the Codex-only
+`codex_cli_rs` originator. Finch records the exact `/oauth/authorize` endpoint
+and six scopes from the source, but the ChatGPT adapter keeps browser PKCE
+disabled rather than impersonating that originator. The provider-neutral core
+and synthetic dialects still exercise browser PKCE, state, and nonce.
+
 ## Persistence and #174 binding
 
 The file store walks from a trusted filesystem root using descriptor-relative

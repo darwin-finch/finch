@@ -156,6 +156,7 @@ impl SyntheticDialect {
                 protocol_revision: format!("{prefix}-v1"),
                 provider: CredentialProvider::ChatgptSubscription,
                 credential_kind: CredentialKind::OauthDevice,
+                browser_credential_kind: Some(CredentialKind::OauthBrowserPkce),
                 issuer: "openai-chatgpt".into(),
                 audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
                 client_id: format!("{prefix}-client"),
@@ -288,7 +289,11 @@ impl OAuthDialect for SyntheticDialect {
             dialect_id: self.descriptor.dialect_id.clone(),
             protocol_revision: self.descriptor.protocol_revision.clone(),
             provider: self.descriptor.provider,
-            kind: self.descriptor.credential_kind,
+            kind: if matches!(context, TokenValidationContext::Browser { .. }) {
+                self.descriptor.browser_credential_kind.unwrap()
+            } else {
+                self.descriptor.credential_kind
+            },
             issuer: self.descriptor.issuer.clone(),
             audience: self.descriptor.audience.clone(),
             client_id: self.descriptor.client_id.clone(),
@@ -590,6 +595,18 @@ fn debug_and_errors_redact_transient_and_persisted_secrets() {
         redirect_uri: "http://127.0.0.1/callback".into(),
     };
     assert!(!format!("{context:?}").contains("nonce-secret"));
+}
+
+#[test]
+fn dialect_can_fail_closed_when_browser_public_client_contract_is_unsupported() {
+    let mut dialect = SyntheticDialect::new("http://127.0.0.1:12345", "alpha");
+    dialect.descriptor.browser_credential_kind = None;
+    let client = OAuthClient::new(Arc::new(dialect), Arc::new(MemoryStore::default())).unwrap();
+    let error = client
+        .begin_browser_authorization("http://127.0.0.1:12346/callback", Duration::from_secs(60))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsupported by this provider dialect revision"));
 }
 
 #[test]
