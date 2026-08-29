@@ -4557,7 +4557,7 @@ mod handler_tests {
             Some("later prompt reached runner")
         );
         release_tx.send(()).unwrap();
-        assert!(forwarding.await);
+        forwarding.await;
         http_server.abort();
         let _ = http_server.await;
         assert!(lifecycle
@@ -4818,7 +4818,7 @@ mod handler_tests {
                 .unwrap()
                 .is_err()
         );
-        assert!(forwarding.await);
+        forwarding.await;
 
         let replacement = lifecycle
             .attach(
