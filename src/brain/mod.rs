@@ -67,13 +67,20 @@ impl IsolatedTestProof {
     }
 }
 
-fn parse_identity(identity: &str) -> anyhow::Result<(u64, u64)> {
+fn parse_identity(label: &str, identity: &str) -> anyhow::Result<(u64, u64)> {
     use anyhow::Context as _;
 
     let (device, inode) = identity
         .split_once(':')
-        .context("wrapper proof has an invalid filesystem identity")?;
-    Ok((device.parse()?, inode.parse()?))
+        .with_context(|| format!("wrapper proof {label} identity has no separator"))?;
+    Ok((
+        device
+            .parse()
+            .with_context(|| format!("wrapper proof {label} device is not numeric"))?,
+        inode
+            .parse()
+            .with_context(|| format!("wrapper proof {label} inode is not numeric"))?,
+    ))
 }
 
 #[cfg(unix)]
@@ -729,7 +736,8 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
     let supervisor_pid: u32 = lines
         .next()
         .context("wrapper proof is missing its supervisor identity")?
-        .parse()?;
+        .parse()
+        .context("wrapper proof supervisor PID is not numeric")?;
     let supervisor_executable = std::path::PathBuf::from(
         lines
             .next()
@@ -786,7 +794,7 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
             112,
             12,
             &ipc_socket,
-            parse_identity(ipc_listener_identity)?,
+            parse_identity("IPC listener", ipc_listener_identity)?,
         )?;
     }
     anyhow::ensure!(
@@ -851,14 +859,14 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
     let proof = IsolatedTestProof {
         home,
         root,
-        home_identity: parse_identity(home_identity)?,
-        root_identity: parse_identity(root_identity)?,
+        home_identity: parse_identity("HOME", home_identity)?,
+        root_identity: parse_identity("Brain root", root_identity)?,
         brain_addr,
         daemon_addr,
         ipc_socket,
         socket_root,
-        socket_root_identity: parse_identity(socket_root_identity)?,
-        ipc_listener_identity: parse_identity(ipc_listener_identity)?,
+        socket_root_identity: parse_identity("socket root", socket_root_identity)?,
+        ipc_listener_identity: parse_identity("IPC listener", ipc_listener_identity)?,
         supervisor_pid,
         password_digest: password_digest.to_owned(),
     };
