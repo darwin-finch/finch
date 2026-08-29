@@ -1714,7 +1714,10 @@ mod isolation_tests {
             std::time::Duration::from_millis(100),
         )
         .expect_err("hostile proof-mode deadline probe escaped its wall-clock bound");
-        assert!(timeout_error.contains("timed out after"));
+        assert!(
+            timeout_error.contains("timed out after"),
+            "hostile deadline returned the wrong bounded-cleanup error: {timeout_error}"
+        );
         assert!(
             timeout_started.elapsed() < std::time::Duration::from_secs(3),
             "hostile proof-mode timeout and reap exceeded its bounded grace"
