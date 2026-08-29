@@ -58,6 +58,15 @@ struct FakeServer {
 impl FakeServer {
     async fn start() -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::from_listener(listener)
+    }
+
+    async fn start_ipv6() -> Self {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        Self::from_listener(listener)
+    }
+
+    fn from_listener(listener: tokio::net::TcpListener) -> Self {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(FakeState::default());
         let app = Router::new()
@@ -417,6 +426,23 @@ async fn two_synthetic_dialects_share_device_core_without_provider_hard_coding()
             .is_err());
         assert_eq!(server.request_count(&format!("/{prefix}/poll")), 3);
     }
+}
+
+#[tokio::test]
+async fn bracketed_ipv6_origin_validates_descriptor_and_outbound_endpoint_exactly_once() {
+    let server = FakeServer::start_ipv6().await;
+    server.push("/alpha/device", StatusCode::OK, device_body("alpha"));
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    dialect.descriptor().validate().unwrap();
+    assert_eq!(
+        origin(&Url::parse(&dialect.descriptor().device_authorization_endpoint).unwrap()).unwrap(),
+        server.origin
+    );
+    let client = OAuthClient::new(dialect, Arc::new(MemoryStore::default())).unwrap();
+    let pending = client.begin_device_authorization().await.unwrap();
+    assert_eq!(pending.user_code, "ABCD-EFGH");
+    assert_eq!(server.request_count("/alpha/device"), 1);
+    assert_eq!(server.request_count("/alpha/poll"), 0);
 }
 
 #[tokio::test]

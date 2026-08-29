@@ -1087,6 +1087,10 @@ fn is_loopback_host(host: &str) -> bool {
 
 fn origin(url: &Url) -> Result<String> {
     let host = url.host_str().context("OAuth endpoint has no host")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
