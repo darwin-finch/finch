@@ -579,7 +579,9 @@ impl ModelConfig {
     }
 
     fn accepts_api_key(&self) -> bool {
-        matches!(self, Self::Remote { provider, .. } if !provider.eq_ignore_ascii_case("chatgpt"))
+        matches!(self, Self::Remote { provider, .. }
+            if !provider.eq_ignore_ascii_case("chatgpt")
+                && !provider.eq_ignore_ascii_case("zai"))
     }
 
     #[allow(dead_code)]
@@ -614,10 +616,14 @@ impl ModelConfig {
 /// Convert a persisted provider profile into the wizard's editable model form.
 /// Local providers live only in the unified provider list, not the legacy
 /// `teachers` projection.
-fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
+fn model_config_from_provider(
+    provider: &ProviderEntry,
+    credentials: &[crate::config::ProviderCredential],
+) -> Option<ModelConfig> {
     match provider {
         ProviderEntry::Credentialed {
             provider: credential_provider,
+            credential,
             model,
             name,
             ..
@@ -637,7 +643,16 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
             name: name
                 .clone()
                 .unwrap_or_else(|| credential_provider.as_str().to_string()),
-            api_key: String::new(),
+            api_key: if *credential_provider == crate::config::CredentialProvider::Zai {
+                credentials
+                    .iter()
+                    .find(|metadata| metadata.name == credential.credential_ref)
+                    .and_then(|metadata| metadata.secret_ref.strip_prefix("env:"))
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                String::new()
+            },
             model: model.clone().unwrap_or_default(),
             enabled: true,
             persisted: Some(provider.clone()),
@@ -814,6 +829,23 @@ fn provider_entry_from_remote_model(
             name,
             reasoning_effort: None,
         },
+        _ if provider.eq_ignore_ascii_case("zai") => ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::Zai,
+            credential: crate::config::CredentialBinding {
+                credential_ref: format!("{}-credential", name.as_deref().unwrap_or("zai")),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name,
+            reasoning_effort: Some(crate::config::ReasoningEffort::Max),
+        },
         _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
             provider: provider.to_string(),
             api_key: api_key.to_string(),
@@ -921,7 +953,9 @@ impl WizardState {
                 config
                     .providers
                     .iter()
-                    .filter_map(model_config_from_provider)
+                    .filter_map(|provider| {
+                        model_config_from_provider(provider, config.credentials())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2346,11 +2380,49 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     });
                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
+                    let mut refresh_credentials = credentials.clone();
+                    let selected_entry = if provider_id == "zai" && persisted.is_none() {
+                        let (credential, entry) = match zai_named_setup_entries(
+                            name,
+                            model,
+                            api_key.as_deref().unwrap_or_default(),
+                        ) {
+                            Ok(entries) => entries,
+                            Err(error) => {
+                                *catalog_error = Some(error.to_string());
+                                return Ok(false);
+                            }
+                        };
+                        if refresh_credentials
+                            .iter()
+                            .any(|existing| existing.name == credential.name)
+                        {
+                            *catalog_error = Some(format!(
+                                "credential '{}' already exists; choose a unique profile name",
+                                credential.name
+                            ));
+                            return Ok(false);
+                        }
+                        refresh_credentials.push(credential);
+                        entry
+                    } else {
+                        provider_entry_from_remote_model(
+                            provider_id,
+                            name,
+                            api_key.as_deref().unwrap_or(""),
+                            model,
+                            persisted,
+                        )
+                    };
                     let Some(profile) = model_catalog_profile(
                         provider_id,
                         name,
-                        api_key.as_deref().unwrap_or(""),
-                        persisted,
+                        if provider_id == "zai" {
+                            ""
+                        } else {
+                            api_key.as_deref().unwrap_or("")
+                        },
+                        Some(&selected_entry),
                     ) else {
                         *catalog_error = Some(format!(
                             "{} does not advertise model discovery; enter a model ID manually",
@@ -2358,13 +2430,6 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         ));
                         return Ok(false);
                     };
-                    let selected_entry = provider_entry_from_remote_model(
-                        provider_id,
-                        name,
-                        api_key.as_deref().unwrap_or(""),
-                        model,
-                        persisted,
-                    );
                     let named_config = matches!(selected_entry, ProviderEntry::Credentialed { .. })
                         .then(|| {
                             named_catalog_refresh_config(
@@ -2372,7 +2437,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 tool_models,
                                 editing_idx.unwrap_or(0),
                                 &selected_entry,
-                                credentials.clone(),
+                                refresh_credentials,
                             )
                         });
                     let named_profile = selected_entry.profile_name();
@@ -2817,10 +2882,27 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
             };
             if !accepts_api_key {
                 *editing_mode = false;
-                *error = Some(
+                let provider = if *selected_idx == 0 {
+                    match primary_model {
+                        ModelConfig::Remote { provider, .. } => provider.as_str(),
+                        ModelConfig::Local { .. } => "local",
+                    }
+                } else {
+                    tool_models
+                        .get(*selected_idx - 1)
+                        .and_then(|model| match model {
+                            ModelConfig::Remote { provider, .. } => Some(provider.as_str()),
+                            ModelConfig::Local { .. } => None,
+                        })
+                        .unwrap_or("local")
+                };
+                *error = Some(if provider.eq_ignore_ascii_case("zai") {
+                    "Z.ai uses a named environment reference; edit the Key env field in the provider dialog, not an API key"
+                        .into()
+                } else {
                     "ChatGPT subscription uses a named Finch device credential, not an API key"
-                        .into(),
-                );
+                        .into()
+                });
                 return Ok(false);
             }
             match key.code {
@@ -4289,7 +4371,7 @@ fn render_models_section(
             api_key,
             persisted,
             ..
-        } if provider.eq_ignore_ascii_case("chatgpt") => {
+        } if provider.eq_ignore_ascii_case("chatgpt") || provider.eq_ignore_ascii_case("zai") => {
             matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
         }
         ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
@@ -4301,6 +4383,12 @@ fn render_models_section(
         ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("chatgpt")
     ) {
         "ChatGPT subscription uses a named Finch device credential; OpenAI Platform API keys are separate."
+            .to_string()
+    } else if matches!(
+        primary_model,
+        ModelConfig::Remote { provider, .. } if provider.eq_ignore_ascii_case("zai")
+    ) {
+        "Z.ai uses a named environment reference; secret values are never entered or stored in Finch configuration."
             .to_string()
     } else if has_key {
         format!(
@@ -4361,6 +4449,8 @@ fn render_models_section(
         } => {
             let key_display = if provider.eq_ignore_ascii_case("chatgpt") {
                 "Named device credential".to_string()
+            } else if provider.eq_ignore_ascii_case("zai") {
+                "Named environment credential".to_string()
             } else if api_key.is_empty() {
                 "[Not configured]".to_string()
             } else {
@@ -4472,10 +4562,35 @@ fn render_models_section(
         );
         f.render_widget(panel, chunks[3]);
     } else if editing_mode {
-        let panel = Paragraph::new("Named Finch device credential; no API key input").block(
+        let selected_provider = if selected_idx == 0 {
+            match primary_model {
+                ModelConfig::Remote { provider, .. } => provider.as_str(),
+                ModelConfig::Local { .. } => "local",
+            }
+        } else {
+            tool_models
+                .get(selected_idx - 1)
+                .and_then(|model| match model {
+                    ModelConfig::Remote { provider, .. } => Some(provider.as_str()),
+                    ModelConfig::Local { .. } => None,
+                })
+                .unwrap_or("local")
+        };
+        let (message, title) = if selected_provider.eq_ignore_ascii_case("zai") {
+            (
+                "Named environment reference; use the provider dialog to edit Key env",
+                "Z.ai authentication",
+            )
+        } else {
+            (
+                "Named Finch device credential; no API key input",
+                "ChatGPT authentication",
+            )
+        };
+        let panel = Paragraph::new(message).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("ChatGPT authentication")
+                .title(title)
                 .border_style(Style::default().fg(Color::Yellow)),
         );
         f.render_widget(panel, chunks[3]);
@@ -6951,8 +7066,8 @@ mod tests {
             name: Some(name.into()),
             reasoning_effort: None,
         };
-        let primary = model_config_from_provider(&named("old-name", "work")).unwrap();
-        let sibling = model_config_from_provider(&named("broken", "missing")).unwrap();
+        let primary = model_config_from_provider(&named("old-name", "work"), &[]).unwrap();
+        let sibling = model_config_from_provider(&named("broken", "missing"), &[]).unwrap();
         let selected = named("renamed", "work");
         let config = named_catalog_refresh_config(
             &primary,
@@ -8981,6 +9096,124 @@ mod tests {
         for invalid in ["", "zai-key", "sk-secret-value", "ZAI API KEY", "9ZAI_KEY"] {
             assert!(zai_named_setup_entries("zai", "glm-5.3-flash", invalid).is_err());
         }
+    }
+
+    #[test]
+    fn zai_first_refresh_uses_named_resolution_and_fails_before_http_when_env_is_missing() {
+        let missing = format!("FINCH_ZAI_MISSING_REFRESH_{}", std::process::id());
+        assert!(std::env::var_os(&missing).is_none());
+        let zai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "zai")
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: zai_idx,
+            name: "zai-refresh".into(),
+            model: "glm-5.3-flash".into(),
+            api_key: Some(missing),
+            focused_field: 3,
+            editing_idx: None,
+        });
+        state.catalog_cache_dir = Some(temporary.path().join("catalog"));
+
+        handle_models_input(
+            &mut state,
+            modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        for _ in 0..200 {
+            advance_catalog_refresh_if_done(&mut state);
+            let pending = matches!(
+                state.sections.get(&WizardSection::Models),
+                Some(SectionState::Models {
+                    catalog_refresh: Some(_),
+                    ..
+                })
+            );
+            if !pending {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let error = match state.sections.get(&WizardSection::Models) {
+            Some(SectionState::Models {
+                catalog_refresh: None,
+                catalog_error: Some(error),
+                ..
+            }) => error,
+            other => panic!("expected completed local credential rejection, got {other:?}"),
+        };
+        assert!(
+            error.contains("Failed to resolve named credential"),
+            "{error}"
+        );
+        assert!(!error.contains("Bearer"), "{error}");
+        assert!(!temporary.path().join("catalog").exists());
+    }
+
+    #[test]
+    fn zai_save_reopen_and_edit_preserve_environment_reference_only_ui() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_path = temporary.path().join("config.toml");
+        let metrics_dir = temporary.path().join("metrics");
+        let (credential, profile) =
+            zai_named_setup_entries("zai-work", "glm-5.3-flash", "ZAI_API_KEY").unwrap();
+        let initial =
+            crate::config::Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let state = WizardState::new_with_catalog_cache_dir(Some(&initial), None);
+        let result = build_setup_result(&state).unwrap();
+        config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+            .save_to(&config_path)
+            .unwrap();
+        let loaded =
+            crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None)
+                .unwrap();
+        let mut reopened = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
+        assert!(matches!(
+            get_primary(&reopened),
+            Some(ModelConfig::Remote {
+                provider,
+                api_key,
+                persisted: Some(ProviderEntry::Credentialed { .. }),
+                ..
+            }) if provider == "zai" && api_key == "ZAI_API_KEY"
+        ));
+        let main = render_wizard_text(&reopened);
+        assert!(main.contains("Named environment credential"), "{main}");
+        assert!(!main.contains("Paste your API key"), "{main}");
+        assert!(!main.contains("ZAI_API_KEY"), "{main}");
+
+        handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            get_step(&reopened),
+            Some(AddProviderStep::ConfigureRemote {
+                api_key: Some(environment),
+                ..
+            }) if environment == "ZAI_API_KEY"
+        ));
+        let overlay = render_wizard_text(&reopened);
+        assert!(overlay.contains("Key env"), "{overlay}");
+        assert!(overlay.contains("ZAI_API_KEY"), "{overlay}");
+        assert!(!overlay.contains("Edit API Key"), "{overlay}");
+
+        handle_models_input(&mut reopened, key(KeyCode::Esc)).unwrap();
+        if let Some(SectionState::Models { editing_mode, .. }) =
+            reopened.sections.get_mut(&WizardSection::Models)
+        {
+            *editing_mode = true;
+        }
+        handle_models_input(&mut reopened, key(KeyCode::Char('s'))).unwrap();
+        assert!(matches!(
+            get_primary(&reopened),
+            Some(ModelConfig::Remote { api_key, .. }) if api_key == "ZAI_API_KEY"
+        ));
+        let rejected = render_wizard_text(&reopened);
+        assert!(
+            rejected.contains("named environment reference"),
+            "{rejected}"
+        );
+        assert!(!rejected.contains("Edit API Key"), "{rejected}");
     }
 
     #[tokio::test]
