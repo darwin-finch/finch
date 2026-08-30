@@ -49,7 +49,7 @@ jobs:
       - name: Compile library and Finch binary tests
         run: cargo test --lib --bin finch --no-run
       - name: Refreshable credential lifecycle regression
-        run: cargo test --lib config::credential::tests::test_lifecycle_and_revocation -- --exact
+        run: cargo test --lib config::credential::tests::test_identity_scopes_and_lifecycle_rejections_are_field_specific -- --exact
       - name: Broken persisted setup is fail closed
         run: cargo test --lib config::loader::tests::test_setup_loader_distinguishes_absent_from_broken_existing_config -- --exact
       - name: Exact provider and credential graph survives setup
