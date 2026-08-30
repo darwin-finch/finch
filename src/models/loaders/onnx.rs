@@ -502,6 +502,25 @@ fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+const QWEN_2_5_1_5B_ONNX_REPOSITORY: &str = "onnx-community/Qwen2.5-1.5B-Instruct";
+
+#[cfg(target_os = "macos")]
+fn qwen_coreml_session_policy(config: &OnnxLoadConfig) -> Result<bool> {
+    if config.repo_id != QWEN_2_5_1_5B_ONNX_REPOSITORY {
+        return Ok(false);
+    }
+
+    match config.execution_providers.as_deref() {
+        None => Ok(true),
+        Some(providers) if providers.contains(&ConfigExecutionProvider::CoreML) => bail!(
+            "CoreML session creation is disabled for {} with ONNX Runtime 1.23.2 because it can terminate Finch with SIGSEGV; select the explicit CPU execution target until the native provider is verified safe",
+            config.repo_id
+        ),
+        Some(_) => Ok(false),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn commit_with_coreml_diagnostics<T, Start, Commit, Describe>(
     config: &OnnxLoadConfig,
     start_capture: Start,
@@ -588,6 +607,20 @@ impl OnnxLoader {
     fn create_session(&self, model_path: &Path, config: &OnnxLoadConfig) -> Result<Session> {
         info!("Creating ONNX session from: {:?}", model_path);
 
+        #[cfg(target_os = "macos")]
+        let force_cpu_for_auto = qwen_coreml_session_policy(config)?;
+
+        #[cfg(target_os = "macos")]
+        if force_cpu_for_auto {
+            warn!(
+                model_repository = %config.repo_id,
+                requested_execution_target = "Auto",
+                resolved_execution_target = "CPU",
+                onnx_runtime_version = "1.23.2",
+                "Avoiding a known-unsafe CoreML session boundary; local inference remains on the explicit CPU provider"
+            );
+        }
+
         // Build execution provider list
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -597,6 +630,13 @@ impl OnnxLoader {
             .map_err(|e| anyhow::anyhow!("{e}"))?; // Parallel ops within layer
 
         // Add execution providers based on config
+        #[cfg(target_os = "macos")]
+        let providers = if force_cpu_for_auto {
+            vec![ep::CPU::default().build()]
+        } else {
+            self.get_execution_providers(config)
+        };
+        #[cfg(not(target_os = "macos"))]
         let providers = self.get_execution_providers(config);
         if !providers.is_empty() {
             builder = builder
@@ -1400,6 +1440,45 @@ mod tests {
             assert_eq!(options.profile_compute_plan, enabled);
             assert_eq!(options.enable_subgraphs, !enabled);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_qwen_1_5b_auto_policy_resolves_to_cpu_before_native_session_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = OnnxLoadConfig::with_size(ModelSize::Medium, directory.path().into());
+
+        assert!(qwen_coreml_session_policy(&config).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_qwen_1_5b_explicit_cpu_policy_remains_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = OnnxLoadConfig::with_size(ModelSize::Medium, directory.path().into());
+        config.execution_providers = Some(vec![ExecutionProvider::CPU]);
+
+        assert!(!qwen_coreml_session_policy(&config).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_create_session_rejects_known_unsafe_qwen_coreml_before_reading_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = OnnxLoadConfig::with_size(ModelSize::Medium, directory.path().into());
+        config.execution_providers = Some(vec![ExecutionProvider::CoreML, ExecutionProvider::CPU]);
+        let missing_model = directory.path().join("model-does-not-exist.onnx");
+
+        let error = OnnxLoader::new(directory.path().into())
+            .create_session(&missing_model, &config)
+            .err()
+            .expect("known-unsafe CoreML policy should fail before session creation");
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("CoreML session creation is disabled"));
+        assert!(diagnostic.contains(QWEN_2_5_1_5B_ONNX_REPOSITORY));
+        assert!(diagnostic.contains("explicit CPU execution target"));
+        assert!(!diagnostic.contains("NoSuchFile"));
     }
 
     #[cfg(target_os = "macos")]
