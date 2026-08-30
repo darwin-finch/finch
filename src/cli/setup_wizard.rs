@@ -1724,61 +1724,56 @@ where
 }
 
 fn chatgpt_setup_failure_cause(error: &anyhow::Error) -> ChatGptSetupFailureCause {
-    for source in error.chain() {
-        if let Some(terminal) = source.downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>()
-        {
-            return match terminal {
-                crate::oauth::OAuthDeviceAuthorizationError::Cancelled => {
-                    ChatGptSetupFailureCause::Cancelled
-                }
-                crate::oauth::OAuthDeviceAuthorizationError::Expired => {
-                    ChatGptSetupFailureCause::Expired
-                }
-                crate::oauth::OAuthDeviceAuthorizationError::Denied => {
-                    ChatGptSetupFailureCause::Denied
-                }
-            };
-        }
-        if let Some(endpoint) =
-            source.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError>()
-        {
-            return match endpoint {
-                crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartDisabledOrUnsupported => {
-                    ChatGptSetupFailureCause::StartDisabledOrUnsupported
-                }
-                crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartRejected(_)
-                | crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::PollRejected(_) => {
-                    ChatGptSetupFailureCause::ProviderRejected
-                }
-            };
-        }
-        if let Some(stage) =
-            source.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>()
-        {
-            return match stage {
-                crate::providers::chatgpt_oauth::ChatGptAuthStageError::PollContract => {
-                    ChatGptSetupFailureCause::PollContract
-                }
-                crate::providers::chatgpt_oauth::ChatGptAuthStageError::TokenExchangeRejected(
-                    _,
-                ) => ChatGptSetupFailureCause::TokenExchangeRejected,
-                crate::providers::chatgpt_oauth::ChatGptAuthStageError::TokenExchangeContract => {
-                    ChatGptSetupFailureCause::TokenExchangeContract
-                }
-                crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification => {
-                    ChatGptSetupFailureCause::IdentityVerification
-                }
-                crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountBinding => {
-                    ChatGptSetupFailureCause::AccountBinding
-                }
-            };
-        }
-        if source
-            .downcast_ref::<crate::oauth::OAuthCredentialPersistenceError>()
-            .is_some()
-        {
-            return ChatGptSetupFailureCause::Persistence;
-        }
+    if let Some(terminal) = error.downcast_ref::<crate::oauth::OAuthDeviceAuthorizationError>() {
+        return match terminal {
+            crate::oauth::OAuthDeviceAuthorizationError::Cancelled => {
+                ChatGptSetupFailureCause::Cancelled
+            }
+            crate::oauth::OAuthDeviceAuthorizationError::Expired => {
+                ChatGptSetupFailureCause::Expired
+            }
+            crate::oauth::OAuthDeviceAuthorizationError::Denied => ChatGptSetupFailureCause::Denied,
+        };
+    }
+    if let Some(endpoint) =
+        error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError>()
+    {
+        return match endpoint {
+            crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartDisabledOrUnsupported => {
+                ChatGptSetupFailureCause::StartDisabledOrUnsupported
+            }
+            crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::StartRejected(_)
+            | crate::providers::chatgpt_oauth::ChatGptDeviceEndpointError::PollRejected(_) => {
+                ChatGptSetupFailureCause::ProviderRejected
+            }
+        };
+    }
+    if let Some(stage) =
+        error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>()
+    {
+        return match stage {
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::PollContract => {
+                ChatGptSetupFailureCause::PollContract
+            }
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::TokenExchangeRejected(_) => {
+                ChatGptSetupFailureCause::TokenExchangeRejected
+            }
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::TokenExchangeContract => {
+                ChatGptSetupFailureCause::TokenExchangeContract
+            }
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification => {
+                ChatGptSetupFailureCause::IdentityVerification
+            }
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountBinding => {
+                ChatGptSetupFailureCause::AccountBinding
+            }
+        };
+    }
+    if error
+        .downcast_ref::<crate::oauth::OAuthCredentialPersistenceError>()
+        .is_some()
+    {
+        return ChatGptSetupFailureCause::Persistence;
     }
     ChatGptSetupFailureCause::ProtocolOrOther
 }
@@ -9754,34 +9749,42 @@ mod tests {
     fn setup_post_browser_failures_are_stage_specific_and_secret_free() {
         use crate::providers::chatgpt_oauth::ChatGptAuthStageError;
 
+        fn wrapped_stage(stage: ChatGptAuthStageError) -> anyhow::Error {
+            Err::<(), _>(anyhow::anyhow!("redacted upstream failure"))
+                .context(stage)
+                .unwrap_err()
+        }
+
         for (error, expected, phrase) in [
             (
-                anyhow::Error::new(ChatGptAuthStageError::PollContract),
+                wrapped_stage(ChatGptAuthStageError::PollContract),
                 ChatGptSetupFailureCause::PollContract,
                 "completed device response",
             ),
             (
-                anyhow::Error::new(ChatGptAuthStageError::TokenExchangeRejected(401)),
+                wrapped_stage(ChatGptAuthStageError::TokenExchangeRejected(401)),
                 ChatGptSetupFailureCause::TokenExchangeRejected,
                 "authorization-code exchange",
             ),
             (
-                anyhow::Error::new(ChatGptAuthStageError::TokenExchangeContract),
+                wrapped_stage(ChatGptAuthStageError::TokenExchangeContract),
                 ChatGptSetupFailureCause::TokenExchangeContract,
                 "token response",
             ),
             (
-                anyhow::Error::new(ChatGptAuthStageError::IdentityVerification),
+                wrapped_stage(ChatGptAuthStageError::IdentityVerification),
                 ChatGptSetupFailureCause::IdentityVerification,
                 "signed identity",
             ),
             (
-                anyhow::Error::new(ChatGptAuthStageError::AccountBinding),
+                wrapped_stage(ChatGptAuthStageError::AccountBinding),
                 ChatGptSetupFailureCause::AccountBinding,
                 "signed account",
             ),
             (
-                anyhow::Error::new(crate::oauth::OAuthCredentialPersistenceError::Commit),
+                Err::<(), _>(anyhow::anyhow!("redacted persistence failure"))
+                    .context(crate::oauth::OAuthCredentialPersistenceError::Commit)
+                    .unwrap_err(),
                 ChatGptSetupFailureCause::Persistence,
                 "could not save",
             ),
