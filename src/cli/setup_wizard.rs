@@ -9198,10 +9198,11 @@ mod tests {
             self.active
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _active = ActiveCeremony(&self.active);
-            let mut calls = self.calls.lock().unwrap();
-            let identity = format!("authorization-{}", calls.len() + 1);
-            calls.push((reference.to_string(), identity));
-            drop(calls);
+            {
+                let mut calls = self.calls.lock().unwrap();
+                let identity = format!("authorization-{}", calls.len() + 1);
+                calls.push((reference.to_string(), identity));
+            }
             tokio::task::yield_now().await;
             match self.outcomes.lock().unwrap().pop_front().unwrap() {
                 ScriptedChatGptOutcome::Cancelled => {
