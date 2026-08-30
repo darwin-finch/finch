@@ -1,6 +1,12 @@
 name: Issue 202 ChatGPT Subscription Transport
 
 on:
+  push:
+    branches: [codex/issue-202-chatgpt-sol]
+    paths:
+      - "src/**"
+      - "schema/**"
+      - ".github/workflows/issue-202-chatgpt-transport.yml"
   workflow_dispatch: {}
 
 jobs:
