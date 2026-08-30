@@ -69,6 +69,8 @@ jobs:
       - name: Three-entry-point persistence regression
         run: cargo test --lib cli::setup_wizard::tests::test_context_lines_save_and_reopen_through_all_setup_invocations -- --exact
       - name: Runtime status-strip budget regression
-        run: cargo test --lib cli::repl_event::query_processor::tests::test_context_strip_uses_selected_budget_and_removes_stale_rows -- --exact
+        run: |
+          cargo test --lib cli::repl_event::query_processor::tests::test_context_strip_uses_selected_budget_and_removes_stale_rows -- --exact
+          cargo test --lib cli::repl_event::event_loop::tests::canonical_brain_context_replaces_semantic_rows_within_one_budget -- --exact
       - name: Configuration bounds regression
         run: cargo test --lib config::settings::tests::test_context_lines_validation_enforces_status_strip_range -- --exact

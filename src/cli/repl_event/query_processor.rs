@@ -647,6 +647,15 @@ fn apply_context_summary_lines(
     let visible_lines = &summary_lines[..summary_lines.len().min(depth)];
     let n = visible_lines.len();
 
+    // Semantic-session and named-Brain context are alternative projections of
+    // the same configured status-strip budget. Never leave the other family
+    // behind when switching between them.
+    for index in 0..8 {
+        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(
+            index,
+        ));
+    }
+
     // Format each line with an appropriate prefix:
     //   single line                → "   └─ now: <text>"
     //   first of multiple          → "📋 <text>"
@@ -1943,6 +1952,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         for budget in 1..=8 {
+            status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::BrainContextLine(0),
+                "stale named-Brain context",
+            );
             apply_context_summary_lines(&status_bar, &summary, budget);
             let visible = status_bar
                 .get_lines()
@@ -1958,6 +1971,10 @@ mod tests {
             assert!(visible
                 .iter()
                 .all(|line| !line.content.contains("summary-7")));
+            assert!(status_bar.get_lines().iter().all(|line| !matches!(
+                line.line_type,
+                crate::cli::status_bar::StatusLineType::BrainContextLine(_)
+            )));
         }
 
         apply_context_summary_lines(&status_bar, &summary, 1);

@@ -8153,6 +8153,12 @@ fn project_brain_context(
     depth: usize,
     local_machine: Option<&str>,
 ) {
+    // Named-Brain and semantic-session summaries are alternative projections
+    // of the same configured line budget. Attaching a Brain must not retain a
+    // second, duplicate semantic block underneath it.
+    for index in 0..8 {
+        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::ContextLine(index));
+    }
     let lines = projected_brain_context_lines(events, depth, local_machine);
     let count = lines.len();
     for (index, text) in lines.into_iter().enumerate() {
@@ -9344,6 +9350,45 @@ mod tests {
             .get_lines()
             .iter()
             .all(|line| !matches!(line.line_type, StatusLineType::BrainContextLine(_))));
+    }
+
+    #[test]
+    fn canonical_brain_context_replaces_semantic_rows_within_one_budget() {
+        use crate::brain::store::BrainEventKind;
+        use crate::cli::status_bar::{StatusBar, StatusLineType};
+
+        let status = StatusBar::new();
+        for index in 0..4 {
+            status.update_line(
+                StatusLineType::ContextLine(index),
+                format!("stale-semantic-{index}"),
+            );
+        }
+        let events = (0..6)
+            .map(|index| {
+                brain_event(
+                    index + 1,
+                    "alice",
+                    BrainEventKind::Prompt {
+                        text: format!("brain-{index}"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        super::project_brain_context(&status, &events, 4, None);
+
+        let lines = status.get_lines();
+        assert!(lines
+            .iter()
+            .all(|line| !matches!(line.line_type, StatusLineType::ContextLine(_))));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line.line_type, StatusLineType::BrainContextLine(_)))
+                .count(),
+            4
+        );
     }
 
     #[test]

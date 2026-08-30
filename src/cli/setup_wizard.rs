@@ -1400,6 +1400,17 @@ pub async fn validate_and_apply_for(
     invocation: SetupInvocation,
     result: &SetupResult,
 ) -> Result<SetupApplyOutcome> {
+    validate_and_apply_for_with_save(invocation, result, &|config| config.save()).await
+}
+
+async fn validate_and_apply_for_with_save<F>(
+    invocation: SetupInvocation,
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
     tracing::debug!(?invocation, "Starting shared setup commit ceremony");
     if result
         .providers
@@ -1411,7 +1422,11 @@ pub async fn validate_and_apply_for(
         );
     }
     if chatgpt_setup_references(result).is_empty() {
-        apply_and_save_for(invocation, result)?;
+        let config = config_from_setup_result_for(invocation, result);
+        save_config(&config)?;
+        if let Some(prompt) = result.custom_system_prompt.as_deref() {
+            crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
+        }
         return Ok(SetupApplyOutcome::Saved);
     }
     let service = crate::cli::chatgpt_auth::ChatGptAuthService::production()?;
@@ -1421,7 +1436,7 @@ pub async fn validate_and_apply_for(
     else {
         return Ok(SetupApplyOutcome::Cancelled);
     };
-    save_chatgpt_setup_config(&config, &compensations, &service, |config| config.save())?;
+    save_chatgpt_setup_config(&config, &compensations, &service, save_config)?;
     if let Some(prompt) = committed_result.custom_system_prompt.as_deref() {
         crate::config::Persona::save_system_prompt_override(
             &committed_result.default_persona,
@@ -1834,17 +1849,47 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
 
 /// Run the shared ceremony for automatic first-run setup.
 pub async fn validate_first_run_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
-    validate_and_apply_for(SetupInvocation::FirstRun, result).await
+    validate_first_run_and_apply_with_save(result, &|config| config.save()).await
+}
+
+async fn validate_first_run_and_apply_with_save<F>(
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
+    validate_and_apply_for_with_save(SetupInvocation::FirstRun, result, save_config).await
 }
 
 /// Run the shared ceremony for the explicit `finch setup` command.
 pub async fn validate_command_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
-    validate_and_apply_for(SetupInvocation::Command, result).await
+    validate_command_and_apply_with_save(result, &|config| config.save()).await
+}
+
+async fn validate_command_and_apply_with_save<F>(
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
+    validate_and_apply_for_with_save(SetupInvocation::Command, result, save_config).await
 }
 
 /// Run the shared ceremony for the in-session `/setup` command.
 pub async fn validate_repl_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
-    validate_and_apply_for(SetupInvocation::Repl, result).await
+    validate_repl_and_apply_with_save(result, &|config| config.save()).await
+}
+
+async fn validate_repl_and_apply_with_save<F>(
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
+    validate_and_apply_for_with_save(SetupInvocation::Repl, result, save_config).await
 }
 
 /// Convert wizard output into the complete configuration written to disk.
@@ -6338,8 +6383,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_context_lines_save_and_reopen_through_all_setup_invocations() {
+    #[tokio::test]
+    async fn test_context_lines_save_and_reopen_through_all_setup_invocations() {
         for invocation in [
             SetupInvocation::FirstRun,
             SetupInvocation::Command,
@@ -6354,11 +6399,27 @@ mod tests {
                 {
                     *memory_context_lines = selected;
                 }
-                let result = build_setup_result(&state).unwrap();
-                let config = config_from_setup_result_for(invocation, &result);
+                let mut result = build_setup_result(&state).unwrap();
+                // This regression targets the shared setup persistence boundary,
+                // not provider authentication or environment API-key discovery.
+                result.providers.clear();
+                result.credentials.clear();
                 let directory = tempfile::tempdir().unwrap();
                 let config_path = directory.path().join("config.toml");
-                config.save_to(&config_path).unwrap();
+                let save = |config: &crate::config::Config| config.save_to(&config_path);
+                let outcome = match invocation {
+                    SetupInvocation::FirstRun => {
+                        validate_first_run_and_apply_with_save(&result, &save).await
+                    }
+                    SetupInvocation::Command => {
+                        validate_command_and_apply_with_save(&result, &save).await
+                    }
+                    SetupInvocation::Repl => {
+                        validate_repl_and_apply_with_save(&result, &save).await
+                    }
+                }
+                .unwrap();
+                assert_eq!(outcome, SetupApplyOutcome::Saved);
                 let reopened_config = crate::config::load_config_from_path_with_paths(
                     &config_path,
                     directory.path().join("metrics"),
