@@ -456,6 +456,52 @@ impl ProviderBackend for ClaudeProvider {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_request_boundary_observes_only_complete_tool_pairs() {
+        use crate::claude::{ContentBlock, Message};
+        use crate::cli::conversation::ConversationHistory;
+
+        let provider = ClaudeProvider::new("test-key".to_string()).unwrap();
+        let query_id = uuid::Uuid::new_v4();
+        let mut history = ConversationHistory::new();
+        history.add_user_message("inspect".to_string());
+        let token = history
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call-A".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"path": "A"}),
+                    }],
+                },
+            )
+            .unwrap();
+
+        let staged = provider.to_message_request(&ProviderRequest::new(history.get_messages()));
+        assert_eq!(staged.messages.len(), 1);
+        assert!(staged.messages.iter().all(|message| message
+            .content
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::ToolUse { .. }))));
+
+        history
+            .record_tool_result(query_id, token, "call-A", &Ok("value".to_string()))
+            .unwrap();
+        history.commit_tool_round(query_id, token).unwrap();
+        let committed = provider.to_message_request(&ProviderRequest::new(history.get_messages()));
+        assert_eq!(committed.messages.len(), 3);
+        assert!(matches!(
+            committed.messages[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert!(matches!(
+            committed.messages[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn configured_claude_endpoint_and_auth_are_honored() {
         let mut server = mockito::Server::new_async().await;
