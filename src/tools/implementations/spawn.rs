@@ -457,6 +457,8 @@ mod tests {
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
                 provider: "echo".to_string(),
+                usage: None,
+                allowance: None,
             })
         }
         async fn send_message_stream_validated(

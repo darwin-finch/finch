@@ -73,6 +73,7 @@ struct StreamChunk {
     done            @3 :Void;
     error           @4 :Text;
     responseMetadata @5 :StreamResponseMetadata;
+    allowanceUpdate  @6 :AllowanceUpdate;
   }
 }
 
@@ -83,6 +84,13 @@ struct StreamResponseMetadata {
 struct UsageUpdate {
   inputTokens  @0 :UInt32;
   outputTokens @1 :UInt32;
+}
+
+struct AllowanceUpdate {
+  hasPrimary          @0 :Bool;
+  primaryUsedPercent  @1 :UInt8;
+  hasSecondary        @2 :Bool;
+  secondaryUsedPercent @3 :UInt8;
 }
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ use crate::oauth::{
 pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str =
     "openai-codex-public-client@3e4707b34b16e139fcb7ad11ab8445993b62bba1";
 pub const CHATGPT_SUBSCRIPTION_SERVICE_REVISION: &str =
-    "chatgpt-codex-service@3e4707b34b16e139fcb7ad11ab8445993b62bba1";
+    "chatgpt-codex-service@6478a751fde8884b2fdc76486fe23175a8e795d4";
 pub(crate) const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub(crate) const OPENAI_AUTH_ORIGIN: &str = "https://auth.openai.com";
 const CHATGPT_SERVICE_ORIGIN: &str = "https://chatgpt.com";

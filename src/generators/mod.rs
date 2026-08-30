@@ -151,6 +151,13 @@ pub enum StreamChunk {
     /// reported by the API before any text arrives.
     Usage {
         input_tokens: u32,
+        output_tokens: u32,
+    },
+    /// Provider-owned subscription allowance snapshot. Percentages are
+    /// bounded to 0..=100 and are not Platform billing data.
+    Allowance {
+        primary_used_percent: Option<u8>,
+        secondary_used_percent: Option<u8>,
     },
 }
 
@@ -311,9 +318,18 @@ mod tests {
 
     #[test]
     fn test_stream_chunk_usage() {
-        let chunk = StreamChunk::Usage { input_tokens: 1024 };
+        let chunk = StreamChunk::Usage {
+            input_tokens: 1024,
+            output_tokens: 256,
+        };
         match chunk {
-            StreamChunk::Usage { input_tokens } => assert_eq!(input_tokens, 1024),
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(input_tokens, 1024);
+                assert_eq!(output_tokens, 256);
+            }
             _ => panic!("Expected Usage"),
         }
     }

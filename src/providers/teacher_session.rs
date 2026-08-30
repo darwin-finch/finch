@@ -439,6 +439,8 @@ mod tests {
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
                 provider: "mock".to_string(),
+                usage: None,
+                allowance: None,
             })
         }
 

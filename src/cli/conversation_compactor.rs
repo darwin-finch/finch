@@ -129,6 +129,7 @@ pub fn format_messages_for_summary(messages: &[Message]) -> String {
                         format!("[Tool result for: {tool_use_id}]")
                     }
                     ContentBlock::Image { .. } => "[image]".to_string(),
+                    ContentBlock::OpaqueReasoning { .. } => "[opaque reasoning]".to_string(),
                 })
                 .collect();
             format!("{role}: {}", parts.join(" "))

@@ -15,6 +15,7 @@ pub mod types;
 
 // Provider implementations
 pub mod chatgpt_oauth;
+pub mod chatgpt_subscription;
 pub mod claude;
 pub mod gemini;
 pub mod openai;
@@ -47,8 +48,8 @@ pub use teacher_session::{
 };
 pub use types::{
     CapabilityProvenance, CapabilitySupport, ContextWindowCapability, ModelCapabilities,
-    ModelFeature, OutputTokenLimitCapability, ProviderRequest, ProviderResponse,
-    ReasoningCapability, StreamChunk, WireProtocol, WireProtocolCapability,
+    ModelFeature, OutputTokenLimitCapability, ProviderAllowance, ProviderRequest, ProviderResponse,
+    ProviderUsage, ReasoningCapability, StreamChunk, WireProtocol, WireProtocolCapability,
 };
 
 mod validated_boundary {

@@ -33,6 +33,11 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+
+    /// Provider-owned opaque reasoning continuation. Finch persists and
+    /// replays this value byte-for-byte but never interprets or renders it.
+    #[serde(rename = "opaque_reasoning")]
+    OpaqueReasoning { encrypted_content: String },
 }
 
 /// Source for an image content block
@@ -85,6 +90,13 @@ impl ContentBlock {
             tool_use_id,
             content,
             is_error,
+        }
+    }
+
+    /// Create an opaque provider continuation block.
+    pub fn opaque_reasoning(encrypted_content: impl Into<String>) -> Self {
+        Self::OpaqueReasoning {
+            encrypted_content: encrypted_content.into(),
         }
     }
 }

@@ -1614,10 +1614,21 @@ impl stream_receiver::Server for StreamReceiverImpl {
             Ok(Which::UsageUpdate(upd)) => upd
                 .map(|u| StreamChunk::Usage {
                     input_tokens: u.get_input_tokens(),
+                    output_tokens: u.get_output_tokens(),
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e)),
             Ok(Which::ResponseMetadata(metadata)) => metadata
                 .and_then(decode_stream_response_metadata)
+                .map_err(|error| anyhow::anyhow!("{}", error)),
+            Ok(Which::AllowanceUpdate(update)) => update
+                .map(|value| StreamChunk::Allowance {
+                    primary_used_percent: value
+                        .get_has_primary()
+                        .then(|| value.get_primary_used_percent()),
+                    secondary_used_percent: value
+                        .get_has_secondary()
+                        .then(|| value.get_secondary_used_percent()),
+                })
                 .map_err(|error| anyhow::anyhow!("{}", error)),
             Ok(Which::Done(())) => {
                 // Close the channel by dropping tx — but we don't have ownership.
@@ -1840,7 +1851,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 5);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 6);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1855,13 +1866,13 @@ mod tests {
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
             assert!(error.contains("protocol 4"));
-            assert!(error.contains("requires 5"));
+            assert!(error.contains("requires 6"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 5,
+                protocol_version: 6,
                 query_calls: std::rc::Rc::clone(&new_daemon_calls),
             });
             let request = daemon.ping_request();
@@ -1870,7 +1881,7 @@ mod tests {
             let error = ensure_protocol_generation(protocol_version, 4)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 5"));
+            assert!(error.contains("protocol 6"));
             assert!(error.contains("requires 4"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);

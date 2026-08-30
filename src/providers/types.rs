@@ -184,6 +184,7 @@ impl OutputTokenLimitCapability {
 pub enum WireProtocol {
     AnthropicMessages,
     OpenAiChatCompletions,
+    OpenAiChatGptResponsesLite,
     GeminiGenerateContent,
 }
 
@@ -371,6 +372,22 @@ impl ModelCapabilities {
             .is_some_and(|tools| !tools.is_empty())
         {
             self.require("tool calls", &self.tools)?;
+        }
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::OpaqueReasoning { .. }))
+        }) {
+            self.require("opaque provider continuation", &self.continuation)?;
+        }
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        }) {
+            self.require("image input", &self.image_input)?;
         }
         if let Some(effort) = reasoning {
             self.reasoning
@@ -706,6 +723,7 @@ fn estimate_message_tokens(msg: &Message) -> usize {
             ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
             ContentBlock::ToolResult { content, .. } => content.len(),
             ContentBlock::Image { source } => source.data.len().min(4_000) + 20,
+            ContentBlock::OpaqueReasoning { encrypted_content } => encrypted_content.len(),
         })
         .sum();
     (content_chars / 3).max(1) + 4 // +4 overhead per message
@@ -733,6 +751,26 @@ pub struct ProviderResponse {
 
     /// Provider name (e.g., "claude", "openai", "gemini")
     pub provider: String,
+
+    /// Provider-reported token counts, when supplied by the terminal response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+
+    /// Subscription allowance metadata, distinct from API billing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowance: Option<ProviderAllowance>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderAllowance {
+    pub primary_used_percent: Option<u8>,
+    pub secondary_used_percent: Option<u8>,
 }
 
 impl ProviderResponse {
@@ -1045,6 +1083,8 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
             role: "assistant".to_string(),
             provider: "claude".to_string(),
+            usage: None,
+            allowance: None,
         }
     }
 

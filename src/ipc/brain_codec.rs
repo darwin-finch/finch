@@ -185,6 +185,9 @@ pub(super) fn encode_messages(
                     // historical behavior rather than inventing a text form.
                     encoded_block.set_text("");
                 }
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                    encoded_block.set_thinking(encrypted_content);
+                }
             }
         }
     }
@@ -220,7 +223,11 @@ pub(super) fn decode_messages(
                         is_error: Some(value.get_is_error()),
                     });
                 }
-                Which::Thinking(_) => {}
+                Which::Thinking(value) => {
+                    content.push(crate::claude::ContentBlock::OpaqueReasoning {
+                        encrypted_content: text(value?)?,
+                    });
+                }
             }
         }
         decoded.push(crate::claude::Message { role, content });

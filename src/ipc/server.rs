@@ -1722,11 +1722,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         r.get().init_chunk().set_text_delta(delta.as_str());
                         r.send().promise.await?;
                     }
-                    Ok(StreamChunk::Usage { input_tokens }) => {
+                    Ok(StreamChunk::Usage {
+                        input_tokens,
+                        output_tokens,
+                    }) => {
                         let mut r = receiver.on_chunk_request();
                         let mut upd = r.get().init_chunk().init_usage_update();
                         upd.set_input_tokens(input_tokens);
-                        upd.set_output_tokens(0);
+                        upd.set_output_tokens(output_tokens);
                         r.send().promise.await?;
                     }
                     Ok(StreamChunk::ResponseMetadata { model }) => {
@@ -1738,6 +1741,20 @@ impl finch_daemon::Server for FinchDaemonImpl {
                             .init_chunk()
                             .init_response_metadata()
                             .set_model(model.as_str());
+                        r.send().promise.await?;
+                    }
+                    Ok(StreamChunk::Allowance {
+                        primary_used_percent,
+                        secondary_used_percent,
+                    }) => {
+                        let mut r = receiver.on_chunk_request();
+                        let mut allowance = r.get().init_chunk().init_allowance_update();
+                        allowance.set_has_primary(primary_used_percent.is_some());
+                        allowance
+                            .set_primary_used_percent(primary_used_percent.unwrap_or_default());
+                        allowance.set_has_secondary(secondary_used_percent.is_some());
+                        allowance
+                            .set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
                         r.send().promise.await?;
                     }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {

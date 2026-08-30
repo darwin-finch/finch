@@ -1067,9 +1067,10 @@ pub(crate) async fn process_query_with_tools(
 
                 while let Some(result) = rx.recv().await {
                     match result {
-                        Ok(StreamChunk::Usage { input_tokens }) => {
+                        Ok(StreamChunk::Usage { input_tokens, .. }) => {
                             input_token_count = Some(input_tokens);
                         }
+                        Ok(StreamChunk::Allowance { .. }) => {}
                         Ok(StreamChunk::ResponseMetadata { .. }) => {
                             // No durable provenance owner exists in this path yet.
                         }

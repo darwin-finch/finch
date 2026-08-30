@@ -107,6 +107,8 @@ mod disabled_training_tests {
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
                 provider: "hermetic-fallback".to_string(),
+                usage: None,
+                allowance: None,
             })
         }
 
@@ -2026,6 +2028,7 @@ impl Repl {
                     // This legacy display-only path has no response record to
                     // attach provider metadata to.
                 }
+                Ok(crate::generators::StreamChunk::Allowance { .. }) => {}
                 Err(e) => {
                     return Err(e);
                 }
