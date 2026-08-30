@@ -106,7 +106,10 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
         .arg("--cloud-only")
-        .env("ANTHROPIC_API_KEY", "sk-ant-finch-pty-regression-placeholder")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-pty-regression-placeholder",
+        )
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave.try_clone().unwrap()))
@@ -133,7 +136,7 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
     );
 
     // Exercise the real event-loop suspend → setup wizard → resume path. The
-    // wizard owns mouse reporting while active; after Escape, the default REPL
+    // wizard owns mouse reporting while active; after Ctrl+C, the default REPL
     // must enable its clickable transcript controls again.
     master.write_all(b"/setup\r").unwrap();
     master.flush().unwrap();
@@ -150,7 +153,7 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
         "setup wizard did not take ownership of the PTY: {}",
         String::from_utf8_lossy(&transcript)
     );
-    master.write_all(b"\x1b").unwrap();
+    master.write_all(b"\x03").unwrap();
     master.flush().unwrap();
     assert!(
         read_pty_until(
