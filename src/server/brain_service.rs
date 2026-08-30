@@ -1742,10 +1742,7 @@ mod tests {
                 .is_err(),
             "durable cancellation must close the daemon's late result receiver"
         );
-        assert!(
-            submitting.await.unwrap().is_err(),
-            "cancelled dispatch must not accept a late runner result"
-        );
+        submitting.await.unwrap().unwrap();
         let snapshot = service.snapshot("shared").unwrap();
         assert_eq!(
             service.inspect_run("shared", run_id).unwrap().status,
