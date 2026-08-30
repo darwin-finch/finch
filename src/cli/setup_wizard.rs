@@ -6402,7 +6402,16 @@ mod tests {
                 let mut result = build_setup_result(&state).unwrap();
                 // This regression targets the shared setup persistence boundary,
                 // not provider authentication or environment API-key discovery.
-                result.providers.clear();
+                result.providers = vec![ProviderEntry::Local {
+                    inference_provider: InferenceProvider::Onnx,
+                    execution_target: ExecutionTarget::Auto,
+                    model_family: ModelFamily::Qwen2,
+                    model_size: ModelSize::Medium,
+                    model_repo: None,
+                    model_path: None,
+                    enabled: true,
+                    name: Some("context-lines-persistence-test".to_string()),
+                }];
                 result.credentials.clear();
                 let directory = tempfile::tempdir().unwrap();
                 let config_path = directory.path().join("config.toml");
