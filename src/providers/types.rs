@@ -767,10 +767,10 @@ pub struct ProviderUsage {
     pub output_tokens: u32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ProviderAllowance {
-    pub primary_used_percent: Option<u8>,
-    pub secondary_used_percent: Option<u8>,
+    pub primary_used_percent: Option<f32>,
+    pub secondary_used_percent: Option<f32>,
 }
 
 impl ProviderResponse {

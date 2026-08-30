@@ -156,8 +156,8 @@ pub enum StreamChunk {
     /// Provider-owned subscription allowance snapshot. Percentages are
     /// bounded to 0..=100 and are not Platform billing data.
     Allowance {
-        primary_used_percent: Option<u8>,
-        secondary_used_percent: Option<u8>,
+        primary_used_percent: Option<f32>,
+        secondary_used_percent: Option<f32>,
     },
 }
 

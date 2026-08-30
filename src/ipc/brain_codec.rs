@@ -1897,6 +1897,9 @@ mod tests {
                     content: "contents".into(),
                     is_error: Some(false),
                 },
+                crate::claude::ContentBlock::OpaqueReasoning {
+                    encrypted_content: "opaque-continuation".into(),
+                },
             ],
         }];
         let mut message = capnp::message::Builder::new_default();
@@ -1938,6 +1941,11 @@ mod tests {
                 content,
                 is_error: Some(false),
             } if tool_use_id == "tool-1" && content == "contents"
+        ));
+        assert!(matches!(
+            &decoded[0].content[3],
+            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content }
+                if encrypted_content == "opaque-continuation"
         ));
     }
 

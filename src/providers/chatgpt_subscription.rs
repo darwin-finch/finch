@@ -375,7 +375,7 @@ impl ChatGptSubscriptionProvider {
         cancel: CancellationToken,
     ) -> Result<Response> {
         let mut lease = self.source.lease(&cancel).await?;
-        let catalog = self.account_catalog(&lease, &cancel).await?;
+        let mut catalog = self.account_catalog(&lease, &cancel).await?;
         let selected = catalog
             .models
             .get(&request.model)
@@ -411,7 +411,12 @@ impl ChatGptSubscriptionProvider {
                     .source
                     .refresh_after_unauthorized(&lease.generation, &cancel)
                     .await?;
-                if !catalog.models.contains_key(&request.model) {
+                catalog = self.account_catalog(&lease, &cancel).await?;
+                let refreshed_model = catalog
+                    .models
+                    .get(&request.model)
+                    .context("ChatGPT account model changed while refreshing credentials")?;
+                if !refreshed_model.responses_lite || refreshed_model.slug != request.model {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
                 continue;
@@ -898,8 +903,32 @@ struct CompletedResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Allowance {
-    primary_used_percent: Option<u8>,
-    secondary_used_percent: Option<u8>,
+    primary_used_percent: Option<f32>,
+    secondary_used_percent: Option<f32>,
+}
+
+#[derive(Default)]
+struct StreamAccumulator {
+    output_items: BTreeMap<u64, Value>,
+    actual_model: Option<String>,
+}
+
+impl StreamAccumulator {
+    fn observe_model(&mut self, model: &str, expected_model: &str) -> Result<()> {
+        validate_identifier(model, 256, "actual model")?;
+        if !model_is_compatible(expected_model, model) {
+            bail!("ChatGPT subscription returned an incompatible actual model");
+        }
+        if self
+            .actual_model
+            .as_deref()
+            .is_some_and(|observed| observed != model)
+        {
+            bail!("ChatGPT subscription actual model changed during the response");
+        }
+        self.actual_model = Some(model.to_string());
+        Ok(())
+    }
 }
 
 async fn consume_sse(
@@ -915,6 +944,10 @@ async fn consume_sse(
     let mut buffer = Vec::new();
     let mut total = 0usize;
     let mut terminal: Option<CompletedResponse> = None;
+    let mut accumulator = StreamAccumulator::default();
+    if let Some(model) = header_model.as_deref() {
+        accumulator.observe_model(model, &expected_model)?;
+    }
     let mut done_seen = false;
     let mut last_sequence = None;
     loop {
@@ -937,7 +970,7 @@ async fn consume_sse(
             }
             let event = buffer.drain(..end).collect::<Vec<_>>();
             buffer.drain(..separator);
-            let data = sse_data(&event)?;
+            let (event_name, data) = sse_data(&event)?;
             if data.is_empty() {
                 continue;
             }
@@ -953,6 +986,14 @@ async fn consume_sse(
             }
             let event: Value = serde_json::from_str(&data)
                 .context("ChatGPT subscription stream event was malformed")?;
+            let event_kind = event
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(Value::as_str)
+                .context("ChatGPT subscription stream event omitted type")?;
+            if event_name.as_deref().is_some_and(|name| name != event_kind) {
+                bail!("ChatGPT subscription SSE event name did not match its payload");
+            }
             let sequence = event
                 .as_object()
                 .and_then(|object| object.get("sequence_number"))
@@ -967,6 +1008,7 @@ async fn consume_sse(
                 &expected_model,
                 header_model.as_deref(),
                 &allowed_tools,
+                &mut accumulator,
             )? {
                 terminal = Some(completed);
             }
@@ -1019,6 +1061,7 @@ fn parse_event(
     expected_model: &str,
     header_model: Option<&str>,
     allowed_tools: &HashSet<String>,
+    accumulator: &mut StreamAccumulator,
 ) -> Result<Option<CompletedResponse>> {
     let object = event
         .as_object()
@@ -1031,21 +1074,29 @@ fn parse_event(
         "response.created" | "response.in_progress" => {
             exact_keys(object, &["type", "sequence_number", "response"])?;
             required_sequence(object)?;
-            object
+            let response = object
                 .get("response")
                 .and_then(Value::as_object)
                 .context("ChatGPT response lifecycle event omitted response")?;
+            observe_response_model(response, expected_model, accumulator)?;
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
             exact_keys(object, &["type", "sequence_number", "output_index", "item"])?;
             required_sequence(object)?;
-            required_index(object, "output_index")?;
-            validate_output_item_shape(
-                object
-                    .get("item")
-                    .context("ChatGPT output item event omitted item")?,
-            )?;
+            let output_index = required_index(object, "output_index")?;
+            let item = object
+                .get("item")
+                .context("ChatGPT output item event omitted item")?;
+            validate_output_item_shape(item)?;
+            if kind == "response.output_item.done"
+                && accumulator
+                    .output_items
+                    .insert(output_index, item.clone())
+                    .is_some()
+            {
+                bail!("ChatGPT subscription repeated a completed output index");
+            }
             Ok(None)
         }
         "response.content_part.added" | "response.content_part.done" => {
@@ -1086,6 +1137,40 @@ fn parse_event(
             validate_text_event(object, "arguments", false)?;
             Ok(None)
         }
+        "response.reasoning_summary_text.delta" => {
+            validate_reasoning_text_event(object, "delta", "summary_index")?;
+            Ok(None)
+        }
+        "response.reasoning_summary_text.done" => {
+            validate_reasoning_text_event(object, "text", "summary_index")?;
+            Ok(None)
+        }
+        "response.reasoning_text.delta" => {
+            validate_reasoning_text_event(object, "delta", "content_index")?;
+            Ok(None)
+        }
+        "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+            exact_keys(
+                object,
+                &[
+                    "type",
+                    "sequence_number",
+                    "item_id",
+                    "output_index",
+                    "summary_index",
+                    "part",
+                ],
+            )?;
+            required_sequence(object)?;
+            required_identifier(object, "item_id", 256)?;
+            required_index(object, "output_index")?;
+            required_index(object, "summary_index")?;
+            object
+                .get("part")
+                .and_then(Value::as_object)
+                .context("ChatGPT reasoning summary part was invalid")?;
+            Ok(None)
+        }
         "response.completed" => {
             exact_keys(object, &["type", "sequence_number", "response"])?;
             required_sequence(object)?;
@@ -1093,7 +1178,14 @@ fn parse_event(
                 .get("response")
                 .and_then(Value::as_object)
                 .context("ChatGPT completion omitted response")?;
-            parse_completed(response, expected_model, header_model, allowed_tools).map(Some)
+            parse_completed(
+                response,
+                expected_model,
+                header_model,
+                allowed_tools,
+                accumulator,
+            )
+            .map(Some)
         }
         "response.failed" | "response.incomplete" => {
             bail!("ChatGPT subscription response failed before completion")
@@ -1110,6 +1202,36 @@ fn validate_output_item_shape(item: &Value) -> Result<()> {
         Some("message") | Some("reasoning") | Some("function_call") => Ok(()),
         _ => bail!("ChatGPT output item event contained an unknown item type"),
     }
+}
+
+fn observe_response_model(
+    response: &Map<String, Value>,
+    expected_model: &str,
+    accumulator: &mut StreamAccumulator,
+) -> Result<()> {
+    if let Some(model) = response.get("model").and_then(Value::as_str) {
+        accumulator.observe_model(model, expected_model)?;
+    }
+    if let Some(headers) = response.get("headers") {
+        let headers = headers
+            .as_object()
+            .context("ChatGPT response model headers were invalid")?;
+        for (name, value) in headers {
+            if name.eq_ignore_ascii_case("openai-model")
+                || name.eq_ignore_ascii_case("x-openai-model")
+            {
+                let model = match value {
+                    Value::String(model) => model.as_str(),
+                    Value::Array(values) if values.len() == 1 => values[0]
+                        .as_str()
+                        .context("ChatGPT response model header was invalid")?,
+                    _ => bail!("ChatGPT response model header was invalid"),
+                };
+                accumulator.observe_model(model, expected_model)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn required_sequence(object: &Map<String, Value>) -> Result<u64> {
@@ -1149,11 +1271,39 @@ fn validate_text_event(
     validate_bounded_text(value, MAX_TOOL_ARGUMENT_BYTES, "stream delta")
 }
 
+fn validate_reasoning_text_event(
+    object: &Map<String, Value>,
+    field: &str,
+    index_field: &str,
+) -> Result<()> {
+    exact_keys(
+        object,
+        &[
+            "type",
+            "sequence_number",
+            "item_id",
+            "output_index",
+            index_field,
+            field,
+        ],
+    )?;
+    required_sequence(object)?;
+    required_identifier(object, "item_id", 256)?;
+    required_index(object, "output_index")?;
+    required_index(object, index_field)?;
+    let value = object
+        .get(field)
+        .and_then(Value::as_str)
+        .context("ChatGPT reasoning stream event omitted text")?;
+    validate_bounded_text(value, MAX_TOOL_ARGUMENT_BYTES, "reasoning stream text")
+}
+
 fn parse_completed(
     response: &Map<String, Value>,
     expected_model: &str,
     header_model: Option<&str>,
     allowed_tools: &HashSet<String>,
+    accumulator: &mut StreamAccumulator,
 ) -> Result<CompletedResponse> {
     exact_keys(
         response,
@@ -1184,32 +1334,68 @@ fn parse_completed(
             "service_tier",
             "prompt_cache_key",
             "safety_identifier",
+            "headers",
+            "usage_metadata",
+            "end_turn",
         ],
     )?;
-    if response.get("status").and_then(Value::as_str) != Some("completed") {
+    if response
+        .get("status")
+        .is_some_and(|status| status.as_str() != Some("completed"))
+    {
         bail!("ChatGPT terminal response status was invalid");
     }
     let id = required_identifier(response, "id", 256)?;
-    let response_model = required_identifier(response, "model", 256)?;
+    observe_response_model(response, expected_model, accumulator)?;
     if let Some(header_model) = header_model {
-        validate_identifier(header_model, 256, "actual model")?;
-        if header_model != response_model {
-            bail!("ChatGPT subscription actual model changed during the response");
+        accumulator.observe_model(header_model, expected_model)?;
+    }
+    let response_model = accumulator
+        .actual_model
+        .clone()
+        .context("ChatGPT subscription response omitted actual model provenance")?;
+    let terminal_output = response
+        .get("output")
+        .map(|output| {
+            output
+                .as_array()
+                .context("ChatGPT completion output items were invalid")
+        })
+        .transpose()?;
+    if terminal_output.is_some_and(|output| output.len() > MAX_OUTPUT_ITEMS)
+        || accumulator.output_items.len() > MAX_OUTPUT_ITEMS
+    {
+        bail!("ChatGPT completion returned too many output items");
+    }
+    if let Some(output) = terminal_output {
+        if !accumulator.output_items.is_empty()
+            && (output.len() != accumulator.output_items.len()
+                || output.iter().enumerate().any(|(index, item)| {
+                    accumulator.output_items.get(&(index as u64)) != Some(item)
+                }))
+        {
+            bail!("ChatGPT terminal output did not match streamed output items");
+        }
+        if accumulator.output_items.is_empty() {
+            accumulator.output_items = output
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, item)| (index as u64, item))
+                .collect();
         }
     }
-    if !model_is_compatible(expected_model, &response_model) {
-        bail!("ChatGPT subscription returned an incompatible actual model");
-    }
-    let output = response
-        .get("output")
-        .and_then(Value::as_array)
-        .context("ChatGPT completion omitted output items")?;
-    if output.len() > MAX_OUTPUT_ITEMS {
-        bail!("ChatGPT completion returned too many output items");
+    if accumulator
+        .output_items
+        .keys()
+        .copied()
+        .ne(0..accumulator.output_items.len() as u64)
+    {
+        bail!("ChatGPT response output indices were not contiguous");
     }
     let mut blocks = Vec::new();
     let mut call_ids = HashSet::new();
-    for item in output {
+    for item in accumulator.output_items.values() {
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
     }
     let (input_tokens, output_tokens) = parse_usage(response.get("usage"))?;
@@ -1350,13 +1536,13 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
 }
 
 fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Option<Allowance>> {
-    let parse = |name: &str| -> Result<Option<u8>> {
+    let parse = |name: &str| -> Result<Option<f32>> {
         bounded_header(headers, name)?
             .map(|value| {
                 value
-                    .parse::<u8>()
+                    .parse::<f32>()
                     .ok()
-                    .filter(|value| *value <= 100)
+                    .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
                     .context("ChatGPT allowance header was invalid")
             })
             .transpose()
@@ -1471,14 +1657,24 @@ fn enforce_sse_remainder_bounds(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sse_data(event: &[u8]) -> Result<String> {
+fn sse_data(event: &[u8]) -> Result<(Option<String>, String)> {
     let event = std::str::from_utf8(event).context("ChatGPT subscription SSE was not UTF-8")?;
+    let mut event_name = None;
     let mut data = String::new();
     for line in event.lines() {
         if line.len() > MAX_SSE_LINE_BYTES {
             bail!("ChatGPT subscription stream line exceeded the size limit");
         }
         if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            if event_name.is_some() {
+                bail!("ChatGPT subscription SSE repeated its event name");
+            }
+            let value = value.trim_start();
+            validate_identifier(value, 128, "SSE event name")?;
+            event_name = Some(value.to_string());
             continue;
         }
         let value = line
@@ -1489,7 +1685,7 @@ fn sse_data(event: &[u8]) -> Result<String> {
         }
         data.push_str(value.trim_start());
     }
-    Ok(data)
+    Ok((event_name, data))
 }
 
 #[cfg(test)]
@@ -1572,22 +1768,19 @@ mod tests {
 
     fn completed_sse(model: &str) -> String {
         format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            json!({
-                "type":"response.completed",
-                "sequence_number":1,
-                "response":{
-                    "id":"resp-1",
-                    "status":"completed",
-                    "model":model,
-                    "output":[
-                        {"type":"reasoning","summary":[],"encrypted_content":"opaque-1"},
-                        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
-                        {"type":"function_call","call_id":"call-2","name":"read","arguments":"{\"path\":\"README.md\"}"}
-                    ],
-                    "usage":{"input_tokens":12,"output_tokens":7}
-                }
-            })
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
+            json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","arguments":"{\"path\":\"README.md\"}"}}),
+            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
         )
     }
 
@@ -1668,8 +1861,16 @@ mod tests {
 
     #[test]
     fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
+        let mut accumulator = StreamAccumulator::default();
         let unknown = json!({"type":"response.future","sequence_number":1});
-        assert!(parse_event(unknown, DEFAULT_MODEL, None, &HashSet::new()).is_err());
+        assert!(parse_event(
+            unknown,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .is_err());
         let malformed = json!({
             "type":"response.output_text.delta",
             "sequence_number":1,
@@ -1678,7 +1879,14 @@ mod tests {
             "content_index":0,
             "unexpected":"secret"
         });
-        assert!(parse_event(malformed, DEFAULT_MODEL, None, &HashSet::new()).is_err());
+        assert!(parse_event(
+            malformed,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .is_err());
         let terminal = json!({
             "id":"resp",
             "status":"in_progress",
@@ -1690,6 +1898,7 @@ mod tests {
             DEFAULT_MODEL,
             None,
             &HashSet::new(),
+            &mut accumulator,
         )
         .is_err());
     }
@@ -1729,7 +1938,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "text/event-stream")
             .with_header("openai-model", DEFAULT_MODEL)
-            .with_header("x-codex-primary-used-percent", "25")
+            .with_header("x-codex-primary-used-percent", "25.5")
             .with_body(completed_sse(DEFAULT_MODEL))
             .create_async()
             .await;
@@ -1750,7 +1959,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.model, DEFAULT_MODEL);
         assert_eq!(response.usage.unwrap().output_tokens, 7);
-        assert_eq!(response.allowance.unwrap().primary_used_percent, Some(25));
+        assert_eq!(response.allowance.unwrap().primary_used_percent, Some(25.5));
         assert!(matches!(
             response.content.first(),
             Some(ContentBlock::OpaqueReasoning { encrypted_content }) if encrypted_content == "opaque-1"
@@ -1772,6 +1981,14 @@ mod tests {
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(200)
             .with_body(catalog_body())
+            .create_async()
+            .await;
+        let refreshed_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
             .create_async()
             .await;
         let first = server
@@ -1804,6 +2021,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
+        refreshed_catalog.assert_async().await;
         first.assert_async().await;
         second.assert_async().await;
     }

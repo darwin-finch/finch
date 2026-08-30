@@ -88,9 +88,9 @@ struct UsageUpdate {
 
 struct AllowanceUpdate {
   hasPrimary          @0 :Bool;
-  primaryUsedPercent  @1 :UInt8;
+  primaryUsedPercent  @1 :Float32;
   hasSecondary        @2 :Bool;
-  secondaryUsedPercent @3 :UInt8;
+  secondaryUsedPercent @3 :Float32;
 }
 
 # ---------------------------------------------------------------------------

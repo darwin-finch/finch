@@ -1860,12 +1860,12 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 4,
+                protocol_version: 5,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 4"));
+            assert!(error.contains("protocol 5"));
             assert!(error.contains("requires 6"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
@@ -1878,11 +1878,11 @@ mod tests {
             let request = daemon.ping_request();
             let reply = request.send().promise.await.unwrap();
             let protocol_version = reply.get().unwrap().get_protocol_version();
-            let error = ensure_protocol_generation(protocol_version, 4)
+            let error = ensure_protocol_generation(protocol_version, 5)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("protocol 6"));
-            assert!(error.contains("requires 4"));
+            assert!(error.contains("requires 5"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);
         }));
