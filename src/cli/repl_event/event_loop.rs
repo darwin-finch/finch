@@ -1307,17 +1307,34 @@ fn register_named_brain_turn_projection(
 
 fn named_brain_wire_source(
     messages: Vec<crate::claude::Message>,
+    initial_message_count: usize,
 ) -> anyhow::Result<(
     String,
     crate::brain::store::ProgramLanguage,
-    Vec<crate::claude::ContentBlock>,
+    Vec<crate::claude::Message>,
 )> {
-    let assistant = messages
-        .into_iter()
+    anyhow::ensure!(
+        initial_message_count <= messages.len(),
+        "named Brain conversation changed before durable continuation capture"
+    );
+    let continuation_messages = messages[initial_message_count..].to_vec();
+    anyhow::ensure!(
+        !continuation_messages.is_empty()
+            && continuation_messages
+                .iter()
+                .all(|message| matches!(message.role.as_str(), "assistant" | "user")),
+        "named Brain continuation messages were invalid"
+    );
+    let assistant = continuation_messages
+        .iter()
         .rev()
         .find(|message| message.role == "assistant")
         .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
-    let source = assistant.text();
+    let source = assistant
+        .content
+        .iter()
+        .filter_map(crate::claude::ContentBlock::as_text)
+        .collect::<String>();
     anyhow::ensure!(
         !source.trim().is_empty(),
         "named Brain turn produced no wire source"
@@ -1326,7 +1343,7 @@ fn named_brain_wire_source(
         crate::programs::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
         crate::programs::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
     };
-    Ok((source, language, assistant.content))
+    Ok((source, language, continuation_messages))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1341,9 +1358,11 @@ fn assemble_named_brain_turn(
     commit_ack: Option<crate::server::RunnerTurnCommitAck>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
     invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+    initial_message_count: usize,
 ) -> std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
     let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
-        let (source, language, assistant_content) = named_brain_wire_source(messages?)?;
+        let (source, language, continuation_messages) =
+            named_brain_wire_source(messages?, initial_message_count)?;
         let runtime_revision = program_runtime.revision();
         let checkpoint = program_runtime
             .revision_history()?
@@ -1357,7 +1376,7 @@ fn assemble_named_brain_turn(
             source,
             language,
             output,
-            assistant_content,
+            continuation_messages,
             invocation_metadata,
             turn_events: turn_events.clone(),
             runtime_revision,
@@ -5325,11 +5344,13 @@ Rules:\n\
     }
 
     async fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {
-        let invocation_metadata = self
-            .query_states
-            .get_metadata(query_id)
-            .await
-            .and_then(|metadata| metadata.invocation_metadata);
+        let query_metadata = self.query_states.get_metadata(query_id).await;
+        let invocation_metadata = query_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.invocation_metadata.clone());
+        let initial_message_count = query_metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.conversation_snapshot.len());
         let transient_output_unit = self.query_states.brain_output_work_unit(query_id).await;
         self.query_states.set_tool_work_unit(query_id, None).await;
         self.query_states
@@ -5404,6 +5425,7 @@ Rules:\n\
             commit_ack,
             transient_output_unit,
             invocation_metadata,
+            initial_message_count,
         );
         let _ = response_tx.send(result);
     }
@@ -9295,7 +9317,7 @@ mod tests {
                     request_seq: 1,
                     output: "1764".into(),
                     error: None,
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                 },
             ),
@@ -9345,7 +9367,7 @@ mod tests {
                     request_seq: 1,
                     output: "partial output".into(),
                     error: Some("provider failed".into()),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                 },
             ),
@@ -9400,7 +9422,7 @@ mod tests {
                 request_seq: 1,
                 output: "hidden helper output".into(),
                 error: None,
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
         );
@@ -9456,7 +9478,7 @@ mod tests {
                 request_seq: 4,
                 output: "probe".into(),
                 error: None,
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
             BrainEventKind::RunStatusChanged {
@@ -9551,7 +9573,7 @@ mod tests {
                 request_seq: 7,
                 output: "cache checked".into(),
                 error: None,
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
             BrainEventKind::RunStatusChanged {
@@ -9648,6 +9670,27 @@ mod tests {
     }
 
     #[test]
+    fn named_brain_continuation_preserves_multi_text_and_opaque_order() {
+        let initial = crate::claude::Message::user("prompt");
+        let continuation = crate::claude::Message::with_content(
+            "assistant",
+            vec![
+                crate::claude::ContentBlock::text("(say \""),
+                crate::claude::ContentBlock::opaque_reasoning("opaque-between-text"),
+                crate::claude::ContentBlock::text("done\")"),
+            ],
+        );
+        let (source, language, captured) =
+            super::named_brain_wire_source(vec![initial, continuation.clone()], 1).unwrap();
+        assert_eq!(source, "(say \"done\")");
+        assert_eq!(language, crate::brain::store::ProgramLanguage::Lisp);
+        assert_eq!(
+            serde_json::to_value(captured).unwrap(),
+            serde_json::to_value(vec![continuation]).unwrap()
+        );
+    }
+
+    #[test]
     fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
@@ -9734,7 +9777,7 @@ mod tests {
                 request_seq: 1,
                 output: String::new(),
                 error: Some("named Brain turn produced no wire source".into()),
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
             BrainEventKind::RunStatusChanged {
@@ -9790,6 +9833,7 @@ mod tests {
             None,
             Some(transient_output_unit),
             None,
+            0,
         );
         assert_eq!(
             assembly_result.unwrap_err().message,
@@ -9869,7 +9913,7 @@ mod tests {
                 request_seq: 12,
                 output: "hello".into(),
                 error: None,
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
         );
@@ -9899,7 +9943,7 @@ mod tests {
                 request_seq: 12,
                 output: "different".into(),
                 error: None,
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
         );

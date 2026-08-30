@@ -1862,7 +1862,7 @@ fn push_named_brain_run_result(
     run_id: crate::brain::store::RunId,
     request_seq: u64,
     result: anyhow::Result<String>,
-    assistant_content: Vec<crate::claude::ContentBlock>,
+    continuation_messages: Vec<crate::claude::Message>,
     invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
     if let Some(metadata) = &invocation_metadata {
@@ -1880,7 +1880,7 @@ fn push_named_brain_run_result(
             request_seq,
             output,
             error,
-            assistant_content,
+            continuation_messages,
             invocation_metadata,
         },
     )
@@ -2118,7 +2118,7 @@ async fn dispatch_named_brain_turn(
         run_id,
         program.seq,
         Ok(outcome.output),
-        outcome.assistant_content,
+        outcome.continuation_messages,
         outcome.invocation_metadata,
     )?;
     store.transition_run(
@@ -2334,6 +2334,24 @@ fn named_brain_provider_messages_at(
             })
     });
     let task_context = tasks_at_request.and_then(named_brain_task_context);
+    let durable_continuations = snapshot
+        .events
+        .iter()
+        .filter(|event| event.seq <= request_seq)
+        .filter_map(|event| match (&event.run_id, &event.kind) {
+            (
+                Some(run_id),
+                BrainEventKind::Result {
+                    continuation_messages,
+                    error: None,
+                    ..
+                },
+            ) if !continuation_messages.is_empty() => {
+                Some((*run_id, continuation_messages.clone()))
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let events = snapshot
         .events
         .iter()
@@ -2372,113 +2390,119 @@ fn named_brain_provider_messages_at(
     let projected = events
         .into_iter()
         .rev()
-        .filter_map(|event| {
-            Some(match &event.kind {
-                BrainEventKind::SpeculativePrompt { .. } => return None,
-                BrainEventKind::Prompt { text } => {
-                    let prompt = format!("[{}]\n{text}", event.sender);
-                    Message::user(
-                        task_context
-                            .as_ref()
-                            .filter(|_| event.seq == request_seq)
-                            .map(|context| format!("{context}\n\n{prompt}"))
-                            .unwrap_or(prompt),
-                    )
-                }
-                BrainEventKind::ParticipantMessage { text } => {
-                    Message::user(format!("[participant {}]\n{text}", event.sender))
-                }
-                BrainEventKind::ToolCall {
-                    tool_id,
-                    name,
-                    input,
-                    ..
-                } => Message::with_content(
-                    "assistant",
-                    vec![crate::claude::ContentBlock::ToolUse {
-                        id: tool_id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    }],
-                ),
-                BrainEventKind::ToolResult {
-                    tool_id,
-                    output,
-                    is_error,
-                    ..
-                } => Message::with_content(
-                    "user",
-                    vec![crate::claude::ContentBlock::ToolResult {
-                        tool_use_id: tool_id.clone(),
-                        content: output.clone(),
-                        is_error: is_error.then_some(true),
-                    }],
-                ),
-                BrainEventKind::Program {
-                    language: _,
-                    source,
-                } if event.sender == "provider" => snapshot
-                    .events
-                    .iter()
-                    .find_map(|candidate| match &candidate.kind {
-                        BrainEventKind::Result {
-                            request_seq,
-                            assistant_content,
-                            error: None,
-                            ..
-                        } if *request_seq == event.seq && !assistant_content.is_empty() => Some(
-                            Message::with_content("assistant", assistant_content.clone()),
-                        ),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| Message::assistant(source.clone())),
-                BrainEventKind::Program { language, source } => Message::user(format!(
-                    "[{} submitted a Finch {} program as event #{}]\n{}",
-                    event.sender,
-                    match language {
-                        crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
-                        crate::brain::store::ProgramLanguage::Lisp => "Lisp",
-                    },
-                    event.seq,
-                    source,
-                )),
-                BrainEventKind::ProgramPopped { program_seq } => Message::user(format!(
-                    "[{} removed program event #{} from the visible Brain projection]",
-                    event.sender, program_seq,
-                )),
-                BrainEventKind::Result {
-                    request_seq,
-                    output,
-                    error,
-                    ..
-                } => {
-                    let result = error
+        .flat_map(|event| match &event.kind {
+            BrainEventKind::SpeculativePrompt { .. } => Vec::new(),
+            BrainEventKind::Prompt { text } => {
+                let prompt = format!("[{}]\n{text}", event.sender);
+                vec![Message::user(
+                    task_context
                         .as_ref()
-                        .map(|error| format!("error: {error}"))
-                        .unwrap_or_else(|| output.clone());
-                    Message::user(format!(
-                        "[Finch VM result for program event #{request_seq}]\n{result}"
-                    ))
-                }
-                BrainEventKind::MutationRecorded { .. }
-                | BrainEventKind::RuntimeCommitted { .. }
-                | BrainEventKind::TaskListReplaced { .. }
-                | BrainEventKind::EffectRecorded { .. }
-                | BrainEventKind::EffectAuditTransition { .. }
-                | BrainEventKind::ApprovalRequested { .. }
-                | BrainEventKind::ApprovalDecided { .. }
-                | BrainEventKind::RunnerLeaseAcquired { .. }
-                | BrainEventKind::RunnerLeaseReleased { .. }
-                | BrainEventKind::RunnerHandoffRequested { .. }
-                | BrainEventKind::RunnerHandoffCompleted { .. }
-                | BrainEventKind::RunnerHandoffCancelled { .. }
-                | BrainEventKind::ClientAttached { .. }
-                | BrainEventKind::ClientDetached { .. }
-                | BrainEventKind::RunStarted { .. }
-                | BrainEventKind::RunStatusChanged { .. }
-                | BrainEventKind::ScheduleChanged { .. }
-                | BrainEventKind::ScheduleDue { .. } => return None,
-            })
+                        .filter(|_| event.seq == request_seq)
+                        .map(|context| format!("{context}\n\n{prompt}"))
+                        .unwrap_or(prompt),
+                )]
+            }
+            BrainEventKind::ParticipantMessage { text } => {
+                vec![Message::user(format!(
+                    "[participant {}]\n{text}",
+                    event.sender
+                ))]
+            }
+            BrainEventKind::ToolCall {
+                tool_id,
+                name,
+                input,
+                ..
+            } => event
+                .run_id
+                .filter(|run_id| durable_continuations.contains_key(run_id))
+                .map_or_else(
+                    || {
+                        vec![Message::with_content(
+                            "assistant",
+                            vec![crate::claude::ContentBlock::ToolUse {
+                                id: tool_id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            }],
+                        )]
+                    },
+                    |_| Vec::new(),
+                ),
+            BrainEventKind::ToolResult {
+                tool_id,
+                output,
+                is_error,
+                ..
+            } => event
+                .run_id
+                .filter(|run_id| durable_continuations.contains_key(run_id))
+                .map_or_else(
+                    || {
+                        vec![Message::with_content(
+                            "user",
+                            vec![crate::claude::ContentBlock::ToolResult {
+                                tool_use_id: tool_id.clone(),
+                                content: output.clone(),
+                                is_error: is_error.then_some(true),
+                            }],
+                        )]
+                    },
+                    |_| Vec::new(),
+                ),
+            BrainEventKind::Program {
+                language: _,
+                source,
+            } if event.sender == "provider" => event
+                .run_id
+                .and_then(|run_id| durable_continuations.get(&run_id).cloned())
+                .unwrap_or_else(|| vec![Message::assistant(source.clone())]),
+            BrainEventKind::Program { language, source } => vec![Message::user(format!(
+                "[{} submitted a Finch {} program as event #{}]\n{}",
+                event.sender,
+                match language {
+                    crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
+                    crate::brain::store::ProgramLanguage::Lisp => "Lisp",
+                },
+                event.seq,
+                source,
+            ))],
+            BrainEventKind::ProgramPopped { program_seq } => vec![Message::user(format!(
+                "[{} removed program event #{} from the visible Brain projection]",
+                event.sender, program_seq,
+            ))],
+            BrainEventKind::Result {
+                request_seq,
+                output,
+                error,
+                ..
+            } => {
+                let result = error
+                    .as_ref()
+                    .map(|error| format!("error: {error}"))
+                    .unwrap_or_else(|| output.clone());
+                vec![Message::user(format!(
+                    "[Finch VM result for program event #{request_seq}]\n{result}"
+                ))]
+            }
+            BrainEventKind::MutationRecorded { .. }
+            | BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::TaskListReplaced { .. }
+            | BrainEventKind::EffectRecorded { .. }
+            | BrainEventKind::EffectAuditTransition { .. }
+            | BrainEventKind::ApprovalRequested { .. }
+            | BrainEventKind::ApprovalDecided { .. }
+            | BrainEventKind::RunnerLeaseAcquired { .. }
+            | BrainEventKind::RunnerLeaseReleased { .. }
+            | BrainEventKind::RunnerHandoffRequested { .. }
+            | BrainEventKind::RunnerHandoffCompleted { .. }
+            | BrainEventKind::RunnerHandoffCancelled { .. }
+            | BrainEventKind::ClientAttached { .. }
+            | BrainEventKind::ClientDetached { .. }
+            | BrainEventKind::RunStarted { .. }
+            | BrainEventKind::RunStatusChanged { .. }
+            | BrainEventKind::ScheduleChanged { .. }
+            | BrainEventKind::ScheduleDue { .. } => Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -5827,7 +5851,7 @@ mod handler_tests {
                             source: "(define (restored) : int 1)".into(),
                             language: ProgramLanguage::Lisp,
                             output: "restored without tools".into(),
-                            assistant_content: Vec::new(),
+                            continuation_messages: Vec::new(),
                             invocation_metadata: None,
                             turn_events: Vec::new(),
                             runtime_revision: outcome.output_revision,
@@ -6004,7 +6028,7 @@ mod handler_tests {
 
     #[test]
     fn brain_history_remains_conversation_data_not_system_text() {
-        let snapshot = BrainSnapshot {
+        let mut snapshot = BrainSnapshot {
             brain_id: BrainId(uuid::Uuid::nil()),
             name: "shared".into(),
             environment: BrainEnvironment {
@@ -6045,10 +6069,15 @@ mod handler_tests {
                         request_seq: 2,
                         output: "answer".into(),
                         error: None,
-                        assistant_content: vec![
-                            crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
-                            crate::claude::ContentBlock::text("(say \"answer\")"),
-                        ],
+                        continuation_messages: vec![crate::claude::Message::with_content(
+                            "assistant",
+                            vec![
+                                crate::claude::ContentBlock::opaque_reasoning(
+                                    "opaque-restart-token",
+                                ),
+                                crate::claude::ContentBlock::text("(say \"answer\")"),
+                            ],
+                        )],
                         invocation_metadata: Some(crate::providers::types::InvocationMetadata {
                             requested_model: "gpt-5.6".into(),
                             resolved_model: "gpt-5.6".into(),
@@ -6071,6 +6100,10 @@ mod handler_tests {
             pending_schedule_dues: Vec::new(),
             effect_audits: Vec::new(),
         };
+        let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        snapshot.events[1].run_id = Some(run_id);
+        snapshot.events[2].run_id = Some(run_id);
+        snapshot.events[3].run_id = Some(run_id);
 
         let messages = named_brain_provider_messages(&snapshot);
         assert_eq!(messages.len(), 3, "internal checkpoint events stay hidden");
@@ -6091,7 +6124,7 @@ mod handler_tests {
 
     #[test]
     fn brain_history_reconstructs_provider_tool_protocol() {
-        let snapshot = BrainSnapshot {
+        let mut snapshot = BrainSnapshot {
             brain_id: BrainId(uuid::Uuid::nil()),
             name: "shared".into(),
             environment: BrainEnvironment {
@@ -6099,7 +6132,7 @@ mod handler_tests {
                 workspace: "/workspace".into(),
                 generation: 1,
             },
-            revision: 6,
+            revision: 7,
             events: vec![
                 event(
                     1,
@@ -6156,6 +6189,56 @@ mod handler_tests {
                         source: "(say \"done\")".into(),
                     },
                 ),
+                event(
+                    7,
+                    "daemon",
+                    BrainEventKind::Result {
+                        request_seq: 6,
+                        output: "done".into(),
+                        error: None,
+                        continuation_messages: vec![
+                            crate::claude::Message::with_content(
+                                "assistant",
+                                vec![
+                                    crate::claude::ContentBlock::opaque_reasoning("opaque-tool"),
+                                    crate::claude::ContentBlock::ToolUse {
+                                        id: "tool-1".into(),
+                                        name: "search_word".into(),
+                                        input: serde_json::json!({"query":"fib"}),
+                                    },
+                                    crate::claude::ContentBlock::ToolUse {
+                                        id: "tool-2".into(),
+                                        name: "get_vm_state".into(),
+                                        input: serde_json::json!({}),
+                                    },
+                                ],
+                            ),
+                            crate::claude::Message::with_content(
+                                "user",
+                                vec![
+                                    crate::claude::ContentBlock::tool_result(
+                                        "tool-1".into(),
+                                        "found fib".into(),
+                                        None,
+                                    ),
+                                    crate::claude::ContentBlock::tool_result(
+                                        "tool-2".into(),
+                                        "revision 7".into(),
+                                        None,
+                                    ),
+                                ],
+                            ),
+                            crate::claude::Message::with_content(
+                                "assistant",
+                                vec![
+                                    crate::claude::ContentBlock::opaque_reasoning("opaque-final"),
+                                    crate::claude::ContentBlock::text("(say \"done\")"),
+                                ],
+                            ),
+                        ],
+                        invocation_metadata: None,
+                    },
+                ),
             ],
             program_stack: Vec::new(),
             attachments: Vec::new(),
@@ -6167,16 +6250,29 @@ mod handler_tests {
             pending_schedule_dues: Vec::new(),
             effect_audits: Vec::new(),
         };
+        let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        for event in &mut snapshot.events[1..] {
+            event.run_id = Some(run_id);
+        }
 
         let messages = named_brain_provider_messages(&snapshot);
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
         assert!(matches!(
             &messages[1].content[..],
             [
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
                 crate::claude::ContentBlock::ToolUse { id, name, .. },
                 crate::claude::ContentBlock::ToolUse { id: id2, name: name2, .. }
-            ] if id == "tool-1" && name == "search_word"
+            ] if encrypted_content == "opaque-tool"
+                && id == "tool-1" && name == "search_word"
                 && id2 == "tool-2" && name2 == "get_vm_state"
+        ));
+        assert!(matches!(
+            &messages[3].content[..],
+            [
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
+                crate::claude::ContentBlock::Text { text },
+            ] if encrypted_content == "opaque-final" && text == "(say \"done\")"
         ));
         assert!(matches!(
             &messages[2].content[..],
@@ -6736,7 +6832,7 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "approved".into(),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::ApprovalRequested {
@@ -7392,7 +7488,7 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "triple defined".into(),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::Call {
@@ -8161,7 +8257,7 @@ mod handler_tests {
                     request_seq: 1,
                     output: "forged".into(),
                     error: None,
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                 },
             )
@@ -8255,7 +8351,7 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "spec-secret-result".into(),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::Call {
@@ -8425,7 +8521,7 @@ mod handler_tests {
                     request_seq: program.seq,
                     output: "v13-secret-result".into(),
                     error: None,
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                 },
             )
@@ -8611,7 +8707,7 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "remembered".into(),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                     turn_events: Vec::new(),
                     runtime_revision: outcome.output_revision,

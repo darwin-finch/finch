@@ -895,7 +895,7 @@ struct BrainTurnResult {
   effectJournal   @7 :List(BrainEffectRecord);
   hasCommitAck    @8 :Bool;
   commitAck       @9 :BrainTurnCommitAck;
-  assistantMessages @10 :List(Message);
+  continuationMessages @10 :List(Message);
   hasInvocationMetadata @11 :Bool;
   invocationMetadata @12 :InvocationMetadata;
 }
@@ -1098,7 +1098,7 @@ struct BrainResult {
   output     @1 :Text;
   hasError   @2 :Bool;
   error      @3 :Text;
-  assistantMessages @4 :List(Message);
+  continuationMessages @4 :List(Message);
   hasInvocationMetadata @5 :Bool;
   invocationMetadata @6 :InvocationMetadata;
 }

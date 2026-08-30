@@ -266,8 +266,8 @@ pub struct RunnerTurnResult {
     pub source: String,
     pub language: ProgramLanguage,
     pub output: String,
-    /// Exact ordered provider assistant blocks, including opaque reasoning.
-    pub assistant_content: Vec<crate::claude::ContentBlock>,
+    /// Exact ordered provider/tool continuation messages, including opaque reasoning.
+    pub continuation_messages: Vec<crate::claude::Message>,
     /// Completed provider identity/accounting for durable Brain provenance.
     pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
     pub turn_events: Vec<RunnerTurnEvent>,
@@ -1373,7 +1373,7 @@ mod tests {
                     source: "(say \"42\")".into(),
                     language: ProgramLanguage::Lisp,
                     output: "42".into(),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                     turn_events: Vec::new(),
                     runtime_revision: 1,

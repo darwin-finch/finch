@@ -1288,10 +1288,12 @@ impl brain_runner::Server for BrainRunnerImpl {
                         }
                     });
                     result.set_output(&response.output);
-                    if !response.assistant_content.is_empty() {
-                        super::brain_codec::encode_assistant_content(
-                            result.reborrow().init_assistant_messages(1),
-                            &response.assistant_content,
+                    if !response.continuation_messages.is_empty() {
+                        super::brain_codec::encode_continuation_messages(
+                            result.reborrow().init_continuation_messages(
+                                response.continuation_messages.len() as u32,
+                            ),
+                            &response.continuation_messages,
                         )
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
                     }

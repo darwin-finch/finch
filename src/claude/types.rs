@@ -101,7 +101,7 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     #[serde(with = "content_serializer")]

@@ -2384,9 +2384,9 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
-        assistant_content: crate::ipc::brain_codec::decode_assistant_content(
+        continuation_messages: crate::ipc::brain_codec::decode_continuation_messages(
             result
-                .get_assistant_messages()
+                .get_continuation_messages()
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?,
@@ -4507,11 +4507,35 @@ mod tests {
             result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
             result.set_output("done");
             result.set_runtime_revision(1);
-            super::super::brain_codec::encode_assistant_content(
-                result.reborrow().init_assistant_messages(1),
+            super::super::brain_codec::encode_continuation_messages(
+                result.reborrow().init_continuation_messages(3),
                 &[
-                    crate::claude::ContentBlock::opaque_reasoning("opaque-runner-token"),
-                    crate::claude::ContentBlock::text("(say \"done\")"),
+                    crate::claude::Message::with_content(
+                        "assistant",
+                        vec![
+                            crate::claude::ContentBlock::opaque_reasoning("opaque-tool-token"),
+                            crate::claude::ContentBlock::ToolUse {
+                                id: "tool-1".into(),
+                                name: "search_word".into(),
+                                input: serde_json::json!({"query":"fib"}),
+                            },
+                        ],
+                    ),
+                    crate::claude::Message::with_content(
+                        "user",
+                        vec![crate::claude::ContentBlock::tool_result(
+                            "tool-1".into(),
+                            "found".into(),
+                            None,
+                        )],
+                    ),
+                    crate::claude::Message::with_content(
+                        "assistant",
+                        vec![
+                            crate::claude::ContentBlock::opaque_reasoning("opaque-runner-token"),
+                            crate::claude::ContentBlock::text("(say \"done\")"),
+                        ],
+                    ),
                 ],
             )
             .unwrap();
@@ -4607,7 +4631,7 @@ mod tests {
         );
         assert_eq!(decoded.effect_journal, vec![expected_effect]);
         assert!(matches!(
-            decoded.assistant_content.as_slice(),
+            decoded.continuation_messages.last().unwrap().content.as_slice(),
             [
                 crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
                 crate::claude::ContentBlock::Text { text },

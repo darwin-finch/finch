@@ -295,36 +295,24 @@ pub(super) fn decode_invocation_metadata(
     Ok(metadata)
 }
 
-pub(super) fn encode_assistant_content(
+pub(super) fn encode_continuation_messages(
     builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
-    content: &[crate::claude::ContentBlock],
+    messages: &[crate::claude::Message],
 ) -> anyhow::Result<()> {
-    encode_messages(
-        builder,
-        &[crate::claude::Message {
-            role: "assistant".to_string(),
-            content: content.to_vec(),
-        }],
-    )
+    encode_messages(builder, messages)
 }
 
-pub(super) fn decode_assistant_content(
+pub(super) fn decode_continuation_messages(
     messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
-) -> anyhow::Result<Vec<crate::claude::ContentBlock>> {
-    if messages.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> anyhow::Result<Vec<crate::claude::Message>> {
+    let decoded = decode_messages(messages)?;
     anyhow::ensure!(
-        messages.len() == 1,
-        "Brain result has multiple assistant messages"
+        decoded
+            .iter()
+            .all(|message| matches!(message.role.as_str(), "assistant" | "user")),
+        "Brain continuation message role is invalid"
     );
-    let mut decoded = decode_messages(messages)?;
-    let message = decoded.pop().expect("one message was validated");
-    anyhow::ensure!(
-        message.role == "assistant",
-        "Brain result message role is invalid"
-    );
-    Ok(message.content)
+    Ok(decoded)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1608,7 +1596,7 @@ pub(super) fn encode_event(
             request_seq,
             output,
             error,
-            assistant_content,
+            continuation_messages,
             invocation_metadata,
         } => {
             let mut result = builder.init_result();
@@ -1618,10 +1606,12 @@ pub(super) fn encode_event(
                 result.set_has_error(true);
                 result.set_error(error);
             }
-            if !assistant_content.is_empty() {
-                encode_assistant_content(
-                    result.reborrow().init_assistant_messages(1),
-                    assistant_content,
+            if !continuation_messages.is_empty() {
+                encode_continuation_messages(
+                    result
+                        .reborrow()
+                        .init_continuation_messages(continuation_messages.len() as u32),
+                    continuation_messages,
                 )?;
             }
             if let Some(metadata) = invocation_metadata {
@@ -1850,7 +1840,9 @@ pub(super) fn decode_event(
                     .transpose()?
                     .map(text)
                     .transpose()?,
-                assistant_content: decode_assistant_content(result.get_assistant_messages()?)?,
+                continuation_messages: decode_continuation_messages(
+                    result.get_continuation_messages()?,
+                )?,
                 invocation_metadata: result
                     .get_has_invocation_metadata()
                     .then(|| result.get_invocation_metadata())
@@ -2126,7 +2118,7 @@ mod tests {
                 request_seq: 1,
                 output: "forged".into(),
                 error: None,
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
         )
@@ -2247,10 +2239,13 @@ mod tests {
                 request_seq: 5,
                 output: "done".into(),
                 error: Some("example".into()),
-                assistant_content: vec![
-                    crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
-                    crate::claude::ContentBlock::text("(say \"done\")"),
-                ],
+                continuation_messages: vec![crate::claude::Message::with_content(
+                    "assistant",
+                    vec![
+                        crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
+                        crate::claude::ContentBlock::text("(say \"done\")"),
+                    ],
+                )],
                 invocation_metadata: Some(crate::providers::types::InvocationMetadata {
                     requested_model: "gpt-5.6".into(),
                     resolved_model: "gpt-5.6".into(),

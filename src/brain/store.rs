@@ -568,10 +568,10 @@ pub enum BrainEventKind {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        /// Exact ordered provider assistant blocks. Legacy results decode as
-        /// empty and retain their historical text-only projection.
+        /// Exact ordered provider/tool continuation. Legacy results decode as
+        /// empty and retain their historical projection.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        assistant_content: Vec<crate::claude::ContentBlock>,
+        continuation_messages: Vec<crate::claude::Message>,
         /// Provider identity/accounting captured at the completed invocation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
@@ -3078,7 +3078,7 @@ impl BrainStore {
                 request_seq,
                 output: String::new(),
                 error: Some(detail.clone()),
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
         });
@@ -5368,7 +5368,7 @@ impl BrainStore {
                         request_seq: intent.request_seq,
                         output: String::new(),
                         error: Some(intent.detail.clone()),
-                        assistant_content: Vec::new(),
+                        continuation_messages: Vec::new(),
                         invocation_metadata: None,
                     },
                 };
@@ -7207,7 +7207,7 @@ mod tests {
                 request_seq: 1,
                 output: String::new(),
                 error: Some("torn disconnect".into()),
-                assistant_content: Vec::new(),
+                continuation_messages: Vec::new(),
                 invocation_metadata: None,
             },
         };

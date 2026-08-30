@@ -4683,7 +4683,7 @@ mod tests {
                     source: "(define (approved) : int 1)".into(),
                     language: ProgramLanguage::Lisp,
                     output: "approved remotely".into(),
-                    assistant_content: Vec::new(),
+                    continuation_messages: Vec::new(),
                     invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::ApprovalRequested {
