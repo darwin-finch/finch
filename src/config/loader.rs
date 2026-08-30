@@ -278,10 +278,7 @@ mod tests {
 
         std::fs::write(&config_path, "this is not valid Finch TOML = [").unwrap();
         let error = try_load_from_path(&config_path).unwrap_err().to_string();
-        assert!(
-            error.contains("Failed to parse configuration") || error.contains("configuration"),
-            "unexpected load error: {error}"
-        );
+        assert!(error.contains("Failed to parse config file"), "{error}");
         assert!(
             config_path.exists(),
             "a failed load must not remove the file"
