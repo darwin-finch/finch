@@ -1458,7 +1458,8 @@ where
     E: ChatGptSetupRecoveryEditor,
 {
     let mut working = result.clone();
-    for _ in 0..MAX_CHATGPT_SETUP_ATTEMPTS {
+    let mut auth_attempts = 0;
+    loop {
         let references = chatgpt_setup_references(&working);
         if references.is_empty() {
             return Ok(Some((
@@ -1467,6 +1468,12 @@ where
                 Vec::new(),
             )));
         }
+        if auth_attempts == MAX_CHATGPT_SETUP_ATTEMPTS {
+            anyhow::bail!(
+                "ChatGPT setup reached the retry limit; setup was not saved and no authorization remains pending"
+            );
+        }
+        auth_attempts += 1;
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let signal_cancel = cancel.clone();
@@ -1502,9 +1509,6 @@ where
             },
         }
     }
-    anyhow::bail!(
-        "ChatGPT setup reached the retry limit; setup was not saved and no authorization remains pending"
-    )
 }
 
 fn chatgpt_setup_references(result: &SetupResult) -> std::collections::BTreeSet<String> {
@@ -9927,6 +9931,46 @@ mod tests {
             authenticator.calls.lock().unwrap().len(),
             MAX_CHATGPT_SETUP_ATTEMPTS
         );
+        assert_eq!(
+            authenticator
+                .active
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_final_allowed_failure_can_remove_sole_provider_without_ninth_ceremony() {
+        let result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let authenticator = ScriptedRecoveryAuthenticator::new(
+            (0..MAX_CHATGPT_SETUP_ATTEMPTS).map(|_| ScriptedChatGptOutcome::ProviderRejected(503)),
+        );
+        let mut actions = std::collections::VecDeque::from(vec![
+            ChatGptSetupRecoveryAction::RetrySignIn;
+            MAX_CHATGPT_SETUP_ATTEMPTS - 1
+        ]);
+        actions.push_back(ChatGptSetupRecoveryAction::RemoveProvider);
+        let mut editor = ScriptedRecoveryEditor::new(actions);
+        let (config, committed, compensations) = run_chatgpt_setup_recovery_loop(
+            SetupInvocation::Command,
+            &result,
+            &authenticator,
+            &mut editor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            authenticator.calls.lock().unwrap().len(),
+            MAX_CHATGPT_SETUP_ATTEMPTS
+        );
+        assert!(chatgpt_setup_references(&committed).is_empty());
+        assert!(config.providers.is_empty());
+        assert!(compensations.is_empty());
         assert_eq!(
             authenticator
                 .active
