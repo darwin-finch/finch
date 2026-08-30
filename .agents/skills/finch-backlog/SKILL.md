@@ -32,11 +32,12 @@ Recompute this frontier after every merge, newly discovered blocker, or changed 
 
 ## Claim work before mutation
 
-1. Inspect assignees, open pull requests, branches, worktrees, running agents, and active claim comments before taking an issue.
+1. Query and parse active `finch-work-claim:v1` events across all open repository issues, then inspect assignees, open pull requests, branches, worktrees, and running agents before taking an issue. If claim discovery is unavailable or incomplete, do not mutate; retry or ask the coordinator.
 2. If another active claim overlaps the files or semantic scope, coordinate with that worker or choose another ready issue. Do not create a competing implementation merely because the other worker is a different tool or person.
-3. After creating the dedicated branch/worktree and before editing production files, publish a claim using [the work-claim protocol](references/work-claims.md). Include the worker/session identity, responsible GitHub actor, branch, worktree, base SHA, bounded scope, and UTC timestamp.
-4. Assign the issue to the responsible GitHub user when repository permissions and the working arrangement allow it. Assignment supplements the claim; it does not replace it when several agents share one GitHub identity.
-5. Recheck active claims immediately before widening scope or merging. Publish a release, completion, or supersession event when ownership ends so stale claims do not strand work.
+3. After creating the dedicated branch/worktree and before editing production files, post exactly one `finch-work-claim:v1` GitHub issue comment using [the work-claim protocol](references/work-claims.md). This versioned comment is the sole authoritative ownership mechanism; do not substitute an assignee, label, project field, branch, draft PR, or unstructured prose.
+4. Require the returned issue-comment URL, then repeat the repository-wide claim query and apply the protocol's deterministic collision rule. If the comment cannot be posted or verified, do not begin implementation; ask a coordinator to establish the claim.
+5. Optionally assign the responsible GitHub user for human accountability. Assignment is informational and never establishes or releases ownership.
+6. Repeat the repository-wide authoritative-claim check immediately before widening scope and immediately before merging. Publish the exact terminal event when ownership ends so stale claims do not strand work.
 
 ## Isolate and delegate work
 
