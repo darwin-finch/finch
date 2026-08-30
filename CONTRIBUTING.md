@@ -4,9 +4,9 @@ Thank you for improving Finch. The project accepts focused fixes, tests, documen
 discussion. Before starting a large change, open or join an issue so implementation and conformance
 work can be coordinated.
 
-Codex contributors can invoke the repository-owned `$finch-goal-seek` skill to audit the current
+Codex contributors can invoke the repository-owned `$finch-backlog` skill to audit the current
 GitHub dependency frontier and carry an issue through an isolated worktree, regression, review, CI,
-merge evidence, and cleanup. The skill lives in `.agents/skills/finch-goal-seek`; changes to the
+merge evidence, and cleanup. The skill lives in `.agents/skills/finch-backlog`; changes to the
 workflow are ordinary reviewable repository changes rather than private assistant configuration.
 
 ## Development setup

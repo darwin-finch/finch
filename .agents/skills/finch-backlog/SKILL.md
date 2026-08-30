@@ -1,9 +1,9 @@
 ---
-name: finch-goal-seek
+name: finch-backlog
 description: Autonomously work Finch's highest-priority unblocked GitHub issues through isolated implementation, regression testing, independent review, merge evidence, and frontier recomputation. Use for Finch backlog, dogfood, release-gate, issue-swarm, or "FIX SHIT" requests; do not use for a single read-only question or an unrelated repository.
 ---
 
-# Finch Goal Seek
+# Finch Backlog Driver
 
 Drive an outcome-level Finch goal until its stated gate is genuinely satisfied. Treat a merged patch as progress, not as the terminal condition.
 
