@@ -224,6 +224,17 @@ pub enum DevicePoll {
     AuthorizationCode(AuthorizationCodeGrant),
 }
 
+/// Typed terminal device-authorization outcomes used by interactive recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OAuthDeviceAuthorizationError {
+    #[error("OAuth device authorization was cancelled")]
+    Cancelled,
+    #[error("OAuth device authorization expired")]
+    Expired,
+    #[error("OAuth device authorization was denied")]
+    Denied,
+}
+
 /// A provider-issued authorization code plus the correlated verifier.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AuthorizationCodeGrant {
@@ -622,8 +633,8 @@ where
         let mut interval = bounded_poll_interval(pending.interval);
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => bail!("OAuth device authorization was cancelled"),
-                _ = tokio::time::sleep_until(deadline) => bail!("OAuth device authorization expired"),
+                _ = cancel.cancelled() => return Err(OAuthDeviceAuthorizationError::Cancelled.into()),
+                _ = tokio::time::sleep_until(deadline) => return Err(OAuthDeviceAuthorizationError::Expired.into()),
                 _ = tokio::time::sleep(interval) => {}
             }
             let request = self.dialect.device_poll_request(pending)?;
@@ -639,8 +650,8 @@ where
                         .min(MAX_POLL_INTERVAL);
                     continue;
                 }
-                DevicePoll::Denied => bail!("OAuth device authorization was denied"),
-                DevicePoll::Expired => bail!("OAuth device authorization expired"),
+                DevicePoll::Denied => return Err(OAuthDeviceAuthorizationError::Denied.into()),
+                DevicePoll::Expired => return Err(OAuthDeviceAuthorizationError::Expired.into()),
                 DevicePoll::Tokens(body) => {
                     self.dialect
                         .validate_tokens(
@@ -1107,8 +1118,8 @@ where
         ensure_device_authorization_active(cancel, deadline)?;
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => bail!("OAuth device authorization was cancelled"),
-            _ = tokio::time::sleep_until(deadline) => bail!("OAuth device authorization expired"),
+            _ = cancel.cancelled() => Err(OAuthDeviceAuthorizationError::Cancelled.into()),
+            _ = tokio::time::sleep_until(deadline) => Err(OAuthDeviceAuthorizationError::Expired.into()),
             response = self.post_form_bytes_cancellable(request, cancel) => response,
         }
     }
@@ -1119,10 +1130,10 @@ fn ensure_device_authorization_active(
     deadline: tokio::time::Instant,
 ) -> Result<()> {
     if cancel.is_cancelled() {
-        bail!("OAuth device authorization was cancelled");
+        return Err(OAuthDeviceAuthorizationError::Cancelled.into());
     }
     if tokio::time::Instant::now() >= deadline {
-        bail!("OAuth device authorization expired");
+        return Err(OAuthDeviceAuthorizationError::Expired.into());
     }
     Ok(())
 }

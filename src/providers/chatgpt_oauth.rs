@@ -42,6 +42,18 @@ pub(crate) const OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE: &str = "https://api.openai.
 const CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+/// Status-only ChatGPT device endpoint failures. Upstream bodies are never
+/// retained in these typed causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChatGptDeviceEndpointError {
+    #[error("ChatGPT device authorization is disabled or unsupported for this account (HTTP 404)")]
+    StartDisabledOrUnsupported,
+    #[error("ChatGPT device authorization is unavailable (HTTP {0})")]
+    StartRejected(u16),
+    #[error("ChatGPT device polling ended (HTTP {0})")]
+    PollRejected(u16),
+}
+
 /// Exact scopes for the pinned public-client compatibility revision.
 pub fn chatgpt_required_scopes() -> BTreeSet<String> {
     BTreeSet::from([
@@ -203,9 +215,9 @@ where
     ) -> Result<DeviceAuthorization> {
         if !status.is_success() {
             if status == StatusCode::NOT_FOUND {
-                bail!("ChatGPT device authorization is disabled or unsupported for this account (HTTP 404); check ChatGPT Settings > Security, then retry sign-in");
+                return Err(ChatGptDeviceEndpointError::StartDisabledOrUnsupported.into());
             }
-            bail!("ChatGPT device authorization is unavailable (HTTP {status})");
+            return Err(ChatGptDeviceEndpointError::StartRejected(status.as_u16()).into());
         }
         let device_code = required_string(&body, "device_auth_id")?;
         let user_code = body
@@ -261,7 +273,7 @@ where
             return Ok(DevicePoll::Pending);
         }
         if !status.is_success() {
-            bail!("ChatGPT device polling ended (HTTP {status})");
+            return Err(ChatGptDeviceEndpointError::PollRejected(status.as_u16()).into());
         }
         let code = required_string(&body, "authorization_code")?;
         let verifier = required_string(&body, "code_verifier")?;
@@ -855,10 +867,13 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 json!({"error": "unsupported-secret-sentinel"}),
             )
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<ChatGptDeviceEndpointError>(),
+            Some(ChatGptDeviceEndpointError::StartDisabledOrUnsupported)
+        ));
+        let missing = missing.to_string();
         assert!(missing.contains("disabled or unsupported"), "{missing}");
-        assert!(missing.contains("Settings > Security"), "{missing}");
         assert!(
             !missing.contains("unsupported-secret-sentinel"),
             "{missing}"
