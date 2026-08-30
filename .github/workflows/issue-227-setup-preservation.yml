@@ -52,6 +52,9 @@ jobs:
         run: cargo test --lib config::credential::tests::test_identity_scopes_and_lifecycle_rejections_are_field_specific -- --exact
       - name: Broken persisted setup is fail closed
         run: cargo test --lib config::loader::tests::test_setup_loader_distinguishes_absent_from_broken_existing_config -- --exact
+      - name: Config symlinks cannot become destructive first-run state
+        if: runner.os != 'Windows'
+        run: cargo test --lib config::loader::tests::test_setup_loader_rejects_dangling_config_symlink_as_existing_state -- --exact
       - name: Exact provider and credential graph survives setup
         run: cargo test --lib cli::setup_wizard::tests::test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph -- --exact
       - name: Empty-state and cancellation regressions
