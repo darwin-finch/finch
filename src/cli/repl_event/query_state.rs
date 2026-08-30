@@ -230,11 +230,20 @@ impl QueryStateManager {
     }
 
     /// Cancel a query
-    pub async fn cancel_query(&self, query_id: Uuid) {
-        if let Some(metadata) = self.states.read().await.get(&query_id) {
-            metadata.cancellation_token.cancel();
+    pub async fn cancel_query(&self, query_id: Uuid) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        if matches!(
+            metadata.state,
+            QueryState::Completed { .. } | QueryState::Failed { .. } | QueryState::Cancelled
+        ) {
+            return false;
         }
-        self.update_state(query_id, QueryState::Cancelled).await;
+        metadata.cancellation_token.cancel();
+        metadata.state = QueryState::Cancelled;
+        true
     }
 
     /// Remove a completed/failed/cancelled query (cleanup)
@@ -386,7 +395,7 @@ mod tests {
     async fn test_cancel_query_sets_cancelled_state() {
         let manager = QueryStateManager::new();
         let id = manager.create_query(vec![]).await;
-        manager.cancel_query(id).await;
+        assert!(manager.cancel_query(id).await);
         assert!(matches!(
             manager.get_state(id).await.unwrap(),
             QueryState::Cancelled
@@ -429,6 +438,33 @@ mod tests {
         assert!(matches!(
             manager.get_state(id).await,
             Some(QueryState::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn published_completion_cannot_be_reclassified_as_cancelled() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let conversation = Arc::new(RwLock::new(
+            crate::cli::conversation::ConversationHistory::new(),
+        ));
+
+        assert!(
+            manager
+                .try_publish_completion(
+                    id,
+                    "rendered".to_string(),
+                    "provider source".to_string(),
+                    &conversation,
+                )
+                .await
+        );
+        assert!(!manager.cancel_query(id).await);
+
+        assert_eq!(conversation.read().await.get_messages().len(), 1);
+        assert!(matches!(
+            manager.get_state(id).await,
+            Some(QueryState::Completed { response }) if response == "rendered"
         ));
     }
 

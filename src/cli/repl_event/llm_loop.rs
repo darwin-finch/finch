@@ -163,6 +163,7 @@ impl LlmLoop {
                     admission,
                     admission_ready,
                     spawned,
+                    publication,
                 } => {
                     if let Some(ready) = admission_ready {
                         if ready.send(()).is_err() {
@@ -174,14 +175,8 @@ impl LlmLoop {
                             continue;
                         }
                     }
-                    if let Some(spawned) = spawned {
-                        // A timed-out caller drops this receiver. Treat that as
-                        // revoked admission and never start provider work.
-                        if spawned.send(()).is_err() {
-                            continue;
-                        }
-                    }
-                    self.spawn_query(id, text, no_tools).await;
+                    self.spawn_query(id, text, no_tools, publication, spawned)
+                        .await;
                 }
             }
         }
@@ -191,7 +186,14 @@ impl LlmLoop {
     ///
     /// `query = ""` for tool-continuation turns (graph is not reset).
     /// `no_tools = true` suppresses tool definitions for conversational turns.
-    async fn spawn_query(&self, query_id: Uuid, query: String, no_tools: bool) {
+    async fn spawn_query(
+        &self,
+        query_id: Uuid,
+        query: String,
+        no_tools: bool,
+        publication: Option<tokio::sync::oneshot::Receiver<()>>,
+        spawned: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
         // Reset the execution graph on fresh queries (not tool continuations).
         if !query.is_empty() {
             let mut g = self.current_graph.lock().await;
@@ -242,6 +244,11 @@ impl LlmLoop {
         let terminal_query_states = Arc::clone(&query_states);
 
         tokio::spawn(async move {
+            if let Some(publication) = publication {
+                if publication.await.is_err() {
+                    return;
+                }
+            }
             process_query_with_tools(
                 query_id,
                 query,
@@ -286,5 +293,8 @@ impl LlmLoop {
                 pinned_generators.release(query_id).await;
             }
         });
+        if let Some(spawned) = spawned {
+            let _ = spawned.send(());
+        }
     }
 }

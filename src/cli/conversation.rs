@@ -303,9 +303,9 @@ impl ConversationHistory {
         Ok(ordered_results)
     }
 
-    /// Apply ordinary context limits after the continuation task has accepted
-    /// the complete pair. Keeping trimming out of the reversible interval
-    /// prevents an admission failure from discarding older committed history.
+    /// Apply ordinary context limits to the complete pair before its durable
+    /// checkpoint and publication permit are released. Callers retain a full
+    /// pre-commit clone until those boundaries succeed.
     pub fn finalize_tool_round_commit(&mut self) {
         self.trim_if_needed();
     }

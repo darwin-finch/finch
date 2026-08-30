@@ -263,6 +263,9 @@ pub enum LlmRequest {
         admission: Option<tokio::sync::oneshot::Receiver<()>>,
         admission_ready: Option<tokio::sync::oneshot::Sender<()>>,
         spawned: Option<tokio::sync::oneshot::Sender<()>>,
+        /// A spawned continuation waits for this durable-publication permit
+        /// before it may read history or contact the provider.
+        publication: Option<tokio::sync::oneshot::Receiver<()>>,
     },
 }
 

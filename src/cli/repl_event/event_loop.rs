@@ -72,6 +72,7 @@ async fn commit_tool_round_and_continue(
     let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+    let (publication_tx, publication_rx) = tokio::sync::oneshot::channel();
     llm_tx
         .send(LlmRequest::Query {
             id: query_id,
@@ -80,41 +81,40 @@ async fn commit_tool_round_and_continue(
             admission: Some(admit_rx),
             admission_ready: Some(ready_tx),
             spawned: Some(spawned_tx),
+            publication: Some(publication_rx),
         })
         .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?;
     tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
         .await
         .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?
         .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?;
-    {
+    let before_commit = {
         let mut history = conversation.write().await;
+        let before_commit = history.clone();
         history.commit_tool_round(query_id, round_token)?;
-        if let Some(path) = checkpoint_path {
-            if let Err(error) = history.save(path) {
-                history.rollback_last_tool_round(query_id, round_token)?;
-                return Err(
-                    crate::cli::conversation::ToolRoundError::PersistenceUnavailable(
-                        error.to_string(),
-                    ),
-                );
-            }
-        }
-    }
+        history.finalize_tool_round_commit();
+        before_commit
+    };
     let _ = admit_tx.send(());
     if !matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), spawned_rx).await,
         Ok(Ok(()))
     ) {
-        let mut history = conversation.write().await;
-        history.rollback_last_tool_round(query_id, round_token)?;
-        if let Some(path) = checkpoint_path {
-            history.save(path).map_err(|error| {
-                crate::cli::conversation::ToolRoundError::PersistenceUnavailable(error.to_string())
-            })?;
-        }
+        *conversation.write().await = before_commit;
         return Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable);
     }
-    conversation.write().await.finalize_tool_round_commit();
+    if let Some(path) = checkpoint_path {
+        let save_result = conversation.read().await.save(path);
+        if let Err(error) = save_result {
+            *conversation.write().await = before_commit;
+            return Err(
+                crate::cli::conversation::ToolRoundError::PersistenceUnavailable(error.to_string()),
+            );
+        }
+    }
+    if publication_tx.send(()).is_err() {
+        return Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable);
+    }
     Ok(())
 }
 
@@ -3601,13 +3601,14 @@ Rules:\n\
         }
 
         // Drain any pending images from TUI (pasted before sending)
-        let pending_images: Vec<(String, String)> = {
+        let pending_image_entries: Vec<(usize, String, String)> = {
             let mut tui = self.tui_renderer.lock().await;
-            tui.pending_images
-                .drain(..)
-                .map(|(_idx, b64, media_type)| (media_type, b64))
-                .collect()
+            tui.pending_images.drain(..).collect()
         };
+        let pending_images: Vec<(String, String)> = pending_image_entries
+            .iter()
+            .map(|(_, b64, media_type)| (media_type.clone(), b64.clone()))
+            .collect();
 
         // Echo query to output buffer (skip when caller already echoed)
         if echo {
@@ -3618,19 +3619,28 @@ Rules:\n\
         let conversation_snapshot = self.conversation.read().await.snapshot();
         let query_id = self.query_states.create_query(conversation_snapshot).await;
 
-        // Add user message to conversation (with images if any were pasted)
+        // Build and durably checkpoint the next provider-visible history
+        // before publishing it in memory or dispatching provider work.
+        let mut proposed_history = self.conversation.read().await.clone();
         if pending_images.is_empty() {
-            self.conversation
-                .write()
-                .await
-                .add_user_message(input.clone());
+            proposed_history.add_user_message(input.clone());
         } else {
-            self.conversation
-                .write()
-                .await
-                .add_user_message_with_images(input.clone(), &pending_images);
+            proposed_history.add_user_message_with_images(input.clone(), &pending_images);
         }
-        self.checkpoint_conversation().await?;
+        if let Err(error) = self.checkpoint_history(&proposed_history) {
+            self.query_states.remove_query(query_id).await;
+            self.tui_renderer
+                .lock()
+                .await
+                .pending_images
+                .extend(pending_image_entries);
+            self.report_checkpoint_error(
+                "Query was not sent; its conversation checkpoint could not be written",
+                &error,
+            );
+            return Ok(());
+        }
+        *self.conversation.write().await = proposed_history;
 
         // Update compaction percentage in status bar
         self.update_compaction_status().await;
@@ -3646,6 +3656,7 @@ Rules:\n\
             admission: None,
             admission_ready: None,
             spawned: None,
+            publication: None,
         });
 
         Ok(())
@@ -4105,13 +4116,17 @@ Rules:\n\
                 {
                     return Ok(());
                 }
-                self.checkpoint_conversation().await?;
-
                 // Update compaction percentage in status bar
                 self.update_compaction_status().await;
 
                 // Display response
                 self.output_manager.write_response(&response);
+                if let Err(error) = self.checkpoint_conversation().await {
+                    self.report_checkpoint_error(
+                        "Response is retained in memory, but its recovery checkpoint failed",
+                        &error,
+                    );
+                }
             }
 
             ReplEvent::QueryFailed { query_id, error } => {
@@ -4437,7 +4452,12 @@ Rules:\n\
 
                 // Update context usage indicator now that the message is committed
                 self.update_compaction_status().await;
-                self.checkpoint_conversation().await?;
+                if let Err(error) = self.checkpoint_conversation().await {
+                    self.report_checkpoint_error(
+                        "Response is retained in memory, but its recovery checkpoint failed",
+                        &error,
+                    );
+                }
 
                 self.finish_named_brain_turn(query_id, full_response.clone())
                     .await;
@@ -4532,7 +4552,10 @@ Rules:\n\
                 if let Some(qid) = query_id {
                     // Fire the per-query cancellation token so handle_present_plan
                     // (and any other token-aware loops) can detect the cancel immediately.
-                    self.query_states.cancel_query(qid).await;
+                    if !self.query_states.cancel_query(qid).await {
+                        tracing::debug!("Ignoring cancellation for already-terminal query {}", qid);
+                        return Ok(());
+                    }
                     self.conversation.write().await.abort_staged(qid);
                     self.close_active_tool_rows(qid, "cancelled").await;
                     let named_turn =
@@ -5179,6 +5202,7 @@ Rules:\n\
                 admission: None,
                 admission_ready: None,
                 spawned: None,
+                publication: None,
             })
             .is_err()
         {
@@ -5220,7 +5244,10 @@ Rules:\n\
             let _ = request.response_tx.send(Ok(false));
             return;
         };
-        self.query_states.cancel_query(query_id).await;
+        if !self.query_states.cancel_query(query_id).await {
+            let _ = request.response_tx.send(Ok(false));
+            return;
+        }
         self.conversation.write().await.abort_staged(query_id);
         self.close_active_tool_rows(query_id, "cancelled remotely")
             .await;
@@ -6789,10 +6816,21 @@ Rules:\n\
     /// Persist the latest committed history after each publication boundary.
     /// Staged rounds are omitted by `ConversationHistory` serialization.
     async fn checkpoint_conversation(&self) -> Result<()> {
+        let history = self.conversation.read().await;
+        self.checkpoint_history(&history)
+    }
+
+    fn checkpoint_history(&self, history: &ConversationHistory) -> Result<()> {
         let Some(path) = self.conversation_checkpoint_path() else {
             return Ok(());
         };
-        self.conversation.read().await.save(path)
+        history.save(path)
+    }
+
+    fn report_checkpoint_error(&self, context: &str, error: &anyhow::Error) {
+        self.output_manager.write_error(format!(
+            "{context}: {error:#}. Check free space and write access under ~/.finch/sessions, then retry."
+        ));
     }
 
     /// Close the visible rows owned by a cancelled query without consuming its
@@ -7018,12 +7056,19 @@ Rules:\n\
                 self.tool_call_history.write().await.remove(&query_id);
 
                 // Reset conversation to a single clear execution prompt.
-                {
-                    let mut conv = self.conversation.write().await;
-                    conv.clear();
-                    conv.add_user_message(directive);
+                let mut proposed_history = self.conversation.read().await.clone();
+                proposed_history.clear();
+                proposed_history.add_user_message(directive);
+                if let Err(error) = self.checkpoint_history(&proposed_history) {
+                    let _ = self.event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: format!(
+                            "Plan continuation was not sent because its checkpoint failed: {error:#}"
+                        ),
+                    });
+                    return Ok(());
                 }
-                self.checkpoint_conversation().await?;
+                *self.conversation.write().await = proposed_history;
 
                 let _ = self.llm_tx.send(LlmRequest::Query {
                     id: query_id,
@@ -7032,6 +7077,7 @@ Rules:\n\
                     admission: None,
                     admission_ready: None,
                     spawned: None,
+                    publication: None,
                 });
                 return Ok(());
             }
@@ -8687,6 +8733,7 @@ mod tests {
                 admission,
                 admission_ready,
                 spawned,
+                publication,
                 ..
             }) = rx.recv().await
             {
@@ -8701,6 +8748,11 @@ mod tests {
                 if let Some(spawned) = spawned {
                     let _ = spawned.send(());
                 }
+                if let Some(publication) = publication {
+                    if publication.await.is_err() {
+                        continue;
+                    }
+                }
                 let _ = observed_tx.send(id);
             }
         });
@@ -8713,7 +8765,10 @@ mod tests {
         use crate::cli::conversation::ToolRoundProgress;
 
         let query_id = uuid::Uuid::new_v4();
-        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        let mut conversation =
+            crate::cli::conversation::ConversationHistory::with_limits(2, usize::MAX);
+        conversation.add_user_message("older user");
+        conversation.add_assistant_message("older assistant");
         let token = conversation
             .stage_assistant(
                 query_id,
@@ -8772,6 +8827,11 @@ mod tests {
         assert_eq!(observed_rx.try_recv(), Ok(query_id));
         let restored = crate::cli::conversation::ConversationHistory::load(&checkpoint).unwrap();
         assert_eq!(restored.get_messages().len(), 2);
+        assert_eq!(
+            serde_json::to_value(restored.get_messages()).unwrap(),
+            serde_json::to_value(conversation.read().await.get_messages()).unwrap(),
+            "durable bytes must contain the exact finalized/trimmed history"
+        );
         assert!(super::commit_tool_round_and_continue(
             &conversation,
             query_id,
@@ -8852,17 +8912,20 @@ mod tests {
                 admission,
                 admission_ready,
                 spawned,
+                publication,
                 ..
             }) = rx.recv().await
             {
                 let _ = admission_ready.unwrap().send(());
                 let _ = admission.unwrap().await;
                 drop(spawned);
+                drop(publication);
             }
         });
 
         let directory = tempfile::tempdir().unwrap();
         let checkpoint = directory.path().join("session.json");
+        conversation.read().await.save(&checkpoint).unwrap();
         assert_eq!(
             super::commit_tool_round_and_continue(
                 &conversation,
@@ -8882,6 +8945,51 @@ mod tests {
             .await
             .completed_tool_results(query_id, token)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_revokes_spawned_continuation_and_restores_live_history() {
+        use crate::claude::{ContentBlock, Message};
+        let query_id = uuid::Uuid::new_v4();
+        let mut history = crate::cli::conversation::ConversationHistory::new();
+        let token = history
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "A".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+            )
+            .unwrap();
+        history
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .unwrap();
+        let conversation = std::sync::Arc::new(tokio::sync::RwLock::new(history));
+        let (tx, mut observed_rx) = admitting_llm_channel();
+        let directory = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            super::commit_tool_round_and_continue(
+                &conversation,
+                query_id,
+                token,
+                &tx,
+                Some(directory.path()),
+            )
+            .await,
+            Err(crate::cli::conversation::ToolRoundError::PersistenceUnavailable(_))
+        ));
+        assert!(conversation.read().await.get_messages().is_empty());
+        assert!(conversation
+            .read()
+            .await
+            .completed_tool_results(query_id, token)
+            .is_ok());
+        assert!(observed_rx.try_recv().is_err());
     }
 
     #[test]
