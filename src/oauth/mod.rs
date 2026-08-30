@@ -235,6 +235,13 @@ pub enum OAuthDeviceAuthorizationError {
     Denied,
 }
 
+/// Secret-free marker for a validated OAuth grant that could not be committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OAuthCredentialPersistenceError {
+    #[error("OAuth credential persistence failed")]
+    Commit,
+}
+
 /// A provider-issued authorization code plus the correlated verifier.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct AuthorizationCodeGrant {
@@ -421,6 +428,21 @@ pub trait OAuthDialect: Send + Sync {
         context: &TokenValidationContext,
         cancel: &CancellationToken,
     ) -> Result<OAuthTokenRecord>;
+    /// Decode and validate a bounded token-endpoint response. The default
+    /// preserves the provider-neutral JSON contract.
+    async fn validate_token_response(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+        previous: Option<&OAuthTokenRecord>,
+        context: &TokenValidationContext,
+        cancel: &CancellationToken,
+    ) -> Result<OAuthTokenRecord> {
+        let body =
+            serde_json::from_slice(body).context("OAuth token response was malformed JSON")?;
+        self.validate_tokens(status, body, previous, context, cancel)
+            .await
+    }
 }
 
 /// Correlation authority passed to provider-specific token validation.
@@ -673,12 +695,10 @@ where
                     let request = self.dialect.authorization_code_request(&grant)?;
                     let (status, body_bytes) =
                         self.post_device_request(request, &cancel, deadline).await?;
-                    let body = serde_json::from_slice(&body_bytes)
-                        .context("OAuth token response was malformed JSON")?;
                     self.dialect
-                        .validate_tokens(
+                        .validate_token_response(
                             status,
-                            body,
+                            &body_bytes,
                             None,
                             &TokenValidationContext::Device,
                             &cancel,
@@ -689,7 +709,8 @@ where
             self.validate_record(&tokens, None)?;
             ensure_device_authorization_active(&cancel, deadline)?;
             self.store
-                .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
+                .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)
+                .context(OAuthCredentialPersistenceError::Commit)?;
             return Ok(OAuthCredentialCommit {
                 credential: tokens.provider_credential(reference),
                 generation: tokens.generation.clone(),

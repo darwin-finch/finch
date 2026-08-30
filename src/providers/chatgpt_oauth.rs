@@ -28,7 +28,7 @@ use crate::oauth::{
 };
 
 pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str =
-    "openai-codex-public-client@3e4707b34b16e139fcb7ad11ab8445993b62bba1";
+    "openai-codex-public-client@94cbbddafc1776d5e377bca1b05932c697e82238";
 pub const CHATGPT_SUBSCRIPTION_SERVICE_REVISION: &str =
     "chatgpt-codex-service@6478a751fde8884b2fdc76486fe23175a8e795d4";
 pub(crate) const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -54,6 +54,21 @@ pub enum ChatGptDeviceEndpointError {
     PollRejected(u16),
 }
 
+/// Secret-free stage markers for actionable device-login diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChatGptAuthStageError {
+    #[error("ChatGPT device polling response changed after browser authorization")]
+    PollContract,
+    #[error("ChatGPT authorization-code exchange was rejected (HTTP {0})")]
+    TokenExchangeRejected(u16),
+    #[error("ChatGPT authorization-code exchange response changed")]
+    TokenExchangeContract,
+    #[error("ChatGPT signed identity verification failed")]
+    IdentityVerification,
+    #[error("ChatGPT signed account binding failed")]
+    AccountBinding,
+}
+
 /// Exact scopes for the pinned public-client compatibility revision.
 pub fn chatgpt_required_scopes() -> BTreeSet<String> {
     BTreeSet::from([
@@ -73,14 +88,12 @@ pub struct VerifiedOpenAiClaims {
     pub issuer: String,
     pub audiences: BTreeSet<String>,
     pub authorized_party: Option<String>,
-    pub access_audiences: BTreeSet<String>,
     pub subject: String,
     pub account_id: String,
     /// Verified `https://api.openai.com/auth.chatgpt_plan_type` entitlement.
     pub chatgpt_plan_type: String,
     /// Verified `https://api.openai.com/auth.chatgpt_account_is_fedramp` routing claim.
     pub account_is_fedramp: bool,
-    pub scopes: BTreeSet<String>,
     pub nonce: Option<String>,
     /// Signature-verified JWT `exp` authority.
     pub expires_at: chrono::DateTime<Utc>,
@@ -295,9 +308,9 @@ where
         if !status.is_success() {
             return self.parse_device_poll(status, Value::Null);
         }
-        let body = serde_json::from_slice(body)
-            .context("ChatGPT device polling response was malformed JSON")?;
+        let body = serde_json::from_slice(body).context(ChatGptAuthStageError::PollContract)?;
         self.parse_device_poll(status, body)
+            .context(ChatGptAuthStageError::PollContract)
     }
 
     fn authorization_code_request(
@@ -349,17 +362,18 @@ where
         cancel: &CancellationToken,
     ) -> Result<OAuthTokenRecord> {
         if !status.is_success() {
-            let code = safe_oauth_error_code(&body);
-            bail!("ChatGPT token request failed (HTTP {status}, code {code})");
+            return Err(ChatGptAuthStageError::TokenExchangeRejected(status.as_u16()).into());
         }
-        let access_token = required_string(&body, "access_token")?;
+        let access_token = required_string(&body, "access_token")
+            .context(ChatGptAuthStageError::TokenExchangeContract)?;
         let refresh_token = body
             .get("refresh_token")
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| previous.and_then(|record| record.refresh_token.clone()))
-            .context("ChatGPT token response omitted a refresh token")?;
-        validate_secret_field(&refresh_token, "refresh token")?;
+            .context(ChatGptAuthStageError::TokenExchangeContract)?;
+        validate_secret_field(&refresh_token, "refresh token")
+            .context(ChatGptAuthStageError::TokenExchangeContract)?;
         let id_token = body
             .get("id_token")
             .and_then(Value::as_str)
@@ -367,7 +381,10 @@ where
         let claims = self
             .verifier
             .verify(id_token.as_deref(), &access_token, cancel)
-            .await?;
+            .await
+            .context(ChatGptAuthStageError::IdentityVerification)?;
+        let scopes = granted_scopes(&body, &self.descriptor.scopes)
+            .context(ChatGptAuthStageError::AccountBinding)?;
         let now = Utc::now();
         if claims.issuer != REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
@@ -377,31 +394,31 @@ where
                 .authorized_party
                 .as_deref()
                 .is_some_and(|party| party != self.descriptor.client_id)
-            || claims.access_audiences
-                != BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.to_string()])
-            || !self.descriptor.scopes.is_subset(&claims.scopes)
             || claims.expires_at <= now
             || claims.not_before.is_some_and(|not_before| not_before > now)
         {
-            bail!("ChatGPT token issuer, audience, account, scope, or lifetime validation failed");
+            return Err(ChatGptAuthStageError::AccountBinding.into());
         }
-        validate_public_claim(&claims.subject, "subject")?;
-        validate_public_claim(&claims.account_id, "account identifier")?;
-        validate_public_claim(&claims.chatgpt_plan_type, "plan type")?;
+        validate_public_claim(&claims.subject, "subject")
+            .context(ChatGptAuthStageError::AccountBinding)?;
+        validate_public_claim(&claims.account_id, "account identifier")
+            .context(ChatGptAuthStageError::AccountBinding)?;
+        validate_public_claim(&claims.chatgpt_plan_type, "plan type")
+            .context(ChatGptAuthStageError::AccountBinding)?;
         match context {
             TokenValidationContext::Browser { expected_nonce, .. }
                 if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
             {
-                bail!("ChatGPT browser token nonce mismatch")
+                return Err(ChatGptAuthStageError::AccountBinding.into())
             }
             TokenValidationContext::Refresh if previous.is_none() => {
-                bail!("ChatGPT refresh token validation lacks prior account authority")
+                return Err(ChatGptAuthStageError::AccountBinding.into())
             }
             _ => {}
         }
         if let Some(previous) = previous {
             if previous.account != claims.account_id {
-                bail!("ChatGPT token refresh changed accounts");
+                return Err(ChatGptAuthStageError::AccountBinding.into());
             }
         }
         Ok(OAuthTokenRecord {
@@ -415,7 +432,7 @@ where
             account: claims.account_id,
             tenant: None,
             project: None,
-            scopes: claims.scopes,
+            scopes,
             access_token,
             refresh_token: Some(refresh_token),
             id_token,
@@ -425,6 +442,48 @@ where
             mutation_pending: false,
         })
     }
+
+    async fn validate_token_response(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+        previous: Option<&OAuthTokenRecord>,
+        context: &TokenValidationContext,
+        cancel: &CancellationToken,
+    ) -> Result<OAuthTokenRecord> {
+        if !status.is_success() {
+            return self
+                .validate_tokens(status, Value::Null, previous, context, cancel)
+                .await;
+        }
+        let body =
+            serde_json::from_slice(body).context(ChatGptAuthStageError::TokenExchangeContract)?;
+        self.validate_tokens(status, body, previous, context, cancel)
+            .await
+    }
+}
+
+fn granted_scopes(body: &Value, requested: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    let Some(scope) = body.get("scope") else {
+        // RFC 6749 allows omission when the granted scope is identical to the request.
+        return Ok(requested.clone());
+    };
+    let scope = scope
+        .as_str()
+        .context("ChatGPT token response scope was not a string")?;
+    let granted = scope
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if granted.len() > 128
+        || granted.iter().any(|value| {
+            value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+        })
+        || !requested.is_subset(&granted)
+    {
+        bail!("ChatGPT token response did not grant the requested scopes");
+    }
+    Ok(granted)
 }
 
 fn validate_public_claim(value: &str, label: &str) -> Result<()> {
@@ -432,22 +491,6 @@ fn validate_public_claim(value: &str, label: &str) -> Result<()> {
         bail!("ChatGPT signed {label} is invalid");
     }
     Ok(())
-}
-
-fn safe_oauth_error_code(body: &Value) -> &'static str {
-    match body.get("error").and_then(Value::as_str) {
-        Some("invalid_request") => "invalid_request",
-        Some("invalid_client") => "invalid_client",
-        Some("invalid_grant") => "invalid_grant",
-        Some("unauthorized_client") => "unauthorized_client",
-        Some("unsupported_grant_type") => "unsupported_grant_type",
-        Some("invalid_scope") => "invalid_scope",
-        Some("access_denied") => "access_denied",
-        Some("expired_token") => "expired_token",
-        Some("temporarily_unavailable") => "temporarily_unavailable",
-        Some("server_error") => "server_error",
-        _ => "unrecognized",
-    }
 }
 
 fn required_string(body: &Value, field: &str) -> Result<String> {
@@ -626,19 +669,10 @@ mod tests {
             issuer: REQUIRED_TOKEN_ISSUER.into(),
             audiences: BTreeSet::from([OPENAI_PUBLIC_CLIENT_ID.into()]),
             authorized_party: None,
-            access_audiences: BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.into()]),
             subject: "subject-work".into(),
             account_id: "acct-work".into(),
             chatgpt_plan_type: "plus".into(),
             account_is_fedramp: false,
-            scopes: BTreeSet::from([
-                "openid".into(),
-                "profile".into(),
-                "email".into(),
-                "offline_access".into(),
-                "api.connectors.read".into(),
-                "api.connectors.invoke".into(),
-            ]),
             nonce: None,
             expires_at: Utc::now() + TimeDelta::hours(1),
             not_before: None,
@@ -740,7 +774,7 @@ mod tests {
         assert!(dialect
             .descriptor()
             .protocol_revision
-            .contains("3e4707b34b16"));
+            .contains("94cbbddafc17"));
         assert!(!dialect
             .descriptor()
             .allowed_origins
@@ -888,8 +922,6 @@ mod tests {
             "issuer",
             "audience",
             "multi-audience",
-            "access-audience-extra",
-            "scope",
             "account",
             "account-control",
             "account-length",
@@ -912,12 +944,6 @@ mod tests {
                     "multi-audience" => {
                         claims.audiences.insert("other-client".into());
                         claims.authorized_party = None;
-                    }
-                    "access-audience-extra" => {
-                        claims.access_audiences.insert("other-service".into());
-                    }
-                    "scope" => {
-                        claims.scopes.remove("offline_access");
                     }
                     "account" => claims.account_id.clear(),
                     "account-control" => claims.account_id = "acct\nforged".into(),

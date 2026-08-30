@@ -23,8 +23,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::chatgpt_oauth::{
-    OpenAiTokenVerifier, VerifiedOpenAiClaims, OPENAI_AUTH_ORIGIN,
-    OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE, OPENAI_PUBLIC_CLIENT_ID, REQUIRED_TOKEN_ISSUER,
+    OpenAiTokenVerifier, VerifiedOpenAiClaims, OPENAI_AUTH_ORIGIN, OPENAI_PUBLIC_CLIENT_ID,
+    REQUIRED_TOKEN_ISSUER,
 };
 
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
@@ -349,47 +349,27 @@ impl OpenAiTokenVerifier for OpenAiJwksVerifier {
         {
             bail!("OpenAI identity token audience does not match the pinned public client");
         }
-        let access = self.verify_compact(access_token, cancel).await?;
-        if access.audiences != BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.to_string()]) {
-            bail!("OpenAI access token audience does not match the pinned Codex service authority");
-        }
-        if identity.subject != access.subject {
-            bail!("OpenAI identity and access tokens name different subjects");
-        }
-        let scopes = access.scopes()?;
+        crate::oauth::validate_secret_field(access_token, "access token")?;
         let identity_auth = identity
             .auth
             .context("OpenAI identity token omitted the namespaced ChatGPT account entitlement")?;
-        let access_auth = access
-            .auth
-            .context("OpenAI access token omitted the namespaced ChatGPT account entitlement")?;
         for (value, label) in [
             (identity_auth.account_id.as_str(), "identity account"),
-            (access_auth.account_id.as_str(), "access account"),
             (identity_auth.plan_type.as_str(), "identity plan"),
-            (access_auth.plan_type.as_str(), "access plan"),
         ] {
             validate_signed_public_claim(value, label)?;
-        }
-        if identity_auth.account_id != access_auth.account_id
-            || identity_auth.plan_type != access_auth.plan_type
-            || identity_auth.account_is_fedramp != access_auth.account_is_fedramp
-        {
-            bail!("OpenAI identity and access token account entitlements do not match");
         }
         Ok(VerifiedOpenAiClaims {
             issuer: identity.issuer,
             audiences: identity.audiences,
             authorized_party: identity.authorized_party,
-            access_audiences: access.audiences,
             subject: identity.subject,
             account_id: identity_auth.account_id,
             chatgpt_plan_type: identity_auth.plan_type,
             account_is_fedramp: identity_auth.account_is_fedramp,
-            scopes,
             nonce: identity.nonce,
-            expires_at: identity.expires_at.min(access.expires_at),
-            not_before: later_optional(identity.not_before, access.not_before),
+            expires_at: identity.expires_at,
+            not_before: identity.not_before,
         })
     }
 }
@@ -447,10 +427,6 @@ struct SignedClaims {
     iat: i64,
     #[serde(default)]
     nonce: Option<String>,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    scp: Option<Vec<String>>,
     #[serde(rename = "https://api.openai.com/auth", default)]
     auth: Option<ChatGptAuthClaims>,
     #[serde(skip)]
@@ -499,25 +475,6 @@ impl SignedClaims {
             bail!("OpenAI signed token issuer, subject, audience, or lifetime is invalid");
         }
         Ok(())
-    }
-
-    fn scopes(&self) -> Result<BTreeSet<String>> {
-        let mut scopes = BTreeSet::new();
-        if let Some(scope) = self.scope.as_deref() {
-            scopes.extend(scope.split_ascii_whitespace().map(str::to_string));
-        }
-        if let Some(values) = &self.scp {
-            scopes.extend(values.iter().cloned());
-        }
-        if scopes.is_empty()
-            || scopes.len() > 128
-            || scopes.iter().any(|scope| {
-                scope.is_empty() || scope.len() > 256 || scope.chars().any(char::is_control)
-            })
-        {
-            bail!("OpenAI access token scopes are invalid");
-        }
-        Ok(scopes)
     }
 }
 
@@ -576,16 +533,6 @@ fn cache_lifetime(value: Option<&str>) -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_CACHE_LIFETIME)
         .min(MAX_CACHE_LIFETIME)
-}
-
-fn later_optional(
-    left: Option<DateTime<Utc>>,
-    right: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (left, right) => left.or(right),
-    }
 }
 
 fn reject_duplicate_json_fields(bytes: &[u8], label: &str) -> Result<()> {
@@ -704,19 +651,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::{OAuthDialect, TokenValidationContext};
+    use crate::oauth::{OAuthCredentialStore, OAuthDialect, TokenValidationContext};
     use crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect;
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::Response;
     use axum::http::StatusCode as AxumStatusCode;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::Router;
     use ring::rand::SystemRandom;
     use ring::signature::{KeyPair, RsaKeyPair, RSA_PKCS1_SHA256};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex as StdMutex;
 
     const TEST_PRIVATE_KEY_DER: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCdAeQ874zqSDAW9XjZmHRYDQvVpFjAju0X3pKB1+42m2Amo28WbSErTp/dVlJtkX1rOfdTVcitvDLqPS9oBD5F+S78+oCyEHaJn89H/jK74si47+8ulnI25WMQNdQ3C5ADy/BpDVU+8wBOWIktGz7mJtOByfWCGSE72OKRQq+cpqYMlyn2D1bCTZoER6MoantQtPdqa40tvmLJig3Z9c2fDN7oqHyRF53EPtSa0OoRu6f2ayTngrwoLE+emVVl8dZHaOrJIaDTMVFux9T3lY4XOxszIWxztdIKyHe08hH8jqWqhJHa6weYmcB2cuTtZrTEAsQhF5wW9xODaSOMLhSNAgMBAAECggEAAda1VQ9bH51DzukGBspVxng0pMZdcbfax/ZH0fR06jfMmvc8BE+33Tl4/s8VfQoApYJSxquRA5PaJssbpIS0M/6UkcrfOfaeZMM12rp73p5rylqo+usxIDp0fAqdVx2wDJNVV+2bi3auELzRsnEIvgpDXNhAI0tnC7vg/2GAC/4U7l66SSX8BQdLbGDlZrq2IVpG29KckBUrsl+uyFJRhJ3EsmdOpjpAWv6882/0ea1Svi4Uy8kvEAF3Qwq2k+0UjOfJZls9MS1JSXpQQARvdeNv4QJmIjnCMo30naCKZmXIFVDrM1xUuVUURAGlu0rSv+qQzV7pJ2Pf3BvLj41pgQKBgQDMnMtDNf8DFndwuKDE0ZAF3dMyS34vqS33jqI7qj930ra0BOvECCgjqGpwIY7xmxYN1U6hZDy+5uFeGthhjpgJbQq0pWFUxob6Xw2dcuEu/D2K/Kqi9YhVq2ZZZ6nT3ddMvJmdXRA+KuoidcX+8dA//gJBnA5K9K/9Ds+XNmOXwQKBgQDEcGkeU+c+fIjLLTEy2jwRsh7n8ZMC5OHg9WaEomuBro4ZfNXi4lwvz7+6+LSTBSPgrJgaJ7hymgH5LwpLL1r5uGZyzFCKnkRz01I9aXVWfewhKIdquRXUU1MNQ2PrFiZtE5u7MctqT+YeuX3J0WASy+aWOGpfNZ06JqoAoNlPzQKBgG0MY4g+jtqmbqG0xHog9hEqWBTGB0p/b/AwJGaIJatGsfjfZofjkQDwEUoRmI1LikV1GaMKORXFFveAdzIHPSBI7Ru5yFXWOLnXTvpK75iK9oHMh2SyVybRYorjpK813DkZiwVDRBTd6krTWeK2Hbb9OVaeRT/NiL3l1t1QL2QBAoGBAIFlkrjZh//PRMShdkELJHp7nIQoyzAi2O+4dtlzq+F2vD/pzXJwrU0JSkC9RyV5Q1LiHidMduF2tUoRRHSWMxU/9Kw2De/hpTGuyAOQDiz1Ma/95IXWeZytbo3UEGNw6cr8GZ9Lg7T6AJnIkiV4+BIpojDd5KPmyzTc9ysGyV8ZAoGAfvFL5BicPTVwwB85n+PdGtl6mMjjHdDyS/O8B9BsESA1sbVJ48Os1NiUT+bjZktTWhjScUKCNCMzAop5RbzANwkdzb0rs8CrrFENYjncMjLnsLFlc/qL8FkpiCFeOxX05iy5kvxbm8nJOTspoCDzQywEKKZGSrx0+Z6vF4bkTWg=";
@@ -730,6 +678,7 @@ mod tests {
         jwks: Arc<StdMutex<VecDeque<Value>>>,
         discovery_count: Arc<AtomicUsize>,
         jwks_count: Arc<AtomicUsize>,
+        token_identity_valid: Arc<AtomicBool>,
         delay: Duration,
         redirect_jwks: bool,
         oversized: bool,
@@ -760,6 +709,7 @@ mod tests {
                 jwks: Arc::new(StdMutex::new(jwks.into())),
                 discovery_count: Arc::new(AtomicUsize::new(0)),
                 jwks_count: Arc::new(AtomicUsize::new(0)),
+                token_identity_valid: Arc::new(AtomicBool::new(true)),
                 delay,
                 redirect_jwks,
                 oversized,
@@ -767,6 +717,9 @@ mod tests {
             let router = Router::new()
                 .route(DISCOVERY_PATH, get(discovery))
                 .route(JWKS_PATH, get(jwks_document))
+                .route("/api/accounts/deviceauth/usercode", post(device_start))
+                .route("/api/accounts/deviceauth/token", post(device_poll))
+                .route("/oauth/token", post(token_exchange))
                 .route("/attacker", get(|| async { "{}" }))
                 .with_state(state.clone());
             tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -826,6 +779,36 @@ mod tests {
             .header("cache-control", "max-age=300")
             .body(Body::from(document.to_string()))
             .unwrap()
+    }
+
+    async fn device_start() -> Response<Body> {
+        json_response(json!({
+            "device_auth_id": "device-fixture",
+            "user_code": "SAFE-FIXTURE",
+            "interval": "0",
+        }))
+    }
+
+    async fn device_poll() -> Response<Body> {
+        let verifier = "fixture-verifier";
+        json_response(json!({
+            "authorization_code": "fixture-authorization",
+            "code_verifier": verifier,
+            "code_challenge": URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())),
+        }))
+    }
+
+    async fn token_exchange(State(state): State<FixtureState>) -> Response<Body> {
+        let (identity, _access) = claims("acct-live-shape", required_scopes());
+        let mut id_token = signed("key-one", &identity);
+        if !state.token_identity_valid.load(AtomicOrdering::SeqCst) {
+            id_token.push('x');
+        }
+        json_response(json!({
+            "id_token": id_token,
+            "access_token": "opaque-access-bearer",
+            "refresh_token": "opaque-refresh-bearer",
+        }))
     }
 
     fn json_response(value: Value) -> Response<Body> {
@@ -898,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_rs256_fixture_binds_issuer_audience_account_scope_nonce_and_time() {
+    async fn signed_identity_and_opaque_access_fixture_binds_account_nonce_and_time() {
         let server = FixtureServer::start(vec![jwks("key-one")]).await;
         let verifier = Arc::new(
             OpenAiJwksVerifier::for_test(
@@ -910,13 +893,13 @@ mod tests {
             .unwrap(),
         );
         let dialect = OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap();
-        let (identity, access) = claims("acct-one", required_scopes());
+        let (identity, _access) = claims("acct-one", required_scopes());
         let record = dialect
             .validate_tokens(
                 StatusCode::OK,
                 json!({
                     "id_token": signed("key-one", &identity),
-                    "access_token": signed("key-one", &access),
+                    "access_token": "opaque-access-bearer",
                     "refresh_token": "refresh-secret",
                 }),
                 None,
@@ -931,12 +914,90 @@ mod tests {
         assert_eq!(record.account, "acct-one");
         assert_eq!(
             record.expires_at.timestamp(),
-            access["exp"].as_i64().unwrap()
+            identity["exp"].as_i64().unwrap()
         );
         assert_eq!(server.state.discovery_count.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(server.state.jwks_count.load(AtomicOrdering::SeqCst), 1);
         let debug = format!("{record:?}{:?}", dialect.descriptor());
         assert!(!debug.contains("refresh-secret"));
+    }
+
+    #[tokio::test]
+    async fn device_browser_success_with_opaque_access_persists_exact_named_credential() {
+        let server = FixtureServer::start(vec![jwks("key-one")]).await;
+        let verifier = Arc::new(
+            OpenAiJwksVerifier::for_test(
+                &server.origin,
+                REQUIRED_TOKEN_ISSUER,
+                OPENAI_PUBLIC_CLIENT_ID,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let dialect =
+            Arc::new(OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+            directory.path().join("oauth"),
+        ));
+        let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();
+        let pending = client.begin_device_authorization().await.unwrap();
+        let credential = client
+            .finish_device_authorization("chatgpt:live-shape", &pending, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(credential.name, "chatgpt:live-shape");
+        assert_eq!(credential.account.as_deref(), Some("acct-live-shape"));
+        let persisted = store.load("chatgpt:live-shape").unwrap().unwrap();
+        assert_eq!(persisted.account, "acct-live-shape");
+        assert_eq!(persisted.access_token, "opaque-access-bearer");
+        assert!(store.load("chatgpt:other").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn device_invalid_signed_identity_is_stage_classified_without_persistence() {
+        let server = FixtureServer::start(vec![jwks("key-one")]).await;
+        server
+            .state
+            .token_identity_valid
+            .store(false, AtomicOrdering::SeqCst);
+        let verifier = Arc::new(
+            OpenAiJwksVerifier::for_test(
+                &server.origin,
+                REQUIRED_TOKEN_ISSUER,
+                OPENAI_PUBLIC_CLIENT_ID,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let dialect =
+            Arc::new(OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+            directory.path().join("oauth"),
+        ));
+        let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();
+        let pending = client.begin_device_authorization().await.unwrap();
+        let error = client
+            .finish_device_authorization(
+                "chatgpt:invalid-identity",
+                &pending,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.chain().any(|source| source
+            .downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>(
+        ) == Some(
+            &crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification
+        )));
+        assert!(store.load("chatgpt:invalid-identity").unwrap().is_none());
+        let rendered = format!("{error:#}");
+        for secret in ["opaque-access-bearer", "opaque-refresh-bearer"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
     #[tokio::test]
@@ -947,7 +1008,6 @@ mod tests {
             "audience",
             "multi-audience-without-azp",
             "multi-audience-wrong-azp",
-            "access-audience-extra",
             "account",
             "scope",
             "nonce",
@@ -968,8 +1028,9 @@ mod tests {
                 .unwrap(),
             );
             let dialect = OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap();
-            let (mut identity, mut access) = claims("acct-one", required_scopes());
+            let (mut identity, _access) = claims("acct-one", required_scopes());
             let mut expected_nonce = "nonce-123";
+            let mut token_scope = required_scopes();
             match defect {
                 "issuer" => identity["iss"] = json!("https://evil.example"),
                 "trailing-issuer" => identity["iss"] = json!("https://auth.openai.com/"),
@@ -981,16 +1042,13 @@ mod tests {
                     identity["aud"] = json!([OPENAI_PUBLIC_CLIENT_ID, "other-client"]);
                     identity["azp"] = json!("other-client");
                 }
-                "access-audience-extra" => {
-                    access["aud"] = json!([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE, "other-service"])
-                }
                 "account" => {
-                    access["https://api.openai.com/auth"]["chatgpt_account_id"] = json!("acct-two")
+                    identity["https://api.openai.com/auth"]["chatgpt_account_id"] = json!("")
                 }
-                "scope" => access["scope"] = json!("openid"),
+                "scope" => token_scope = "openid",
                 "nonce" => expected_nonce = "other-nonce",
                 "expired" => identity["exp"] = json!(Utc::now().timestamp() - 120),
-                "future" => access["nbf"] = json!(Utc::now().timestamp() + 120),
+                "future" => identity["nbf"] = json!(Utc::now().timestamp() + 120),
                 "missing-iat" => {
                     identity.as_object_mut().unwrap().remove("iat");
                 }
@@ -999,9 +1057,33 @@ mod tests {
                 _ => unreachable!(),
             }
             let id_token = signed("key-one", &identity);
-            let mut access_token = signed("key-one", &access);
+            let access_token = "opaque-access-bearer".to_string();
             if defect == "signature" {
-                access_token.push('x');
+                let separator = id_token.find('.').unwrap();
+                let mut corrupted = id_token.clone().into_bytes();
+                corrupted[separator.saturating_sub(1)] ^= 1;
+                let corrupted = String::from_utf8(corrupted).unwrap();
+                let error = dialect
+                    .validate_tokens(
+                        StatusCode::OK,
+                        json!({
+                            "id_token": corrupted,
+                            "access_token": access_token,
+                            "refresh_token": "refresh-secret",
+                            "scope": token_scope,
+                        }),
+                        None,
+                        &TokenValidationContext::Browser {
+                            expected_nonce: expected_nonce.into(),
+                            redirect_uri: "http://127.0.0.1/callback".into(),
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(!error.contains("refresh-secret"), "{defect}: {error}");
+                continue;
             }
             let error = dialect
                 .validate_tokens(
@@ -1010,6 +1092,7 @@ mod tests {
                         "id_token": id_token,
                         "access_token": access_token,
                         "refresh_token": "refresh-secret",
+                        "scope": token_scope,
                     }),
                     None,
                     &TokenValidationContext::Browser {
