@@ -54,6 +54,7 @@ impl EventHandler {
 
             ReplEvent::ToolResult {
                 query_id,
+                round_token: _,
                 tool_id,
                 result,
             } => {

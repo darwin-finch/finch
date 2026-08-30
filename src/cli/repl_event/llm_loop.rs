@@ -156,7 +156,31 @@ impl LlmLoop {
     pub async fn run(mut self) {
         while let Some(req) = self.llm_rx.recv().await {
             match req {
-                LlmRequest::Query { id, text, no_tools } => {
+                LlmRequest::Query {
+                    id,
+                    text,
+                    no_tools,
+                    admission,
+                    admission_ready,
+                    spawned,
+                } => {
+                    if let Some(ready) = admission_ready {
+                        if ready.send(()).is_err() {
+                            continue;
+                        }
+                    }
+                    if let Some(admission) = admission {
+                        if admission.await.is_err() {
+                            continue;
+                        }
+                    }
+                    if let Some(spawned) = spawned {
+                        // A timed-out caller drops this receiver. Treat that as
+                        // revoked admission and never start provider work.
+                        if spawned.send(()).is_err() {
+                            continue;
+                        }
+                    }
                     self.spawn_query(id, text, no_tools).await;
                 }
             }

@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 use super::events::ConfirmationResult;
-use crate::cli::conversation::ConversationHistory;
+use crate::cli::conversation::{ConversationHistory, ToolRoundToken};
 use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
@@ -151,6 +151,7 @@ impl ToolExecutionCoordinator {
     pub fn spawn_tool_execution(
         &self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_use: ToolUse,
         work_unit: Arc<WorkUnit>,
         row_idx: usize,
@@ -262,6 +263,7 @@ impl ToolExecutionCoordinator {
                                 // Tool denied, send error result
                                 let _ = event_tx.send(ReplEvent::ToolResult {
                                     query_id,
+                                    round_token,
                                     tool_id: tool_use.id.clone(),
                                     result: Err(anyhow::anyhow!("Tool execution denied by user")),
                                 });
@@ -273,6 +275,7 @@ impl ToolExecutionCoordinator {
                         // Approval channel closed (user cancelled?)
                         let _ = event_tx.send(ReplEvent::ToolResult {
                             query_id,
+                            round_token,
                             tool_id: tool_use.id.clone(),
                             result: Err(anyhow::anyhow!("Tool approval cancelled")),
                         });
@@ -321,6 +324,7 @@ impl ToolExecutionCoordinator {
 
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
+                        round_token,
                         tool_id: tool_use.id.clone(),
                         result: Ok(tool_result.content),
                     });
@@ -330,6 +334,7 @@ impl ToolExecutionCoordinator {
                     tracing::warn!("[tool_exec] Tool {} returned error: {}", tool_use.name, e);
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
+                        round_token,
                         tool_id: tool_use.id.clone(),
                         result: Err(e),
                     });
@@ -346,6 +351,7 @@ impl ToolExecutionCoordinator {
                     );
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
+                        round_token,
                         tool_id: tool_use.id.clone(),
                         result: Err(anyhow::anyhow!(
                             "Tool execution timed out after {} seconds. \

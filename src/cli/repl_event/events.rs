@@ -62,6 +62,7 @@ pub enum ReplEvent {
     /// A tool execution completed
     ToolResult {
         query_id: Uuid,
+        round_token: crate::cli::conversation::ToolRoundToken,
         tool_id: String,
         result: Result<String>,
     },
@@ -257,6 +258,11 @@ pub enum LlmRequest {
         id: Uuid,
         text: String,
         no_tools: bool,
+        /// Continuations acknowledge receipt, wait until their complete
+        /// history pair is committed, then acknowledge task admission.
+        admission: Option<tokio::sync::oneshot::Receiver<()>>,
+        admission_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        spawned: Option<tokio::sync::oneshot::Sender<()>>,
     },
 }
 
