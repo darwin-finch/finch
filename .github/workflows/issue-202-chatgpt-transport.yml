@@ -1,0 +1,56 @@
+name: Issue 202 ChatGPT Subscription Transport
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  focused-transport:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check changed Rust formatting
+        run: >-
+          rustfmt --edition 2021 --check
+          src/claude/types.rs src/cli/conversation_compactor.rs src/cli/repl.rs
+          src/cli/repl_event/query_processor.rs src/client/daemon_client.rs
+          src/generators/mod.rs src/ipc/brain_codec.rs src/ipc/client.rs
+          src/ipc/mod.rs src/ipc/server.rs src/providers/chatgpt_oauth.rs
+          src/providers/chatgpt_subscription.rs src/providers/claude.rs
+          src/providers/factory.rs src/providers/fallback_chain.rs
+          src/providers/gemini.rs src/providers/mod.rs src/providers/openai.rs
+          src/providers/teacher_session.rs src/providers/types.rs
+          src/server/openai_handlers.rs src/tools/implementations/spawn.rs
+      - name: Compile library and binary tests
+        run: cargo test --no-run
+      - name: Native subscription protocol regressions
+        run: cargo test --lib providers::chatgpt_subscription::
+      - name: Credential and factory boundary regressions
+        run: |
+          cargo test --lib providers::chatgpt_oauth::
+          cargo test --lib providers::factory::
+      - name: Platform and compatible-provider non-regressions
+        run: |
+          cargo test --lib providers::openai::
+          cargo test --lib providers::gemini::
+      - name: IPC metadata and ordered-history regressions
+        run: |
+          cargo test --lib ipc::client::tests::mixed_ipc_generations_reject_before_query_or_stream_use -- --exact
+          cargo test --lib ipc::brain_codec::tests:: -- --nocapture
+          cargo test --lib cli::conversation::tests::test_staged_tool_round_is_invisible_until_complete_atomic_commit -- --exact
+      - name: No external provider binary regression
+        run: cargo test --test no_external_provider_binary_test
