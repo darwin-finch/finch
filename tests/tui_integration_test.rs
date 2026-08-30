@@ -155,6 +155,21 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
     );
     master.write_all(b"\x03").unwrap();
     master.flush().unwrap();
+    let cancel_confirmation = b"Cancel setup?";
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(10),
+            |bytes| bytes
+                .windows(cancel_confirmation.len())
+                .any(|window| window == cancel_confirmation),
+        ),
+        "setup wizard did not request cancellation confirmation: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    master.write_all(b"y").unwrap();
+    master.flush().unwrap();
     assert!(
         read_pty_until(
             &mut master,
