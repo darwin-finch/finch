@@ -112,7 +112,9 @@ jobs:
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
     - name: Verify binary reports its version
-      run: cargo run --bin finch ${{ matrix.cargo_args }} -- --version
+      # Exercise Cargo's default binary selection so adding a test-only binary
+      # cannot silently break the documented `cargo run -- <args>` workflow.
+      run: cargo run ${{ matrix.cargo_args }} -- --version
 
   runtime-authority:
     name: Runtime Authority (Ubuntu)

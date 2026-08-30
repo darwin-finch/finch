@@ -2,6 +2,7 @@
 name = "finch"
 version = "0.7.30"
 edition = "2021"
+default-run = "finch"
 authors = ["Darwin Finch Contributors"]
 description = "AI that evolves with your code - distributed assistant with hierarchical memory"
 license = "LicenseRef-PolyForm-Noncommercial-1.0"
