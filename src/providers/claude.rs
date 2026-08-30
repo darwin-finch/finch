@@ -220,15 +220,12 @@ impl ClaudeProvider {
 
             // Track blocks being built (index -> BlockBuilder)
             let mut blocks: HashMap<usize, BlockBuilder> = HashMap::new();
-            #[allow(unused_assignments)]
-            let mut done = false;
+            let mut message_stop_seen = false;
+            let mut transport_end_seen = false;
+            let mut receiver_closed = false;
+            let mut stream_failed = false;
 
             while let Some(chunk) = stream.next().await {
-                if done {
-                    tracing::debug!("[STREAM] Done flag set, breaking from chunk loop");
-                    break;
-                }
-
                 match chunk {
                     Ok(bytes) => {
                         buffer.extend_from_slice(&bytes);
@@ -244,11 +241,32 @@ impl ClaudeProvider {
 
                                 // Check for end marker
                                 if json_str == "[DONE]" {
-                                    tracing::debug!(
-                                        "[STREAM] Received [DONE], marking stream as complete"
-                                    );
-                                    done = true;
-                                    break;
+                                    if !blocks.is_empty() {
+                                        let _ = tx
+                                            .send(Err(anyhow::anyhow!(
+                                                "Claude SSE terminated with open content blocks"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if !message_stop_seen {
+                                        let _ = tx
+                                            .send(Err(anyhow::anyhow!(
+                                                "Claude SSE [DONE] arrived before message_stop"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    transport_end_seen = true;
+                                    continue;
+                                }
+                                if transport_end_seen || message_stop_seen {
+                                    let _ = tx
+                                        .send(Err(anyhow::anyhow!(
+                                            "Claude SSE emitted data after its terminal event"
+                                        )))
+                                        .await;
+                                    return;
                                 }
 
                                 // Parse event
@@ -318,7 +336,7 @@ impl ClaudeProvider {
                                                                         .is_err()
                                                                 {
                                                                     // Receiver dropped, stop streaming
-                                                                    done = true;
+                                                                    receiver_closed = true;
                                                                     break;
                                                                 }
                                                             }
@@ -369,10 +387,22 @@ impl ClaudeProvider {
                                                     .is_err()
                                                 {
                                                     // Receiver dropped, stop streaming
-                                                    done = true;
+                                                    receiver_closed = true;
                                                     break;
                                                 }
                                             }
+                                        }
+
+                                        "message_stop" => {
+                                            if !blocks.is_empty() {
+                                                let _ = tx
+                                                    .send(Err(anyhow::anyhow!(
+                                                        "Claude SSE message_stop arrived with open content blocks"
+                                                    )))
+                                                    .await;
+                                                return;
+                                            }
+                                            message_stop_seen = true;
                                         }
 
                                         _ => {}
@@ -384,8 +414,28 @@ impl ClaudeProvider {
                     Err(e) => {
                         tracing::error!("Stream error: {}", e);
                         let _ = tx.send(Err(e.into())).await;
+                        stream_failed = true;
                         break;
                     }
+                }
+                if receiver_closed {
+                    break;
+                }
+            }
+
+            if !receiver_closed && !stream_failed {
+                if !buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "Claude SSE ended with an incomplete frame"
+                        )))
+                        .await;
+                } else if !message_stop_seen {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "Claude SSE ended before a terminal message_stop"
+                        )))
+                        .await;
                 }
             }
 
@@ -455,6 +505,57 @@ impl ProviderBackend for ClaudeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_sse_eof_after_tool_block_is_an_error_not_a_completion() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-A\",\"name\":\"Read\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+        );
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = ClaudeProvider::new_with_endpoints(
+            "test-key".to_string(),
+            &server.url(),
+            "/v1/messages",
+            "/v1/models",
+        )
+        .unwrap();
+        let mut stream = provider
+            .send_message_stream_once(&ProviderRequest::new(vec![crate::claude::Message::user(
+                "inspect",
+            )]))
+            .await
+            .unwrap();
+        let mut tool_blocks = 0;
+        let mut terminal_error = None;
+        while let Some(item) = stream.recv().await {
+            match item {
+                Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { .. })) => {
+                    tool_blocks += 1;
+                }
+                Err(error) => terminal_error = Some(error.to_string()),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            tool_blocks, 1,
+            "fixture crosses the production tool boundary"
+        );
+        assert_eq!(
+            terminal_error.as_deref(),
+            Some("Claude SSE ended before a terminal message_stop")
+        );
+        mock.assert_async().await;
+    }
 
     #[test]
     fn provider_request_boundary_observes_only_complete_tool_pairs() {
