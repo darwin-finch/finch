@@ -353,11 +353,11 @@ impl OpenAiTokenVerifier for OpenAiJwksVerifier {
         let identity_auth = identity
             .auth
             .context("OpenAI identity token omitted the namespaced ChatGPT account entitlement")?;
-        for (value, label) in [
-            (identity_auth.account_id.as_str(), "identity account"),
-            (identity_auth.plan_type.as_str(), "identity plan"),
-        ] {
-            validate_signed_public_claim(value, label)?;
+        if let Some(account_id) = identity_auth.account_id.as_deref() {
+            validate_signed_public_claim(account_id, "identity account")?;
+        }
+        if let Some(plan_type) = identity_auth.plan_type.as_deref() {
+            validate_signed_public_claim(plan_type, "identity plan")?;
         }
         Ok(VerifiedOpenAiClaims {
             issuer: identity.issuer,
@@ -438,9 +438,9 @@ struct SignedClaims {
 #[derive(Deserialize)]
 struct ChatGptAuthClaims {
     #[serde(rename = "chatgpt_account_id")]
-    account_id: String,
-    #[serde(rename = "chatgpt_plan_type")]
-    plan_type: String,
+    account_id: Option<String>,
+    #[serde(rename = "chatgpt_plan_type", default)]
+    plan_type: Option<String>,
     #[serde(rename = "chatgpt_account_is_fedramp", default)]
     account_is_fedramp: bool,
 }
@@ -681,6 +681,7 @@ mod tests {
         discovery_count: Arc<AtomicUsize>,
         jwks_count: Arc<AtomicUsize>,
         token_identity_valid: Arc<AtomicBool>,
+        token_account_present: Arc<AtomicBool>,
         delay: Duration,
         redirect_jwks: bool,
         oversized: bool,
@@ -712,6 +713,7 @@ mod tests {
                 discovery_count: Arc::new(AtomicUsize::new(0)),
                 jwks_count: Arc::new(AtomicUsize::new(0)),
                 token_identity_valid: Arc::new(AtomicBool::new(true)),
+                token_account_present: Arc::new(AtomicBool::new(true)),
                 delay,
                 redirect_jwks,
                 oversized,
@@ -801,7 +803,17 @@ mod tests {
     }
 
     async fn token_exchange(State(state): State<FixtureState>) -> Response<Body> {
-        let (identity, _access) = claims("acct-live-shape", required_scopes());
+        let (mut identity, _access) = claims("acct-live-shape", required_scopes());
+        identity["https://api.openai.com/auth"]
+            .as_object_mut()
+            .unwrap()
+            .remove("chatgpt_plan_type");
+        if !state.token_account_present.load(AtomicOrdering::SeqCst) {
+            identity["https://api.openai.com/auth"]
+                .as_object_mut()
+                .unwrap()
+                .remove("chatgpt_account_id");
+        }
         let mut id_token = signed("key-one", &identity);
         if !state.token_identity_valid.load(AtomicOrdering::SeqCst) {
             id_token.push('x');
@@ -810,6 +822,8 @@ mod tests {
             "id_token": id_token,
             "access_token": "opaque-access-bearer",
             "refresh_token": "opaque-refresh-bearer",
+            "scope": "openid profile email offline_access",
+            "expires_in": "metadata-ignored-by-pinned-device-contract",
         }))
     }
 
@@ -954,6 +968,10 @@ mod tests {
         let persisted = store.load("chatgpt:live-shape").unwrap().unwrap();
         assert_eq!(persisted.account, "acct-live-shape");
         assert_eq!(persisted.access_token, "opaque-access-bearer");
+        assert_eq!(
+            persisted.scopes,
+            BTreeSet::from(["chatgpt.codex.invoke".into()])
+        );
         assert!(store.load("chatgpt:other").unwrap().is_none());
     }
 
@@ -1002,6 +1020,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_missing_signed_account_is_typed_and_persists_nothing() {
+        let server = FixtureServer::start(vec![jwks("key-one")]).await;
+        server
+            .state
+            .token_account_present
+            .store(false, AtomicOrdering::SeqCst);
+        let verifier = Arc::new(
+            OpenAiJwksVerifier::for_test(
+                &server.origin,
+                REQUIRED_TOKEN_ISSUER,
+                OPENAI_PUBLIC_CLIENT_ID,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let dialect =
+            Arc::new(OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+            directory.path().join("oauth"),
+        ));
+        let client = crate::oauth::OAuthClient::new(dialect, store.clone()).unwrap();
+        let pending = client.begin_device_authorization().await.unwrap();
+        let error = client
+            .finish_device_authorization(
+                "chatgpt:missing-account",
+                &pending,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>(),
+            Some(&crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountEntitlement)
+        );
+        assert!(store.load("chatgpt:missing-account").unwrap().is_none());
+        let rendered = format!("{error:#}");
+        for secret in ["opaque-access-bearer", "opaque-refresh-bearer"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
     async fn signed_claim_and_signature_hostile_matrix_fails_before_persistence() {
         for defect in [
             "issuer",
@@ -1010,7 +1072,6 @@ mod tests {
             "multi-audience-without-azp",
             "multi-audience-wrong-azp",
             "account",
-            "scope",
             "nonce",
             "expired",
             "future",
@@ -1031,7 +1092,6 @@ mod tests {
             let dialect = OpenAiChatGptOAuthDialect::for_test(&server.origin, verifier).unwrap();
             let (mut identity, _access) = claims("acct-one", required_scopes());
             let mut expected_nonce = "nonce-123";
-            let mut token_scope = required_scopes();
             match defect {
                 "issuer" => identity["iss"] = json!("https://evil.example"),
                 "trailing-issuer" => identity["iss"] = json!("https://auth.openai.com/"),
@@ -1046,7 +1106,6 @@ mod tests {
                 "account" => {
                     identity["https://api.openai.com/auth"]["chatgpt_account_id"] = json!("")
                 }
-                "scope" => token_scope = "openid",
                 "nonce" => expected_nonce = "other-nonce",
                 "expired" => identity["exp"] = json!(Utc::now().timestamp() - 120),
                 "future" => identity["nbf"] = json!(Utc::now().timestamp() + 120),
@@ -1071,7 +1130,7 @@ mod tests {
                             "id_token": corrupted,
                             "access_token": access_token,
                             "refresh_token": "refresh-secret",
-                            "scope": token_scope,
+                            "scope": "unrequested-metadata",
                         }),
                         None,
                         &TokenValidationContext::Browser {
@@ -1093,7 +1152,7 @@ mod tests {
                         "id_token": id_token,
                         "access_token": access_token,
                         "refresh_token": "refresh-secret",
-                        "scope": token_scope,
+                        "scope": "unrequested-metadata",
                     }),
                     None,
                     &TokenValidationContext::Browser {
