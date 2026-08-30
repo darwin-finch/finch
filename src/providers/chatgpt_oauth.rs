@@ -1031,7 +1031,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("token exchange was rejected (HTTP 400 Bad Request)"));
+        assert!(error.contains("token exchange was rejected (HTTP 400)"));
         assert!(!error.contains(marker));
 
         let mut short = claims();
@@ -1083,6 +1083,25 @@ mod tests {
         let latest_response_expiry = Utc::now() + TimeDelta::seconds(60);
         assert!(record.expires_at >= earliest_response_expiry);
         assert!(record.expires_at <= latest_response_expiry);
+
+        let error = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                json!({
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                    "expires_in": u64::MAX
+                }),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ChatGptAuthStageError>(),
+            Some(&ChatGptAuthStageError::TokenExchangeContract)
+        );
     }
 
     #[tokio::test]
