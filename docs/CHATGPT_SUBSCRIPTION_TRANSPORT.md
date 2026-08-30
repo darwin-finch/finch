@@ -48,7 +48,7 @@ The production origin is exactly `https://chatgpt.com` with these routes:
 Requests use bearer authorization, `ChatGPT-Account-ID`, honest
 `originator: finch`, Finch's version, and the pinned protocol revision. Both
 routes use the bounded static client identifier
-`finch/<version> (+https://github.com/darwin-finch/finch)` as their
+`finch/<version> (+https://darwin-finch.github.io/)` as their
 `User-Agent`; it contains no username, hostname, Brain/session, account, or
 credential identifier. This provides honest client identification and project
 discoverability only; it does not guarantee that OpenAI exposes telemetry or

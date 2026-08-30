@@ -42,7 +42,7 @@ const CHATGPT_CATALOG_CLIENT_VERSION: &str = "0.151.0";
 const FINCH_CHATGPT_USER_AGENT: &str = concat!(
     "finch/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/darwin-finch/finch)"
+    " (+https://darwin-finch.github.io/)"
 );
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const MODEL_ALIAS: &str = "gpt-5.6";
@@ -2323,7 +2323,7 @@ mod tests {
             concat!(
                 "finch/",
                 env!("CARGO_PKG_VERSION"),
-                " (+https://github.com/darwin-finch/finch)"
+                " (+https://darwin-finch.github.io/)"
             )
         );
         assert!(FINCH_CHATGPT_USER_AGENT.len() <= 256);
