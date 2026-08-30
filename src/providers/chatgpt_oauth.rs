@@ -502,8 +502,10 @@ fn bounded_access_expiry(
         .context("ChatGPT token response expires_in was not a positive integer")?;
     let seconds =
         i64::try_from(seconds).context("ChatGPT token response expires_in was too large")?;
+    let lifetime = TimeDelta::try_seconds(seconds)
+        .context("ChatGPT token response expires_in was too large")?;
     let response_expiry = now
-        .checked_add_signed(TimeDelta::seconds(seconds))
+        .checked_add_signed(lifetime)
         .context("ChatGPT token response expires_in overflowed")?;
     Ok(response_expiry.min(signed_expiry))
 }
