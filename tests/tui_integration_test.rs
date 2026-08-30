@@ -153,6 +153,19 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
         "setup wizard did not take ownership of the PTY: {}",
         String::from_utf8_lossy(&transcript)
     );
+    let wizard_ready = b"Ctrl+C: Cancel";
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(10),
+            |bytes| bytes
+                .windows(wizard_ready.len())
+                .any(|window| window == wizard_ready),
+        ),
+        "setup wizard did not finish its first draw: {}",
+        String::from_utf8_lossy(&transcript)
+    );
     master.write_all(b"\x03").unwrap();
     master.flush().unwrap();
     let cancel_confirmation = b"Cancel setup?";
