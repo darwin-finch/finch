@@ -1599,13 +1599,19 @@ where
         let existing = preflight_credentials
             .iter()
             .find(|credential| credential.name == *reference);
-        if existing.is_some() {
+        if let Some(existing) = existing {
+            if !is_exact_chatgpt_setup_credential(existing, reference) {
+                anyhow::bail!(
+                    "Stored named credential '{reference}' does not satisfy the exact ChatGPT setup authority contract"
+                );
+            }
             // Existing records are static configuration authority. Preserve
-            // them exactly and let Config::validate reject wrong-provider,
-            // wrong-store, revoked, or unrefreshable-expired bindings before
-            // any OAuth boundary is opened. A refreshable access lease may be
-            // expired here; the provider refreshes it when inference uses it.
-            continue;
+            // valid leases exactly. A refreshable access lease may be expired
+            // here; the provider refreshes it when inference uses it.
+            if is_reusable_chatgpt_setup_credential(existing) {
+                continue;
+            }
+            preflight_credentials.retain(|credential| credential.name != *reference);
         }
         preflight_credentials.push(crate::config::ProviderCredential {
             name: reference.clone(),
@@ -1637,7 +1643,11 @@ where
     for reference in chatgpt_references {
         if credentials
             .iter()
-            .any(|credential| credential.name == *reference)
+            .find(|credential| credential.name == *reference)
+            .is_some_and(|credential| {
+                is_exact_chatgpt_setup_credential(credential, reference)
+                    && is_reusable_chatgpt_setup_credential(credential)
+            })
         {
             // Preflight already proved this persisted record satisfies the
             // exact ChatGPT authority contract. Setup is not a provider-use
@@ -1696,6 +1706,31 @@ where
         config,
         compensations,
     })
+}
+
+fn is_exact_chatgpt_setup_credential(
+    credential: &crate::config::ProviderCredential,
+    reference: &str,
+) -> bool {
+    credential.kind == crate::config::CredentialKind::OauthDevice
+        && credential.provider == crate::config::CredentialProvider::ChatgptSubscription
+        && credential.issuer == "openai-chatgpt"
+        && credential.audience
+            == crate::config::AudienceBinding::standard(
+                crate::config::EndpointFamily::ChatgptSubscription,
+            )
+        && credential.secret_ref == format!("oauth-store:{reference}")
+        && crate::providers::chatgpt_oauth::chatgpt_required_scopes().is_subset(&credential.scopes)
+}
+
+fn is_reusable_chatgpt_setup_credential(credential: &crate::config::ProviderCredential) -> bool {
+    matches!(
+        credential.lifecycle,
+        crate::config::CredentialLifecycle::Active {
+            expires_at,
+            refreshable,
+        } if refreshable || expires_at.is_none_or(|expiry| expiry > Utc::now())
+    )
 }
 
 fn chatgpt_setup_failure_cause(error: &anyhow::Error) -> ChatGptSetupFailureCause {
@@ -10469,46 +10504,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_and_expired_same_name_metadata_are_replaced_only_by_exact_account_result() {
-        for lifecycle in [
-            crate::config::CredentialLifecycle::Revoked,
-            crate::config::CredentialLifecycle::Active {
-                expires_at: Some(Utc::now() - chrono::TimeDelta::minutes(1)),
-                refreshable: true,
-            },
-        ] {
-            let mut result = setup_result_with_profiles(vec![chatgpt_setup_profile(
-                "chatgpt:work",
-                "work",
-                "gpt-5.6-sol",
-            )]);
-            let mut stale = chatgpt_setup_credential("chatgpt:work", "acct-old");
-            stale.lifecycle = lifecycle;
-            result.credentials = vec![stale];
-            let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
-            let authenticator = FakeChatGptSetupAuthenticator::default();
-            let config = prepare_chatgpt_setup_config(
-                &result,
-                &references,
-                &authenticator,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                authenticator.calls.lock().unwrap().as_slice(),
-                ["chatgpt:work"]
-            );
-            assert_eq!(config.credentials().len(), 1);
-            assert_eq!(
-                config.credentials()[0].account.as_deref(),
-                Some("acct-work")
-            );
-            assert!(matches!(
-                config.credentials()[0].lifecycle,
-                crate::config::CredentialLifecycle::Active { .. }
-            ));
-        }
+    async fn revoked_same_name_metadata_is_replaced_only_by_exact_account_result() {
+        let mut result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let mut stale = chatgpt_setup_credential("chatgpt:work", "acct-old");
+        stale.lifecycle = crate::config::CredentialLifecycle::Revoked;
+        result.credentials = vec![stale];
+        let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+        let authenticator = FakeChatGptSetupAuthenticator::default();
+        let config = prepare_chatgpt_setup_config(
+            &result,
+            &references,
+            &authenticator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            authenticator.calls.lock().unwrap().as_slice(),
+            ["chatgpt:work"]
+        );
+        assert_eq!(config.credentials().len(), 1);
+        assert_eq!(
+            config.credentials()[0].account.as_deref(),
+            Some("acct-work")
+        );
+        assert!(matches!(
+            config.credentials()[0].lifecycle,
+            crate::config::CredentialLifecycle::Active { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_wrong_chatgpt_secret_store_before_authentication() {
+        let mut result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let mut hostile = chatgpt_setup_credential("chatgpt:work", "acct-work");
+        hostile.secret_ref = "keyring:finch/chatgpt/work".into();
+        result.credentials = vec![hostile];
+        let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+        let authenticator = FakeChatGptSetupAuthenticator::default();
+
+        let error = prepare_chatgpt_setup_config(
+            &result,
+            &references,
+            &authenticator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exact ChatGPT setup authority"), "{error}");
+        assert!(authenticator.calls.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]
