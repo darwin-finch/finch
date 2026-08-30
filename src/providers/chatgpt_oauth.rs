@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{TimeDelta, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,7 +28,7 @@ use crate::oauth::{
 };
 
 pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str =
-    "openai-codex-public-client@94cbbddafc1776d5e377bca1b05932c697e82238";
+    "openai-codex-public-client@94cbbddafc1776d5e377bca1b05932c697e82238+finch-binding-v2";
 pub const CHATGPT_SUBSCRIPTION_SERVICE_REVISION: &str =
     "chatgpt-codex-service@6478a751fde8884b2fdc76486fe23175a8e795d4";
 pub(crate) const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -65,20 +65,19 @@ pub enum ChatGptAuthStageError {
     TokenExchangeContract,
     #[error("ChatGPT signed identity verification failed")]
     IdentityVerification,
-    #[error("ChatGPT signed account binding failed")]
-    AccountBinding,
+    #[error("ChatGPT signed client binding failed")]
+    ClientBinding,
+    #[error("ChatGPT signed account entitlement is missing or invalid")]
+    AccountEntitlement,
 }
 
-/// Exact scopes for the pinned public-client compatibility revision.
+/// Finch-local capability attached to a verified ChatGPT account credential.
+///
+/// The pinned Codex device flow sends no OAuth scope parameter. Token response
+/// `scope` fields are therefore not proof of requested authority and are not
+/// projected into Finch's credential graph.
 pub fn chatgpt_required_scopes() -> BTreeSet<String> {
-    BTreeSet::from([
-        "openid".into(),
-        "profile".into(),
-        "email".into(),
-        "offline_access".into(),
-        "api.connectors.read".into(),
-        "api.connectors.invoke".into(),
-    ])
+    BTreeSet::from(["chatgpt.codex.invoke".into()])
 }
 
 /// Signature-verified provider claims. The adapter does not parse an
@@ -89,9 +88,10 @@ pub struct VerifiedOpenAiClaims {
     pub audiences: BTreeSet<String>,
     pub authorized_party: Option<String>,
     pub subject: String,
-    pub account_id: String,
-    /// Verified `https://api.openai.com/auth.chatgpt_plan_type` entitlement.
-    pub chatgpt_plan_type: String,
+    pub account_id: Option<String>,
+    /// Optional signed plan metadata. Account identity, not plan labeling,
+    /// binds the credential to the selected ChatGPT workspace.
+    pub chatgpt_plan_type: Option<String>,
     /// Verified `https://api.openai.com/auth.chatgpt_account_is_fedramp` routing claim.
     pub account_is_fedramp: bool,
     pub nonce: Option<String>,
@@ -383,11 +383,7 @@ where
             .verify(id_token.as_deref(), &access_token, cancel)
             .await
             .context(ChatGptAuthStageError::IdentityVerification)?;
-        let scopes = granted_scopes(&body, &self.descriptor.scopes)
-            .context(ChatGptAuthStageError::AccountBinding)?;
         let now = Utc::now();
-        let expires_at = bounded_access_expiry(&body, now, claims.expires_at)
-            .context(ChatGptAuthStageError::TokenExchangeContract)?;
         if claims.issuer != REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
             || (claims.audiences.len() > 1
@@ -399,28 +395,34 @@ where
             || claims.expires_at <= now
             || claims.not_before.is_some_and(|not_before| not_before > now)
         {
-            return Err(ChatGptAuthStageError::AccountBinding.into());
+            return Err(ChatGptAuthStageError::ClientBinding.into());
         }
         validate_public_claim(&claims.subject, "subject")
-            .context(ChatGptAuthStageError::AccountBinding)?;
-        validate_public_claim(&claims.account_id, "account identifier")
-            .context(ChatGptAuthStageError::AccountBinding)?;
-        validate_public_claim(&claims.chatgpt_plan_type, "plan type")
-            .context(ChatGptAuthStageError::AccountBinding)?;
+            .context(ChatGptAuthStageError::ClientBinding)?;
+        let account_id = claims
+            .account_id
+            .as_deref()
+            .context(ChatGptAuthStageError::AccountEntitlement)?;
+        validate_public_claim(account_id, "account identifier")
+            .context(ChatGptAuthStageError::AccountEntitlement)?;
+        if let Some(plan_type) = claims.chatgpt_plan_type.as_deref() {
+            validate_public_claim(plan_type, "plan type")
+                .context(ChatGptAuthStageError::AccountEntitlement)?;
+        }
         match context {
             TokenValidationContext::Browser { expected_nonce, .. }
                 if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
             {
-                return Err(ChatGptAuthStageError::AccountBinding.into())
+                return Err(ChatGptAuthStageError::ClientBinding.into())
             }
             TokenValidationContext::Refresh if previous.is_none() => {
-                return Err(ChatGptAuthStageError::AccountBinding.into())
+                return Err(ChatGptAuthStageError::ClientBinding.into())
             }
             _ => {}
         }
         if let Some(previous) = previous {
-            if previous.account != claims.account_id {
-                return Err(ChatGptAuthStageError::AccountBinding.into());
+            if previous.account != account_id {
+                return Err(ChatGptAuthStageError::AccountEntitlement.into());
             }
         }
         Ok(OAuthTokenRecord {
@@ -431,14 +433,14 @@ where
             issuer: self.descriptor.issuer.clone(),
             audience: self.descriptor.audience.clone(),
             client_id: self.descriptor.client_id.clone(),
-            account: claims.account_id,
+            account: account_id.to_string(),
             tenant: None,
             project: None,
-            scopes,
+            scopes: self.descriptor.scopes.clone(),
             access_token,
             refresh_token: Some(refresh_token),
             id_token,
-            expires_at,
+            expires_at: claims.expires_at,
             generation: Uuid::new_v4().to_string(),
             revoked: false,
             mutation_pending: false,
@@ -463,51 +465,6 @@ where
         self.validate_tokens(status, body, previous, context, cancel)
             .await
     }
-}
-
-fn granted_scopes(body: &Value, requested: &BTreeSet<String>) -> Result<BTreeSet<String>> {
-    let Some(scope) = body.get("scope") else {
-        // RFC 6749 allows omission when the granted scope is identical to the request.
-        return Ok(requested.clone());
-    };
-    let scope = scope
-        .as_str()
-        .context("ChatGPT token response scope was not a string")?;
-    let granted = scope
-        .split_ascii_whitespace()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    if granted.len() > 128
-        || granted.iter().any(|value| {
-            value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
-        })
-        || &granted != requested
-    {
-        bail!("ChatGPT token response did not grant the requested scopes");
-    }
-    Ok(granted)
-}
-
-fn bounded_access_expiry(
-    body: &Value,
-    now: DateTime<Utc>,
-    signed_expiry: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
-    let Some(expires_in) = body.get("expires_in") else {
-        return Ok(signed_expiry);
-    };
-    let seconds = expires_in
-        .as_u64()
-        .filter(|seconds| *seconds > 0)
-        .context("ChatGPT token response expires_in was not a positive integer")?;
-    let seconds =
-        i64::try_from(seconds).context("ChatGPT token response expires_in was too large")?;
-    let lifetime = TimeDelta::try_seconds(seconds)
-        .context("ChatGPT token response expires_in was too large")?;
-    let response_expiry = now
-        .checked_add_signed(lifetime)
-        .context("ChatGPT token response expires_in overflowed")?;
-    Ok(response_expiry.min(signed_expiry))
 }
 
 fn validate_public_claim(value: &str, label: &str) -> Result<()> {
@@ -694,8 +651,8 @@ mod tests {
             audiences: BTreeSet::from([OPENAI_PUBLIC_CLIENT_ID.into()]),
             authorized_party: None,
             subject: "subject-work".into(),
-            account_id: "acct-work".into(),
-            chatgpt_plan_type: "plus".into(),
+            account_id: Some("acct-work".into()),
+            chatgpt_plan_type: Some("plus".into()),
             account_is_fedramp: false,
             nonce: None,
             expires_at: Utc::now() + TimeDelta::hours(1),
@@ -808,7 +765,10 @@ mod tests {
             "https://auth.openai.com/oauth/authorize"
         );
         assert!(dialect.descriptor().browser_credential_kind.is_none());
-        assert_eq!(dialect.descriptor().scopes.len(), 6);
+        assert_eq!(
+            dialect.descriptor().scopes,
+            BTreeSet::from(["chatgpt.codex.invoke".into()])
+        );
         assert_eq!(CHATGPT_AUTH_CLAIM_NAMESPACE, "https://api.openai.com/auth");
         assert!(dialect.preflight().is_ok());
     }
@@ -969,10 +929,10 @@ mod tests {
                         claims.audiences.insert("other-client".into());
                         claims.authorized_party = None;
                     }
-                    "account" => claims.account_id.clear(),
-                    "account-control" => claims.account_id = "acct\nforged".into(),
-                    "account-length" => claims.account_id = "x".repeat(257),
-                    "plan-control" => claims.chatgpt_plan_type = "plus\u{1b}[31m".into(),
+                    "account" => claims.account_id = None,
+                    "account-control" => claims.account_id = Some("acct\nforged".into()),
+                    "account-length" => claims.account_id = Some("x".repeat(257)),
+                    "plan-control" => claims.chatgpt_plan_type = Some("plus\u{1b}[31m".into()),
                     "expired" => claims.expires_at = Utc::now() - TimeDelta::minutes(1),
                     "not_before" => {
                         claims.not_before = Some(Utc::now() + TimeDelta::minutes(5));
@@ -999,21 +959,26 @@ mod tests {
                     &CancellationToken::new(),
                 )
                 .await
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("validation failed")
-                    || error.contains("nonce mismatch")
-                    || error.contains("signed account")
-                    || error.contains("signed plan"),
+                .unwrap_err();
+            let expected = if matches!(
+                defect,
+                "account" | "account-control" | "account-length" | "plan-control"
+            ) {
+                ChatGptAuthStageError::AccountEntitlement
+            } else {
+                ChatGptAuthStageError::ClientBinding
+            };
+            assert_eq!(
+                error.downcast_ref::<ChatGptAuthStageError>(),
+                Some(&expected),
                 "defect={defect} error={error}"
             );
-            assert!(!error.contains("secret"));
+            assert!(!format!("{error:#}").contains("secret"));
         }
     }
 
     #[tokio::test]
-    async fn hostile_token_error_and_unsigned_lifetime_never_leak_or_extend_authority() {
+    async fn hostile_token_error_and_unsigned_metadata_never_leak_or_define_authority() {
         let dialect = OpenAiChatGptOAuthDialect::for_test(
             "http://127.0.0.1:12345",
             Arc::new(FixedVerifier(claims())),
@@ -1052,7 +1017,8 @@ mod tests {
                 json!({
                     "access_token": "access-secret",
                     "refresh_token": "refresh-secret",
-                    "expires_in": 86400
+                    "expires_in": "unrequested-metadata",
+                    "scope": "openid profile email offline_access"
                 }),
                 None,
                 &TokenValidationContext::Device,
@@ -1061,22 +1027,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(record.expires_at, signed_expiry);
+    }
 
-        let mut long = claims();
-        long.expires_at = Utc::now() + TimeDelta::hours(2);
+    #[tokio::test]
+    async fn unrequested_scope_metadata_does_not_define_local_authority() {
         let dialect = OpenAiChatGptOAuthDialect::for_test(
             "http://127.0.0.1:12345",
-            Arc::new(FixedVerifier(long)),
+            Arc::new(FixedVerifier(claims())),
         )
         .unwrap();
-        let earliest_response_expiry = Utc::now() + TimeDelta::seconds(59);
         let record = dialect
             .validate_tokens(
                 StatusCode::OK,
                 json!({
                     "access_token": "access-secret",
                     "refresh_token": "refresh-secret",
-                    "expires_in": 60
+                    "scope": "openid profile email offline_access"
                 }),
                 None,
                 &TokenValidationContext::Device,
@@ -1084,56 +1050,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let latest_response_expiry = Utc::now() + TimeDelta::seconds(60);
-        assert!(record.expires_at >= earliest_response_expiry);
-        assert!(record.expires_at <= latest_response_expiry);
-
-        let error = dialect
-            .validate_tokens(
-                StatusCode::OK,
-                json!({
-                    "access_token": "access-secret",
-                    "refresh_token": "refresh-secret",
-                    "expires_in": u64::MAX
-                }),
-                None,
-                &TokenValidationContext::Device,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
         assert_eq!(
-            error.downcast_ref::<ChatGptAuthStageError>(),
-            Some(&ChatGptAuthStageError::TokenExchangeContract)
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_scope_response_must_equal_the_pinned_scope_set() {
-        let dialect = OpenAiChatGptOAuthDialect::for_test(
-            "http://127.0.0.1:12345",
-            Arc::new(FixedVerifier(claims())),
-        )
-        .unwrap();
-        let mut scopes = chatgpt_required_scopes().into_iter().collect::<Vec<_>>();
-        scopes.push("unexpected.extra.authority".into());
-        let error = dialect
-            .validate_tokens(
-                StatusCode::OK,
-                json!({
-                    "access_token": "access-secret",
-                    "refresh_token": "refresh-secret",
-                    "scope": scopes.join(" ")
-                }),
-                None,
-                &TokenValidationContext::Device,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<ChatGptAuthStageError>(),
-            Some(&ChatGptAuthStageError::AccountBinding)
+            record.scopes,
+            BTreeSet::from(["chatgpt.codex.invoke".into()])
         );
     }
 }
