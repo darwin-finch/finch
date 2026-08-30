@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -386,6 +386,8 @@ where
         let scopes = granted_scopes(&body, &self.descriptor.scopes)
             .context(ChatGptAuthStageError::AccountBinding)?;
         let now = Utc::now();
+        let expires_at = bounded_access_expiry(&body, now, claims.expires_at)
+            .context(ChatGptAuthStageError::TokenExchangeContract)?;
         if claims.issuer != REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
             || (claims.audiences.len() > 1
@@ -436,7 +438,7 @@ where
             access_token,
             refresh_token: Some(refresh_token),
             id_token,
-            expires_at: claims.expires_at,
+            expires_at,
             generation: Uuid::new_v4().to_string(),
             revoked: false,
             mutation_pending: false,
@@ -479,11 +481,31 @@ fn granted_scopes(body: &Value, requested: &BTreeSet<String>) -> Result<BTreeSet
         || granted.iter().any(|value| {
             value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
         })
-        || !requested.is_subset(&granted)
+        || &granted != requested
     {
         bail!("ChatGPT token response did not grant the requested scopes");
     }
     Ok(granted)
+}
+
+fn bounded_access_expiry(
+    body: &Value,
+    now: DateTime<Utc>,
+    signed_expiry: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let Some(expires_in) = body.get("expires_in") else {
+        return Ok(signed_expiry);
+    };
+    let seconds = expires_in
+        .as_u64()
+        .filter(|seconds| *seconds > 0)
+        .context("ChatGPT token response expires_in was not a positive integer")?;
+    let seconds =
+        i64::try_from(seconds).context("ChatGPT token response expires_in was too large")?;
+    let response_expiry = now
+        .checked_add_signed(TimeDelta::seconds(seconds))
+        .context("ChatGPT token response expires_in overflowed")?;
+    Ok(response_expiry.min(signed_expiry))
 }
 
 fn validate_public_claim(value: &str, label: &str) -> Result<()> {
@@ -1033,5 +1055,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(record.expires_at, signed_expiry);
+
+        let mut long = claims();
+        long.expires_at = Utc::now() + TimeDelta::hours(2);
+        let dialect = OpenAiChatGptOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(long)),
+        )
+        .unwrap();
+        let earliest_response_expiry = Utc::now() + TimeDelta::seconds(59);
+        let record = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                json!({
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                    "expires_in": 60
+                }),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let latest_response_expiry = Utc::now() + TimeDelta::seconds(60);
+        assert!(record.expires_at >= earliest_response_expiry);
+        assert!(record.expires_at <= latest_response_expiry);
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_response_must_equal_the_pinned_scope_set() {
+        let dialect = OpenAiChatGptOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(claims())),
+        )
+        .unwrap();
+        let mut scopes = chatgpt_required_scopes().into_iter().collect::<Vec<_>>();
+        scopes.push("unexpected.extra.authority".into());
+        let error = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                json!({
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                    "scope": scopes.join(" ")
+                }),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ChatGptAuthStageError>(),
+            Some(&ChatGptAuthStageError::AccountBinding)
+        );
     }
 }

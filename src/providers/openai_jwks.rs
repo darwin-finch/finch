@@ -990,11 +990,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.chain().any(|source| source
-            .downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>(
-        ) == Some(
-            &crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification
-        )));
+        assert_eq!(
+            error.downcast_ref::<crate::providers::chatgpt_oauth::ChatGptAuthStageError>(),
+            Some(&crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification)
+        );
         assert!(store.load("chatgpt:invalid-identity").unwrap().is_none());
         let rendered = format!("{error:#}");
         for secret in ["opaque-access-bearer", "opaque-refresh-bearer"] {
