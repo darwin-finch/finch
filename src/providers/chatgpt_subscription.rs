@@ -2433,7 +2433,9 @@ mod tests {
         )
         .unwrap();
         provider
-            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
             .await
             .unwrap();
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
