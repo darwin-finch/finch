@@ -58,9 +58,11 @@ jobs:
           cargo test --lib ipc::client::tests:: -- --nocapture
           cargo test --lib ipc::brain_codec::tests:: -- --nocapture
           cargo test --lib ipc::server::tests::runner_turn_result_decodes_ordered_capnp_lifecycle -- --exact
-          cargo test --lib server::handlers::tests::brain_history_remains_conversation_data_not_system_text -- --exact
+          cargo test --lib server::handlers::handler_tests::brain_history_remains_conversation_data_not_system_text -- --exact
+          cargo test --lib server::handlers::handler_tests::brain_history_reconstructs_provider_tool_protocol -- --exact
           cargo test --lib cli::repl_event::query_processor::tests::completed_history_replaces_text_without_reordering_opaque_continuation -- --exact
           cargo test --lib cli::repl_event::query_state::tests:: -- --nocapture
+          cargo test --lib cli::repl_event::event_loop::tests::named_brain_continuation_preserves_multi_text_and_opaque_order -- --exact
           cargo test --lib cli::conversation::tests::test_opaque_reasoning_continuation_survives_restart_byte_for_byte -- --exact
           cargo test --lib cli::conversation::tests::test_staged_tool_round_is_invisible_until_complete_atomic_commit -- --exact
       - name: No external provider binary regression
