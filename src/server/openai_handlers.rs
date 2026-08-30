@@ -238,6 +238,12 @@ async fn handle_chat_completions_streaming(
         GeneratorState::Ready { .. } => {
             // Model ready, proceed
         }
+        GeneratorState::FailedNoCloudFallback { error } => {
+            return Err(error_response(
+                &format!("Local provider failed and cloud fallback is disabled: {error}"),
+                "local_provider_failed",
+            ));
+        }
         _ => {
             return Err(error_response(
                 "Local model not ready for streaming",
@@ -563,7 +569,10 @@ pub async fn handle_chat_completions(
 
     let native_local_failure = {
         let state = server.generator_state().read().await;
-        matches!(&*state, crate::models::GeneratorState::FailedNoCloudFallback { .. })
+        matches!(
+            &*state,
+            crate::models::GeneratorState::FailedNoCloudFallback { .. }
+        )
     };
     if native_local_failure {
         info!(

@@ -52,6 +52,19 @@ pub struct DownloadProgressSnapshot {
 }
 
 impl GeneratorState {
+    /// Preserve native-provider safety classification through contextual error layers.
+    pub fn from_load_error(error: &anyhow::Error) -> Self {
+        let diagnostic = format!("{error:#}");
+        if error
+            .downcast_ref::<crate::models::loaders::onnx::UnsafeNativeProviderError>()
+            .is_some()
+        {
+            return Self::FailedNoCloudFallback { error: diagnostic };
+        }
+
+        Self::Failed { error: diagnostic }
+    }
+
     /// Check if generator is ready for use
     pub fn is_ready(&self) -> bool {
         matches!(self, GeneratorState::Ready { .. })
@@ -84,6 +97,35 @@ impl GeneratorState {
             }
             GeneratorState::NotAvailable => "⚠ Offline mode - forwarding to Claude".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_contextual_unsafe_native_error_disables_cloud_fallback() {
+        let error = anyhow::Error::new(
+            crate::models::loaders::onnx::UnsafeNativeProviderError::for_model_repository(
+                "onnx-community/Qwen2.5-1.5B-Instruct",
+            ),
+        )
+        .context("Failed to create ONNX session")
+        .context("Failed to load ONNX model");
+
+        let state = GeneratorState::from_load_error(&error);
+        let GeneratorState::FailedNoCloudFallback { error } = state else {
+            panic!("contextual native safety error lost its no-fallback classification");
+        };
+        assert!(error.contains("Failed to load ONNX model"));
+        assert!(error.contains("CoreML session creation is disabled"));
+    }
+
+    #[test]
+    fn test_ordinary_load_error_keeps_existing_fallback_policy() {
+        let state = GeneratorState::from_load_error(&anyhow::anyhow!("ordinary load failure"));
+        assert!(matches!(state, GeneratorState::Failed { .. }));
     }
 }
 

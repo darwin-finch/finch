@@ -493,9 +493,7 @@ fn write_coreml_manifest(
 
 #[cfg(target_os = "macos")]
 fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
-    if config.repo_id == QWEN_2_5_1_5B_ONNX_REPOSITORY
-        && config.execution_providers.is_none()
-    {
+    if config.repo_id == QWEN_2_5_1_5B_ONNX_REPOSITORY && config.execution_providers.is_none() {
         return false;
     }
 
@@ -515,6 +513,14 @@ const QWEN_2_5_1_5B_ONNX_REPOSITORY: &str = "onnx-community/Qwen2.5-1.5B-Instruc
 #[derive(Debug)]
 pub struct UnsafeNativeProviderError {
     model_repository: String,
+}
+
+impl UnsafeNativeProviderError {
+    pub(crate) fn for_model_repository(model_repository: impl Into<String>) -> Self {
+        Self {
+            model_repository: model_repository.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for UnsafeNativeProviderError {
@@ -538,10 +544,7 @@ fn qwen_coreml_session_policy(config: &OnnxLoadConfig) -> Result<bool> {
     match config.execution_providers.as_deref() {
         None => Ok(true),
         Some(providers) if providers.contains(&ConfigExecutionProvider::CoreML) => {
-            Err(UnsafeNativeProviderError {
-                model_repository: config.repo_id.clone(),
-            }
-            .into())
+            Err(UnsafeNativeProviderError::for_model_repository(config.repo_id.clone()).into())
         }
         Some(_) => Ok(false),
     }

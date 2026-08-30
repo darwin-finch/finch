@@ -3669,6 +3669,7 @@ async fn handle_message(
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<MessageResponse>, AppError> {
     use crate::metrics::{RequestMetric, ResponseComparison};
+    use crate::models::GeneratorState;
     use crate::router::RouteDecision;
     use std::time::Instant;
 
@@ -3684,6 +3685,20 @@ async fn handle_message(
 
     // Extract text content from the user message for routing
     let user_text = user_message.text();
+
+    {
+        let state = server.generator_state().read().await;
+        if let GeneratorState::FailedNoCloudFallback { error } = &*state {
+            tracing::warn!(
+                request_id = %request_id,
+                error = %error,
+                "Local provider failed at an unsafe native boundary; refusing compatibility-route cloud fallback"
+            );
+            return Err(anyhow::anyhow!(
+                "Local provider failed and cloud fallback is disabled: {error}"
+            ));
+        }
+    }
 
     // Process query through router
     let router = server.router().read().await;
@@ -3713,7 +3728,6 @@ async fn handle_message(
             tracing::info!(request_id = %request_id, "Handling locally");
 
             // Check if local generator is ready
-            use crate::models::GeneratorState;
             let state = server.generator_state().read().await;
 
             match &*state {

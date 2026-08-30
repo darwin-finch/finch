@@ -1249,10 +1249,73 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "local_provider_failed");
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
+
+        let streaming_local = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "configured-cloud",
+                            "messages": [{"role": "user", "content": "stay local streaming"}],
+                            "stream": true,
+                            "local_only": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            streaming_local.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let streaming_body = streaming_local
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let streaming_body: serde_json::Value = serde_json::from_slice(&streaming_body).unwrap();
+        assert_eq!(streaming_body["error"]["type"], "local_provider_failed");
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
+
+        let compatibility = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "configured-cloud",
+                            "messages": [{
+                                "role": "user",
+                                "content": [{"type": "text", "text": "compatibility route"}]
+                            }],
+                            "max_tokens": 32
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            compatibility.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
         assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
 
         let explicit_cloud = isolated_http_router(Arc::clone(&server))
