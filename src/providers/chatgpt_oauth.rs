@@ -1029,10 +1029,14 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("token exchange was rejected (HTTP 400)"));
-        assert!(!error.contains(marker));
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ChatGptAuthStageError>(),
+            Some(&ChatGptAuthStageError::TokenExchangeRejected(400))
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("authorization-code exchange was rejected (HTTP 400)"));
+        assert!(!rendered.contains(marker));
 
         let mut short = claims();
         short.expires_at = Utc::now() + TimeDelta::minutes(5);
