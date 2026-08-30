@@ -8824,7 +8824,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(observed_rx.try_recv(), Ok(query_id));
+        assert_eq!(observed_rx.recv().await, Some(query_id));
         let restored = crate::cli::conversation::ConversationHistory::load(&checkpoint).unwrap();
         assert_eq!(restored.get_messages().len(), 2);
         assert_eq!(
