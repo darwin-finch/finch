@@ -63,8 +63,17 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 }
 
 fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
-    if !config_path.exists() {
-        return Ok(None);
+    match fs::metadata(config_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not inspect existing Finch configuration at {}",
+                    config_path.display()
+                )
+            });
+        }
     }
 
     Ok(Some(load_config_from_path(&config_path)?))
@@ -283,5 +292,13 @@ mod tests {
             config_path.exists(),
             "a failed load must not remove the file"
         );
+
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "sentinel").unwrap();
+        let inaccessible = blocked_parent.join("config.toml");
+        let error = try_load_from_path(&inaccessible)
+            .expect_err("filesystem inspection errors must not look like first run")
+            .to_string();
+        assert!(error.contains("Could not inspect existing Finch configuration"));
     }
 }
