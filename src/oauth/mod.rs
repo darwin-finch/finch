@@ -376,8 +376,26 @@ pub trait OAuthDialect: Send + Sync {
         status: StatusCode,
         body: Value,
     ) -> Result<DeviceAuthorization>;
+    /// Parse one bounded device-start response. Dialects may claim documented
+    /// status-only responses before decoding an untrusted body.
+    fn parse_device_authorization_response(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Result<DeviceAuthorization> {
+        let body = serde_json::from_slice(body)
+            .context("OAuth device authorization response was malformed JSON")?;
+        self.parse_device_authorization(status, body)
+    }
     fn device_poll_request(&self, pending: &DeviceAuthorization) -> Result<OAuthHttpRequest>;
     fn parse_device_poll(&self, status: StatusCode, body: Value) -> Result<DevicePoll>;
+    /// Parse one bounded poll response. The default retains strict RFC-style
+    /// JSON error bodies; dialects with status-only polling override it.
+    fn parse_device_poll_response(&self, status: StatusCode, body: &[u8]) -> Result<DevicePoll> {
+        let body = serde_json::from_slice(body)
+            .context("OAuth device polling response was malformed JSON")?;
+        self.parse_device_poll(status, body)
+    }
     fn authorization_code_request(
         &self,
         grant: &AuthorizationCodeGrant,
@@ -550,10 +568,10 @@ where
         cancel: CancellationToken,
     ) -> Result<DeviceAuthorization> {
         let request = self.dialect.device_authorization_request()?;
-        let (status, body) = self.post_form_cancellable(request, &cancel).await?;
+        let (status, body) = self.post_form_bytes_cancellable(request, &cancel).await?;
         let pending = self
             .dialect
-            .parse_device_authorization(status, body)
+            .parse_device_authorization_response(status, &body)
             .context("OAuth device authorization response is incompatible")?;
         validate_device_authorization(&pending, self.dialect.descriptor())?;
         Ok(pending)
@@ -610,7 +628,10 @@ where
             }
             let request = self.dialect.device_poll_request(pending)?;
             let response = self.post_device_request(request, &cancel, deadline).await?;
-            let tokens = match self.dialect.parse_device_poll(response.0, response.1)? {
+            let tokens = match self
+                .dialect
+                .parse_device_poll_response(response.0, &response.1)?
+            {
                 DevicePoll::Pending => continue,
                 DevicePoll::SlowDown => {
                     interval = interval
@@ -1008,6 +1029,16 @@ where
         request: OAuthHttpRequest,
         cancel: &CancellationToken,
     ) -> Result<(StatusCode, Value)> {
+        let (status, bytes) = self.post_form_bytes_cancellable(request, cancel).await?;
+        let body = serde_json::from_slice(&bytes).context("OAuth response was malformed JSON")?;
+        Ok((status, body))
+    }
+
+    async fn post_form_bytes_cancellable(
+        &self,
+        request: OAuthHttpRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(StatusCode, Vec<u8>)> {
         let descriptor = self.dialect.descriptor();
         let url = validate_endpoint(&request.endpoint, descriptor.allow_insecure_loopback)?;
         if !descriptor.allowed_origins.contains(&origin(&url)?) {
@@ -1027,9 +1058,7 @@ where
             }
             let status = response.status();
             let bytes = read_bounded(response, MAX_AUTH_BODY_BYTES).await?;
-            let body =
-                serde_json::from_slice(&bytes).context("OAuth response was malformed JSON")?;
-            Ok((status, body))
+            Ok((status, bytes))
             }) => result.context("OAuth request timed out")?,
         }
     }
@@ -1074,13 +1103,13 @@ where
         request: OAuthHttpRequest,
         cancel: &CancellationToken,
         deadline: tokio::time::Instant,
-    ) -> Result<(StatusCode, Value)> {
+    ) -> Result<(StatusCode, Vec<u8>)> {
         ensure_device_authorization_active(cancel, deadline)?;
         tokio::select! {
             biased;
             _ = cancel.cancelled() => bail!("OAuth device authorization was cancelled"),
             _ = tokio::time::sleep_until(deadline) => bail!("OAuth device authorization expired"),
-            response = self.post_form(request) => response,
+            response = self.post_form_bytes_cancellable(request, cancel) => response,
         }
     }
 }
