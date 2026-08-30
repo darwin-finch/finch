@@ -544,7 +544,13 @@ async fn device_start_http_cancellation_retains_typed_terminal_cause_through_con
     let cancel = CancellationToken::new();
     let pending = client.begin_device_authorization_cancellable(cancel.clone());
     tokio::pin!(pending);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.request_count("/alpha/device") == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     cancel.cancel();
     let error = pending.await.unwrap_err().context("setup start context");
     assert!(error.chain().any(|source| matches!(
@@ -575,7 +581,13 @@ async fn generic_oauth_http_cancellation_is_not_mislabeled_as_device_authorizati
     };
     let pending = client.post_form_bytes_cancellable(request, &cancel);
     tokio::pin!(pending);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.request_count("/alpha/token") == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     cancel.cancel();
     let error = pending.await.unwrap_err();
     assert!(error.to_string().contains("cancelled"));

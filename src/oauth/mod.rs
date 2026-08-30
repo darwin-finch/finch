@@ -582,7 +582,8 @@ where
         let (status, body) = match self.post_form_bytes_cancellable(request, &cancel).await {
             Ok(response) => response,
             Err(error) if cancel.is_cancelled() => {
-                return Err(error).context(OAuthDeviceAuthorizationError::Cancelled)
+                tracing::debug!(error = %error, "OAuth device-start request was cancelled");
+                return Err(OAuthDeviceAuthorizationError::Cancelled.into());
             }
             Err(error) => return Err(error),
         };
