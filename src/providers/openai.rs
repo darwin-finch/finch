@@ -96,6 +96,12 @@ fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
     })
 }
 
+/// Reuse the canonical OpenAI image integrity boundary for Responses-family
+/// transports without exposing the Platform wire type.
+pub(crate) fn validated_image_data_url(source: &ImageSource) -> Result<String> {
+    Ok(validate_image_source(source)?.url)
+}
+
 fn validate_png(bytes: &[u8]) -> Result<()> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         anyhow::bail!("OpenAI image bytes did not match the declared media type");
@@ -534,6 +540,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         state.usage_seen = true;
         output.push(StreamChunk::Usage {
             input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
         });
     }
     if chunk.choices.is_empty() {
@@ -1120,7 +1127,9 @@ impl OpenAIProvider {
                                         );
                                     }
                                 }
-                                ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {
+                                ContentBlock::Image { .. }
+                                | ContentBlock::ToolResult { .. }
+                                | ContentBlock::OpaqueReasoning { .. } => {
                                     anyhow::bail!(
                                         "OpenAI assistant message contained an unsupported content block"
                                     );
@@ -1222,6 +1231,9 @@ impl OpenAIProvider {
                                     compatible_text_parts.push("[image]");
                                 }
                             },
+                            ContentBlock::OpaqueReasoning { .. } => {
+                                anyhow::bail!("OpenAI Chat Completions cannot carry opaque Responses continuation")
+                            }
                             ContentBlock::ToolUse { .. } => {
                                 if rule == TransportRule::CanonicalGpt56ChatCompletions {
                                     anyhow::bail!(
@@ -1447,6 +1459,8 @@ impl OpenAIProvider {
             stop_reason: choice.finish_reason,
             role: choice.message.role,
             provider: self.provider_name.clone(),
+            usage: None,
+            allowance: None,
         })
     }
 
@@ -2497,7 +2511,8 @@ mod tests {
                 StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { id, name, input }) => {
                     calls.push((id, name, input))
                 }
-                StreamChunk::Usage { input_tokens } => usage = Some(input_tokens),
+                StreamChunk::Usage { input_tokens, .. } => usage = Some(input_tokens),
+                StreamChunk::Allowance { .. } => {}
                 StreamChunk::ResponseMetadata { model } => actual_model = Some(model),
                 _ => {}
             }

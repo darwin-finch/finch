@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use super::chatgpt_subscription::ChatGptSubscriptionProvider;
 use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
@@ -405,6 +406,9 @@ fn resolve_named_graph(
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked every named credential reference");
+        if credential.provider == CredentialProvider::ChatgptSubscription {
+            continue;
+        }
         let handle = resolve_named_credential(binding, credential, resolver)?;
         resolved.insert(binding.credential_ref.clone(), handle);
     }
@@ -440,9 +444,11 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
         return Ok(());
     };
     match provider {
-        CredentialProvider::ChatgptSubscription => bail!(
-            "ChatGPT subscription credentials are distinct from OpenAI Platform credentials, but no documented Finch-native subscription transport is currently available"
-        ),
+        CredentialProvider::ChatgptSubscription
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("ChatGPT subscription custom endpoints and paths are not supported")
+        }
         CredentialProvider::GoogleVertex => bail!(
             "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
         ),
@@ -482,10 +488,24 @@ pub(crate) fn preflight_provider_config(config: &Config) -> Result<()> {
 fn create_named_profiles_from_config_with_resolver(
     config: &Config,
     resolver: &dyn CredentialResolver,
+    production_oauth: bool,
 ) -> Result<Vec<(String, Box<dyn LlmProvider>)>> {
     // Complete graph and transport validation happen before secret resolution
     // or the first provider constructor.
     preflight_provider_config(config)?;
+    if !production_oauth
+        && config.providers.iter().any(|entry| {
+            matches!(
+                entry,
+                ProviderEntry::Credentialed {
+                    provider: CredentialProvider::ChatgptSubscription,
+                    ..
+                }
+            )
+        })
+    {
+        bail!("Injected credential resolvers cannot fabricate a refreshable ChatGPT subscription lease")
+    }
     let resolved = resolve_named_graph(config, resolver)?;
     let credentials = crate::config::credential::credential_index(config.credentials())?;
     let cloud: Vec<_> = config
@@ -501,14 +521,28 @@ fn create_named_profiles_from_config_with_resolver(
         .into_iter()
         .map(|(index, entry)| {
             let provider = if let Some(binding) = entry.credential_binding() {
-                let handle = resolved
-                    .get(&binding.credential_ref)
-                    .expect("resolved graph contains every validated named credential");
-                let inner = create_provider_from_resolved_entry(entry, handle)?;
                 let metadata = credentials
                     .get(binding.credential_ref.as_str())
                     .expect("validated credential index contains every profile reference");
-                Ok(Box::new(CredentialBoundProvider::new(inner, metadata)) as Box<dyn LlmProvider>)
+                if metadata.provider == CredentialProvider::ChatgptSubscription {
+                    if !production_oauth {
+                        bail!("Injected credential resolvers cannot fabricate a refreshable ChatGPT subscription lease")
+                    }
+                    let ProviderEntry::Credentialed { model, reasoning_effort, .. } = entry else {
+                        unreachable!("credential binding implies credentialed entry")
+                    };
+                    Ok(Box::new(ChatGptSubscriptionProvider::production(
+                        metadata,
+                        model.as_deref(),
+                        *reasoning_effort,
+                    )?) as Box<dyn LlmProvider>)
+                } else {
+                    let handle = resolved
+                        .get(&binding.credential_ref)
+                        .expect("resolved graph contains every validated non-OAuth credential");
+                    let inner = create_provider_from_resolved_entry(entry, handle)?;
+                    Ok(Box::new(CredentialBoundProvider::new(inner, metadata)) as Box<dyn LlmProvider>)
+                }
             } else {
                 create_provider_from_entry(entry)
             }
@@ -620,7 +654,11 @@ fn graph_from_boxed_profiles(
 /// Legacy teacher-only configuration remains supported.
 pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGraph> {
     let profiles = if config.providers.iter().any(|entry| !entry.is_local()) {
-        create_named_profiles_from_config_with_resolver(config, &EnvironmentCredentialResolver)?
+        create_named_profiles_from_config_with_resolver(
+            config,
+            &EnvironmentCredentialResolver,
+            true,
+        )?
     } else {
         if config.teachers.is_empty() {
             bail!("No teacher providers configured");
@@ -664,7 +702,7 @@ pub fn create_provider_graph_from_config_with_resolver(
         return create_provider_graph_from_config(config);
     }
     graph_from_boxed_profiles(
-        create_named_profiles_from_config_with_resolver(config, resolver)?,
+        create_named_profiles_from_config_with_resolver(config, resolver, false)?,
         false,
     )
 }
@@ -674,11 +712,13 @@ pub fn create_provider_profile_from_config(
     config: &Config,
     profile_name: &str,
 ) -> Result<Arc<dyn LlmProvider>> {
-    create_provider_profile_from_config_with_resolver(
-        config,
-        profile_name,
-        &EnvironmentCredentialResolver,
-    )
+    let graph = create_provider_graph_from_config(config)?;
+    graph
+        .profiles()
+        .iter()
+        .find(|profile| profile.profile_name() == profile_name)
+        .map(|profile| Arc::clone(profile.provider()))
+        .with_context(|| format!("Provider profile '{profile_name}' was not found"))
 }
 
 /// Revalidate the complete graph with an injected credential resolver and
@@ -712,6 +752,9 @@ pub fn create_provider_profile_from_config_with_resolver(
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked the selected named credential reference");
+        if credential.provider == CredentialProvider::ChatgptSubscription {
+            bail!("Injected credential resolvers cannot fabricate a refreshable ChatGPT subscription lease")
+        }
         let handle = resolve_named_credential(binding, credential, resolver)?;
         let inner = create_provider_from_resolved_entry(entry, &handle)?;
         Arc::new(CredentialBoundProvider::new(inner, credential)) as Arc<dyn LlmProvider>
@@ -728,6 +771,7 @@ pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmPr
         return Ok(create_named_profiles_from_config_with_resolver(
             config,
             &EnvironmentCredentialResolver,
+            true,
         )?
         .into_iter()
         .map(|(_, provider)| provider)

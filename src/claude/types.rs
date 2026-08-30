@@ -9,7 +9,7 @@ pub use crate::tools::types::ToolDefinition;
 use crate::config::constants::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
 
 /// Content block - supports text, image, tool_use, and tool_result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
@@ -33,10 +33,15 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+
+    /// Provider-owned opaque reasoning continuation. Finch persists and
+    /// replays this value byte-for-byte but never interprets or renders it.
+    #[serde(rename = "opaque_reasoning")]
+    OpaqueReasoning { encrypted_content: String },
 }
 
 /// Source for an image content block
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String, // "base64"
@@ -87,9 +92,16 @@ impl ContentBlock {
             is_error,
         }
     }
+
+    /// Create an opaque provider continuation block.
+    pub fn opaque_reasoning(encrypted_content: impl Into<String>) -> Self {
+        Self::OpaqueReasoning {
+            encrypted_content: encrypted_content.into(),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     #[serde(with = "content_serializer")]
@@ -275,6 +287,14 @@ pub struct MessageResponse {
     pub content: Vec<ContentBlock>,
     pub model: String,
     pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
+    #[serde(default)]
+    pub primary_allowance_used_percent: Option<f32>,
+    #[serde(default)]
+    pub secondary_allowance_used_percent: Option<f32>,
 }
 
 impl MessageResponse {

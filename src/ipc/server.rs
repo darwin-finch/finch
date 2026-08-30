@@ -1722,11 +1722,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         r.get().init_chunk().set_text_delta(delta.as_str());
                         r.send().promise.await?;
                     }
-                    Ok(StreamChunk::Usage { input_tokens }) => {
+                    Ok(StreamChunk::Usage {
+                        input_tokens,
+                        output_tokens,
+                    }) => {
                         let mut r = receiver.on_chunk_request();
                         let mut upd = r.get().init_chunk().init_usage_update();
                         upd.set_input_tokens(input_tokens);
-                        upd.set_output_tokens(0);
+                        upd.set_output_tokens(output_tokens);
                         r.send().promise.await?;
                     }
                     Ok(StreamChunk::ResponseMetadata { model }) => {
@@ -1740,19 +1743,56 @@ impl finch_daemon::Server for FinchDaemonImpl {
                             .set_model(model.as_str());
                         r.send().promise.await?;
                     }
+                    Ok(StreamChunk::Allowance {
+                        primary_used_percent,
+                        secondary_used_percent,
+                    }) => {
+                        let mut r = receiver.on_chunk_request();
+                        let mut allowance = r.get().init_chunk().init_allowance_update();
+                        allowance.set_has_primary(primary_used_percent.is_some());
+                        allowance
+                            .set_primary_used_percent(primary_used_percent.unwrap_or_default());
+                        allowance.set_has_secondary(secondary_used_percent.is_some());
+                        allowance
+                            .set_secondary_used_percent(secondary_used_percent.unwrap_or_default());
+                        r.send().promise.await?;
+                    }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {
-                        if let crate::claude::ContentBlock::ToolUse { id, name, input } = block {
-                            let mut r = receiver.on_chunk_request();
-                            let mut tu = r.get().init_chunk().init_tool_use_complete();
-                            tu.set_id(id.as_str());
-                            tu.set_name(name.as_str());
-                            super::brain_codec::encode_json_value(
-                                tu.reborrow().init_input(),
-                                &input,
-                            )
-                            .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                            r.send().promise.await?;
+                        let mut r = receiver.on_chunk_request();
+                        let mut encoded = r.get().init_chunk().init_content_block_complete();
+                        match block {
+                            crate::claude::ContentBlock::Text { text } => encoded.set_text(&text),
+                            crate::claude::ContentBlock::Image { source } => {
+                                let mut image = encoded.init_image();
+                                image.set_source_type(&source.source_type);
+                                image.set_media_type(&source.media_type);
+                                image.set_data(&source.data);
+                            }
+                            crate::claude::ContentBlock::ToolUse { id, name, input } => {
+                                let mut tool = encoded.init_tool_use();
+                                tool.set_id(&id);
+                                tool.set_name(&name);
+                                super::brain_codec::encode_json_value(
+                                    tool.reborrow().init_input(),
+                                    &input,
+                                )
+                                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                            }
+                            crate::claude::ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                let mut result = encoded.init_tool_result();
+                                result.set_tool_use_id(&tool_use_id);
+                                result.set_content(&content);
+                                result.set_is_error(is_error.unwrap_or(false));
+                            }
+                            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                                encoded.set_thinking(&encrypted_content);
+                            }
                         }
+                        r.send().promise.await?;
                     }
                     Err(e) => {
                         let mut r = receiver.on_chunk_request();
@@ -2344,6 +2384,20 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
+        continuation_messages: crate::ipc::brain_codec::decode_continuation_messages(
+            result
+                .get_continuation_messages()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?,
+        invocation_metadata: result
+            .get_has_invocation_metadata()
+            .then(|| result.get_invocation_metadata())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(crate::ipc::brain_codec::decode_invocation_metadata)
+            .transpose()
+            .map_err(|error| error.to_string())?,
         turn_events,
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
@@ -2808,6 +2862,8 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
                 },
             })
         }
@@ -4451,6 +4507,51 @@ mod tests {
             result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
             result.set_output("done");
             result.set_runtime_revision(1);
+            super::super::brain_codec::encode_continuation_messages(
+                result.reborrow().init_continuation_messages(3),
+                &[
+                    crate::claude::Message::with_content(
+                        "assistant",
+                        vec![
+                            crate::claude::ContentBlock::opaque_reasoning("opaque-tool-token"),
+                            crate::claude::ContentBlock::ToolUse {
+                                id: "tool-1".into(),
+                                name: "search_word".into(),
+                                input: serde_json::json!({"query":"fib"}),
+                            },
+                        ],
+                    ),
+                    crate::claude::Message::with_content(
+                        "user",
+                        vec![crate::claude::ContentBlock::tool_result(
+                            "tool-1".into(),
+                            "found".into(),
+                            None,
+                        )],
+                    ),
+                    crate::claude::Message::with_content(
+                        "assistant",
+                        vec![
+                            crate::claude::ContentBlock::opaque_reasoning("opaque-runner-token"),
+                            crate::claude::ContentBlock::text("(say \"done\")"),
+                        ],
+                    ),
+                ],
+            )
+            .unwrap();
+            result.set_has_invocation_metadata(true);
+            super::super::brain_codec::encode_invocation_metadata(
+                result.reborrow().init_invocation_metadata(),
+                &crate::providers::types::InvocationMetadata {
+                    requested_model: "gpt-5.6".into(),
+                    resolved_model: "gpt-5.6".into(),
+                    actual_model: "gpt-5.6-sol".into(),
+                    input_tokens: Some(5),
+                    output_tokens: Some(3),
+                    primary_allowance_used_percent: Some(40.0),
+                    secondary_allowance_used_percent: None,
+                },
+            );
             super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
             result.set_error("");
             super::super::checkpoint_codec::encode_effect_record(
@@ -4529,6 +4630,17 @@ mod tests {
             ]
         );
         assert_eq!(decoded.effect_journal, vec![expected_effect]);
+        assert!(matches!(
+            decoded.continuation_messages.last().unwrap().content.as_slice(),
+            [
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
+                crate::claude::ContentBlock::Text { text },
+            ] if encrypted_content == "opaque-runner-token" && text == "(say \"done\")"
+        ));
+        assert_eq!(
+            decoded.invocation_metadata.unwrap().actual_model,
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]

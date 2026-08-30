@@ -386,6 +386,8 @@ mod tests {
                 stop_reason: Some("end_turn".into()),
                 role: "assistant".into(),
                 provider: "compatible".into(),
+                usage: None,
+                allowance: None,
             })
         }
 
@@ -494,6 +496,8 @@ mod tests {
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
                 provider: self.name.clone(),
+                usage: None,
+                allowance: None,
             })
         }
 
@@ -554,6 +558,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -577,6 +582,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -600,6 +606,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -622,6 +629,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: true,
+            cancellation_token: None,
             system: None,
         };
 

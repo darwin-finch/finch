@@ -184,6 +184,7 @@ impl OutputTokenLimitCapability {
 pub enum WireProtocol {
     AnthropicMessages,
     OpenAiChatCompletions,
+    OpenAiChatGptResponsesLite,
     GeminiGenerateContent,
 }
 
@@ -372,6 +373,22 @@ impl ModelCapabilities {
         {
             self.require("tool calls", &self.tools)?;
         }
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::OpaqueReasoning { .. }))
+        }) {
+            self.require("opaque provider continuation", &self.continuation)?;
+        }
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. }))
+        }) {
+            self.require("image input", &self.image_input)?;
+        }
         if let Some(effort) = reasoning {
             self.reasoning
                 .require(&self.provider, &self.model, effort)?;
@@ -422,6 +439,10 @@ pub struct ProviderRequest {
     /// Whether to stream the response
     #[serde(skip)]
     pub stream: bool,
+
+    /// Caller-owned cancellation propagated to network transports.
+    #[serde(skip)]
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ProviderRequest {
@@ -435,6 +456,7 @@ impl ProviderRequest {
             tools: None,
             temperature: None,
             stream: false,
+            cancellation_token: None,
         }
     }
 
@@ -465,6 +487,14 @@ impl ProviderRequest {
     /// Enable streaming
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = stream;
+        self
+    }
+
+    pub fn with_cancellation_token(
+        mut self,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        self.cancellation_token = Some(cancellation_token);
         self
     }
 
@@ -706,6 +736,7 @@ fn estimate_message_tokens(msg: &Message) -> usize {
             ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
             ContentBlock::ToolResult { content, .. } => content.len(),
             ContentBlock::Image { source } => source.data.len().min(4_000) + 20,
+            ContentBlock::OpaqueReasoning { encrypted_content } => encrypted_content.len(),
         })
         .sum();
     (content_chars / 3).max(1) + 4 // +4 overhead per message
@@ -733,6 +764,70 @@ pub struct ProviderResponse {
 
     /// Provider name (e.g., "claude", "openai", "gemini")
     pub provider: String,
+
+    /// Provider-reported token counts, when supplied by the terminal response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+
+    /// Subscription allowance metadata, distinct from API billing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowance: Option<ProviderAllowance>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ProviderAllowance {
+    pub primary_used_percent: Option<f32>,
+    pub secondary_used_percent: Option<f32>,
+}
+
+/// Provider-neutral identity and accounting for one completed inference.
+///
+/// Requested/resolved identity is Finch-owned dispatch state; `actual_model`
+/// is authoritative provider response metadata. Subscription allowance is
+/// deliberately distinct from billable token usage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvocationMetadata {
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub actual_model: String,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub primary_allowance_used_percent: Option<f32>,
+    pub secondary_allowance_used_percent: Option<f32>,
+}
+
+impl InvocationMetadata {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for model in [
+            &self.requested_model,
+            &self.resolved_model,
+            &self.actual_model,
+        ] {
+            anyhow::ensure!(
+                !model.is_empty() && model.len() <= 256 && model.is_ascii(),
+                "provider invocation model identity was invalid"
+            );
+        }
+        for allowance in [
+            self.primary_allowance_used_percent,
+            self.secondary_allowance_used_percent,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            anyhow::ensure!(
+                allowance.is_finite() && (0.0..=100.0).contains(&allowance),
+                "provider invocation allowance was invalid"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl ProviderResponse {
@@ -993,6 +1088,7 @@ mod tests {
             tools: None,
             temperature: None,
             stream: false,
+            cancellation_token: None,
         };
         let original_len = req.messages.len();
         let dropped = req.truncate_to_context_limit(10_000); // tight limit
@@ -1024,6 +1120,7 @@ mod tests {
             tools: None,
             temperature: None,
             stream: false,
+            cancellation_token: None,
         };
         // Limit of 20k tokens; ~13k system + ~4k response reserve = ~3k for messages
         // Each message ~1.3k tokens so only a couple fit → should drop several
@@ -1045,6 +1142,8 @@ mod tests {
             stop_reason: Some("end_turn".to_string()),
             role: "assistant".to_string(),
             provider: "claude".to_string(),
+            usage: None,
+            allowance: None,
         }
     }
 

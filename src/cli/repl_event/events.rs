@@ -142,6 +142,8 @@ pub enum ReplEvent {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
         latency_ms: Option<u64>,
+        primary_allowance_used_percent: Option<f32>,
+        secondary_allowance_used_percent: Option<f32>,
     },
 
     /// A child-agent lifecycle update for the live task projection.
@@ -355,6 +357,8 @@ mod tests {
             input_tokens: Some(100),
             output_tokens: Some(250),
             latency_ms: Some(1500),
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
         };
         match event {
             ReplEvent::StatsUpdate {
@@ -362,6 +366,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 latency_ms,
+                ..
             } => {
                 assert_eq!(model, "claude-sonnet-4-6");
                 assert_eq!(input_tokens, Some(100));
@@ -379,6 +384,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             latency_ms: None,
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
         };
         match event {
             ReplEvent::StatsUpdate {

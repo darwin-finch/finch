@@ -150,6 +150,8 @@ impl QwenGenerator {
                 input_tokens: Some(input_token_estimate),
                 output_tokens: Some(output_token_estimate),
                 latency_ms: Some(latency_ms),
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
             },
         })
     }
@@ -201,6 +203,8 @@ impl QwenGenerator {
                         input_tokens: None,
                         output_tokens: Some(text.split_whitespace().count() as u32),
                         latency_ms: None,
+                        primary_allowance_used_percent: None,
+                        secondary_allowance_used_percent: None,
                     },
                 });
             }

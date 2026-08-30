@@ -180,10 +180,14 @@ pub(super) fn encode_messages(
                     result.set_content(content);
                     result.set_is_error(is_error.unwrap_or(false));
                 }
-                crate::claude::ContentBlock::Image { .. } => {
-                    // The current IPC schema has no image arm. Preserve the
-                    // historical behavior rather than inventing a text form.
-                    encoded_block.set_text("");
+                crate::claude::ContentBlock::Image { source } => {
+                    let mut image = encoded_block.init_image();
+                    image.set_source_type(&source.source_type);
+                    image.set_media_type(&source.media_type);
+                    image.set_data(&source.data);
+                }
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                    encoded_block.set_thinking(encrypted_content);
                 }
             }
         }
@@ -220,11 +224,94 @@ pub(super) fn decode_messages(
                         is_error: Some(value.get_is_error()),
                     });
                 }
-                Which::Thinking(_) => {}
+                Which::Thinking(value) => {
+                    content.push(crate::claude::ContentBlock::OpaqueReasoning {
+                        encrypted_content: text(value?)?,
+                    });
+                }
+                Which::Image(value) => {
+                    let value = value?;
+                    content.push(crate::claude::ContentBlock::Image {
+                        source: crate::claude::types::ImageSource {
+                            source_type: text(value.get_source_type()?)?,
+                            media_type: text(value.get_media_type()?)?,
+                            data: text(value.get_data()?)?,
+                        },
+                    });
+                }
             }
         }
         decoded.push(crate::claude::Message { role, content });
     }
+    Ok(decoded)
+}
+
+pub(super) fn encode_invocation_metadata(
+    mut builder: finch_ipc_capnp::invocation_metadata::Builder<'_>,
+    metadata: &crate::providers::types::InvocationMetadata,
+) {
+    builder.set_requested_model(&metadata.requested_model);
+    builder.set_resolved_model(&metadata.resolved_model);
+    builder.set_actual_model(&metadata.actual_model);
+    if let Some(value) = metadata.input_tokens {
+        builder.set_has_input_tokens(true);
+        builder.set_input_tokens(value);
+    }
+    if let Some(value) = metadata.output_tokens {
+        builder.set_has_output_tokens(true);
+        builder.set_output_tokens(value);
+    }
+    if let Some(value) = metadata.primary_allowance_used_percent {
+        builder.set_has_primary_allowance(true);
+        builder.set_primary_allowance_used_percent(value);
+    }
+    if let Some(value) = metadata.secondary_allowance_used_percent {
+        builder.set_has_secondary_allowance(true);
+        builder.set_secondary_allowance_used_percent(value);
+    }
+}
+
+pub(super) fn decode_invocation_metadata(
+    reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
+) -> anyhow::Result<crate::providers::types::InvocationMetadata> {
+    let metadata = crate::providers::types::InvocationMetadata {
+        requested_model: text(reader.get_requested_model()?)?,
+        resolved_model: text(reader.get_resolved_model()?)?,
+        actual_model: text(reader.get_actual_model()?)?,
+        input_tokens: reader
+            .get_has_input_tokens()
+            .then(|| reader.get_input_tokens()),
+        output_tokens: reader
+            .get_has_output_tokens()
+            .then(|| reader.get_output_tokens()),
+        primary_allowance_used_percent: reader
+            .get_has_primary_allowance()
+            .then(|| reader.get_primary_allowance_used_percent()),
+        secondary_allowance_used_percent: reader
+            .get_has_secondary_allowance()
+            .then(|| reader.get_secondary_allowance_used_percent()),
+    };
+    metadata.validate()?;
+    Ok(metadata)
+}
+
+pub(super) fn encode_continuation_messages(
+    builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
+    messages: &[crate::claude::Message],
+) -> anyhow::Result<()> {
+    encode_messages(builder, messages)
+}
+
+pub(super) fn decode_continuation_messages(
+    messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
+) -> anyhow::Result<Vec<crate::claude::Message>> {
+    let decoded = decode_messages(messages)?;
+    anyhow::ensure!(
+        decoded
+            .iter()
+            .all(|message| matches!(message.role.as_str(), "assistant" | "user")),
+        "Brain continuation message role is invalid"
+    );
     Ok(decoded)
 }
 
@@ -1509,6 +1596,8 @@ pub(super) fn encode_event(
             request_seq,
             output,
             error,
+            continuation_messages,
+            invocation_metadata,
         } => {
             let mut result = builder.init_result();
             result.set_request_seq(*request_seq);
@@ -1516,6 +1605,18 @@ pub(super) fn encode_event(
             if let Some(error) = error {
                 result.set_has_error(true);
                 result.set_error(error);
+            }
+            if !continuation_messages.is_empty() {
+                encode_continuation_messages(
+                    result
+                        .reborrow()
+                        .init_continuation_messages(continuation_messages.len() as u32),
+                    continuation_messages,
+                )?;
+            }
+            if let Some(metadata) = invocation_metadata {
+                result.set_has_invocation_metadata(true);
+                encode_invocation_metadata(result.init_invocation_metadata(), metadata);
             }
         }
         BrainEventKind::RuntimeCommitted {
@@ -1739,6 +1840,15 @@ pub(super) fn decode_event(
                     .transpose()?
                     .map(text)
                     .transpose()?,
+                continuation_messages: decode_continuation_messages(
+                    result.get_continuation_messages()?,
+                )?,
+                invocation_metadata: result
+                    .get_has_invocation_metadata()
+                    .then(|| result.get_invocation_metadata())
+                    .transpose()?
+                    .map(decode_invocation_metadata)
+                    .transpose()?,
             }
         }
         Which::RuntimeCommitted(committed) => {
@@ -1890,6 +2000,10 @@ mod tests {
                     content: "contents".into(),
                     is_error: Some(false),
                 },
+                crate::claude::ContentBlock::OpaqueReasoning {
+                    encrypted_content: "opaque-continuation".into(),
+                },
+                crate::claude::ContentBlock::image("image/png", "aW1hZ2U="),
             ],
         }];
         let mut message = capnp::message::Builder::new_default();
@@ -1931,6 +2045,18 @@ mod tests {
                 content,
                 is_error: Some(false),
             } if tool_use_id == "tool-1" && content == "contents"
+        ));
+        assert!(matches!(
+            &decoded[0].content[3],
+            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content }
+                if encrypted_content == "opaque-continuation"
+        ));
+        assert!(matches!(
+            &decoded[0].content[4],
+            crate::claude::ContentBlock::Image { source }
+                if source.source_type == "base64"
+                    && source.media_type == "image/png"
+                    && source.data == "aW1hZ2U="
         ));
     }
 
@@ -1992,6 +2118,8 @@ mod tests {
                 request_seq: 1,
                 output: "forged".into(),
                 error: None,
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
             },
         )
         .is_err());
@@ -2111,6 +2239,22 @@ mod tests {
                 request_seq: 5,
                 output: "done".into(),
                 error: Some("example".into()),
+                continuation_messages: vec![crate::claude::Message::with_content(
+                    "assistant",
+                    vec![
+                        crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
+                        crate::claude::ContentBlock::text("(say \"done\")"),
+                    ],
+                )],
+                invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                    requested_model: "gpt-5.6".into(),
+                    resolved_model: "gpt-5.6".into(),
+                    actual_model: "gpt-5.6-sol".into(),
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    primary_allowance_used_percent: Some(12.5),
+                    secondary_allowance_used_percent: None,
+                }),
             },
             BrainEventKind::RuntimeCommitted {
                 request_seq: 5,

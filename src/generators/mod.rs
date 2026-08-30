@@ -59,6 +59,17 @@ impl Generator for ProfiledGenerator {
         self.inner.generate_stream(messages, tools).await
     }
 
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        self.inner
+            .generate_stream_cancellable(messages, tools, cancellation_token)
+            .await
+    }
+
     fn capabilities(&self) -> &GeneratorCapabilities {
         self.inner.capabilities()
     }
@@ -88,6 +99,15 @@ pub trait Generator: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>>;
+
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        _cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        self.generate_stream(messages, tools).await
+    }
 
     /// Get generator capabilities
     fn capabilities(&self) -> &GeneratorCapabilities;
@@ -136,6 +156,8 @@ pub struct ResponseMetadata {
     pub input_tokens: Option<u32>,   // Input token count (if available)
     pub output_tokens: Option<u32>,  // Output token count (if available)
     pub latency_ms: Option<u64>,     // Response latency in milliseconds
+    pub primary_allowance_used_percent: Option<f32>,
+    pub secondary_allowance_used_percent: Option<f32>,
 }
 
 /// Streaming chunk (text delta or complete block)
@@ -151,6 +173,13 @@ pub enum StreamChunk {
     /// reported by the API before any text arrives.
     Usage {
         input_tokens: u32,
+        output_tokens: u32,
+    },
+    /// Provider-owned subscription allowance snapshot. Percentages are
+    /// bounded to 0..=100 and are not Platform billing data.
+    Allowance {
+        primary_used_percent: Option<f32>,
+        secondary_used_percent: Option<f32>,
     },
 }
 
@@ -264,6 +293,8 @@ mod tests {
             input_tokens: Some(150),
             output_tokens: Some(400),
             latency_ms: Some(1200),
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
         };
         assert_eq!(meta.generator, "claude");
         assert_eq!(meta.input_tokens, Some(150));
@@ -281,6 +312,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             latency_ms: Some(45),
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
         };
         assert_eq!(meta.confidence, Some(0.87));
         assert!(meta.stop_reason.is_none());
@@ -311,9 +344,18 @@ mod tests {
 
     #[test]
     fn test_stream_chunk_usage() {
-        let chunk = StreamChunk::Usage { input_tokens: 1024 };
+        let chunk = StreamChunk::Usage {
+            input_tokens: 1024,
+            output_tokens: 256,
+        };
         match chunk {
-            StreamChunk::Usage { input_tokens } => assert_eq!(input_tokens, 1024),
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(input_tokens, 1024);
+                assert_eq!(output_tokens, 256);
+            }
             _ => panic!("Expected Usage"),
         }
     }
@@ -367,6 +409,8 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 latency_ms: Some(500),
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
             },
         };
         assert_eq!(response.text, "The answer is 42");

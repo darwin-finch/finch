@@ -167,9 +167,11 @@ impl ClaudeGenerator {
                 model: response.model,
                 confidence: None,
                 stop_reason: response.stop_reason,
-                input_tokens: None,
-                output_tokens: None,
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
                 latency_ms: None,
+                primary_allowance_used_percent: response.primary_allowance_used_percent,
+                secondary_allowance_used_percent: response.secondary_allowance_used_percent,
             },
         }
     }
@@ -202,6 +204,23 @@ impl Generator for ClaudeGenerator {
         }
 
         let rx = self.client.send_message_stream(&request).await?;
+        Ok(Some(rx))
+    }
+
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
+        if let Some(tools) = tools {
+            request = request.with_tools(tools);
+        }
+        let rx = self
+            .client
+            .send_message_stream_with_cancel(&request, cancellation_token)
+            .await?;
         Ok(Some(rx))
     }
 

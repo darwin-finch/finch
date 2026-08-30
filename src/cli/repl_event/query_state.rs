@@ -65,6 +65,10 @@ pub struct QueryMetadata {
     /// Cancellation token for this query
     pub cancellation_token: CancellationToken,
 
+    /// Completed provider identity/accounting retained until a named-Brain
+    /// turn crosses its durable daemon commit boundary.
+    pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+
     /// When this query was created
     pub created_at: std::time::Instant,
 
@@ -101,6 +105,7 @@ impl QueryStateManager {
             brain_turn_provenance: None,
             effect_audit: None,
             cancellation_token: CancellationToken::new(),
+            invocation_metadata: None,
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
             brain_output_work_unit: None,
@@ -167,6 +172,26 @@ impl QueryStateManager {
         source_for_history: String,
         conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>,
     ) -> bool {
+        self.try_publish_completion_content(
+            query_id,
+            response,
+            vec![crate::claude::ContentBlock::Text {
+                text: source_for_history,
+            }],
+            conversation,
+        )
+        .await
+    }
+
+    /// Atomically publish a provider completion with its ordered opaque
+    /// continuation blocks intact.
+    pub async fn try_publish_completion_content(
+        &self,
+        query_id: Uuid,
+        response: String,
+        content: Vec<crate::claude::ContentBlock>,
+        conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>,
+    ) -> bool {
         let mut states = self.states.write().await;
         let Some(metadata) = states.get_mut(&query_id) else {
             return false;
@@ -182,7 +207,10 @@ impl QueryStateManager {
         conversation
             .write()
             .await
-            .add_assistant_message(source_for_history);
+            .add_message(crate::claude::Message {
+                role: "assistant".to_string(),
+                content,
+            });
         metadata.state = QueryState::Completed { response };
         true
     }
@@ -199,6 +227,16 @@ impl QueryStateManager {
     /// Get full metadata for a query
     pub async fn get_metadata(&self, query_id: Uuid) -> Option<QueryMetadata> {
         self.states.read().await.get(&query_id).cloned()
+    }
+
+    pub async fn set_invocation_metadata(
+        &self,
+        query_id: Uuid,
+        invocation: crate::providers::types::InvocationMetadata,
+    ) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.invocation_metadata = Some(invocation);
+        }
     }
 
     pub async fn set_tool_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {

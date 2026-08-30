@@ -1288,6 +1288,22 @@ impl brain_runner::Server for BrainRunnerImpl {
                         }
                     });
                     result.set_output(&response.output);
+                    if !response.continuation_messages.is_empty() {
+                        super::brain_codec::encode_continuation_messages(
+                            result.reborrow().init_continuation_messages(
+                                response.continuation_messages.len() as u32,
+                            ),
+                            &response.continuation_messages,
+                        )
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    }
+                    if let Some(metadata) = &response.invocation_metadata {
+                        result.set_has_invocation_metadata(true);
+                        super::brain_codec::encode_invocation_metadata(
+                            result.reborrow().init_invocation_metadata(),
+                            metadata,
+                        );
+                    }
                     result.set_runtime_revision(response.runtime_revision);
                     encode_checkpoint(result.reborrow().init_checkpoint(), &response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
@@ -1614,10 +1630,25 @@ impl stream_receiver::Server for StreamReceiverImpl {
             Ok(Which::UsageUpdate(upd)) => upd
                 .map(|u| StreamChunk::Usage {
                     input_tokens: u.get_input_tokens(),
+                    output_tokens: u.get_output_tokens(),
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e)),
             Ok(Which::ResponseMetadata(metadata)) => metadata
                 .and_then(decode_stream_response_metadata)
+                .map_err(|error| anyhow::anyhow!("{}", error)),
+            Ok(Which::AllowanceUpdate(update)) => update
+                .map(|value| StreamChunk::Allowance {
+                    primary_used_percent: value
+                        .get_has_primary()
+                        .then(|| value.get_primary_used_percent()),
+                    secondary_used_percent: value
+                        .get_has_secondary()
+                        .then(|| value.get_secondary_used_percent()),
+                })
+                .map_err(|error| anyhow::anyhow!("{}", error)),
+            Ok(Which::ContentBlockComplete(block)) => block
+                .and_then(decode_stream_content_block)
+                .map(StreamChunk::ContentBlockComplete)
                 .map_err(|error| anyhow::anyhow!("{}", error)),
             Ok(Which::Done(())) => {
                 // Close the channel by dropping tx — but we don't have ownership.
@@ -1644,6 +1675,81 @@ impl stream_receiver::Server for StreamReceiverImpl {
 
         let _ = self.tx.send(result);
         Promise::ok(())
+    }
+}
+
+fn decode_stream_content_block(
+    block: finch_ipc_capnp::content_block::Reader<'_>,
+) -> std::result::Result<ContentBlock, capnp::Error> {
+    use finch_ipc_capnp::content_block::Which;
+    match block.which()? {
+        Which::Text(value) => Ok(ContentBlock::Text {
+            text: value?
+                .to_str()
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+                .to_string(),
+        }),
+        Which::Thinking(value) => Ok(ContentBlock::OpaqueReasoning {
+            encrypted_content: value?
+                .to_str()
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+                .to_string(),
+        }),
+        Which::Image(value) => {
+            let value = value?;
+            Ok(ContentBlock::Image {
+                source: crate::claude::types::ImageSource {
+                    source_type: value
+                        .get_source_type()?
+                        .to_str()
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?
+                        .to_string(),
+                    media_type: value
+                        .get_media_type()?
+                        .to_str()
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?
+                        .to_string(),
+                    data: value
+                        .get_data()?
+                        .to_str()
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?
+                        .to_string(),
+                },
+            })
+        }
+        Which::ToolUse(value) => {
+            let value = value?;
+            Ok(ContentBlock::ToolUse {
+                id: value
+                    .get_id()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_string(),
+                name: value
+                    .get_name()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_string(),
+                input: super::brain_codec::decode_json_value(value.get_input()?)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?,
+            })
+        }
+        Which::ToolResult(value) => {
+            let value = value?;
+            Ok(ContentBlock::ToolResult {
+                tool_use_id: value
+                    .get_tool_use_id()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_string(),
+                content: value
+                    .get_content()?
+                    .to_str()
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?
+                    .to_string(),
+                is_error: Some(value.get_is_error()),
+            })
+        }
     }
 }
 
@@ -1840,7 +1946,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 5);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 8);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1849,29 +1955,29 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 4,
+                protocol_version: 7,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 4"));
-            assert!(error.contains("requires 5"));
+            assert!(error.contains("protocol 7"));
+            assert!(error.contains("requires 8"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 5,
+                protocol_version: 8,
                 query_calls: std::rc::Rc::clone(&new_daemon_calls),
             });
             let request = daemon.ping_request();
             let reply = request.send().promise.await.unwrap();
             let protocol_version = reply.get().unwrap().get_protocol_version();
-            let error = ensure_protocol_generation(protocol_version, 4)
+            let error = ensure_protocol_generation(protocol_version, 7)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 5"));
-            assert!(error.contains("requires 4"));
+            assert!(error.contains("protocol 8"));
+            assert!(error.contains("requires 7"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);
         }));
@@ -1918,6 +2024,48 @@ mod tests {
         let error = error.to_string();
         assert!(error.ends_with("IPC response model metadata was invalid"));
         assert!(!error.contains("bad\nmodel"));
+    }
+
+    #[test]
+    fn stream_content_block_schema_preserves_text_image_and_opaque_reasoning() {
+        let mut image_message = capnp::message::Builder::new_default();
+        {
+            let mut image = image_message
+                .init_root::<finch_ipc_capnp::content_block::Builder<'_>>()
+                .init_image();
+            image.set_source_type("base64");
+            image.set_media_type("image/png");
+            image.set_data("aW1hZ2U=");
+        }
+        let image = decode_stream_content_block(
+            image_message
+                .get_root_as_reader::<finch_ipc_capnp::content_block::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            image,
+            ContentBlock::Image { source }
+                if source.source_type == "base64"
+                    && source.media_type == "image/png"
+                    && source.data == "aW1hZ2U="
+        ));
+
+        let mut reasoning_message = capnp::message::Builder::new_default();
+        reasoning_message
+            .init_root::<finch_ipc_capnp::content_block::Builder<'_>>()
+            .set_thinking("opaque-continuation");
+        let reasoning = decode_stream_content_block(
+            reasoning_message
+                .get_root_as_reader::<finch_ipc_capnp::content_block::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reasoning,
+            ContentBlock::OpaqueReasoning { encrypted_content }
+                if encrypted_content == "opaque-continuation"
+        ));
     }
 
     struct BlockingBrainRunner {

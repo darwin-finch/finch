@@ -173,6 +173,8 @@ impl ClaudeProvider {
             stop_reason: message_response.stop_reason,
             role: message_response.role,
             provider: "claude".to_string(),
+            usage: None,
+            allowance: None,
         })
     }
 
@@ -287,6 +289,7 @@ impl ClaudeProvider {
                                                     let _ = tx
                                                         .send(Ok(StreamChunk::Usage {
                                                             input_tokens: n as u32,
+                                                            output_tokens: 0,
                                                         }))
                                                         .await;
                                                 }

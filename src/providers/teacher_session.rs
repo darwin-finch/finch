@@ -439,6 +439,8 @@ mod tests {
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
                 provider: "mock".to_string(),
+                usage: None,
+                allowance: None,
             })
         }
 
@@ -506,6 +508,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -547,6 +550,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -575,6 +579,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -644,6 +649,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -711,6 +717,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -871,6 +878,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 

@@ -180,6 +180,8 @@ impl LocalGenerator {
                         input_tokens: None,
                         output_tokens: Some(generated.text.split_whitespace().count() as u32),
                         latency_ms: None,
+                        primary_allowance_used_percent: None,
+                        secondary_allowance_used_percent: None,
                     },
                 };
 

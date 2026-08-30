@@ -16,7 +16,14 @@ struct ContentBlock {
     toolUse   @1 :ToolUseBlock;
     toolResult @2 :ToolResultBlock;
     thinking  @3 :Text;
+    image     @4 :ImageBlock;
   }
+}
+
+struct ImageBlock {
+  sourceType @0 :Text;
+  mediaType  @1 :Text;
+  data       @2 :Text;
 }
 
 struct ToolUseBlock {
@@ -73,6 +80,8 @@ struct StreamChunk {
     done            @3 :Void;
     error           @4 :Text;
     responseMetadata @5 :StreamResponseMetadata;
+    allowanceUpdate  @6 :AllowanceUpdate;
+    contentBlockComplete @7 :ContentBlock;
   }
 }
 
@@ -80,9 +89,30 @@ struct StreamResponseMetadata {
   model @0 :Text;
 }
 
+struct InvocationMetadata {
+  requestedModel @0 :Text;
+  resolvedModel @1 :Text;
+  actualModel @2 :Text;
+  hasInputTokens @3 :Bool;
+  inputTokens @4 :UInt32;
+  hasOutputTokens @5 :Bool;
+  outputTokens @6 :UInt32;
+  hasPrimaryAllowance @7 :Bool;
+  primaryAllowanceUsedPercent @8 :Float32;
+  hasSecondaryAllowance @9 :Bool;
+  secondaryAllowanceUsedPercent @10 :Float32;
+}
+
 struct UsageUpdate {
   inputTokens  @0 :UInt32;
   outputTokens @1 :UInt32;
+}
+
+struct AllowanceUpdate {
+  hasPrimary          @0 :Bool;
+  primaryUsedPercent  @1 :Float32;
+  hasSecondary        @2 :Bool;
+  secondaryUsedPercent @3 :Float32;
 }
 
 # ---------------------------------------------------------------------------
@@ -865,6 +895,9 @@ struct BrainTurnResult {
   effectJournal   @7 :List(BrainEffectRecord);
   hasCommitAck    @8 :Bool;
   commitAck       @9 :BrainTurnCommitAck;
+  continuationMessages @10 :List(Message);
+  hasInvocationMetadata @11 :Bool;
+  invocationMetadata @12 :InvocationMetadata;
 }
 
 # Optional reverse capability returned by the runner with a completed turn.
@@ -1065,6 +1098,9 @@ struct BrainResult {
   output     @1 :Text;
   hasError   @2 :Bool;
   error      @3 :Text;
+  continuationMessages @4 :List(Message);
+  hasInvocationMetadata @5 :Bool;
+  invocationMetadata @6 :InvocationMetadata;
 }
 
 struct BrainRuntimeCommitted {

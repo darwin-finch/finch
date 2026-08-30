@@ -1197,7 +1197,7 @@ mod tests {
                         required_scopes: BTreeSet::new(),
                     },
                     model: Some("subscription-model".into()),
-                    base_url: None,
+                    base_url: Some(endpoint.to_string()),
                     chat_path: None,
                     models_path: None,
                     name: Some("broken".into()),
@@ -1208,9 +1208,7 @@ mod tests {
                     kind: CredentialKind::Bearer,
                     provider: CredentialProvider::ChatgptSubscription,
                     issuer: "openai-chatgpt".into(),
-                    audience: AudienceBinding::standard(
-                        crate::config::EndpointFamily::ChatgptSubscription,
-                    ),
+                    audience: AudienceBinding::custom(endpoint).unwrap(),
                     tenant: None,
                     project: None,
                     account: Some("chat-account".into()),
@@ -1265,6 +1263,8 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
                 },
             })
         }
@@ -1418,7 +1418,7 @@ mod tests {
             (SiblingDefect::Revoked, "revoked"),
             (
                 SiblingDefect::Unsupported,
-                "ChatGPT subscription credentials are distinct",
+                "ChatGPT subscription custom endpoints and paths are not supported",
             ),
         ];
         let selectors = [

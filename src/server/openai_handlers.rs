@@ -440,7 +440,9 @@ fn openai_stream_chunks(content: Vec<ContentBlock>, model: &str) -> Vec<serde_js
                 tool_index += 1;
                 delta
             }
-            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => continue,
+            ContentBlock::Image { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::OpaqueReasoning { .. } => continue,
         };
         events.push(serde_json::json!({
             "id": &completion_id,
@@ -914,6 +916,7 @@ fn convert_response_to_openai(
             ContentBlock::Image { .. } => {
                 // Image blocks: not applicable in this context
             }
+            ContentBlock::OpaqueReasoning { .. } => {}
         }
     }
 

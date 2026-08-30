@@ -745,6 +745,7 @@ impl<'a> ConversationCompactor<'a> {
             tools: None,
             temperature: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -1060,6 +1061,35 @@ mod tests {
         assert_eq!(messages[0].text_content(), "Test message");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "Test response");
+    }
+
+    #[test]
+    fn test_opaque_reasoning_continuation_survives_restart_byte_for_byte() {
+        let mut conversation = ConversationHistory::new();
+        conversation.add_message(Message::with_content(
+            "assistant",
+            vec![
+                ContentBlock::OpaqueReasoning {
+                    encrypted_content: "opaque\0continuation+/=".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path":"README.md"}),
+                },
+            ],
+        ));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        conversation.save(file.path()).unwrap();
+
+        let restarted = ConversationHistory::load(file.path()).unwrap();
+        assert!(matches!(
+            restarted.get_messages()[0].content.as_slice(),
+            [
+                ContentBlock::OpaqueReasoning { encrypted_content },
+                ContentBlock::ToolUse { id, .. }
+            ] if encrypted_content == "opaque\0continuation+/=" && id == "call-1"
+        ));
     }
 
     #[test]

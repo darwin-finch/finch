@@ -102,6 +102,9 @@ impl GeminiProvider {
                         ContentBlock::Image { .. } => GeminiPart::Text {
                             text: "[image content]".to_string(),
                         },
+                        ContentBlock::OpaqueReasoning { .. } => GeminiPart::Text {
+                            text: String::new(),
+                        },
                     })
                     .collect();
 
@@ -195,6 +198,8 @@ impl GeminiProvider {
             stop_reason: candidate.finish_reason,
             role: "assistant".to_string(), // Convert "model" back to "assistant"
             provider: "gemini".to_string(),
+            usage: None,
+            allowance: None,
         })
     }
 
