@@ -965,10 +965,11 @@ impl BrainRunnerBroker {
                 })?;
         }
         tokio::select! {
+            biased;
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
             response = response_rx => response
                 .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
                 .map_err(anyhow::Error::new),
-            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
         }
     }
 
@@ -1023,10 +1024,11 @@ impl BrainRunnerBroker {
                 })?;
         }
         tokio::select! {
+            biased;
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
             response = response_rx => response
                 .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
                 .map_err(anyhow::Error::new),
-            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
         }
     }
 

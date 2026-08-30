@@ -1651,7 +1651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_cancellation_atomically_suppresses_late_effect_checkpoint_and_result() {
+    async fn effect_audit_cancellation_suppresses_ready_late_program_response() {
         let service = service();
         let driver = service
             .attach("shared", "alice", AttachmentRole::Driver, None)
