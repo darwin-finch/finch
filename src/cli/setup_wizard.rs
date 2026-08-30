@@ -1599,13 +1599,29 @@ where
         let existing = preflight_credentials
             .iter()
             .find(|credential| credential.name == *reference);
-        if existing.is_some() {
-            // Existing records are static configuration authority. Preserve
-            // them exactly and let Config::validate reject wrong-provider,
-            // wrong-store, revoked, or unrefreshable-expired bindings before
-            // any OAuth boundary is opened. A refreshable access lease may be
-            // expired here; the provider refreshes it when inference uses it.
-            continue;
+        if let Some(existing) = existing {
+            let exact_authority = existing.kind == crate::config::CredentialKind::OauthDevice
+                && existing.provider == crate::config::CredentialProvider::ChatgptSubscription
+                && existing.issuer == "openai-chatgpt"
+                && existing.audience
+                    == crate::config::AudienceBinding::standard(
+                        crate::config::EndpointFamily::ChatgptSubscription,
+                    )
+                && existing.secret_ref == format!("oauth-store:{reference}")
+                && crate::providers::chatgpt_oauth::chatgpt_required_scopes()
+                    .is_subset(&existing.scopes);
+            if !exact_authority {
+                continue;
+            }
+            let active = matches!(
+                existing.lifecycle,
+                crate::config::CredentialLifecycle::Active { expires_at, .. }
+                    if expires_at.is_none_or(|expiry| expiry > Utc::now())
+            );
+            if active {
+                continue;
+            }
+            preflight_credentials.retain(|credential| credential.name != *reference);
         }
         preflight_credentials.push(crate::config::ProviderCredential {
             name: reference.clone(),
@@ -1635,15 +1651,6 @@ where
     let mut credentials = result.credentials.clone();
     let mut compensations = Vec::new();
     for reference in chatgpt_references {
-        if credentials
-            .iter()
-            .any(|credential| credential.name == *reference)
-        {
-            // Preflight already proved this persisted record satisfies the
-            // exact ChatGPT authority contract. Setup is not a provider-use
-            // boundary, so it must neither refresh nor rewrite the lease.
-            continue;
-        }
         let ensured = match authenticator
             .ensure_named_credential(
                 &reference,

@@ -63,13 +63,7 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 }
 
 fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
-    match fs::symlink_metadata(config_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!(
-                "Existing Finch configuration at {} is a symbolic link; setup will not follow or overwrite it",
-                config_path.display()
-            );
-        }
+    match fs::metadata(config_path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
