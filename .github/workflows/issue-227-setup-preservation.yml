@@ -56,7 +56,9 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test --lib config::loader::tests::test_setup_loader_rejects_dangling_config_symlink_as_existing_state -- --exact
       - name: Exact provider and credential graph survives setup
-        run: cargo test --lib cli::setup_wizard::tests::test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph -- --exact
+        run: |
+          cargo test --lib cli::setup_wizard::tests::test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph -- --exact
+          cargo test --lib cli::setup_wizard::tests::setup_rejects_wrong_chatgpt_secret_store_before_authentication -- --exact
       - name: Empty-state and cancellation regressions
         run: |
           cargo test --lib cli::setup_wizard::tests::test_genuinely_empty_setup_alone_renders_unconfigured_claude_default -- --exact
