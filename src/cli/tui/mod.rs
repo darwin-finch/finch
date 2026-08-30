@@ -51,6 +51,7 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 
 use accordion::{AccordionState, RenderedTranscriptLine};
 
+pub(crate) use async_input::pause_input_task;
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix};

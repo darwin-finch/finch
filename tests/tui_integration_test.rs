@@ -193,6 +193,10 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
         "Finch did not restore mouse capture after setup: {}",
         String::from_utf8_lossy(&transcript)
     );
+    assert!(
+        !String::from_utf8_lossy(&transcript).contains("❯ y"),
+        "wizard confirmation leaked into the REPL input"
+    );
 
     master.write_all(b"/quit\r").unwrap();
     master.flush().unwrap();

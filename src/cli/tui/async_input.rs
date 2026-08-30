@@ -2,11 +2,49 @@
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use super::TuiRenderer;
+
+static INPUT_PAUSED: AtomicBool = AtomicBool::new(false);
+static INPUT_PAUSE_REQUEST: AtomicU64 = AtomicU64::new(0);
+static INPUT_PAUSE_ACKNOWLEDGED: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusive ownership token for another in-process terminal UI.
+pub(crate) struct InputTaskPauseGuard;
+
+impl Drop for InputTaskPauseGuard {
+    fn drop(&mut self) {
+        INPUT_PAUSED.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Pause the REPL reader and wait until it has stopped polling Crossterm.
+///
+/// Waiting for the generation acknowledgement closes the race where a nested
+/// TUI starts after setting a flag but while the REPL reader is already inside
+/// `poll`/`read` and can still steal its first key.
+pub(crate) async fn pause_input_task() -> Result<InputTaskPauseGuard> {
+    if INPUT_PAUSED.swap(true, Ordering::SeqCst) {
+        anyhow::bail!("terminal input task is already paused");
+    }
+    let guard = InputTaskPauseGuard;
+    let generation = INPUT_PAUSE_REQUEST.fetch_add(1, Ordering::SeqCst) + 1;
+    let acknowledged = tokio::time::timeout(Duration::from_secs(2), async {
+        while INPUT_PAUSE_ACKNOWLEDGED.load(Ordering::SeqCst) < generation {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    if acknowledged.is_err() {
+        drop(guard);
+        anyhow::bail!("timed out pausing terminal input task");
+    }
+    Ok(guard)
+}
 
 // ---------------------------------------------------------------------------
 // InputEvent — discriminated input events sent to the event loop
@@ -133,6 +171,15 @@ pub fn spawn_input_task(
         let mut pending_brain_content: Option<String> = None;
 
         loop {
+            if INPUT_PAUSED.load(Ordering::SeqCst) {
+                INPUT_PAUSE_ACKNOWLEDGED
+                    .store(INPUT_PAUSE_REQUEST.load(Ordering::SeqCst), Ordering::SeqCst);
+                while INPUT_PAUSED.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                continue;
+            }
+
             // While an external editor owns the terminal, suspend all crossterm
             // event polling.  Consuming events here would steal keystrokes from
             // the editor process and cause visible flickering / input loss.

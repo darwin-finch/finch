@@ -2871,6 +2871,9 @@ impl EventLoop {
                         // Suspend the inline TUI, run the full setup wizard,
                         // then resume.  The wizard manages its own terminal
                         // lifecycle (enable_raw_mode / alternate screen).
+                        let input_pause = crate::cli::tui::pause_input_task()
+                            .await
+                            .context("pause REPL input for setup wizard")?;
                         {
                             let tui = self.tui_renderer.lock().await;
                             tui.suspend().ok();
@@ -2915,6 +2918,7 @@ impl EventLoop {
                             let mut tui = self.tui_renderer.lock().await;
                             tui.resume().ok();
                         }
+                        drop(input_pause);
                         self.render_tui().await?;
                     }
                     Command::SelfFix => {
