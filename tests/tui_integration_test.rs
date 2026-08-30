@@ -106,7 +106,7 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
         .arg("--cloud-only")
-        .env("ANTHROPIC_API_KEY", "finch-pty-regression-placeholder")
+        .env("ANTHROPIC_API_KEY", "sk-ant-finch-pty-regression-placeholder")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave.try_clone().unwrap()))
