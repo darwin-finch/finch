@@ -2790,7 +2790,11 @@ mod tests {
             anyhow::ensure!(call == 0, "provider continuation escaped cancellation");
             Ok(crate::generators::GeneratorResponse {
                 text: String::new(),
-                content_blocks: Vec::new(),
+                content_blocks: vec![crate::claude::ContentBlock::ToolUse {
+                    id: "effect-tool".into(),
+                    name: "submit_program".into(),
+                    input: self.input.clone(),
+                }],
                 tool_uses: vec![crate::generators::ToolUse {
                     id: "effect-tool".into(),
                     name: "submit_program".into(),

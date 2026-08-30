@@ -3,13 +3,84 @@
 use crate::claude::{ContentBlock, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+/// Immutable identity for one staged provider tool round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolRoundToken(Uuid);
+
+/// One validated result retained in assistant declaration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRoundResult {
+    pub tool_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRoundError {
+    StageAlreadyExists,
+    InvalidAssistant(String),
+    NoActiveStage,
+    StaleToken,
+    UnknownTool(String),
+    DuplicateResult(String),
+    MissingResults(Vec<String>),
+    ContinuationUnavailable,
+    PersistenceUnavailable(String),
+}
+
+impl std::fmt::Display for ToolRoundError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StageAlreadyExists => write!(formatter, "a tool round is already staged"),
+            Self::InvalidAssistant(reason) => write!(formatter, "invalid tool assistant: {reason}"),
+            Self::NoActiveStage => write!(formatter, "no tool round is staged"),
+            Self::StaleToken => write!(formatter, "tool result belongs to a stale round"),
+            Self::UnknownTool(id) => write!(formatter, "unknown tool result id {id}"),
+            Self::DuplicateResult(id) => write!(formatter, "duplicate tool result id {id}"),
+            Self::MissingResults(ids) => {
+                write!(formatter, "missing tool results: {}", ids.join(", "))
+            }
+            Self::ContinuationUnavailable => write!(formatter, "LLM continuation is unavailable"),
+            Self::PersistenceUnavailable(error) => {
+                write!(formatter, "conversation checkpoint is unavailable: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ToolRoundError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRoundProgress {
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone)]
+struct StagedToolRound {
+    token: ToolRoundToken,
+    // Retain the provider's complete ordered assistant payload. Future opaque
+    // reasoning/output items can extend ContentBlock without this layer
+    // reconstructing or reordering them.
+    assistant: Message,
+    expected_ids: Vec<String>,
+    results: HashMap<String, ToolRoundResult>,
+}
 
 /// Manages conversation history for multi-turn interactions with context window management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationHistory {
     messages: Vec<Message>,
+    /// Provider-invisible tool rounds. Staged state is deliberately neither
+    /// returned by history reads nor serialized during crash recovery.
+    #[serde(skip)]
+    staged_tool_rounds: HashMap<Uuid, StagedToolRound>,
     #[serde(skip)]
     max_messages: usize,
     #[serde(skip)]
@@ -25,6 +96,7 @@ impl ConversationHistory {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            staged_tool_rounds: HashMap::new(),
             max_messages: 500, // ~250 turns — plenty for a full coding session
             max_tokens_estimate: 600_000, // ~150k tokens * 4 chars/token (Claude: 200k context)
             compaction_threshold_percent: 0.9, // Compact at 90% of max
@@ -36,6 +108,7 @@ impl ConversationHistory {
     pub fn with_limits(max_messages: usize, max_tokens_estimate: usize) -> Self {
         Self {
             messages: Vec::new(),
+            staged_tool_rounds: HashMap::new(),
             max_messages,
             max_tokens_estimate,
             compaction_threshold_percent: 0.8,
@@ -83,6 +156,245 @@ impl ConversationHistory {
         self.trim_if_needed();
     }
 
+    /// Stage a complete provider assistant payload without making it visible
+    /// to request builders, snapshots, compaction, or persistence.
+    pub fn stage_assistant(
+        &mut self,
+        query_id: Uuid,
+        assistant: Message,
+    ) -> std::result::Result<ToolRoundToken, ToolRoundError> {
+        if self.staged_tool_rounds.contains_key(&query_id) {
+            return Err(ToolRoundError::StageAlreadyExists);
+        }
+        if assistant.role != "assistant" {
+            return Err(ToolRoundError::InvalidAssistant(
+                "role must be assistant".to_string(),
+            ));
+        }
+        let expected_ids = assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if expected_ids.is_empty() {
+            return Err(ToolRoundError::InvalidAssistant(
+                "at least one tool_use is required".to_string(),
+            ));
+        }
+        if expected_ids.iter().collect::<HashSet<_>>().len() != expected_ids.len() {
+            return Err(ToolRoundError::InvalidAssistant(
+                "tool_use ids must be unique".to_string(),
+            ));
+        }
+
+        let token = ToolRoundToken(Uuid::new_v4());
+        self.staged_tool_rounds.insert(
+            query_id,
+            StagedToolRound {
+                token,
+                assistant,
+                expected_ids,
+                results: HashMap::new(),
+            },
+        );
+        Ok(token)
+    }
+
+    /// Record one result exactly once for the matching staged round.
+    pub fn record_tool_result(
+        &mut self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+        tool_id: &str,
+        result: &std::result::Result<String, anyhow::Error>,
+    ) -> std::result::Result<ToolRoundProgress, ToolRoundError> {
+        let stage = self
+            .staged_tool_rounds
+            .get_mut(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        if stage.token != token {
+            return Err(ToolRoundError::StaleToken);
+        }
+        if !stage
+            .expected_ids
+            .iter()
+            .any(|expected| expected == tool_id)
+        {
+            return Err(ToolRoundError::UnknownTool(tool_id.to_string()));
+        }
+        if stage.results.contains_key(tool_id) {
+            return Err(ToolRoundError::DuplicateResult(tool_id.to_string()));
+        }
+        let (content, is_error) = match result {
+            Ok(content) => (content.clone(), false),
+            Err(error) => (error.to_string(), true),
+        };
+        stage.results.insert(
+            tool_id.to_string(),
+            ToolRoundResult {
+                tool_id: tool_id.to_string(),
+                content,
+                is_error,
+            },
+        );
+        Ok(if stage.results.len() == stage.expected_ids.len() {
+            ToolRoundProgress::Complete
+        } else {
+            ToolRoundProgress::Pending
+        })
+    }
+
+    pub fn completed_tool_results(
+        &self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+    ) -> std::result::Result<Vec<ToolRoundResult>, ToolRoundError> {
+        let stage = self
+            .staged_tool_rounds
+            .get(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        if stage.token != token {
+            return Err(ToolRoundError::StaleToken);
+        }
+        let missing = stage
+            .expected_ids
+            .iter()
+            .filter(|id| !stage.results.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(ToolRoundError::MissingResults(missing));
+        }
+        Ok(stage
+            .expected_ids
+            .iter()
+            .map(|id| stage.results[id].clone())
+            .collect())
+    }
+
+    /// Publish the complete assistant payload and all matching results under
+    /// one conversation write lock. No reader can observe only one half.
+    pub fn commit_tool_round(
+        &mut self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+    ) -> std::result::Result<Vec<ToolRoundResult>, ToolRoundError> {
+        let ordered_results = self.completed_tool_results(query_id, token)?;
+        let stage = self
+            .staged_tool_rounds
+            .remove(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        let tool_results = Message {
+            role: "user".to_string(),
+            content: ordered_results
+                .iter()
+                .map(|result| ContentBlock::ToolResult {
+                    tool_use_id: result.tool_id.clone(),
+                    content: result.content.clone(),
+                    is_error: result.is_error.then_some(true),
+                })
+                .collect(),
+        };
+        self.messages.push(stage.assistant);
+        self.messages.push(tool_results);
+        Ok(ordered_results)
+    }
+
+    /// Apply ordinary context limits to the complete pair before its durable
+    /// checkpoint and publication permit are released. Callers retain a full
+    /// pre-commit clone until those boundaries succeed.
+    pub fn finalize_tool_round_commit(&mut self) {
+        self.trim_if_needed();
+    }
+
+    /// Drop a staged round without changing committed provider history.
+    pub fn abort_staged(&mut self, query_id: Uuid) -> bool {
+        self.staged_tool_rounds.remove(&query_id).is_some()
+    }
+
+    /// Restore the immediately preceding complete round to provider-invisible
+    /// staging if the admitted continuation could not be spawned.
+    pub fn rollback_last_tool_round(
+        &mut self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+    ) -> std::result::Result<(), ToolRoundError> {
+        let results_message = self.messages.pop().ok_or(ToolRoundError::NoActiveStage)?;
+        let assistant = match self.messages.pop() {
+            Some(assistant) => assistant,
+            None => {
+                self.messages.push(results_message);
+                return Err(ToolRoundError::NoActiveStage);
+            }
+        };
+        let expected_ids = assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let results = results_message
+            .content
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((
+                    tool_use_id.clone(),
+                    ToolRoundResult {
+                        tool_id: tool_use_id,
+                        content,
+                        is_error: is_error.unwrap_or(false),
+                    },
+                )),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        if expected_ids.is_empty()
+            || results.len() != expected_ids.len()
+            || expected_ids.iter().any(|id| !results.contains_key(id))
+        {
+            self.messages.push(assistant);
+            self.messages.push(Message {
+                role: "user".to_string(),
+                content: results
+                    .into_values()
+                    .map(|result| ContentBlock::ToolResult {
+                        tool_use_id: result.tool_id,
+                        content: result.content,
+                        is_error: result.is_error.then_some(true),
+                    })
+                    .collect(),
+            });
+            return Err(ToolRoundError::InvalidAssistant(
+                "last messages are not a complete tool round".to_string(),
+            ));
+        }
+        self.staged_tool_rounds.insert(
+            query_id,
+            StagedToolRound {
+                token,
+                assistant,
+                expected_ids,
+                results,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn staged_round(&self, query_id: Uuid) -> Option<(ToolRoundToken, usize, usize)> {
+        self.staged_tool_rounds
+            .get(&query_id)
+            .map(|stage| (stage.token, stage.expected_ids.len(), stage.results.len()))
+    }
+
     /// Get all messages for API request
     pub fn get_messages(&self) -> Vec<Message> {
         self.messages.clone()
@@ -91,6 +403,7 @@ impl ConversationHistory {
     /// Clear conversation history (start fresh)
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.staged_tool_rounds.clear();
     }
 
     /// Check if conversation has any messages
@@ -117,6 +430,7 @@ impl ConversationHistory {
     /// Restore conversation from a snapshot
     pub fn restore_snapshot(&mut self, snapshot: Vec<Message>) {
         self.messages = snapshot;
+        self.staged_tool_rounds.clear();
     }
 
     /// Trim old messages if context exceeds limits
@@ -140,6 +454,18 @@ impl ConversationHistory {
             {
                 self.messages.remove(0);
             }
+        }
+
+        // A front trim can cut between an assistant tool call and its result
+        // message. Never expose an orphaned result as the new history prefix.
+        while self.messages.first().is_some_and(|message| {
+            !message.content.is_empty()
+                && message
+                    .content
+                    .iter()
+                    .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        }) {
+            self.messages.remove(0);
         }
     }
 
@@ -197,21 +523,15 @@ impl ConversationHistory {
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("Failed to serialize conversation")?;
+        let path = path.as_ref();
 
         // Ensure parent directory exists
-        if let Some(parent) = path.as_ref().parent() {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .context("Failed to create directory for conversation state")?;
         }
-
-        fs::write(path.as_ref(), json).with_context(|| {
-            format!(
-                "Failed to write conversation to {}",
-                path.as_ref().display()
-            )
-        })?;
-
-        Ok(())
+        atomic_replace(path, json.as_bytes())
+            .with_context(|| format!("Failed to write conversation to {}", path.display()))
     }
 
     /// Load conversation from JSON file
@@ -231,9 +551,48 @@ impl ConversationHistory {
         history.max_tokens_estimate = 600_000;
         history.compaction_threshold_percent = 0.9;
         history.auto_compact_enabled = true;
+        history.staged_tool_rounds = HashMap::new();
 
         Ok(history)
     }
+}
+
+fn atomic_replace(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .context("Conversation path must name a file")?
+        .to_string_lossy();
+    let temp_path: PathBuf = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("Failed to create {}", temp_path.display()))?;
+        temp.write_all(contents)
+            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("Failed to sync {}", temp_path.display()))?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Failed to atomically replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("Failed to sync {}", parent.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 impl Default for ConversationHistory {
@@ -449,6 +808,24 @@ impl<'a> ConversationCompactor<'a> {
 mod tests {
     use super::*;
 
+    fn tool_assistant(ids: &[&str]) -> Message {
+        let mut content = vec![ContentBlock::Text {
+            text: "opaque-before".to_string(),
+        }];
+        content.extend(ids.iter().map(|id| ContentBlock::ToolUse {
+            id: (*id).to_string(),
+            name: "Read".to_string(),
+            input: serde_json::json!({"path": id}),
+        }));
+        content.push(ContentBlock::Text {
+            text: "opaque-after".to_string(),
+        });
+        Message {
+            role: "assistant".to_string(),
+            content,
+        }
+    }
+
     #[test]
     fn test_conversation_creation() {
         let conv = ConversationHistory::new();
@@ -483,6 +860,129 @@ mod tests {
         assert_eq!(messages[0].text_content(), "What is 2+2?");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "4");
+    }
+
+    #[test]
+    fn test_staged_tool_round_is_invisible_until_complete_atomic_commit() {
+        let mut history = ConversationHistory::new();
+        history.add_user_message("inspect".to_string());
+        let query_id = Uuid::new_v4();
+        let token = history
+            .stage_assistant(query_id, tool_assistant(&["A", "B"]))
+            .unwrap();
+
+        assert_eq!(history.message_count(), 1);
+        assert_eq!(history.snapshot().len(), 1);
+        assert_eq!(
+            history.record_tool_result(query_id, token, "B", &Ok("second".to_string())),
+            Ok(ToolRoundProgress::Pending)
+        );
+        assert_eq!(history.get_messages().len(), 1);
+        assert_eq!(
+            history.record_tool_result(query_id, token, "A", &Ok("first".to_string())),
+            Ok(ToolRoundProgress::Complete)
+        );
+        history.commit_tool_round(query_id, token).unwrap();
+
+        let messages = history.get_messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages[1].content.first(),
+            Some(ContentBlock::Text { text }) if text == "opaque-before"
+        ));
+        assert!(matches!(
+            messages[1].content.last(),
+            Some(ContentBlock::Text { text }) if text == "opaque-after"
+        ));
+        let ids = messages[2]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_stale_duplicate_unknown_and_cancelled_results_never_publish() {
+        let mut history = ConversationHistory::new();
+        let query_id = Uuid::new_v4();
+        let first = history
+            .stage_assistant(query_id, tool_assistant(&["A", "B"]))
+            .unwrap();
+        assert_eq!(
+            history.record_tool_result(query_id, first, "A", &Ok("first".to_string())),
+            Ok(ToolRoundProgress::Pending)
+        );
+        assert_eq!(
+            history.record_tool_result(query_id, first, "A", &Ok("duplicate".to_string())),
+            Err(ToolRoundError::DuplicateResult("A".to_string()))
+        );
+        assert_eq!(
+            history.record_tool_result(query_id, first, "X", &Ok("unknown".to_string())),
+            Err(ToolRoundError::UnknownTool("X".to_string()))
+        );
+        assert_eq!(
+            history.commit_tool_round(query_id, first),
+            Err(ToolRoundError::MissingResults(vec!["B".to_string()]))
+        );
+        assert!(history.abort_staged(query_id));
+        let second = history
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        assert_eq!(
+            history.record_tool_result(query_id, first, "A", &Ok("stale".to_string())),
+            Err(ToolRoundError::StaleToken)
+        );
+        assert!(history.abort_staged(query_id));
+        assert_eq!(
+            history.record_tool_result(query_id, second, "A", &Ok("late".to_string())),
+            Err(ToolRoundError::NoActiveStage)
+        );
+        assert!(history.get_messages().is_empty());
+    }
+
+    #[test]
+    fn test_failed_continuation_rolls_complete_pair_back_to_invisible_stage() {
+        let mut history = ConversationHistory::with_limits(2, 600_000);
+        history.add_user_message("older-user".to_string());
+        history.add_assistant_message("older-assistant".to_string());
+        let query_id = Uuid::new_v4();
+        let token = history
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        history
+            .record_tool_result(query_id, token, "A", &Ok("value".to_string()))
+            .unwrap();
+        history.commit_tool_round(query_id, token).unwrap();
+        assert_eq!(history.message_count(), 4);
+
+        history.rollback_last_tool_round(query_id, token).unwrap();
+        assert_eq!(history.message_count(), 2);
+        assert_eq!(history.get_messages()[0].text_content(), "older-user");
+        assert_eq!(history.get_messages()[1].text_content(), "older-assistant");
+        assert_eq!(history.staged_round(query_id), Some((token, 1, 1)));
+    }
+
+    #[test]
+    fn test_context_trimming_never_exposes_an_orphaned_tool_result_prefix() {
+        let mut history = ConversationHistory::with_limits(1, 600_000);
+        let query_id = Uuid::new_v4();
+        let token = history
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        history
+            .record_tool_result(query_id, token, "A", &Ok("value".to_string()))
+            .unwrap();
+        history.commit_tool_round(query_id, token).unwrap();
+        history.finalize_tool_round_commit();
+
+        assert!(history.get_messages().iter().all(|message| !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))));
     }
 
     #[test]
@@ -560,5 +1060,44 @@ mod tests {
         assert_eq!(messages[0].text_content(), "Test message");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "Test response");
+    }
+
+    #[test]
+    fn test_persistence_replaces_atomically_and_never_serializes_staged_round() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conversation.json");
+        fs::write(&path, b"old incomplete bytes").unwrap();
+        let query_id = Uuid::new_v4();
+        let mut history = ConversationHistory::new();
+        history.add_user_message("inspect".to_string());
+        let token = history
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        history
+            .record_tool_result(query_id, token, "A", &Ok("value".to_string()))
+            .unwrap();
+
+        history.save(&path).unwrap();
+        let staged_reload = ConversationHistory::load(&path).unwrap();
+        assert_eq!(staged_reload.message_count(), 1);
+
+        history.commit_tool_round(query_id, token).unwrap();
+        history.save(&path).unwrap();
+        let committed_reload = ConversationHistory::load(&path).unwrap();
+        assert_eq!(committed_reload.message_count(), 3);
+        assert!(matches!(
+            committed_reload.get_messages()[1].content[1],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert!(matches!(
+            committed_reload.get_messages()[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+        let leftovers = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }

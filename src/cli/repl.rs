@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
@@ -539,6 +540,8 @@ pub struct Repl {
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
+    /// Stable durable checkpoint identity, retained across `--resume`.
+    session_uuid: Uuid,
 
     // Number of context-summary lines to display in the status strip
     memory_context_lines: usize,
@@ -1161,6 +1164,7 @@ impl Repl {
 
             // Session identity
             session_label,
+            session_uuid: Uuid::new_v4(),
             memory_context_lines,
             max_verbatim_messages,
             context_recall_k,
@@ -2041,6 +2045,23 @@ impl Repl {
         self.conversation = Arc::new(RwLock::new(history));
     }
 
+    /// Restore history and retain a UUID-named checkpoint as the active
+    /// session identity so later atomic checkpoints replace the same file.
+    pub fn restore_conversation_from(
+        &mut self,
+        history: ConversationHistory,
+        checkpoint: &std::path::Path,
+    ) {
+        self.restore_conversation(history);
+        if let Some(id) = checkpoint
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| Uuid::parse_str(stem).ok())
+        {
+            self.session_uuid = id;
+        }
+    }
+
     /// Run REPL with an optional initial prompt
     pub async fn run_with_initial_prompt(&mut self, initial_prompt: Option<String>) -> Result<()> {
         if let Some(prompt) = initial_prompt {
@@ -2205,6 +2226,7 @@ impl Repl {
             mode,
             self.memory_system.clone(),
             self.session_label.clone(),
+            self.session_uuid,
             self.available_providers.clone(),
             initial_provider_index,
             self.daemon_client.clone(),

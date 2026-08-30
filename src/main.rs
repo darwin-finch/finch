@@ -1158,11 +1158,10 @@ async fn main() -> Result<()> {
         if session_path.exists() {
             match ConversationHistory::load(&session_path) {
                 Ok(history) => {
-                    repl.restore_conversation(history);
+                    repl.restore_conversation_from(history, &session_path);
                     if std::env::var("SHAMMAH_DEBUG").is_ok() {
                         eprintln!("✓ Restored conversation from session");
                     }
-                    std::fs::remove_file(&session_path)?;
                 }
                 Err(e) => {
                     if std::env::var("SHAMMAH_DEBUG").is_ok() {
