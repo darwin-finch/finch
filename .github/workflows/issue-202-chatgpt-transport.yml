@@ -32,7 +32,7 @@ jobs:
       - name: Check changed Rust formatting
         run: >-
           rustfmt --edition 2021 --check
-          src/claude/types.rs src/cli/conversation_compactor.rs src/cli/repl.rs
+          src/claude/types.rs src/cli/conversation.rs src/cli/conversation_compactor.rs src/cli/repl.rs
           src/cli/repl_event/query_processor.rs src/client/daemon_client.rs
           src/generators/mod.rs src/ipc/brain_codec.rs src/ipc/client.rs
           src/ipc/mod.rs src/ipc/server.rs src/providers/chatgpt_oauth.rs
@@ -57,6 +57,7 @@ jobs:
         run: |
           cargo test --lib ipc::client::tests::mixed_ipc_generations_reject_before_query_or_stream_use -- --exact
           cargo test --lib ipc::brain_codec::tests:: -- --nocapture
+          cargo test --lib cli::conversation::tests::test_opaque_reasoning_continuation_survives_restart_byte_for_byte -- --exact
           cargo test --lib cli::conversation::tests::test_staged_tool_round_is_invisible_until_complete_atomic_commit -- --exact
       - name: No external provider binary regression
         run: cargo test --test no_external_provider_binary_test

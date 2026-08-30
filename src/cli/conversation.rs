@@ -1063,6 +1063,35 @@ mod tests {
     }
 
     #[test]
+    fn test_opaque_reasoning_continuation_survives_restart_byte_for_byte() {
+        let mut conversation = ConversationHistory::new();
+        conversation.add_message(Message::with_content(
+            "assistant",
+            vec![
+                ContentBlock::OpaqueReasoning {
+                    encrypted_content: "opaque\0continuation+/=".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path":"README.md"}),
+                },
+            ],
+        ));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        conversation.save(file.path()).unwrap();
+
+        let restarted = ConversationHistory::load(file.path()).unwrap();
+        assert!(matches!(
+            restarted.get_messages()[0].content.as_slice(),
+            [
+                ContentBlock::OpaqueReasoning { encrypted_content },
+                ContentBlock::ToolUse { id, .. }
+            ] if encrypted_content == "opaque\0continuation+/=" && id == "call-1"
+        ));
+    }
+
+    #[test]
     fn test_persistence_replaces_atomically_and_never_serializes_staged_round() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("conversation.json");

@@ -47,10 +47,21 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_OPAQUE_REASONING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 const REFRESH_SKEW: ChronoDuration = ChronoDuration::minutes(2);
+
+#[derive(Debug)]
+struct SubscriptionUnauthorized;
+
+impl fmt::Display for SubscriptionUnauthorized {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatGPT subscription authorization was rejected")
+    }
+}
+
+impl std::error::Error for SubscriptionUnauthorized {}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -139,7 +150,10 @@ impl ProductionCredentialSource {
         rejected_generation: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<ChatGptCredentialLease> {
-        let _guard = self.refresh_lock.lock().await;
+        let _guard = tokio::select! {
+            _ = cancel.cancelled() => bail!("ChatGPT subscription credential refresh was cancelled"),
+            guard = self.refresh_lock.lock() => guard,
+        };
         let current = self.load_bound()?;
         let needs_refresh = rejected_generation
             .map(|generation| generation == current.generation)
@@ -306,7 +320,10 @@ impl ChatGptSubscriptionProvider {
         lease: &ChatGptCredentialLease,
         cancel: &CancellationToken,
     ) -> Result<Catalog> {
-        let mut cache = self.catalog.lock().await;
+        let mut cache = tokio::select! {
+            _ = cancel.cancelled() => bail!("ChatGPT subscription model discovery was cancelled"),
+            cache = self.catalog.lock() => cache,
+        };
         if let Some(entry) = cache.as_ref() {
             if entry.generation == lease.generation
                 && entry.account == lease.account
@@ -355,6 +372,9 @@ impl ChatGptSubscriptionProvider {
         let status = response.status();
         let response_etag = bounded_header(response.headers(), reqwest::header::ETAG.as_str())?;
         let body = read_bounded(response, MAX_CATALOG_BYTES, cancel).await?;
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(SubscriptionUnauthorized.into());
+        }
         if !status.is_success() {
             bail!("ChatGPT subscription model discovery failed (HTTP {status})");
         }
@@ -381,7 +401,19 @@ impl ChatGptSubscriptionProvider {
             bail!("ChatGPT subscription request exceeded the size limit");
         }
         let mut lease = self.source.lease(&cancel).await?;
-        let mut catalog = self.account_catalog(&lease, &cancel).await?;
+        let mut unauthorized_retry_used = false;
+        let mut catalog = match self.account_catalog(&lease, &cancel).await {
+            Ok(catalog) => catalog,
+            Err(error) if error.downcast_ref::<SubscriptionUnauthorized>().is_some() => {
+                lease = self
+                    .source
+                    .refresh_after_unauthorized(&lease.generation, &cancel)
+                    .await?;
+                unauthorized_retry_used = true;
+                self.account_catalog(&lease, &cancel).await?
+            }
+            Err(error) => return Err(error),
+        };
         let selected = catalog
             .models
             .get(&request.model)
@@ -394,7 +426,7 @@ impl ChatGptSubscriptionProvider {
             bail!("ChatGPT account model is not compatible with the pinned Responses-Lite dialect");
         }
         let url = self.route(RESPONSES_PATH, None)?;
-        for attempt in 0..2 {
+        for _ in 0..2 {
             let response = tokio::select! {
                 _ = cancel.cancelled() => bail!("ChatGPT subscription request was cancelled"),
                 response = self.client.post(url.clone())
@@ -409,7 +441,7 @@ impl ChatGptSubscriptionProvider {
                     .body(body.clone())
                     .send() => response.context("Failed to start ChatGPT subscription response")?,
             };
-            if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
+            if response.status() == StatusCode::UNAUTHORIZED && !unauthorized_retry_used {
                 let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
                 lease = self
                     .source
@@ -427,6 +459,7 @@ impl ChatGptSubscriptionProvider {
                 {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
+                unauthorized_retry_used = true;
                 continue;
             }
             if !response.status().is_success() {
@@ -813,7 +846,8 @@ fn map_message(
                     .context("Failed to serialize ChatGPT function arguments")?;
                 validate_bounded_text(&arguments, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
                 input.push(json!({
-                    "type":"function_call","call_id":id,"name":name,"arguments":arguments
+                    "type":"function_call","call_id":id,"name":name,
+                    "namespace":"functions","arguments":arguments
                 }));
             }
             ContentBlock::ToolResult {
@@ -1448,10 +1482,25 @@ fn parse_output_item(
         "message" => {
             exact_keys(
                 object,
-                &["id", "type", "status", "role", "content", "phase"],
+                &[
+                    "id",
+                    "type",
+                    "status",
+                    "role",
+                    "content",
+                    "phase",
+                    "internal_chat_message_metadata_passthrough",
+                ],
             )?;
             if object.get("role").and_then(Value::as_str) != Some("assistant") {
                 bail!("ChatGPT response message role was invalid");
+            }
+            validate_optional_item_fields(object)?;
+            if object
+                .get("phase")
+                .is_some_and(|phase| !matches!(phase.as_str(), Some("commentary" | "final_answer")))
+            {
+                bail!("ChatGPT response message phase was invalid");
             }
             let content = object
                 .get("content")
@@ -1461,6 +1510,7 @@ fn parse_output_item(
                 let part = part
                     .as_object()
                     .context("ChatGPT response content was invalid")?;
+                exact_keys(part, &["type", "text"])?;
                 if part.get("type").and_then(Value::as_str) != Some("output_text") {
                     bail!("ChatGPT response contained an unknown message content type");
                 }
@@ -1484,8 +1534,12 @@ fn parse_output_item(
                     "content",
                     "encrypted_content",
                     "status",
+                    "internal_chat_message_metadata_passthrough",
                 ],
             )?;
+            validate_optional_item_fields(object)?;
+            validate_reasoning_projection(object.get("summary"), "reasoning summary")?;
+            validate_reasoning_projection(object.get("content"), "reasoning content")?;
             let encrypted = object
                 .get("encrypted_content")
                 .and_then(Value::as_str)
@@ -1505,10 +1559,15 @@ fn parse_output_item(
                     "arguments",
                     "namespace",
                     "encrypted_function_args",
+                    "internal_chat_message_metadata_passthrough",
                 ],
             )?;
+            validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
             let name = required_identifier(object, "name", 128)?;
+            if object.get("namespace").and_then(Value::as_str) != Some("functions") {
+                bail!("ChatGPT function call namespace was invalid");
+            }
             if !allowed_tools.contains(&name) {
                 bail!("ChatGPT requested a function Finch did not advertise");
             }
@@ -1517,6 +1576,24 @@ fn parse_output_item(
                 .and_then(Value::as_str)
                 .context("ChatGPT function call omitted arguments")?;
             validate_bounded_text(arguments, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
+            if let Some(encrypted) = object.get("encrypted_function_args") {
+                let encrypted = encrypted
+                    .as_array()
+                    .context("ChatGPT encrypted function arguments were invalid")?;
+                if encrypted.len() > 64 {
+                    bail!("ChatGPT encrypted function arguments were excessive");
+                }
+                for value in encrypted {
+                    let value = value
+                        .as_str()
+                        .context("ChatGPT encrypted function arguments were invalid")?;
+                    validate_bounded_text(
+                        value,
+                        MAX_TOOL_ARGUMENT_BYTES,
+                        "encrypted function arguments",
+                    )?;
+                }
+            }
             if !call_ids.insert(call_id.clone()) {
                 bail!("ChatGPT response repeated a function call identifier");
             }
@@ -1536,6 +1613,62 @@ fn parse_output_item(
     Ok(())
 }
 
+fn validate_optional_item_fields(object: &Map<String, Value>) -> Result<()> {
+    if let Some(id) = object.get("id") {
+        let id = id
+            .as_str()
+            .context("ChatGPT response output item identifier was invalid")?;
+        validate_identifier(id, 256, "output item identifier")?;
+    }
+    if object
+        .get("status")
+        .is_some_and(|status| status.as_str() != Some("completed"))
+    {
+        bail!("ChatGPT response output item status was invalid");
+    }
+    if let Some(metadata) = object.get("internal_chat_message_metadata_passthrough") {
+        let encoded =
+            serde_json::to_vec(metadata).context("ChatGPT response item metadata was invalid")?;
+        if encoded.len() > MAX_TOOL_ARGUMENT_BYTES {
+            bail!("ChatGPT response item metadata exceeded the size limit");
+        }
+    }
+    Ok(())
+}
+
+fn validate_reasoning_projection(value: Option<&Value>, label: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let items = value
+        .as_array()
+        .with_context(|| format!("ChatGPT {label} was invalid"))?;
+    if items.len() > 256 {
+        bail!("ChatGPT {label} was excessive");
+    }
+    for item in items {
+        let item = item
+            .as_object()
+            .with_context(|| format!("ChatGPT {label} was invalid"))?;
+        exact_keys(item, &["type", "text"])?;
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("summary_text" | "reasoning_text" | "text")
+        ) {
+            bail!("ChatGPT {label} contained an unknown item type");
+        }
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .with_context(|| format!("ChatGPT {label} text was invalid"))?;
+        validate_bounded_text(text, MAX_TOOL_ARGUMENT_BYTES, label)?;
+    }
+    Ok(())
+}
+
 fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
     let Some(value) = value else {
         return Ok((None, None));
@@ -1543,6 +1676,17 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
     let object = value
         .as_object()
         .context("ChatGPT response usage was invalid")?;
+    exact_keys(
+        object,
+        &[
+            "input_tokens",
+            "input_tokens_details",
+            "output_tokens",
+            "output_tokens_details",
+            "total_tokens",
+            "codex_rollout_budget_units",
+        ],
+    )?;
     let convert = |name: &str| -> Result<Option<u32>> {
         object
             .get(name)
@@ -1554,7 +1698,21 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
             })
             .transpose()
     };
-    Ok((convert("input_tokens")?, convert("output_tokens")?))
+    let input = convert("input_tokens")?;
+    let output = convert("output_tokens")?;
+    if input.is_some() != output.is_some() {
+        bail!("ChatGPT response returned incomplete usage metadata");
+    }
+    if let Some(total) = convert("total_tokens")? {
+        if Some(total)
+            != input
+                .zip(output)
+                .map(|(input, output)| input.saturating_add(output))
+        {
+            bail!("ChatGPT response usage totals were inconsistent");
+        }
+    }
+    Ok((input, output))
 }
 
 fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Option<Allowance>> {
@@ -1718,6 +1876,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const VALID_PNG_BASE64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
     struct StaticSource {
         generation: Mutex<String>,
         leases: AtomicUsize,
@@ -1802,7 +1963,7 @@ mod tests {
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
             json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
-            json!({"type":"response.output_item.done","sequence_number":4,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","arguments":"{\"path\":\"README.md\"}"}}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
             json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
         )
     }
@@ -1913,13 +2074,13 @@ mod tests {
 
     async fn subscription_stream_outcome(body: String, header_model: &str) -> Vec<String> {
         let mut server = mockito::Server::new_async().await;
-        server
+        let _models = server
             .mock("GET", "/backend-api/codex/models")
             .with_status(200)
             .with_body(catalog_body())
             .create_async()
             .await;
-        server
+        let _inference = server
             .mock("POST", RESPONSES_PATH)
             .with_status(200)
             .with_header("content-type", "text/event-stream")
@@ -1949,7 +2110,13 @@ mod tests {
     #[test]
     fn canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() {
         let request = ProviderRequest::new(vec![
-            Message::user("inspect"),
+            Message::with_content(
+                "user",
+                vec![
+                    ContentBlock::text("inspect"),
+                    ContentBlock::image("image/png", VALID_PNG_BASE64),
+                ],
+            ),
             Message::with_content(
                 "assistant",
                 vec![
@@ -1977,8 +2144,14 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "additional_tools");
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][2]["content"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][2]["content"][1]["image_url"],
+            format!("data:image/png;base64,{VALID_PNG_BASE64}")
+        );
         assert_eq!(body["input"][3]["type"], "reasoning");
         assert_eq!(body["input"][4]["type"], "function_call");
+        assert_eq!(body["input"][4]["namespace"], "functions");
         assert_eq!(body["input"][5]["type"], "function_call_output");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
@@ -2126,7 +2299,7 @@ mod tests {
     #[tokio::test]
     async fn stream_and_nonstream_preserve_equal_terminal_output_and_provenance() {
         let mut server = mockito::Server::new_async().await;
-        server
+        let models = server
             .mock("GET", "/backend-api/codex/models")
             .with_status(200)
             .with_body(catalog_body())
@@ -2171,6 +2344,7 @@ mod tests {
         );
         assert_eq!(streamed_model.as_deref(), Some(nonstream.model.as_str()));
         assert_eq!(streamed_usage, Some((12, 7)));
+        models.assert_async().await;
         inference.assert_async().await;
     }
 
@@ -2202,7 +2376,7 @@ mod tests {
     #[tokio::test]
     async fn one_pre_stream_unauthorized_refreshes_same_account_once() {
         let mut server = mockito::Server::new_async().await;
-        server
+        let initial_catalog = server
             .mock("GET", "/backend-api/codex/models")
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(200)
@@ -2247,9 +2421,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
+        initial_catalog.assert_async().await;
         refreshed_catalog.assert_async().await;
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn one_catalog_unauthorized_refreshes_before_inference_only_once() {
+        let mut server = mockito::Server::new_async().await;
+        let rejected_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(401)
+            .with_body("catalog-auth-secret")
+            .expect(1)
+            .create_async()
+            .await;
+        let refreshed_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .expect(1)
+            .create_async()
+            .await;
+        let source = Arc::new(StaticSource::new());
+        let provider = ChatGptSubscriptionProvider::for_test(
+            source.clone(),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
+        rejected_catalog.assert_async().await;
+        refreshed_catalog.assert_async().await;
+        inference.assert_async().await;
     }
 
     #[tokio::test]
@@ -2347,6 +2570,7 @@ mod tests {
         let first = server
             .mock("GET", "/backend-api/codex/models")
             .match_header("chatgpt-account-id", "account-1")
+            .match_header("if-none-match", mockito::Matcher::Missing)
             .with_status(200)
             .with_header("etag", "account-1-etag")
             .with_body(catalog_body())
@@ -2418,14 +2642,14 @@ mod tests {
     #[tokio::test]
     async fn non_success_bodies_are_bounded_and_redacted() {
         let mut server = mockito::Server::new_async().await;
-        server
+        let models = server
             .mock("GET", "/backend-api/codex/models")
             .with_status(200)
             .with_body(catalog_body())
             .create_async()
             .await;
         let secret = "attacker-tool-argument-and-reasoning-secret";
-        server
+        let inference = server
             .mock("POST", RESPONSES_PATH)
             .with_status(429)
             .with_body(format!("{secret}{}", "x".repeat(MAX_ERROR_BYTES)))
@@ -2446,6 +2670,8 @@ mod tests {
         assert!(!error.contains("subscription-secret"));
         assert!(error.contains("size limit"));
         assert!(error.len() < 256);
+        models.assert_async().await;
+        inference.assert_async().await;
     }
 
     #[test]
