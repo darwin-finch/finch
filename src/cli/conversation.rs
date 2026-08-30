@@ -451,6 +451,18 @@ impl ConversationHistory {
                 self.messages.remove(0);
             }
         }
+
+        // A front trim can cut between an assistant tool call and its result
+        // message. Never expose an orphaned result as the new history prefix.
+        while self.messages.first().is_some_and(|message| {
+            !message.content.is_empty()
+                && message
+                    .content
+                    .iter()
+                    .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        }) {
+            self.messages.remove(0);
+        }
     }
 
     /// Get estimated token count (rough approximation)
@@ -948,6 +960,25 @@ mod tests {
         assert_eq!(history.get_messages()[0].text_content(), "older-user");
         assert_eq!(history.get_messages()[1].text_content(), "older-assistant");
         assert_eq!(history.staged_round(query_id), Some((token, 1, 1)));
+    }
+
+    #[test]
+    fn test_context_trimming_never_exposes_an_orphaned_tool_result_prefix() {
+        let mut history = ConversationHistory::with_limits(1, 600_000);
+        let query_id = Uuid::new_v4();
+        let token = history
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        history
+            .record_tool_result(query_id, token, "A", &Ok("value".to_string()))
+            .unwrap();
+        history.commit_tool_round(query_id, token).unwrap();
+        history.finalize_tool_round_commit();
+
+        assert!(history.get_messages().iter().all(|message| !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))));
     }
 
     #[test]
