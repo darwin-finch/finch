@@ -1599,31 +1599,13 @@ where
         let existing = preflight_credentials
             .iter()
             .find(|credential| credential.name == *reference);
-        if let Some(existing) = existing {
-            let exact_authority = existing.kind == crate::config::CredentialKind::OauthDevice
-                && existing.provider == crate::config::CredentialProvider::ChatgptSubscription
-                && existing.issuer == "openai-chatgpt"
-                && existing.audience
-                    == crate::config::AudienceBinding::standard(
-                        crate::config::EndpointFamily::ChatgptSubscription,
-                    )
-                && existing.secret_ref == format!("oauth-store:{reference}")
-                && crate::providers::chatgpt_oauth::chatgpt_required_scopes()
-                    .is_subset(&existing.scopes);
-            if !exact_authority {
-                // Preserve the hostile record so graph validation rejects it
-                // before the authenticator or any OAuth socket is reached.
-                continue;
-            }
-            let active = matches!(
-                existing.lifecycle,
-                crate::config::CredentialLifecycle::Active { expires_at, .. }
-                    if expires_at.is_none_or(|expiry| expiry > Utc::now())
-            );
-            if active {
-                continue;
-            }
-            preflight_credentials.retain(|credential| credential.name != *reference);
+        if existing.is_some() {
+            // Existing records are static configuration authority. Preserve
+            // them exactly and let Config::validate reject wrong-provider,
+            // wrong-store, revoked, or unrefreshable-expired bindings before
+            // any OAuth boundary is opened. A refreshable access lease may be
+            // expired here; the provider refreshes it when inference uses it.
+            continue;
         }
         preflight_credentials.push(crate::config::ProviderCredential {
             name: reference.clone(),
@@ -1653,6 +1635,15 @@ where
     let mut credentials = result.credentials.clone();
     let mut compensations = Vec::new();
     for reference in chatgpt_references {
+        if credentials
+            .iter()
+            .any(|credential| credential.name == *reference)
+        {
+            // Preflight already proved this persisted record satisfies the
+            // exact ChatGPT authority contract. Setup is not a provider-use
+            // boundary, so it must neither refresh nor rewrite the lease.
+            continue;
+        }
         let ensured = match authenticator
             .ensure_named_credential(
                 &reference,
@@ -9215,8 +9206,8 @@ mod tests {
         assert!(!serialized.contains("sk-"));
     }
 
-    #[test]
-    fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph() {
+    #[tokio::test]
+    async fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph() {
         use crate::config::{
             load_config_from_path_with_paths, AudienceBinding, CredentialBinding, CredentialKind,
             CredentialLifecycle, CredentialProvider, EndpointFamily, ProviderCredential,
@@ -9281,7 +9272,7 @@ mod tests {
             project: None,
             account: Some("account-123".into()),
             scopes,
-            secret_ref: "keyring:finch/chatgpt/default".into(),
+            secret_ref: "oauth-store:chatgpt:default".into(),
             lifecycle: CredentialLifecycle::Active {
                 expires_at: Some(future_expiry),
                 refreshable: true,
@@ -9353,11 +9344,42 @@ mod tests {
         let result = build_setup_result(&WizardState::new(Some(&opened))).unwrap();
         assert_eq!(result.providers, providers);
         assert_eq!(result.credentials, vec![expected_credential.clone()]);
-        let saved = config_from_setup_result_with_paths(&result, metrics_dir.clone(), None);
-        saved.save_to(&reopened_path).unwrap();
-        let reopened = load_config_from_path_with_paths(&reopened_path, metrics_dir, None).unwrap();
-        assert_eq!(reopened.providers, providers);
-        assert_eq!(reopened.credentials(), &[expected_credential]);
+        let authenticator = FakeChatGptSetupAuthenticator::default();
+        for invocation in [
+            SetupInvocation::FirstRun,
+            SetupInvocation::Command,
+            SetupInvocation::Repl,
+        ] {
+            let mut editor = ScriptedRecoveryEditor::new([]);
+            let (saved, committed, compensations) =
+                run_chatgpt_setup_recovery_loop(invocation, &result, &authenticator, &mut editor)
+                    .await
+                    .unwrap()
+                    .expect("an unchanged valid provider graph must be ready to save");
+            assert_eq!(committed.providers, result.providers);
+            assert_eq!(committed.credentials, result.credentials);
+            assert!(compensations.is_empty());
+            assert!(editor.recoveries.is_empty());
+            assert!(
+                authenticator.calls.lock().unwrap().is_empty(),
+                "{invocation:?} must not refresh a persisted credential during setup"
+            );
+
+            let invocation_path = reopened_path.with_extension(format!("{invocation:?}.toml"));
+            save_chatgpt_setup_config(&saved, &compensations, &authenticator, |config| {
+                config.save_to(&invocation_path)
+            })
+            .unwrap();
+            let reopened =
+                load_config_from_path_with_paths(&invocation_path, metrics_dir.clone(), None)
+                    .unwrap();
+            assert_eq!(reopened.providers, providers, "{invocation:?}");
+            assert_eq!(
+                reopened.credentials(),
+                &[expected_credential.clone()],
+                "{invocation:?}"
+            );
+        }
     }
 
     #[test]

@@ -63,7 +63,13 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 }
 
 fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
-    match fs::metadata(config_path) {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "Existing Finch configuration at {} is a symbolic link; setup will not follow or overwrite it",
+                config_path.display()
+            );
+        }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -300,5 +306,24 @@ mod tests {
             .expect_err("filesystem inspection errors must not look like first run")
             .to_string();
         assert!(error.contains("Could not inspect existing Finch configuration"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_loader_rejects_dangling_config_symlink_as_existing_state() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        symlink(directory.path().join("missing-target.toml"), &config_path).unwrap();
+
+        let error = try_load_from_path(&config_path)
+            .expect_err("a dangling config symlink must not look like first run")
+            .to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&config_path).is_ok(),
+            "failed inspection must preserve the link"
+        );
     }
 }
