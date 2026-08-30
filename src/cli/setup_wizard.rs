@@ -1725,11 +1725,11 @@ fn is_exact_chatgpt_setup_credential(
 
 fn is_reusable_chatgpt_setup_credential(credential: &crate::config::ProviderCredential) -> bool {
     matches!(
-        credential.lifecycle,
+        &credential.lifecycle,
         crate::config::CredentialLifecycle::Active {
             expires_at,
             refreshable,
-        } if refreshable || expires_at.is_none_or(|expiry| expiry > Utc::now())
+        } if *refreshable || expires_at.as_ref().is_none_or(|expiry| expiry > &Utc::now())
     )
 }
 
