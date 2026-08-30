@@ -1197,7 +1197,7 @@ mod tests {
                         required_scopes: BTreeSet::new(),
                     },
                     model: Some("subscription-model".into()),
-                    base_url: None,
+                    base_url: Some(endpoint.to_string()),
                     chat_path: None,
                     models_path: None,
                     name: Some("broken".into()),
@@ -1420,7 +1420,7 @@ mod tests {
             (SiblingDefect::Revoked, "revoked"),
             (
                 SiblingDefect::Unsupported,
-                "ChatGPT subscription credentials are distinct",
+                "ChatGPT subscription custom endpoints and paths are not supported",
             ),
         ];
         let selectors = [

@@ -539,7 +539,7 @@ mod tests {
                 CredentialKind::Bearer,
                 "openai-chatgpt",
                 AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
-                None,
+                Some(origin.to_string()),
             ),
             CredentialProvider::GoogleVertex => (
                 CredentialKind::CloudIdentity,
@@ -688,7 +688,7 @@ mod tests {
         let cases = [
             (
                 CredentialProvider::ChatgptSubscription,
-                "ChatGPT subscription credentials are distinct",
+                "ChatGPT subscription custom endpoints and paths are not supported",
             ),
             (
                 CredentialProvider::GoogleVertex,

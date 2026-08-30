@@ -1319,10 +1319,9 @@ fn named_brain_wire_source(
     );
     let continuation_messages = messages[initial_message_count..].to_vec();
     anyhow::ensure!(
-        !continuation_messages.is_empty()
-            && continuation_messages
-                .iter()
-                .all(|message| matches!(message.role.as_str(), "assistant" | "user")),
+        continuation_messages
+            .iter()
+            .all(|message| matches!(message.role.as_str(), "assistant" | "user")),
         "named Brain continuation messages were invalid"
     );
     let assistant = continuation_messages
