@@ -6,6 +6,7 @@ Give each independent collaborator all of the following. Replace every placehold
 Issue and outcome
 - GitHub issue: #<number> — <title>
 - Concrete outcome: <observable behavior and acceptance gate>
+- Work claim: <claim id and issue-comment URL>
 
 Starting point
 - Repository: <absolute path>
@@ -37,4 +38,5 @@ Expected deliverable
 - Clean worktree and exact final SHA.
 - PR or handoff with changed files, named regression, test/CI links, residual risks, and merge recommendation.
 - Do not merge, close issues, or remove the worktree unless explicitly authorized.
+- Publish the required claim terminal event when ownership ends.
 ```

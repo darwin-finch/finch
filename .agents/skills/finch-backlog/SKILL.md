@@ -30,6 +30,14 @@ If repository state contradicts the issue tracker or user direction, report the 
 
 Recompute this frontier after every merge, newly discovered blocker, or changed issue dependency.
 
+## Claim work before mutation
+
+1. Inspect assignees, open pull requests, branches, worktrees, running agents, and active claim comments before taking an issue.
+2. If another active claim overlaps the files or semantic scope, coordinate with that worker or choose another ready issue. Do not create a competing implementation merely because the other worker is a different tool or person.
+3. After creating the dedicated branch/worktree and before editing production files, publish a claim using [the work-claim protocol](references/work-claims.md). Include the worker/session identity, responsible GitHub actor, branch, worktree, base SHA, bounded scope, and UTC timestamp.
+4. Assign the issue to the responsible GitHub user when repository permissions and the working arrangement allow it. Assignment supplements the claim; it does not replace it when several agents share one GitHub identity.
+5. Recheck active claims immediately before widening scope or merging. Publish a release, completion, or supersession event when ownership ends so stale claims do not strand work.
+
 ## Isolate and delegate work
 
 - Give each independent implementation its own branch and worktree based on synchronized `origin/main`.
@@ -64,7 +72,7 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
 
 1. Merge only reviewed, tested work into current `main`.
 2. Synchronize `main` and verify the merge commit.
-3. Update or close the GitHub issue with commit, regression, review, CI, and remaining-gap evidence.
+3. Update or close the GitHub issue with commit, regression, review, CI, remaining-gap evidence, and a completion/release event for its work claim.
 4. Remove clean worktrees after merge or proven supersession. Preserve unique work by committing and pushing it first.
 5. Recompute the ready frontier and immediately continue while an unblocked gate remains.
 

@@ -9,6 +9,9 @@ Codex contributors can invoke `$finch-backlog`, and Claude Code contributors can
 isolated worktree, regression, review, CI, merge evidence, and cleanup. The canonical skill lives in
 `.agents/skills/finch-backlog`; `.claude/skills/finch-backlog` links to the same directory so both
 tools use one reviewable workflow rather than private or duplicated assistant configuration.
+Before editing an issue, the workflow records a machine-readable claim comment with the worker,
+branch, worktree, and bounded scope. This distinguishes concurrent tools or people even when they
+share a GitHub account, and prevents overlapping implementations from silently stomping each other.
 
 ## Development setup
 
