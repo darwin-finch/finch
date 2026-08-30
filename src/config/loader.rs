@@ -12,7 +12,7 @@ use crate::errors;
 /// Load configuration from Shammah config file or environment
 pub fn load_config() -> Result<Config> {
     // Try loading from ~/.finch/config.toml first
-    if let Some(config) = try_load_from_finch_config()? {
+    if let Some(config) = load_persisted_config()? {
         return Ok(config);
     }
 
@@ -45,10 +45,24 @@ pub fn load_config() -> Result<Config> {
     );
 }
 
+/// Load the persisted configuration without substituting environment or empty
+/// state when an existing file is invalid.
+///
+/// `None` means the file is genuinely absent. Any read, parse, or validation
+/// failure is returned so setup cannot overwrite a provider graph it failed to
+/// understand.
+pub fn load_persisted_config() -> Result<Option<Config>> {
+    try_load_from_finch_config()
+}
+
 fn try_load_from_finch_config() -> Result<Option<Config>> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".finch/config.toml");
 
+    try_load_from_path(&config_path)
+}
+
+fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
     if !config_path.exists() {
         return Ok(None);
     }
@@ -253,5 +267,24 @@ mod tests {
         assert_eq!(resolver_calls.get(), 0);
         assert_eq!(loaded.metrics_dir, metrics_dir);
         assert_eq!(loaded.constitution_path, None);
+    }
+
+    #[test]
+    fn test_setup_loader_distinguishes_absent_from_broken_existing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+
+        assert!(try_load_from_path(&config_path).unwrap().is_none());
+
+        std::fs::write(&config_path, "this is not valid Finch TOML = [").unwrap();
+        let error = try_load_from_path(&config_path).unwrap_err().to_string();
+        assert!(
+            error.contains("Failed to parse configuration") || error.contains("configuration"),
+            "unexpected load error: {error}"
+        );
+        assert!(
+            config_path.exists(),
+            "a failed load must not remove the file"
+        );
     }
 }

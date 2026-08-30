@@ -1177,35 +1177,18 @@ fn cleanup_terminal(
 
 /// Show first-run setup wizard and return configuration
 pub fn show_setup_wizard() -> Result<SetupResult> {
-    // Try to load existing config to pre-fill values
-    let existing_config = match crate::config::load_config() {
-        Ok(config) => {
-            let debug_msg = format!(
-                "Successfully loaded existing config with {} teachers\n",
-                config.teachers.len()
-            );
-            if let Some(teacher) = config.active_teacher() {
-                let debug_msg = format!(
-                    "{}Active teacher: provider={}, key_len={}\n",
-                    debug_msg,
-                    teacher.provider,
-                    teacher.api_key.len()
-                );
-                let _ = std::fs::write("/tmp/wizard_debug.log", debug_msg);
-            }
-            tracing::debug!(
-                "Successfully loaded existing config with {} teachers",
-                config.teachers.len()
-            );
-            Some(config)
-        }
-        Err(e) => {
-            let debug_msg = format!("Could not load existing config: {}\n", e);
-            let _ = std::fs::write("/tmp/wizard_debug.log", debug_msg);
-            tracing::debug!("Could not load existing config: {}", e);
-            None
-        }
-    };
+    // `None` is reserved for a genuinely absent file. Existing configuration
+    // failures must stop setup before it can render or save an empty fallback.
+    let existing_config = crate::config::load_persisted_config().context(
+        "Existing Finch configuration could not be loaded; setup was not opened because saving an empty wizard would overwrite it",
+    )?;
+    if let Some(config) = existing_config.as_ref() {
+        tracing::debug!(
+            providers = config.providers.len(),
+            credentials = config.credentials().len(),
+            "Successfully loaded existing setup configuration"
+        );
+    }
 
     // Set up terminal
     crossterm::terminal::enable_raw_mode()?;
@@ -9230,6 +9213,167 @@ mod tests {
         let serialized = toml::to_string(&saved.credentials()[0]).unwrap();
         assert!(serialized.contains("env:OPENAI_WORK_API_KEY"));
         assert!(!serialized.contains("sk-"));
+    }
+
+    #[test]
+    fn test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph() {
+        use crate::config::{
+            load_config_from_path_with_paths, AudienceBinding, CredentialBinding, CredentialKind,
+            CredentialLifecycle, CredentialProvider, EndpointFamily, ProviderCredential,
+            ReasoningEffort,
+        };
+        use chrono::{DateTime, Utc};
+        use ratatui::backend::TestBackend;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let reopened_path = directory.path().join("reopened.toml");
+        let metrics_dir = directory.path().join("metrics");
+        let scopes = crate::providers::chatgpt_oauth::chatgpt_required_scopes();
+        let providers = vec![
+            ProviderEntry::Credentialed {
+                provider: CredentialProvider::ChatgptSubscription,
+                credential: CredentialBinding {
+                    credential_ref: "chatgpt:default".into(),
+                    audience: Some(AudienceBinding::standard(
+                        EndpointFamily::ChatgptSubscription,
+                    )),
+                    tenant: None,
+                    project: None,
+                    account: Some("account-123".into()),
+                    required_scopes: scopes.clone(),
+                },
+                model: Some("gpt-5.6-sol".into()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("ChatGPT Personal".into()),
+                reasoning_effort: Some(ReasoningEffort::High),
+            },
+            ProviderEntry::Grok {
+                api_key: "xai-test-preserved".into(),
+                model: Some("grok-code-fast-1".into()),
+                base_url: Some("https://xai-compatible.example/v1".into()),
+                chat_path: Some("/chat/completions?profile=build".into()),
+                models_path: Some("/models?profile=build".into()),
+                name: Some("Grok Build".into()),
+            },
+            ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::Auto,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Medium,
+                model_repo: Some("Qwen/Qwen2.5-Coder-7B-Instruct-ONNX".into()),
+                model_path: Some(directory.path().join("models/qwen")),
+                enabled: true,
+                name: Some("Local Qwen Medium".into()),
+            },
+        ];
+        let future_expiry: DateTime<Utc> = "2099-01-02T03:04:05Z".parse().unwrap();
+        let expired_at: DateTime<Utc> = "2000-01-02T03:04:05Z".parse().unwrap();
+        let credential = ProviderCredential {
+            name: "chatgpt:default".into(),
+            kind: CredentialKind::OauthDevice,
+            provider: CredentialProvider::ChatgptSubscription,
+            issuer: "openai-chatgpt".into(),
+            audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+            tenant: None,
+            project: None,
+            account: Some("account-123".into()),
+            scopes,
+            secret_ref: "keyring:finch/chatgpt/default".into(),
+            lifecycle: CredentialLifecycle::Active {
+                expires_at: Some(future_expiry),
+                refreshable: true,
+            },
+            revocation: Default::default(),
+        };
+        let source = crate::config::Config::with_providers_and_paths(
+            providers.clone(),
+            metrics_dir.clone(),
+            None,
+        )
+        .with_credentials(vec![credential.clone()]);
+        source.save_to(&config_path).unwrap();
+
+        // Model a real short-lived OAuth access lease aging after it was saved.
+        let serialized = std::fs::read_to_string(&config_path).unwrap();
+        let serialized = serialized
+            .replace("2099-01-02T03:04:05Z", "2000-01-02T03:04:05Z")
+            .replace("2099-01-02T03:04:05+00:00", "2000-01-02T03:04:05+00:00");
+        assert!(
+            serialized.contains("2000-01-02T03:04:05"),
+            "fixture must contain an expired refreshable lease"
+        );
+        std::fs::write(&config_path, serialized).unwrap();
+        let before_open = std::fs::read(&config_path).unwrap();
+
+        let opened = load_config_from_path_with_paths(&config_path, metrics_dir.clone(), None)
+            .expect("refreshable expiry must not make static configuration unloadable");
+        let mut expected_credential = credential;
+        expected_credential.lifecycle = CredentialLifecycle::Active {
+            expires_at: Some(expired_at),
+            refreshable: true,
+        };
+        assert_eq!(opened.providers, providers);
+        assert_eq!(opened.credentials(), &[expected_credential.clone()]);
+
+        let mut state = WizardState::new(Some(&opened));
+        state.current_section = WizardSection::Models;
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tabbed_wizard(frame, &state))
+            .unwrap();
+        let rendered = test_buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("ChatGPT Personal"), "{rendered}");
+        assert!(rendered.contains("Grok Build"), "{rendered}");
+        assert!(rendered.contains("Local Qwen"), "{rendered}");
+        assert!(!rendered.contains("Claude"), "{rendered}");
+        assert!(!rendered.contains("[Not configured]"), "{rendered}");
+
+        assert_eq!(
+            handle_wizard_key(
+                &mut state,
+                modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            )
+            .unwrap(),
+            WizardAction::Continue
+        );
+        assert_eq!(
+            handle_wizard_key(&mut state, key(KeyCode::Char('y'))).unwrap(),
+            WizardAction::Cancel
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before_open,
+            "opening and cancelling setup must be byte-for-byte read-only"
+        );
+
+        let result = build_setup_result(&WizardState::new(Some(&opened))).unwrap();
+        assert_eq!(result.providers, providers);
+        assert_eq!(result.credentials, vec![expected_credential.clone()]);
+        let saved = config_from_setup_result_with_paths(&result, metrics_dir.clone(), None);
+        saved.save_to(&reopened_path).unwrap();
+        let reopened = load_config_from_path_with_paths(&reopened_path, metrics_dir, None).unwrap();
+        assert_eq!(reopened.providers, providers);
+        assert_eq!(reopened.credentials(), &[expected_credential]);
+    }
+
+    #[test]
+    fn test_genuinely_empty_setup_alone_renders_unconfigured_claude_default() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Models;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tabbed_wizard(frame, &state))
+            .unwrap();
+        let rendered = test_buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("Claude"), "{rendered}");
+        assert!(rendered.contains("[Not configured]"), "{rendered}");
     }
 
     #[derive(Default)]

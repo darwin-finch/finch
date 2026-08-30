@@ -360,6 +360,10 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
     teachers
 }
 
+fn first_run_setup_cancelled() -> anyhow::Error {
+    anyhow::anyhow!("Setup cancelled; no configuration was saved")
+}
+
 /// Create a ClaudeClient with the configured provider
 ///
 /// This function creates a provider based on the teacher configuration
@@ -926,119 +930,78 @@ async fn main() -> Result<()> {
     // NOW initialize tracing (will use the global OutputManager we just configured)
     init_tracing();
 
-    // Load configuration (or run setup if missing)
-    let mut config = match load_config() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("{}", e);
+    // Load configuration (or run setup only when the file is genuinely
+    // absent). A broken existing file is never an invitation to overwrite it
+    // with auto-detected or default first-run state.
+    let persisted_config = finch::config::load_persisted_config()
+        .context("Existing Finch configuration could not be loaded and was left unchanged")?;
+    let mut config = match persisted_config {
+        Some(cfg) => cfg,
+        None => match load_config() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("{}", e);
 
-            // Before showing the wizard, try to auto-detect API keys.
-            // If any exist (env vars, Claude Code config, etc.) just start immediately.
-            let auto_teachers = build_teachers_from_env();
-            if !auto_teachers.is_empty() {
-                let names: Vec<&str> = auto_teachers.iter().map(|t| t.provider.as_str()).collect();
-                use crossterm::style::Stylize as _;
-                eprintln!(
-                    "\n{}",
-                    format!("✓ Auto-configured: {}", names.join(", "))
-                        .green()
-                        .bold()
-                );
-                eprintln!(
-                    "{}\n",
-                    "  Run `finch setup` any time to change settings.".yellow()
-                );
-                let cfg = Config::new(auto_teachers);
-                cfg.save().ok();
-                cfg
-            } else {
-                {
-                    use crossterm::execute;
-                    use crossterm::style::{
-                        Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor,
-                    };
-                    let _ = execute!(
-                        std::io::stderr(),
-                        Print("\n"),
-                        SetForegroundColor(Color::Yellow),
-                        SetAttribute(Attribute::Bold),
-                        Print("⚠️  Running first-time setup wizard..."),
-                        ResetColor,
-                        Print("\n\n"),
+                // Before showing the wizard, try to auto-detect API keys.
+                // If any exist (env vars, Claude Code config, etc.) just start immediately.
+                let auto_teachers = build_teachers_from_env();
+                if !auto_teachers.is_empty() {
+                    let names: Vec<&str> =
+                        auto_teachers.iter().map(|t| t.provider.as_str()).collect();
+                    use crossterm::style::Stylize as _;
+                    eprintln!(
+                        "\n{}",
+                        format!("✓ Auto-configured: {}", names.join(", "))
+                            .green()
+                            .bold()
                     );
-                }
-
-                // Run setup wizard
-                use finch::cli::show_setup_wizard;
-                match show_setup_wizard() {
-                    Ok(result) => {
-                        if finch::cli::setup_wizard::validate_first_run_and_apply(&result).await?
-                            == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
-                        {
-                            return Err(anyhow::anyhow!("Setup cancelled"));
-                        }
-                        let new_config = finch::config::load_config()?;
-                        use crossterm::style::Stylize as _;
-                        eprintln!("\n{}\n", "✓ Configuration saved!".green().bold());
-                        new_config
-                    }
-                    Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
-                        // User pressed Escape/Ctrl+C — don't crash, fall back gracefully
-                        use crossterm::style::Stylize as _;
-                        eprintln!(
-                            "\n{}",
-                            "Setup skipped. Detecting API keys from environment...".yellow()
+                    eprintln!(
+                        "{}\n",
+                        "  Run `finch setup` any time to change settings.".yellow()
+                    );
+                    let cfg = Config::new(auto_teachers);
+                    cfg.save().ok();
+                    cfg
+                } else {
+                    {
+                        use crossterm::execute;
+                        use crossterm::style::{
+                            Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor,
+                        };
+                        let _ = execute!(
+                            std::io::stderr(),
+                            Print("\n"),
+                            SetForegroundColor(Color::Yellow),
+                            SetAttribute(Attribute::Bold),
+                            Print("⚠️  Running first-time setup wizard..."),
+                            ResetColor,
+                            Print("\n\n"),
                         );
-
-                        let teachers = build_teachers_from_env();
-
-                        if teachers.is_empty() {
-                            eprintln!("{}", "No API keys found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GROK_API_KEY)".yellow());
-                            eprintln!(
-                                "{}\n",
-                                "and re-run, or run `finch setup` to configure interactively."
-                                    .yellow()
-                            );
-                        } else {
-                            let names: Vec<&str> =
-                                teachers.iter().map(|t| t.provider.as_str()).collect();
-                            eprintln!(
-                                "{}\n",
-                                format!("✓ Auto-configured: {}", names.join(", ")).green()
-                            );
-                        }
-
-                        let cfg = Config::new(teachers);
-                        // Save so next launch doesn't show the wizard again
-                        if cfg.save().is_err() {
-                            // Non-fatal — we'll just show the wizard again next time
-                        }
-                        {
-                            use crossterm::execute;
-                            use crossterm::style::{
-                                Attribute, Color, Print, ResetColor, SetAttribute,
-                                SetForegroundColor,
-                            };
-                            let _ = execute!(
-                                std::io::stderr(),
-                                Print("\n"),
-                                SetForegroundColor(Color::Green),
-                                SetAttribute(Attribute::Bold),
-                                Print("✓ Setup complete!"),
-                                ResetColor,
-                                Print(" Type "),
-                                SetAttribute(Attribute::Bold),
-                                Print("/help"),
-                                SetAttribute(Attribute::Reset),
-                                Print(" for commands, or just start talking.\n\n"),
-                            );
-                        }
-                        cfg
                     }
-                    Err(e) => return Err(e),
-                }
-            } // end else (no auto-detected keys)
-        }
+
+                    // Run setup wizard
+                    use finch::cli::show_setup_wizard;
+                    match show_setup_wizard() {
+                        Ok(result) => {
+                            if finch::cli::setup_wizard::validate_first_run_and_apply(&result)
+                                .await?
+                                == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
+                            {
+                                return Err(first_run_setup_cancelled());
+                            }
+                            let new_config = finch::config::load_config()?;
+                            use crossterm::style::Stylize as _;
+                            eprintln!("\n{}\n", "✓ Configuration saved!".green().bold());
+                            new_config
+                        }
+                        Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
+                            return Err(first_run_setup_cancelled());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } // end else (no auto-detected keys)
+            }
+        },
     };
 
     // Override TUI setting if --raw or --no-tui flag is provided
@@ -3185,7 +3148,7 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{register_query_vm_tools, Args, AuthCommand, Command};
+    use super::{first_run_setup_cancelled, register_query_vm_tools, Args, AuthCommand, Command};
     use clap::Parser;
     use std::sync::Arc;
 
@@ -3197,6 +3160,14 @@ mod tests {
         assert!(Args::try_parse_from(["finch", "library", "verify"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "heal"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "build", "--all"]).is_err());
+    }
+
+    #[test]
+    fn cancelled_first_run_reports_read_only_outcome_without_success_claim() {
+        let message = first_run_setup_cancelled().to_string();
+        assert_eq!(message, "Setup cancelled; no configuration was saved");
+        assert!(!message.contains("complete"));
+        assert!(!message.contains("saved!"));
     }
 
     #[test]

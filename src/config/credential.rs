@@ -548,12 +548,20 @@ pub fn validate_binding(
     match &credential.lifecycle {
         CredentialLifecycle::Revoked => bail!("credential '{}' is revoked; choose or configure another named credential", name),
         CredentialLifecycle::LegacyAmbiguous => bail!("credential '{}' is an ambiguous legacy record; run `finch setup` and explicitly classify its provider, kind, issuer, and audience", name),
-        CredentialLifecycle::Active { expires_at: Some(expires_at), refreshable } if *expires_at <= now => {
-            if *refreshable {
-                bail!("credential '{}' is expired; this resolver cannot refresh during validation, so refresh it explicitly before retrying", name)
-            }
+        CredentialLifecycle::Active {
+            expires_at: Some(expires_at),
+            refreshable: false,
+        } if *expires_at <= now => {
             bail!("credential '{}' is expired and cannot be refreshed", name)
         }
+        // Static configuration validation proves provider/credential authority,
+        // not whether a short-lived access token is fresh at this instant. A
+        // refreshable lease remains loadable so its resolver can refresh it at
+        // the provider-use boundary without making setup discard the graph.
+        CredentialLifecycle::Active {
+            expires_at: Some(expires_at),
+            refreshable: true,
+        } if *expires_at <= now => {}
         CredentialLifecycle::Active { .. } => {}
     }
     Ok(())
@@ -840,6 +848,19 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("cannot be refreshed"));
+
+        value.lifecycle = CredentialLifecycle::Active {
+            expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            refreshable: true,
+        };
+        validate_binding(
+            CredentialProvider::GoogleVertex,
+            None,
+            &expected,
+            &value,
+            Utc::now(),
+        )
+        .expect("refreshable expiry is resolved at use time, not config load time");
     }
 
     #[test]
