@@ -1728,8 +1728,8 @@ fn is_reusable_chatgpt_setup_credential(credential: &crate::config::ProviderCred
         &credential.lifecycle,
         crate::config::CredentialLifecycle::Active {
             expires_at,
-            refreshable,
-        } if *refreshable || expires_at.as_ref().is_none_or(|expiry| expiry > &Utc::now())
+            ..
+        } if expires_at.as_ref().is_none_or(|expiry| expiry > &Utc::now())
     )
 }
 
