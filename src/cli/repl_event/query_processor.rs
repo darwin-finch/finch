@@ -29,6 +29,27 @@ fn raw_wire_source(source: &str) -> String {
     source.trim().to_string()
 }
 
+fn history_content_with_source(blocks: &[ContentBlock], source: String) -> Vec<ContentBlock> {
+    let mut inserted_text = false;
+    let mut content = Vec::with_capacity(blocks.len().max(1));
+    for block in blocks {
+        if matches!(block, ContentBlock::Text { .. }) {
+            if !inserted_text {
+                content.push(ContentBlock::Text {
+                    text: source.clone(),
+                });
+                inserted_text = true;
+            }
+        } else {
+            content.push(block.clone());
+        }
+    }
+    if !inserted_text && !source.is_empty() {
+        content.push(ContentBlock::Text { text: source });
+    }
+    content
+}
+
 /// Whether a provider has emitted any candidate ProgramSubmission source.
 ///
 /// The text channel is the Finch wire, so duplicating a small subset of the
@@ -1064,15 +1085,30 @@ pub(crate) async fn process_query_with_tools(
                 // Process stream (handles tools via StreamChunk::ContentBlockComplete)
                 let mut blocks = Vec::new();
                 let mut text = String::new();
+                let mut completed_text = String::new();
+                let mut actual_model: Option<String> = None;
+                let mut output_token_count: Option<u32> = None;
+                let mut primary_allowance_used_percent: Option<f32> = None;
+                let mut secondary_allowance_used_percent: Option<f32> = None;
 
                 while let Some(result) = rx.recv().await {
                     match result {
-                        Ok(StreamChunk::Usage { input_tokens, .. }) => {
+                        Ok(StreamChunk::Usage {
+                            input_tokens,
+                            output_tokens,
+                        }) => {
                             input_token_count = Some(input_tokens);
+                            output_token_count = Some(output_tokens);
                         }
-                        Ok(StreamChunk::Allowance { .. }) => {}
-                        Ok(StreamChunk::ResponseMetadata { .. }) => {
-                            // No durable provenance owner exists in this path yet.
+                        Ok(StreamChunk::Allowance {
+                            primary_used_percent,
+                            secondary_used_percent,
+                        }) => {
+                            primary_allowance_used_percent = primary_used_percent;
+                            secondary_allowance_used_percent = secondary_used_percent;
+                        }
+                        Ok(StreamChunk::ResponseMetadata { model }) => {
+                            actual_model = Some(model);
                         }
                         Ok(StreamChunk::TextDelta(delta)) => {
                             tracing::debug!("Received TextDelta: {} bytes", delta.len());
@@ -1095,6 +1131,9 @@ pub(crate) async fn process_query_with_tools(
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
                             tracing::debug!("Received ContentBlockComplete: {:?}", block);
+                            if let ContentBlock::Text { text } = &block {
+                                completed_text.push_str(text);
+                            }
                             blocks.push(block);
                         }
                         Err(e) => {
@@ -1115,12 +1154,32 @@ pub(crate) async fn process_query_with_tools(
                 );
                 tracing::debug!("Stream receive loop ended");
 
+                if text.is_empty() {
+                    text.clone_from(&completed_text);
+                    if !text.is_empty() {
+                        token_count = text.split_whitespace().count();
+                        work_unit.add_tokens(&text);
+                    }
+                } else if !completed_text.is_empty() && completed_text != text {
+                    work_unit.set_failed();
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: "Provider streaming text did not match its completed content"
+                            .to_string(),
+                    });
+                    return;
+                }
+                let actual_model =
+                    actual_model.unwrap_or_else(|| generator.model_name().to_string());
+
                 // Send stats update
                 let _ = event_tx.send(ReplEvent::StatsUpdate {
-                    model: generator.name().to_string(),
+                    model: actual_model.clone(),
                     input_tokens: input_token_count,
-                    output_tokens: Some(token_count as u32),
+                    output_tokens: output_token_count.or(Some(token_count as u32)),
                     latency_ms: Some(stream_start.elapsed().as_millis() as u64),
+                    primary_allowance_used_percent,
+                    secondary_allowance_used_percent,
                 });
 
                 tracing::debug!("[EVENT_LOOP] Streaming complete");
@@ -1269,12 +1328,14 @@ pub(crate) async fn process_query_with_tools(
                 }
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
+                let history_content =
+                    history_content_with_source(&blocks, source_for_history.clone());
                 let effect_journal = wire_execution.effect_journal;
                 let published = query_states
-                    .try_publish_completion(
+                    .try_publish_completion_content(
                         query_id,
                         response.clone(),
-                        source_for_history.clone(),
+                        history_content,
                         &conversation,
                     )
                     .await;
@@ -1295,7 +1356,7 @@ pub(crate) async fn process_query_with_tools(
                             query_states.as_ref(),
                             &query,
                             &source_for_history,
-                            generator.name(),
+                            &actual_model,
                             &session_label,
                             &cwd,
                             &status_bar,
@@ -1346,6 +1407,10 @@ pub(crate) async fn process_query_with_tools(
                 input_tokens: response.metadata.input_tokens,
                 output_tokens: response.metadata.output_tokens,
                 latency_ms: response.metadata.latency_ms,
+                primary_allowance_used_percent: response.metadata.primary_allowance_used_percent,
+                secondary_allowance_used_percent: response
+                    .metadata
+                    .secondary_allowance_used_percent,
             });
 
             // Convert GenToolUse to ToolUse
@@ -1474,11 +1539,13 @@ pub(crate) async fn process_query_with_tools(
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
             let source_for_history = wire_execution.source_for_history;
+            let history_content =
+                history_content_with_source(&response.content_blocks, source_for_history.clone());
             let published = query_states
-                .try_publish_completion(
+                .try_publish_completion_content(
                     query_id,
                     rendered_response.clone(),
-                    source_for_history.clone(),
+                    history_content,
                     &conversation,
                 )
                 .await;
@@ -1974,6 +2041,8 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
                 },
             })
         }
@@ -2587,5 +2656,23 @@ mod tests {
                 text: "partial".into(),
             });
         assert!(!is_repairable_wire_outcome(&outcome));
+    }
+
+    #[test]
+    fn completed_history_replaces_text_without_reordering_opaque_continuation() {
+        let blocks = vec![
+            ContentBlock::opaque_reasoning("opaque-before"),
+            ContentBlock::text("wire-before-repair"),
+            ContentBlock::opaque_reasoning("opaque-after"),
+        ];
+        let content = history_content_with_source(&blocks, "wire-after-repair".into());
+        assert!(matches!(
+            content.as_slice(),
+            [
+                ContentBlock::OpaqueReasoning { encrypted_content: before },
+                ContentBlock::Text { text },
+                ContentBlock::OpaqueReasoning { encrypted_content: after },
+            ] if before == "opaque-before" && text == "wire-after-repair" && after == "opaque-after"
+        ));
     }
 }

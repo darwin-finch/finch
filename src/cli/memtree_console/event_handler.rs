@@ -73,6 +73,7 @@ impl EventHandler {
                 input_tokens,
                 output_tokens,
                 latency_ms,
+                ..
             } => {
                 self.handle_stats_update(
                     console,

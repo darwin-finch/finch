@@ -11,9 +11,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -96,7 +96,23 @@ struct ProductionCredentialSource {
     expected_account: String,
     store: Arc<FileOAuthCredentialStore>,
     oauth: Arc<ProductionOAuthClient>,
-    refresh_lock: Mutex<()>,
+    refresh_lock: Arc<Mutex<()>>,
+}
+
+fn shared_refresh_lock(reference: &str, account: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    let key = format!("{reference}\0{account}");
+    let mut locks = LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 impl ProductionCredentialSource {
@@ -116,15 +132,16 @@ impl ProductionCredentialSource {
         let store = Arc::new(FileOAuthCredentialStore::new(root));
         let dialect = Arc::new(OpenAiChatGptOAuthDialect::production()?);
         let oauth = Arc::new(OAuthClient::new(dialect, store.clone())?);
+        let expected_account = credential
+            .account
+            .clone()
+            .context("ChatGPT subscription credential omitted its signed account")?;
         Ok(Self {
             reference: reference.to_string(),
-            expected_account: credential
-                .account
-                .clone()
-                .context("ChatGPT subscription credential omitted its signed account")?,
+            expected_account: expected_account.clone(),
             store,
             oauth,
-            refresh_lock: Mutex::new(()),
+            refresh_lock: shared_refresh_lock(reference, &expected_account),
         })
     }
 
@@ -1047,6 +1064,15 @@ async fn consume_sse(
                 .and_then(|object| object.get("type"))
                 .and_then(Value::as_str)
                 .context("ChatGPT subscription stream event omitted type")?;
+            let text_delta = (event_kind == "response.output_text.delta")
+                .then(|| {
+                    event
+                        .as_object()
+                        .and_then(|object| object.get("delta"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten();
             if event_name.as_deref().is_some_and(|name| name != event_kind) {
                 bail!("ChatGPT subscription SSE event name did not match its payload");
             }
@@ -1067,6 +1093,14 @@ async fn consume_sse(
                 &mut accumulator,
             )? {
                 terminal = Some(completed);
+            }
+            if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
+                sender
+                    .send(Ok(StreamChunk::TextDelta(delta)))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")
+                    })?;
             }
             enforce_sse_remainder_bounds(&buffer)?;
         }
@@ -1128,13 +1162,45 @@ fn parse_event(
         .context("ChatGPT subscription stream event omitted type")?;
     match kind {
         "response.created" | "response.in_progress" => {
-            exact_keys(object, &["type", "sequence_number", "response"])?;
+            exact_keys(object, &["type", "sequence_number", "response", "headers"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
                 .and_then(Value::as_object)
                 .context("ChatGPT response lifecycle event omitted response")?;
             observe_response_model(response, expected_model, accumulator)?;
+            observe_event_headers(object, expected_model, accumulator)?;
+            Ok(None)
+        }
+        "response.metadata" | "codex.response.metadata" => {
+            exact_keys(
+                object,
+                &[
+                    "type",
+                    "sequence_number",
+                    "response_id",
+                    "headers",
+                    "metadata",
+                    "safety_buffering",
+                ],
+            )?;
+            required_sequence(object)?;
+            if let Some(response_id) = object.get("response_id") {
+                let response_id = response_id
+                    .as_str()
+                    .context("ChatGPT response metadata identifier was invalid")?;
+                validate_identifier(response_id, 256, "response metadata identifier")?;
+            }
+            for field in ["metadata", "safety_buffering"] {
+                if let Some(value) = object.get(field) {
+                    let encoded = serde_json::to_vec(value)
+                        .context("ChatGPT response metadata was invalid")?;
+                    if encoded.len() > MAX_SSE_EVENT_BYTES {
+                        bail!("ChatGPT response metadata exceeded the size limit");
+                    }
+                }
+            }
+            observe_event_headers(object, expected_model, accumulator)?;
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
@@ -1285,6 +1351,33 @@ fn observe_response_model(
                 };
                 accumulator.observe_model(model, expected_model)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn observe_event_headers(
+    event: &Map<String, Value>,
+    expected_model: &str,
+    accumulator: &mut StreamAccumulator,
+) -> Result<()> {
+    let Some(headers) = event.get("headers") else {
+        return Ok(());
+    };
+    let headers = headers
+        .as_object()
+        .context("ChatGPT response model headers were invalid")?;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
+        {
+            let model = match value {
+                Value::String(model) => model.as_str(),
+                Value::Array(values) if values.len() == 1 => values[0]
+                    .as_str()
+                    .context("ChatGPT response model header was invalid")?,
+                _ => bail!("ChatGPT response model header was invalid"),
+            };
+            accumulator.observe_model(model, expected_model)?;
         }
     }
     Ok(())
@@ -1955,6 +2048,7 @@ mod tests {
             concat!(
                 "event: response.created\ndata: {}\n\n",
                 "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
                 "event: response.output_item.done\ndata: {}\n\n",
                 "event: response.output_item.done\ndata: {}\n\n",
                 "event: response.completed\ndata: {}\n\n",
@@ -1962,9 +2056,10 @@ mod tests {
             ),
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
-            json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
-            json!({"type":"response.output_item.done","sequence_number":4,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
-            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_item.done","sequence_number":5,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
+            json!({"type":"response.completed","sequence_number":6,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
         )
     }
 
@@ -2230,6 +2325,58 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn pinned_metadata_events_preserve_top_level_actual_model_and_reject_drift() {
+        for kind in ["response.metadata", "codex.response.metadata"] {
+            let mut accumulator = StreamAccumulator::default();
+            let event = json!({
+                "type":kind,
+                "sequence_number":1,
+                "response_id":"resp-1",
+                "headers":{"OpenAI-Model":DEFAULT_MODEL},
+                "metadata":{}
+            });
+            assert!(parse_event(
+                event,
+                DEFAULT_MODEL,
+                None,
+                &HashSet::new(),
+                &mut accumulator,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(accumulator.actual_model.as_deref(), Some(DEFAULT_MODEL));
+        }
+
+        let mut accumulator = StreamAccumulator::default();
+        let drift = json!({
+            "type":"response.metadata",
+            "sequence_number":1,
+            "headers":{"openai-model":"gpt-4o"}
+        });
+        let error = parse_event(
+            drift,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("incompatible actual model"));
+    }
+
+    #[test]
+    fn production_refresh_lock_is_shared_by_named_credential_and_account() {
+        let first = shared_refresh_lock("credential-a", "account-a");
+        let second = shared_refresh_lock("credential-a", "account-a");
+        let other_account = shared_refresh_lock("credential-a", "account-b");
+        let other_credential = shared_refresh_lock("credential-b", "account-a");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other_account));
+        assert!(!Arc::ptr_eq(&first, &other_credential));
+    }
+
     #[tokio::test]
     async fn validated_dispatch_uses_exact_account_routes_and_preserves_terminal_metadata() {
         let mut server = mockito::Server::new_async().await;
@@ -2335,8 +2482,10 @@ mod tests {
         let mut streamed_blocks = Vec::new();
         let mut streamed_model = None;
         let mut streamed_usage = None;
+        let mut streamed_text = String::new();
         while let Some(chunk) = receiver.recv().await {
             match chunk.unwrap() {
+                StreamChunk::TextDelta(delta) => streamed_text.push_str(&delta),
                 StreamChunk::ContentBlockComplete(block) => streamed_blocks.push(block),
                 StreamChunk::ResponseMetadata { model } => streamed_model = Some(model),
                 StreamChunk::Usage {
@@ -2352,6 +2501,7 @@ mod tests {
         );
         assert_eq!(streamed_model.as_deref(), Some(nonstream.model.as_str()));
         assert_eq!(streamed_usage, Some((12, 7)));
+        assert_eq!(streamed_text, "hello");
         models.assert_async().await;
         inference.assert_async().await;
     }

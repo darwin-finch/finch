@@ -1265,6 +1265,8 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
                 },
             })
         }

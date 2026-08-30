@@ -94,6 +94,8 @@ impl Generator for DaemonLocalGenerator {
                 input_tokens: Some(response.usage.prompt_tokens),
                 output_tokens: Some(response.usage.completion_tokens),
                 latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
             },
         })
     }

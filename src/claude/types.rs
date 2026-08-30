@@ -287,6 +287,14 @@ pub struct MessageResponse {
     pub content: Vec<ContentBlock>,
     pub model: String,
     pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
+    #[serde(default)]
+    pub primary_allowance_used_percent: Option<f32>,
+    #[serde(default)]
+    pub secondary_allowance_used_percent: Option<f32>,
 }
 
 impl MessageResponse {

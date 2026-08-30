@@ -180,10 +180,11 @@ pub(super) fn encode_messages(
                     result.set_content(content);
                     result.set_is_error(is_error.unwrap_or(false));
                 }
-                crate::claude::ContentBlock::Image { .. } => {
-                    // The current IPC schema has no image arm. Preserve the
-                    // historical behavior rather than inventing a text form.
-                    encoded_block.set_text("");
+                crate::claude::ContentBlock::Image { source } => {
+                    let mut image = encoded_block.init_image();
+                    image.set_source_type(&source.source_type);
+                    image.set_media_type(&source.media_type);
+                    image.set_data(&source.data);
                 }
                 crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
                     encoded_block.set_thinking(encrypted_content);
@@ -226,6 +227,16 @@ pub(super) fn decode_messages(
                 Which::Thinking(value) => {
                     content.push(crate::claude::ContentBlock::OpaqueReasoning {
                         encrypted_content: text(value?)?,
+                    });
+                }
+                Which::Image(value) => {
+                    let value = value?;
+                    content.push(crate::claude::ContentBlock::Image {
+                        source: crate::claude::types::ImageSource {
+                            source_type: text(value.get_source_type()?)?,
+                            media_type: text(value.get_media_type()?)?,
+                            data: text(value.get_data()?)?,
+                        },
                     });
                 }
             }
@@ -1900,6 +1911,7 @@ mod tests {
                 crate::claude::ContentBlock::OpaqueReasoning {
                     encrypted_content: "opaque-continuation".into(),
                 },
+                crate::claude::ContentBlock::image("image/png", "aW1hZ2U="),
             ],
         }];
         let mut message = capnp::message::Builder::new_default();
@@ -1946,6 +1958,13 @@ mod tests {
             &decoded[0].content[3],
             crate::claude::ContentBlock::OpaqueReasoning { encrypted_content }
                 if encrypted_content == "opaque-continuation"
+        ));
+        assert!(matches!(
+            &decoded[0].content[4],
+            crate::claude::ContentBlock::Image { source }
+                if source.source_type == "base64"
+                    && source.media_type == "image/png"
+                    && source.data == "aW1hZ2U="
         ));
     }
 

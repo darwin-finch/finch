@@ -16,7 +16,14 @@ struct ContentBlock {
     toolUse   @1 :ToolUseBlock;
     toolResult @2 :ToolResultBlock;
     thinking  @3 :Text;
+    image     @4 :ImageBlock;
   }
+}
+
+struct ImageBlock {
+  sourceType @0 :Text;
+  mediaType  @1 :Text;
+  data       @2 :Text;
 }
 
 struct ToolUseBlock {
@@ -74,6 +81,7 @@ struct StreamChunk {
     error           @4 :Text;
     responseMetadata @5 :StreamResponseMetadata;
     allowanceUpdate  @6 :AllowanceUpdate;
+    contentBlockComplete @7 :ContentBlock;
   }
 }
 

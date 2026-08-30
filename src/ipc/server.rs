@@ -1758,18 +1758,41 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         r.send().promise.await?;
                     }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {
-                        if let crate::claude::ContentBlock::ToolUse { id, name, input } = block {
-                            let mut r = receiver.on_chunk_request();
-                            let mut tu = r.get().init_chunk().init_tool_use_complete();
-                            tu.set_id(id.as_str());
-                            tu.set_name(name.as_str());
-                            super::brain_codec::encode_json_value(
-                                tu.reborrow().init_input(),
-                                &input,
-                            )
-                            .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                            r.send().promise.await?;
+                        let mut r = receiver.on_chunk_request();
+                        let mut encoded = r.get().init_chunk().init_content_block_complete();
+                        match block {
+                            crate::claude::ContentBlock::Text { text } => encoded.set_text(&text),
+                            crate::claude::ContentBlock::Image { source } => {
+                                let mut image = encoded.init_image();
+                                image.set_source_type(&source.source_type);
+                                image.set_media_type(&source.media_type);
+                                image.set_data(&source.data);
+                            }
+                            crate::claude::ContentBlock::ToolUse { id, name, input } => {
+                                let mut tool = encoded.init_tool_use();
+                                tool.set_id(&id);
+                                tool.set_name(&name);
+                                super::brain_codec::encode_json_value(
+                                    tool.reborrow().init_input(),
+                                    &input,
+                                )
+                                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                            }
+                            crate::claude::ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                let mut result = encoded.init_tool_result();
+                                result.set_tool_use_id(&tool_use_id);
+                                result.set_content(&content);
+                                result.set_is_error(is_error.unwrap_or(false));
+                            }
+                            crate::claude::ContentBlock::OpaqueReasoning { encrypted_content } => {
+                                encoded.set_thinking(&encrypted_content);
+                            }
                         }
+                        r.send().promise.await?;
                     }
                     Err(e) => {
                         let mut r = receiver.on_chunk_request();
@@ -2825,6 +2848,8 @@ mod tests {
                     input_tokens: None,
                     output_tokens: None,
                     latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
                 },
             })
         }

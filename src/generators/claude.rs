@@ -167,9 +167,11 @@ impl ClaudeGenerator {
                 model: response.model,
                 confidence: None,
                 stop_reason: response.stop_reason,
-                input_tokens: None,
-                output_tokens: None,
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
                 latency_ms: None,
+                primary_allowance_used_percent: response.primary_allowance_used_percent,
+                secondary_allowance_used_percent: response.secondary_allowance_used_percent,
             },
         }
     }

@@ -136,6 +136,8 @@ pub struct ResponseMetadata {
     pub input_tokens: Option<u32>,   // Input token count (if available)
     pub output_tokens: Option<u32>,  // Output token count (if available)
     pub latency_ms: Option<u64>,     // Response latency in milliseconds
+    pub primary_allowance_used_percent: Option<f32>,
+    pub secondary_allowance_used_percent: Option<f32>,
 }
 
 /// Streaming chunk (text delta or complete block)
@@ -271,6 +273,8 @@ mod tests {
             input_tokens: Some(150),
             output_tokens: Some(400),
             latency_ms: Some(1200),
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
         };
         assert_eq!(meta.generator, "claude");
         assert_eq!(meta.input_tokens, Some(150));
@@ -288,6 +292,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             latency_ms: Some(45),
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
         };
         assert_eq!(meta.confidence, Some(0.87));
         assert!(meta.stop_reason.is_none());
@@ -383,6 +389,8 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 latency_ms: Some(500),
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
             },
         };
         assert_eq!(response.text, "The answer is 42");

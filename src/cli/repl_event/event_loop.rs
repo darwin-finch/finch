@@ -4500,7 +4500,14 @@ Rules:\n\
                 input_tokens,
                 output_tokens,
                 latency_ms,
+                primary_allowance_used_percent,
+                secondary_allowance_used_percent,
             } => {
+                tracing::debug!(
+                    primary_allowance_used_percent,
+                    secondary_allowance_used_percent,
+                    "Provider subscription allowance snapshot"
+                );
                 // Record LLM invocation in execution graph
                 self.current_graph
                     .lock()

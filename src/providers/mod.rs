@@ -250,6 +250,16 @@ impl From<ProviderResponse> for crate::claude::types::MessageResponse {
             content: response.content,
             model: response.model,
             stop_reason: response.stop_reason,
+            input_tokens: response.usage.as_ref().map(|usage| usage.input_tokens),
+            output_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            primary_allowance_used_percent: response
+                .allowance
+                .as_ref()
+                .and_then(|allowance| allowance.primary_used_percent),
+            secondary_allowance_used_percent: response
+                .allowance
+                .as_ref()
+                .and_then(|allowance| allowance.secondary_used_percent),
         }
     }
 }
