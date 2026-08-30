@@ -561,6 +561,32 @@ pub async fn handle_chat_completions(
         .as_ref()
         .map(|tools| convert_tools_to_internal(tools));
 
+    let native_local_failure = {
+        let state = server.generator_state().read().await;
+        matches!(&*state, crate::models::GeneratorState::FailedNoCloudFallback { .. })
+    };
+    if native_local_failure {
+        info!(
+            provider = %provider_name,
+            "Local native provider is blocked; honoring the explicitly selected cloud profile"
+        );
+        let content = match forward_to_cloud(
+            &server,
+            Some(&provider_name),
+            internal_messages,
+            internal_tools,
+        )
+        .await
+        {
+            Ok(content) => content,
+            Err(error) => return error_response(&error.to_string(), "api_error"),
+        };
+        return match convert_response_to_openai(content, &request.model, &request.messages) {
+            Ok(response) => Json(response).into_response(),
+            Err(response) => response,
+        };
+    }
+
     // Extract user query for routing
     let user_query = request
         .messages
@@ -718,6 +744,17 @@ async fn handle_local_only_query(
                 Json(ErrorResponse::new(
                     format!("Local model failed: {}", error),
                     "model_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+        GeneratorState::FailedNoCloudFallback { ref error } => {
+            warn!("Local provider failed without cloud fallback: {}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Local provider failed and cloud fallback is disabled: {error}"),
+                    "local_provider_failed".to_string(),
                 )),
             )
                 .into_response());

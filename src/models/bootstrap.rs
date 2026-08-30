@@ -36,6 +36,9 @@ pub enum GeneratorState {
     /// Failed to load (with error message)
     Failed { error: String },
 
+    /// Native local-provider policy failed and must not trigger cloud inference.
+    FailedNoCloudFallback { error: String },
+
     /// Offline mode (no network, no cached model)
     NotAvailable,
 }
@@ -75,6 +78,9 @@ impl GeneratorState {
             }
             GeneratorState::Failed { error } => {
                 format!("✗ Failed: {}", error)
+            }
+            GeneratorState::FailedNoCloudFallback { error } => {
+                format!("✗ Local provider blocked: {}", error)
             }
             GeneratorState::NotAvailable => "⚠ Offline mode - forwarding to Claude".to_string(),
         }

@@ -493,6 +493,12 @@ fn write_coreml_manifest(
 
 #[cfg(target_os = "macos")]
 fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
+    if config.repo_id == QWEN_2_5_1_5B_ONNX_REPOSITORY
+        && config.execution_providers.is_none()
+    {
+        return false;
+    }
+
     config
         .execution_providers
         .as_ref()
@@ -504,6 +510,25 @@ fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
 #[cfg(target_os = "macos")]
 const QWEN_2_5_1_5B_ONNX_REPOSITORY: &str = "onnx-community/Qwen2.5-1.5B-Instruct";
 
+/// A native ONNX execution-provider combination Finch must reject before
+/// entering the in-process session boundary.
+#[derive(Debug)]
+pub struct UnsafeNativeProviderError {
+    model_repository: String,
+}
+
+impl std::fmt::Display for UnsafeNativeProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "CoreML session creation is disabled for {} with ONNX Runtime 1.23.2 because it can terminate Finch with SIGSEGV; select the explicit CPU execution target until the native provider is verified safe",
+            self.model_repository
+        )
+    }
+}
+
+impl std::error::Error for UnsafeNativeProviderError {}
+
 #[cfg(target_os = "macos")]
 fn qwen_coreml_session_policy(config: &OnnxLoadConfig) -> Result<bool> {
     if config.repo_id != QWEN_2_5_1_5B_ONNX_REPOSITORY {
@@ -512,10 +537,12 @@ fn qwen_coreml_session_policy(config: &OnnxLoadConfig) -> Result<bool> {
 
     match config.execution_providers.as_deref() {
         None => Ok(true),
-        Some(providers) if providers.contains(&ConfigExecutionProvider::CoreML) => bail!(
-            "CoreML session creation is disabled for {} with ONNX Runtime 1.23.2 because it can terminate Finch with SIGSEGV; select the explicit CPU execution target until the native provider is verified safe",
-            config.repo_id
-        ),
+        Some(providers) if providers.contains(&ConfigExecutionProvider::CoreML) => {
+            Err(UnsafeNativeProviderError {
+                model_repository: config.repo_id.clone(),
+            }
+            .into())
+        }
         Some(_) => Ok(false),
     }
 }
@@ -1449,6 +1476,7 @@ mod tests {
         let config = OnnxLoadConfig::with_size(ModelSize::Medium, directory.path().into());
 
         assert!(qwen_coreml_session_policy(&config).unwrap());
+        assert!(!coreml_provider_requested(&config));
     }
 
     #[cfg(target_os = "macos")]

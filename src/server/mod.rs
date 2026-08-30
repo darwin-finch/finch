@@ -491,7 +491,9 @@ impl AgentServer {
                     }
                 } else if matches!(
                     *state,
-                    GeneratorState::Failed { .. } | GeneratorState::NotAvailable
+                    GeneratorState::Failed { .. }
+                        | GeneratorState::FailedNoCloudFallback { .. }
+                        | GeneratorState::NotAvailable
                 ) {
                     tracing::warn!("Model loading failed or not available, stopping monitor");
                     break; // Stop monitoring on failure
@@ -1207,6 +1209,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_router_refuses_fallback_but_keeps_selected_cloud_and_health() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let state = tempfile::tempdir().unwrap();
+        let credentials = crate::brain::credential::BrainCredentialAuthority::load_or_create(
+            &state.path().join("credentials"),
+        )
+        .unwrap();
+        let mut server =
+            AgentServer::for_brain_http_test("test.local", state.path(), credentials).unwrap();
+        let cloud_calls = Arc::new(AtomicUsize::new(0));
+        server.providers = vec![ProviderSlot {
+            profile_name: "configured-cloud".to_string(),
+            provider: Arc::new(CountingProvider(Arc::clone(&cloud_calls))),
+        }];
+        *server.generator_state.write().await = GeneratorState::FailedNoCloudFallback {
+            error: "unsafe native provider boundary".to_string(),
+        };
+        let server = Arc::new(server);
+
+        let response = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "configured-cloud",
+                            "messages": [{"role": "user", "content": "stay local"}],
+                            "stream": false,
+                            "local_only": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "local_provider_failed");
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 0);
+
+        let explicit_cloud = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "configured-cloud",
+                            "messages": [{"role": "user", "content": "use selected cloud"}],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit_cloud.status(), axum::http::StatusCode::OK);
+        assert_eq!(cloud_calls.load(Ordering::SeqCst), 1);
+
+        let health = isolated_http_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn production_router_rejects_malformed_and_oversized_messages() {
         use tower::ServiceExt as _;
         let (_state, server) = isolated_http_server();
@@ -1681,6 +1763,46 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     struct NamedProvider(String);
+
+    struct CountingProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ProviderBackend for CountingProvider {
+        fn name(&self) -> &str {
+            "configured-cloud"
+        }
+
+        fn default_model(&self) -> &str {
+            "never-called"
+        }
+
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> anyhow::Result<ProviderResponse> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ProviderResponse {
+                id: "configured-cloud-response".to_string(),
+                model: "never-called".to_string(),
+                content: vec![crate::claude::ContentBlock::Text {
+                    text: "explicit cloud response".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                role: "assistant".to_string(),
+                provider: "configured-cloud".to_string(),
+                usage: None,
+                allowance: None,
+            })
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> anyhow::Result<Receiver<anyhow::Result<StreamChunk>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("cloud provider must not stream after native provider failure")
+        }
+    }
 
     #[async_trait]
     impl ProviderBackend for NamedProvider {

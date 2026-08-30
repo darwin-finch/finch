@@ -3791,6 +3791,16 @@ async fn handle_message(
 
                     (text, "failed_fallback".to_string())
                 }
+                GeneratorState::FailedNoCloudFallback { error } => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %error,
+                        "Local provider failed at an unsafe native boundary; refusing cloud fallback"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Local provider failed and cloud fallback is disabled: {error}"
+                    ));
+                }
                 GeneratorState::NotAvailable => {
                     tracing::info!(
                         request_id = %request_id,
@@ -3896,6 +3906,9 @@ async fn get_status(
             model_size: model_name.clone(),
         },
         GeneratorState::Failed { error } => GeneratorStatus::Failed {
+            error: error.clone(),
+        },
+        GeneratorState::FailedNoCloudFallback { error } => GeneratorStatus::Failed {
             error: error.clone(),
         },
         GeneratorState::NotAvailable => GeneratorStatus::NotAvailable,

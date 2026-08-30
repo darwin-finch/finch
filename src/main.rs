@@ -1692,10 +1692,22 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);
-                output_status!("   Will forward all queries to teacher APIs");
+                let no_cloud_fallback = e
+                    .downcast_ref::<finch::models::loaders::onnx::UnsafeNativeProviderError>()
+                    .is_some();
+                if no_cloud_fallback {
+                    output_status!(
+                        "   Local requests will fail explicitly; configured cloud profiles remain available when selected"
+                    );
+                } else {
+                    output_status!("   Will forward eligible queries to teacher APIs");
+                }
                 let mut state = state_clone.write().await;
-                *state = GeneratorState::Failed {
-                    error: format!("{}", e),
+                let error = format!("{e:#}");
+                *state = if no_cloud_fallback {
+                    GeneratorState::FailedNoCloudFallback { error }
+                } else {
+                    GeneratorState::Failed { error }
                 };
             }
         });
@@ -1730,7 +1742,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 break; // Stop monitoring once injected
             } else if matches!(
                 *state,
-                GeneratorState::Failed { .. } | GeneratorState::NotAvailable
+                GeneratorState::Failed { .. }
+                    | GeneratorState::FailedNoCloudFallback { .. }
+                    | GeneratorState::NotAvailable
             ) {
                 break; // Stop monitoring on failure
             }
