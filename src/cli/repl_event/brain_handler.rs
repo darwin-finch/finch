@@ -1452,6 +1452,7 @@ mod brain_handler_tests {
             tasks: Vec::new(),
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
+            effect_audits: Vec::new(),
         }
     }
 

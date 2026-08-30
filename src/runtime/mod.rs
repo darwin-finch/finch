@@ -446,6 +446,7 @@ struct PendingTypedExecution {
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     deferred_host_effects: DeferredHostEffects,
     /// An execution-specific authority ceiling, used by durable scheduled
     /// callbacks. Ordinary interactive runs intentionally pick up newly
@@ -2306,6 +2307,7 @@ impl ProgramRuntime {
                     output_chunks: output_chunks.clone(),
                     side_effects: side_effects.clone(),
                     effect_sink: pending.effect_sink.clone(),
+                    effect_audit: pending.effect_audit.clone(),
                     deferred_host_effects: pending.deferred_host_effects,
                     grant_ceiling: pending.grant_ceiling.clone(),
                 },
@@ -2759,6 +2761,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             None,
+            None,
         )
         .await
     }
@@ -2777,6 +2780,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             Some(grant_ceiling),
+            None,
         )
         .await
     }
@@ -2790,6 +2794,7 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
         grant_ceiling: Option<EffectSet>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
             submission,
@@ -2797,6 +2802,7 @@ impl ProgramRuntime {
             Some(effect_sink),
             DeferredHostEffects::Schedules,
             grant_ceiling,
+            effect_audit,
         )
         .await
     }
@@ -2815,6 +2821,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             None,
+            None,
         )
         .await
     }
@@ -2832,6 +2839,7 @@ impl ProgramRuntime {
             caller,
             Some(effect_sink),
             DeferredHostEffects::None,
+            None,
             None,
         )
         .await
@@ -2865,6 +2873,34 @@ impl ProgramRuntime {
             Some(effect_sink),
             DeferredHostEffects::ProgramInvocations,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Provider-native `submit_program` entry point. A named-Brain turn must
+    /// carry its daemon-issued audit capability through every tool round; the
+    /// tool cannot reconstruct that authority from Brain/run provenance.
+    pub(crate) async fn submit_tool_program(
+        &self,
+        submission: ProgramSubmission,
+        caller: Option<scheduler::AgentIdentity>,
+        effect_sink: Option<TypedEffectSink>,
+        defer_program_effects: bool,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    ) -> Result<ExecutionOutcome> {
+        let deferred_host_effects = if defer_program_effects && caller.is_none() {
+            DeferredHostEffects::ProgramInvocations
+        } else {
+            DeferredHostEffects::None
+        };
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            caller,
+            effect_sink,
+            deferred_host_effects,
+            None,
+            effect_audit,
         )
         .await
     }
@@ -2884,6 +2920,7 @@ impl ProgramRuntime {
             None,
             Some(effect_sink),
             DeferredHostEffects::AllAwaited,
+            None,
             None,
         )
         .await
@@ -2916,6 +2953,7 @@ impl ProgramRuntime {
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         grant_ceiling: Option<EffectSet>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
@@ -2978,6 +3016,7 @@ impl ProgramRuntime {
                 caller.clone(),
                 effect_sink.clone(),
                 deferred_host_effects,
+                effect_audit.clone(),
             )
             .await?;
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -3000,6 +3039,7 @@ impl ProgramRuntime {
                     side_effects: execution.side_effects.clone(),
                     effect_sink,
                     deferred_host_effects,
+                    effect_audit,
                     grant_ceiling: grant_ceiling.clone(),
                 },
             )? {
@@ -3155,6 +3195,7 @@ impl ProgramRuntime {
         caller: Option<scheduler::AgentIdentity>,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let resource_roots = Arc::clone(&self.resource_roots);
@@ -3234,6 +3275,7 @@ impl ProgramRuntime {
                 grants,
                 typed_effect_sink,
                 deferred_host_effects,
+                effect_audit,
             );
             let execution = runtime.execute_with_handler(
                 language,
@@ -3285,6 +3327,7 @@ impl ProgramRuntime {
         let streams = Arc::clone(&self.streams);
         let typed_effect_sink = pending.effect_sink.clone();
         let deferred_host_effects = pending.deferred_host_effects;
+        let effect_audit = pending.effect_audit.clone();
         let scheduler = self
             .agent_scheduler
             .read()
@@ -3332,6 +3375,7 @@ impl ProgramRuntime {
                 grants,
                 typed_effect_sink,
                 deferred_host_effects,
+                effect_audit,
             );
             let execution = match external_effect_result {
                 Some((effect_sequence, values)) => runtime.resume_with_effect_result(
@@ -3372,6 +3416,7 @@ struct TypedHostHandler {
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
     deferred_host_effects: DeferredHostEffects,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     authorization_attempt: Option<HostAuthorizationAttempt>,
 }
 
@@ -3410,6 +3455,7 @@ impl TypedHostHandler {
         network_grants: EffectSet,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) -> Self {
         Self {
             automation,
@@ -3431,6 +3477,7 @@ impl TypedHostHandler {
             network_grants,
             typed_effect_sink,
             deferred_host_effects,
+            effect_audit,
             authorization_attempt: None,
         }
     }
@@ -4242,22 +4289,65 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         &mut self,
         effect: &VmSideEffect,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
-        let values = match &effect.event {
-            crate::vm::interpreter::HostSideEffect::Request { arguments } => self
-                .request_with_authority_lease(
-                    &effect.requirement,
-                    arguments.clone(),
-                    &effect.origin,
-                )?,
-            _ => {
-                return Err(VmDiagnostic::error(
-                    "E-HOST-002",
-                    crate::vm::DiagnosticPhase::HostCall,
-                    "VM await boundary did not carry a host request",
-                    Some(effect.origin.clone()),
-                ));
-            }
+        let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+            return Err(VmDiagnostic::error(
+                "E-HOST-002",
+                crate::vm::DiagnosticPhase::HostCall,
+                "VM await boundary did not carry a host request",
+                Some(effect.origin.clone()),
+            ));
         };
+
+        // Named-Brain execution receives a daemon-owned audit proxy. Reserve
+        // the immutable intent, then fsync AwaitingHostResult immediately
+        // before the first host binding can perform a physical operation.
+        let permit = if let Some(control) = self.effect_audit.clone() {
+            let runtime = tokio::runtime::Handle::current();
+            let reservation = runtime
+                .block_on(control.reserve(self.execution_id, effect.clone()))
+                .map_err(|error| {
+                    host_binding_error(
+                        &effect.origin,
+                        format!("durable effect audit reservation failed: {error}"),
+                    )
+                })?;
+            Some(runtime.block_on(reservation.begin()).map_err(|error| {
+                host_binding_error(
+                    &effect.origin,
+                    format!("durable effect audit begin failed: {error}"),
+                )
+            })?)
+        } else {
+            None
+        };
+
+        let values = self.request_with_authority_lease(
+            &effect.requirement,
+            arguments.clone(),
+            &effect.origin,
+        );
+
+        if let Some(permit) = permit {
+            let outcome = match &values {
+                Ok(values) => crate::server::RunnerHostEffectOutcome::Acknowledged {
+                    values: values.clone(),
+                },
+                Err(_) => crate::server::RunnerHostEffectOutcome::FailedPartial {
+                    detail: "host binding failed after physical dispatch was authorized"
+                        .to_string(),
+                },
+            };
+            tokio::runtime::Handle::current()
+                .block_on(permit.finish(outcome))
+                .map_err(|error| {
+                    host_binding_error(
+                        &effect.origin,
+                        format!("durable effect audit finish failed: {error}"),
+                    )
+                })?;
+        }
+
+        let values = values?;
 
         // `output-open` awaits a host-issued opaque handle. Project its
         // corresponding Create event immediately, but retain the original
@@ -7866,6 +7956,7 @@ mod tests {
             TypedRuntime::intrinsic_grants(),
             None,
             DeferredHostEffects::None,
+            None,
         )
     }
 
@@ -9562,6 +9653,7 @@ mod tests {
                     ExecutionEffect::Unclassified,
                 ),
                 sink,
+                None,
                 None,
             )
             .await

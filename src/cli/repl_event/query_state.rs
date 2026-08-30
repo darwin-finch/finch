@@ -58,6 +58,10 @@ pub struct QueryMetadata {
     /// Present only when a named-Brain run caused this provider query.
     pub brain_turn_provenance: Option<BrainTurnProvenance>,
 
+    /// Opaque daemon-owned authority for physical effects performed by tools
+    /// in this named-Brain turn. This is never reconstructed from provenance.
+    pub effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+
     /// Cancellation token for this query
     pub cancellation_token: CancellationToken,
 
@@ -95,6 +99,7 @@ impl QueryStateManager {
             state: QueryState::Processing,
             conversation_snapshot,
             brain_turn_provenance: None,
+            effect_audit: None,
             cancellation_token: CancellationToken::new(),
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
@@ -113,6 +118,17 @@ impl QueryStateManager {
     ) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.brain_turn_provenance = Some(provenance);
+        }
+    }
+
+    /// Bind the daemon-issued effect capability before provider/tool dispatch.
+    pub async fn bind_effect_audit(
+        &self,
+        query_id: Uuid,
+        effect_audit: crate::server::RunnerEffectAuditControl,
+    ) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.effect_audit = Some(effect_audit);
         }
     }
 
@@ -455,6 +471,23 @@ mod tests {
         let metadata = manager.get_metadata(id).await.unwrap();
         assert_eq!(metadata.id, id);
         assert!(matches!(metadata.state, QueryState::Processing));
+    }
+
+    #[tokio::test]
+    async fn test_named_brain_effect_audit_binding_survives_query_metadata_round_trip() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let (audit_tx, _audit_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        manager
+            .bind_effect_audit(id, crate::server::RunnerEffectAuditControl::new(audit_tx))
+            .await;
+
+        assert!(manager
+            .get_metadata(id)
+            .await
+            .and_then(|metadata| metadata.effect_audit)
+            .is_some());
     }
 
     #[tokio::test]

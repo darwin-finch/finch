@@ -941,12 +941,38 @@ interface BrainProgramControl {
   inspectSchedule @1 (scheduleId :Text) ->
                      (found :Bool, schedule :BrainSchedule);
   cancelSchedule @2 (scheduleId :Text) -> (cancelled :Bool);
+  reserveEffect @3 (executionId :Text, effect :VmSideEffect)
+      -> (reservation :BrainEffectReservation);
 }
 
 # Per-turn reverse capability. The runner publishes an addressed approval and
 # suspends until the daemon returns the decision submitted by that attachment.
 interface BrainTurnControl {
   requestApproval @0 (event :BrainTurnEvent) -> (decision :JsonValue);
+  reserveEffect @1 (executionId :Text, effect :VmSideEffect)
+      -> (reservation :BrainEffectReservation);
+}
+
+# The reservation capability captures the daemon-minted run/lease authority
+# and canonical identity. Neither provenance nor a bearer secret crosses the
+# wire. `begin` returns only after the AwaitingHostResult record is fsynced.
+interface BrainEffectReservation {
+  begin @0 () -> (permit :BrainHostEffectPermit);
+  notApplied @1 (reason :Text) -> ();
+}
+
+# Possession proves durable begin. It can record one exact monotonic outcome
+# even if the parent turn has already been cancelled or disconnected.
+interface BrainHostEffectPermit {
+  finish @0 (outcome :BrainHostEffectOutcome) -> ();
+}
+
+struct BrainHostEffectOutcome {
+  union {
+    acknowledged @0 :List(TypedValue);
+    notApplied   @1 :Text;
+    failedPartial @2 :Text;
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1078,13 @@ struct BrainEffectRecorded {
   executionId @1 :Text;
   effect @2 :VmSideEffect;
   state @3 :VmEffectJournalState;
+}
+
+# Canonical schema-v15 audit transition. The daemon validates the complete
+# typed transition before append; event-stream clients receive the exact JSON
+# representation for forward-compatible inspection without gaining authority.
+struct BrainEffectAuditTransition {
+  json @0 :Text;
 }
 
 struct BrainClientAttached {
@@ -1206,6 +1239,7 @@ struct BrainEvent {
     taskListReplaced       @28 :BrainTaskList;
     speculativePrompt      @29 :Text;
     mutationRecorded       @34 :BrainMutationOutcome;
+    effectAuditTransition  @35 :BrainEffectAuditTransition;
   }
   hasMutation @32 :Bool;
   mutation    @33 :BrainMutationReceipt;
@@ -1259,6 +1293,7 @@ struct BrainSnapshot {
   schedules        @12 :List(BrainSchedule);
   pendingScheduleDues @13 :List(BrainScheduleDue);
   tasks           @14 :List(BrainTask);
+  effectAudits    @15 :List(Text);
 }
 
 struct BrainWireMessage {

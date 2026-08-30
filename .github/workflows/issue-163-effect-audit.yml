@@ -1,0 +1,64 @@
+name: Issue 163 durable effect audit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/issue-163-effect-audit.yml"
+      - "schema/finch_ipc.capnp"
+      - "src/brain/effect_audit_archive.rs"
+      - "src/brain/mod.rs"
+      - "src/brain/remote.rs"
+      - "src/brain/store.rs"
+      - "src/cli/repl_event/**"
+      - "src/ipc/**"
+      - "src/runtime/effect_log.rs"
+      - "src/runtime/mod.rs"
+      - "src/server/brain_runner.rs"
+      - "src/server/brain_service.rs"
+      - "src/server/handlers.rs"
+      - "src/server/mod.rs"
+      - "src/tools/executor.rs"
+      - "src/tools/types.rs"
+      - "src/tools/implementations/program.rs"
+  pull_request:
+    paths:
+      - ".github/workflows/issue-163-effect-audit.yml"
+      - "schema/finch_ipc.capnp"
+      - "src/brain/effect_audit_archive.rs"
+      - "src/brain/mod.rs"
+      - "src/brain/remote.rs"
+      - "src/brain/store.rs"
+      - "src/cli/repl_event/**"
+      - "src/ipc/**"
+      - "src/runtime/effect_log.rs"
+      - "src/runtime/mod.rs"
+      - "src/server/brain_runner.rs"
+      - "src/server/brain_service.rs"
+      - "src/server/handlers.rs"
+      - "src/server/mod.rs"
+      - "src/tools/executor.rs"
+      - "src/tools/types.rs"
+      - "src/tools/implementations/program.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  effect-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Test durable reducer and log recovery
+        run: cargo test --lib runtime::effect_log::tests -- --nocapture
+      - name: Test named-Brain and Cap'n Proto audit boundary
+        run: cargo test --lib effect_audit -- --nocapture

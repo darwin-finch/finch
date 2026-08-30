@@ -104,6 +104,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
 
@@ -130,6 +131,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
 

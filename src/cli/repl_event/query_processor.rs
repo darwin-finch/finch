@@ -72,8 +72,13 @@ async fn execute_direct_wire_response(
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     source: String,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "VM program cancelled before audited submission"
+    );
     let projection = VmOutputProjection::new(output_manager, work_unit);
     let effect_event_tx = event_tx.clone();
     let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
@@ -86,7 +91,7 @@ async fn execute_direct_wire_response(
         });
     });
     let outcome = runtime
-        .submit_with_deferred_program_effects(submission, sink)
+        .submit_tool_program(submission, None, Some(sink), true, effect_audit)
         .await?;
     let execution_id = outcome.execution_id;
     let mut resumed = Box::pin(resume_interactive_boundaries(runtime, event_tx, outcome));
@@ -295,6 +300,7 @@ async fn execute_wire_with_single_repair(
     messages: &[crate::claude::Message],
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -318,6 +324,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel.clone(),
         source.clone(),
+        effect_audit.clone(),
     )
     .await;
 
@@ -374,6 +381,17 @@ async fn execute_wire_with_single_repair(
             output_unit,
         };
     }
+    if cancel.is_cancelled() {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+            effect_journal,
+            output_unit,
+        };
+    }
     metric.repair_attempted = true;
 
     // Keep the rejected result visibly live while the bounded corrective
@@ -384,8 +402,34 @@ async fn execute_wire_with_single_repair(
         "requesting one corrected ProgramSubmission from the provider…".to_string(),
     ));
     let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
-    let repair = generator.generate(repair_messages, None).await;
+    let repair = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            output_unit.set_transient_status(None);
+            metric.terminal_failure = true;
+            record_wire_metric(metrics_logger, &metric);
+            output_unit.set_complete();
+            return WireExecution {
+                source_for_history: source,
+                response: diagnostic,
+                effect_journal,
+                output_unit,
+            };
+        }
+        repair = generator.generate(repair_messages, None) => repair,
+    };
     output_unit.set_transient_status(None);
+    if cancel.is_cancelled() {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+            effect_journal,
+            output_unit,
+        };
+    }
     let Ok(repair) = repair else {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
@@ -435,6 +479,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel,
         repaired_source.clone(),
+        effect_audit,
     )
     .await
     {
@@ -691,6 +736,10 @@ pub(super) async fn dispatch_tool_uses(
         query_id,
         tool_uses: tool_uses.clone(),
     });
+    let effect_audit = query_states
+        .get_metadata(query_id)
+        .await
+        .and_then(|metadata| metadata.effect_audit);
     let current_mode = mode.read().await;
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
@@ -808,6 +857,7 @@ pub(super) async fn dispatch_tool_uses(
                 tool_use,
                 Arc::clone(work_unit),
                 row_idx,
+                effect_audit.clone(),
             );
         }
     }
@@ -1161,11 +1211,12 @@ pub(crate) async fn process_query_with_tools(
                 source_unit.set_program_source(wire_language.as_str());
                 source_unit.set_response(wire_source.clone());
                 source_unit.set_complete();
-                let cancel = query_states
-                    .get_metadata(query_id)
-                    .await
-                    .map(|metadata| metadata.cancellation_token)
+                let query_metadata = query_states.get_metadata(query_id).await;
+                let cancel = query_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.cancellation_token.clone())
                     .unwrap_or_default();
+                let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
@@ -1175,6 +1226,7 @@ pub(crate) async fn process_query_with_tools(
                     &messages,
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
+                    effect_audit,
                 )
                 .await;
                 if query_states
@@ -1346,11 +1398,12 @@ pub(crate) async fn process_query_with_tools(
             source_unit.set_program_source(wire_language.as_str());
             source_unit.set_response(wire_source.clone());
             source_unit.set_complete();
-            let cancel = query_states
-                .get_metadata(query_id)
-                .await
-                .map(|metadata| metadata.cancellation_token)
+            let query_metadata = query_states.get_metadata(query_id).await;
+            let cancel = query_metadata
+                .as_ref()
+                .map(|metadata| metadata.cancellation_token.clone())
                 .unwrap_or_default();
+            let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
@@ -1360,6 +1413,7 @@ pub(crate) async fn process_query_with_tools(
                 &messages,
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
+                effect_audit,
             )
             .await;
             if query_states
@@ -1847,6 +1901,11 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct BlockingRepairGenerator {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+    }
+
     #[async_trait::async_trait]
     impl Generator for SingleRepairGenerator {
         async fn generate(
@@ -1899,6 +1958,43 @@ mod tests {
 
         fn name(&self) -> &str {
             "single-repair"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for BlockingRepairGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "blocking-repair"
         }
     }
 
@@ -2010,6 +2106,7 @@ mod tests {
             event_tx.clone(),
             tokio_util::sync::CancellationToken::new(),
             "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2054,20 +2151,24 @@ mod tests {
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
         let work_unit = output.start_work_unit("VM output");
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-
-        let outcome = execute_direct_wire_response(
+        let execution = execute_direct_wire_response(
             &runtime,
             output,
             work_unit,
             event_tx,
-            cancel,
+            cancel.clone(),
             "(begin (say \"before\") (yield) (say \"after\"))".to_string(),
-        )
-        .await
-        .unwrap();
+            None,
+        );
+        let cancel_after_prefix = async {
+            let event = event_rx.recv().await.expect("first effect projection");
+            assert!(matches!(event, ReplEvent::VmEffect { .. }));
+            cancel.cancel();
+        };
+        let (outcome, ()) = tokio::join!(execution, cancel_after_prefix);
+        let outcome = outcome.unwrap();
 
         assert_eq!(
             outcome.status,
@@ -2086,6 +2187,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_brain_direct_wire_effect_audit_precedes_host_dispatch() {
+        let task_output = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::ProgramRuntime::new();
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Write,
+                crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+            ))
+            .unwrap();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (audit_tx, mut audit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let effect_audit = crate::server::RunnerEffectAuditControl::new(audit_tx);
+        let rejection = tokio::spawn(async move {
+            let crate::server::RunnerEffectAuditControlRequest::Reserve { response_tx, .. } =
+                audit_rx.recv().await.expect("audit reservation request");
+            response_tx
+                .send(Err("direct wire audit rejected before host dispatch".into()))
+                .unwrap();
+        });
+        let outcome = execute_direct_wire_response(
+            &runtime,
+            output,
+            work_unit,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "s\" blocked.txt\" task-output-path s\" secret\" bytes task-output-file-write"
+                .to_string(),
+            Some(effect_audit),
+        )
+        .await
+        .unwrap();
+        rejection.await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Failed
+        );
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("direct wire audit rejected")));
+        assert!(!task_output.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
     async fn interactive_wire_approval_resumes_the_exact_saved_program() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -2099,6 +2248,7 @@ mod tests {
             event_tx,
             tokio_util::sync::CancellationToken::new(),
             "(file-read (path \"Cargo.toml\"))".to_string(),
+            None,
         );
         tokio::pin!(execution);
         loop {
@@ -2229,6 +2379,7 @@ mod tests {
             &[crate::claude::Message::user("reply")],
             source.clone(),
             Some(&metrics),
+            None,
         )
         .await;
 
@@ -2270,6 +2421,86 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::config::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    #[tokio::test]
+    async fn named_brain_effect_audit_cancel_before_repair_never_invokes_provider() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            output,
+            event_tx,
+            cancel,
+            generator.clone(),
+            &[crate::claude::Message::user("reply")],
+            source.clone(),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(execution.source_for_history, source);
+        assert!(execution.response.contains("E-WIRE-002"));
+    }
+
+    #[tokio::test]
+    async fn named_brain_effect_audit_cancel_drops_inflight_repair_without_continuation() {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(BlockingRepairGenerator {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = {
+            let runtime = Arc::clone(&runtime);
+            let output = Arc::clone(&output);
+            let generator = Arc::clone(&generator);
+            let cancel = cancel.clone();
+            let source = source.clone();
+            tokio::spawn(async move {
+                execute_wire_with_single_repair(
+                    runtime.as_ref(),
+                    output,
+                    event_tx,
+                    cancel,
+                    generator,
+                    &[crate::claude::Message::user("reply")],
+                    source,
+                    None,
+                    None,
+                )
+                .await
+            })
+        };
+        generator.started.notified().await;
+        cancel.cancel();
+        let execution = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("cancellation must abort repair generation promptly")
+            .unwrap();
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execution.source_for_history, source);
+        assert!(execution.response.contains("E-WIRE-002"));
+        assert!(event_rx.try_recv().is_err(), "no repaired VM continuation");
+        assert!(output.get_messages().iter().all(|message| !message
+            .format(&crate::config::ColorScheme::default())
+            .contains("VM program repair")));
     }
 
     #[test]

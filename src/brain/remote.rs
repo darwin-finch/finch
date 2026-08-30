@@ -4272,7 +4272,8 @@ mod tests {
             BrainEventKind::EffectRecorded { execution_id, .. }
                 if *execution_id == effect_execution_id))
                 .count(),
-            1
+            0,
+            "runner summaries cannot forge schema-15 audit provenance"
         );
         assert_eq!(
             snapshot

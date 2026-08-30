@@ -1110,6 +1110,57 @@ pub struct TuiRenderer {
 // ─── Construction ─────────────────────────────────────────────────────────────
 
 impl TuiRenderer {
+    #[cfg(test)]
+    pub(crate) fn new_headless(
+        output_manager: Arc<OutputManager>,
+        status_bar: Arc<StatusBar>,
+        colors: ColorScheme,
+    ) -> Self {
+        output_manager.disable_stdout();
+        Self {
+            output_manager,
+            status_bar,
+            colors,
+            input_textarea: Self::create_clean_textarea(),
+            command_history: Vec::new(),
+            history_index: None,
+            history_draft: None,
+            active_rows: 0,
+            pending_viewport_size: None,
+            viewport_invalidated: false,
+            cursor_row_from_top: 0,
+            printed_ids: HashSet::new(),
+            accordion: AccordionState::default(),
+            active_dialog: None,
+            active_tabbed_dialog: None,
+            is_active: false,
+            needs_full_refresh: false,
+            last_render_error: None,
+            pending_feedback: None,
+            pending_cancellation: false,
+            pending_dialog_result: None,
+            ghost_text: None,
+            suggestions: crate::cli::suggestions::SuggestionManager::new(),
+            command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
+            autocomplete_state: AutocompleteState::default(),
+            pending_images: Vec::new(),
+            image_counter: 0,
+            todo_list: None,
+            agent_tasks: HashMap::new(),
+            agent_active_tools: HashMap::new(),
+            corner: Arc::new(std::sync::Mutex::new(None)),
+            stack: None,
+            poset: None,
+            poset_was_visible: false,
+            poset_panel_mode: PosetPanelMode::Forth,
+            panel_hint_shown: false,
+            session_label: String::new(),
+            typing_words: Vec::new(),
+            pre_typing_mode: PosetPanelMode::Forth,
+            live_area_dirty: true,
+        }
+    }
+
     pub fn new(
         output_manager: Arc<OutputManager>,
         status_bar: Arc<StatusBar>,

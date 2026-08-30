@@ -322,6 +322,7 @@ impl AgentLoop {
                             None, // repl_mode
                             None, // plan_content
                             None, // live_output
+                            None, // effect_audit
                         )
                         .await
                 };

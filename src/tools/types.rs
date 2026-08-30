@@ -86,6 +86,11 @@ pub struct ToolContext<'a> {
     /// Allows the WorkUnit row to show a live scrolling preview.
     pub live_output: Option<LiveOutput>,
 
+    /// Opaque daemon-issued authority for physical effects in one named-Brain
+    /// provider/tool loop. Ordinary sessions and non-program tools receive
+    /// `None`; provenance fields can never manufacture this capability.
+    pub effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+
     /// Co-Forth poset VM — partially-ordered task graph.
     pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }

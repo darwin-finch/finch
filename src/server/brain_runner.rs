@@ -47,6 +47,9 @@ pub struct RunnerProgramRequest {
     /// Send-safe proxy for the run-scoped daemon capability installed only
     /// after this request crosses the runner IPC boundary.
     pub control_tx: Option<mpsc::UnboundedSender<RunnerProgramControlRequest>>,
+    /// Run-scoped write-ahead audit capability. Host bindings must reserve
+    /// and begin through this proxy before applying a physical effect.
+    pub effect_audit: Option<RunnerEffectAuditControl>,
     pub response_tx: oneshot::Sender<Result<RunnerProgramResult, RunnerProgramError>>,
 }
 
@@ -69,6 +72,134 @@ pub enum RunnerProgramControlRequest {
         schedule_id: crate::brain::store::ScheduleId,
         response_tx: oneshot::Sender<Result<bool, String>>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunnerHostEffectOutcome {
+    Acknowledged { values: Vec<crate::vm::TypedValue> },
+    NotApplied { reason: String },
+    FailedPartial { detail: String },
+}
+
+#[derive(Debug)]
+pub(crate) enum RunnerEffectAuditControlRequest {
+    Reserve {
+        execution_id: uuid::Uuid,
+        effect: crate::vm::VmSideEffect,
+        response_tx: oneshot::Sender<Result<RunnerEffectAuditReservation, String>>,
+    },
+}
+
+/// Send-safe proxy for the daemon-owned run-scoped effect audit capability.
+/// It contains no authority provenance and cannot be constructed by external
+/// callers.
+#[derive(Debug, Clone)]
+pub struct RunnerEffectAuditControl {
+    tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>,
+}
+
+impl RunnerEffectAuditControl {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditControlRequest>) -> Self {
+        Self { tx }
+    }
+
+    pub async fn reserve(
+        &self,
+        execution_id: uuid::Uuid,
+        effect: crate::vm::VmSideEffect,
+    ) -> Result<RunnerEffectAuditReservation, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(RunnerEffectAuditControlRequest::Reserve {
+                execution_id,
+                effect,
+                response_tx,
+            })
+            .map_err(|_| "effect audit control disconnected".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "effect audit reservation response disconnected".to_string())?
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RunnerEffectAuditReservationRequest {
+    Begin {
+        response_tx: oneshot::Sender<Result<RunnerHostEffectPermit, String>>,
+    },
+    NotApplied {
+        reason: String,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// One accepted intent. Consuming this value either durably begins the host
+/// effect and returns its permit, or records that no physical effect occurred.
+#[derive(Debug)]
+pub struct RunnerEffectAuditReservation {
+    tx: mpsc::UnboundedSender<RunnerEffectAuditReservationRequest>,
+}
+
+impl RunnerEffectAuditReservation {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerEffectAuditReservationRequest>) -> Self {
+        Self { tx }
+    }
+
+    pub async fn begin(self) -> Result<RunnerHostEffectPermit, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(RunnerEffectAuditReservationRequest::Begin { response_tx })
+            .map_err(|_| "effect audit reservation disconnected".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "effect audit begin response disconnected".to_string())?
+    }
+
+    pub async fn not_applied(self, reason: impl Into<String>) -> Result<(), String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(RunnerEffectAuditReservationRequest::NotApplied {
+                reason: reason.into(),
+                response_tx,
+            })
+            .map_err(|_| "effect audit reservation disconnected".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "effect audit terminal response disconnected".to_string())?
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RunnerHostEffectFinishRequest {
+    pub outcome: RunnerHostEffectOutcome,
+    pub response_tx: oneshot::Sender<Result<(), String>>,
+}
+
+/// Opaque proof that the daemon fsynced `AwaitingHostResult`. This value is
+/// neither serializable nor cloneable; the host binding consumes it when
+/// recording the physical outcome.
+#[derive(Debug)]
+pub struct RunnerHostEffectPermit {
+    tx: mpsc::UnboundedSender<RunnerHostEffectFinishRequest>,
+}
+
+impl RunnerHostEffectPermit {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<RunnerHostEffectFinishRequest>) -> Self {
+        Self { tx }
+    }
+
+    pub async fn finish(self, outcome: RunnerHostEffectOutcome) -> Result<(), String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(RunnerHostEffectFinishRequest {
+                outcome,
+                response_tx,
+            })
+            .map_err(|_| "host effect permit disconnected".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "host effect finish response disconnected".to_string())?
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +250,8 @@ pub struct RunnerTurnRequest {
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
+    /// Run-scoped write-ahead audit capability for physical host effects.
+    pub effect_audit: Option<RunnerEffectAuditControl>,
     pub response_tx: oneshot::Sender<Result<RunnerTurnResult, RunnerTurnError>>,
 }
 
@@ -236,6 +369,76 @@ struct ConnectionAuthority {
     identities: HashMap<String, uuid::Uuid>,
     leases: HashMap<(String, RunnerLeaseId), uuid::Uuid>,
     attachments: HashMap<(String, AttachmentId, ConnectionId), uuid::Uuid>,
+    dispatch: HashMap<uuid::Uuid, Arc<ConnectionDispatchAdmission>>,
+}
+
+#[derive(Default)]
+struct ConnectionDispatchState {
+    closed: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct ConnectionDispatchAdmission {
+    state: Mutex<ConnectionDispatchState>,
+    quiesced: tokio::sync::Notify,
+}
+
+pub(crate) struct ConnectionDispatchGuard {
+    admission: Arc<ConnectionDispatchAdmission>,
+}
+
+impl ConnectionDispatchAdmission {
+    pub(crate) fn try_enter(self: &Arc<Self>) -> Option<ConnectionDispatchGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("connection dispatch lock poisoned");
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        Some(ConnectionDispatchGuard {
+            admission: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("connection dispatch lock poisoned")
+            .closed = true;
+    }
+
+    async fn wait_quiesced(&self) {
+        loop {
+            let notified = self.quiesced.notified();
+            if self
+                .state
+                .lock()
+                .expect("connection dispatch lock poisoned")
+                .active
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ConnectionDispatchGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .expect("connection dispatch lock poisoned");
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            self.admission.quiesced.notify_waiters();
+        }
+    }
 }
 
 /// Registrations contain only Tokio channels and portable values. Cap'n Proto
@@ -247,6 +450,51 @@ pub struct BrainRunnerBroker {
     connection_authority: Arc<Mutex<ConnectionAuthority>>,
     inflight: Arc<Mutex<HashMap<(String, RunId), HashMap<uuid::Uuid, oneshot::Sender<()>>>>>,
     cancelled_before_dispatch: Arc<Mutex<std::collections::HashSet<(String, RunId)>>>,
+}
+
+/// Exact authority owned by one IPC connection while its teardown is being
+/// durably reconciled. Claims remain fenced until [`finish`](Self::finish)
+/// succeeds; dropping this value deliberately leaves them fenced.
+pub(crate) struct RunnerConnectionTeardown {
+    broker: BrainRunnerBroker,
+    connection_id: uuid::Uuid,
+    pub(crate) runner_leases: Vec<(String, RunnerLeaseId)>,
+    pub(crate) attachments: Vec<(String, AttachmentId, ConnectionId)>,
+    dispatch: Arc<ConnectionDispatchAdmission>,
+}
+
+impl RunnerConnectionTeardown {
+    pub(crate) async fn wait_quiesced(&self) {
+        self.dispatch.wait_quiesced().await;
+    }
+
+    pub(crate) fn finish(self) -> Result<()> {
+        anyhow::ensure!(
+            self.dispatch
+                .state
+                .lock()
+                .expect("connection dispatch lock poisoned")
+                .active
+                == 0,
+            "connection callback dispatch is not quiescent"
+        );
+        let mut authority = self
+            .broker
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        authority
+            .identities
+            .retain(|_, owner| *owner != self.connection_id);
+        authority
+            .leases
+            .retain(|_, owner| *owner != self.connection_id);
+        authority
+            .attachments
+            .retain(|_, owner| *owner != self.connection_id);
+        authority.dispatch.remove(&self.connection_id);
+        Ok(())
+    }
 }
 
 struct InflightRequest {
@@ -387,6 +635,15 @@ impl BrainRunnerBroker {
                 anyhow::bail!("runner subject is already claimed by another IPC connection")
             }
             _ => {
+                let dispatch = authority.dispatch.entry(connection_id).or_default();
+                anyhow::ensure!(
+                    !dispatch
+                        .state
+                        .lock()
+                        .expect("connection dispatch lock poisoned")
+                        .closed,
+                    "IPC connection is tearing down"
+                );
                 authority
                     .identities
                     .insert(subject.to_string(), connection_id);
@@ -426,6 +683,15 @@ impl BrainRunnerBroker {
                 anyhow::bail!("runner lease is owned by another IPC connection")
             }
             _ => {
+                let dispatch = authority.dispatch.entry(connection_id).or_default();
+                anyhow::ensure!(
+                    !dispatch
+                        .state
+                        .lock()
+                        .expect("connection dispatch lock poisoned")
+                        .closed,
+                    "IPC connection is tearing down"
+                );
                 authority.leases.insert(key, connection_id);
                 Ok(())
             }
@@ -533,7 +799,26 @@ impl BrainRunnerBroker {
         tx: mpsc::UnboundedSender<RunnerRequest>,
     ) -> Result<RunnerRegistrationId> {
         let brain = brain.into();
-        self.require_connection_lease(connection_id, &brain, lease_id)?;
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        anyhow::ensure!(
+            authority.leases.get(&(brain.clone(), lease_id)) == Some(&connection_id),
+            "runner lease is not owned by this IPC connection"
+        );
+        let dispatch = authority
+            .dispatch
+            .get(&connection_id)
+            .context("IPC connection has no dispatch authority")?;
+        anyhow::ensure!(
+            !dispatch
+                .state
+                .lock()
+                .expect("connection dispatch lock poisoned")
+                .closed,
+            "IPC connection is tearing down"
+        );
         let id = RunnerRegistrationId(uuid::Uuid::new_v4());
         self.registrations
             .write()
@@ -547,14 +832,28 @@ impl BrainRunnerBroker {
                     tx,
                 },
             );
+        drop(authority);
         Ok(id)
     }
 
-    pub(crate) fn disconnect_connection(
+    pub(crate) fn connection_dispatch_admission(
         &self,
         connection_id: uuid::Uuid,
-    ) -> Vec<(String, AttachmentId, ConnectionId)> {
-        let mut authority = self
+    ) -> Result<Arc<ConnectionDispatchAdmission>> {
+        self.connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned")
+            .dispatch
+            .get(&connection_id)
+            .cloned()
+            .context("IPC connection has no dispatch authority")
+    }
+
+    pub(crate) fn begin_connection_teardown(
+        &self,
+        connection_id: uuid::Uuid,
+    ) -> RunnerConnectionTeardown {
+        let authority = self
             .connection_authority
             .lock()
             .expect("runner connection-authority lock poisoned");
@@ -568,19 +867,31 @@ impl BrainRunnerBroker {
                 },
             )
             .collect();
-        authority
-            .identities
-            .retain(|_, owner| *owner != connection_id);
-        authority.leases.retain(|_, owner| *owner != connection_id);
-        authority
-            .attachments
-            .retain(|_, owner| *owner != connection_id);
+        let runner_leases = authority
+            .leases
+            .iter()
+            .filter_map(|((brain, lease_id), owner)| {
+                (*owner == connection_id).then(|| (brain.clone(), *lease_id))
+            })
+            .collect();
+        let dispatch = authority
+            .dispatch
+            .get(&connection_id)
+            .cloned()
+            .unwrap_or_default();
+        dispatch.close();
         drop(authority);
         self.registrations
             .write()
             .expect("runner broker lock poisoned")
             .retain(|_, registration| registration.connection_id != Some(connection_id));
-        attachments
+        RunnerConnectionTeardown {
+            broker: self.clone(),
+            connection_id,
+            runner_leases,
+            attachments,
+            dispatch,
+        }
     }
 
     /// Remove a registration only if it is still the connection that created
@@ -646,6 +957,7 @@ impl BrainRunnerBroker {
                     interaction,
                     grant_ceiling,
                     control_tx: None,
+                    effect_audit: None,
                     response_tx,
                 }))
                 .map_err(|_| {
@@ -653,10 +965,11 @@ impl BrainRunnerBroker {
                 })?;
         }
         tokio::select! {
+            biased;
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
             response = response_rx => response
                 .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
                 .map_err(anyhow::Error::new),
-            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
         }
     }
 
@@ -703,6 +1016,7 @@ impl BrainRunnerBroker {
                     approval_audience,
                     approval_connection_id,
                     approval_tx: None,
+                    effect_audit: None,
                     response_tx,
                 }))
                 .map_err(|_| {
@@ -710,10 +1024,11 @@ impl BrainRunnerBroker {
                 })?;
         }
         tokio::select! {
+            biased;
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
             response = response_rx => response
                 .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
                 .map_err(anyhow::Error::new),
-            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
         }
     }
 
@@ -860,12 +1175,29 @@ mod tests {
             )
             .is_err());
 
-        let disconnected = broker.disconnect_connection(owner);
+        let teardown = broker.begin_connection_teardown(owner);
         assert_eq!(
-            disconnected,
+            teardown.attachments,
             vec![("brain".to_string(), attachment_id, attachment_connection_id,)]
         );
+        assert_eq!(
+            teardown.runner_leases,
+            vec![("brain".to_string(), lease_id)]
+        );
         assert!(!broker.has_registration("brain", lease_id));
+        assert!(broker
+            .claim_connection_lease(intruder, "brain", lease_id)
+            .is_err());
+        drop(teardown);
+        assert!(broker
+            .claim_connection_identity(intruder, "runner-a@box.local")
+            .is_err());
+        assert!(broker
+            .require_connection_lease(owner, "brain", lease_id)
+            .is_ok());
+
+        let teardown = broker.begin_connection_teardown(owner);
+        teardown.finish().unwrap();
         assert!(broker
             .require_connection_lease(owner, "brain", lease_id)
             .is_err());
