@@ -691,7 +691,7 @@ mod tests {
             account: "acct-work".into(),
             tenant: None,
             project: None,
-            scopes: claims().scopes,
+            scopes: chatgpt_required_scopes(),
             access_token: "subscription-bearer".into(),
             refresh_token: Some("subscription-refresh".into()),
             id_token: None,

@@ -652,7 +652,9 @@ where
 mod tests {
     use super::*;
     use crate::oauth::{OAuthCredentialStore, OAuthDialect, TokenValidationContext};
-    use crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect;
+    use crate::providers::chatgpt_oauth::{
+        OpenAiChatGptOAuthDialect, OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE,
+    };
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::Response;
