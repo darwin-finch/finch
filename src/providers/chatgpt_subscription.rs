@@ -2361,7 +2361,8 @@ mod tests {
             &HashSet::new(),
             &mut accumulator,
         )
-        .unwrap_err()
+        .err()
+        .expect("model drift must fail")
         .to_string();
         assert!(error.contains("incompatible actual model"));
     }
