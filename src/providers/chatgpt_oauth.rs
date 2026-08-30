@@ -42,6 +42,18 @@ pub(crate) const OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE: &str = "https://api.openai.
 const CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+/// Status-only ChatGPT device endpoint failures. Upstream bodies are never
+/// retained in these typed causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChatGptDeviceEndpointError {
+    #[error("ChatGPT device authorization is disabled or unsupported for this account (HTTP 404)")]
+    StartDisabledOrUnsupported,
+    #[error("ChatGPT device authorization is unavailable (HTTP {0})")]
+    StartRejected(u16),
+    #[error("ChatGPT device polling ended (HTTP {0})")]
+    PollRejected(u16),
+}
+
 /// Exact scopes for the pinned public-client compatibility revision.
 pub fn chatgpt_required_scopes() -> BTreeSet<String> {
     BTreeSet::from([
@@ -202,7 +214,10 @@ where
         body: Value,
     ) -> Result<DeviceAuthorization> {
         if !status.is_success() {
-            bail!("ChatGPT device authorization is unavailable (HTTP {status})");
+            if status == StatusCode::NOT_FOUND {
+                return Err(ChatGptDeviceEndpointError::StartDisabledOrUnsupported.into());
+            }
+            return Err(ChatGptDeviceEndpointError::StartRejected(status.as_u16()).into());
         }
         let device_code = required_string(&body, "device_auth_id")?;
         let user_code = body
@@ -230,6 +245,19 @@ where
         )
     }
 
+    fn parse_device_authorization_response(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Result<DeviceAuthorization> {
+        if !status.is_success() {
+            return self.parse_device_authorization(status, Value::Null);
+        }
+        let body = serde_json::from_slice(body)
+            .context("ChatGPT device authorization response was malformed JSON")?;
+        self.parse_device_authorization(status, body)
+    }
+
     fn device_poll_request(&self, pending: &DeviceAuthorization) -> Result<OAuthHttpRequest> {
         Ok(OAuthHttpRequest {
             endpoint: self.descriptor.device_token_endpoint.clone(),
@@ -241,32 +269,35 @@ where
     }
 
     fn parse_device_poll(&self, status: StatusCode, body: Value) -> Result<DevicePoll> {
-        if status.is_success() {
-            let code = required_string(&body, "authorization_code")?;
-            let verifier = required_string(&body, "code_verifier")?;
-            let challenge = required_string(&body, "code_challenge")?;
-            if URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) != challenge {
-                bail!("ChatGPT device authorization returned an invalid PKCE pair");
-            }
-            return Ok(DevicePoll::AuthorizationCode(AuthorizationCodeGrant {
-                code,
-                verifier,
-                redirect_uri: format!("{}/deviceauth/callback", self.auth_origin),
-            }));
+        if matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN) {
+            return Ok(DevicePoll::Pending);
         }
-        let code = body.get("error").and_then(Value::as_str).unwrap_or("");
-        match code {
-            "authorization_pending" | "pending" => Ok(DevicePoll::Pending),
-            "slow_down" => Ok(DevicePoll::SlowDown),
-            "access_denied" | "authorization_declined" => Ok(DevicePoll::Denied),
-            "expired_token" | "authorization_expired" => Ok(DevicePoll::Expired),
-            _ if matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN)
-                && body.as_object().is_some_and(|object| object.is_empty()) =>
-            {
-                Ok(DevicePoll::Pending)
-            }
-            _ => bail!("ChatGPT device polling contract changed (HTTP {status})"),
+        if !status.is_success() {
+            return Err(ChatGptDeviceEndpointError::PollRejected(status.as_u16()).into());
         }
+        let code = required_string(&body, "authorization_code")?;
+        let verifier = required_string(&body, "code_verifier")?;
+        let challenge = required_string(&body, "code_challenge")?;
+        if URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) != challenge {
+            bail!("ChatGPT device authorization returned an invalid PKCE pair");
+        }
+        Ok(DevicePoll::AuthorizationCode(AuthorizationCodeGrant {
+            code,
+            verifier,
+            redirect_uri: format!("{}/deviceauth/callback", self.auth_origin),
+        }))
+    }
+
+    fn parse_device_poll_response(&self, status: StatusCode, body: &[u8]) -> Result<DevicePoll> {
+        if matches!(status, StatusCode::NOT_FOUND | StatusCode::FORBIDDEN) {
+            return Ok(DevicePoll::Pending);
+        }
+        if !status.is_success() {
+            return self.parse_device_poll(status, Value::Null);
+        }
+        let body = serde_json::from_slice(body)
+            .context("ChatGPT device polling response was malformed JSON")?;
+        self.parse_device_poll(status, body)
     }
 
     fn authorization_code_request(
@@ -783,6 +814,72 @@ mod tests {
         assert_eq!(metadata.account.as_deref(), Some("acct-work"));
         assert_eq!(metadata.secret_ref, "oauth-store:chatgpt:work");
         assert!(!format!("{tokens:?}").contains("access-secret"));
+    }
+
+    #[test]
+    fn device_poll_403_and_404_are_status_first_pending_without_body_reflection() {
+        let dialect = OpenAiChatGptOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(claims())),
+        )
+        .unwrap();
+        for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
+            for body in [
+                Value::Null,
+                json!({}),
+                json!({"error": "access_denied", "secret": "body-sentinel"}),
+                json!("untrusted-html-sentinel"),
+            ] {
+                assert!(matches!(
+                    dialect.parse_device_poll(status, body).unwrap(),
+                    DevicePoll::Pending
+                ));
+            }
+        }
+
+        let error = match dialect
+            .parse_device_poll(StatusCode::BAD_REQUEST, json!({"error": "body-sentinel"}))
+        {
+            Ok(_) => panic!("unexpected successful poll response"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("HTTP 400"), "{error}");
+        assert!(!error.contains("body-sentinel"), "{error}");
+    }
+
+    #[test]
+    fn device_authorization_start_errors_are_status_only_and_404_is_actionable() {
+        let dialect = OpenAiChatGptOAuthDialect::for_test(
+            "http://127.0.0.1:12345",
+            Arc::new(FixedVerifier(claims())),
+        )
+        .unwrap();
+        let forbidden = dialect
+            .parse_device_authorization(
+                StatusCode::FORBIDDEN,
+                json!({"error": "policy-secret-sentinel"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(forbidden.contains("HTTP 403"), "{forbidden}");
+        assert!(!forbidden.contains("policy-secret-sentinel"), "{forbidden}");
+
+        let missing = dialect
+            .parse_device_authorization(
+                StatusCode::NOT_FOUND,
+                json!({"error": "unsupported-secret-sentinel"}),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<ChatGptDeviceEndpointError>(),
+            Some(ChatGptDeviceEndpointError::StartDisabledOrUnsupported)
+        ));
+        let missing = missing.to_string();
+        assert!(missing.contains("disabled or unsupported"), "{missing}");
+        assert!(
+            !missing.contains("unsupported-secret-sentinel"),
+            "{missing}"
+        );
     }
 
     #[tokio::test]

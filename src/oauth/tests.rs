@@ -1,5 +1,8 @@
 use super::*;
 use crate::config::EndpointFamily;
+use crate::providers::chatgpt_oauth::{
+    OpenAiChatGptOAuthDialect, OpenAiTokenVerifier, VerifiedOpenAiClaims,
+};
 use anyhow::{bail, Result};
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -12,6 +15,24 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 struct MemoryStore(Mutex<BTreeMap<String, OAuthTokenRecord>>);
+
+struct NeverReachedOpenAiVerifier;
+
+#[async_trait::async_trait]
+impl OpenAiTokenVerifier for NeverReachedOpenAiVerifier {
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _id_token: Option<&str>,
+        _access_token: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<VerifiedOpenAiClaims> {
+        bail!("token verifier must not run while device authorization is pending")
+    }
+}
 
 impl OAuthCredentialStore for MemoryStore {
     fn load(&self, reference: &str) -> Result<Option<OAuthTokenRecord>> {
@@ -445,6 +466,149 @@ async fn bracketed_ipv6_origin_validates_descriptor_and_outbound_endpoint_exactl
     assert_eq!(pending.user_code, "ABCD-EFGH");
     assert_eq!(server.request_count("/alpha/device"), 1);
     assert_eq!(server.request_count("/alpha/poll"), 0);
+}
+
+#[tokio::test]
+async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() {
+    let server = FakeServer::start().await;
+    let sentinels = [
+        "html-secret-sentinel",
+        "json-secret-sentinel",
+        "empty-body-sentinel",
+        "scalar-secret-sentinel",
+    ];
+    for index in 0..12 {
+        let (status, body) = match index % 4 {
+            0 => (
+                StatusCode::FORBIDDEN,
+                format!("<html>{}</html>", sentinels[0]),
+            ),
+            1 => (
+                StatusCode::NOT_FOUND,
+                json!({"error": sentinels[1]}).to_string(),
+            ),
+            2 => (StatusCode::FORBIDDEN, String::new()),
+            _ => (StatusCode::NOT_FOUND, format!("\"{}\"", sentinels[3])),
+        };
+        server.push_raw("/api/accounts/deviceauth/token", status, body);
+    }
+    let dialect = Arc::new(
+        OpenAiChatGptOAuthDialect::for_test(&server.origin, Arc::new(NeverReachedOpenAiVerifier))
+            .unwrap(),
+    );
+    let store = Arc::new(MemoryStore::default());
+    let client = OAuthClient::new(dialect, store.clone()).unwrap();
+    let pending = DeviceAuthorization::issued(
+        "device-secret".into(),
+        "ABCD-EFGH".into(),
+        format!("{}/codex/device", server.origin),
+        None,
+        Duration::from_millis(70),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let error = client
+        .finish_device_authorization("chatgpt:status-first", &pending, CancellationToken::new())
+        .await
+        .unwrap_err();
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("expired"), "{diagnostic}");
+    assert!(
+        sentinels.iter().all(|secret| !diagnostic.contains(secret)),
+        "{diagnostic}"
+    );
+    assert!(server.request_count("/api/accounts/deviceauth/token") >= 2);
+    assert!(store.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn device_start_http_cancellation_retains_typed_terminal_cause_through_context() {
+    let server = FakeServer::start().await;
+    server.push_delayed(
+        "/alpha/device",
+        StatusCode::OK,
+        json!({
+            "device_code": "must-not-complete",
+            "user_code": "MUST-NOT-COMPLETE",
+            "verification_uri": "https://login.example/device",
+            "expires_in": 600,
+            "interval": 1
+        }),
+        Duration::from_secs(30),
+    );
+    let client = OAuthClient::new(
+        Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+        Arc::new(MemoryStore::default()),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let pending = client.begin_device_authorization_cancellable(cancel.clone());
+    tokio::pin!(pending);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut pending => panic!("device-start request completed before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    if server.request_count("/alpha/device") == 1 {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    let error = pending.await.unwrap_err().context("setup start context");
+    assert!(error.chain().any(|source| matches!(
+        source.downcast_ref::<OAuthDeviceAuthorizationError>(),
+        Some(OAuthDeviceAuthorizationError::Cancelled)
+    )));
+    assert_eq!(server.request_count("/alpha/device"), 1);
+}
+
+#[tokio::test]
+async fn generic_oauth_http_cancellation_is_not_mislabeled_as_device_authorization() {
+    let server = FakeServer::start().await;
+    server.push_delayed(
+        "/alpha/token",
+        StatusCode::OK,
+        json!({"access_token": "must-not-complete"}),
+        Duration::from_secs(30),
+    );
+    let client = OAuthClient::new(
+        Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+        Arc::new(MemoryStore::default()),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let request = OAuthHttpRequest {
+        endpoint: format!("{}/alpha/token", server.origin),
+        body: OAuthRequestBody::Json(json!({"grant_type": "refresh_token"})),
+    };
+    let pending = client.post_form_bytes_cancellable(request, &cancel);
+    tokio::pin!(pending);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                result = &mut pending => panic!("generic OAuth request completed before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    if server.request_count("/alpha/token") == 1 {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    let error = pending.await.unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert!(!error.chain().any(|source| source
+        .downcast_ref::<OAuthDeviceAuthorizationError>()
+        .is_some()));
+    assert_eq!(server.request_count("/alpha/token"), 1);
 }
 
 #[tokio::test]

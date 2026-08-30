@@ -2,6 +2,21 @@ name: Issue 201 ChatGPT Auth
 
 on:
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "src/oauth/**"
+      - "src/config/**"
+      - "src/providers/chatgpt_oauth.rs"
+      - "src/providers/model_catalog.rs"
+      - "src/providers/openai_jwks.rs"
+      - "src/cli/chatgpt_auth.rs"
+      - "src/cli/setup_wizard.rs"
+      - "src/main.rs"
+      - "docs/OAUTH.md"
+      - ".github/issue-201-windows-probe/**"
+      - ".github/workflows/issue-201-chatgpt-auth.yml"
   pull_request:
     branches: [main]
     paths:
@@ -57,7 +72,19 @@ jobs:
       - name: Scriptable auth parser regressions
         run: "cargo test --bin finch chatgpt_auth_cli_"
       - name: Shared setup auth regressions
-        run: cargo test --lib cli::setup_wizard::tests::setup_
+        run: |
+          listed="$(cargo test --lib cli::setup_wizard::tests::setup_ -- --list)"
+          printf '%s\n' "$listed"
+          for expected in \
+            setup_retry_crosses_real_oauth_boundary_with_fresh_quiescent_ceremony \
+            setup_injected_save_failure_compensates_owned_generation_without_config_mutation \
+            setup_recovery_editor_reprompts_invalid_choice_and_name_without_reflection
+          do
+            printf '%s\n' "$listed" | grep -F "cli::setup_wizard::tests::$expected: test"
+          done
+          count="$(printf '%s\n' "$listed" | grep -c ': test$')"
+          test "$count" -ge 12
+          cargo test --lib cli::setup_wizard::tests::setup_
       - name: ChatGPT chooser, catalogue, and cancellation regressions
         run: |
           cargo test --lib cli::setup_wizard::tests::test_known_models_for_returns_list_for_all_providers -- --exact
