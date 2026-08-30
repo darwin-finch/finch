@@ -371,7 +371,7 @@ pub struct EventLoop {
     cwd: String,
 
     /// Total number of status-strip lines (🧠 + context summaries).
-    /// Comes from config.features.memory_context_lines (default 4).
+    /// Comes from config.features.memory_context_lines (default 5).
     context_lines: usize,
 
     /// Maximum number of recent messages sent verbatim to the provider.

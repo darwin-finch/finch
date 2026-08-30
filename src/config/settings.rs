@@ -568,6 +568,12 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         use crate::errors;
 
+        if !(1..=8).contains(&self.features.memory_context_lines) {
+            anyhow::bail!(
+                "features.memory_context_lines must be between 1 and 8; run `finch setup` and edit Settings → Context lines"
+            );
+        }
+
         // Validate the complete named-credential graph before any provider,
         // fallback, catalogue, or transport object is constructed.
         let credentials = super::credential::credential_index(&self.credentials)
@@ -1086,6 +1092,22 @@ struct TomlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_context_lines_validation_enforces_status_strip_range() {
+        for invalid in [0, 9, usize::MAX] {
+            let mut config = Config::new(vec![]);
+            config.features.memory_context_lines = invalid;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("between 1 and 8"), "{error}");
+        }
+
+        for valid in 1..=8 {
+            let mut config = Config::new(vec![]);
+            config.features.memory_context_lines = valid;
+            config.validate().unwrap();
+        }
+    }
 
     #[test]
     fn test_server_config_persists_single_finch_api_key() {
