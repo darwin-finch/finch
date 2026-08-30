@@ -1,0 +1,103 @@
+# Native ChatGPT subscription transport
+
+Finch's `chatgpt_subscription` provider is a Finch-owned HTTP transport. It does
+not execute Codex, app-server, or any other provider binary, and it never reads
+another application's credential store. It is intentionally separate from the
+OpenAI Platform and generic OpenAI-compatible transports.
+
+## Versioned compatibility contract
+
+The public Responses API documents the message, image, function, encrypted
+reasoning, and streaming item shapes used here:
+
+- <https://developers.openai.com/api/reference/resources/responses/methods/create>
+- <https://developers.openai.com/api/docs/models/gpt-5.6-sol>
+
+ChatGPT subscription routing is a compatibility contract derived from the
+public OpenAI Codex source at commit
+`6478a751fde8884b2fdc76486fe23175a8e795d4`. The relevant source files are:
+
+- `codex-rs/codex-api/src/endpoint/responses.rs`
+- `codex-rs/codex-api/src/endpoint/models.rs`
+- `codex-rs/codex-api/src/sse/responses.rs`
+- `codex-rs/codex-api/src/rate_limits.rs`
+- `codex-rs/core/src/client.rs`
+- `codex-rs/protocol/src/openai_models.rs`
+
+Finch records that pin as
+`openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4`.
+Protocol drift fails closed; it is not silently treated as Platform behavior.
+
+## Identity and routing
+
+Only a named `ChatgptSubscription` credential created by Finch's device-login
+flow can select this provider. Its issuer, audience, account, store reference,
+revision, and generation are revalidated before reuse and after refresh.
+
+The production origin is exactly `https://chatgpt.com` with these routes:
+
+- `GET /backend-api/codex/models?client_version=<finch-version>`
+- `POST /backend-api/codex/responses`
+
+Requests use bearer authorization, `ChatGPT-Account-ID`, honest
+`originator: finch`, Finch's version, and the pinned protocol revision. Sol
+requests additionally send `x-openai-internal-codex-responses-lite: true`.
+Redirects, custom endpoints, userinfo, fragments, FedRAMP, Platform fallback,
+and model fallback are rejected.
+
+The account catalog is bounded and cached by account plus credential
+generation. ETags may revalidate an expired cache, but an entry from another
+account is never reused. Both `gpt-5.6-sol` and `gpt-5.6` must be explicitly
+advertised with text, image, API, and Responses-Lite support before inference.
+
+## Request and continuation semantics
+
+Every request uses `store: false`, `stream: true`,
+`include: ["reasoning.encrypted_content"]`, and
+`reasoning.context: "all_turns"`. Reasoning effort is explicit. Instructions
+and tools are Responses-Lite developer items; user/assistant text, validated
+PNG/JPEG inputs, function calls, and function outputs retain their history
+order.
+
+Encrypted reasoning is provider-owned opaque data. Finch bounds it, persists it
+as an ordered content block through the atomic conversation path, and replays it
+byte-for-byte. Finch never renders or interprets it. The IPC generation is 6;
+generation 5 peers reject the new continuation/allowance schema before query or
+stream work.
+
+## Streaming and failure policy
+
+The SSE parser bounds each line and event and the total response. It validates
+standard `event:` names against JSON event types, requires strictly increasing
+sequence numbers, accumulates completed output items by contiguous output
+index, and reconciles them with any terminal output. Actual-model provenance
+must remain compatible and unchanged. Unknown fields/events, malformed tool
+arguments, missing completion, duplicate terminal markers, post-terminal data,
+partial EOF, idle timeout, receiver drop, and payload-limit violations fail
+visibly before terminal chunks are published.
+
+Non-success bodies are consumed only to a small bound and discarded. Tokens,
+account identifiers, request bodies, image data, tool arguments, reasoning
+continuations, and response bodies are never placed in provider errors.
+
+Proactive refresh is generation-bound and serialized. A 401 before the stream
+starts permits one shared refresh, a fresh account catalog check, and one retry.
+There is no retry after successful stream headers or any response event.
+
+## Opt-in live acceptance
+
+Live auth and inference are never part of normal tests. After independent
+security review, a user who has explicitly completed Finch's own device login
+can run:
+
+```sh
+FINCH_LIVE_CHATGPT_ACCEPTANCE=1 cargo test --lib \
+  providers::chatgpt_subscription::tests::live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in \
+  -- --ignored --exact
+```
+
+The test selects a Finch-owned named credential and asserts non-empty Sol model
+provenance. It does not print tokens or response bodies. Until that opt-in test
+is run, live-service acceptance—including current account entitlement and
+server-side compatibility with the pinned revision—remains intentionally
+unverified.

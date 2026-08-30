@@ -374,20 +374,24 @@ impl ChatGptSubscriptionProvider {
         request: ProviderRequest,
         cancel: CancellationToken,
     ) -> Result<Response> {
+        let body = responses_lite_request(&request, self.reasoning_effort)?;
+        let body =
+            serde_json::to_vec(&body).context("Failed to encode ChatGPT subscription request")?;
+        if body.len() > MAX_REQUEST_BYTES {
+            bail!("ChatGPT subscription request exceeded the size limit");
+        }
         let mut lease = self.source.lease(&cancel).await?;
         let mut catalog = self.account_catalog(&lease, &cancel).await?;
         let selected = catalog
             .models
             .get(&request.model)
             .context("ChatGPT account does not advertise the configured model")?;
-        if !selected.responses_lite || selected.slug != request.model {
+        if !selected.responses_lite
+            || !selected.image_input
+            || selected.context_window != 1_050_000
+            || selected.slug != request.model
+        {
             bail!("ChatGPT account model is not compatible with the pinned Responses-Lite dialect");
-        }
-        let body = responses_lite_request(&request, self.reasoning_effort)?;
-        let body =
-            serde_json::to_vec(&body).context("Failed to encode ChatGPT subscription request")?;
-        if body.len() > MAX_REQUEST_BYTES {
-            bail!("ChatGPT subscription request exceeded the size limit");
         }
         let url = self.route(RESPONSES_PATH, None)?;
         for attempt in 0..2 {
@@ -416,7 +420,11 @@ impl ChatGptSubscriptionProvider {
                     .models
                     .get(&request.model)
                     .context("ChatGPT account model changed while refreshing credentials")?;
-                if !refreshed_model.responses_lite || refreshed_model.slug != request.model {
+                if !refreshed_model.responses_lite
+                    || !refreshed_model.image_input
+                    || refreshed_model.context_window != 1_050_000
+                    || refreshed_model.slug != request.model
+                {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
                 continue;
@@ -649,6 +657,7 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
         bail!("ChatGPT Responses-Lite does not accept Finch temperature overrides");
     }
     let tools = map_tools(request.tools.as_deref().unwrap_or_default())?;
+    let allowed_tools = advertised_tool_names(request);
     let mut input = Vec::new();
     input.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
     if let Some(system) = request.system.as_deref().filter(|value| !value.is_empty()) {
@@ -661,7 +670,13 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
     let mut calls = HashSet::new();
     let mut results = HashSet::new();
     for message in &request.messages {
-        map_message(message, &mut input, &mut calls, &mut results)?;
+        map_message(
+            message,
+            &mut input,
+            &mut calls,
+            &mut results,
+            &allowed_tools,
+        )?;
     }
     if input.len() == 1 && request.system.as_deref().is_none_or(str::is_empty) {
         bail!("ChatGPT subscription request omitted conversation input");
@@ -733,6 +748,7 @@ fn map_message(
     input: &mut Vec<Value>,
     calls: &mut HashSet<String>,
     results: &mut HashSet<String>,
+    allowed_tools: &HashSet<String>,
 ) -> Result<()> {
     if !matches!(message.role.as_str(), "user" | "assistant") {
         bail!("ChatGPT subscription history contained an unsupported role");
@@ -787,6 +803,9 @@ fn map_message(
                 }
                 validate_identifier(id, 256, "tool call identifier")?;
                 validate_identifier(name, 128, "tool name")?;
+                if !allowed_tools.contains(name) {
+                    bail!("ChatGPT subscription history used an unadvertised tool");
+                }
                 if !calls.insert(id.clone()) {
                     bail!("ChatGPT subscription history repeated a tool call identifier");
                 }
@@ -808,6 +827,9 @@ fn map_message(
                 }
                 validate_identifier(tool_use_id, 256, "tool call identifier")?;
                 validate_bounded_text(content, MAX_TOOL_ARGUMENT_BYTES, "tool result")?;
+                if !calls.contains(tool_use_id) {
+                    bail!("ChatGPT subscription history contained an unmatched tool result");
+                }
                 if !results.insert(tool_use_id.clone()) {
                     bail!("ChatGPT subscription history repeated a tool result identifier");
                 }
@@ -867,7 +889,7 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
             .and_then(Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .context("ChatGPT catalog model omitted a valid context window")?;
-        if context_window == 0 || context_window > 4_000_000 {
+        if context_window != 1_050_000 {
             bail!("ChatGPT catalog model context window was invalid");
         }
         if supported && matches!(slug.as_str(), DEFAULT_MODEL | MODEL_ALIAS) {
@@ -901,7 +923,7 @@ struct CompletedResponse {
     allowance: Option<Allowance>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Allowance {
     primary_used_percent: Option<f32>,
     secondary_used_percent: Option<f32>,
@@ -1694,6 +1716,7 @@ mod tests {
     use crate::providers::LlmProvider;
     use crate::tools::types::ToolInputSchema;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct StaticSource {
         generation: Mutex<String>,
@@ -1794,6 +1817,133 @@ mod tests {
                 required: vec!["path".to_string()],
             },
         }
+    }
+
+    async fn stalling_subscription_server(
+        send_stream_headers: bool,
+    ) -> (String, tokio::sync::oneshot::Receiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut catalog_socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            catalog_socket.flush().await.unwrap();
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener.accept().await.unwrap();
+            let _ = response_socket.read(&mut request).await;
+            if send_stream_headers {
+                response_socket
+                    .write_all(
+                        concat!(
+                            "HTTP/1.1 200 OK\r\n",
+                            "content-type: text/event-stream\r\n",
+                            "openai-model: gpt-5.6-sol\r\n",
+                            "connection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                response_socket.flush().await.unwrap();
+            }
+            let mut byte = [0u8; 1];
+            while matches!(response_socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (format!("http://{address}/backend-api/codex"), closed_rx)
+    }
+
+    async fn fragmented_subscription_server(body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener.accept().await.unwrap();
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            catalog_socket.flush().await.unwrap();
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener.accept().await.unwrap();
+            let _ = response_socket.read(&mut request).await;
+            response_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nopenai-model: {DEFAULT_MODEL}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for byte in body.bytes() {
+                response_socket.write_all(&[byte]).await.unwrap();
+                response_socket.flush().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        format!("http://{address}/backend-api/codex")
+    }
+
+    async fn subscription_stream_outcome(body: String, header_model: &str) -> Vec<String> {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/backend-api/codex/models")
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", header_model)
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap();
+        let mut errors = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            if let Err(error) = chunk {
+                errors.push(error.to_string());
+            }
+        }
+        errors
     }
 
     #[test]
@@ -1974,6 +2124,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_and_nonstream_preserve_equal_terminal_output_and_provenance() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/backend-api/codex/models")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let nonstream = provider.send_message(&request).await.unwrap();
+        let mut receiver = provider.send_message_stream(&request).await.unwrap();
+        let mut streamed_blocks = Vec::new();
+        let mut streamed_model = None;
+        let mut streamed_usage = None;
+        while let Some(chunk) = receiver.recv().await {
+            match chunk.unwrap() {
+                StreamChunk::ContentBlockComplete(block) => streamed_blocks.push(block),
+                StreamChunk::ResponseMetadata { model } => streamed_model = Some(model),
+                StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => streamed_usage = Some((input_tokens, output_tokens)),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(streamed_blocks).unwrap(),
+            serde_json::to_value(&nonstream.content).unwrap()
+        );
+        assert_eq!(streamed_model.as_deref(), Some(nonstream.model.as_str()));
+        assert_eq!(streamed_usage, Some((12, 7)));
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn byte_fragmented_sse_preserves_ordered_opaque_and_tool_items() {
+        let base = fragmented_subscription_server(completed_sse(DEFAULT_MODEL)).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let response = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.content.as_slice(),
+            [
+                ContentBlock::OpaqueReasoning { .. },
+                ContentBlock::Text { .. },
+                ContentBlock::ToolUse { .. }
+            ]
+        ));
+    }
+
+    #[tokio::test]
     async fn one_pre_stream_unauthorized_refreshes_same_account_once() {
         let mut server = mockito::Server::new_async().await;
         server
@@ -2026,6 +2252,202 @@ mod tests {
         second.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn stream_receiver_drop_cancels_and_releases_subscription_transport() {
+        let (base, closed) = stalling_subscription_server(true).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("subscription transport was not released after receiver drop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_bounded_and_releases_subscription_transport() {
+        let (base, closed) = stalling_subscription_server(false).await;
+        let mut provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        provider.client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Failed to start ChatGPT subscription response"));
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("subscription transport was not released after request timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
+        let created = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
+        );
+        let eof = subscription_stream_outcome(created.clone(), DEFAULT_MODEL).await;
+        assert_eq!(eof.len(), 1);
+        assert!(eof[0].contains("before response.completed"));
+
+        let terminal = format!(
+            "{}event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+            created,
+            json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp"}})
+        );
+        let duplicate =
+            subscription_stream_outcome(format!("{terminal}data: [DONE]\n\n"), DEFAULT_MODEL).await;
+        assert_eq!(duplicate.len(), 1);
+        assert!(duplicate[0].contains("terminal marker was invalid"));
+
+        let late = subscription_stream_outcome(
+            format!(
+                "{terminal}event: response.in_progress\ndata: {}\n\n",
+                json!({"type":"response.in_progress","sequence_number":3,"response":{}})
+            ),
+            DEFAULT_MODEL,
+        )
+        .await;
+        assert_eq!(late.len(), 1);
+        assert!(late[0].contains("data after its terminal response"));
+    }
+
+    #[tokio::test]
+    async fn actual_model_drift_fails_before_completion_effects() {
+        let body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}})
+        );
+        let errors = subscription_stream_outcome(body, DEFAULT_MODEL).await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("incompatible actual model"));
+    }
+
+    #[tokio::test]
+    async fn catalog_etag_is_generation_revalidated_but_never_crosses_accounts() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("chatgpt-account-id", "account-1")
+            .with_status(200)
+            .with_header("etag", "account-1-etag")
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let revalidated = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("chatgpt-account-id", "account-1")
+            .match_header("if-none-match", "account-1-etag")
+            .with_status(304)
+            .expect(1)
+            .create_async()
+            .await;
+        let other_account = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("chatgpt-account-id", "account-2")
+            .match_header("if-none-match", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        provider
+            .account_catalog(
+                &ChatGptCredentialLease {
+                    access_token: "secret-1".into(),
+                    account: "account-1".into(),
+                    generation: "generation-1".into(),
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+        provider
+            .account_catalog(
+                &ChatGptCredentialLease {
+                    access_token: "secret-2".into(),
+                    account: "account-1".into(),
+                    generation: "generation-2".into(),
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+        provider
+            .account_catalog(
+                &ChatGptCredentialLease {
+                    access_token: "secret-3".into(),
+                    account: "account-2".into(),
+                    generation: "generation-3".into(),
+                },
+                &cancel,
+            )
+            .await
+            .unwrap();
+        first.assert_async().await;
+        revalidated.assert_async().await;
+        other_account.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn non_success_bodies_are_bounded_and_redacted() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/backend-api/codex/models")
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let secret = "attacker-tool-argument-and-reasoning-secret";
+        server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(429)
+            .with_body(format!("{secret}{}", "x".repeat(MAX_ERROR_BYTES)))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret));
+        assert!(!error.contains("subscription-secret"));
+        assert!(error.contains("size limit"));
+        assert!(error.len() < 256);
+    }
+
     #[test]
     fn hostile_origin_route_and_request_preflight_fail_before_credentials() {
         let source = Arc::new(StaticSource::new());
@@ -2044,6 +2466,28 @@ mod tests {
             )
             .is_err());
         }
+        assert_eq!(source.leases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_image_and_history_fail_before_credential_or_network_use() {
+        let source = Arc::new(StaticSource::new());
+        let provider = ChatGptSubscriptionProvider::for_test(
+            source.clone(),
+            "http://127.0.0.1:9/backend-api/codex",
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let invalid_image = ProviderRequest::new(vec![Message::with_content(
+            "user",
+            vec![ContentBlock::image("image/png", "iVBORw0KGgo=")],
+        )]);
+        assert!(provider.send_message(&invalid_image).await.is_err());
+        let invalid_role = ProviderRequest::new(vec![Message::with_content(
+            "developer",
+            vec![ContentBlock::text("attacker-controlled")],
+        )]);
+        assert!(provider.send_message(&invalid_role).await.is_err());
         assert_eq!(source.leases.load(Ordering::SeqCst), 0);
     }
 
