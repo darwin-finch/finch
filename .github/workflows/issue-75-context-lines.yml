@@ -7,6 +7,7 @@ on:
       - "src/cli/setup_wizard.rs"
       - "src/cli/repl_event/event_loop.rs"
       - "src/cli/repl_event/query_processor.rs"
+      - "src/cli/status_bar.rs"
       - "src/config/settings.rs"
       - ".github/workflows/issue-75-context-lines.yml"
   push:
@@ -15,6 +16,7 @@ on:
       - "src/cli/setup_wizard.rs"
       - "src/cli/repl_event/event_loop.rs"
       - "src/cli/repl_event/query_processor.rs"
+      - "src/cli/status_bar.rs"
       - "src/config/settings.rs"
       - ".github/workflows/issue-75-context-lines.yml"
   workflow_dispatch: {}
@@ -59,6 +61,7 @@ jobs:
           src/cli/setup_wizard.rs
           src/cli/repl_event/event_loop.rs
           src/cli/repl_event/query_processor.rs
+          src/cli/status_bar.rs
           src/config/settings.rs
       - name: Compile library regressions
         run: cargo test --lib --no-run
@@ -71,6 +74,7 @@ jobs:
       - name: Runtime status-strip budget regression
         run: |
           cargo test --lib cli::repl_event::query_processor::tests::test_context_strip_uses_selected_budget_and_removes_stale_rows -- --exact
+          cargo test --lib cli::repl_event::query_processor::tests::test_semantic_refresh_cannot_erase_active_brain_until_explicit_release -- --exact
           cargo test --lib cli::repl_event::event_loop::tests::canonical_brain_context_replaces_semantic_rows_within_one_budget -- --exact
       - name: Configuration bounds regression
         run: cargo test --lib config::settings::tests::test_context_lines_validation_enforces_status_strip_range -- --exact

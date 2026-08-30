@@ -638,7 +638,7 @@ pub(super) async fn refresh_context_strip(
     }
 }
 
-fn apply_context_summary_lines(
+pub(super) fn apply_context_summary_lines(
     status_bar: &StatusBar,
     summary_lines: &[String],
     context_lines: usize,
@@ -647,40 +647,28 @@ fn apply_context_summary_lines(
     let visible_lines = &summary_lines[..summary_lines.len().min(depth)];
     let n = visible_lines.len();
 
-    // Semantic-session and named-Brain context are alternative projections of
-    // the same configured status-strip budget. Never leave the other family
-    // behind when switching between them.
-    for index in 0..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(
-            index,
-        ));
-    }
-
     // Format each line with an appropriate prefix:
     //   single line                → "   └─ now: <text>"
     //   first of multiple          → "📋 <text>"
     //   middle lines               → "   ├─ <text>"
     //   last of multiple           → "   └─ now: <text>"
-    for (i, text) in visible_lines.iter().enumerate() {
-        let label = if n == 1 {
-            format!("   └─ now: {}", text)
-        } else if i == 0 {
-            format!("📋 {}", text)
-        } else if i == n - 1 {
-            format!("   └─ now: {}", text)
-        } else {
-            format!("   ├─ {}", text)
-        };
-        status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::ContextLine(i),
-            label,
-        );
-    }
-
-    // Remove stale slots beyond what we just wrote (depth change or short history)
-    for i in n..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::ContextLine(i));
-    }
+    let labels = visible_lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let label = if n == 1 {
+                format!("   └─ now: {}", text)
+            } else if i == 0 {
+                format!("📋 {}", text)
+            } else if i == n - 1 {
+                format!("   └─ now: {}", text)
+            } else {
+                format!("   ├─ {}", text)
+            };
+            label
+        })
+        .collect::<Vec<_>>();
+    status_bar.replace_semantic_context(&labels);
 }
 
 async fn persist_completed_turn_memory(
@@ -1952,10 +1940,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         for budget in 1..=8 {
-            status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::BrainContextLine(0),
-                "stale named-Brain context",
-            );
             apply_context_summary_lines(&status_bar, &summary, budget);
             let visible = status_bar
                 .get_lines()
@@ -1971,16 +1955,45 @@ mod tests {
             assert!(visible
                 .iter()
                 .all(|line| !line.content.contains("summary-7")));
-            assert!(status_bar.get_lines().iter().all(|line| !matches!(
-                line.line_type,
-                crate::cli::status_bar::StatusLineType::BrainContextLine(_)
-            )));
         }
 
         apply_context_summary_lines(&status_bar, &summary, 1);
         assert!(status_bar.get_lines().iter().all(|line| !matches!(
             line.line_type,
             crate::cli::status_bar::StatusLineType::ContextLine(_)
+        )));
+    }
+
+    #[test]
+    fn test_semantic_refresh_cannot_erase_active_brain_until_explicit_release() {
+        let status_bar = StatusBar::new();
+        status_bar.replace_brain_context(&["durable Brain row".to_string()]);
+
+        apply_context_summary_lines(&status_bar, &[], 5);
+        let active = status_bar.get_lines();
+        assert!(active.iter().any(|line| {
+            matches!(
+                line.line_type,
+                crate::cli::status_bar::StatusLineType::BrainContextLine(0)
+            ) && line.content == "durable Brain row"
+        }));
+        assert!(active.iter().all(|line| !matches!(
+            line.line_type,
+            crate::cli::status_bar::StatusLineType::ContextLine(_)
+        )));
+
+        status_bar.release_brain_context();
+        apply_context_summary_lines(&status_bar, &["semantic after detach".to_string()], 5);
+        let detached = status_bar.get_lines();
+        assert!(detached.iter().any(|line| {
+            matches!(
+                line.line_type,
+                crate::cli::status_bar::StatusLineType::ContextLine(0)
+            ) && line.content.contains("semantic after detach")
+        }));
+        assert!(detached.iter().all(|line| !matches!(
+            line.line_type,
+            crate::cli::status_bar::StatusLineType::BrainContextLine(_)
         )));
     }
 

@@ -6068,6 +6068,20 @@ Rules:\n\
                 home.acknowledge(snapshot.revision).await?;
             }
         } else {
+            self.status_bar.release_brain_context();
+            if let Some(memory) = self.memory_system.as_ref() {
+                let cwd = std::env::current_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
+                refresh_context_strip(
+                    memory,
+                    &self.session_label,
+                    &cwd,
+                    &self.status_bar,
+                    self.context_lines,
+                )
+                .await;
+            }
             self.status_bar.update_line(
                 crate::cli::status_bar::StatusLineType::SessionLabel,
                 if self.home_runner_lease_active {
@@ -8153,32 +8167,22 @@ fn project_brain_context(
     depth: usize,
     local_machine: Option<&str>,
 ) {
-    // Named-Brain and semantic-session summaries are alternative projections
-    // of the same configured line budget. Attaching a Brain must not retain a
-    // second, duplicate semantic block underneath it.
-    for index in 0..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::ContextLine(index));
-    }
     let lines = projected_brain_context_lines(events, depth, local_machine);
     let count = lines.len();
-    for (index, text) in lines.into_iter().enumerate() {
-        let label = if count == 1 || index + 1 == count {
-            format!("   └─ now: {text}")
-        } else if index == 0 {
-            format!("💬 {text}")
-        } else {
-            format!("   ├─ {text}")
-        };
-        status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::BrainContextLine(index),
-            label,
-        );
-    }
-    for index in count..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(
-            index,
-        ));
-    }
+    let labels = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            if count == 1 || index + 1 == count {
+                format!("   └─ now: {text}")
+            } else if index == 0 {
+                format!("💬 {text}")
+            } else {
+                format!("   ├─ {text}")
+            }
+        })
+        .collect::<Vec<_>>();
+    status_bar.replace_brain_context(&labels);
 }
 
 fn projected_brain_context_lines(
@@ -9389,6 +9393,23 @@ mod tests {
                 .count(),
             4
         );
+
+        super::super::query_processor::apply_context_summary_lines(
+            &status,
+            &["semantic must not win".to_string()],
+            5,
+        );
+        let still_brain = status.get_lines();
+        assert_eq!(
+            still_brain
+                .iter()
+                .filter(|line| matches!(line.line_type, StatusLineType::BrainContextLine(_)))
+                .count(),
+            4
+        );
+        assert!(still_brain
+            .iter()
+            .all(|line| !matches!(line.line_type, StatusLineType::ContextLine(_))));
     }
 
     #[test]
