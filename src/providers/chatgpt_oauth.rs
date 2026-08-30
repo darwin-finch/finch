@@ -959,16 +959,21 @@ mod tests {
                     &CancellationToken::new(),
                 )
                 .await
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("validation failed")
-                    || error.contains("nonce mismatch")
-                    || error.contains("signed account")
-                    || error.contains("signed plan"),
+                .unwrap_err();
+            let expected = if matches!(
+                defect,
+                "account" | "account-control" | "account-length" | "plan-control"
+            ) {
+                ChatGptAuthStageError::AccountEntitlement
+            } else {
+                ChatGptAuthStageError::ClientBinding
+            };
+            assert_eq!(
+                error.downcast_ref::<ChatGptAuthStageError>(),
+                Some(&expected),
                 "defect={defect} error={error}"
             );
-            assert!(!error.contains("secret"));
+            assert!(!format!("{error:#}").contains("secret"));
         }
     }
 
