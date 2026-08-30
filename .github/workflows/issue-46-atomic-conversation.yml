@@ -47,6 +47,7 @@ jobs:
         run: |
           cargo test --lib continuation_ -- --nocapture
           cargo test --lib cancelled_query_cannot_publish_late_provider_history -- --nocapture
+          cargo test --lib published_completion_cannot_be_reclassified_as_cancelled -- --nocapture
           cargo test --lib named_brain_effect_audit_cancellation_quiesces_without_late_tool_result -- --nocapture
           cargo test --lib effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publication -- --nocapture
           cargo test --lib effect_audit_raw_frontend_eof_reconciles_before_and_after_application_boundary -- --nocapture
