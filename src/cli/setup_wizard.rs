@@ -1291,7 +1291,8 @@ enum ChatGptSetupFailureCause {
     TokenExchangeRejected,
     TokenExchangeContract,
     IdentityVerification,
-    AccountBinding,
+    ClientBinding,
+    AccountEntitlement,
     Persistence,
     ProtocolOrOther,
 }
@@ -1764,8 +1765,11 @@ fn chatgpt_setup_failure_cause(error: &anyhow::Error) -> ChatGptSetupFailureCaus
             crate::providers::chatgpt_oauth::ChatGptAuthStageError::IdentityVerification => {
                 ChatGptSetupFailureCause::IdentityVerification
             }
-            crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountBinding => {
-                ChatGptSetupFailureCause::AccountBinding
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::ClientBinding => {
+                ChatGptSetupFailureCause::ClientBinding
+            }
+            crate::providers::chatgpt_oauth::ChatGptAuthStageError::AccountEntitlement => {
+                ChatGptSetupFailureCause::AccountEntitlement
             }
         };
     }
@@ -1789,7 +1793,8 @@ fn chatgpt_setup_failure_summary(cause: ChatGptSetupFailureCause) -> String {
         ChatGptSetupFailureCause::TokenExchangeRejected => "ChatGPT approved the browser sign-in, but rejected the authorization-code exchange. No credential was saved. Retry sign-in for a fresh code; if it repeats, update Finch.",
         ChatGptSetupFailureCause::TokenExchangeContract => "ChatGPT approved the browser sign-in, but its token response was incompatible with this Finch version. No credential was saved. Update Finch before retrying.",
         ChatGptSetupFailureCause::IdentityVerification => "ChatGPT approved the browser sign-in, but Finch could not verify the signed identity response. No credential was saved. Check connectivity to auth.openai.com and retry; update Finch if it repeats.",
-        ChatGptSetupFailureCause::AccountBinding => "ChatGPT approved the browser sign-in, but the signed account or requested scopes did not match the configured credential. No credential was saved. Retry with the intended account or choose another named credential.",
+        ChatGptSetupFailureCause::ClientBinding => "ChatGPT approved the browser sign-in, but the signed issuer, public client, or token lifetime did not match Finch's pinned ChatGPT contract. No credential was saved. Update Finch before retrying.",
+        ChatGptSetupFailureCause::AccountEntitlement => "ChatGPT approved the browser sign-in, but the signed response did not contain a usable ChatGPT account identifier. No credential was saved. Retry with the intended account; update Finch if it repeats.",
         ChatGptSetupFailureCause::Persistence => "ChatGPT sign-in was validated, but Finch could not save the named credential. No active credential was committed. Check local credential-store permissions before retrying.",
         ChatGptSetupFailureCause::ProtocolOrOther => "ChatGPT sign-in failed. No credential was saved. Retry sign-in or choose another provider/account action.",
     }
@@ -9270,8 +9275,8 @@ mod tests {
                 ]),
                 authorized_party: None,
                 subject: "subject-work".into(),
-                account_id: "acct-work".into(),
-                chatgpt_plan_type: "plus".into(),
+                account_id: Some("acct-work".into()),
+                chatgpt_plan_type: Some("plus".into()),
                 account_is_fedramp: false,
                 nonce: None,
                 expires_at: Utc::now() + chrono::TimeDelta::hours(1),
@@ -9777,9 +9782,14 @@ mod tests {
                 "signed identity",
             ),
             (
-                wrapped_stage(ChatGptAuthStageError::AccountBinding),
-                ChatGptSetupFailureCause::AccountBinding,
-                "signed account",
+                wrapped_stage(ChatGptAuthStageError::ClientBinding),
+                ChatGptSetupFailureCause::ClientBinding,
+                "public client",
+            ),
+            (
+                wrapped_stage(ChatGptAuthStageError::AccountEntitlement),
+                ChatGptSetupFailureCause::AccountEntitlement,
+                "account identifier",
             ),
             (
                 Err::<(), _>(anyhow::anyhow!("redacted persistence failure"))
