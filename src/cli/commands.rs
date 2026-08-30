@@ -679,6 +679,10 @@ fn parse_word_id(s: &str) -> Option<usize> {
     digits.parse::<usize>().ok()
 }
 
+/// Selection override shown wherever Finch documents transcript mouse controls.
+pub const MOUSE_SELECTION_HINT: &str =
+    "Mouse transcript controls on · hold Option (iTerm2) or Shift (many terminals) and drag to select text";
+
 pub fn format_help() -> String {
     use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
     let reset = SetAttribute(Attribute::Reset);
@@ -690,6 +694,7 @@ pub fn format_help() -> String {
     let cyan_bold = format!("{}{}", SetAttribute(Attribute::Bold), cyan);
     let green_bold = format!("{}{}", SetAttribute(Attribute::Bold), green);
     let yellow_bold = format!("{}{}", SetAttribute(Attribute::Bold), yellow);
+    let mouse_selection_hint = MOUSE_SELECTION_HINT;
     format!("{cyan_bold}╔═══════════════════════════════════════════════════════════════════════╗{reset}\n\
          {cyan_bold}║{reset}                   {green_bold}Finch Help - Commands & Shortcuts{reset}                   {cyan_bold}║{reset}\n\
          {cyan_bold}╚═══════════════════════════════════════════════════════════════════════╝{reset}\n\n\
@@ -770,7 +775,8 @@ pub fn format_help() -> String {
          {cyan}  Shift+Enter{reset}        Multi-line input (insert newline)\n\
          {cyan}  Shift+PgUp{reset}         Scroll up in history\n\
          {cyan}  Shift+PgDown{reset}       Scroll down in history\n\
-         {gray}  ↑ / ↓ arrows{reset}       Navigate command history\n\n\
+         {gray}  ↑ / ↓ arrows{reset}       Navigate command history\n\
+         {gray}  {mouse_selection_hint}{reset}\n\n\
          {yellow_bold}🛠️  Tool Execution:{reset}\n\
          When Claude needs to use tools (read files, run commands, etc.), you'll\n\
          be asked to approve each action. You can:\n\
@@ -1026,6 +1032,13 @@ pub fn format_training(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_help_includes_terminal_specific_mouse_selection_hint() {
+        assert!(format_help().contains(MOUSE_SELECTION_HINT));
+        assert!(MOUSE_SELECTION_HINT.contains("Option (iTerm2)"));
+        assert!(MOUSE_SELECTION_HINT.contains("Shift (many terminals)"));
+    }
 
     #[test]
     fn forth_commands_have_only_the_typed_public_entry_point() {

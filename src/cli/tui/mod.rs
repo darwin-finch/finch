@@ -65,17 +65,18 @@ enum TerminalActivation {
     EmergencyRestore,
 }
 
-/// Enable only the terminal modes owned by Finch's default REPL.
-///
-/// Mouse capture is deliberately absent: terminals use click-drag for native
-/// text selection and copying when applications leave mouse reporting alone.
+/// Enable the terminal modes owned by Finch's default REPL.
 fn activate_default_terminal_modes<W: Write>(
     mut writer: W,
     activation: TerminalActivation,
 ) -> io::Result<()> {
     match activation {
         TerminalActivation::Startup => {
-            execute!(writer, crossterm::event::EnableBracketedPaste)?;
+            execute!(
+                writer,
+                crossterm::event::EnableBracketedPaste,
+                crossterm::event::EnableMouseCapture
+            )?;
             execute!(
                 writer,
                 crossterm::event::PushKeyboardEnhancementFlags(
@@ -83,10 +84,13 @@ fn activate_default_terminal_modes<W: Write>(
                 )
             )?;
         }
-        TerminalActivation::Resume => {}
+        TerminalActivation::Resume => {
+            execute!(writer, crossterm::event::EnableMouseCapture)?;
+        }
         TerminalActivation::EmergencyRestore => {
             execute!(
                 writer,
+                crossterm::event::EnableMouseCapture,
                 crossterm::event::EnableBracketedPaste,
                 crossterm::event::PushKeyboardEnhancementFlags(
                     crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
@@ -100,9 +104,8 @@ fn activate_default_terminal_modes<W: Write>(
 
 /// Restore terminal modes owned by the default REPL.
 ///
-/// Disabling mouse capture is intentionally defensive even though Finch does
-/// not enable it: this also repairs a stale mode left by an older Finch or an
-/// interrupted nested TUI before control returns to the user's shell.
+/// Mouse capture is disabled symmetrically so native selection is restored
+/// before control returns to the user's shell.
 fn restore_default_terminal_modes<W: Write>(mut writer: W) -> io::Result<()> {
     execute!(
         writer,
@@ -2321,7 +2324,8 @@ impl TuiRenderer {
     pub fn startup_header(model: &str, cwd: &str, session_label: &str) -> String {
         let version = env!("CARGO_PKG_VERSION");
         format!(
-            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲"
+            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲\n\n{}",
+            crate::cli::commands::MOUSE_SELECTION_HINT,
         )
     }
 }
@@ -3883,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_terminal_activation_never_enables_mouse_capture() {
+    fn test_default_terminal_activation_enables_clickable_transcript_mouse_capture() {
         let enable_mouse = mouse_capture_sequence(true);
         for activation in [
             TerminalActivation::Startup,
@@ -3892,10 +3896,7 @@ mod tests {
         ] {
             let mut bytes = Vec::new();
             activate_default_terminal_modes(&mut bytes, activation).unwrap();
-            assert!(
-                !contains_bytes(&bytes, &enable_mouse),
-                "default TUI activation emitted mouse capture"
-            );
+            assert!(contains_bytes(&bytes, &enable_mouse));
         }
     }
 
@@ -3926,6 +3927,7 @@ mod tests {
         assert!(header.contains("finch v"));
         assert!(header.contains("grok-code-fast-1"));
         assert!(header.contains("amber-river  ·  ~/repo"));
+        assert!(header.contains(crate::cli::commands::MOUSE_SELECTION_HINT));
         assert!(!header.contains('\x1b'));
     }
 

@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_keyboard_controls_expand_and_collapse_without_mouse_capture() {
+    fn test_keyboard_controls_expand_and_collapse_independently_of_mouse_input() {
         let work = Arc::new(WorkUnit::new("Tools"));
         let call = work.add_row("bash(echo selectable)");
         work.complete_row_with_body(call, "1 line", vec!["selectable".into()]);
