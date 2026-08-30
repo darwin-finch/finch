@@ -1208,9 +1208,7 @@ mod tests {
                     kind: CredentialKind::Bearer,
                     provider: CredentialProvider::ChatgptSubscription,
                     issuer: "openai-chatgpt".into(),
-                    audience: AudienceBinding::standard(
-                        crate::config::EndpointFamily::ChatgptSubscription,
-                    ),
+                    audience: AudienceBinding::custom(endpoint).unwrap(),
                     tenant: None,
                     project: None,
                     account: Some("chat-account".into()),

@@ -538,7 +538,7 @@ mod tests {
             CredentialProvider::ChatgptSubscription => (
                 CredentialKind::Bearer,
                 "openai-chatgpt",
-                AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+                AudienceBinding::custom(origin).unwrap(),
                 Some(origin.to_string()),
             ),
             CredentialProvider::GoogleVertex => (
