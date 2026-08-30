@@ -1371,7 +1371,10 @@ impl ChatGptSetupRecoveryEditor for TerminalChatGptSetupRecoveryEditor {
 }
 
 enum ChatGptSetupAttempt {
-    Ready(crate::config::Config),
+    Ready {
+        config: crate::config::Config,
+        compensations: Vec<crate::cli::chatgpt_auth::ChatGptCompensationHandle>,
+    },
     Recoverable(ChatGptSetupRecovery),
 }
 
@@ -1399,12 +1402,12 @@ pub async fn validate_and_apply_for(
     }
     let service = crate::cli::chatgpt_auth::ChatGptAuthService::production()?;
     let mut editor = TerminalChatGptSetupRecoveryEditor;
-    let Some((config, committed_result)) =
+    let Some((config, committed_result, compensations)) =
         run_chatgpt_setup_recovery_loop(invocation, result, &service, &mut editor).await?
     else {
         return Ok(SetupApplyOutcome::Cancelled);
     };
-    config.save()?;
+    save_chatgpt_setup_config(&config, &compensations, &service, |config| config.save())?;
     if let Some(prompt) = committed_result.custom_system_prompt.as_deref() {
         crate::config::Persona::save_system_prompt_override(
             &committed_result.default_persona,
@@ -1414,6 +1417,28 @@ pub async fn validate_and_apply_for(
     Ok(SetupApplyOutcome::Saved)
 }
 
+fn save_chatgpt_setup_config<A, F>(
+    config: &crate::config::Config,
+    compensations: &[crate::cli::chatgpt_auth::ChatGptCompensationHandle],
+    authenticator: &A,
+    save: F,
+) -> Result<()>
+where
+    A: crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator,
+    F: FnOnce(&crate::config::Config) -> Result<()>,
+{
+    if let Err(error) = save(config) {
+        let failures = compensate_chatgpt_setup(authenticator, compensations);
+        if !failures.is_empty() {
+            anyhow::bail!("ChatGPT setup configuration could not be saved or rolled back safely. Run `finch auth status chatgpt` before trying again");
+        }
+        return Err(error).context(
+            "ChatGPT setup configuration was not saved; newly issued credentials were rolled back",
+        );
+    }
+    Ok(())
+}
+
 const MAX_CHATGPT_SETUP_ATTEMPTS: usize = 8;
 
 async fn run_chatgpt_setup_recovery_loop<A, E>(
@@ -1421,7 +1446,13 @@ async fn run_chatgpt_setup_recovery_loop<A, E>(
     result: &SetupResult,
     authenticator: &A,
     editor: &mut E,
-) -> Result<Option<(crate::config::Config, SetupResult)>>
+) -> Result<
+    Option<(
+        crate::config::Config,
+        SetupResult,
+        Vec<crate::cli::chatgpt_auth::ChatGptCompensationHandle>,
+    )>,
+>
 where
     A: crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator,
     E: ChatGptSetupRecoveryEditor,
@@ -1447,7 +1478,10 @@ where
         let _ = signal.await;
 
         match attempt? {
-            ChatGptSetupAttempt::Ready(config) => return Ok(Some((config, working))),
+            ChatGptSetupAttempt::Ready {
+                config,
+                compensations,
+            } => return Ok(Some((config, working, compensations))),
             ChatGptSetupAttempt::Recoverable(recovery) => match editor.choose(&recovery)? {
                 ChatGptSetupRecoveryAction::RetrySignIn => {}
                 ChatGptSetupRecoveryAction::ChangeNamedCredential(replacement) => {
@@ -1544,7 +1578,7 @@ where
     )
     .await?
     {
-        ChatGptSetupAttempt::Ready(config) => Ok(config),
+        ChatGptSetupAttempt::Ready { config, .. } => Ok(config),
         ChatGptSetupAttempt::Recoverable(recovery) => anyhow::bail!(recovery.summary),
     }
 }
@@ -1669,7 +1703,10 @@ where
             summary: chatgpt_setup_failure_summary(cause),
         }));
     }
-    Ok(ChatGptSetupAttempt::Ready(config))
+    Ok(ChatGptSetupAttempt::Ready {
+        config,
+        compensations,
+    })
 }
 
 fn chatgpt_setup_failure_cause(error: &anyhow::Error) -> ChatGptSetupFailureCause {
@@ -1708,7 +1745,7 @@ fn chatgpt_setup_failure_cause(error: &anyhow::Error) -> ChatGptSetupFailureCaus
 fn chatgpt_setup_failure_summary(cause: ChatGptSetupFailureCause) -> String {
     match cause {
         ChatGptSetupFailureCause::Cancelled => "ChatGPT sign-in was cancelled. No credential was saved. You can retry, change the named credential, remove the provider, or cancel setup.",
-        ChatGptSetupFailureCause::Expired => "ChatGPT sign-in expired. No credential was saved. Retry sign-in to request a fresh one-time code.",
+        ChatGptSetupFailureCause::Expired => "ChatGPT sign-in expired. No credential was saved. If device login is not enabled for this account or workspace, enable device-code authorization in ChatGPT Settings > Security, then Retry sign-in for a fresh one-time code.",
         ChatGptSetupFailureCause::Denied => "ChatGPT sign-in was denied. No credential was saved. Choose Retry sign-in, change the named credential, remove the provider, or cancel setup.",
         ChatGptSetupFailureCause::StartDisabledOrUnsupported => "ChatGPT device authorization is disabled or unsupported for this account. Check ChatGPT Settings > Security, then choose Retry sign-in. No credential was saved.",
         ChatGptSetupFailureCause::ProviderRejected => "ChatGPT rejected the sign-in request. No credential was saved. Retry sign-in or choose another provider/account action.",
@@ -9169,6 +9206,204 @@ mod tests {
         active: std::sync::atomic::AtomicUsize,
     }
 
+    #[derive(Clone)]
+    struct RealRetryVerifier;
+
+    #[async_trait::async_trait]
+    impl crate::providers::chatgpt_oauth::OpenAiTokenVerifier for RealRetryVerifier {
+        fn preflight(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify(
+            &self,
+            _id_token: Option<&str>,
+            _access_token: &str,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<crate::providers::chatgpt_oauth::VerifiedOpenAiClaims> {
+            Ok(crate::providers::chatgpt_oauth::VerifiedOpenAiClaims {
+                issuer: crate::providers::chatgpt_oauth::REQUIRED_TOKEN_ISSUER.into(),
+                audiences: std::collections::BTreeSet::from([
+                    crate::providers::chatgpt_oauth::OPENAI_PUBLIC_CLIENT_ID.into(),
+                ]),
+                authorized_party: None,
+                access_audiences: std::collections::BTreeSet::from([
+                    crate::providers::chatgpt_oauth::OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.into(),
+                ]),
+                subject: "subject-work".into(),
+                account_id: "acct-work".into(),
+                chatgpt_plan_type: "plus".into(),
+                account_is_fedramp: false,
+                scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+                nonce: None,
+                expires_at: Utc::now() + chrono::TimeDelta::hours(1),
+                not_before: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RealRetryHttpState {
+        starts: std::sync::Mutex<Vec<String>>,
+        first_poll_finished: std::sync::atomic::AtomicBool,
+        second_start_after_first_poll: std::sync::atomic::AtomicBool,
+        first_polls: std::sync::atomic::AtomicUsize,
+        second_polls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct RealRetryHttpServer {
+        origin: String,
+        state: std::sync::Arc<RealRetryHttpState>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RealRetryHttpServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let state = std::sync::Arc::new(RealRetryHttpState::default());
+            let app = axum::Router::new()
+                .fallback(axum::routing::post(real_retry_http_handler))
+                .with_state(state.clone());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                origin,
+                state,
+                task,
+            }
+        }
+    }
+
+    impl Drop for RealRetryHttpServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn real_retry_http_handler(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<RealRetryHttpState>>,
+        request: axum::extract::Request,
+    ) -> axum::http::Response<axum::body::Body> {
+        use base64::Engine;
+        use sha2::Digest;
+        let path = request.uri().path().to_string();
+        let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let (status, response) = match path.as_str() {
+            "/api/accounts/deviceauth/usercode" => {
+                let mut starts = state.starts.lock().unwrap();
+                let attempt = starts.len() + 1;
+                starts.push(format!("device-{attempt}|CODE-{attempt}"));
+                if attempt == 2 {
+                    state.second_start_after_first_poll.store(
+                        state
+                            .first_poll_finished
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({
+                        "device_auth_id": format!("device-{attempt}"),
+                        "user_code": format!("CODE-{attempt}"),
+                        "interval": "0"
+                    }),
+                )
+            }
+            "/api/accounts/deviceauth/token" => {
+                match json
+                    .get("device_auth_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("device-1") => {
+                        state
+                            .first_polls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        state
+                            .first_poll_finished
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            serde_json::json!({"ignored": "first-body-secret"}),
+                        )
+                    }
+                    Some("device-2") => {
+                        state
+                            .second_polls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let verifier = "second-pkce-verifier";
+                        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+                        (
+                            axum::http::StatusCode::OK,
+                            serde_json::json!({
+                                "authorization_code": "second-authorization-code",
+                                "code_verifier": verifier,
+                                "code_challenge": challenge
+                            }),
+                        )
+                    }
+                    _ => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        serde_json::json!({"error": "unknown-device"}),
+                    ),
+                }
+            }
+            "/oauth/token" => (
+                axum::http::StatusCode::OK,
+                serde_json::json!({
+                    "access_token": "successful-access-secret",
+                    "refresh_token": "successful-refresh-secret",
+                    "id_token": "successful-id-secret",
+                    "expires_in": 3600
+                }),
+            ),
+            _ => (
+                axum::http::StatusCode::NOT_FOUND,
+                serde_json::json!({"error": "unexpected-path"}),
+            ),
+        };
+        axum::http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response.to_string()))
+            .unwrap()
+    }
+
+    struct RealRetryAuthenticator {
+        client: crate::oauth::OAuthClient<
+            crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect<RealRetryVerifier>,
+            crate::oauth::file_store::FileOAuthCredentialStore,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator for RealRetryAuthenticator {
+        async fn ensure_named_credential(
+            &self,
+            reference: &str,
+            presentation: crate::cli::chatgpt_auth::DeviceLoginPresentation,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::cli::chatgpt_auth::EnsuredChatGptCredential> {
+            let credential = crate::cli::chatgpt_auth::login_device_with(
+                &self.client,
+                reference,
+                presentation,
+                cancel,
+            )
+            .await?;
+            Ok(crate::cli::chatgpt_auth::EnsuredChatGptCredential {
+                credential,
+                compensation: None,
+            })
+        }
+    }
+
     impl ScriptedRecoveryAuthenticator {
         fn new(outcomes: impl IntoIterator<Item = ScriptedChatGptOutcome>) -> Self {
             Self {
@@ -9489,7 +9724,7 @@ mod tests {
                 ScriptedChatGptOutcome::Success,
             ]);
             let mut editor = ScriptedRecoveryEditor::new([ChatGptSetupRecoveryAction::RetrySignIn]);
-            let (config, committed) =
+            let (config, committed, _) =
                 run_chatgpt_setup_recovery_loop(invocation, &result, &authenticator, &mut editor)
                     .await
                     .unwrap()
@@ -9522,6 +9757,92 @@ mod tests {
                     .load(std::sync::atomic::Ordering::SeqCst),
                 0
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_retry_crosses_real_oauth_boundary_with_fresh_quiescent_ceremony() {
+        use crate::oauth::OAuthCredentialStore;
+        let server = RealRetryHttpServer::start().await;
+        let temporary = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::oauth::file_store::FileOAuthCredentialStore::new(
+            temporary.path().join("oauth"),
+        ));
+        let dialect = crate::providers::chatgpt_oauth::OpenAiChatGptOAuthDialect::for_test(
+            &server.origin,
+            std::sync::Arc::new(RealRetryVerifier),
+        )
+        .unwrap();
+        let authenticator = RealRetryAuthenticator {
+            client: crate::oauth::OAuthClient::new(std::sync::Arc::new(dialect), store.clone())
+                .unwrap(),
+        };
+        let result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let mut editor = ScriptedRecoveryEditor::new([ChatGptSetupRecoveryAction::RetrySignIn]);
+        let (config, _, _) = run_chatgpt_setup_recovery_loop(
+            SetupInvocation::Command,
+            &result,
+            &authenticator,
+            &mut editor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let starts = server.state.starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[0], starts[1]);
+        drop(starts);
+        assert!(server
+            .state
+            .second_start_after_first_poll
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            server
+                .state
+                .first_polls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            server
+                .state
+                .second_polls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(editor.recoveries.len(), 1);
+        assert_eq!(
+            editor.recoveries[0].cause,
+            ChatGptSetupFailureCause::ProviderRejected
+        );
+        let record = store.load("chatgpt:work").unwrap().unwrap();
+        assert_eq!(record.account, "acct-work");
+        assert!(!record.revoked && !record.mutation_pending);
+        assert_eq!(config.credentials().len(), 1);
+        assert_eq!(config.credentials()[0].name, "chatgpt:work");
+        assert_eq!(
+            config.credentials()[0].account.as_deref(),
+            Some("acct-work")
+        );
+        assert!(store.load("device-1").unwrap().is_none());
+        let rendered = format!(
+            "{:?}\n{}",
+            editor.recoveries[0].cause, editor.recoveries[0].summary
+        );
+        for secret in [
+            "device-1",
+            "CODE-1",
+            "first-body-secret",
+            "successful-access-secret",
+            "successful-refresh-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
         }
     }
 
@@ -9625,7 +9946,7 @@ mod tests {
             ScriptedRecoveryEditor::new([ChatGptSetupRecoveryAction::ChangeNamedCredential(
                 "chatgpt:replacement".into(),
             )]);
-        let (config, committed) = run_chatgpt_setup_recovery_loop(
+        let (config, committed, _) = run_chatgpt_setup_recovery_loop(
             SetupInvocation::Command,
             &result,
             &authenticator,
@@ -9650,7 +9971,7 @@ mod tests {
         ]);
         let mut remove_editor =
             ScriptedRecoveryEditor::new([ChatGptSetupRecoveryAction::RemoveProvider]);
-        let (_, removed) = run_chatgpt_setup_recovery_loop(
+        let (_, removed, _) = run_chatgpt_setup_recovery_loop(
             SetupInvocation::Command,
             &result,
             &remove_auth,
@@ -9914,6 +10235,58 @@ mod tests {
             assert!(!record.revoked && !record.mutation_pending);
             assert!(record.access_token.starts_with("secret-access-"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_injected_save_failure_compensates_owned_generation_without_config_mutation() {
+        use crate::oauth::OAuthCredentialStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("oauth");
+        let config_path = temporary.path().join("config.toml");
+        std::fs::write(&config_path, "prior-config-sentinel").unwrap();
+        let result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let authenticator = DurableSetupAuthenticator {
+            root: root.clone(),
+            fail_reference: None,
+            invalid_final_reference: None,
+            replace_before_compensation: None,
+        };
+        let mut editor = ScriptedRecoveryEditor::new([]);
+        let (config, _, compensations) = run_chatgpt_setup_recovery_loop(
+            SetupInvocation::Command,
+            &result,
+            &authenticator,
+            &mut editor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let error = save_chatgpt_setup_config(&config, &compensations, &authenticator, |_| {
+            anyhow::bail!("forced-save-failure-sentinel")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("newly issued credentials were rolled back"),
+            "{error}"
+        );
+        assert!(!error.contains("secret-access"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(config_path).unwrap(),
+            "prior-config-sentinel"
+        );
+        let record = crate::oauth::file_store::FileOAuthCredentialStore::new(root)
+            .load("chatgpt:work")
+            .unwrap()
+            .unwrap();
+        assert!(record.revoked && !record.mutation_pending);
+        assert!(record.access_token.is_empty());
+        assert!(record.refresh_token.is_none() && record.id_token.is_none());
     }
 
     #[cfg(unix)]

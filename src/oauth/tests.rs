@@ -522,6 +522,70 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
 }
 
 #[tokio::test]
+async fn device_start_http_cancellation_retains_typed_terminal_cause_through_context() {
+    let server = FakeServer::start().await;
+    server.push_delayed(
+        "/alpha/device",
+        StatusCode::OK,
+        json!({
+            "device_code": "must-not-complete",
+            "user_code": "MUST-NOT-COMPLETE",
+            "verification_uri": "https://login.example/device",
+            "expires_in": 600,
+            "interval": 1
+        }),
+        Duration::from_secs(30),
+    );
+    let client = OAuthClient::new(
+        Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+        Arc::new(MemoryStore::default()),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let pending = client.begin_device_authorization_cancellable(cancel.clone());
+    tokio::pin!(pending);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cancel.cancel();
+    let error = pending.await.unwrap_err().context("setup start context");
+    assert!(error.chain().any(|source| matches!(
+        source.downcast_ref::<OAuthDeviceAuthorizationError>(),
+        Some(OAuthDeviceAuthorizationError::Cancelled)
+    )));
+    assert_eq!(server.request_count("/alpha/device"), 1);
+}
+
+#[tokio::test]
+async fn generic_oauth_http_cancellation_is_not_mislabeled_as_device_authorization() {
+    let server = FakeServer::start().await;
+    server.push_delayed(
+        "/alpha/token",
+        StatusCode::OK,
+        json!({"access_token": "must-not-complete"}),
+        Duration::from_secs(30),
+    );
+    let client = OAuthClient::new(
+        Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+        Arc::new(MemoryStore::default()),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let request = OAuthHttpRequest {
+        endpoint: format!("{}/alpha/token", server.origin),
+        body: OAuthRequestBody::Json(json!({"grant_type": "refresh_token"})),
+    };
+    let pending = client.post_form_bytes_cancellable(request, &cancel);
+    tokio::pin!(pending);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cancel.cancel();
+    let error = pending.await.unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert!(!error.chain().any(|source| source
+        .downcast_ref::<OAuthDeviceAuthorizationError>()
+        .is_some()));
+    assert_eq!(server.request_count("/alpha/token"), 1);
+}
+
+#[tokio::test]
 async fn device_deadline_and_shared_completion_claim_cannot_be_restarted_or_duplicated() {
     let server = FakeServer::start().await;
     let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));

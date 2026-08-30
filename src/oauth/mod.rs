@@ -579,7 +579,13 @@ where
         cancel: CancellationToken,
     ) -> Result<DeviceAuthorization> {
         let request = self.dialect.device_authorization_request()?;
-        let (status, body) = self.post_form_bytes_cancellable(request, &cancel).await?;
+        let (status, body) = match self.post_form_bytes_cancellable(request, &cancel).await {
+            Ok(response) => response,
+            Err(error) if cancel.is_cancelled() => {
+                return Err(error).context(OAuthDeviceAuthorizationError::Cancelled)
+            }
+            Err(error) => return Err(error),
+        };
         let pending = self
             .dialect
             .parse_device_authorization_response(status, &body)
