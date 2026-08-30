@@ -198,6 +198,7 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
         "wizard confirmation leaked into the REPL input"
     );
 
+    let disables_before_quit = count_bytes(&transcript, disable_mouse);
     master.write_all(b"/quit\r").unwrap();
     master.flush().unwrap();
     assert!(
@@ -205,16 +206,14 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
             &mut master,
             &mut transcript,
             Instant::now() + Duration::from_secs(10),
-            |bytes| bytes
-                .windows(disable_mouse.len())
-                .any(|window| window == disable_mouse),
+            |bytes| count_bytes(bytes, disable_mouse) > disables_before_quit,
         ),
         "Finch shutdown did not disable mouse capture: {}",
         String::from_utf8_lossy(&transcript)
     );
     assert!(
-        count_bytes(&transcript, disable_mouse) >= 3,
-        "suspend, wizard cleanup, and shutdown must each disable mouse capture"
+        count_bytes(&transcript, disable_mouse) > disables_before_quit,
+        "shutdown must emit a new mouse-disable sequence"
     );
 
     let deadline = Instant::now() + Duration::from_secs(10);

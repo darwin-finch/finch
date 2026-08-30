@@ -13,6 +13,10 @@ static INPUT_PAUSED: AtomicBool = AtomicBool::new(false);
 static INPUT_PAUSE_REQUEST: AtomicU64 = AtomicU64::new(0);
 static INPUT_PAUSE_ACKNOWLEDGED: AtomicU64 = AtomicU64::new(0);
 
+fn acknowledge_current_input_pause(request: &AtomicU64, acknowledged: &AtomicU64) {
+    acknowledged.store(request.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
 /// Exclusive ownership token for another in-process terminal UI.
 pub(crate) struct InputTaskPauseGuard;
 
@@ -172,9 +176,11 @@ pub fn spawn_input_task(
 
         loop {
             if INPUT_PAUSED.load(Ordering::SeqCst) {
-                INPUT_PAUSE_ACKNOWLEDGED
-                    .store(INPUT_PAUSE_REQUEST.load(Ordering::SeqCst), Ordering::SeqCst);
                 while INPUT_PAUSED.load(Ordering::SeqCst) {
+                    acknowledge_current_input_pause(
+                        &INPUT_PAUSE_REQUEST,
+                        &INPUT_PAUSE_ACKNOWLEDGED,
+                    );
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 continue;
@@ -727,6 +733,18 @@ pub fn spawn_input_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_paused_reader_reacknowledges_late_generation() {
+        let request = AtomicU64::new(0);
+        let acknowledged = AtomicU64::new(0);
+
+        acknowledge_current_input_pause(&request, &acknowledged);
+        request.store(1, Ordering::SeqCst);
+        acknowledge_current_input_pause(&request, &acknowledged);
+
+        assert_eq!(acknowledged.load(Ordering::SeqCst), 1);
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
