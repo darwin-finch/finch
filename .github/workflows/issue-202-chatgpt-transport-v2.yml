@@ -48,7 +48,7 @@ jobs:
       - name: Compile library and binary tests
         run: cargo test --no-run
       - name: Native subscription protocol regressions
-        run: cargo test --lib providers::chatgpt_subscription::
+        run: "cargo test --lib providers::chatgpt_subscription::"
       - name: Credential and factory boundary regressions
         run: |
           cargo test --lib providers::chatgpt_oauth::
