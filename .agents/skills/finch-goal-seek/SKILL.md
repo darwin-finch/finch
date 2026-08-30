@@ -1,9 +1,9 @@
 ---
-name: finch-fix-shit
+name: finch-goal-seek
 description: Autonomously work Finch's highest-priority unblocked GitHub issues through isolated implementation, regression testing, independent review, merge evidence, and frontier recomputation. Use for Finch backlog, dogfood, release-gate, issue-swarm, or "FIX SHIT" requests; do not use for a single read-only question or an unrelated repository.
 ---
 
-# Finch Fix Shit
+# Finch Goal Seek
 
 Drive an outcome-level Finch goal until its stated gate is genuinely satisfied. Treat a merged patch as progress, not as the terminal condition.
 
