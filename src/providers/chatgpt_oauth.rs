@@ -837,10 +837,12 @@ mod tests {
             }
         }
 
-        let error = dialect
+        let error = match dialect
             .parse_device_poll(StatusCode::BAD_REQUEST, json!({"error": "body-sentinel"}))
-            .unwrap_err()
-            .to_string();
+        {
+            Ok(_) => panic!("unexpected successful poll response"),
+            Err(error) => error.to_string(),
+        };
         assert!(error.contains("HTTP 400"), "{error}");
         assert!(!error.contains("body-sentinel"), "{error}");
     }

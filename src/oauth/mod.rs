@@ -665,8 +665,10 @@ where
                 }
                 DevicePoll::AuthorizationCode(grant) => {
                     let request = self.dialect.authorization_code_request(&grant)?;
-                    let (status, body) =
+                    let (status, body_bytes) =
                         self.post_device_request(request, &cancel, deadline).await?;
+                    let body = serde_json::from_slice(&body_bytes)
+                        .context("OAuth token response was malformed JSON")?;
                     self.dialect
                         .validate_tokens(
                             status,
