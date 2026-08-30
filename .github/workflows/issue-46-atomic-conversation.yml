@@ -1,0 +1,57 @@
+name: Issue 46 atomic conversation rounds
+
+on:
+  push:
+    branches:
+      - codex/issue-46-atomic-conversation-v2
+  pull_request:
+    paths:
+      - ".github/workflows/issue-46-atomic-conversation.yml"
+      - "src/cli/conversation.rs"
+      - "src/cli/memtree_console/event_handler.rs"
+      - "src/cli/repl_event/**"
+      - "src/providers/claude.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  atomic-rounds:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test atomic history and provider boundary
+        run: |
+          cargo test --lib cli::conversation::tests -- --nocapture
+          cargo test --lib provider_request_boundary_observes_only_complete_tool_pairs -- --nocapture
+      - name: Test event admission and cancellation boundaries
+        run: |
+          cargo test --lib continuation_ -- --nocapture
+          cargo test --lib named_brain_effect_audit_cancellation_quiesces_without_late_tool_result -- --nocapture
+          cargo test --lib effect_audit_provider_turn_cancel_disconnect_late_finish_has_no_publication -- --nocapture
+          cargo test --lib effect_audit_raw_frontend_eof_reconciles_before_and_after_application_boundary -- --nocapture
+          cargo test --lib stale_lease_cannot_use_a_replacement_callback -- --nocapture
+      - name: Check minimal feature graph
+        if: runner.os == 'Linux'
+        run: cargo check --no-default-features
+      - name: Release-mode atomic history regression
+        if: runner.os == 'Linux'
+        run: cargo test --release --lib cli::conversation::tests -- --nocapture
