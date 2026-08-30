@@ -1007,7 +1007,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unrecognized"));
+        assert!(error.contains("token exchange was rejected (HTTP 400 Bad Request)"));
         assert!(!error.contains(marker));
 
         let mut short = claims();
