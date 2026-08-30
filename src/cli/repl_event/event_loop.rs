@@ -67,6 +67,7 @@ async fn commit_tool_round_and_continue(
     query_id: Uuid,
     round_token: ToolRoundToken,
     llm_tx: &mpsc::UnboundedSender<LlmRequest>,
+    checkpoint_path: Option<&std::path::Path>,
 ) -> std::result::Result<(), crate::cli::conversation::ToolRoundError> {
     let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -85,19 +86,32 @@ async fn commit_tool_round_and_continue(
         .await
         .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?
         .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?;
-    conversation
-        .write()
-        .await
-        .commit_tool_round(query_id, round_token)?;
+    {
+        let mut history = conversation.write().await;
+        history.commit_tool_round(query_id, round_token)?;
+        if let Some(path) = checkpoint_path {
+            if let Err(error) = history.save(path) {
+                history.rollback_last_tool_round(query_id, round_token)?;
+                return Err(
+                    crate::cli::conversation::ToolRoundError::PersistenceUnavailable(
+                        error.to_string(),
+                    ),
+                );
+            }
+        }
+    }
     let _ = admit_tx.send(());
     if !matches!(
         tokio::time::timeout(std::time::Duration::from_secs(2), spawned_rx).await,
         Ok(Ok(()))
     ) {
-        conversation
-            .write()
-            .await
-            .rollback_last_tool_round(query_id, round_token)?;
+        let mut history = conversation.write().await;
+        history.rollback_last_tool_round(query_id, round_token)?;
+        if let Some(path) = checkpoint_path {
+            history.save(path).map_err(|error| {
+                crate::cli::conversation::ToolRoundError::PersistenceUnavailable(error.to_string())
+            })?;
+        }
         return Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable);
     }
     conversation.write().await.finalize_tool_round_commit();
@@ -1818,6 +1832,7 @@ impl EventLoop {
         mode: Arc<RwLock<ReplMode>>,
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
+        session_uuid: Uuid,
         available_providers: Vec<crate::config::ProviderEntry>,
         active_provider_index: usize,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
@@ -2004,7 +2019,7 @@ impl EventLoop {
             session_label,
             participant_subject,
             runner_subject,
-            session_uuid: Uuid::new_v4(),
+            session_uuid,
             cwd: String::new(), // populated at the start of run()
             context_lines,
             max_verbatim_messages,
@@ -3615,6 +3630,7 @@ Rules:\n\
                 .await
                 .add_user_message_with_images(input.clone(), &pending_images);
         }
+        self.checkpoint_conversation().await?;
 
         // Update compaction percentage in status bar
         self.update_compaction_status().await;
@@ -4077,24 +4093,22 @@ Rules:\n\
             }
 
             ReplEvent::QueryComplete { query_id, response } => {
-                // Add response to conversation
-                self.conversation
-                    .write()
+                if !self
+                    .query_states
+                    .try_publish_completion(
+                        query_id,
+                        response.clone(),
+                        response.clone(),
+                        &self.conversation,
+                    )
                     .await
-                    .add_assistant_message(response.clone());
+                {
+                    return Ok(());
+                }
+                self.checkpoint_conversation().await?;
 
                 // Update compaction percentage in status bar
                 self.update_compaction_status().await;
-
-                // Update query state
-                self.query_states
-                    .update_state(
-                        query_id,
-                        QueryState::Completed {
-                            response: response.clone(),
-                        },
-                    )
-                    .await;
 
                 // Display response
                 self.output_manager.write_response(&response);
@@ -4389,34 +4403,41 @@ Rules:\n\
                 // sending StreamingComplete. The non-streaming path does not — it relies on
                 // this handler to do both. Detect which case we are in.
                 let already_completed = matches!(state, Some(QueryState::Completed { .. }));
+                if matches!(
+                    state,
+                    Some(QueryState::Cancelled | QueryState::Failed { .. })
+                ) {
+                    tracing::debug!(
+                        "Discarding terminal provider response for closed query {}",
+                        query_id
+                    );
+                    return Ok(());
+                }
 
                 if !is_executing_tools && !already_completed {
                     tracing::debug!(
                         "[EVENT_LOOP] No tools, adding assistant message to conversation"
                     );
-                    // Add complete response to conversation (only if not executing tools)
-                    self.conversation
-                        .write()
-                        .await
-                        .add_assistant_message(full_response.clone());
-                    tracing::debug!("[EVENT_LOOP] Added assistant message to conversation");
-
-                    // Update query state
-                    self.query_states
-                        .update_state(
+                    if !self
+                        .query_states
+                        .try_publish_completion(
                             query_id,
-                            QueryState::Completed {
-                                response: full_response.clone(),
-                            },
+                            full_response.clone(),
+                            full_response.clone(),
+                            &self.conversation,
                         )
-                        .await;
-                    tracing::debug!("[EVENT_LOOP] Updated query state");
+                        .await
+                    {
+                        return Ok(());
+                    }
+                    tracing::debug!("[EVENT_LOOP] Published assistant completion");
                 } else {
                     tracing::debug!("[EVENT_LOOP] Skipping duplicate message (tools={is_executing_tools}, already_completed={already_completed})");
                 }
 
                 // Update context usage indicator now that the message is committed
                 self.update_compaction_status().await;
+                self.checkpoint_conversation().await?;
 
                 self.finish_named_brain_turn(query_id, full_response.clone())
                     .await;
@@ -4513,6 +4534,7 @@ Rules:\n\
                     // (and any other token-aware loops) can detect the cancel immediately.
                     self.query_states.cancel_query(qid).await;
                     self.conversation.write().await.abort_staged(qid);
+                    self.close_active_tool_rows(qid, "cancelled").await;
                     let named_turn =
                         if let Some(pending) = self.pending_named_brain_turns.get_mut(&qid) {
                             pending.cancellation_requested = true;
@@ -5199,6 +5221,9 @@ Rules:\n\
             return;
         };
         self.query_states.cancel_query(query_id).await;
+        self.conversation.write().await.abort_staged(query_id);
+        self.close_active_tool_rows(query_id, "cancelled remotely")
+            .await;
         if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
             pending.cancellation_requested = true;
         }
@@ -6753,6 +6778,43 @@ Rules:\n\
         );
     }
 
+    fn conversation_checkpoint_path(&self) -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|home| {
+            home.join(".finch")
+                .join("sessions")
+                .join(format!("{}.json", self.session_uuid))
+        })
+    }
+
+    /// Persist the latest committed history after each publication boundary.
+    /// Staged rounds are omitted by `ConversationHistory` serialization.
+    async fn checkpoint_conversation(&self) -> Result<()> {
+        let Some(path) = self.conversation_checkpoint_path() else {
+            return Ok(());
+        };
+        self.conversation.read().await.save(path)
+    }
+
+    /// Close the visible rows owned by a cancelled query without consuming its
+    /// detached effect correlation. Named-Brain active tool ids stay pending
+    /// until their physical outcomes arrive and #163 records them.
+    async fn close_active_tool_rows(&self, query_id: Uuid, reason: &str) {
+        let Some(query_unit) = self.query_states.tool_work_unit(query_id).await else {
+            return;
+        };
+        let mut active = self.active_tool_uses.write().await;
+        active.retain(|_, (_, _, unit, row_idx)| {
+            if Arc::ptr_eq(unit, &query_unit) {
+                unit.fail_row(*row_idx, reason);
+                false
+            } else {
+                true
+            }
+        });
+        drop(active);
+        self.query_states.set_tool_work_unit(query_id, None).await;
+    }
+
     /// Handle a tool result
     async fn handle_tool_result(
         &mut self,
@@ -6761,6 +6823,30 @@ Rules:\n\
         tool_id: String,
         result: Result<String>,
     ) -> Result<()> {
+        // Physical outcomes remain part of #163's runner audit even when the
+        // provider-visible staged round has already been closed. Correlate
+        // each active id at most once before attempting history publication.
+        let named_turn_finished =
+            if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                if turn.active_tool_ids.remove(&tool_id) {
+                    turn.effect_journal
+                        .extend(runner_effect_records_from_tool_result(&result));
+                    let (output, is_error) = match &result {
+                        Ok(output) => (output.clone(), false),
+                        Err(error) => (error.to_string(), true),
+                    };
+                    turn.turn_events
+                        .push(crate::server::RunnerTurnEvent::Result {
+                            tool_id: tool_id.clone(),
+                            output,
+                            is_error,
+                        });
+                }
+                turn.cancellation_requested && turn.active_tool_ids.is_empty()
+            } else {
+                false
+            };
+
         let progress = match self.conversation.write().await.record_tool_result(
             query_id,
             round_token,
@@ -6775,6 +6861,14 @@ Rules:\n\
                     tool_id,
                     error
                 );
+                if let Some((_name, _input, work_unit, row_idx)) =
+                    self.active_tool_uses.write().await.remove(&tool_id)
+                {
+                    work_unit.fail_row(row_idx, "discarded after closed tool round");
+                }
+                if named_turn_finished {
+                    self.finish_named_brain_turn(query_id, String::new()).await;
+                }
                 return Ok(());
             }
         };
@@ -6789,22 +6883,6 @@ Rules:\n\
                 (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
             })
         };
-
-        if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
-            turn.active_tool_ids.remove(&tool_id);
-            turn.effect_journal
-                .extend(runner_effect_records_from_tool_result(&result));
-            let (output, is_error) = match &result {
-                Ok(output) => (output.clone(), false),
-                Err(error) => (error.to_string(), true),
-            };
-            turn.turn_events
-                .push(crate::server::RunnerTurnEvent::Result {
-                    tool_id: tool_id.clone(),
-                    output,
-                    is_error,
-                });
-        }
 
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
@@ -6945,6 +7023,7 @@ Rules:\n\
                     conv.clear();
                     conv.add_user_message(directive);
                 }
+                self.checkpoint_conversation().await?;
 
                 let _ = self.llm_tx.send(LlmRequest::Query {
                     id: query_id,
@@ -6958,15 +7037,20 @@ Rules:\n\
             }
         }
 
-        let committed =
-            commit_tool_round_and_continue(&self.conversation, query_id, round_token, &self.llm_tx)
-                .await;
+        let checkpoint_path = self.conversation_checkpoint_path();
+        let committed = commit_tool_round_and_continue(
+            &self.conversation,
+            query_id,
+            round_token,
+            &self.llm_tx,
+            checkpoint_path.as_deref(),
+        )
+        .await;
         if let Err(error) = committed {
-            tracing::warn!(
-                "Ignoring rejected tool-round commit for query {}: {}",
+            let _ = self.event_tx.send(ReplEvent::QueryFailed {
                 query_id,
-                error
-            );
+                error: format!("Tool continuation could not be admitted: {error}"),
+            });
             return Ok(());
         }
 
@@ -8652,11 +8736,15 @@ mod tests {
             .record_tool_result(query_id, token, "A", &Ok("a".into()))
             .unwrap();
         let conversation = std::sync::Arc::new(tokio::sync::RwLock::new(conversation));
-        assert!(
-            super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
-                .await
-                .is_err()
-        );
+        assert!(super::commit_tool_round_and_continue(
+            &conversation,
+            query_id,
+            token,
+            &llm_tx,
+            None
+        )
+        .await
+        .is_err());
         assert!(
             observed_rx.try_recv().is_err(),
             "incomplete round must admit zero continuations"
@@ -8670,15 +8758,29 @@ mod tests {
                 .unwrap(),
             ToolRoundProgress::Complete
         );
-        super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
-            .await
-            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("session.json");
+        super::commit_tool_round_and_continue(
+            &conversation,
+            query_id,
+            token,
+            &llm_tx,
+            Some(&checkpoint),
+        )
+        .await
+        .unwrap();
         assert_eq!(observed_rx.try_recv(), Ok(query_id));
-        assert!(
-            super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
-                .await
-                .is_err()
-        );
+        let restored = crate::cli::conversation::ConversationHistory::load(&checkpoint).unwrap();
+        assert_eq!(restored.get_messages().len(), 2);
+        assert!(super::commit_tool_round_and_continue(
+            &conversation,
+            query_id,
+            token,
+            &llm_tx,
+            None
+        )
+        .await
+        .is_err());
         assert!(
             observed_rx.try_recv().is_err(),
             "completed round must admit only one continuation"
@@ -8711,7 +8813,7 @@ mod tests {
         drop(rx);
 
         assert_eq!(
-            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx).await,
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx, None).await,
             Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
         );
         assert!(conversation.read().await.get_messages().is_empty());
@@ -8759,11 +8861,22 @@ mod tests {
             }
         });
 
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("session.json");
         assert_eq!(
-            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx).await,
+            super::commit_tool_round_and_continue(
+                &conversation,
+                query_id,
+                token,
+                &tx,
+                Some(&checkpoint),
+            )
+            .await,
             Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
         );
         assert!(conversation.read().await.get_messages().is_empty());
+        let restored = crate::cli::conversation::ConversationHistory::load(&checkpoint).unwrap();
+        assert!(restored.get_messages().is_empty());
         assert!(conversation
             .read()
             .await

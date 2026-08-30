@@ -31,6 +31,7 @@ pub enum ToolRoundError {
     DuplicateResult(String),
     MissingResults(Vec<String>),
     ContinuationUnavailable,
+    PersistenceUnavailable(String),
 }
 
 impl std::fmt::Display for ToolRoundError {
@@ -46,6 +47,9 @@ impl std::fmt::Display for ToolRoundError {
                 write!(formatter, "missing tool results: {}", ids.join(", "))
             }
             Self::ContinuationUnavailable => write!(formatter, "LLM continuation is unavailable"),
+            Self::PersistenceUnavailable(error) => {
+                write!(formatter, "conversation checkpoint is unavailable: {error}")
+            }
         }
     }
 }

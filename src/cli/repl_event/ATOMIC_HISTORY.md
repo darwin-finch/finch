@@ -17,9 +17,13 @@ replace or reinterpret the durable effect audit introduced by #163: an already-s
 effect may still report its one physical outcome, but its late `ToolResult` cannot enter provider
 history. A retry gets a new token, so stale and duplicate continuations cannot attach to it.
 
-Session files use same-directory write, file sync, atomic rename, and directory sync. Therefore a
-restart sees either the previous committed history or the replacement; it never sees a partially
-written JSON file. Staged rounds are intentionally absent after restart.
+The active UUID-named session file is checkpointed at every provider-visible publication boundary,
+including before a committed tool pair is admitted to the continuation worker. Session files use
+same-directory write, file sync, atomic rename, and directory sync. A continuation admission
+failure rolls the pair back to staging and atomically restores the previous checkpoint. Therefore
+a restart sees either the previous committed history or the complete ordered pair; it never sees a
+partially written JSON file. `--resume` retains the UUID and checkpoint instead of deleting the
+only recovery copy. Staged rounds are intentionally absent after restart.
 
 The assistant payload is stored without reconstructing its content blocks. This preserves an
 ordered opaque-item seam for provider-native encrypted reasoning or output metadata (#202)

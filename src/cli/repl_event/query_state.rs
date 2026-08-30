@@ -156,6 +156,37 @@ impl QueryStateManager {
         true
     }
 
+    /// Publish a text-only provider completion while holding the same state
+    /// lock used by cancellation. This makes the history append and terminal
+    /// state one linearized operation: cancellation either wins first and no
+    /// message is published, or observes an already-completed query.
+    pub async fn try_publish_completion(
+        &self,
+        query_id: Uuid,
+        response: String,
+        source_for_history: String,
+        conversation: &Arc<RwLock<crate::cli::conversation::ConversationHistory>>,
+    ) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        if metadata.cancellation_token.is_cancelled()
+            || matches!(
+                metadata.state,
+                QueryState::Cancelled | QueryState::Failed { .. } | QueryState::Completed { .. }
+            )
+        {
+            return false;
+        }
+        conversation
+            .write()
+            .await
+            .add_assistant_message(source_for_history);
+        metadata.state = QueryState::Completed { response };
+        true
+    }
+
     /// Get the current state of a query
     pub async fn get_state(&self, query_id: Uuid) -> Option<QueryState> {
         self.states
@@ -369,6 +400,32 @@ mod tests {
         manager.cancel_query(id).await;
 
         assert!(!manager.begin_tool_execution(id, 2).await);
+        assert!(matches!(
+            manager.get_state(id).await,
+            Some(QueryState::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_query_cannot_publish_late_provider_history() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let conversation = Arc::new(RwLock::new(
+            crate::cli::conversation::ConversationHistory::new(),
+        ));
+        manager.cancel_query(id).await;
+
+        assert!(
+            !manager
+                .try_publish_completion(
+                    id,
+                    "rendered late".to_string(),
+                    "provider late".to_string(),
+                    &conversation,
+                )
+                .await
+        );
+        assert!(conversation.read().await.get_messages().is_empty());
         assert!(matches!(
             manager.get_state(id).await,
             Some(QueryState::Cancelled)

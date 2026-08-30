@@ -1269,16 +1269,12 @@ pub(crate) async fn process_query_with_tools(
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
                 let effect_journal = wire_execution.effect_journal;
-                conversation
-                    .write()
-                    .await
-                    .add_assistant_message(source_for_history.clone());
-                query_states
-                    .update_state(
+                let published = query_states
+                    .try_publish_completion(
                         query_id,
-                        QueryState::Completed {
-                            response: response.clone(),
-                        },
+                        response.clone(),
+                        source_for_history.clone(),
+                        &conversation,
                     )
                     .await;
                 let _ = event_tx.send(ReplEvent::VmEffectJournalComplete {
@@ -1289,22 +1285,24 @@ pub(crate) async fn process_query_with_tools(
                     query_id,
                     full_response: response,
                 });
-                if let Some(ref mem) = memory_system {
-                    persist_completed_turn_memory(
-                        mem,
-                        &conversation,
-                        query_id,
-                        query_states.as_ref(),
-                        &query,
-                        &source_for_history,
-                        generator.name(),
-                        &session_label,
-                        &cwd,
-                        &status_bar,
-                        context_lines,
-                        memory_recall_count,
-                    )
-                    .await;
+                if published {
+                    if let Some(ref mem) = memory_system {
+                        persist_completed_turn_memory(
+                            mem,
+                            &conversation,
+                            query_id,
+                            query_states.as_ref(),
+                            &query,
+                            &source_for_history,
+                            generator.name(),
+                            &session_label,
+                            &cwd,
+                            &status_bar,
+                            context_lines,
+                            memory_recall_count,
+                        )
+                        .await;
+                    }
                 }
                 return;
             }
@@ -1474,16 +1472,13 @@ pub(crate) async fn process_query_with_tools(
             }
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
-            conversation
-                .write()
-                .await
-                .add_assistant_message(wire_execution.source_for_history);
-            query_states
-                .update_state(
+            let source_for_history = wire_execution.source_for_history;
+            let published = query_states
+                .try_publish_completion(
                     query_id,
-                    QueryState::Completed {
-                        response: rendered_response.clone(),
-                    },
+                    rendered_response.clone(),
+                    source_for_history.clone(),
+                    &conversation,
                 )
                 .await;
             let _ = event_tx.send(ReplEvent::VmEffectJournalComplete {
@@ -1497,23 +1492,25 @@ pub(crate) async fn process_query_with_tools(
             tracing::debug!("Query complete (no tools), non-streaming finished");
 
             // Store the completed turn and refresh its Brain-local summary.
-            if let Some(ref mem) = memory_system {
-                let model_name = response.metadata.model.clone();
-                persist_completed_turn_memory(
-                    mem,
-                    &conversation,
-                    query_id,
-                    query_states.as_ref(),
-                    &query,
-                    &response.text,
-                    &model_name,
-                    &session_label,
-                    &cwd,
-                    &status_bar,
-                    context_lines,
-                    memory_recall_count,
-                )
-                .await;
+            if published {
+                if let Some(ref mem) = memory_system {
+                    let model_name = response.metadata.model.clone();
+                    persist_completed_turn_memory(
+                        mem,
+                        &conversation,
+                        query_id,
+                        query_states.as_ref(),
+                        &query,
+                        &source_for_history,
+                        &model_name,
+                        &session_label,
+                        &cwd,
+                        &status_bar,
+                        context_lines,
+                        memory_recall_count,
+                    )
+                    .await;
+                }
             }
         }
         Err(e) => {
