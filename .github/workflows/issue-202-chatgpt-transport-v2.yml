@@ -1,4 +1,4 @@
-name: Issue 202 ChatGPT Subscription Transport
+name: Issue 202 ChatGPT Subscription Transport v2
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
     paths:
       - "src/**"
       - "schema/**"
-      - ".github/workflows/issue-202-chatgpt-transport.yml"
+      - ".github/workflows/issue-202-chatgpt-transport-v2.yml"
   workflow_dispatch: {}
 
 jobs:
