@@ -1461,7 +1461,11 @@ where
     for _ in 0..MAX_CHATGPT_SETUP_ATTEMPTS {
         let references = chatgpt_setup_references(&working);
         if references.is_empty() {
-            return Ok(Some((config_from_setup_result(&working), working)));
+            return Ok(Some((
+                config_from_setup_result(&working),
+                working,
+                Vec::new(),
+            )));
         }
 
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -9984,6 +9988,27 @@ mod tests {
             chatgpt_setup_references(&removed),
             std::collections::BTreeSet::from(["chatgpt:z-other".to_string()])
         );
+
+        let sole = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:only",
+            "only",
+            "gpt-5.6-sol",
+        )]);
+        let sole_auth = ScriptedRecoveryAuthenticator::new([ScriptedChatGptOutcome::Denied]);
+        let mut sole_editor =
+            ScriptedRecoveryEditor::new([ChatGptSetupRecoveryAction::RemoveProvider]);
+        let (config, removed, compensations) = run_chatgpt_setup_recovery_loop(
+            SetupInvocation::Command,
+            &sole,
+            &sole_auth,
+            &mut sole_editor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(chatgpt_setup_references(&removed).is_empty());
+        assert!(config.providers.is_empty());
+        assert!(compensations.is_empty());
     }
 
     #[tokio::test]
