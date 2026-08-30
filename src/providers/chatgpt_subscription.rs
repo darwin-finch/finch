@@ -2076,6 +2076,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _models = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .with_status(200)
             .with_body(catalog_body())
             .create_async()
@@ -2301,6 +2305,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .with_status(200)
             .with_body(catalog_body())
             .expect(1)
@@ -2378,6 +2386,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let initial_catalog = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(200)
             .with_body(catalog_body())
@@ -2385,6 +2397,10 @@ mod tests {
             .await;
         let refreshed_catalog = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("authorization", "Bearer refreshed-subscription-secret")
             .with_status(200)
             .with_body(catalog_body())
@@ -2432,6 +2448,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let rejected_catalog = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(401)
             .with_body("catalog-auth-secret")
@@ -2440,6 +2460,10 @@ mod tests {
             .await;
         let refreshed_catalog = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("authorization", "Bearer refreshed-subscription-secret")
             .with_status(200)
             .with_body(catalog_body())
@@ -2569,6 +2593,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let first = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("chatgpt-account-id", "account-1")
             .match_header("if-none-match", mockito::Matcher::Missing)
             .with_status(200)
@@ -2579,6 +2607,10 @@ mod tests {
             .await;
         let revalidated = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("chatgpt-account-id", "account-1")
             .match_header("if-none-match", "account-1-etag")
             .with_status(304)
@@ -2587,6 +2619,10 @@ mod tests {
             .await;
         let other_account = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .match_header("chatgpt-account-id", "account-2")
             .match_header("if-none-match", mockito::Matcher::Missing)
             .with_status(200)
@@ -2644,6 +2680,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                env!("CARGO_PKG_VERSION").into(),
+            ))
             .with_status(200)
             .with_body(catalog_body())
             .create_async()
