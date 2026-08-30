@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn provider_request_boundary_observes_only_complete_tool_pairs() {
         use crate::claude::{ContentBlock, Message};
-        use crate::cli::conversation::ConversationHistory;
+        use crate::cli::ConversationHistory;
 
         let provider = ClaudeProvider::new("test-key".to_string()).unwrap();
         let query_id = uuid::Uuid::new_v4();
