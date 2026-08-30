@@ -1730,16 +1730,22 @@ mod tests {
                 state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
             },
         };
-        program
-            .response_tx
-            .send(Ok(crate::server::RunnerProgramResult {
-                output: "late-program".into(),
-                runtime_revision: 0,
-                checkpoint,
-                effect_journal: vec![effect],
-            }))
-            .unwrap();
-        submitting.await.unwrap().unwrap();
+        assert!(
+            program
+                .response_tx
+                .send(Ok(crate::server::RunnerProgramResult {
+                    output: "late-program".into(),
+                    runtime_revision: 0,
+                    checkpoint,
+                    effect_journal: vec![effect],
+                }))
+                .is_err(),
+            "durable cancellation must close the daemon's late result receiver"
+        );
+        assert!(
+            submitting.await.unwrap().is_err(),
+            "cancelled dispatch must not accept a late runner result"
+        );
         let snapshot = service.snapshot("shared").unwrap();
         assert_eq!(
             service.inspect_run("shared", run_id).unwrap().status,
