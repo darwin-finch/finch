@@ -2338,18 +2338,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_catalog_is_typed_actionable_and_secret_free() {
-        let secret = "catalog-response-secret";
-        let body = json!({"models": [], "debug": secret}).to_string();
-        let error = parse_catalog(body.as_bytes())
+    #[tokio::test]
+    async fn empty_catalog_is_typed_actionable_and_secret_free() {
+        let access_secret = "empty-catalog-access-secret";
+        let account_secret = "empty-catalog-account-secret";
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                "0.151.0".into(),
+            ))
+            .match_header("authorization", format!("Bearer {access_secret}").as_str())
+            .match_header("chatgpt-account-id", account_secret)
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .with_status(200)
+            .with_body(json!({"models": []}).to_string())
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .account_catalog(
+                &ChatGptCredentialLease {
+                    access_token: access_secret.into(),
+                    account: account_secret.into(),
+                    generation: "generation-empty-catalog".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
             .err()
             .expect("empty catalog must fail");
         assert!(error.is::<SubscriptionCatalogUnavailable>());
         let rendered = error.to_string();
         assert!(rendered.contains("pinned Codex compatibility version 0.151.0"));
         assert!(rendered.contains("entitlement or server compatibility filtering"));
-        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains(access_secret));
+        assert!(!rendered.contains(account_secret));
+        models.assert_async().await;
     }
 
     #[test]
