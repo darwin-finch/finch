@@ -2384,6 +2384,20 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
+        assistant_content: crate::ipc::brain_codec::decode_assistant_content(
+            result
+                .get_assistant_messages()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?,
+        invocation_metadata: result
+            .get_has_invocation_metadata()
+            .then(|| result.get_invocation_metadata())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .map(crate::ipc::brain_codec::decode_invocation_metadata)
+            .transpose()
+            .map_err(|error| error.to_string())?,
         turn_events,
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
@@ -4493,6 +4507,27 @@ mod tests {
             result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
             result.set_output("done");
             result.set_runtime_revision(1);
+            super::super::brain_codec::encode_assistant_content(
+                result.reborrow().init_assistant_messages(1),
+                &[
+                    crate::claude::ContentBlock::opaque_reasoning("opaque-runner-token"),
+                    crate::claude::ContentBlock::text("(say \"done\")"),
+                ],
+            )
+            .unwrap();
+            result.set_has_invocation_metadata(true);
+            super::super::brain_codec::encode_invocation_metadata(
+                result.reborrow().init_invocation_metadata(),
+                &crate::providers::types::InvocationMetadata {
+                    requested_model: "gpt-5.6".into(),
+                    resolved_model: "gpt-5.6".into(),
+                    actual_model: "gpt-5.6-sol".into(),
+                    input_tokens: Some(5),
+                    output_tokens: Some(3),
+                    primary_allowance_used_percent: Some(40.0),
+                    secondary_allowance_used_percent: None,
+                },
+            );
             super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
             result.set_error("");
             super::super::checkpoint_codec::encode_effect_record(
@@ -4571,6 +4606,17 @@ mod tests {
             ]
         );
         assert_eq!(decoded.effect_journal, vec![expected_effect]);
+        assert!(matches!(
+            decoded.assistant_content.as_slice(),
+            [
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
+                crate::claude::ContentBlock::Text { text },
+            ] if encrypted_content == "opaque-runner-token" && text == "(say \"done\")"
+        ));
+        assert_eq!(
+            decoded.invocation_metadata.unwrap().actual_model,
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]

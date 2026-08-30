@@ -108,6 +108,18 @@ impl ClaudeClient {
         let provider_request = self.to_provider_request(request).with_stream(true);
         self.provider.send_message_stream(&provider_request).await
     }
+
+    pub async fn send_message_stream_with_cancel(
+        &self,
+        request: &MessageRequest,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        let provider_request = self
+            .to_provider_request(request)
+            .with_stream(true)
+            .with_cancellation_token(cancellation_token);
+        self.provider.send_message_stream(&provider_request).await
+    }
 }
 
 #[cfg(test)]

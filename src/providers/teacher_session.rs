@@ -508,6 +508,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -549,6 +550,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -577,6 +579,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -646,6 +649,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -713,6 +717,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
@@ -873,6 +878,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 

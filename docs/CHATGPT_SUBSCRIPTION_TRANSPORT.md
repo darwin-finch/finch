@@ -61,7 +61,7 @@ order.
 
 Encrypted reasoning is provider-owned opaque data. Finch bounds it, persists it
 as an ordered content block through the atomic conversation path, and replays it
-byte-for-byte. Finch never renders or interprets it. The IPC generation is 7;
+byte-for-byte. Finch never renders or interprets it. The IPC generation is 8;
 generation 6 peers reject the typed image and complete-content stream schema before query or
 stream work.
 

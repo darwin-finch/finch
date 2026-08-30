@@ -1305,6 +1305,8 @@ async fn dispatch_named_brain_run(
                 run.run_id,
                 run.request_seq,
                 Err(anyhow::anyhow!(detail.clone())),
+                Vec::new(),
+                None,
             )?;
             store.transition_run(
                 name,
@@ -1450,6 +1452,8 @@ async fn dispatch_named_brain_run(
                 run.run_id,
                 request.seq,
                 Err(anyhow::anyhow!(detail.clone())),
+                Vec::new(),
+                None,
             )?;
             let status = BrainRunStatus::Failed;
             match store.transition_run(name, "daemon", run.run_id, status, Some(detail)) {
@@ -1858,7 +1862,12 @@ fn push_named_brain_run_result(
     run_id: crate::brain::store::RunId,
     request_seq: u64,
     result: anyhow::Result<String>,
+    assistant_content: Vec<crate::claude::ContentBlock>,
+    invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
+    if let Some(metadata) = &invocation_metadata {
+        metadata.validate()?;
+    }
     let (output, error) = match result {
         Ok(output) => (output, None),
         Err(error) => (String::new(), Some(error.to_string())),
@@ -1871,6 +1880,8 @@ fn push_named_brain_run_result(
             request_seq,
             output,
             error,
+            assistant_content,
+            invocation_metadata,
         },
     )
 }
@@ -1927,6 +1938,8 @@ async fn dispatch_named_brain_program(
                     run_id,
                     request_seq,
                     Err(anyhow::anyhow!(error.to_string())),
+                    Vec::new(),
+                    None,
                 )?;
                 store.transition_run(
                     name,
@@ -1954,7 +1967,15 @@ async fn dispatch_named_brain_program(
         outcome.runtime_revision,
         outcome.checkpoint,
     )?;
-    let result = push_named_brain_run_result(store, name, run_id, request_seq, Ok(outcome.output))?;
+    let result = push_named_brain_run_result(
+        store,
+        name,
+        run_id,
+        request_seq,
+        Ok(outcome.output),
+        Vec::new(),
+        None,
+    )?;
     store.transition_run(
         name,
         "daemon",
@@ -2043,6 +2064,8 @@ async fn dispatch_named_brain_turn(
                     run_id,
                     request_seq,
                     Err(anyhow::anyhow!(error.to_string())),
+                    Vec::new(),
+                    None,
                 )?;
                 store.transition_run(
                     name,
@@ -2089,7 +2112,15 @@ async fn dispatch_named_brain_turn(
         outcome.runtime_revision,
         outcome.checkpoint,
     )?;
-    let result = push_named_brain_run_result(store, name, run_id, program.seq, Ok(outcome.output))?;
+    let result = push_named_brain_run_result(
+        store,
+        name,
+        run_id,
+        program.seq,
+        Ok(outcome.output),
+        outcome.assistant_content,
+        outcome.invocation_metadata,
+    )?;
     store.transition_run(
         name,
         "daemon",
@@ -2386,7 +2417,21 @@ fn named_brain_provider_messages_at(
                 BrainEventKind::Program {
                     language: _,
                     source,
-                } if event.sender == "provider" => Message::assistant(source.clone()),
+                } if event.sender == "provider" => snapshot
+                    .events
+                    .iter()
+                    .find_map(|candidate| match &candidate.kind {
+                        BrainEventKind::Result {
+                            request_seq,
+                            assistant_content,
+                            error: None,
+                            ..
+                        } if *request_seq == event.seq && !assistant_content.is_empty() => Some(
+                            Message::with_content("assistant", assistant_content.clone()),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| Message::assistant(source.clone())),
                 BrainEventKind::Program { language, source } => Message::user(format!(
                     "[{} submitted a Finch {} program as event #{}]\n{}",
                     event.sender,
@@ -2405,6 +2450,7 @@ fn named_brain_provider_messages_at(
                     request_seq,
                     output,
                     error,
+                    ..
                 } => {
                     let result = error
                         .as_ref()
@@ -5781,6 +5827,8 @@ mod handler_tests {
                             source: "(define (restored) : int 1)".into(),
                             language: ProgramLanguage::Lisp,
                             output: "restored without tools".into(),
+                            assistant_content: Vec::new(),
+                            invocation_metadata: None,
                             turn_events: Vec::new(),
                             runtime_revision: outcome.output_revision,
                             checkpoint,
@@ -5997,6 +6045,19 @@ mod handler_tests {
                         request_seq: 2,
                         output: "answer".into(),
                         error: None,
+                        assistant_content: vec![
+                            crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
+                            crate::claude::ContentBlock::text("(say \"answer\")"),
+                        ],
+                        invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                            requested_model: "gpt-5.6".into(),
+                            resolved_model: "gpt-5.6".into(),
+                            actual_model: "gpt-5.6-sol".into(),
+                            input_tokens: Some(10),
+                            output_tokens: Some(4),
+                            primary_allowance_used_percent: Some(25.0),
+                            secondary_allowance_used_percent: None,
+                        }),
                     },
                 ),
             ],
@@ -6017,6 +6078,13 @@ mod handler_tests {
         assert!(messages[0].text_content().contains("[driver]"));
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "(say \"answer\")");
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [
+                crate::claude::ContentBlock::OpaqueReasoning { encrypted_content },
+                crate::claude::ContentBlock::Text { text },
+            ] if encrypted_content == "opaque-restart-token" && text == "(say \"answer\")"
+        ));
         assert_eq!(messages[2].role, "user");
         assert!(messages[2].text_content().contains("program event #2"));
     }
@@ -6668,6 +6736,8 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "approved".into(),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::ApprovalRequested {
                             approval_id: "live-approval".into(),
@@ -7322,6 +7392,8 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "triple defined".into(),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::Call {
                             tool_id: "tool-1".into(),
@@ -7368,6 +7440,7 @@ mod handler_tests {
             request_seq,
             output,
             error,
+            ..
         } = result.0.kind
         else {
             panic!("expected result event")
@@ -7733,6 +7806,7 @@ mod handler_tests {
                     request_seq,
                     output,
                     error: None,
+                    ..
                 } if *request_seq == request.seq && output == "definition committed"
             )
         }));
@@ -7936,6 +8010,7 @@ mod handler_tests {
                     request_seq,
                     output,
                     error: None,
+                    ..
                 } if *request_seq == due_seq && output == "scheduled"
             )
         }));
@@ -8086,6 +8161,8 @@ mod handler_tests {
                     request_seq: 1,
                     output: "forged".into(),
                     error: None,
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                 },
             )
             .await,
@@ -8178,6 +8255,8 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "spec-secret-result".into(),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::Call {
                             tool_id: "spec-tool".into(),
@@ -8346,6 +8425,8 @@ mod handler_tests {
                     request_seq: program.seq,
                     output: "v13-secret-result".into(),
                     error: None,
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                 },
             )
             .unwrap();
@@ -8530,6 +8611,8 @@ mod handler_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "remembered".into(),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                     turn_events: Vec::new(),
                     runtime_revision: outcome.output_revision,
                     checkpoint,
@@ -8647,6 +8730,8 @@ mod handler_tests {
             run.run_id,
             program.seq,
             Ok("after restart".into()),
+            Vec::new(),
+            None,
         )
         .unwrap();
         store

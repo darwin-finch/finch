@@ -9,7 +9,7 @@ pub use crate::tools::types::ToolDefinition;
 use crate::config::constants::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
 
 /// Content block - supports text, image, tool_use, and tool_result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
@@ -41,7 +41,7 @@ pub enum ContentBlock {
 }
 
 /// Source for an image content block
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String, // "base64"

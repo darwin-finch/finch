@@ -266,6 +266,10 @@ pub struct RunnerTurnResult {
     pub source: String,
     pub language: ProgramLanguage,
     pub output: String,
+    /// Exact ordered provider assistant blocks, including opaque reasoning.
+    pub assistant_content: Vec<crate::claude::ContentBlock>,
+    /// Completed provider identity/accounting for durable Brain provenance.
+    pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
     pub turn_events: Vec<RunnerTurnEvent>,
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
@@ -1237,6 +1241,8 @@ mod tests {
                 .response_tx
                 .send(Ok(RunnerProgramResult {
                     output: "42".into(),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                     runtime_revision: 1,
                     checkpoint,
                     effect_journal: Vec::new(),
@@ -1369,6 +1375,8 @@ mod tests {
                     source: "(say \"42\")".into(),
                     language: ProgramLanguage::Lisp,
                     output: "42".into(),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                     turn_events: Vec::new(),
                     runtime_revision: 1,
                     checkpoint,

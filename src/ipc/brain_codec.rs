@@ -246,6 +246,87 @@ pub(super) fn decode_messages(
     Ok(decoded)
 }
 
+pub(super) fn encode_invocation_metadata(
+    mut builder: finch_ipc_capnp::invocation_metadata::Builder<'_>,
+    metadata: &crate::providers::types::InvocationMetadata,
+) {
+    builder.set_requested_model(&metadata.requested_model);
+    builder.set_resolved_model(&metadata.resolved_model);
+    builder.set_actual_model(&metadata.actual_model);
+    if let Some(value) = metadata.input_tokens {
+        builder.set_has_input_tokens(true);
+        builder.set_input_tokens(value);
+    }
+    if let Some(value) = metadata.output_tokens {
+        builder.set_has_output_tokens(true);
+        builder.set_output_tokens(value);
+    }
+    if let Some(value) = metadata.primary_allowance_used_percent {
+        builder.set_has_primary_allowance(true);
+        builder.set_primary_allowance_used_percent(value);
+    }
+    if let Some(value) = metadata.secondary_allowance_used_percent {
+        builder.set_has_secondary_allowance(true);
+        builder.set_secondary_allowance_used_percent(value);
+    }
+}
+
+pub(super) fn decode_invocation_metadata(
+    reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
+) -> anyhow::Result<crate::providers::types::InvocationMetadata> {
+    let metadata = crate::providers::types::InvocationMetadata {
+        requested_model: text(reader.get_requested_model()?)?,
+        resolved_model: text(reader.get_resolved_model()?)?,
+        actual_model: text(reader.get_actual_model()?)?,
+        input_tokens: reader
+            .get_has_input_tokens()
+            .then(|| reader.get_input_tokens()),
+        output_tokens: reader
+            .get_has_output_tokens()
+            .then(|| reader.get_output_tokens()),
+        primary_allowance_used_percent: reader
+            .get_has_primary_allowance()
+            .then(|| reader.get_primary_allowance_used_percent()),
+        secondary_allowance_used_percent: reader
+            .get_has_secondary_allowance()
+            .then(|| reader.get_secondary_allowance_used_percent()),
+    };
+    metadata.validate()?;
+    Ok(metadata)
+}
+
+pub(super) fn encode_assistant_content(
+    builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
+    content: &[crate::claude::ContentBlock],
+) -> anyhow::Result<()> {
+    encode_messages(
+        builder,
+        &[crate::claude::Message {
+            role: "assistant".to_string(),
+            content: content.to_vec(),
+        }],
+    )
+}
+
+pub(super) fn decode_assistant_content(
+    messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
+) -> anyhow::Result<Vec<crate::claude::ContentBlock>> {
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        messages.len() == 1,
+        "Brain result has multiple assistant messages"
+    );
+    let mut decoded = decode_messages(messages)?;
+    let message = decoded.pop().expect("one message was validated");
+    anyhow::ensure!(
+        message.role == "assistant",
+        "Brain result message role is invalid"
+    );
+    Ok(message.content)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BrainRemoteCommand {
     pub request_id: u64,
@@ -1527,6 +1608,8 @@ pub(super) fn encode_event(
             request_seq,
             output,
             error,
+            assistant_content,
+            invocation_metadata,
         } => {
             let mut result = builder.init_result();
             result.set_request_seq(*request_seq);
@@ -1534,6 +1617,16 @@ pub(super) fn encode_event(
             if let Some(error) = error {
                 result.set_has_error(true);
                 result.set_error(error);
+            }
+            if !assistant_content.is_empty() {
+                encode_assistant_content(
+                    result.reborrow().init_assistant_messages(1),
+                    assistant_content,
+                )?;
+            }
+            if let Some(metadata) = invocation_metadata {
+                result.set_has_invocation_metadata(true);
+                encode_invocation_metadata(result.init_invocation_metadata(), metadata);
             }
         }
         BrainEventKind::RuntimeCommitted {
@@ -1756,6 +1849,13 @@ pub(super) fn decode_event(
                     .then(|| result.get_error())
                     .transpose()?
                     .map(text)
+                    .transpose()?,
+                assistant_content: decode_assistant_content(result.get_assistant_messages()?)?,
+                invocation_metadata: result
+                    .get_has_invocation_metadata()
+                    .then(|| result.get_invocation_metadata())
+                    .transpose()?
+                    .map(decode_invocation_metadata)
                     .transpose()?,
             }
         }
@@ -2026,6 +2126,8 @@ mod tests {
                 request_seq: 1,
                 output: "forged".into(),
                 error: None,
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
         )
         .is_err());
@@ -2145,6 +2247,19 @@ mod tests {
                 request_seq: 5,
                 output: "done".into(),
                 error: Some("example".into()),
+                assistant_content: vec![
+                    crate::claude::ContentBlock::opaque_reasoning("opaque-restart-token"),
+                    crate::claude::ContentBlock::text("(say \"done\")"),
+                ],
+                invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                    requested_model: "gpt-5.6".into(),
+                    resolved_model: "gpt-5.6".into(),
+                    actual_model: "gpt-5.6-sol".into(),
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    primary_allowance_used_percent: Some(12.5),
+                    secondary_allowance_used_percent: None,
+                }),
             },
             BrainEventKind::RuntimeCommitted {
                 request_seq: 5,

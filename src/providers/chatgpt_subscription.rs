@@ -548,7 +548,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let request = request.into_request_for(self)?;
         let expected_model = request.model.clone();
         let allowed_tools = advertised_tool_names(&request);
-        let cancel = CancellationToken::new();
+        let cancel = request.cancellation_token.clone().unwrap_or_default();
         let response = self.start_response(request, cancel.clone()).await?;
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -914,6 +914,9 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
             .as_object()
             .context("ChatGPT catalog model was invalid")?;
         let slug = required_identifier(object, "slug", 256)?;
+        if !matches!(slug.as_str(), DEFAULT_MODEL | MODEL_ALIAS) {
+            continue;
+        }
         let supported = object
             .get("supported_in_api")
             .and_then(Value::as_bool)
@@ -943,7 +946,7 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
         if context_window != 1_050_000 {
             bail!("ChatGPT catalog model context window was invalid");
         }
-        if supported && matches!(slug.as_str(), DEFAULT_MODEL | MODEL_ALIAS) {
+        if supported {
             if !responses_lite || !image_input {
                 bail!("ChatGPT GPT-5.6 Sol catalog capabilities drifted");
             }
@@ -958,8 +961,8 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
             );
         }
     }
-    if !parsed.contains_key(DEFAULT_MODEL) {
-        bail!("ChatGPT account does not advertise gpt-5.6-sol");
+    if !parsed.contains_key(DEFAULT_MODEL) || !parsed.contains_key(MODEL_ALIAS) {
+        bail!("ChatGPT account does not advertise both pinned GPT-5.6 Sol identifiers");
     }
     Ok(Catalog { models: parsed })
 }
@@ -1331,9 +1334,6 @@ fn observe_response_model(
     expected_model: &str,
     accumulator: &mut StreamAccumulator,
 ) -> Result<()> {
-    if let Some(model) = response.get("model").and_then(Value::as_str) {
-        accumulator.observe_model(model, expected_model)?;
-    }
     if let Some(headers) = response.get("headers") {
         let headers = headers
             .as_object()
@@ -2282,6 +2282,60 @@ mod tests {
     }
 
     #[test]
+    fn catalog_ignores_unrelated_models_but_requires_both_pinned_identifiers() {
+        let mut catalog: Value = serde_json::from_str(&catalog_body()).unwrap();
+        catalog["models"].as_array_mut().unwrap().push(json!({
+            "slug":"unrelated-account-model",
+            "context_window":"attacker-controlled-not-a-number"
+        }));
+        let parsed = parse_catalog(catalog.to_string().as_bytes()).unwrap();
+        assert_eq!(parsed.models.len(), 2);
+
+        catalog["models"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|model| model["slug"] != MODEL_ALIAS);
+        let error = parse_catalog(catalog.to_string().as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("both pinned GPT-5.6 Sol identifiers"));
+    }
+
+    #[test]
+    fn actual_model_uses_authoritative_header_and_never_payload_model() {
+        let allowed = HashSet::new();
+        let terminal = json!({
+            "id":"resp-1",
+            "status":"completed",
+            "model":"attacker-payload-model",
+            "output":[],
+            "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}
+        });
+        let mut accumulator = StreamAccumulator::default();
+        let completed = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &allowed,
+            &mut accumulator,
+        )
+        .unwrap();
+        assert_eq!(completed.model, DEFAULT_MODEL);
+
+        let mut accumulator = StreamAccumulator::default();
+        let error = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &allowed,
+            &mut accumulator,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("omitted actual model provenance"));
+    }
+
+    #[test]
     fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
         let mut accumulator = StreamAccumulator::default();
         let unknown = json!({"type":"response.future","sequence_number":1});
@@ -2669,6 +2723,37 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), closed)
             .await
             .expect("subscription transport was not released after receiver drop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_reaches_and_releases_subscription_transport() {
+        let (base, closed) = stalling_subscription_server(true).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")])
+                    .with_cancellation_token(cancel.clone()),
+            )
+            .await
+            .unwrap();
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("cancelled subscription stream did not terminate")
+            .expect("cancelled subscription stream omitted its error")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cancelled"));
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("subscription transport was not released after caller cancellation")
             .unwrap();
     }
 

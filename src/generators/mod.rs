@@ -59,6 +59,17 @@ impl Generator for ProfiledGenerator {
         self.inner.generate_stream(messages, tools).await
     }
 
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        self.inner
+            .generate_stream_cancellable(messages, tools, cancellation_token)
+            .await
+    }
+
     fn capabilities(&self) -> &GeneratorCapabilities {
         self.inner.capabilities()
     }
@@ -88,6 +99,15 @@ pub trait Generator: Send + Sync {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>>;
+
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        _cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        self.generate_stream(messages, tools).await
+    }
 
     /// Get generator capabilities
     fn capabilities(&self) -> &GeneratorCapabilities;

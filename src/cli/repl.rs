@@ -1250,6 +1250,7 @@ impl Repl {
             temperature: None,
             tools: request.tools.clone(),
             stream: false,
+            cancellation_token: None,
             system,
         };
 
@@ -1298,6 +1299,7 @@ impl Repl {
             temperature: None,
             tools: request.tools.clone(),
             stream: true,
+            cancellation_token: None,
             system,
         };
 

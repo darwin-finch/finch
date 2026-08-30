@@ -207,6 +207,23 @@ impl Generator for ClaudeGenerator {
         Ok(Some(rx))
     }
 
+    async fn generate_stream_cancellable(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
+        if let Some(tools) = tools {
+            request = request.with_tools(tools);
+        }
+        let rx = self
+            .client
+            .send_message_stream_with_cancel(&request, cancellation_token)
+            .await?;
+        Ok(Some(rx))
+    }
+
     fn capabilities(&self) -> &GeneratorCapabilities {
         &self.capabilities
     }

@@ -1307,19 +1307,26 @@ fn register_named_brain_turn_projection(
 
 fn named_brain_wire_source(
     messages: Vec<crate::claude::Message>,
-) -> anyhow::Result<(String, crate::brain::store::ProgramLanguage)> {
-    let source = messages
+) -> anyhow::Result<(
+    String,
+    crate::brain::store::ProgramLanguage,
+    Vec<crate::claude::ContentBlock>,
+)> {
+    let assistant = messages
         .into_iter()
         .rev()
         .find(|message| message.role == "assistant")
-        .map(|message| message.text())
-        .filter(|source| !source.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
+    let source = assistant.text();
+    anyhow::ensure!(
+        !source.trim().is_empty(),
+        "named Brain turn produced no wire source"
+    );
     let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
         crate::programs::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
         crate::programs::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
     };
-    Ok((source, language))
+    Ok((source, language, assistant.content))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1333,9 +1340,10 @@ fn assemble_named_brain_turn(
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
     commit_ack: Option<crate::server::RunnerTurnCommitAck>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
 ) -> std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
     let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
-        let (source, language) = named_brain_wire_source(messages?)?;
+        let (source, language, assistant_content) = named_brain_wire_source(messages?)?;
         let runtime_revision = program_runtime.revision();
         let checkpoint = program_runtime
             .revision_history()?
@@ -1349,6 +1357,8 @@ fn assemble_named_brain_turn(
             source,
             language,
             output,
+            assistant_content,
+            invocation_metadata,
             turn_events: turn_events.clone(),
             runtime_revision,
             checkpoint,
@@ -1402,6 +1412,7 @@ impl LocalBrainProjection {
                 request_seq,
                 output,
                 error,
+                ..
             } if self.program_seq == Some(*request_seq)
                 && error.is_none()
                 && self.output == *output =>
@@ -5314,6 +5325,11 @@ Rules:\n\
     }
 
     async fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {
+        let invocation_metadata = self
+            .query_states
+            .get_metadata(query_id)
+            .await
+            .and_then(|metadata| metadata.invocation_metadata);
         let transient_output_unit = self.query_states.brain_output_work_unit(query_id).await;
         self.query_states.set_tool_work_unit(query_id, None).await;
         self.query_states
@@ -5387,6 +5403,7 @@ Rules:\n\
             effect_journal,
             commit_ack,
             transient_output_unit,
+            invocation_metadata,
         );
         let _ = response_tx.send(result);
     }
@@ -6697,6 +6714,7 @@ Rules:\n\
                 request_seq: _,
                 output,
                 error,
+                ..
             } => {
                 let projection_match = self
                     .selected_brain_is_home()
@@ -9277,6 +9295,8 @@ mod tests {
                     request_seq: 1,
                     output: "1764".into(),
                     error: None,
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                 },
             ),
         ];
@@ -9325,6 +9345,8 @@ mod tests {
                     request_seq: 1,
                     output: "partial output".into(),
                     error: Some("provider failed".into()),
+                    assistant_content: Vec::new(),
+                    invocation_metadata: None,
                 },
             ),
         ];
@@ -9378,6 +9400,8 @@ mod tests {
                 request_seq: 1,
                 output: "hidden helper output".into(),
                 error: None,
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
         );
         result.run_id = Some(run_id);
@@ -9432,6 +9456,8 @@ mod tests {
                 request_seq: 4,
                 output: "probe".into(),
                 error: None,
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
             BrainEventKind::RunStatusChanged {
                 run_id,
@@ -9525,6 +9551,8 @@ mod tests {
                 request_seq: 7,
                 output: "cache checked".into(),
                 error: None,
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
             BrainEventKind::RunStatusChanged {
                 run_id,
@@ -9706,6 +9734,8 @@ mod tests {
                 request_seq: 1,
                 output: String::new(),
                 error: Some("named Brain turn produced no wire source".into()),
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
             BrainEventKind::RunStatusChanged {
                 run_id,
@@ -9759,6 +9789,7 @@ mod tests {
             Vec::new(),
             None,
             Some(transient_output_unit),
+            None,
         );
         assert_eq!(
             assembly_result.unwrap_err().message,
@@ -9838,6 +9869,8 @@ mod tests {
                 request_seq: 12,
                 output: "hello".into(),
                 error: None,
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
         );
         result.run_id = Some(projection.run_id);
@@ -9866,6 +9899,8 @@ mod tests {
                 request_seq: 12,
                 output: "different".into(),
                 error: None,
+                assistant_content: Vec::new(),
+                invocation_metadata: None,
             },
         );
         result.run_id = Some(projection.run_id);

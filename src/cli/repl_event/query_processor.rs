@@ -29,7 +29,22 @@ fn raw_wire_source(source: &str) -> String {
     source.trim().to_string()
 }
 
-fn history_content_with_source(blocks: &[ContentBlock], source: String) -> Vec<ContentBlock> {
+fn history_content_with_source(
+    blocks: &[ContentBlock],
+    source: String,
+) -> anyhow::Result<Vec<ContentBlock>> {
+    let text_count = blocks.iter().filter(|block| block.is_text()).count();
+    if text_count > 1 {
+        let original = blocks
+            .iter()
+            .filter_map(ContentBlock::as_text)
+            .collect::<String>();
+        anyhow::ensure!(
+            original == source,
+            "Provider continuation with multiple text items cannot be rewritten without reordering opaque content"
+        );
+        return Ok(blocks.to_vec());
+    }
     let mut inserted_text = false;
     let mut content = Vec::with_capacity(blocks.len().max(1));
     for block in blocks {
@@ -47,7 +62,7 @@ fn history_content_with_source(blocks: &[ContentBlock], source: String) -> Vec<C
     if !inserted_text && !source.is_empty() {
         content.push(ContentBlock::Text { text: source });
     }
-    content
+    Ok(content)
 }
 
 /// Whether a provider has emitted any candidate ProgramSubmission source.
@@ -1074,8 +1089,17 @@ pub(crate) async fn process_query_with_tools(
             );
         }
 
+        let stream_cancellation = query_states
+            .get_metadata(query_id)
+            .await
+            .map(|metadata| metadata.cancellation_token)
+            .unwrap_or_default();
         match generator
-            .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
+            .generate_stream_cancellable(
+                messages.clone(),
+                Some((*tool_definitions).clone()),
+                stream_cancellation,
+            )
             .await
         {
             Ok(Some(mut rx)) => {
@@ -1130,7 +1154,16 @@ pub(crate) async fn process_query_with_tools(
                             }
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
-                            tracing::debug!("Received ContentBlockComplete: {:?}", block);
+                            tracing::debug!(
+                                block_type = match &block {
+                                    ContentBlock::Text { .. } => "text",
+                                    ContentBlock::Image { .. } => "image",
+                                    ContentBlock::ToolUse { .. } => "tool_use",
+                                    ContentBlock::ToolResult { .. } => "tool_result",
+                                    ContentBlock::OpaqueReasoning { .. } => "opaque_reasoning",
+                                },
+                                "Received completed provider content block"
+                            );
                             if let ContentBlock::Text { text } = &block {
                                 completed_text.push_str(text);
                             }
@@ -1171,6 +1204,21 @@ pub(crate) async fn process_query_with_tools(
                 }
                 let actual_model =
                     actual_model.unwrap_or_else(|| generator.model_name().to_string());
+
+                query_states
+                    .set_invocation_metadata(
+                        query_id,
+                        crate::providers::types::InvocationMetadata {
+                            requested_model: generator.model_name().to_string(),
+                            resolved_model: generator.model_name().to_string(),
+                            actual_model: actual_model.clone(),
+                            input_tokens: input_token_count,
+                            output_tokens: output_token_count.or(Some(token_count as u32)),
+                            primary_allowance_used_percent,
+                            secondary_allowance_used_percent,
+                        },
+                    )
+                    .await;
 
                 // Send stats update
                 let _ = event_tx.send(ReplEvent::StatsUpdate {
@@ -1329,7 +1377,17 @@ pub(crate) async fn process_query_with_tools(
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
                 let history_content =
-                    history_content_with_source(&blocks, source_for_history.clone());
+                    match history_content_with_source(&blocks, source_for_history.clone()) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            work_unit.set_failed();
+                            let _ = event_tx.send(ReplEvent::QueryFailed {
+                                query_id,
+                                error: error.to_string(),
+                            });
+                            return;
+                        }
+                    };
                 let effect_journal = wire_execution.effect_journal;
                 let published = query_states
                     .try_publish_completion_content(
@@ -1396,6 +1454,24 @@ pub(crate) async fn process_query_with_tools(
         .await
     {
         Ok(response) => {
+            query_states
+                .set_invocation_metadata(
+                    query_id,
+                    crate::providers::types::InvocationMetadata {
+                        requested_model: generator.model_name().to_string(),
+                        resolved_model: generator.model_name().to_string(),
+                        actual_model: response.metadata.model.clone(),
+                        input_tokens: response.metadata.input_tokens,
+                        output_tokens: response.metadata.output_tokens,
+                        primary_allowance_used_percent: response
+                            .metadata
+                            .primary_allowance_used_percent,
+                        secondary_allowance_used_percent: response
+                            .metadata
+                            .secondary_allowance_used_percent,
+                    },
+                )
+                .await;
             // Set response text on the WorkUnit
             if !response.text.is_empty() {
                 work_unit.set_response(&response.text);
@@ -1539,8 +1615,20 @@ pub(crate) async fn process_query_with_tools(
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
             let source_for_history = wire_execution.source_for_history;
-            let history_content =
-                history_content_with_source(&response.content_blocks, source_for_history.clone());
+            let history_content = match history_content_with_source(
+                &response.content_blocks,
+                source_for_history.clone(),
+            ) {
+                Ok(content) => content,
+                Err(error) => {
+                    work_unit.set_failed();
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: error.to_string(),
+                    });
+                    return;
+                }
+            };
             let published = query_states
                 .try_publish_completion_content(
                     query_id,
@@ -2665,7 +2753,7 @@ mod tests {
             ContentBlock::text("wire-before-repair"),
             ContentBlock::opaque_reasoning("opaque-after"),
         ];
-        let content = history_content_with_source(&blocks, "wire-after-repair".into());
+        let content = history_content_with_source(&blocks, "wire-after-repair".into()).unwrap();
         assert!(matches!(
             content.as_slice(),
             [
@@ -2674,5 +2762,19 @@ mod tests {
                 ContentBlock::OpaqueReasoning { encrypted_content: after },
             ] if before == "opaque-before" && text == "wire-after-repair" && after == "opaque-after"
         ));
+
+        let multiple = vec![
+            ContentBlock::text("first"),
+            ContentBlock::opaque_reasoning("opaque-middle"),
+            ContentBlock::text("second"),
+        ];
+        assert_eq!(
+            serde_json::to_value(
+                history_content_with_source(&multiple, "firstsecond".into()).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&multiple).unwrap()
+        );
+        assert!(history_content_with_source(&multiple, "rewritten".into()).is_err());
     }
 }

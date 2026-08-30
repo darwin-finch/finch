@@ -745,6 +745,7 @@ impl<'a> ConversationCompactor<'a> {
             tools: None,
             temperature: None,
             stream: false,
+            cancellation_token: None,
             system: None,
         };
 
