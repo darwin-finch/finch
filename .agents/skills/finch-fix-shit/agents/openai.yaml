@@ -1,0 +1,7 @@
+interface:
+  display_name: "Finch Fix Shit"
+  short_description: "Drive Finch backlog issues through verified merge"
+  default_prompt: "Use $finch-fix-shit to pursue the highest-priority unblocked Finch dogfood and release gates."
+
+policy:
+  allow_implicit_invocation: true
