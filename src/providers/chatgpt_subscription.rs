@@ -1850,7 +1850,7 @@ mod tests {
     /// ignored by default and intentionally never prints tokens or bodies.
     #[tokio::test]
     #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
-    async fn live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in() {
+    async fn live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in() -> Result<()> {
         if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
             bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
         }
