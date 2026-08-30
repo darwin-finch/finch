@@ -2100,6 +2100,7 @@ impl EventLoop {
             Arc::new(RwLock::new(ReplMode::Normal)),
             None,
             "audit-test".into(),
+            Uuid::new_v4(),
             Vec::new(),
             0,
             None,
@@ -6885,12 +6886,11 @@ Rules:\n\
                 false
             };
 
-        let progress = match self.conversation.write().await.record_tool_result(
-            query_id,
-            round_token,
-            &tool_id,
-            &result,
-        ) {
+        let recorded_result = {
+            let mut history = self.conversation.write().await;
+            history.record_tool_result(query_id, round_token, &tool_id, &result)
+        };
+        let progress = match recorded_result {
             Ok(progress) => progress,
             Err(error) => {
                 tracing::warn!(
@@ -8767,8 +8767,8 @@ mod tests {
         let query_id = uuid::Uuid::new_v4();
         let mut conversation =
             crate::cli::conversation::ConversationHistory::with_limits(2, usize::MAX);
-        conversation.add_user_message("older user");
-        conversation.add_assistant_message("older assistant");
+        conversation.add_user_message("older user".to_string());
+        conversation.add_assistant_message("older assistant".to_string());
         let token = conversation
             .stage_assistant(
                 query_id,
