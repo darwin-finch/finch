@@ -58,6 +58,62 @@ pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::visible_length;
 
+#[derive(Clone, Copy)]
+enum TerminalActivation {
+    Startup,
+    Resume,
+    EmergencyRestore,
+}
+
+/// Enable only the terminal modes owned by Finch's default REPL.
+///
+/// Mouse capture is deliberately absent: terminals use click-drag for native
+/// text selection and copying when applications leave mouse reporting alone.
+fn activate_default_terminal_modes<W: Write>(
+    mut writer: W,
+    activation: TerminalActivation,
+) -> io::Result<()> {
+    match activation {
+        TerminalActivation::Startup => {
+            execute!(writer, crossterm::event::EnableBracketedPaste)?;
+            execute!(
+                writer,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                )
+            )?;
+        }
+        TerminalActivation::Resume => {}
+        TerminalActivation::EmergencyRestore => {
+            execute!(
+                writer,
+                crossterm::event::EnableBracketedPaste,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                ),
+                cursor::Show,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Restore terminal modes owned by the default REPL.
+///
+/// Disabling mouse capture is intentionally defensive even though Finch does
+/// not enable it: this also repairs a stale mode left by an older Finch or an
+/// interrupted nested TUI before control returns to the user's shell.
+fn restore_default_terminal_modes<W: Write>(mut writer: W) -> io::Result<()> {
+    execute!(
+        writer,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+        cursor::Show,
+        ResetColor,
+    )
+}
+
 /// Best-effort terminal restoration for an exit path that cannot acquire the
 /// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
 /// `/quit` and the IPC quit watcher may call `process::exit`, which skips Drop,
@@ -1174,11 +1230,7 @@ impl TuiRenderer {
         // Unlike kitty keyboard enhancement flags, bracketed paste cannot
         // corrupt the terminal on unclean exit — it simply falls back to
         // normal (unbounded) paste mode, which is safe.
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::EnableMouseCapture
-        );
+        let _ = activate_default_terminal_modes(io::stdout(), TerminalActivation::Startup);
 
         // Enable DISAMBIGUATE_ESCAPE_CODES so terminals that support the kitty
         // keyboard protocol send distinct sequences for Shift+Enter (vs bare Enter).
@@ -1195,13 +1247,6 @@ impl TuiRenderer {
         // are covered.  SIGKILL terminates the session entirely so corruption
         // doesn't persist.  This is the same risk level we already accept for
         // enable_raw_mode().
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            )
-        );
-
         // Panic hook: restore terminal state so the shell is usable after a crash.
         std::panic::set_hook(Box::new(|info| {
             let _ = execute!(
@@ -2293,14 +2338,7 @@ impl TuiRenderer {
         // Reset terminal state: show cursor, reset colours, move to a clean line.
         // The `\r\n` ensures the shell prompt lands on its own fresh line rather
         // than overwriting content from the erased live area.
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::PopKeyboardEnhancementFlags,
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-            cursor::Show,
-            ResetColor,
-        );
+        let _ = restore_default_terminal_modes(io::stdout());
         print!("\r\n");
         // Flush pending output BEFORE leaving raw mode — otherwise some terminals
         // silently discard buffered bytes after the mode switch.
@@ -2327,7 +2365,7 @@ impl TuiRenderer {
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
-        let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+        let _ = activate_default_terminal_modes(io::stdout(), TerminalActivation::Resume);
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -2341,15 +2379,7 @@ impl TuiRenderer {
     /// also pops keyboard enhancements and disables bracketed paste.
     pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            ),
-            cursor::Show,
-        );
+        let _ = activate_default_terminal_modes(io::stdout(), TerminalActivation::EmergencyRestore);
         self.output_manager.disable_stdout();
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -3835,6 +3865,60 @@ mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
     use crate::cli::messages::{Message, MessageRef, WorkUnit};
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn mouse_capture_sequence(enable: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if enable {
+            execute!(&mut bytes, crossterm::event::EnableMouseCapture).unwrap();
+        } else {
+            execute!(&mut bytes, crossterm::event::DisableMouseCapture).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_default_terminal_activation_never_enables_mouse_capture() {
+        let enable_mouse = mouse_capture_sequence(true);
+        for activation in [
+            TerminalActivation::Startup,
+            TerminalActivation::Resume,
+            TerminalActivation::EmergencyRestore,
+        ] {
+            let mut bytes = Vec::new();
+            activate_default_terminal_modes(&mut bytes, activation).unwrap();
+            assert!(
+                !contains_bytes(&bytes, &enable_mouse),
+                "default TUI activation emitted mouse capture"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_terminal_shutdown_defensively_disables_mouse_capture() {
+        let mut bytes = Vec::new();
+        restore_default_terminal_modes(&mut bytes).unwrap();
+
+        assert!(!contains_bytes(&bytes, &mouse_capture_sequence(true)));
+        assert!(contains_bytes(&bytes, &mouse_capture_sequence(false)));
+
+        let mut disable_paste = Vec::new();
+        execute!(&mut disable_paste, crossterm::event::DisableBracketedPaste).unwrap();
+        assert!(contains_bytes(&bytes, &disable_paste));
+
+        let mut pop_keyboard = Vec::new();
+        execute!(
+            &mut pop_keyboard,
+            crossterm::event::PopKeyboardEnhancementFlags
+        )
+        .unwrap();
+        assert!(contains_bytes(&bytes, &pop_keyboard));
+    }
 
     #[test]
     fn startup_header_is_plain_scrollback_content() {

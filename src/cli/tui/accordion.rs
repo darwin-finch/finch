@@ -263,6 +263,32 @@ mod tests {
     }
 
     #[test]
+    fn test_keyboard_controls_expand_and_collapse_without_mouse_capture() {
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(echo selectable)");
+        work.complete_row_with_body(call, "1 line", vec!["selectable".into()]);
+        work.set_complete();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+
+        let collapsed = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&collapsed, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        assert!(state
+            .render_message(&message, &colors)
+            .iter()
+            .any(|line| line.text.contains("selectable")));
+
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        assert!(!state
+            .render_message(&message, &colors)
+            .iter()
+            .any(|line| line.text.contains("selectable")));
+    }
+
+    #[test]
     fn test_unicode_wrapped_hit_region_moves_after_resize() {
         let id = TranscriptRowId {
             message_id: crate::cli::messages::MessageId::new(),
