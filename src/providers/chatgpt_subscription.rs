@@ -2296,7 +2296,8 @@ mod tests {
             .unwrap()
             .retain(|model| model["slug"] != MODEL_ALIAS);
         let error = parse_catalog(catalog.to_string().as_bytes())
-            .unwrap_err()
+            .err()
+            .expect("missing alias must fail")
             .to_string();
         assert!(error.contains("both pinned GPT-5.6 Sol identifiers"));
     }
@@ -2330,7 +2331,8 @@ mod tests {
             &allowed,
             &mut accumulator,
         )
-        .unwrap_err()
+        .err()
+        .expect("missing authoritative model header must fail")
         .to_string();
         assert!(error.contains("omitted actual model provenance"));
     }

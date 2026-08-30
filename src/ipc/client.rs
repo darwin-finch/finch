@@ -1157,20 +1157,6 @@ impl brain_runner::Server for BrainRunnerImpl {
             match response {
                 Ok(response) => {
                     result.set_output(&response.output);
-                    if !response.assistant_content.is_empty() {
-                        super::brain_codec::encode_assistant_content(
-                            result.reborrow().init_assistant_messages(1),
-                            &response.assistant_content,
-                        )
-                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                    }
-                    if let Some(metadata) = &response.invocation_metadata {
-                        result.set_has_invocation_metadata(true);
-                        super::brain_codec::encode_invocation_metadata(
-                            result.reborrow().init_invocation_metadata(),
-                            metadata,
-                        );
-                    }
                     result.set_runtime_revision(response.runtime_revision);
                     encode_checkpoint(result.reborrow().init_checkpoint(), &response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
@@ -1302,6 +1288,20 @@ impl brain_runner::Server for BrainRunnerImpl {
                         }
                     });
                     result.set_output(&response.output);
+                    if !response.assistant_content.is_empty() {
+                        super::brain_codec::encode_assistant_content(
+                            result.reborrow().init_assistant_messages(1),
+                            &response.assistant_content,
+                        )
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    }
+                    if let Some(metadata) = &response.invocation_metadata {
+                        result.set_has_invocation_metadata(true);
+                        super::brain_codec::encode_invocation_metadata(
+                            result.reborrow().init_invocation_metadata(),
+                            metadata,
+                        );
+                    }
                     result.set_runtime_revision(response.runtime_revision);
                     encode_checkpoint(result.reborrow().init_checkpoint(), &response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;

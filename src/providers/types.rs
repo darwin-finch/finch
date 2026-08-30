@@ -457,7 +457,6 @@ impl ProviderRequest {
             temperature: None,
             stream: false,
             cancellation_token: None,
-            cancellation_token: None,
         }
     }
 
@@ -1121,6 +1120,7 @@ mod tests {
             tools: None,
             temperature: None,
             stream: false,
+            cancellation_token: None,
         };
         // Limit of 20k tokens; ~13k system + ~4k response reserve = ~3k for messages
         // Each message ~1.3k tokens so only a couple fit → should drop several

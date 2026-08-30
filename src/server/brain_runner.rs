@@ -1241,8 +1241,6 @@ mod tests {
                 .response_tx
                 .send(Ok(RunnerProgramResult {
                     output: "42".into(),
-                    assistant_content: Vec::new(),
-                    invocation_metadata: None,
                     runtime_revision: 1,
                     checkpoint,
                     effect_journal: Vec::new(),
