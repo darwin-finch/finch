@@ -1,0 +1,82 @@
+name: Issue 227 Setup Preservation
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - codex/issue-227-setup-provider-preservation
+      - codex/issue-227-failing-before
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/config/**"
+      - "src/cli/setup_wizard.rs"
+      - "src/main.rs"
+      - ".github/workflows/issue-227-setup-preservation.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  setup-preservation:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check focused formatting
+        run: >-
+          rustfmt --edition 2021 --check
+          src/config/credential.rs src/config/loader.rs src/config/mod.rs
+          src/cli/setup_wizard.rs src/main.rs
+      - name: Compile library and Finch binary tests
+        run: cargo test --lib --bin finch --no-run
+      - name: Refreshable credential lifecycle regression
+        run: cargo test --lib config::credential::tests::test_lifecycle_and_revocation -- --exact
+      - name: Broken persisted setup is fail closed
+        run: cargo test --lib config::loader::tests::test_setup_loader_distinguishes_absent_from_broken_existing_config -- --exact
+      - name: Exact provider and credential graph survives setup
+        run: cargo test --lib cli::setup_wizard::tests::test_expired_refreshable_chatgpt_grok_local_setup_round_trip_preserves_exact_graph -- --exact
+      - name: Empty-state and cancellation regressions
+        run: |
+          cargo test --lib cli::setup_wizard::tests::test_genuinely_empty_setup_alone_renders_unconfigured_claude_default -- --exact
+          cargo test --bin finch tests::cancelled_first_run_reports_read_only_outcome_without_success_claim -- --exact
+      - name: Preserve Issue 201 auth and shared setup entry points
+        run: |
+          cargo test --lib cli::setup_wizard::tests::first_run_command_and_repl
+          cargo test --lib providers::chatgpt_oauth::
+          cargo test --lib cli::chatgpt_auth::
+
+  windows-auth-contract:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting for cross-platform setup sources
+        run: >-
+          rustfmt --edition 2021 --check
+          src/config/credential.rs src/config/loader.rs src/config/mod.rs
+          src/cli/setup_wizard.rs src/main.rs
+      - name: Compile exact OAuth and OpenAI verifier sources on Windows
+        run: cargo check --manifest-path .github/issue-201-windows-probe/Cargo.toml

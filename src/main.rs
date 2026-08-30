@@ -3168,6 +3168,15 @@ mod tests {
         assert_eq!(message, "Setup cancelled; no configuration was saved");
         assert!(!message.contains("complete"));
         assert!(!message.contains("saved!"));
+
+        let source = include_str!("main.rs");
+        let cancellation_arm = source
+            .split_once("Err(wizard_err) if wizard_err.to_string().contains(\"Setup cancelled\")")
+            .and_then(|(_, remainder)| remainder.split_once("Err(e) =>"))
+            .map(|(arm, _)| arm)
+            .expect("first-run cancellation arm must remain explicit");
+        assert!(!cancellation_arm.contains(".save("));
+        assert!(!cancellation_arm.contains("Setup complete!"));
     }
 
     #[test]
