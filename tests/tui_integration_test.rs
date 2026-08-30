@@ -61,7 +61,7 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
 
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let size = nix::libc::winsize {
+    let mut size = nix::libc::winsize {
         ws_row: 24,
         ws_col: 120,
         ws_xpixel: 0,
@@ -72,8 +72,8 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &size,
+            std::ptr::null_mut(),
+            &mut size,
         )
     };
     assert_eq!(
