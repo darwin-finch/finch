@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::chatgpt_oauth::{OpenAiChatGptOAuthDialect, CHATGPT_SUBSCRIPTION_BASE_URL};
@@ -133,6 +134,21 @@ impl fmt::Display for SubscriptionRequestedModelUnavailable {
 }
 
 impl std::error::Error for SubscriptionRequestedModelUnavailable {}
+
+#[derive(Debug)]
+struct SubscriptionResponseRejected(StatusCode);
+
+impl fmt::Display for SubscriptionResponseRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ChatGPT subscription rejected the pinned Responses-Lite request (HTTP {}); the account entitlement or pinned protocol contract may have changed",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionResponseRejected {}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -547,7 +563,7 @@ impl ChatGptSubscriptionProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
-                bail!("ChatGPT subscription response failed (HTTP {status})");
+                return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
                 bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?
@@ -783,10 +799,18 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
     let tools = map_tools(request.tools.as_deref().unwrap_or_default())?;
     let allowed_tools = advertised_tool_names(request);
     let mut input = Vec::new();
-    input.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
+    let tools_payload = serde_json::to_vec(&tools)
+        .context("Failed to encode ChatGPT subscription tool definitions")?;
+    input.push(json!({
+        "id": responses_lite_prefix_id("at", &tools_payload),
+        "type":"additional_tools",
+        "role":"developer",
+        "tools":tools
+    }));
     if let Some(system) = request.system.as_deref().filter(|value| !value.is_empty()) {
         validate_bounded_text(system, MAX_TOOL_ARGUMENT_BYTES, "instructions")?;
         input.push(json!({
+            "id": responses_lite_prefix_id("msg", system.as_bytes()),
             "type":"message","role":"developer",
             "content":[{"type":"input_text","text":system}]
         }));
@@ -819,6 +843,18 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
         "include": ["reasoning.encrypted_content"]
     });
     Ok(body)
+}
+
+fn responses_lite_prefix_id(prefix: &str, visible_payload: &[u8]) -> String {
+    // Codex v0.151.0 assigns UUID-v5 IDs to the two prompt-only Responses-Lite
+    // items so retries retain identity. Finch has no Codex thread UUID at this
+    // provider boundary, so the audited protocol revision is the stable,
+    // application-owned namespace and the visible payload remains the name.
+    let namespace = Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        CHATGPT_INFERENCE_PROTOCOL_REVISION.as_bytes(),
+    );
+    format!("{prefix}_{}", Uuid::new_v5(&namespace, visible_payload))
 }
 
 fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
@@ -2341,7 +2377,19 @@ mod tests {
         let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
         assert_eq!(body["input"][0]["type"], "additional_tools");
         assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(
+            body["input"][0]["id"],
+            "at_06f0d744-9e74-54f8-9371-312adc3c666b"
+        );
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+        assert_eq!(body["input"][0]["tools"][0]["description"], "");
+        assert_eq!(body["input"][0]["tools"][0]["tools"][0]["type"], "function");
         assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(
+            body["input"][1]["id"],
+            "msg_e26db3f8-834d-58b1-9d5e-5e9465345d82"
+        );
         assert_eq!(body["input"][2]["content"][1]["type"], "input_image");
         assert_eq!(
             body["input"][2]["content"][1]["image_url"],
@@ -2358,6 +2406,34 @@ mod tests {
         assert!(body.get("instructions").is_none());
         assert!(body.get("tools").is_none());
         assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("client_metadata").is_none());
+    }
+
+    #[test]
+    fn responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_model(DEFAULT_MODEL)
+            .with_system("developer instructions")
+            .with_tools(vec![tool()]);
+        let first = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        let retry = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        assert_eq!(first["input"][0]["id"], retry["input"][0]["id"]);
+        assert_eq!(first["input"][1]["id"], retry["input"][1]["id"]);
+
+        let changed = responses_lite_request(
+            &request.with_system("different developer instructions"),
+            ReasoningEffort::High,
+        )
+        .unwrap();
+        assert_eq!(first["input"][0]["id"], changed["input"][0]["id"]);
+        assert_ne!(first["input"][1]["id"], changed["input"][1]["id"]);
+        assert!(first["input"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("at_") && id.len() == 39));
+        assert!(first["input"][1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_") && id.len() == 40));
     }
 
     #[test]
@@ -2712,13 +2788,40 @@ mod tests {
             .with_body(catalog_body())
             .create_async()
             .await;
-        let expected = responses_lite_request(
-            &ProviderRequest::new(vec![Message::user("hello")])
-                .with_model(DEFAULT_MODEL)
-                .with_tools(vec![tool()]),
-            ReasoningEffort::High,
-        )
-        .unwrap();
+        let expected = json!({
+            "model": DEFAULT_MODEL,
+            "input": [
+                {
+                    "id": "at_06f0d744-9e74-54f8-9371-312adc3c666b",
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [{
+                            "type": "function",
+                            "name": "read",
+                            "description": "Read a file",
+                            "strict": false,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path":{"type":"string"}},
+                                "required": ["path"],
+                                "additionalProperties": false
+                            }
+                        }]
+                    }]
+                },
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": {"effort":"high","context":"all_turns"},
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"]
+        });
         let inference = server
             .mock("POST", RESPONSES_PATH)
             .match_header("authorization", "Bearer subscription-secret")
@@ -3253,6 +3356,51 @@ mod tests {
         assert!(!error.contains("subscription-secret"));
         assert!(error.contains("size limit"));
         assert!(error.len() < 256);
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn response_rejection_is_typed_clear_and_secret_free() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let attacker_body = "account-1 subscription-secret private-tool-argument private-reasoning";
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(400)
+            .with_body(attacker_body)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("HTTP rejection must retain its typed provider boundary");
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+        let display = error.to_string();
+        assert!(display.contains("HTTP 400 Bad Request"));
+        assert!(display.contains("pinned protocol contract may have changed"));
+        assert!(!display.contains(attacker_body));
+        assert!(!display.contains("account-1"));
+        assert!(!display.contains("subscription-secret"));
+        assert!(display.len() < 256);
         models.assert_async().await;
         inference.assert_async().await;
     }

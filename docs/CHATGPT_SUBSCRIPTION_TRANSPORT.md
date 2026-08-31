@@ -83,6 +83,21 @@ and tools are Responses-Lite developer items; user/assistant text, validated
 PNG/JPEG inputs, function calls, and function outputs retain their history
 order.
 
+The request prefix follows the audited Codex v0.151.0 Responses-Lite shape:
+ordinary function definitions are nested under the `functions` namespace, and
+the `additional_tools` and developer-instructions items carry deterministic
+UUID-v5 IDs with `at_` and `msg_` prefixes. Codex scopes those payload-derived
+IDs to its thread UUID. Finch does not expose a Codex thread at this provider
+boundary, so it scopes them to the pinned protocol revision instead; identical
+visible prefix payloads therefore keep identity across retries without putting
+a username, Brain, account, credential, or host identifier on the wire. The
+pin must be re-audited if OpenAI changes the prefix identity contract.
+
+The audited client also sends fields tied to Codex-owned thread and client
+state, including `prompt_cache_key` and `client_metadata`. Finch does not
+fabricate those values: they remain absent until Finch has an independently
+defined, reviewed contract for them.
+
 Encrypted reasoning is provider-owned opaque data. Finch bounds it, persists it
 as an ordered content block through the atomic conversation path, and replays it
 byte-for-byte. Finch never renders or interprets it. The IPC generation is 8;
@@ -100,7 +115,9 @@ arguments, missing completion, duplicate terminal markers, post-terminal data,
 partial EOF, idle timeout, receiver drop, and payload-limit violations fail
 visibly before terminal chunks are published.
 
-Non-success bodies are consumed only to a small bound and discarded. Tokens,
+Non-success bodies are consumed only to a small bound and discarded. A
+Responses-Lite rejection retains a typed HTTP status and a compatibility or
+entitlement hint, never the response body. Tokens,
 account identifiers, request bodies, image data, tool arguments, reasoning
 continuations, and response bodies are never placed in provider errors.
 
