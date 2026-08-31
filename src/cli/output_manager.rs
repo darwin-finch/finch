@@ -10,8 +10,9 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
-    BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef, OperationMessage,
-    StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
+    ActivityMessage, BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef,
+    OperationMessage, ProgramOutputMessage, ProgramSourceMessage, StaticMessage,
+    StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
 use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
@@ -25,8 +26,8 @@ const MAX_BUFFER_SIZE: usize = 1000;
 #[derive(Clone)]
 pub struct VmOutputProjection {
     output: Arc<OutputManager>,
-    default_response: Arc<WorkUnit>,
-    handles: Arc<Mutex<HashMap<String, Arc<WorkUnit>>>>,
+    default_response: VmDefaultResponse,
+    handles: Arc<Mutex<HashMap<String, Arc<ProgramOutputMessage>>>>,
     /// The portable effect protocol is at-least-once at the application
     /// boundary: a reconnecting host may replay a journal suffix.  Keep the
     /// per-run cursor with this client-local projection so a duplicate cannot
@@ -43,6 +44,23 @@ pub struct VmOutputProjection {
     /// later Brain event log, but a live client must not lose output merely
     /// because its local delivery was reordered.
     pending_effects: Arc<Mutex<HashMap<uuid::Uuid, BTreeMap<u64, VmEffectEnvelope>>>>,
+}
+
+#[derive(Clone)]
+enum VmDefaultResponse {
+    Program(Arc<ProgramOutputMessage>),
+    ToolActivity(Arc<WorkUnit>),
+}
+
+impl VmDefaultResponse {
+    fn append(&self, text: &str) {
+        match self {
+            Self::Program(message) => {
+                message.append_output(text);
+            }
+            Self::ToolActivity(unit) => unit.append_response(text),
+        }
+    }
 }
 
 impl std::fmt::Debug for VmOutputProjection {
@@ -65,10 +83,22 @@ impl std::fmt::Debug for VmOutputProjection {
 }
 
 impl VmOutputProjection {
-    pub fn new(output: Arc<OutputManager>, default_response: Arc<WorkUnit>) -> Self {
+    pub fn new(output: Arc<OutputManager>, default_response: Arc<ProgramOutputMessage>) -> Self {
         Self {
             output,
-            default_response,
+            default_response: VmDefaultResponse::Program(default_response),
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
+            pending_effects: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Bind VM effects to a genuine tool activity without creating a second
+    /// top-level program-output artifact for the tool's internal execution.
+    pub fn for_tool_activity(output: Arc<OutputManager>, activity: Arc<WorkUnit>) -> Self {
+        Self {
+            output,
+            default_response: VmDefaultResponse::ToolActivity(activity),
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
             pending_effects: Arc::new(Mutex::new(HashMap::new())),
@@ -129,7 +159,9 @@ impl VmOutputProjection {
 
     fn project_for_execution(&self, execution_id: Option<uuid::Uuid>, effect: &VmSideEffect) {
         match &effect.event {
-            HostSideEffect::Emit { text } => self.default_response.append_response(text),
+            HostSideEffect::Emit { text } => {
+                self.default_response.append(text);
+            }
             HostSideEffect::Request { .. } => {}
             HostSideEffect::Ui {
                 operation,
@@ -151,7 +183,7 @@ impl VmOutputProjection {
     /// from `project`: the portable VM event remains unchanged and another
     /// embedder may choose a different presentation for it.
     pub fn append_default(&self, text: &str) {
-        self.default_response.append_response(text);
+        self.default_response.append(text);
     }
 
     fn project_ui(
@@ -172,12 +204,10 @@ impl VmOutputProjection {
                         &execution_id,
                         format!("output-handle:{handle}").as_bytes(),
                     );
-                    self.output.start_work_unit_with_id(
-                        MessageId::from_uuid(stable),
-                        text.unwrap_or("Working"),
-                    )
+                    self.output
+                        .start_program_output_with_id(MessageId::from_uuid(stable))
                 } else {
-                    self.output.start_work_unit(text.unwrap_or("Working"))
+                    self.output.start_program_output()
                 };
                 // A handle is a VM-owned reactive artifact, not a second
                 // assistant reply.  Give it the same plain output chrome as
@@ -191,12 +221,12 @@ impl VmOutputProjection {
             }
             UiOperation::Append => {
                 if let (Some(unit), Some(text)) = (self.unit(handle), text) {
-                    unit.append_response(text);
+                    unit.append_output(text);
                 }
             }
             UiOperation::Replace => {
                 if let (Some(unit), Some(text)) = (self.unit(handle), text) {
-                    unit.set_response(text);
+                    unit.replace_output(text);
                 }
             }
             UiOperation::Status => {
@@ -219,7 +249,7 @@ impl VmOutputProjection {
                 if let Some(unit) = self.remove_unit(handle) {
                     unit.set_transient_status(None);
                     if let Some(text) = text {
-                        unit.set_response(text);
+                        unit.replace_output(text);
                     }
                     unit.set_failed();
                 }
@@ -227,7 +257,7 @@ impl VmOutputProjection {
         }
     }
 
-    fn unit(&self, handle: &str) -> Option<Arc<WorkUnit>> {
+    fn unit(&self, handle: &str) -> Option<Arc<ProgramOutputMessage>> {
         self.handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -235,7 +265,7 @@ impl VmOutputProjection {
             .cloned()
     }
 
-    fn remove_unit(&self, handle: &str) -> Option<Arc<WorkUnit>> {
+    fn remove_unit(&self, handle: &str) -> Option<Arc<ProgramOutputMessage>> {
         self.handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -439,6 +469,49 @@ impl OutputManager {
         wu
     }
 
+    /// Register stable run activity which cannot later be retyped as source or output.
+    pub fn start_activity_with_id(
+        &self,
+        id: MessageId,
+        title: impl Into<String>,
+    ) -> Arc<ActivityMessage> {
+        let message = Arc::new(ActivityMessage::with_id(id, title));
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
+    /// Register a source artifact with a fresh local identity.
+    pub fn start_program_source(&self, language: impl Into<String>) -> Arc<ProgramSourceMessage> {
+        let message = Arc::new(ProgramSourceMessage::new(language));
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
+    /// Register a source artifact with a canonical stable identity.
+    pub fn start_program_source_with_id(
+        &self,
+        id: MessageId,
+        language: impl Into<String>,
+    ) -> Arc<ProgramSourceMessage> {
+        let message = Arc::new(ProgramSourceMessage::with_id(id, language));
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
+    /// Register a program-output artifact with a fresh local identity.
+    pub fn start_program_output(&self) -> Arc<ProgramOutputMessage> {
+        let message = Arc::new(ProgramOutputMessage::new());
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
+    /// Register a program-output artifact with a canonical stable identity.
+    pub fn start_program_output_with_id(&self, id: MessageId) -> Arc<ProgramOutputMessage> {
+        let message = Arc::new(ProgramOutputMessage::with_id(id));
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
     /// Write status information (deprecated - use write_progress or write_info)
     pub fn write_status(&self, content: impl Into<String>) {
         // Route to progress for backward compatibility
@@ -572,7 +645,7 @@ mod tests {
     #[test]
     fn vm_output_projection_keeps_explicit_handles_independent() {
         let manager = Arc::new(silent_manager());
-        let response = manager.start_work_unit("Response");
+        let response = manager.start_program_output();
         let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
 
         projection.project(&VmSideEffect {
@@ -651,9 +724,42 @@ mod tests {
     }
 
     #[test]
+    fn vm_tool_projection_retains_activity_semantics_without_extra_output_message() {
+        use crate::cli::messages::TranscriptRowKind;
+
+        let manager = Arc::new(silent_manager());
+        let activity = manager.start_activity_with_id(MessageId::new(), "Brain activity");
+        let projection =
+            VmOutputProjection::for_tool_activity(Arc::clone(&manager), activity.work_unit());
+        projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "tool output".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+
+        let messages = manager.get_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]
+                .transcript_row(&crate::config::ColorScheme::default())
+                .unwrap()
+                .kind,
+            TranscriptRowKind::Activity
+        );
+    }
+
+    #[test]
     fn vm_output_projection_applies_envelopes_once_and_in_order() {
         let manager = Arc::new(silent_manager());
-        let response = manager.start_work_unit("Response");
+        let response = manager.start_program_output();
         let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
         let execution_id = uuid::Uuid::new_v4();
         let emit = |sequence, text: &str| VmEffectEnvelope {
@@ -708,7 +814,7 @@ mod tests {
         };
         let project_once = || {
             let manager = Arc::new(silent_manager());
-            let response = manager.start_work_unit("Response");
+            let response = manager.start_program_output();
             let projection = VmOutputProjection::new(Arc::clone(&manager), response);
             assert_eq!(projection.project_envelope(envelope.clone()).len(), 1);
             manager.get_messages()[1].id()

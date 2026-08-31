@@ -5,7 +5,7 @@
 //! Each query has associated `WorkUnit` rows that drive the live TUI display.
 
 use crate::claude::Message;
-use crate::cli::messages::WorkUnit;
+use crate::cli::messages::{ProgramOutputMessage, ProgramSourceMessage, WorkUnit};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -76,10 +76,11 @@ pub struct QueryMetadata {
     /// Keeping it live across continuation requests prevents each round trip
     /// from becoming a separate anonymous transcript block.
     pub tool_work_unit: Option<Arc<WorkUnit>>,
-    /// Transient live VM output for a named-Brain turn. Once the daemon
-    /// publishes the correlated Result, EventLoop folds this into the run
-    /// group and removes the transient unit without losing live updates.
-    pub brain_output_work_unit: Option<Arc<WorkUnit>>,
+    /// Stable live VM output for a named-Brain turn. The correlated canonical
+    /// Result adopts and finalizes this same semantic message in place.
+    pub brain_output_message: Option<Arc<ProgramOutputMessage>>,
+    /// Stable local source projection awaiting its matching canonical Program.
+    pub brain_source_message: Option<Arc<ProgramSourceMessage>>,
 }
 
 /// Manages state for all in-flight queries
@@ -108,7 +109,8 @@ impl QueryStateManager {
             invocation_metadata: None,
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
-            brain_output_work_unit: None,
+            brain_output_message: None,
+            brain_source_message: None,
         };
 
         self.states.write().await.insert(id, metadata);
@@ -253,18 +255,40 @@ impl QueryStateManager {
             .and_then(|metadata| metadata.tool_work_unit.clone())
     }
 
-    pub async fn set_brain_output_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
+    pub async fn set_brain_output_message(
+        &self,
+        query_id: Uuid,
+        unit: Option<Arc<ProgramOutputMessage>>,
+    ) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
-            metadata.brain_output_work_unit = unit;
+            metadata.brain_output_message = unit;
         }
     }
 
-    pub async fn brain_output_work_unit(&self, query_id: Uuid) -> Option<Arc<WorkUnit>> {
+    pub async fn brain_output_message(&self, query_id: Uuid) -> Option<Arc<ProgramOutputMessage>> {
         self.states
             .read()
             .await
             .get(&query_id)
-            .and_then(|metadata| metadata.brain_output_work_unit.clone())
+            .and_then(|metadata| metadata.brain_output_message.clone())
+    }
+
+    pub async fn set_brain_source_message(
+        &self,
+        query_id: Uuid,
+        message: Option<Arc<ProgramSourceMessage>>,
+    ) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.brain_source_message = message;
+        }
+    }
+
+    pub async fn brain_source_message(&self, query_id: Uuid) -> Option<Arc<ProgramSourceMessage>> {
+        self.states
+            .read()
+            .await
+            .get(&query_id)
+            .and_then(|metadata| metadata.brain_source_message.clone())
     }
 
     /// Cancel a query
