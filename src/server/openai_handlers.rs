@@ -5,7 +5,7 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Json, Response,
@@ -24,6 +24,11 @@ use crate::claude::{ContentBlock, Message};
 use crate::router::RouteDecision;
 use crate::tools::types::ToolDefinition as InternalToolDefinition;
 use crate::tools::types::ToolInputSchema;
+
+struct DaemonCompletion {
+    content_blocks: Vec<ContentBlock>,
+    invocation_metadata: crate::providers::InvocationMetadata,
+}
 
 /// Error response for OpenAI API
 #[derive(Debug, serde::Serialize)]
@@ -223,7 +228,7 @@ async fn handle_chat_completions_streaming(
         .await
         .map_err(|e| error_response(&e.to_string(), "api_error"))?;
 
-        return Ok(openai_sse_response(content, &request.model));
+        return Ok(openai_sse_response(content.content_blocks, &request.model));
     }
 
     // Convert OpenAI messages to internal format
@@ -495,14 +500,35 @@ async fn forward_to_cloud(
     provider_name: Option<&str>,
     messages: Vec<crate::claude::Message>,
     tools: Option<Vec<InternalToolDefinition>>,
-) -> anyhow::Result<Vec<crate::claude::ContentBlock>> {
+) -> anyhow::Result<DaemonCompletion> {
     if let Some(provider) = server.provider_for_name(provider_name) {
+        let turn_identity = crate::providers::provider_turn_identity(
+            provider.as_ref(),
+            provider_name.unwrap_or("daemon"),
+        )?;
         let mut req = crate::providers::ProviderRequest::new(messages);
         if let Some(tools) = tools {
             req = req.with_tools(tools);
         }
         let resp = provider.send_message(&req).await?;
-        Ok(resp.content)
+        let mut invocation_metadata = crate::providers::InvocationMetadata::from_turn(
+            &turn_identity,
+            resp.provider.clone(),
+            (!resp.model.trim().is_empty()).then(|| resp.model.clone()),
+        );
+        if let Some(usage) = &resp.usage {
+            invocation_metadata.input_tokens = Some(usage.input_tokens);
+            invocation_metadata.output_tokens = Some(usage.output_tokens);
+        }
+        if let Some(allowance) = &resp.allowance {
+            invocation_metadata.primary_allowance_used_percent = allowance.primary_used_percent;
+            invocation_metadata.secondary_allowance_used_percent = allowance.secondary_used_percent;
+        }
+        invocation_metadata.validate()?;
+        Ok(DaemonCompletion {
+            content_blocks: resp.content,
+            invocation_metadata,
+        })
     } else if let Some(name) = provider_name.filter(|_| server.has_provider_profiles()) {
         anyhow::bail!("Unknown or ambiguous provider profile '{name}'")
     } else {
@@ -512,13 +538,77 @@ async fn forward_to_cloud(
             claude_request = claude_request.with_tools(tools);
         }
         let resp = server.claude_client().send_message(&claude_request).await?;
-        Ok(resp.content)
+        let turn_identity = server.claude_client().turn_identity()?;
+        let mut invocation_metadata = crate::providers::InvocationMetadata::from_turn(
+            &turn_identity,
+            resp.provider.clone(),
+            (!resp.model.trim().is_empty()).then(|| resp.model.clone()),
+        );
+        invocation_metadata.input_tokens = resp.input_tokens;
+        invocation_metadata.output_tokens = resp.output_tokens;
+        invocation_metadata.primary_allowance_used_percent = resp.primary_allowance_used_percent;
+        invocation_metadata.secondary_allowance_used_percent =
+            resp.secondary_allowance_used_percent;
+        invocation_metadata.validate()?;
+        Ok(DaemonCompletion {
+            content_blocks: resp.content,
+            invocation_metadata,
+        })
     }
+}
+
+fn local_completion(
+    response: crate::generators::GeneratorResponse,
+) -> anyhow::Result<DaemonCompletion> {
+    let metadata = response.metadata;
+    let turn_identity = crate::providers::TurnIdentity::new(
+        "daemon-local",
+        &metadata.generator,
+        &metadata.generator,
+        &metadata.model,
+        &metadata.model,
+    )?;
+    let mut invocation_metadata = crate::providers::InvocationMetadata::from_turn(
+        &turn_identity,
+        metadata.generator,
+        Some(metadata.model),
+    );
+    invocation_metadata.input_tokens = metadata.input_tokens;
+    invocation_metadata.output_tokens = metadata.output_tokens;
+    invocation_metadata.primary_allowance_used_percent = metadata.primary_allowance_used_percent;
+    invocation_metadata.secondary_allowance_used_percent =
+        metadata.secondary_allowance_used_percent;
+    invocation_metadata.validate()?;
+    Ok(DaemonCompletion {
+        content_blocks: response.content_blocks,
+        invocation_metadata,
+    })
+}
+
+fn with_finch_invocation(
+    response: ChatCompletionResponse,
+    invocation_metadata: &crate::providers::InvocationMetadata,
+    required: bool,
+) -> Result<Response, Response> {
+    let mut response = Json(response).into_response();
+    if !required {
+        return Ok(response);
+    }
+    let encoded = serde_json::to_string(invocation_metadata)
+        .map_err(|_| error_response("Could not encode Finch invocation metadata", "api_error"))?;
+    let header = HeaderValue::from_str(&encoded)
+        .map_err(|_| error_response("Could not encode Finch invocation metadata", "api_error"))?;
+    response.headers_mut().insert(
+        crate::server::openai_types::FINCH_INVOCATION_RESPONSE_HEADER,
+        header,
+    );
+    Ok(response)
 }
 
 /// Handle POST /v1/chat/completions - OpenAI-compatible chat endpoint
 pub async fn handle_chat_completions(
     State(server): State<Arc<AgentServer>>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     let start_time = Instant::now();
@@ -574,7 +664,7 @@ pub async fn handle_chat_completions(
     let decision = router.route(user_query);
     drop(router);
 
-    let (content_blocks, routing_decision) = match decision {
+    let (completion, routing_decision) = match decision {
         RouteDecision::Forward { reason } => {
             info!(
                 "☁️  ROUTING TO TEACHER API (reason: {:?}, provider: {:?})",
@@ -589,7 +679,7 @@ pub async fn handle_chat_completions(
             )
             .await
             {
-                Ok(blocks) => (blocks, "forward"),
+                Ok(completion) => (completion, "forward"),
                 Err(e) => return error_response(&e.to_string(), "api_error"),
             }
         }
@@ -612,7 +702,12 @@ pub async fn handle_chat_completions(
                     ) {
                         Ok(Some(response)) => {
                             info!("✓ LOCAL MODEL RESPONDED");
-                            (response.content_blocks, "local")
+                            match local_completion(response) {
+                                Ok(completion) => (completion, "local"),
+                                Err(error) => {
+                                    return error_response(&error.to_string(), "api_error")
+                                }
+                            }
                         }
                         Ok(None) => {
                             drop(generator);
@@ -625,7 +720,7 @@ pub async fn handle_chat_completions(
                             )
                             .await
                             {
-                                Ok(blocks) => (blocks, "fallback"),
+                                Ok(completion) => (completion, "fallback"),
                                 Err(e) => return error_response(&e.to_string(), "api_error"),
                             }
                         }
@@ -640,7 +735,7 @@ pub async fn handle_chat_completions(
                             )
                             .await
                             {
-                                Ok(blocks) => (blocks, "fallback"),
+                                Ok(completion) => (completion, "fallback"),
                                 Err(e2) => return error_response(&e2.to_string(), "api_error"),
                             }
                         }
@@ -657,7 +752,7 @@ pub async fn handle_chat_completions(
                     )
                     .await
                     {
-                        Ok(blocks) => (blocks, "forward"),
+                        Ok(completion) => (completion, "forward"),
                         Err(e) => return error_response(&e.to_string(), "api_error"),
                     }
                 }
@@ -672,14 +767,24 @@ pub async fn handle_chat_completions(
         "Chat completion handled"
     );
 
+    let DaemonCompletion {
+        content_blocks,
+        invocation_metadata,
+    } = completion;
+
     // Convert internal response to OpenAI format (handles tool_calls)
     let openai_response =
         match convert_response_to_openai(content_blocks, &request.model, &request.messages) {
             Ok(resp) => resp,
             Err(error_resp) => return error_resp,
         };
-
-    Json(openai_response).into_response()
+    let invocation_required = headers
+        .get(crate::server::openai_types::FINCH_INVOCATION_REQUEST_HEADER)
+        .is_some_and(|value| value == "1");
+    match with_finch_invocation(openai_response, &invocation_metadata, invocation_required) {
+        Ok(response) => response,
+        Err(error) => error,
+    }
 }
 
 /// Handle local-only query (bypass routing, direct local model access)
@@ -1068,6 +1173,52 @@ mod tests {
             provider_profile_name("  "),
             Err("model must name a configured Finch provider profile")
         );
+    }
+
+    #[test]
+    fn generic_openai_response_only_carries_invocation_when_finch_requests_it() {
+        let identity = crate::providers::TurnIdentity::new(
+            "private-profile-label",
+            "openai",
+            "openai",
+            "requested-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        let invocation = crate::providers::InvocationMetadata::from_turn(
+            &identity,
+            "openai",
+            Some("gpt-5.6-sol-2026-08-30".into()),
+        );
+        let response = convert_response_to_openai(
+            vec![ContentBlock::Text { text: "ok".into() }],
+            "requested-alias",
+            &[ChatMessage::user("hello")],
+        )
+        .unwrap();
+
+        let generic = with_finch_invocation(response, &invocation, false).unwrap();
+        assert!(generic
+            .headers()
+            .get(crate::server::openai_types::FINCH_INVOCATION_RESPONSE_HEADER)
+            .is_none());
+
+        let response = convert_response_to_openai(
+            vec![ContentBlock::Text { text: "ok".into() }],
+            "requested-alias",
+            &[ChatMessage::user("hello")],
+        )
+        .unwrap();
+        let finch = with_finch_invocation(response, &invocation, true).unwrap();
+        let encoded = finch
+            .headers()
+            .get(crate::server::openai_types::FINCH_INVOCATION_RESPONSE_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded: crate::providers::InvocationMetadata = serde_json::from_str(encoded).unwrap();
+        assert_eq!(decoded.actual_model, invocation.actual_model);
+        assert_ne!(decoded.actual_model.as_deref(), Some("requested-alias"));
     }
 
     #[test]

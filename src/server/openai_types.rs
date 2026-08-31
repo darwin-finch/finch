@@ -5,6 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Opt-in request marker for Finch clients that require an authoritative
+/// invocation attestation in the response headers.
+pub const FINCH_INVOCATION_REQUEST_HEADER: &str = "x-finch-require-invocation";
+/// Finch-owned response header carrying the admitted invocation metadata.
+/// Generic OpenAI clients neither request nor need this extension.
+pub const FINCH_INVOCATION_RESPONSE_HEADER: &str = "x-finch-invocation";
+
 /// Request body for /v1/chat/completions endpoint
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {

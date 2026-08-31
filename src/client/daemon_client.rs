@@ -12,6 +12,7 @@ use crate::claude::{ContentBlock, Message};
 use crate::daemon::ensure_daemon_running;
 use crate::server::openai_types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionDefinition, Tool,
+    FINCH_INVOCATION_REQUEST_HEADER, FINCH_INVOCATION_RESPONSE_HEADER,
 };
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::{ToolDefinition, ToolUse};
@@ -57,6 +58,14 @@ pub struct DaemonClient {
     base_url: String,
     client: Client,
     config: DaemonConfig,
+}
+
+/// Final daemon answer plus the immutable provider identity admitted before
+/// any local tool or VM action.
+#[derive(Debug, Clone)]
+pub struct DaemonQueryResult {
+    pub response: String,
+    pub invocation_metadata: crate::providers::InvocationMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,8 +351,10 @@ impl DaemonClient {
         tools: Vec<ToolDefinition>,
         tool_executor: &ToolExecutor,
     ) -> Result<String> {
-        self.query_with_tools_with_system(initial_query, None, tools, tool_executor)
-            .await
+        Ok(self
+            .query_with_tools_with_system(initial_query, None, tools, tool_executor)
+            .await?
+            .response)
     }
 
     /// Run the local tool loop with an optional provider system contract.
@@ -356,15 +367,29 @@ impl DaemonClient {
         system: Option<String>,
         tools: Vec<ToolDefinition>,
         tool_executor: &ToolExecutor,
-    ) -> Result<String> {
+    ) -> Result<DaemonQueryResult> {
+        self.query_with_tools_with_system_and_provenance(
+            initial_query,
+            system,
+            tools,
+            tool_executor,
+            None,
+        )
+        .await
+    }
+
+    /// Run the local tool loop while pinning a previously admitted daemon
+    /// invocation across a repair or other explicit continuation.
+    pub async fn query_with_tools_with_system_and_provenance(
+        &self,
+        initial_query: &str,
+        system: Option<String>,
+        tools: Vec<ToolDefinition>,
+        tool_executor: &ToolExecutor,
+        prior_invocation: Option<crate::providers::InvocationMetadata>,
+    ) -> Result<DaemonQueryResult> {
         let model = self.default_model_profile().await?;
         let mut messages = Vec::new();
-        if let Some(system) = system {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: vec![ContentBlock::Text { text: system }],
-            });
-        }
         messages.push(Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
@@ -374,6 +399,14 @@ impl DaemonClient {
 
         const MAX_TURNS: usize = 30;
         let mut turn = 0;
+        let mut invocation_metadata = prior_invocation;
+        if let Some(invocation) = &invocation_metadata {
+            invocation.validate()?;
+            anyhow::ensure!(
+                invocation.provenance == crate::providers::InvocationProvenance::Authoritative,
+                "daemon continuation requires authoritative provider provenance"
+            );
+        }
 
         loop {
             if turn >= MAX_TURNS {
@@ -382,7 +415,23 @@ impl DaemonClient {
             turn += 1;
 
             // Convert to OpenAI format
-            let openai_messages = Self::convert_to_openai_messages(&messages);
+            let mut outbound_messages = messages.clone();
+            if let Some(system) = &system {
+                let identity_context = match invocation_metadata.as_ref() {
+                    Some(invocation) => invocation.model_context()?,
+                    None => "## Finch turn identity\nprovenance: pending daemon response\n\nDo not infer provider identity from request model text.".to_string(),
+                };
+                outbound_messages.insert(
+                    0,
+                    Message {
+                        role: "system".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: format!("{system}\n\n{identity_context}"),
+                        }],
+                    },
+                );
+            }
+            let openai_messages = Self::convert_to_openai_messages(&outbound_messages);
             let openai_tools = Self::convert_to_openai_tools(&tools);
 
             // Send request
@@ -402,16 +451,24 @@ impl DaemonClient {
             let url = format!("{}/v1/chat/completions", self.base_url);
             debug!(url = %url, turn, "Sending chat completion request with tools");
 
-            let response: ChatCompletionResponse = self
+            let response = self
                 .client
                 .post(&url)
+                .header(FINCH_INVOCATION_REQUEST_HEADER, "1")
                 .json(&request)
                 .send()
                 .await
-                .context("Failed to send request to daemon")?
+                .context("Failed to send request to daemon")?;
+            let admitted = Self::decode_required_invocation(response.headers())?;
+            let response: ChatCompletionResponse = response
                 .json()
                 .await
                 .context("Failed to parse response from daemon")?;
+            if let Some(current) = &mut invocation_metadata {
+                current.reconcile(&admitted)?;
+            } else {
+                invocation_metadata = Some(admitted);
+            }
 
             let choice = response
                 .choices
@@ -453,7 +510,16 @@ impl DaemonClient {
 
                         let result = tool_executor
                             .execute_tool::<fn() -> Result<()>>(
-                                &tool_use, None, None, None, None, None, None, None, None, None,
+                                &tool_use,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                invocation_metadata.clone(),
                                 None,
                             )
                             .await?;
@@ -478,11 +544,36 @@ impl DaemonClient {
 
             // No tool calls, return final answer
             if let Some(content) = &choice.message.content {
-                return Ok(content.clone());
+                return Ok(DaemonQueryResult {
+                    response: content.clone(),
+                    invocation_metadata: invocation_metadata.ok_or_else(|| {
+                        anyhow::anyhow!("daemon response lacked invocation metadata")
+                    })?,
+                });
             }
 
             anyhow::bail!("Response has no content and no tool calls");
         }
+    }
+
+    fn decode_required_invocation(
+        headers: &header::HeaderMap,
+    ) -> Result<crate::providers::InvocationMetadata> {
+        let encoded = headers
+            .get(FINCH_INVOCATION_RESPONSE_HEADER)
+            .ok_or_else(|| {
+                anyhow::anyhow!("daemon response lacked authoritative invocation metadata")
+            })?
+            .to_str()
+            .context("daemon invocation metadata header was invalid")?;
+        let invocation: crate::providers::InvocationMetadata =
+            serde_json::from_str(encoded).context("daemon invocation metadata was invalid")?;
+        invocation.validate()?;
+        anyhow::ensure!(
+            invocation.provenance == crate::providers::InvocationProvenance::Authoritative,
+            "daemon response invocation metadata was not authoritative"
+        );
+        Ok(invocation)
     }
 
     /// Convert internal messages to OpenAI format.
@@ -1136,6 +1227,163 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::State,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Clone)]
+    struct MockDaemonReply {
+        invocation: Option<crate::providers::InvocationMetadata>,
+        tool_call: bool,
+    }
+
+    struct CountingTool(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for CountingTool {
+        fn name(&self) -> &str {
+            "count"
+        }
+
+        fn description(&self) -> &str {
+            "Count local effects"
+        }
+
+        fn input_schema(&self) -> crate::tools::ToolInputSchema {
+            crate::tools::ToolInputSchema::simple(vec![])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::types::ToolContext<'_>,
+        ) -> Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("counted".into())
+        }
+    }
+
+    fn daemon_invocation(actual_model: &str) -> crate::providers::InvocationMetadata {
+        let identity = crate::providers::TurnIdentity::new(
+            "daemon-profile",
+            "openai",
+            "openai",
+            "requested-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        crate::providers::InvocationMetadata::from_turn(
+            &identity,
+            "openai",
+            Some(actual_model.into()),
+        )
+    }
+
+    fn daemon_response(reply: &MockDaemonReply) -> ChatCompletionResponse {
+        let tool_calls = reply.tool_call.then(|| {
+            vec![crate::server::openai_types::ToolCall {
+                id: "tool-1".into(),
+                tool_type: "function".into(),
+                function: crate::server::openai_types::FunctionCall {
+                    name: "count".into(),
+                    arguments: "{}".into(),
+                },
+            }]
+        });
+        ChatCompletionResponse {
+            id: "response".into(),
+            object: "chat.completion".into(),
+            created: 0,
+            // A generic OpenAI echo. The client must ignore this for actual
+            // identity and rely solely on the Finch header.
+            model: "requested-alias".into(),
+            choices: vec![crate::server::openai_types::Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content: (!reply.tool_call).then(|| "done".into()),
+                    tool_calls,
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason: if reply.tool_call {
+                    "tool_calls"
+                } else {
+                    "stop"
+                }
+                .into(),
+            }],
+            usage: crate::server::openai_types::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+        }
+    }
+
+    async fn mock_models() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"data": [{"id": "daemon-profile"}]}))
+    }
+
+    async fn mock_completion(
+        State(replies): State<Arc<Mutex<VecDeque<MockDaemonReply>>>>,
+    ) -> axum::response::Response {
+        let reply = replies.lock().await.pop_front().expect("mock reply");
+        let mut response = Json(daemon_response(&reply)).into_response();
+        if let Some(invocation) = reply.invocation {
+            response.headers_mut().insert(
+                FINCH_INVOCATION_RESPONSE_HEADER,
+                axum::http::HeaderValue::from_str(&serde_json::to_string(&invocation).unwrap())
+                    .unwrap(),
+            );
+        }
+        response
+    }
+
+    async fn mock_daemon_client(
+        replies: Vec<MockDaemonReply>,
+    ) -> (DaemonClient, tokio::task::JoinHandle<()>) {
+        let state = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let app = Router::new()
+            .route("/v1/models", get(mock_models))
+            .route("/v1/chat/completions", post(mock_completion))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            DaemonClient {
+                base_url: format!("http://{address}"),
+                client: Client::new(),
+                config: DaemonConfig {
+                    auto_spawn: false,
+                    ..DaemonConfig::default()
+                },
+            },
+            task,
+        )
+    }
+
+    fn counting_executor(counter: Arc<AtomicUsize>) -> ToolExecutor {
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(CountingTool(counter)));
+        ToolExecutor::new(
+            registry,
+            crate::tools::PermissionManager::new()
+                .with_default_rule(crate::tools::PermissionRule::Allow),
+            tempfile::tempdir().unwrap().path().join("patterns.json"),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn test_daemon_config_default() {
@@ -1181,5 +1429,92 @@ mod tests {
         assert_eq!(converted[0].content.as_deref(), Some("VM wire contract"));
         assert_eq!(converted[1].role, "user");
         assert_eq!(converted[1].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn daemon_tool_loop_rejects_generic_openai_model_echo_without_finch_metadata() {
+        let headers = header::HeaderMap::new();
+        let error = DaemonClient::decode_required_invocation(&headers).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("lacked authoritative invocation metadata"));
+        // The generic OpenAI `model` field is deliberately not an input to
+        // this admission function, so an echoed requested model cannot become
+        // an actual-model attestation.
+    }
+
+    #[test]
+    fn daemon_tool_loop_accepts_only_authoritative_finch_metadata_header() {
+        let identity = crate::providers::TurnIdentity::new(
+            "daemon-profile",
+            "openai",
+            "openai",
+            "requested-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        let invocation = crate::providers::InvocationMetadata::from_turn(
+            &identity,
+            "openai",
+            Some("gpt-5.6-sol-2026-08-30".into()),
+        );
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            FINCH_INVOCATION_RESPONSE_HEADER,
+            header::HeaderValue::from_str(&serde_json::to_string(&invocation).unwrap()).unwrap(),
+        );
+
+        assert_eq!(
+            DaemonClient::decode_required_invocation(&headers)
+                .unwrap()
+                .actual_model
+                .as_deref(),
+            Some("gpt-5.6-sol-2026-08-30")
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_tool_loop_rejects_missing_metadata_before_first_local_effect() {
+        let (client, server) = mock_daemon_client(vec![MockDaemonReply {
+            invocation: None,
+            tool_call: true,
+        }])
+        .await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let executor = counting_executor(Arc::clone(&effects));
+
+        let result = client
+            .query_with_tools_with_system("work", None, vec![], &executor)
+            .await;
+        server.abort();
+
+        assert!(result.is_err());
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn daemon_tool_loop_rejects_continuation_drift_before_next_local_effect() {
+        let (client, server) = mock_daemon_client(vec![
+            MockDaemonReply {
+                invocation: Some(daemon_invocation("gpt-5.6-sol-2026-08-30")),
+                tool_call: true,
+            },
+            MockDaemonReply {
+                invocation: Some(daemon_invocation("gpt-5.6-sol-2026-08-31")),
+                tool_call: true,
+            },
+        ])
+        .await;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let executor = counting_executor(Arc::clone(&effects));
+
+        let result = client
+            .query_with_tools_with_system("work", None, vec![], &executor)
+            .await;
+        server.abort();
+
+        assert!(result.is_err());
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
     }
 }

@@ -2101,14 +2101,17 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
         finch::metrics::WireAdherenceMetric::first_pass("daemon", "daemon-selected", "one_shot");
-    let response = client
-        .query_with_tools_with_system(
+    let daemon_result = client
+        .query_with_tools_with_system_and_provenance(
             query,
             Some(vm_wire_system_prompt()),
             tool_definitions,
             &guard,
+            None,
         )
         .await?;
+    let response = daemon_result.response;
+    let invocation_metadata = daemon_result.invocation_metadata;
     finch::programs::corpus::capture_with_runtime_from_env(
         &program_runtime,
         "daemon",
@@ -2150,14 +2153,16 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             // A correction is source-only.  Do not give it the tool manifest:
             // a malformed, effect-free response must not turn into a new
             // arbitrary host action merely because it is being repaired.
-            let repair = client
-                .query_with_tools_with_system(
+            let repair_result = client
+                .query_with_tools_with_system_and_provenance(
                     &one_shot_wire_repair_request(&response, &diagnostic),
                     Some(vm_wire_system_prompt()),
                     Vec::new(),
                     &guard,
+                    Some(invocation_metadata.clone()),
                 )
                 .await?;
+            let repair = repair_result.response;
             finch::programs::corpus::capture_with_runtime_from_env(
                 &program_runtime,
                 "daemon",
@@ -2178,14 +2183,16 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             }
             mark_wire_rejection(&mut wire_metric, &response, &error.to_string());
             wire_metric.repair_attempted = true;
-            let repair = client
-                .query_with_tools_with_system(
+            let repair_result = client
+                .query_with_tools_with_system_and_provenance(
                     &one_shot_wire_repair_request(&response, &error.to_string()),
                     Some(vm_wire_system_prompt()),
                     Vec::new(),
                     &guard,
+                    Some(invocation_metadata.clone()),
                 )
                 .await?;
+            let repair = repair_result.response;
             finch::programs::corpus::capture_with_runtime_from_env(
                 &program_runtime,
                 "daemon",
@@ -2452,7 +2459,7 @@ fn one_shot_system_with_identity(
 fn admit_one_shot_response(
     client: &ClaudeClient,
     turn_identity: &finch::providers::TurnIdentity,
-    response: &finch::claude::types::MessageResponse,
+    response: &finch::claude::MessageResponse,
 ) -> Result<finch::providers::InvocationMetadata> {
     let actual_model = (!response.model.trim().is_empty()).then(|| response.model.clone());
     let invocation = finch::providers::InvocationMetadata::from_turn(
@@ -3259,11 +3266,8 @@ mod tests {
         }
     }
 
-    fn admitted_test_response(
-        provider: &str,
-        model: &str,
-    ) -> finch::claude::types::MessageResponse {
-        finch::claude::types::MessageResponse {
+    fn admitted_test_response(provider: &str, model: &str) -> finch::claude::MessageResponse {
+        finch::claude::MessageResponse {
             id: "response".into(),
             response_type: "message".into(),
             role: "assistant".into(),
