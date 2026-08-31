@@ -15,6 +15,8 @@ use std::sync::{Arc, RwLock};
 pub enum StatusLineType {
     /// Session label shown permanently (e.g. "◆ swift-falcon · ~/repos/finch")
     SessionLabel,
+    /// Canonical secret-free configured/resolved provider-model identity.
+    ProviderIdentity,
     /// Memory context: engine type + recall info ("🧠 neural · 142 memories · recalled 3")
     MemoryContext,
     /// Conversation topic derived from MemTree overall centroid ("📋 <topic>")
@@ -97,6 +99,13 @@ impl StatusBar {
         if let Some(content) = lines.get(&StatusLineType::SessionLabel) {
             result.push(StatusLine {
                 line_type: StatusLineType::SessionLabel,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::ProviderIdentity) {
+            result.push(StatusLine {
+                line_type: StatusLineType::ProviderIdentity,
                 content: content.clone(),
             });
         }
@@ -243,9 +252,13 @@ impl StatusBar {
 
     /// Get rendered status content while projecting one line somewhere else.
     pub fn get_status_without(&self, excluded: &StatusLineType) -> String {
+        self.get_status_without_types(std::slice::from_ref(excluded))
+    }
+
+    pub fn get_status_without_types(&self, excluded: &[StatusLineType]) -> String {
         self.get_lines()
             .iter()
-            .filter(|line| &line.line_type != excluded)
+            .filter(|line| !excluded.contains(&line.line_type))
             .map(|line| line.content.as_str())
             .collect::<Vec<_>>()
             .join("\n")
@@ -451,6 +464,31 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
         assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
+    }
+
+    #[test]
+    fn provider_identity_is_rendered_once_and_can_be_projected_into_the_banner() {
+        let status = StatusBar::new();
+        status.update_line(StatusLineType::SessionLabel, "◆ brain: quiet-hill");
+        status.update_line(
+            StatusLineType::ProviderIdentity,
+            "Openai · fast-alias → gpt-5.6-sol",
+        );
+        status.update_line(StatusLineType::MemoryContext, "🧠 recalled 2");
+
+        assert_eq!(
+            status.get_status_without_types(&[
+                StatusLineType::SessionLabel,
+                StatusLineType::ProviderIdentity,
+            ]),
+            "🧠 recalled 2"
+        );
+        assert_eq!(
+            status
+                .get_line(&StatusLineType::ProviderIdentity)
+                .as_deref(),
+            Some("Openai · fast-alias → gpt-5.6-sol")
+        );
     }
 
     #[test]

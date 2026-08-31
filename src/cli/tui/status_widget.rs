@@ -36,6 +36,9 @@ impl<'a> StatusWidget<'a> {
                     .fg(self.colors.ui.cursor.to_color())
                     .add_modifier(Modifier::BOLD)
             }
+            StatusLineType::ProviderIdentity => Style::default()
+                .fg(self.colors.ui.cursor.to_color())
+                .add_modifier(Modifier::BOLD),
             StatusLineType::MemoryContext => {
                 // Memory context: subtle teal/cyan
                 Style::default().fg(Color::Cyan)

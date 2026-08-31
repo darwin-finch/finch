@@ -579,6 +579,22 @@ fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
     )
 }
 
+fn provider_status_rule_line(width: usize, provider_identity: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if provider_identity.is_empty() {
+        return "─".repeat(width);
+    }
+    let label_budget = width.saturating_sub(3);
+    let label = ellipsize(provider_identity, label_budget);
+    let prefix = format!("─ {label} ");
+    format!(
+        "{prefix}{}",
+        "─".repeat(width.saturating_sub(prefix.chars().count()))
+    )
+}
+
 /// Return a plain visible suffix small enough to fit in `columns`. This is
 /// used only when one logical line is itself taller than the remaining live
 /// viewport; completed scrollback retains the original ANSI-bearing line.
@@ -1490,9 +1506,10 @@ impl TuiRenderer {
         let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let input_lines = self.input_textarea.lines().to_vec();
-        let raw_status = self
-            .status_bar
-            .get_status_without(&StatusLineType::SessionLabel);
+        let raw_status = self.status_bar.get_status_without_types(&[
+            StatusLineType::SessionLabel,
+            StatusLineType::ProviderIdentity,
+        ]);
         let current_input = input_lines.join("\n");
         let effective_status = compute_effective_status(
             self.ghost_text.as_deref(),
@@ -1765,7 +1782,11 @@ impl TuiRenderer {
             // Session identity is projected into the upper separator. Keeping it
             // here as well wastes a row and makes the Brain appear twice.
             // Thin separator between input area and status line(s) — full terminal width
-            let status_sep: String = "─".repeat(term_width);
+            let provider_identity = self
+                .status_bar
+                .get_line(&StatusLineType::ProviderIdentity)
+                .unwrap_or_default();
+            let status_sep = provider_status_rule_line(term_width, &provider_identity);
             execute!(
                 stdout,
                 Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET))
@@ -2567,9 +2588,10 @@ impl TuiRenderer {
         let draw_width = term_width;
         let draw_height = usize::from(height);
         let input_lines = self.input_textarea.lines().to_vec();
-        let raw_status = self
-            .status_bar
-            .get_status_without(&StatusLineType::SessionLabel);
+        let raw_status = self.status_bar.get_status_without_types(&[
+            StatusLineType::SessionLabel,
+            StatusLineType::ProviderIdentity,
+        ]);
         let effective_status = compute_effective_status(
             self.ghost_text.as_deref(),
             &raw_status,
@@ -2671,11 +2693,17 @@ impl TuiRenderer {
             term_width,
             self.ghost_text.as_deref(),
         );
-        let status_rows = shadow_buffer::physical_rows(&"─".repeat(draw_width), term_width)
-            + effective_status
-                .lines()
-                .map(|line| shadow_buffer::physical_rows(line, term_width))
-                .sum::<usize>();
+        let provider_identity = self
+            .status_bar
+            .get_line(&StatusLineType::ProviderIdentity)
+            .unwrap_or_default();
+        let status_rows = shadow_buffer::physical_rows(
+            &provider_status_rule_line(draw_width, &provider_identity),
+            term_width,
+        ) + effective_status
+            .lines()
+            .map(|line| shadow_buffer::physical_rows(line, term_width))
+            .sum::<usize>();
         rows += input_phys_rows.iter().sum::<usize>() + completion_rows + status_rows;
         let cursor_text_width = input_lines
             .get(cursor_row)
@@ -3838,11 +3866,24 @@ mod tests {
 
     #[test]
     fn startup_header_is_plain_scrollback_content() {
-        let header = TuiRenderer::startup_header("grok-code-fast-1", "~/repo", "amber-river");
+        let header = TuiRenderer::startup_header(
+            "Openai · fast-alias → gpt-5.6-sol",
+            "~/repo",
+            "amber-river",
+        );
         assert!(header.contains("finch v"));
-        assert!(header.contains("grok-code-fast-1"));
+        assert!(header.contains("Openai · fast-alias → gpt-5.6-sol"));
         assert!(header.contains("amber-river  ·  ~/repo"));
         assert!(!header.contains('\x1b'));
+    }
+
+    #[test]
+    fn provider_banner_projects_the_canonical_identity_and_clips_to_terminal_width() {
+        assert_eq!(
+            provider_status_rule_line(32, "Openai · fast-alias → gpt-5.6-sol"),
+            "─ Openai · fast-alias → gpt-5.… "
+        );
+        assert_eq!(provider_status_rule_line(0, "Openai"), "");
     }
 
     // ── count_status_lines ────────────────────────────────────────────────────

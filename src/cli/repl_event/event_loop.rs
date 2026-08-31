@@ -2202,7 +2202,9 @@ impl EventLoop {
         // clean header: finch version · primary model · working directory.
         self.output_manager.clear();
 
-        let model_name = self.model_selection.generator().await.name().to_string();
+        let startup_generator = self.model_selection.generator().await;
+        let startup_identity = startup_generator.turn_identity()?;
+        let provider_display = startup_identity.display_name();
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| {
@@ -2253,13 +2255,17 @@ impl EventLoop {
                 None => format!("◆ brain: {} · home · daemon offline", self.session_label),
             },
         );
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::ProviderIdentity,
+            provider_display.clone(),
+        );
 
         {
             let mut tui = self.tui_renderer.lock().await;
             tui.set_session_label(self.session_label.clone());
         }
         self.output_manager.write_info(TuiRenderer::startup_header(
-            &model_name,
+            &provider_display,
             &cwd,
             &self.session_label,
         ));
@@ -3808,17 +3814,21 @@ Rules:\n\
     }
 
     async fn handle_provider_show(&self) {
-        let active = self.model_selection.active_index().await;
-        let Some(entry) = self.available_providers.get(active) else {
-            self.output_manager.write_info("No active model profile.");
-            return;
+        let identity = match self.model_selection.generator().await.turn_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.output_manager
+                    .write_error(format!("Active provider identity is invalid: {error}"));
+                return;
+            }
         };
-
         let mut text = format!(
-            "Active model: {}\n  provider: {}\n  model: {}\n  conversation: preserved across switches",
-            entry.profile_name(),
-            entry.provider_type(),
-            entry.model().unwrap_or("provider default")
+            "Active model: {}\n  requested provider: {}\n  resolved provider: {}\n  requested model: {}\n  resolved model: {}\n  conversation: preserved across switches",
+            identity.configured_profile,
+            identity.requested_provider,
+            identity.resolved_provider,
+            identity.requested_model,
+            identity.resolved_model,
         );
         if let Some(pending) = self.model_selection.pending_index().await {
             if let Some(entry) = self.available_providers.get(pending) {
@@ -3867,7 +3877,12 @@ Rules:\n\
                             client,
                             entry.profile_name(),
                         ));
+                    let provider_display = generator.turn_identity()?.display_name();
                     self.model_selection.activate(target_index, generator).await;
+                    self.status_bar.update_line(
+                        crate::cli::status_bar::StatusLineType::ProviderIdentity,
+                        provider_display,
+                    );
                     self.output_manager.write_info(format!(
                         "✓ Switched to {} · {} (conversation preserved)",
                         entry.profile_name(),
@@ -3888,8 +3903,10 @@ Rules:\n\
                             Arc::clone(&client),
                             entry.profile_name(),
                         ));
+                    let provider_display = local_generator.turn_identity()?.display_name();
                     let selection = self.model_selection.clone();
                     let output = Arc::clone(&self.output_manager);
+                    let status_bar = Arc::clone(&self.status_bar);
                     let profile_name = entry.profile_name();
                     tokio::spawn(async move {
                         let outcome = activate_local_when_ready(
@@ -3905,9 +3922,15 @@ Rules:\n\
                         )
                         .await;
                         match outcome {
-                            LocalActivationOutcome::Activated(model) => output.write_info(format!(
-                                "✓ Switched to {profile_name} · {model} (conversation preserved)"
-                            )),
+                            LocalActivationOutcome::Activated(model) => {
+                                status_bar.update_line(
+                                    crate::cli::status_bar::StatusLineType::ProviderIdentity,
+                                    provider_display,
+                                );
+                                output.write_info(format!(
+                                    "✓ Switched to {profile_name} · {model} (conversation preserved)"
+                                ));
+                            }
                             LocalActivationOutcome::Failed(error) => output.write_error(format!(
                                 "Local model {profile_name} failed to start: {error}"
                             )),
@@ -3946,7 +3969,12 @@ Rules:\n\
                         .write_info(format!("⚠️  Failed to create model '{}': {}", name, e));
                 }
                 Ok(new_gen) => {
+                    let provider_display = new_gen.turn_identity()?.display_name();
                     self.model_selection.activate(target_index, new_gen).await;
+                    self.status_bar.update_line(
+                        crate::cli::status_bar::StatusLineType::ProviderIdentity,
+                        provider_display,
+                    );
                     self.output_manager.write_info(format!(
                         "✓ Switched to {} · {} (conversation preserved)",
                         entry.profile_name(),
