@@ -77,6 +77,28 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
 ## Integrate and account
 
 1. Merge only reviewed, tested work into current `main`.
+
+   **The worker merges; it does not ask.** When the merge conditions below are
+   all met, merging is the worker's decision and handing it to the user instead
+   is a failure to finish the work. Ask only when a condition cannot be met.
+
+   Merge when every one of these holds:
+
+   - the review protocol reached convergence with no unresolved confirmed
+     finding, at the exact tip being merged;
+   - the named regression and the affected suites pass at that same tip, run
+     through the Cargo slot;
+   - every repository gate the change touches passes locally or in CI, and any
+     gate that could not run is named with the reason;
+   - a failing check unrelated to the change is shown to be unrelated by
+     evidence, not assumption — reproduce it on an untouched branch or on
+     `main` before discounting it;
+   - the branch is rebased on current `main` and the claim check has been
+     repeated immediately beforehand.
+
+   Stop and ask only for: an unresolved confirmed finding, a gate that cannot
+   be run at all, a material product choice, or authority the user has not
+   granted. "This change feels significant" is not a reason to ask.
 2. Synchronize `main` and verify the merge commit.
 3. Update or close the GitHub issue with commit, regression, review, CI, remaining-gap evidence, and a completion/release event for its work claim.
 4. Remove clean worktrees after merge or proven supersession. Preserve unique work by committing and pushing it first.
