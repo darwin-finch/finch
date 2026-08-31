@@ -59,8 +59,20 @@ and model fallback are rejected.
 
 The account catalog is bounded and cached by account plus credential
 generation. ETags may revalidate an expired cache, but an entry from another
-account is never reused. Both `gpt-5.6-sol` and `gpt-5.6` must be explicitly
-advertised with text, image, API, and Responses-Lite support before inference.
+account is never reused. A requested `gpt-5.6-sol` or `gpt-5.6` entry must be
+explicitly advertised with text, image, API, and Responses-Lite support before
+inference.
+Their numeric `context_window` values are authoritative account-catalog
+metadata when they fall in the defensive range `1..=10,000,000`; Finch does
+not treat one exact window size as a dialect or authorization discriminator.
+Missing, non-numeric, zero, and excessive values fail closed without exposing
+the catalog body or account credentials. The synchronous capability descriptor
+reports the context window as unknown because it cannot perform credentialed
+account discovery; the validated catalog retains the exact value for each
+selectable model. The service may advertise either pinned identifier without
+advertising both. Finch requires the exact configured/requested identifier to
+be present and compatible before inference, so an alias is never silently
+substituted and an unrecognized slug is never accepted.
 
 ## Request and continuation semantics
 
@@ -70,6 +82,21 @@ Every request uses `store: false`, `stream: true`,
 and tools are Responses-Lite developer items; user/assistant text, validated
 PNG/JPEG inputs, function calls, and function outputs retain their history
 order.
+
+The request prefix follows the audited Codex v0.151.0 Responses-Lite shape:
+ordinary function definitions are nested under the `functions` namespace, and
+the `additional_tools` and developer-instructions items carry deterministic
+UUID-v5 IDs with `at_` and `msg_` prefixes. Codex scopes those payload-derived
+IDs to its thread UUID. Finch does not expose a Codex thread at this provider
+boundary, so it scopes them to the pinned protocol revision instead; identical
+visible prefix payloads therefore keep identity across retries without putting
+a username, Brain, account, credential, or host identifier on the wire. The
+pin must be re-audited if OpenAI changes the prefix identity contract.
+
+The audited client also sends fields tied to Codex-owned thread and client
+state, including `prompt_cache_key` and `client_metadata`. Finch does not
+fabricate those values: they remain absent until Finch has an independently
+defined, reviewed contract for them.
 
 Encrypted reasoning is provider-owned opaque data. Finch bounds it, persists it
 as an ordered content block through the atomic conversation path, and replays it
@@ -88,7 +115,9 @@ arguments, missing completion, duplicate terminal markers, post-terminal data,
 partial EOF, idle timeout, receiver drop, and payload-limit violations fail
 visibly before terminal chunks are published.
 
-Non-success bodies are consumed only to a small bound and discarded. Tokens,
+Non-success bodies are consumed only to a small bound and discarded. A
+Responses-Lite rejection retains a typed HTTP status and a compatibility or
+entitlement hint, never the response body. Tokens,
 account identifiers, request bodies, image data, tool arguments, reasoning
 continuations, and response bodies are never placed in provider errors.
 

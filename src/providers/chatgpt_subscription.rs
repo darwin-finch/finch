@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::chatgpt_oauth::{OpenAiChatGptOAuthDialect, CHATGPT_SUBSCRIPTION_BASE_URL};
@@ -52,6 +53,7 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -86,6 +88,67 @@ impl fmt::Display for SubscriptionCatalogUnavailable {
 }
 
 impl std::error::Error for SubscriptionCatalogUnavailable {}
+
+#[derive(Debug)]
+enum SubscriptionCatalogContextWindowInvalid {
+    MissingOrMalformed,
+    OutOfBounds(u64),
+}
+
+impl fmt::Display for SubscriptionCatalogContextWindowInvalid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOrMalformed => formatter.write_str(
+                "ChatGPT catalog model context window was missing or malformed",
+            ),
+            Self::OutOfBounds(value) => write!(
+                formatter,
+                "ChatGPT catalog model context window {value} was outside the supported range 1..={MAX_CATALOG_CONTEXT_WINDOW}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubscriptionCatalogContextWindowInvalid {}
+
+#[derive(Debug)]
+struct SubscriptionCatalogNoSelectableModel;
+
+impl fmt::Display for SubscriptionCatalogNoSelectableModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "ChatGPT account catalog did not advertise a supported GPT-5.6 Sol identifier",
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionCatalogNoSelectableModel {}
+
+#[derive(Debug)]
+struct SubscriptionRequestedModelUnavailable;
+
+impl fmt::Display for SubscriptionRequestedModelUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChatGPT account does not advertise the configured supported model")
+    }
+}
+
+impl std::error::Error for SubscriptionRequestedModelUnavailable {}
+
+#[derive(Debug)]
+struct SubscriptionResponseRejected(StatusCode);
+
+impl fmt::Display for SubscriptionResponseRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ChatGPT subscription rejected the pinned Responses-Lite request (HTTP {}); the account entitlement or pinned protocol contract may have changed",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionResponseRejected {}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -459,12 +522,8 @@ impl ChatGptSubscriptionProvider {
         let selected = catalog
             .models
             .get(&request.model)
-            .context("ChatGPT account does not advertise the configured model")?;
-        if !selected.responses_lite
-            || !selected.image_input
-            || selected.context_window != 1_050_000
-            || selected.slug != request.model
-        {
+            .ok_or(SubscriptionRequestedModelUnavailable)?;
+        if !catalog_model_matches_request(selected, &request.model) {
             bail!("ChatGPT account model is not compatible with the pinned Responses-Lite dialect");
         }
         let url = self.route(RESPONSES_PATH, None)?;
@@ -494,12 +553,8 @@ impl ChatGptSubscriptionProvider {
                 let refreshed_model = catalog
                     .models
                     .get(&request.model)
-                    .context("ChatGPT account model changed while refreshing credentials")?;
-                if !refreshed_model.responses_lite
-                    || !refreshed_model.image_input
-                    || refreshed_model.context_window != 1_050_000
-                    || refreshed_model.slug != request.model
-                {
+                    .ok_or(SubscriptionRequestedModelUnavailable)?;
+                if !catalog_model_matches_request(refreshed_model, &request.model) {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
                 unauthorized_retry_used = true;
@@ -508,7 +563,7 @@ impl ChatGptSubscriptionProvider {
             if !response.status().is_success() {
                 let status = response.status();
                 let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
-                bail!("ChatGPT subscription response failed (HTTP {status})");
+                return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
                 bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?
@@ -635,7 +690,9 @@ fn subscription_capabilities(model: &str) -> ModelCapabilities {
             "2026-08-30",
             source,
         ),
-        Some(1_050_000),
+        // The account-scoped catalog is authoritative for this value. The
+        // synchronous capability API cannot perform credentialed discovery.
+        None,
         Some(128_000),
         None,
     )
@@ -651,6 +708,13 @@ fn subscription_capabilities(model: &str) -> ModelCapabilities {
     capabilities.usage_reporting =
         ModelFeature::static_metadata(CapabilitySupport::Supported, "2026-08-30", source);
     capabilities
+}
+
+fn catalog_model_matches_request(model: &CatalogModel, requested_model: &str) -> bool {
+    model.responses_lite
+        && model.image_input
+        && (1..=MAX_CATALOG_CONTEXT_WINDOW as usize).contains(&model.context_window)
+        && model.slug == requested_model
 }
 
 fn validate_model(model: &str) -> Result<()> {
@@ -735,10 +799,18 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
     let tools = map_tools(request.tools.as_deref().unwrap_or_default())?;
     let allowed_tools = advertised_tool_names(request);
     let mut input = Vec::new();
-    input.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
+    let tools_payload = serde_json::to_vec(&tools)
+        .context("Failed to encode ChatGPT subscription tool definitions")?;
+    input.push(json!({
+        "id": responses_lite_prefix_id("at", &tools_payload),
+        "type":"additional_tools",
+        "role":"developer",
+        "tools":tools
+    }));
     if let Some(system) = request.system.as_deref().filter(|value| !value.is_empty()) {
         validate_bounded_text(system, MAX_TOOL_ARGUMENT_BYTES, "instructions")?;
         input.push(json!({
+            "id": responses_lite_prefix_id("msg", system.as_bytes()),
             "type":"message","role":"developer",
             "content":[{"type":"input_text","text":system}]
         }));
@@ -771,6 +843,18 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
         "include": ["reasoning.encrypted_content"]
     });
     Ok(body)
+}
+
+fn responses_lite_prefix_id(prefix: &str, visible_payload: &[u8]) -> String {
+    // Codex v0.151.0 assigns UUID-v5 IDs to the two prompt-only Responses-Lite
+    // items so retries retain identity. Finch has no Codex thread UUID at this
+    // provider boundary, so the audited protocol revision is the stable,
+    // application-owned namespace and the visible payload remains the name.
+    let namespace = Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        CHATGPT_INFERENCE_PROTOCOL_REVISION.as_bytes(),
+    );
+    format!("{prefix}_{}", Uuid::new_v5(&namespace, visible_payload))
 }
 
 fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
@@ -967,14 +1051,7 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
         {
             continue;
         }
-        let context_window = object
-            .get("context_window")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .context("ChatGPT catalog model omitted a valid context window")?;
-        if context_window != 1_050_000 {
-            bail!("ChatGPT catalog model context window was invalid");
-        }
+        let context_window = parse_catalog_context_window(object)?;
         if supported {
             if !responses_lite || !image_input {
                 bail!("ChatGPT GPT-5.6 Sol catalog capabilities drifted");
@@ -990,10 +1067,22 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
             );
         }
     }
-    if !parsed.contains_key(DEFAULT_MODEL) || !parsed.contains_key(MODEL_ALIAS) {
-        bail!("ChatGPT account does not advertise both pinned GPT-5.6 Sol identifiers");
+    if parsed.is_empty() {
+        return Err(SubscriptionCatalogNoSelectableModel.into());
     }
     Ok(Catalog { models: parsed })
+}
+
+fn parse_catalog_context_window(object: &Map<String, Value>) -> Result<usize> {
+    let value = object
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .ok_or(SubscriptionCatalogContextWindowInvalid::MissingOrMalformed)?;
+    if value == 0 || value > MAX_CATALOG_CONTEXT_WINDOW {
+        return Err(SubscriptionCatalogContextWindowInvalid::OutOfBounds(value).into());
+    }
+    usize::try_from(value)
+        .map_err(|_| SubscriptionCatalogContextWindowInvalid::OutOfBounds(value).into())
 }
 
 #[derive(Default)]
@@ -2051,6 +2140,10 @@ mod tests {
     }
 
     fn catalog_body() -> String {
+        catalog_body_with_context_windows(1_050_000, 1_050_000)
+    }
+
+    fn catalog_body_with_context_windows(sol: u64, alias: u64) -> String {
         json!({
             "models":[
                 {
@@ -2058,16 +2151,29 @@ mod tests {
                     "supported_in_api":true,
                     "use_responses_lite":true,
                     "input_modalities":["text","image"],
-                    "context_window":1050000
+                    "context_window":sol
                 },
                 {
                     "slug":"gpt-5.6",
                     "supported_in_api":true,
                     "use_responses_lite":true,
                     "input_modalities":["text","image"],
-                    "context_window":1050000
+                    "context_window":alias
                 }
             ]
+        })
+        .to_string()
+    }
+
+    fn single_model_catalog_body(slug: &str, context_window: u64) -> String {
+        json!({
+            "models":[{
+                "slug":slug,
+                "supported_in_api":true,
+                "use_responses_lite":true,
+                "input_modalities":["text","image"],
+                "context_window":context_window
+            }]
         })
         .to_string()
     }
@@ -2271,7 +2377,19 @@ mod tests {
         let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
         assert_eq!(body["input"][0]["type"], "additional_tools");
         assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(
+            body["input"][0]["id"],
+            "at_06f0d744-9e74-54f8-9371-312adc3c666b"
+        );
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+        assert_eq!(body["input"][0]["tools"][0]["description"], "");
+        assert_eq!(body["input"][0]["tools"][0]["tools"][0]["type"], "function");
         assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(
+            body["input"][1]["id"],
+            "msg_e26db3f8-834d-58b1-9d5e-5e9465345d82"
+        );
         assert_eq!(body["input"][2]["content"][1]["type"], "input_image");
         assert_eq!(
             body["input"][2]["content"][1]["image_url"],
@@ -2288,6 +2406,34 @@ mod tests {
         assert!(body.get("instructions").is_none());
         assert!(body.get("tools").is_none());
         assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("client_metadata").is_none());
+    }
+
+    #[test]
+    fn responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_model(DEFAULT_MODEL)
+            .with_system("developer instructions")
+            .with_tools(vec![tool()]);
+        let first = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        let retry = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        assert_eq!(first["input"][0]["id"], retry["input"][0]["id"]);
+        assert_eq!(first["input"][1]["id"], retry["input"][1]["id"]);
+
+        let changed = responses_lite_request(
+            &request.with_system("different developer instructions"),
+            ReasoningEffort::High,
+        )
+        .unwrap();
+        assert_eq!(first["input"][0]["id"], changed["input"][0]["id"]);
+        assert_ne!(first["input"][1]["id"], changed["input"][1]["id"]);
+        assert!(first["input"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("at_") && id.len() == 39));
+        assert!(first["input"][1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_") && id.len() == 40));
     }
 
     #[test]
@@ -2303,11 +2449,98 @@ mod tests {
             );
             assert!(capability.image_input.is_supported());
             assert!(capability.continuation.is_supported());
+            assert_eq!(capability.context_window.max_tokens, None);
         }
         assert!(subscription_capabilities("gpt-4o")
             .wire_protocol
             .protocol
             .is_none());
+    }
+
+    #[test]
+    fn catalog_accepts_and_preserves_authoritative_bounded_context_windows() {
+        for (sol, alias) in [(200_000, 262_144), (1_000_000, 1_050_000)] {
+            let catalog =
+                parse_catalog(catalog_body_with_context_windows(sol, alias).as_bytes()).unwrap();
+            assert_eq!(catalog.models[DEFAULT_MODEL].context_window, sol as usize);
+            assert_eq!(catalog.models[MODEL_ALIAS].context_window, alias as usize);
+        }
+        for slug in [DEFAULT_MODEL, MODEL_ALIAS] {
+            let catalog = parse_catalog(single_model_catalog_body(slug, 1_000_000).as_bytes())
+                .expect("either exact selectable identifier is sufficient");
+            assert_eq!(catalog.models.len(), 1);
+            assert_eq!(catalog.models[slug].context_window, 1_000_000);
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_missing_malformed_zero_and_excessive_context_windows() {
+        let assert_invalid = |catalog: Value| {
+            let error = parse_catalog(catalog.to_string().as_bytes())
+                .err()
+                .expect("invalid context window must fail");
+            assert!(error.is::<SubscriptionCatalogContextWindowInvalid>());
+            error.to_string()
+        };
+
+        let mut missing: Value = serde_json::from_str(&catalog_body()).unwrap();
+        missing["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_window");
+        assert!(assert_invalid(missing).contains("missing or malformed"));
+
+        let mut malformed: Value = serde_json::from_str(&catalog_body()).unwrap();
+        malformed["models"][0]["context_window"] = json!("1000000");
+        assert!(assert_invalid(malformed).contains("missing or malformed"));
+
+        let mut zero: Value = serde_json::from_str(&catalog_body()).unwrap();
+        zero["models"][0]["context_window"] = json!(0);
+        let zero_error = assert_invalid(zero);
+        assert!(zero_error.contains("context window 0"));
+        assert!(!zero_error.contains("models"));
+
+        let mut excessive: Value = serde_json::from_str(&catalog_body()).unwrap();
+        excessive["models"][0]["context_window"] = json!(MAX_CATALOG_CONTEXT_WINDOW + 1);
+        let excessive_error = assert_invalid(excessive);
+        assert!(excessive_error.contains(&(MAX_CATALOG_CONTEXT_WINDOW + 1).to_string()));
+        assert!(!excessive_error.contains("models"));
+    }
+
+    #[test]
+    fn catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
+        let mut wrong_slug: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
+        wrong_slug["models"][0]["slug"] = json!("gpt-5.6-sol-impostor");
+        let wrong_slug_error = parse_catalog(wrong_slug.to_string().as_bytes())
+            .err()
+            .expect("wrong slug must fail");
+        assert!(wrong_slug_error.is::<SubscriptionCatalogNoSelectableModel>());
+
+        let mut unsupported_api: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
+        unsupported_api["models"][0]["supported_in_api"] = json!(false);
+        let unsupported_error = parse_catalog(unsupported_api.to_string().as_bytes())
+            .err()
+            .expect("unsupported API model must fail");
+        assert!(unsupported_error.is::<SubscriptionCatalogNoSelectableModel>());
+
+        let mut missing_image: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
+        missing_image["models"][0]["input_modalities"] = json!(["text"]);
+        assert!(parse_catalog(missing_image.to_string().as_bytes())
+            .err()
+            .expect("missing image modality must fail")
+            .to_string()
+            .contains("catalog capabilities drifted"));
+
+        let mut missing_text: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
+        missing_text["models"][0]["input_modalities"] = json!(["image"]);
+        let missing_text_error = parse_catalog(missing_text.to_string().as_bytes())
+            .err()
+            .expect("missing text modality must fail");
+        assert!(missing_text_error.is::<SubscriptionCatalogNoSelectableModel>());
     }
 
     #[test]
@@ -2385,7 +2618,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ignores_unrelated_models_but_requires_both_pinned_identifiers() {
+    fn catalog_ignores_unrelated_models_and_accepts_one_pinned_identifier() {
         let mut catalog: Value = serde_json::from_str(&catalog_body()).unwrap();
         catalog["models"].as_array_mut().unwrap().push(json!({
             "slug":"unrelated-account-model",
@@ -2398,11 +2631,10 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .retain(|model| model["slug"] != MODEL_ALIAS);
-        let error = parse_catalog(catalog.to_string().as_bytes())
-            .err()
-            .expect("missing alias must fail")
-            .to_string();
-        assert!(error.contains("both pinned GPT-5.6 Sol identifiers"));
+        let parsed = parse_catalog(catalog.to_string().as_bytes())
+            .expect("one exact selectable identifier is sufficient");
+        assert_eq!(parsed.models.len(), 1);
+        assert!(parsed.models.contains_key(DEFAULT_MODEL));
     }
 
     #[test]
@@ -2556,13 +2788,40 @@ mod tests {
             .with_body(catalog_body())
             .create_async()
             .await;
-        let expected = responses_lite_request(
-            &ProviderRequest::new(vec![Message::user("hello")])
-                .with_model(DEFAULT_MODEL)
-                .with_tools(vec![tool()]),
-            ReasoningEffort::High,
-        )
-        .unwrap();
+        let expected = json!({
+            "model": DEFAULT_MODEL,
+            "input": [
+                {
+                    "id": "at_06f0d744-9e74-54f8-9371-312adc3c666b",
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [{
+                            "type": "function",
+                            "name": "read",
+                            "description": "Read a file",
+                            "strict": false,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path":{"type":"string"}},
+                                "required": ["path"],
+                                "additionalProperties": false
+                            }
+                        }]
+                    }]
+                },
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": {"effort":"high","context":"all_turns"},
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"]
+        });
         let inference = server
             .mock("POST", RESPONSES_PATH)
             .match_header("authorization", "Bearer subscription-secret")
@@ -2619,7 +2878,7 @@ mod tests {
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
-            .with_body(catalog_body())
+            .with_body(single_model_catalog_body(DEFAULT_MODEL, 1_000_000))
             .expect(1)
             .create_async()
             .await;
@@ -2666,6 +2925,48 @@ mod tests {
         assert_eq!(streamed_text, "hello");
         models.assert_async().await;
         inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn buffered_and_streaming_require_the_exact_requested_catalog_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(single_model_catalog_body(MODEL_ALIAS, 1_000_000))
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let buffered_error = provider
+            .send_message(&request)
+            .await
+            .err()
+            .expect("buffered request must require its exact catalog entry");
+        assert!(buffered_error.is::<SubscriptionRequestedModelUnavailable>());
+        assert!(!buffered_error.to_string().contains("subscription-secret"));
+        assert!(!buffered_error.to_string().contains("account-1"));
+
+        let streaming_error = provider
+            .send_message_stream(&request)
+            .await
+            .err()
+            .expect("streaming request must require its exact catalog entry");
+        assert!(streaming_error.is::<SubscriptionRequestedModelUnavailable>());
+        assert!(!streaming_error.to_string().contains("subscription-secret"));
+        assert!(!streaming_error.to_string().contains("account-1"));
+        models.assert_async().await;
     }
 
     #[tokio::test]
@@ -3055,6 +3356,51 @@ mod tests {
         assert!(!error.contains("subscription-secret"));
         assert!(error.contains("size limit"));
         assert!(error.len() < 256);
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn response_rejection_is_typed_clear_and_secret_free() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let attacker_body = "account-1 subscription-secret private-tool-argument private-reasoning";
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(400)
+            .with_body(attacker_body)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("HTTP rejection must retain its typed provider boundary");
+        assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+        let display = error.to_string();
+        assert!(display.contains("HTTP 400 Bad Request"));
+        assert!(display.contains("pinned protocol contract may have changed"));
+        assert!(!display.contains(attacker_body));
+        assert!(!display.contains("account-1"));
+        assert!(!display.contains("subscription-secret"));
+        assert!(display.len() < 256);
         models.assert_async().await;
         inference.assert_async().await;
     }
