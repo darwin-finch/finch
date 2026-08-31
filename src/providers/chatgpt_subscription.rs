@@ -898,6 +898,9 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
     let mut functions = Vec::with_capacity(tools.len());
     for tool in tools {
         validate_identifier(&tool.name, 128, "tool name")?;
+        if is_chatgpt_agent_wire_alias(&tool.name) {
+            bail!("ChatGPT subscription request used a reserved wire tool name");
+        }
         validate_bounded_text(
             &tool.description,
             MAX_TOOL_ARGUMENT_BYTES,
@@ -939,6 +942,13 @@ fn chatgpt_wire_tool_name(name: &str) -> &str {
         "cancel_agent" => "finch_cancel_agent",
         _ => name,
     }
+}
+
+fn is_chatgpt_agent_wire_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "finch_spawn_agent" | "finch_await_agent" | "finch_poll_agent" | "finch_cancel_agent"
+    )
 }
 
 fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
@@ -2930,18 +2940,27 @@ mod tests {
             ));
         }
 
-        let collision = ProviderRequest::new(vec![Message::user("delegate")])
-            .with_model(DEFAULT_MODEL)
-            .with_tools(vec![
-                named_tool("spawn_agent"),
-                named_tool("finch_spawn_agent"),
-            ]);
-        assert_eq!(
-            responses_lite_request(&collision, ReasoningEffort::High)
-                .unwrap_err()
-                .to_string(),
-            "ChatGPT subscription request repeated a wire tool name"
-        );
+        for alias in [
+            "finch_spawn_agent",
+            "finch_await_agent",
+            "finch_poll_agent",
+            "finch_cancel_agent",
+        ] {
+            for tools in [
+                vec![named_tool(alias)],
+                vec![named_tool("spawn_agent"), named_tool(alias)],
+            ] {
+                let collision = ProviderRequest::new(vec![Message::user("delegate")])
+                    .with_model(DEFAULT_MODEL)
+                    .with_tools(tools);
+                assert_eq!(
+                    responses_lite_request(&collision, ReasoningEffort::High)
+                        .unwrap_err()
+                        .to_string(),
+                    "ChatGPT subscription request used a reserved wire tool name"
+                );
+            }
+        }
     }
 
     #[test]
