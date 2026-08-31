@@ -14,9 +14,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-const SELECTION_HINT: &str = "Mouse transcript controls on · hold Option (iTerm2) or Shift (many terminals) and drag to select text";
-
-#[cfg(unix)]
 fn read_pty_until(
     master: &mut std::fs::File,
     transcript: &mut Vec<u8>,
@@ -51,6 +48,13 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
         .windows(needle.len())
         .filter(|window| *window == needle)
         .count()
+}
+
+#[cfg(unix)]
+fn last_byte_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 #[cfg(unix)]
@@ -139,7 +143,7 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
         .expect("failed to spawn Finch in owned PTY");
     drop(slave);
 
-    let hint = SELECTION_HINT.as_bytes();
+    let hint = finch::cli::MOUSE_SELECTION_HINT.as_bytes();
     let enable_mouse = b"\x1b[?1000h";
     let disable_mouse = b"\x1b[?1000l";
     let mut transcript = Vec::new();
@@ -225,6 +229,10 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
     );
     let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
     assert!(status.success(), "Finch exited unsuccessfully: {status}");
+    assert!(
+        last_byte_offset(&transcript, enable_mouse) < last_byte_offset(&transcript, disable_mouse),
+        "Finch did not leave mouse reporting disabled"
+    );
 }
 
 /// Child-only probe used by `test_tui_renderer_restores_mouse_mode_on_all_terminations`.
@@ -292,6 +300,11 @@ fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
             observed_cleanup,
             "{termination} path left mouse reporting enabled: {}",
             String::from_utf8_lossy(&transcript)
+        );
+        assert!(
+            last_byte_offset(&transcript, enable_mouse)
+                < last_byte_offset(&transcript, disable_mouse),
+            "{termination} path ended with mouse reporting enabled"
         );
         if matches!(termination, "clean" | "drop") {
             assert!(status.success(), "{termination} probe failed: {status}");

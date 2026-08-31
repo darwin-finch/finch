@@ -17,7 +17,9 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   disclosure state only changes later reconstructed/live viewport projections.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
-  same toggle behavior when terminal mouse reporting is available.
+  same toggle behavior when terminal mouse reporting is available. Native text
+  selection remains available with Option-drag in iTerm2 or Shift-drag in many
+  terminals; modified mouse events never toggle disclosure.
 - Disclosure labels include `expanded`/`collapsed`; neither color nor triangle
   shape is the sole carrier of state.
 - Hit regions are rebuilt from Unicode physical-row geometry after every frame

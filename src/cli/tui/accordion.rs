@@ -214,6 +214,15 @@ impl AccordionState {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
+        // Selection modifiers belong to the terminal, not transcript
+        // disclosure. iTerm2 uses Option and many xterm-compatible terminals
+        // use Shift to bypass application mouse reporting. Most such drags do
+        // not reach Finch at all; ignore them if a terminal does report one.
+        if mouse.modifiers.contains(KeyModifiers::ALT)
+            || mouse.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return false;
+        }
         let Some(region) = self.hit_regions.iter().find(|region| {
             mouse.row >= region.top
                 && mouse.row <= region.bottom
