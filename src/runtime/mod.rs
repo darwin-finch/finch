@@ -12097,8 +12097,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let runtime = ProgramRuntime::new();
         let output_manager = Arc::new(crate::cli::OutputManager::default());
         output_manager.disable_stdout();
-        let response = output_manager.start_work_unit("VM program output");
-        response.set_program_output();
+        let response = output_manager.start_program_output();
         let projection =
             crate::cli::VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&response));
         let events = Arc::new(Mutex::new(Vec::new()));

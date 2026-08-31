@@ -7,7 +7,7 @@
 //!   `ToolApprovalNeeded`, `CancelQuery`.
 //! * **Brain** — canonical named-Brain projections and runner requests.
 
-use crate::cli::messages::WorkUnit;
+use crate::cli::messages::ProgramOutputMessage;
 use crate::cli::output_manager::VmOutputProjection;
 use crate::runtime::VmEffectEnvelope;
 use crate::tools::executor::ToolSignature;
@@ -111,7 +111,7 @@ pub enum ReplEvent {
     /// Completion travels through the same ordered event bus so scrollback
     /// cannot commit the WorkUnit after only its first `say` chunk.
     VmOutputComplete {
-        output_unit: Arc<WorkUnit>,
+        output_unit: Arc<ProgramOutputMessage>,
     },
 
     /// Execute-once VM effects observed while running one provider response.
@@ -126,7 +126,7 @@ pub enum ReplEvent {
     /// Its output unit already exists in the shadow buffer; the event loop
     /// owns final status/error projection and the corresponding redraw.
     TypedProgramComplete {
-        output_unit: Arc<WorkUnit>,
+        output_unit: Arc<ProgramOutputMessage>,
         result: std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
     },
 
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn typed_program_completion_keeps_the_output_unit_on_the_event_loop() {
-        let unit = Arc::new(WorkUnit::new("typed program output"));
+        let unit = Arc::new(ProgramOutputMessage::new());
         let event = ReplEvent::TypedProgramComplete {
             output_unit: Arc::clone(&unit),
             result: Err("cancelled before completion".to_string()),

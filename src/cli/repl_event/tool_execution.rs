@@ -168,12 +168,16 @@ impl ToolExecutionCoordinator {
         let poset = self.poset.clone();
 
         // Build a per-tool presentation binding. Ordinary streaming tools append
-        // their lines to their row; a typed VM program's portable `say` events
-        // append to the owning generation WorkUnit instead. Neither route uses a
+        // their lines to their row; a typed VM tool's portable `say` events
+        // remain part of that genuine tool activity. Neither route uses a
         // process-global "current output" target.
         let program = tool_use.name == "submit_program";
-        let vm_output = program
-            .then(|| VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&work_unit)));
+        let vm_output = program.then(|| {
+            VmOutputProjection::for_tool_activity(
+                Arc::clone(&output_manager),
+                Arc::clone(&work_unit),
+            )
+        });
         let live_output: LiveOutput = Arc::new(WorkUnitPresentation {
             work_unit: Arc::clone(&work_unit),
             row_idx,

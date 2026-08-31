@@ -76,6 +76,40 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
+fn brain_artifact_message_id(
+    provenance: &super::query_state::BrainTurnProvenance,
+    artifact: &str,
+) -> crate::cli::messages::MessageId {
+    crate::cli::messages::MessageId::from_namespace(provenance.run_id.0, artifact)
+}
+
+fn start_wire_source_projection(
+    output_manager: &OutputManager,
+    provenance: Option<&super::query_state::BrainTurnProvenance>,
+    source: &str,
+) -> Arc<crate::cli::messages::ProgramSourceMessage> {
+    let language = crate::programs::ProgramLanguage::infer_source(source);
+    let message = provenance.map_or_else(
+        || output_manager.start_program_source(language.as_str()),
+        |provenance| {
+            output_manager.start_program_source_with_id(
+                brain_artifact_message_id(provenance, "program-source"),
+                language.as_str(),
+            )
+        },
+    );
+    message.replace_source(source);
+    message
+}
+
+fn commit_wire_source_projection(
+    message: &crate::cli::messages::ProgramSourceMessage,
+    final_source: &str,
+) {
+    message.replace_source(final_source);
+    message.set_complete();
+}
+
 /// Build the submission for a provider response carried on the VM wire rather
 /// than in a provider-native tool call.  The typed runtime derives authority
 /// from the program itself; `Pure` is only the coarse compatibility label and
@@ -104,7 +138,7 @@ fn direct_wire_submission(
 async fn execute_direct_wire_response(
     runtime: &crate::runtime::ProgramRuntime,
     output_manager: Arc<OutputManager>,
-    work_unit: Arc<crate::cli::messages::WorkUnit>,
+    work_unit: Arc<crate::cli::messages::ProgramOutputMessage>,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     source: String,
@@ -295,7 +329,7 @@ struct WireExecution {
     source_for_history: String,
     response: String,
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
-    output_unit: Arc<crate::cli::messages::WorkUnit>,
+    output_unit: Arc<crate::cli::messages::ProgramOutputMessage>,
 }
 
 pub(super) fn runner_effect_records(
@@ -337,6 +371,8 @@ async fn execute_wire_with_single_repair(
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    source_projection: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
+    output_id: Option<crate::cli::messages::MessageId>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -351,8 +387,11 @@ async fn execute_wire_with_single_repair(
         crate::programs::corpus::WireCorpusAttempt::FirstPass,
         &source,
     );
-    let output_unit = output_manager.start_work_unit("VM program output");
-    output_unit.set_program_output();
+    let reuse_output_for_repair = output_id.is_some();
+    let output_unit = output_id.map_or_else(
+        || output_manager.start_program_output(),
+        |id| output_manager.start_program_output_with_id(id),
+    );
     let initial = execute_direct_wire_response(
         runtime,
         Arc::clone(&output_manager),
@@ -403,7 +442,7 @@ async fn execute_wire_with_single_repair(
     metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
     metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
 
-    output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+    output_unit.append_output(&format!("VM wire error: {diagnostic}"));
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
@@ -488,8 +527,6 @@ async fn execute_wire_with_single_repair(
             output_unit,
         };
     }
-    output_unit.set_complete();
-
     let repaired_source = raw_wire_source(&repair.text);
     crate::programs::corpus::capture_with_runtime_from_env(
         runtime,
@@ -499,15 +536,23 @@ async fn execute_wire_with_single_repair(
         crate::programs::corpus::WireCorpusAttempt::Repair,
         &repaired_source,
     );
-    let repair_source_unit = output_manager.start_work_unit("VM program repair");
-    repair_source_unit.set_program_source(
-        crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
-    );
-    repair_source_unit.set_response(repaired_source.clone());
-    repair_source_unit.set_complete();
+    if let Some(source_projection) = source_projection {
+        source_projection.replace_source(repaired_source.clone());
+    } else {
+        let repair_source_unit = output_manager.start_program_source(
+            crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+        );
+        repair_source_unit.replace_source(repaired_source.clone());
+        repair_source_unit.set_complete();
+    }
 
-    let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
-    repair_output_unit.set_program_output();
+    let repair_output_unit = if reuse_output_for_repair {
+        output_unit.reset_provisional_output();
+        Arc::clone(&output_unit)
+    } else {
+        output_unit.set_complete();
+        output_manager.start_program_output()
+    };
     match execute_direct_wire_response(
         runtime,
         output_manager,
@@ -544,7 +589,7 @@ async fn execute_wire_with_single_repair(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            repair_output_unit.append_response(&format!("VM wire error: {detail}"));
+            repair_output_unit.append_output(&format!("VM wire error: {detail}"));
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -559,7 +604,7 @@ async fn execute_wire_with_single_repair(
         }
         Err(error) => {
             let detail = format!("VM wire error: {error}");
-            repair_output_unit.append_response(&detail);
+            repair_output_unit.append_output(&detail);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -1061,10 +1106,11 @@ pub(crate) async fn process_query_with_tools(
         // The shadow-buffer / insert_before architecture requires the message to
         // exist in output_manager before any blit cycles run — the WorkUnit's
         // time-driven animation will be visible during streaming.
-        let named_brain_turn = query_states
+        let brain_turn_provenance = query_states
             .get_metadata(query_id)
             .await
-            .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
+            .and_then(|metadata| metadata.brain_turn_provenance);
+        let named_brain_turn = brain_turn_provenance.is_some();
         let inherited_tool_unit = if query.is_empty() || named_brain_turn {
             query_states.tool_work_unit(query_id).await
         } else {
@@ -1114,6 +1160,9 @@ pub(crate) async fn process_query_with_tools(
                 let mut output_token_count: Option<u32> = None;
                 let mut primary_allowance_used_percent: Option<f32> = None;
                 let mut secondary_allowance_used_percent: Option<f32> = None;
+                let mut streamed_source_unit: Option<
+                    Arc<crate::cli::messages::ProgramSourceMessage>,
+                > = None;
 
                 while let Some(result) = rx.recv().await {
                     match result {
@@ -1149,8 +1198,10 @@ pub(crate) async fn process_query_with_tools(
                             if !reusing_tool_unit && has_streamed_wire_source(&text) {
                                 let language =
                                     crate::programs::ProgramLanguage::infer_source(&text);
-                                work_unit.set_program_source(language.as_str());
-                                work_unit.set_response(&text);
+                                let source = streamed_source_unit.get_or_insert_with(|| {
+                                    output_manager.start_program_source(language.as_str())
+                                });
+                                source.replace_source(&text);
                             }
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
@@ -1254,8 +1305,14 @@ pub(crate) async fn process_query_with_tools(
                     // scratch narration, not an executable Finch wire
                     // program. Keep only the structured calls in the stable
                     // query-level tool activity block.
-                    work_unit.set_assistant_presentation();
-                    work_unit.set_response("");
+                    if let Some(source) = streamed_source_unit.take() {
+                        output_manager
+                            .remove_message(crate::cli::messages::Message::id(source.as_ref()));
+                    }
+                    if !named_brain_turn {
+                        work_unit.set_assistant_presentation();
+                        work_unit.set_response("");
+                    }
                     query_states
                         .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
                         .await;
@@ -1327,23 +1384,27 @@ pub(crate) async fn process_query_with_tools(
                     return;
                 }
 
-                // A text-only provider response is Finch source, not prose.
-                // Preserve the received program as one completed work unit,
-                // then route its `say`/UI events to a distinct output unit.
-                // This keeps agent activity inspectable without making source
-                // and user-visible output compete for the same mutable row.
-                let source_unit = if reusing_tool_unit && !named_brain_turn {
+                // A text-only provider response is a distinct Program source
+                // message. Brain activity remains its own stable message and
+                // can receive late lifecycle/tool events without mutating this
+                // committed source artifact.
+                if reusing_tool_unit && !named_brain_turn {
                     work_unit.set_complete();
                     query_states.set_tool_work_unit(query_id, None).await;
-                    output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
-                } else {
-                    Arc::clone(&work_unit)
-                };
+                } else if !reusing_tool_unit {
+                    work_unit.set_complete();
+                    output_manager
+                        .remove_message(crate::cli::messages::Message::id(work_unit.as_ref()));
+                }
                 let wire_source = raw_wire_source(&text);
-                let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
-                source_unit.set_program_source(wire_language.as_str());
-                source_unit.set_response(wire_source.clone());
-                source_unit.set_complete();
+                let source_unit = streamed_source_unit.unwrap_or_else(|| {
+                    start_wire_source_projection(
+                        output_manager.as_ref(),
+                        brain_turn_provenance.as_ref(),
+                        &wire_source,
+                    )
+                });
+                source_unit.replace_source(wire_source.clone());
                 let query_metadata = query_states.get_metadata(query_id).await;
                 let cancel = query_metadata
                     .as_ref()
@@ -1360,6 +1421,10 @@ pub(crate) async fn process_query_with_tools(
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
                     effect_audit,
+                    Some(Arc::clone(&source_unit)),
+                    brain_turn_provenance
+                        .as_ref()
+                        .map(|provenance| brain_artifact_message_id(provenance, "program-output")),
                 )
                 .await;
                 if query_states
@@ -1368,7 +1433,7 @@ pub(crate) async fn process_query_with_tools(
                     .is_some_and(|metadata| metadata.brain_turn_provenance.is_some())
                 {
                     query_states
-                        .set_brain_output_work_unit(
+                        .set_brain_output_message(
                             query_id,
                             Some(Arc::clone(&wire_execution.output_unit)),
                         )
@@ -1376,6 +1441,12 @@ pub(crate) async fn process_query_with_tools(
                 }
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
+                commit_wire_source_projection(source_unit.as_ref(), &source_for_history);
+                if named_brain_turn {
+                    query_states
+                        .set_brain_source_message(query_id, Some(Arc::clone(&source_unit)))
+                        .await;
+                }
                 let history_content =
                     match history_content_with_source(&blocks, source_for_history.clone()) {
                         Ok(content) => content,
@@ -1435,10 +1506,11 @@ pub(crate) async fn process_query_with_tools(
     // Non-streaming path (for Qwen or fallback)
     // Create WorkUnit before the blocking generate call so the animated
     // header is visible during the wait (blit cycle runs every ~100ms).
-    let named_brain_turn = query_states
+    let brain_turn_provenance = query_states
         .get_metadata(query_id)
         .await
-        .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
+        .and_then(|metadata| metadata.brain_turn_provenance);
+    let named_brain_turn = brain_turn_provenance.is_some();
     let inherited_tool_unit = if query.is_empty() || named_brain_turn {
         query_states.tool_work_unit(query_id).await
     } else {
@@ -1472,11 +1544,6 @@ pub(crate) async fn process_query_with_tools(
                     },
                 )
                 .await;
-            // Set response text on the WorkUnit
-            if !response.text.is_empty() {
-                work_unit.set_response(&response.text);
-            }
-
             // Send stats update
             let _ = event_tx.send(ReplEvent::StatsUpdate {
                 model: response.metadata.model.clone(),
@@ -1501,8 +1568,10 @@ pub(crate) async fn process_query_with_tools(
                 .collect();
 
             if !tool_uses.is_empty() {
-                work_unit.set_assistant_presentation();
-                work_unit.set_response("");
+                if !named_brain_turn {
+                    work_unit.set_assistant_presentation();
+                    work_unit.set_response("");
+                }
                 query_states
                     .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
                     .await;
@@ -1568,20 +1637,22 @@ pub(crate) async fn process_query_with_tools(
                 return;
             }
 
-            // Non-streaming providers receive the same two-unit projection:
-            // source first, then the independently reactive program output.
-            let source_unit = if reusing_tool_unit && !named_brain_turn {
+            // Non-streaming providers use the same three-way semantic split as
+            // streaming providers: activity, source, then emitted output.
+            if reusing_tool_unit && !named_brain_turn {
                 work_unit.set_complete();
                 query_states.set_tool_work_unit(query_id, None).await;
-                output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
-            } else {
-                Arc::clone(&work_unit)
-            };
+            } else if !reusing_tool_unit {
+                work_unit.set_complete();
+                output_manager
+                    .remove_message(crate::cli::messages::Message::id(work_unit.as_ref()));
+            }
             let wire_source = raw_wire_source(&response.text);
-            let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
-            source_unit.set_program_source(wire_language.as_str());
-            source_unit.set_response(wire_source.clone());
-            source_unit.set_complete();
+            let source_unit = start_wire_source_projection(
+                output_manager.as_ref(),
+                brain_turn_provenance.as_ref(),
+                &wire_source,
+            );
             let query_metadata = query_states.get_metadata(query_id).await;
             let cancel = query_metadata
                 .as_ref()
@@ -1598,6 +1669,10 @@ pub(crate) async fn process_query_with_tools(
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
                 effect_audit,
+                Some(Arc::clone(&source_unit)),
+                brain_turn_provenance
+                    .as_ref()
+                    .map(|provenance| brain_artifact_message_id(provenance, "program-output")),
             )
             .await;
             if query_states
@@ -1606,7 +1681,7 @@ pub(crate) async fn process_query_with_tools(
                 .is_some_and(|metadata| metadata.brain_turn_provenance.is_some())
             {
                 query_states
-                    .set_brain_output_work_unit(
+                    .set_brain_output_message(
                         query_id,
                         Some(Arc::clone(&wire_execution.output_unit)),
                     )
@@ -1615,6 +1690,12 @@ pub(crate) async fn process_query_with_tools(
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
             let source_for_history = wire_execution.source_for_history;
+            commit_wire_source_projection(source_unit.as_ref(), &source_for_history);
+            if named_brain_turn {
+                query_states
+                    .set_brain_source_message(query_id, Some(Arc::clone(&source_unit)))
+                    .await;
+            }
             let history_content = match history_content_with_source(
                 &response.content_blocks,
                 source_for_history.clone(),
@@ -2296,7 +2377,7 @@ mod tests {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
-        let work_unit = output.start_work_unit("VM output");
+        let work_unit = output.start_program_output();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let complete = execute_direct_wire_response(
             &runtime,
@@ -2349,7 +2430,7 @@ mod tests {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
-        let work_unit = output.start_work_unit("VM output");
+        let work_unit = output.start_program_output();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
         let execution = execute_direct_wire_response(
@@ -2398,7 +2479,7 @@ mod tests {
             .unwrap();
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
-        let work_unit = output.start_work_unit("VM output");
+        let work_unit = output.start_program_output();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (audit_tx, mut audit_rx) = tokio::sync::mpsc::unbounded_channel();
         let effect_audit = crate::server::RunnerEffectAuditControl::new(audit_tx);
@@ -2438,7 +2519,7 @@ mod tests {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
-        let work_unit = output.start_work_unit("VM output");
+        let work_unit = output.start_program_output();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let execution = execute_direct_wire_response(
             &runtime,
@@ -2556,6 +2637,47 @@ mod tests {
         assert!(!has_streamed_wire_source("  \n\t"));
     }
 
+    #[test]
+    fn named_brain_streaming_and_nonstreaming_projection_have_semantic_parity() {
+        use crate::cli::messages::Message;
+
+        let provenance = crate::cli::repl_event::query_state::BrainTurnProvenance {
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
+            request_seq: 9,
+        };
+        let streaming = OutputManager::default();
+        streaming.disable_stdout();
+        let nonstreaming = OutputManager::default();
+        nonstreaming.disable_stdout();
+        let source = "(say \"parity\")";
+
+        let streaming_source = start_wire_source_projection(&streaming, Some(&provenance), source);
+        let nonstreaming_source =
+            start_wire_source_projection(&nonstreaming, Some(&provenance), source);
+        commit_wire_source_projection(streaming_source.as_ref(), source);
+        commit_wire_source_projection(nonstreaming_source.as_ref(), source);
+        let output_id = brain_artifact_message_id(&provenance, "program-output");
+        let streaming_output = streaming.start_program_output_with_id(output_id);
+        let nonstreaming_output = nonstreaming.start_program_output_with_id(output_id);
+        streaming_output.append_output("parity");
+        nonstreaming_output.append_output("parity");
+        streaming_output.set_complete();
+        nonstreaming_output.set_complete();
+
+        let colors = crate::config::ColorScheme::default();
+        assert_eq!(streaming_source.id(), nonstreaming_source.id());
+        assert_eq!(streaming_output.id(), nonstreaming_output.id());
+        assert_eq!(
+            streaming_source.transcript_row(&colors),
+            nonstreaming_source.transcript_row(&colors)
+        );
+        assert_eq!(
+            streaming_output.transcript_row(&colors),
+            nonstreaming_output.transcript_row(&colors)
+        );
+    }
+
     #[tokio::test]
     async fn fenced_wire_response_is_repaired_once_without_executing_its_body() {
         let runtime = crate::runtime::ProgramRuntime::new();
@@ -2578,6 +2700,8 @@ mod tests {
             &[crate::claude::Message::user("reply")],
             source.clone(),
             Some(&metrics),
+            None,
+            None,
             None,
         )
         .await;
@@ -2623,6 +2747,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_brain_repair_preserves_one_stable_source_and_output_identity() {
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let namespace = uuid::Uuid::new_v4();
+        let source_id =
+            crate::cli::messages::MessageId::from_namespace(namespace, "program-source");
+        let output_id =
+            crate::cli::messages::MessageId::from_namespace(namespace, "program-output");
+        let source_projection = output.start_program_source_with_id(source_id, "lisp");
+        let rejected = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        source_projection.replace_source(rejected.clone());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator,
+            &[crate::claude::Message::user("reply")],
+            rejected,
+            None,
+            None,
+            Some(Arc::clone(&source_projection)),
+            Some(output_id),
+        )
+        .await;
+        while let Ok(ReplEvent::VmEffect {
+            projection,
+            envelope,
+        }) = event_rx.try_recv()
+        {
+            projection.project_envelope(envelope);
+        }
+        source_projection.replace_source(execution.source_for_history.clone());
+        source_projection.set_complete();
+
+        let messages = output.get_messages();
+        assert_eq!(messages.len(), 2, "one source and one output artifact");
+        assert_eq!(messages[0].id(), source_id);
+        assert_eq!(messages[1].id(), output_id);
+        let colors = crate::config::ColorScheme::default();
+        let source_row = messages[0].transcript_row(&colors).unwrap();
+        let output_row = messages[1].transcript_row(&colors).unwrap();
+        assert_eq!(source_row.kind, TranscriptRowKind::Program);
+        assert_eq!(output_row.kind, TranscriptRowKind::Output);
+        assert!(source_row.children.is_empty());
+        assert!(output_row.children.is_empty());
+        assert_eq!(source_projection.content(), "(say \"repaired\")");
+        assert_eq!(execution.output_unit.content(), "repaired");
+    }
+
+    #[tokio::test]
     async fn named_brain_effect_audit_cancel_before_repair_never_invokes_provider() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -2643,6 +2826,8 @@ mod tests {
             generator.clone(),
             &[crate::claude::Message::user("reply")],
             source.clone(),
+            None,
+            None,
             None,
             None,
         )
@@ -2680,6 +2865,8 @@ mod tests {
                     generator,
                     &[crate::claude::Message::user("reply")],
                     source,
+                    None,
+                    None,
                     None,
                     None,
                 )
