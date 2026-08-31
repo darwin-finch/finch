@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::cli::messages::{MessageRef, TranscriptRow, TranscriptRowId};
+use crate::cli::messages::{
+    DisclosureLookup, MessageRef, RenderCapabilities, RenderContext, TranscriptRow, TranscriptRowId,
+};
 use crate::config::ColorScheme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,20 +47,19 @@ impl AccordionState {
         message: &MessageRef,
         colors: &ColorScheme,
     ) -> Vec<RenderedTranscriptLine> {
-        let Some(root) = message.transcript_row(colors) else {
-            return message
-                .format(colors)
-                .split('\n')
-                .map(|text| RenderedTranscriptLine {
-                    text: text.to_owned(),
-                    row_id: None,
-                    row_expanded: None,
-                })
-                .collect();
-        };
-        let mut lines = Vec::new();
-        self.render_row(&root, 0, false, &mut lines);
-        lines
+        message
+            .render(
+                &RenderContext::new(colors, RenderCapabilities::terminal(usize::MAX))
+                    .with_disclosure(self),
+            )
+            .lines
+            .into_iter()
+            .map(|line| RenderedTranscriptLine {
+                text: line.text,
+                row_id: line.row_id,
+                row_expanded: line.row_expanded,
+            })
+            .collect()
     }
 
     pub fn render_message_fully_expanded(
@@ -66,66 +67,20 @@ impl AccordionState {
         message: &MessageRef,
         colors: &ColorScheme,
     ) -> Vec<RenderedTranscriptLine> {
-        let Some(root) = message.transcript_row(colors) else {
-            return self.render_message(message, colors);
-        };
-        let mut lines = Vec::new();
-        self.render_row(&root, 0, true, &mut lines);
-        lines
-    }
-
-    fn render_row(
-        &self,
-        row: &TranscriptRow,
-        depth: usize,
-        force_expanded: bool,
-        lines: &mut Vec<RenderedTranscriptLine>,
-    ) {
-        let expandable = !row.body.is_empty() || !row.children.is_empty();
-        let expanded = expandable && (force_expanded || self.is_expanded(row));
-        let marker = match (expandable, expanded) {
-            (true, true) => "▼",
-            (true, false) => "▶",
-            (false, _) => "•",
-        };
-        let state = if expandable {
-            if expanded {
-                " [expanded]"
-            } else {
-                " [collapsed]"
-            }
-        } else {
-            ""
-        };
-        let focus = if self.focused.as_ref() == Some(&row.id) {
-            "> "
-        } else {
-            "  "
-        };
-        lines.push(RenderedTranscriptLine {
-            text: format!(
-                "{focus}{}{} {}{}",
-                "  ".repeat(depth),
-                marker,
-                row.label,
-                state
-            ),
-            row_id: expandable.then(|| row.id.clone()),
-            row_expanded: expandable.then_some(expanded),
-        });
-        if !expanded {
-            return;
-        }
-        for body in &row.body {
-            lines.push(RenderedTranscriptLine {
-                text: format!("{}  {}", "  ".repeat(depth), body),
-                row_id: None,
-                row_expanded: None,
-            });
-        }
-        for child in &row.children {
-            self.render_row(child, depth + 1, force_expanded, lines);
-        }
+        message
+            .render(
+                &RenderContext::new(colors, RenderCapabilities::terminal(usize::MAX))
+                    .with_disclosure(self)
+                    .fully_expanded(),
+            )
+            .lines
+            .into_iter()
+            .map(|line| RenderedTranscriptLine {
+                text: line.text,
+                row_id: line.row_id,
+                row_expanded: line.row_expanded,
+            })
+            .collect()
     }
 
     pub fn rebuild_hit_regions(
@@ -231,6 +186,16 @@ impl AccordionState {
         self.expanded.insert(row_id.clone(), !current);
         self.visible_expanded.insert(row_id, !current);
         true
+    }
+}
+
+impl DisclosureLookup for AccordionState {
+    fn expanded(&self, row_id: &TranscriptRowId) -> Option<bool> {
+        self.expanded.get(row_id).copied()
+    }
+
+    fn focused(&self, row_id: &TranscriptRowId) -> bool {
+        self.focused.as_ref() == Some(row_id)
     }
 }
 
