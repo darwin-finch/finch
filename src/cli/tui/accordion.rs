@@ -223,7 +223,10 @@ impl AccordionState {
             return false;
         };
         let row_id = region.row_id.clone();
-        self.focused = Some(row_id.clone());
+        // Mouse disclosure is direct manipulation, not keyboard traversal.
+        // Clear keyboard focus so clicking never leaves a persistent `> `
+        // marker on a differently indented row.
+        self.focused = None;
         let current = self.visible_expanded.get(&row_id).copied().unwrap_or(false);
         self.expanded.insert(row_id.clone(), !current);
         self.visible_expanded.insert(row_id, !current);
@@ -360,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mouse_uses_reflowed_region_and_matches_keyboard_toggle() {
+    fn test_mouse_disclosure_uses_reflowed_region_without_leaking_keyboard_focus() {
         let work = Arc::new(WorkUnit::new("response"));
         work.set_response("one\ntwo");
         work.set_complete();
@@ -380,6 +383,15 @@ mod tests {
             .render_message(&message, &colors)
             .iter()
             .all(|line| !line.text.contains("one")));
+        assert!(state.focused.is_none());
+        assert!(!state.render_message(&message, &colors)[0]
+            .text
+            .starts_with("> "));
+        assert!(!state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.render_message(&message, &colors)[0]
+            .text
+            .starts_with("> "));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(state
             .render_message(&message, &colors)
