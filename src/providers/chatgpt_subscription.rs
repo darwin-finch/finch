@@ -34,6 +34,16 @@ use crate::tools::types::ToolDefinition;
 
 pub const CHATGPT_INFERENCE_PROTOCOL_REVISION: &str =
     "openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4";
+// The catalog service filters models by the Codex protocol version, not by
+// Finch's product version. This is the released Codex version corresponding to
+// the public source revision pinned above. Update both pins together after a
+// protocol audit and live acceptance run.
+const CHATGPT_CATALOG_CLIENT_VERSION: &str = "0.151.0";
+const FINCH_CHATGPT_USER_AGENT: &str = concat!(
+    "finch/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://darwin-finch.github.io/)"
+);
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const MODEL_ALIAS: &str = "gpt-5.6";
 const RESPONSES_PATH: &str = "/backend-api/codex/responses";
@@ -62,6 +72,20 @@ impl fmt::Display for SubscriptionUnauthorized {
 }
 
 impl std::error::Error for SubscriptionUnauthorized {}
+
+#[derive(Debug)]
+struct SubscriptionCatalogUnavailable;
+
+impl fmt::Display for SubscriptionCatalogUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ChatGPT subscription returned no models for pinned Codex compatibility version {CHATGPT_CATALOG_CLIENT_VERSION}; account entitlement or server compatibility filtering may have excluded the catalog"
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionCatalogUnavailable {}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -355,7 +379,7 @@ impl ChatGptSubscriptionProvider {
             .and_then(|entry| entry.etag.clone());
         let url = self.route(
             MODELS_PATH,
-            Some(("client_version", env!("CARGO_PKG_VERSION"))),
+            Some(("client_version", CHATGPT_CATALOG_CLIENT_VERSION)),
         )?;
         let mut request = self
             .client
@@ -363,6 +387,7 @@ impl ChatGptSubscriptionProvider {
             .bearer_auth(&lease.access_token)
             .header("ChatGPT-Account-ID", &lease.account)
             .header("originator", "finch")
+            .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
             .header("version", env!("CARGO_PKG_VERSION"))
             .header(
                 "x-finch-chatgpt-protocol",
@@ -450,6 +475,7 @@ impl ChatGptSubscriptionProvider {
                     .bearer_auth(&lease.access_token)
                     .header("ChatGPT-Account-ID", &lease.account)
                     .header("originator", "finch")
+                    .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
                     .header("version", env!("CARGO_PKG_VERSION"))
                     .header("x-finch-chatgpt-protocol", CHATGPT_INFERENCE_PROTOCOL_REVISION)
                     .header("x-openai-internal-codex-responses-lite", "true")
@@ -905,8 +931,11 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
     let models = root["models"]
         .as_array()
         .context("ChatGPT catalog omitted models")?;
-    if models.is_empty() || models.len() > 512 {
-        bail!("ChatGPT subscription model catalog was empty or excessive");
+    if models.is_empty() {
+        return Err(SubscriptionCatalogUnavailable.into());
+    }
+    if models.len() > 512 {
+        bail!("ChatGPT subscription model catalog was excessive");
     }
     let mut parsed = BTreeMap::new();
     for model in models {
@@ -2173,7 +2202,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
             .with_body(catalog_body())
@@ -2279,6 +2308,80 @@ mod tests {
             .wire_protocol
             .protocol
             .is_none());
+    }
+
+    #[test]
+    fn catalog_client_version_is_pinned_to_audited_codex_not_finch_package() {
+        assert_eq!(CHATGPT_CATALOG_CLIENT_VERSION, "0.151.0");
+        assert_ne!(CHATGPT_CATALOG_CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn chatgpt_user_agent_is_static_bounded_and_has_no_user_identity() {
+        assert_eq!(
+            FINCH_CHATGPT_USER_AGENT,
+            concat!(
+                "finch/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://darwin-finch.github.io/)"
+            )
+        );
+        assert!(FINCH_CHATGPT_USER_AGENT.len() <= 256);
+        for private_value in [
+            "shammah",
+            "Shammahs-MacBook-Air.local",
+            "brain-identifier",
+            "account-identifier",
+            "credential-identifier",
+        ] {
+            assert!(!FINCH_CHATGPT_USER_AGENT.contains(private_value));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_is_typed_actionable_and_secret_free() {
+        let access_secret = "empty-catalog-access-secret";
+        let account_secret = "empty-catalog-account-secret";
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                "0.151.0".into(),
+            ))
+            .match_header("authorization", format!("Bearer {access_secret}").as_str())
+            .match_header("chatgpt-account-id", account_secret)
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .with_status(200)
+            .with_body(json!({"models": []}).to_string())
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .account_catalog(
+                &ChatGptCredentialLease {
+                    access_token: access_secret.into(),
+                    account: account_secret.into(),
+                    generation: "generation-empty-catalog".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("empty catalog must fail");
+        assert!(error.is::<SubscriptionCatalogUnavailable>());
+        let rendered = error.to_string();
+        assert!(rendered.contains("pinned Codex compatibility version 0.151.0"));
+        assert!(rendered.contains("entitlement or server compatibility filtering"));
+        assert!(!rendered.contains(access_secret));
+        assert!(!rendered.contains(account_secret));
+        models.assert_async().await;
     }
 
     #[test]
@@ -2441,11 +2544,12 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                "0.151.0".into(),
             ))
             .match_header("authorization", "Bearer subscription-secret")
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_header("etag", "account-etag")
@@ -2464,6 +2568,7 @@ mod tests {
             .match_header("authorization", "Bearer subscription-secret")
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
             .match_header("x-openai-internal-codex-responses-lite", "true")
             .match_body(mockito::Matcher::Json(expected))
             .with_status(200)
@@ -2511,7 +2616,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
             .with_body(catalog_body())
@@ -2595,7 +2700,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(200)
@@ -2606,7 +2711,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("authorization", "Bearer refreshed-subscription-secret")
             .with_status(200)
@@ -2659,7 +2764,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(401)
@@ -2671,7 +2776,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("authorization", "Bearer refreshed-subscription-secret")
             .with_status(200)
@@ -2835,7 +2940,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("chatgpt-account-id", "account-1")
             .match_header("if-none-match", mockito::Matcher::Missing)
@@ -2849,7 +2954,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("chatgpt-account-id", "account-1")
             .match_header("if-none-match", "account-1-etag")
@@ -2861,7 +2966,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .match_header("chatgpt-account-id", "account-2")
             .match_header("if-none-match", mockito::Matcher::Missing)
@@ -2922,7 +3027,7 @@ mod tests {
             .mock("GET", "/backend-api/codex/models")
             .match_query(mockito::Matcher::UrlEncoded(
                 "client_version".into(),
-                env!("CARGO_PKG_VERSION").into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
             .with_body(catalog_body())
