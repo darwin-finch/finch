@@ -121,21 +121,27 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
         std::env::current_exe().context("Failed to determine current executable path")?;
 
     // Create log file in ~/.finch/daemon.log
-    let log_path = dirs::home_dir()
-        .context("Failed to determine home directory")?
-        .join(".finch")
-        .join("daemon.log");
+    let log_path = crate::daemon::daemon_log_path()?;
 
-    // Ensure .finch directory exists
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    // Reconcile retention before handing an fd to the child: this creates the
+    // directory, refuses a symlinked path, rotates an already-oversized log,
+    // and prunes generations beyond the retention count.
+    let policy = crate::daemon::RotationPolicy::from_env();
+    let reconciled = crate::daemon::RotatingLog::open(&log_path, policy)?;
+    drop(reconciled);
+
+    // Open log file in append mode for the child's stdout/stderr
+    let mut log_options = std::fs::OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The reconcile above dropped its handle, so this open is what the child
+        // actually receives. Without O_NOFOLLOW a symlink planted in the window
+        // between them redirects the daemon's stdout and stderr.
+        log_options.custom_flags(nix::libc::O_NOFOLLOW);
     }
-
-    // Open log file in append mode
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let log_file = log_options
         .open(&log_path)
         .with_context(|| format!("Failed to open daemon log file: {}", log_path.display()))?;
 

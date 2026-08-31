@@ -687,6 +687,7 @@ integration_inventory="$(
 )"
 expected_integration_inventory="$(cat <<'EOF'
 tests/daemon_integration_test.rs
+tests/daemon_log_rotation.rs
 tests/daemon_upgrade_preflight_test.rs
 tests/live.rs
 tests/live/impcpd.rs

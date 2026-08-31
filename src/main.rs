@@ -1558,21 +1558,14 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         }
     }
 
-    // Set up file logging for daemon (append to ~/.finch/daemon.log)
-    let log_path = dirs::home_dir()
-        .context("Failed to determine home directory")?
-        .join(".finch")
-        .join("daemon.log");
+    // Set up bounded file logging for daemon (rotating ~/.finch/daemon.log)
+    let log_path = finch::daemon::daemon_log_path()?;
+    let policy = finch::daemon::RotationPolicy::from_env();
+    let rotating_log = finch::daemon::RotatingLog::open(&log_path, policy)?;
+    let log_status = rotating_log.status();
 
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .with_context(|| format!("Failed to open daemon log: {}", log_path.display()))?;
-
-    // Create a file logger layer
-
-    let file_writer = Arc::new(log_file);
+    // Create a file logger layer over the rotating writer
+    let file_writer = rotating_log.clone();
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(move || file_writer.clone())
         .with_ansi(false); // No ANSI colors in log file
@@ -1587,7 +1580,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         .with(file_layer)
         .init();
 
-    eprintln!("Daemon logs: {}", log_path.display());
+    eprintln!("Daemon logs: {}", log_status.summary());
 
     // Suppress ONNX Runtime verbose logs (must be set before library initialization)
     // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
