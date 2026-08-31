@@ -9266,7 +9266,7 @@ mod tests {
                     )),
                     tenant: None,
                     project: None,
-                    account: Some("account-123".into()),
+                    account: None,
                     required_scopes: scopes.clone(),
                 },
                 model: Some("gpt-5.6-sol".into()),
