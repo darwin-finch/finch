@@ -62,6 +62,45 @@ type PendingApprovalsMap = Arc<
     >,
 >;
 
+#[cfg(unix)]
+struct TerminalShutdownSignals {
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminalShutdownSignals {
+    fn install() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        Ok(Self {
+            terminate: signal(SignalKind::terminate()).context("install SIGTERM listener")?,
+            hangup: signal(SignalKind::hangup()).context("install SIGHUP listener")?,
+        })
+    }
+
+    async fn receive(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalShutdownSignals;
+
+#[cfg(not(unix))]
+impl TerminalShutdownSignals {
+    fn install() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn receive(&mut self) -> &'static str {
+        std::future::pending::<&'static str>().await
+    }
+}
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
@@ -2203,6 +2242,7 @@ impl EventLoop {
         // Signal that the TUI owns the terminal so proposal editors perform a
         // complete terminal-protocol handoff before launching $VISUAL/$EDITOR.
         crate::set_tui_active(true);
+        let mut terminal_shutdown_signals = TerminalShutdownSignals::install()?;
 
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
@@ -2394,11 +2434,28 @@ impl EventLoop {
         // Cleanup interval (30 seconds)
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
 
+        // Unix termination signals are converted into an ordinary event-loop
+        // exit. Terminal restoration therefore runs from normal async context,
+        // never directly inside an OS signal handler.
         // Flag to control the loop
         let mut should_exit = false;
 
         while !should_exit {
             tokio::select! {
+                signal = terminal_shutdown_signals.receive() => {
+                    tracing::info!(signal, "received terminal shutdown signal");
+                    // Restore the user's terminal before durable/session
+                    // cleanup awaits any external resource. The final normal
+                    // shutdown call is idempotent after this succeeds.
+                    let mut tui = self.tui_renderer.lock().await;
+                    if let Err(error) = tui.shutdown() {
+                        tracing::warn!(%error, signal, "terminal shutdown after signal failed");
+                        crate::cli::tui::emergency_restore_terminal();
+                    }
+                    drop(tui);
+                    should_exit = true;
+                }
+
                 // User input event
                 Some(event) = self.input_rx.recv() => {
                     use crate::cli::tui::InputEvent;
@@ -2878,12 +2935,9 @@ impl EventLoop {
                         // Suspend the inline TUI, run the full setup wizard,
                         // then resume.  The wizard manages its own terminal
                         // lifecycle (enable_raw_mode / alternate screen).
-                        let input_pause = crate::cli::tui::pause_input_task()
-                            .await
-                            .context("pause REPL input for setup wizard")?;
                         {
                             let tui = self.tui_renderer.lock().await;
-                            tui.suspend().context("release terminal for setup wizard")?;
+                            tui.suspend().ok();
                         }
                         let wizard_result =
                             tokio::task::spawn_blocking(crate::cli::setup_wizard::run_setup_wizard)
@@ -2923,10 +2977,8 @@ impl EventLoop {
                         // state is terminal, including cancellation and error recovery.
                         {
                             let mut tui = self.tui_renderer.lock().await;
-                            tui.resume()
-                                .context("restore terminal after setup wizard")?;
+                            tui.resume().ok();
                         }
-                        drop(input_pause);
                         self.render_tui().await?;
                     }
                     Command::SelfFix => {
@@ -6814,11 +6866,11 @@ Rules:\n\
         }
         let mut tui = self.tui_renderer.lock().await;
 
-        // After returning from an external editor, call resume() to reset
-        // active_rows so the TUI live area repaints from scratch.
-        // enable_raw_mode() in resume() is idempotent — raw mode is already on.
+        // The editor guard already reacquired raw/paste/keyboard modes. Only
+        // retained viewport geometry needs rebuilding here; calling resume()
+        // would push the keyboard protocol a second time.
         if crate::take_tui_rebuild() {
-            tui.resume().ok();
+            tui.rebuild_after_terminal_handoff();
         }
 
         // Check if recovery needed from previous render failure

@@ -30,7 +30,10 @@ use crossterm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tui_textarea::TextArea;
 
@@ -51,7 +54,6 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 
 use accordion::{AccordionState, RenderedTranscriptLine};
 
-pub(crate) use async_input::pause_input_task;
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
 use autocomplete_widget::{completion_pane_lines, replace_command_prefix};
@@ -72,7 +74,7 @@ fn activate_default_terminal_modes<W: Write>(
     activation: TerminalActivation,
 ) -> io::Result<()> {
     match activation {
-        TerminalActivation::Startup => {
+        TerminalActivation::Startup | TerminalActivation::Resume => {
             execute!(writer, crossterm::event::EnableBracketedPaste)?;
             execute!(
                 writer,
@@ -81,7 +83,6 @@ fn activate_default_terminal_modes<W: Write>(
                 )
             )?;
         }
-        TerminalActivation::Resume => {}
         TerminalActivation::EmergencyRestore => {
             execute!(
                 writer,
@@ -98,18 +99,71 @@ fn activate_default_terminal_modes<W: Write>(
 
 /// Restore every terminal mode owned by Finch's default REPL.
 fn restore_default_terminal_modes<W: Write>(mut writer: W) -> io::Result<()> {
-    execute!(
-        writer,
-        // A begin/end pair is idempotent when no update is open and closes a
-        // synchronized update whose owner was interrupted before finalization.
-        BeginSynchronizedUpdate,
-        EndSynchronizedUpdate,
-        crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-        cursor::Show,
-        ResetColor,
-    )
+    let mut first_error = None;
+    macro_rules! attempt {
+        ($step:literal, $operation:expr) => {{
+            let result = if supervised_cleanup_failure_requested($step) {
+                Err(io::Error::other(format!(
+                    "injected terminal cleanup failure at {}",
+                    $step
+                )))
+            } else {
+                $operation
+            };
+            let succeeded = result.is_ok();
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            succeeded
+        }};
+    }
+
+    // Each reset is deliberately independent. An early writer failure must
+    // not suppress later attempts to release keyboard, paste, mouse, cursor,
+    // or style state. Retry a failed synchronized-update end after those
+    // attempts so a transient/partial failure cannot leave output frozen.
+    attempt!("begin_sync", execute!(writer, BeginSynchronizedUpdate));
+    let ended_sync = attempt!("end_sync", execute!(writer, EndSynchronizedUpdate));
+    attempt!(
+        "pop_keyboard",
+        execute!(writer, crossterm::event::PopKeyboardEnhancementFlags)
+    );
+    attempt!(
+        "disable_mouse",
+        execute!(writer, crossterm::event::DisableMouseCapture)
+    );
+    attempt!(
+        "disable_paste",
+        execute!(writer, crossterm::event::DisableBracketedPaste)
+    );
+    attempt!("show_cursor", execute!(writer, cursor::Show));
+    attempt!("reset_color", execute!(writer, ResetColor));
+    if !ended_sync {
+        attempt!("end_sync_retry", execute!(writer, EndSynchronizedUpdate));
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+static CLEANUP_FAILURE_INJECTED: AtomicBool = AtomicBool::new(false);
+
+fn supervised_cleanup_failure_requested(step: &str) -> bool {
+    if std::env::var("FINCH_TEST_TUI_CLEANUP_FAIL_ONCE")
+        .ok()
+        .as_deref()
+        != Some(step)
+    {
+        return false;
+    }
+    if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+        return false;
+    }
+    !CLEANUP_FAILURE_INJECTED.swap(true, Ordering::SeqCst)
 }
 
 /// Roll terminal state back when construction exits after raw mode is active
@@ -2516,8 +2570,12 @@ impl TuiRenderer {
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
         let _ = io::stdout().flush();
-        disable_raw_mode().context("Failed to disable raw mode")?;
-        Ok(())
+        let modes = restore_default_terminal_modes(io::stdout());
+        let raw_mode = disable_raw_mode();
+        if let Err(error) = modes {
+            return Err(error).context("Failed to release terminal modes");
+        }
+        raw_mode.context("Failed to disable raw mode")
     }
 
     /// Re-acquire the terminal after a `suspend()`.
@@ -2534,6 +2592,15 @@ impl TuiRenderer {
         self.pending_viewport_size = None;
         self.viewport_invalidated = true;
         Ok(())
+    }
+
+    /// Rebuild retained viewport geometry after another terminal owner already
+    /// restored Finch's modes itself (for example the external-editor guard).
+    pub(crate) fn rebuild_after_terminal_handoff(&mut self) {
+        self.active_rows = 0;
+        self.pending_viewport_size = None;
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
     }
 
     /// Reacquire every terminal mode after an attempted process replacement
@@ -4089,6 +4156,20 @@ mod tests {
             let mut bytes = Vec::new();
             activate_default_terminal_modes(&mut bytes, activation).unwrap();
             assert!(!contains_bytes(&bytes, &enable_mouse));
+
+            let mut enable_paste = Vec::new();
+            execute!(&mut enable_paste, crossterm::event::EnableBracketedPaste).unwrap();
+            assert!(contains_bytes(&bytes, &enable_paste));
+
+            let mut push_keyboard = Vec::new();
+            execute!(
+                &mut push_keyboard,
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+                )
+            )
+            .unwrap();
+            assert!(contains_bytes(&bytes, &push_keyboard));
         }
     }
 
@@ -4115,6 +4196,43 @@ mod tests {
         let raw = String::from_utf8(bytes).unwrap();
         assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
         assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+    }
+
+    #[test]
+    fn test_terminal_cleanup_retries_end_and_attempts_later_resets_after_failure() {
+        struct FailFirstEndSync {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for FailFirstEndSync {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.failed && bytes.windows(7).any(|window| window == b"[?2026l") {
+                    self.failed = true;
+                    return Err(io::Error::other("injected end-sync failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = FailFirstEndSync {
+            bytes: Vec::new(),
+            failed: false,
+        };
+        assert!(restore_default_terminal_modes(&mut output).is_err());
+
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+        assert!(raw.contains("\x1b[<1u"), "keyboard pop missing: {raw:?}");
+        assert!(raw.contains("\x1b[?1000l"), "mouse reset missing: {raw:?}");
+        assert!(raw.contains("\x1b[?2004l"), "paste reset missing: {raw:?}");
+        assert!(raw.contains("\x1b[?25h"), "cursor restore missing: {raw:?}");
     }
 
     #[test]
