@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+wrapper="$script_dir/with-cargo-slot"
+fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch cargo slot [test].XXXXXX")"
+holder_pid=""
+holder_command_pid=""
+
+cleanup() {
+    if [[ -n "$holder_pid" ]]; then
+        kill "$holder_pid" 2>/dev/null || true
+        wait "$holder_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$holder_command_pid" ]]; then
+        kill "$holder_command_pid" 2>/dev/null || true
+    fi
+    rm -rf "$fixture_root"
+}
+trap cleanup EXIT
+
+repo="$fixture_root/repo"
+worktree="$fixture_root/worktree"
+ready="$fixture_root/holder-ready"
+command_pid_file="$fixture_root/holder-command-pid"
+git init -q "$repo"
+printf 'fixture\n' >"$repo/README"
+git -C "$repo" add README
+git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid commit -qm fixture
+git -C "$repo" worktree add -q "$worktree" -b second-worktree
+
+jobs="$(cd "$repo" && env -u CARGO_BUILD_JOBS "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
+if [[ "$jobs" != "2" ]]; then
+    echo "expected default CARGO_BUILD_JOBS=2, got $jobs" >&2
+    exit 1
+fi
+
+jobs="$(cd "$repo" && CARGO_BUILD_JOBS=1 "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
+if [[ "$jobs" != "1" ]]; then
+    echo "wrapper replaced an explicit CARGO_BUILD_JOBS value" >&2
+    exit 1
+fi
+
+set +e
+(cd "$repo" && "$wrapper" sh -c 'exit 23')
+status=$?
+set -e
+if [[ $status -ne 23 ]]; then
+    echo "expected wrapped exit status 23, got $status" >&2
+    exit 1
+fi
+
+(cd "$repo" && "$wrapper" sh -c 'touch "$1"; sleep 2' sh "$ready") &
+holder_pid=$!
+for _ in {1..100}; do
+    [[ -e "$ready" ]] && break
+    sleep 0.02
+done
+if [[ ! -e "$ready" ]]; then
+    echo "lock holder did not start" >&2
+    exit 1
+fi
+
+if (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true); then
+    echo "a second worktree acquired the repository-wide slot concurrently" >&2
+    exit 1
+fi
+
+wait "$holder_pid"
+holder_pid=""
+(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true)
+
+# A killed wrapped command must release the kernel-owned slot without leaving a
+# stale lock file that excludes later work.
+rm -f "$ready" "$command_pid_file"
+(cd "$repo" && "$wrapper" sh -c 'printf %s "$$" >"$1"; touch "$2"; exec sleep 30' sh "$command_pid_file" "$ready") &
+holder_pid=$!
+for _ in {1..100}; do
+    [[ -s "$command_pid_file" && -e "$ready" ]] && break
+    sleep 0.02
+done
+if [[ ! -s "$command_pid_file" || ! -e "$ready" ]]; then
+    echo "crash-recovery lock holder did not start" >&2
+    exit 1
+fi
+holder_command_pid="$(<"$command_pid_file")"
+kill "$holder_command_pid"
+set +e
+wait "$holder_pid"
+set -e
+holder_pid=""
+holder_command_pid=""
+(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true)
+
+# Resolve the current platform normally but hide its required lock utility.
+# Keeping only explicit symlinks also proves the wrapper does not silently fall
+# through to some other locking mechanism.
+no_lock_bin="$fixture_root/no-lock-bin"
+mkdir "$no_lock_bin"
+ln -s "$(command -v bash)" "$no_lock_bin/bash"
+ln -s "$(command -v git)" "$no_lock_bin/git"
+ln -s "$(command -v uname)" "$no_lock_bin/uname"
+set +e
+(cd "$repo" && PATH="$no_lock_bin" /bin/bash "$wrapper" true >/dev/null 2>&1)
+status=$?
+set -e
+if [[ $status -ne 69 ]]; then
+    echo "expected missing lock utility to fail closed with status 69, got $status" >&2
+    exit 1
+fi
+
+unsupported_bin="$fixture_root/unsupported-bin"
+mkdir "$unsupported_bin"
+ln -s "$(command -v bash)" "$unsupported_bin/bash"
+ln -s "$(command -v git)" "$unsupported_bin/git"
+printf '#!/usr/bin/env bash\nprintf "Plan9\\n"\n' >"$unsupported_bin/uname"
+chmod +x "$unsupported_bin/uname"
+set +e
+(cd "$repo" && PATH="$unsupported_bin" /bin/bash "$wrapper" true >/dev/null 2>&1)
+status=$?
+set -e
+if [[ $status -ne 69 ]]; then
+    echo "expected unsupported platform to fail closed with status 69, got $status" >&2
+    exit 1
+fi
+
+echo "with-cargo-slot regression passed"
