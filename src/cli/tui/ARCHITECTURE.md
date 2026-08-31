@@ -16,8 +16,9 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 - Native scrollback always receives the fully expanded semantic projection;
   disclosure state only changes later reconstructed/live viewport projections.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
-  Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
-  same toggle behavior when terminal mouse reporting is available.
+  Enter/Space toggles, and Escape returns focus to the draft. Finch does not
+  enable terminal mouse reporting by default, so selection, copying, and
+  native scrollback remain owned by the terminal.
 - Disclosure labels include `expanded`/`collapsed`; neither color nor triangle
   shape is the sole carrier of state.
 - Hit regions are rebuilt from Unicode physical-row geometry after every frame
