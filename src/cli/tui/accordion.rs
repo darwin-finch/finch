@@ -206,15 +206,7 @@ impl AccordionState {
                 self.focused = None;
                 true
             }
-            _ => {
-                // Accordion focus is an explicit keyboard mode entered with F6.
-                // As soon as the user types or invokes an unrelated composer
-                // command, return focus to the draft before allowing that key to
-                // continue through normal input routing. This prevents a stale
-                // highlighted row from coexisting with live composer input.
-                self.focused = None;
-                false
-            }
+            _ => false,
         }
     }
 
@@ -231,10 +223,9 @@ impl AccordionState {
             return false;
         };
         let row_id = region.row_id.clone();
-        // Clicking is a direct disclosure action, not a transfer of keyboard
-        // focus. Keeping focus in the composer means the next Space or Enter
-        // behaves like text input/submission instead of unexpectedly toggling
-        // the row again. Keyboard disclosure mode remains available via F6.
+        // Mouse disclosure is direct manipulation, not keyboard traversal.
+        // Clear keyboard focus so clicking never leaves a persistent `> `
+        // marker on a differently indented row.
         self.focused = None;
         let current = self.visible_expanded.get(&row_id).copied().unwrap_or(false);
         self.expanded.insert(row_id.clone(), !current);
@@ -260,8 +251,13 @@ mod tests {
         let mut state = AccordionState::default();
         let first = state.render_message(&message, &colors);
         let call_id = work.transcript_row(&colors).unwrap().children[0].id.clone();
-        state.focused = Some(call_id.clone());
-        state.visible_order = vec![call_id.clone()];
+        state.rebuild_hit_regions(&first, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let root_expanded = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&root_expanded, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert_eq!(state.focused.as_ref(), Some(&call_id));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
         let expanded = state.render_message(&message, &colors);
         assert!(expanded.iter().any(|line| line.text.contains("Input")));
@@ -272,6 +268,59 @@ mod tests {
             work.transcript_row(&colors).unwrap().children[0].id
         );
         assert_ne!(first, expanded);
+    }
+
+    #[test]
+    fn test_failed_tool_defaults_to_one_summary_and_full_expansion_preserves_details() {
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("catalog.validate provider=chatgpt");
+        work.append_row_body_line(call, "raw provider detail".into());
+        work.fail_row(call, "catalog unavailable");
+        work.set_failed();
+        let canonical_before_disclosure = work.complete_transcript(&ColorScheme::default());
+        let message: MessageRef = work.clone();
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+
+        let compact = state.render_message(&message, &colors);
+        assert_eq!(compact.len(), 1);
+        assert!(compact[0].text.contains("catalog.validate"));
+        assert_eq!(compact[0].text.matches("catalog unavailable").count(), 1);
+        assert!(!compact[0].text.contains("Output (0)"));
+
+        state.rebuild_hit_regions(&compact, 3, 24);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let keyboard_expanded = state.render_message(&message, &colors);
+        assert!(keyboard_expanded
+            .iter()
+            .any(|line| line.text.contains("catalog.validate")));
+
+        state.rebuild_hit_regions(&keyboard_expanded, 1, 9);
+        let root = state.hit_regions[0].clone();
+        assert!(state.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: root.left,
+            row: root.top,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(state.render_message(&message, &colors).len(), 1);
+
+        let fully_expanded = state.render_message_fully_expanded(&message, &colors);
+        assert!(fully_expanded
+            .iter()
+            .any(|line| line.text.contains("catalog.validate provider=chatgpt")));
+        assert!(fully_expanded
+            .iter()
+            .any(|line| line.text.contains("raw provider detail")));
+        assert!(!fully_expanded
+            .iter()
+            .any(|line| line.text.contains("Output (0)")));
+        assert_eq!(
+            work.complete_transcript(&colors),
+            canonical_before_disclosure
+        );
+        assert!(canonical_before_disclosure.contains("catalog unavailable"));
     }
 
     #[test]
@@ -322,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mouse_uses_reflowed_region_without_stealing_composer_focus() {
+    fn test_mouse_disclosure_uses_reflowed_region_without_leaking_keyboard_focus() {
         let work = Arc::new(WorkUnit::new("response"));
         work.set_response("one\ntwo");
         work.set_complete();
@@ -343,29 +392,19 @@ mod tests {
             .iter()
             .all(|line| !line.text.contains("one")));
         assert!(state.focused.is_none());
+        assert!(!state.render_message(&message, &colors)[0]
+            .text
+            .starts_with("> "));
         assert!(!state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.render_message(&message, &colors)[0]
+            .text
+            .starts_with("> "));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(state
             .render_message(&message, &colors)
             .iter()
-            .all(|line| !line.text.contains("one")));
-    }
-
-    #[test]
-    fn test_printable_key_leaves_explicit_keyboard_focus_for_composer() {
-        let work = Arc::new(WorkUnit::new("response"));
-        work.set_response("one\ntwo");
-        work.set_complete();
-        let message: MessageRef = work;
-        let colors = ColorScheme::default();
-        let mut state = AccordionState::default();
-        let lines = state.render_message(&message, &colors);
-        state.rebuild_hit_regions(&lines, 0, 80);
-
-        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
-        assert!(state.focused.is_some());
-        assert!(!state.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)));
-        assert!(state.focused.is_none());
-        assert!(!state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
+            .any(|line| line.text.contains("one")));
     }
 
     #[test]
