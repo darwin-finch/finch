@@ -123,12 +123,15 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     // Create log file in ~/.finch/daemon.log
     let log_path = crate::daemon::daemon_log_path()?;
 
-    // Reconcile retention before handing an fd to the child: this creates the
-    // directory, refuses a symlinked path, rotates an already-oversized log,
-    // and prunes generations beyond the retention count.
-    let policy = crate::daemon::RotationPolicy::from_env();
-    let reconciled = crate::daemon::RotatingLog::open(&log_path, policy)?;
-    drop(reconciled);
+    // The daemon owns rotation and retention for its own log (#249). The
+    // frontend only guarantees the directory exists and that the path is a
+    // regular file, so early child output has somewhere safe to land before
+    // the daemon binds its own descriptors.
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+    crate::daemon::log::ensure_regular_file(&log_path)?;
 
     // Open log file in append mode for the child's stdout/stderr
     let mut log_options = std::fs::OpenOptions::new();
@@ -136,6 +139,11 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // The daemon secures this file once it starts, but the frontend creates
+        // it first. Without an explicit mode a fresh log is created at
+        // 0o666 & ~umask — typically 0644 — and is world-readable for the
+        // second or two before the daemon takes over.
+        log_options.mode(0o600);
         // The reconcile above dropped its handle, so this open is what the child
         // actually receives. Without O_NOFOLLOW a symlink planted in the window
         // between them redirects the daemon's stdout and stderr.
@@ -144,6 +152,23 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     let log_file = log_options
         .open(&log_path)
         .with_context(|| format!("Failed to open daemon log file: {}", log_path.display()))?;
+
+    // `mode` applies only when the file is created. A log left world-readable
+    // by an older build must also be repaired, and the child cannot do it if it
+    // fails to start.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = log_file.metadata() {
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                if let Err(error) = log_file.set_permissions(perms) {
+                    warn!(path = %log_path.display(), %error, "Could not secure the daemon log");
+                }
+            }
+        }
+    }
 
     info!(
         exe = %exe_path.display(),
@@ -155,7 +180,8 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::process::CommandExt;
-        Command::new(&exe_path)
+        let mut command = Command::new(&exe_path);
+        command
             .arg("daemon")
             .arg("--bind")
             .arg(bind_address)
@@ -165,11 +191,41 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
                     .try_clone()
                     .context("Failed to clone log file handle")?,
             ))
-            .stderr(Stdio::from(log_file))
-            // New process group so the daemon is independent of the shell's
-            // job control — prevents zsh from reporting it as "[1] terminated"
-            // when the REPL exits.
-            .process_group(0)
+            .stderr(Stdio::from(log_file));
+
+        // Start a new session in the child. This supersedes a new process
+        // group: it detaches from the controlling terminal as well, so the
+        // daemon is independent of the shell's job control and zsh no longer
+        // reports it as "[1] terminated" when the REPL exits.
+        //
+        // The call runs in the pre-exec window, where only async-signal-safe
+        // functions are legal; the new-session call is one. It must stay in
+        // the parent spawn path, which `ensure_daemon_access_allowed()` denies
+        // under test isolation. A daemon that started its own session from
+        // inside `run_daemon` would escape the test supervisor's process group
+        // and could not be reaped. See scripts/test_brain_isolation.sh.
+        //
+        // Note: the escape-API allowlist in that script matches the bare
+        // token, so the call below is the only place it may appear here.
+        //
+        // SAFETY: the closure calls one async-signal-safe libc function and
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        // Marks the child as the detached daemon. `run_daemon` binds its own
+        // stdout/stderr only when this is set, so the documented foreground
+        // modes (`finch daemon` in a terminal, `finch worker`, and the shipped
+        // systemd unit) keep writing to the terminal or the journal.
+        command.env(crate::daemon::DETACHED_DAEMON_ENV, "1");
+
+        command
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
     }
@@ -226,6 +282,77 @@ pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_ensure_regular_file_rejects_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: creating a FIFO at a path inside a fresh temporary directory.
+        assert_eq!(unsafe { nix::libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let error = crate::daemon::log::ensure_regular_file(&path)
+            .expect_err("a FIFO must be refused before anything opens it");
+
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "the error must name the reason: {error}"
+        );
+        // Opening a FIFO with no reader blocks forever, so refusing it here is
+        // what keeps the frontend from hanging with no diagnostic.
+    }
+
+    #[test]
+    fn test_ensure_regular_file_rejects_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = crate::daemon::log::ensure_regular_file(&path)
+            .expect_err("a directory must be refused");
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn test_ensure_regular_file_accepts_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        std::fs::write(&path, b"existing\n").unwrap();
+        crate::daemon::log::ensure_regular_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_frontend_open_repairs_a_world_readable_log() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        std::fs::write(&path, b"inherited\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // The same open the frontend performs before handing the fd to the child.
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).mode(0o600);
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+        let file = options.open(&path).unwrap();
+
+        // `mode` applies only on create, so an existing file needs the fchmod
+        // repair; without it the log stays world-readable whenever the child
+        // fails to start.
+        let mut perms = file.metadata().unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o644, "precondition");
+        perms.set_mode(0o600);
+        file.set_permissions(perms).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

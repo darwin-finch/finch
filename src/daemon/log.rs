@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(any(test, unix))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +172,20 @@ fn generation_path(path: &Path, index: usize) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Public guard for callers that must open the log without owning rotation,
+/// such as the frontend creating the file it hands to the spawned daemon.
+pub fn ensure_regular_file(path: &Path) -> Result<()> {
+    reject_symlink(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => bail!(
+            "Refusing to use daemon log {}: not a regular file. A FIFO or \
+             device node here would block the daemon indefinitely on open",
+            path.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Reject any path whose final component is a symlink.
 ///
 /// Rotation renames and removes files. Following a symlink would let a link
@@ -319,6 +333,11 @@ pub struct RotatingLog {
     /// False when an archived generation could not be re-secured before its
     /// rename, so it may have kept a more permissive mode.
     hardened: bool,
+    /// Whether this process's stdout/stderr are bound to the log and must be
+    /// re-pointed at the new file on every rotation. Only unix binds
+    /// descriptors, so only unix reads this.
+    #[cfg(unix)]
+    bind_stdio: Arc<AtomicBool>,
     /// Test-only: forces the next reopen after rotation to fail exactly once.
     #[cfg(test)]
     fail_next_reopen: Arc<AtomicBool>,
@@ -360,6 +379,8 @@ impl RotatingLog {
                 degraded: false,
             })),
             hardened,
+            #[cfg(unix)]
+            bind_stdio: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_reopen: Arc::new(AtomicBool::new(false)),
         })
@@ -476,6 +497,56 @@ fn rotate_files(path: &Path, policy: RotationPolicy) -> Result<()> {
     Ok(())
 }
 
+/// Point this process's stdout and stderr at `file`.
+///
+/// `dup2` replaces the descriptor's target, so writes that never pass through
+/// `tracing` — `println!`, panic output, and ONNX Runtime's C++ stderr — land in
+/// the current active log rather than in whatever inode the descriptor was
+/// pointing at when the process was spawned.
+#[cfg(unix)]
+fn bind_stdio_to(file: &File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let source = file.as_raw_fd();
+    for target in [nix::libc::STDOUT_FILENO, nix::libc::STDERR_FILENO] {
+        loop {
+            // SAFETY: `source` is an open descriptor owned by this process and
+            // `target` is a standard descriptor number. `dup2` is a plain
+            // syscall with no allocation or locking.
+            if unsafe { nix::libc::dup2(source, target) } != -1 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            // macOS documents EINTR for dup2; a signal delivered mid-rollover
+            // must not abort the bind and leave stdio on the archived inode.
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error)
+                .with_context(|| format!("Failed to bind descriptor {target} to the daemon log"));
+        }
+    }
+    Ok(())
+}
+
+impl RotatingLog {
+    /// Take ownership of this process's stdout and stderr.
+    ///
+    /// The daemon calls this once at startup. Afterwards every rotation
+    /// re-points both descriptors at the new active file, so output that
+    /// bypasses `tracing` stays inside the retention boundary instead of
+    /// growing an archived generation without limit.
+    #[cfg(unix)]
+    pub fn bind_process_stdio(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon log mutex poisoned"))?;
+        bind_stdio_to(&state.file)?;
+        self.bind_stdio.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 impl Write for RotatingLog {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // The guarded state is not corrupt after a panic — at worst `written` is
@@ -491,6 +562,10 @@ impl Write for RotatingLog {
                     state.file = file;
                     state.written = 0;
                     state.degraded = false;
+                    #[cfg(unix)]
+                    if self.bind_stdio.load(Ordering::SeqCst) {
+                        bind_stdio_to(&state.file).map_err(io::Error::other)?;
+                    }
                 }
                 Err(error) => return Err(io::Error::other(error)),
             }
@@ -533,6 +608,13 @@ impl Write for RotatingLog {
                 Ok(file) => {
                     state.file = file;
                     state.degraded = false;
+                    // Follow the rename with the process descriptors, so output
+                    // that never passes through tracing does not stay pinned to
+                    // the archived inode.
+                    #[cfg(unix)]
+                    if self.bind_stdio.load(Ordering::SeqCst) {
+                        bind_stdio_to(&state.file).map_err(io::Error::other)?;
+                    }
                 }
                 Err(error) => {
                     state.degraded = true;

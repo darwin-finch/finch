@@ -1564,6 +1564,26 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     let rotating_log = finch::daemon::RotatingLog::open(&log_path, policy)?;
     let log_status = rotating_log.status();
 
+    // Own this process's descriptors so output that never passes through
+    // tracing — println!, panic output, ONNX Runtime's C++ stderr — follows
+    // rotation instead of pinning the inode inherited from the frontend (#249).
+    //
+    // Only the detached child does this. `finch daemon` run in a terminal and
+    // `finch worker` are documented foreground modes, and the shipped systemd
+    // unit runs `finch daemon` expecting its output in the journal; binding
+    // unconditionally would send all three — including startup failures and
+    // panics — into a file and leave the operator with a blank terminal.
+    #[cfg(unix)]
+    if std::env::var_os(finch::daemon::DETACHED_DAEMON_ENV).is_some() {
+        rotating_log.bind_process_stdio()?;
+        // Consume the marker. It lives in this process's environment and would
+        // otherwise be inherited by every child the daemon spawns — bash tools,
+        // MCP stdio servers, the upgrade preflight probe — each of which would
+        // then hijack its own descriptors and discard the diagnostics its
+        // caller is collecting.
+        std::env::remove_var(finch::daemon::DETACHED_DAEMON_ENV);
+    }
+
     // Create a file logger layer over the rotating writer
     let file_writer = rotating_log.clone();
     let file_layer = tracing_subscriber::fmt::layer()
