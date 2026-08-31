@@ -2051,6 +2051,10 @@ mod tests {
     }
 
     fn catalog_body() -> String {
+        catalog_body_with_context_windows(1_050_000, 1_050_000)
+    }
+
+    fn catalog_body_with_context_windows(sol: u64, alias: u64) -> String {
         json!({
             "models":[
                 {
@@ -2058,14 +2062,14 @@ mod tests {
                     "supported_in_api":true,
                     "use_responses_lite":true,
                     "input_modalities":["text","image"],
-                    "context_window":1050000
+                    "context_window":sol
                 },
                 {
                     "slug":"gpt-5.6",
                     "supported_in_api":true,
                     "use_responses_lite":true,
                     "input_modalities":["text","image"],
-                    "context_window":1050000
+                    "context_window":alias
                 }
             ]
         })
@@ -2619,7 +2623,7 @@ mod tests {
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
-            .with_body(catalog_body())
+            .with_body(catalog_body_with_context_windows(1_000_000, 1_000_000))
             .expect(1)
             .create_async()
             .await;

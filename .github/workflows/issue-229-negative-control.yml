@@ -1,0 +1,26 @@
+name: Issue 229 negative control
+
+on:
+  push:
+    branches:
+      - codex/issue-229-negative-control
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  rejects-valid-window-before-fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Valid non-pinned catalog window regression
+        run: "cargo test --lib providers::chatgpt_subscription::tests::stream_and_nonstream_preserve_equal_terminal_output_and_provenance -- --exact --nocapture"
