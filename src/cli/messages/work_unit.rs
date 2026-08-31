@@ -636,13 +636,22 @@ impl Message for WorkUnit {
 
     fn transcript_row(&self, colors: &ColorScheme) -> Option<TranscriptRow> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let children = inner
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| transcript_tool_row(self.id, index, row, colors))
+            .collect();
         let (kind, label, body, default_expanded) = match &inner.presentation {
-            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => (
-                TranscriptRowKind::ToolGroup,
-                format!("Tools ({} calls)", inner.rows.len()),
-                lines(&inner.response_text),
-                true,
-            ),
+            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => {
+                let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
+                (
+                    TranscriptRowKind::ToolGroup,
+                    compact_tool_group_label(&inner.rows),
+                    lines(&inner.response_text),
+                    inner.status == MessageStatus::InProgress || actionable,
+                )
+            }
             WorkUnitPresentation::Assistant => (
                 TranscriptRowKind::Response,
                 "Assistant response".to_string(),
@@ -666,12 +675,6 @@ impl Message for WorkUnit {
             ),
         };
 
-        let children = inner
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| transcript_tool_row(self.id, index, row, colors, inner.status))
-            .collect();
         Some(TranscriptRow {
             id: TranscriptRowId {
                 message_id: self.id,
@@ -784,7 +787,6 @@ fn transcript_tool_row(
     index: usize,
     row: &WorkRow,
     colors: &ColorScheme,
-    unit_status: MessageStatus,
 ) -> TranscriptRow {
     let summary = match &row.status {
         WorkRowStatus::Running => "running".to_string(),
@@ -814,17 +816,21 @@ fn transcript_tool_row(
     } else {
         row.body_lines.clone()
     };
-    let output = TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: vec![1, index as u32, 1],
-        },
-        kind: TranscriptRowKind::ToolOutput,
-        label: format!("Output ({})", output_body.len()),
-        body: output_body,
-        children: Vec::new(),
-        default_expanded: matches!(row.status, WorkRowStatus::Running),
-    };
+    let actionable = tool_row_requires_default_expansion(row);
+    let mut children = vec![input];
+    if !output_body.is_empty() {
+        children.push(TranscriptRow {
+            id: TranscriptRowId {
+                message_id,
+                path: vec![1, index as u32, 1],
+            },
+            kind: TranscriptRowKind::ToolOutput,
+            label: format!("Output ({})", output_body.len()),
+            body: output_body,
+            children: Vec::new(),
+            default_expanded: matches!(row.status, WorkRowStatus::Running) || actionable,
+        });
+    }
     TranscriptRow {
         id: TranscriptRowId {
             message_id,
@@ -833,9 +839,37 @@ fn transcript_tool_row(
         kind: TranscriptRowKind::ToolCall,
         label: format!("{} — {summary}", row.label),
         body: Vec::new(),
-        children: vec![input, output],
-        default_expanded: unit_status == MessageStatus::InProgress,
+        children,
+        default_expanded: matches!(row.status, WorkRowStatus::Running) || actionable,
     }
+}
+
+fn tool_row_requires_default_expansion(row: &WorkRow) -> bool {
+    matches!(&row.status, WorkRowStatus::Complete(summary) if summary.trim().is_empty())
+        && (row.diffs.as_ref().is_some_and(|diffs| !diffs.is_empty()) || !row.body_lines.is_empty())
+}
+
+fn compact_tool_group_label(rows: &[WorkRow]) -> String {
+    let mut label = format!("Tools ({} calls)", rows.len());
+    let Some(error) = rows.iter().find_map(|row| match &row.status {
+        WorkRowStatus::Error(error) => Some(compact_failure_text(error)),
+        _ => None,
+    }) else {
+        return label;
+    };
+    label.push_str(" — failed: ");
+    label.push_str(&error);
+    label
+}
+
+fn compact_failure_text(error: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let first_line = error.lines().next().unwrap_or_default().trim();
+    let mut compact = first_line.chars().take(MAX_CHARS).collect::<String>();
+    if first_line.chars().count() > MAX_CHARS {
+        compact.push('…');
+    }
+    compact
 }
 
 fn format_work_unit_header(inner: &WorkUnitInner) -> String {
