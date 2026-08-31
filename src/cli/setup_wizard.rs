@@ -9429,7 +9429,7 @@ mod tests {
             .draw(|frame| render_tabbed_wizard(frame, &state))
             .unwrap();
         let rendered = test_buffer_text(terminal.backend().buffer());
-        assert!(rendered.contains("Claude"), "{rendered}");
+        assert!(rendered.contains("claude"), "{rendered}");
         assert!(rendered.contains("[Not configured]"), "{rendered}");
     }
 
