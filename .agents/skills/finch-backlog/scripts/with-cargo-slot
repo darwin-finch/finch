@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "usage: with-cargo-slot <command> [args...]" >&2
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 64
+fi
+
+timeout_seconds="${FINCH_CARGO_SLOT_TIMEOUT_SECONDS:-900}"
+if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
+    echo "with-cargo-slot: FINCH_CARGO_SLOT_TIMEOUT_SECONDS must be a non-negative integer" >&2
+    exit 64
+fi
+
+if ! git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    echo "with-cargo-slot: run from a Finch Git worktree" >&2
+    exit 69
+fi
+
+lock_path="$git_common_dir/finch-cargo-slot.lock"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+
+case "$(uname -s)" in
+    Darwin)
+        if ! command -v lockf >/dev/null 2>&1; then
+            echo "with-cargo-slot: macOS requires lockf; refusing an unlocked build" >&2
+            exit 69
+        fi
+        exec lockf -k -t "$timeout_seconds" "$lock_path" "$@"
+        ;;
+    Linux)
+        if ! command -v flock >/dev/null 2>&1; then
+            echo "with-cargo-slot: Linux requires flock; refusing an unlocked build" >&2
+            exit 69
+        fi
+        exec flock -w "$timeout_seconds" "$lock_path" "$@"
+        ;;
+    *)
+        echo "with-cargo-slot: unsupported platform $(uname -s); refusing an unlocked build" >&2
+        exit 69
+        ;;
+esac
