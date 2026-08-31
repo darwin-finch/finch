@@ -251,8 +251,13 @@ mod tests {
         let mut state = AccordionState::default();
         let first = state.render_message(&message, &colors);
         let call_id = work.transcript_row(&colors).unwrap().children[0].id.clone();
-        state.focused = Some(call_id.clone());
-        state.visible_order = vec![call_id.clone()];
+        state.rebuild_hit_regions(&first, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let root_expanded = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&root_expanded, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert_eq!(state.focused.as_ref(), Some(&call_id));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
         let expanded = state.render_message(&message, &colors);
         assert!(expanded.iter().any(|line| line.text.contains("Input")));
@@ -272,6 +277,7 @@ mod tests {
         work.append_row_body_line(call, "raw provider detail".into());
         work.fail_row(call, "catalog unavailable");
         work.set_failed();
+        let canonical_before_disclosure = work.complete_transcript(&ColorScheme::default());
         let message: MessageRef = work.clone();
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
@@ -310,9 +316,11 @@ mod tests {
         assert!(!fully_expanded
             .iter()
             .any(|line| line.text.contains("Output (0)")));
-        assert!(work
-            .complete_transcript(&colors)
-            .contains("raw provider detail"));
+        assert_eq!(
+            work.complete_transcript(&colors),
+            canonical_before_disclosure
+        );
+        assert!(canonical_before_disclosure.contains("catalog unavailable"));
     }
 
     #[test]
