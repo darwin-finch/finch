@@ -150,6 +150,31 @@ impl fmt::Display for SubscriptionResponseRejected {
 
 impl std::error::Error for SubscriptionResponseRejected {}
 
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionUnexpectedContentType {
+    Missing,
+    Json,
+    Html,
+    Other,
+}
+
+impl fmt::Display for SubscriptionUnexpectedContentType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let media_type = match self {
+            Self::Missing => "a missing Content-Type",
+            Self::Json => "application/json",
+            Self::Html => "text/html",
+            Self::Other => "an unexpected Content-Type",
+        };
+        write!(
+            formatter,
+            "ChatGPT subscription returned HTTP success with {media_type} instead of text/event-stream"
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionUnexpectedContentType {}
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
     access_token: String,
@@ -568,9 +593,15 @@ impl ChatGptSubscriptionProvider {
             let content_type =
                 bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?
                     .unwrap_or_default();
-            if !content_type.starts_with("text/event-stream") {
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
-                bail!("ChatGPT subscription response was not an event stream");
+            // The ChatGPT Codex backend currently omits Content-Type on a
+            // successful streaming response. A missing header is not enough
+            // to reject the response: consume_sse remains the authoritative,
+            // bounded validator for the wire body. Explicitly contradictory
+            // media types are still rejected before parsing.
+            if !content_type.is_empty() && !content_type.starts_with("text/event-stream") {
+                let classification = classify_unexpected_content_type(&content_type);
+                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
+                return Err(classification.into());
             }
             return Ok(response);
         }
@@ -840,6 +871,7 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
         "reasoning": {"effort":effort.as_str(),"context":"all_turns"},
         "store": false,
         "stream": true,
+        "stream_options": {"include_obfuscation": false},
         "include": ["reasoning.encrypted_content"]
     });
     Ok(body)
@@ -1452,6 +1484,12 @@ fn observe_response_model(
     expected_model: &str,
     accumulator: &mut StreamAccumulator,
 ) -> Result<()> {
+    if let Some(model) = response.get("model") {
+        let model = model
+            .as_str()
+            .context("ChatGPT response model field was invalid")?;
+        accumulator.observe_model(model, expected_model)?;
+    }
     if let Some(headers) = response.get("headers") {
         let headers = headers
             .as_object()
@@ -1572,7 +1610,7 @@ fn parse_completed(
     allowed_tools: &HashSet<String>,
     accumulator: &mut StreamAccumulator,
 ) -> Result<CompletedResponse> {
-    exact_keys(
+    bounded_terminal_response_keys(
         response,
         &[
             "id",
@@ -1604,8 +1642,26 @@ fn parse_completed(
             "headers",
             "usage_metadata",
             "end_turn",
+            "background",
+            "completed_at",
+            "conversation",
+            "max_tool_calls",
+            "moderation",
+            "prompt",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "top_logprobs",
+            "frequency_penalty",
+            "presence_penalty",
         ],
     )?;
+    validate_documented_response_metadata(response)?;
+    if response
+        .get("background")
+        .is_some_and(|background| background.as_bool() != Some(false))
+    {
+        bail!("ChatGPT terminal response background state was invalid");
+    }
     if response
         .get("status")
         .is_some_and(|status| status.as_str() != Some("completed"))
@@ -1635,22 +1691,22 @@ fn parse_completed(
         bail!("ChatGPT completion returned too many output items");
     }
     if let Some(output) = terminal_output {
-        if !accumulator.output_items.is_empty()
-            && (output.len() != accumulator.output_items.len()
-                || output.iter().enumerate().any(|(index, item)| {
-                    accumulator.output_items.get(&(index as u64)) != Some(item)
-                }))
-        {
-            bail!("ChatGPT terminal output did not match streamed output items");
+        if !accumulator.output_items.is_empty() {
+            // A completed response is the provider's authoritative snapshot.  The
+            // preceding output_item.done events are useful for progressive UI, but
+            // OpenAI may consolidate, replace, or enrich those snapshots before
+            // response.completed (notably opaque reasoning continuations).  Fully
+            // validate both representations, then retain the terminal snapshot;
+            // requiring equality here rejects valid Responses streams.
+            project_output_items(accumulator.output_items.values(), allowed_tools)?;
         }
-        if accumulator.output_items.is_empty() {
-            accumulator.output_items = output
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(index, item)| (index as u64, item))
-                .collect();
-        }
+        project_output_items(output.iter(), allowed_tools)?;
+        accumulator.output_items = output
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, item)| (index as u64, item))
+            .collect();
     }
     if accumulator
         .output_items
@@ -1674,6 +1730,18 @@ fn parse_completed(
         output_tokens,
         allowance: None,
     })
+}
+
+fn project_output_items<'a>(
+    items: impl IntoIterator<Item = &'a Value>,
+    allowed_tools: &HashSet<String>,
+) -> Result<Vec<ContentBlock>> {
+    let mut blocks = Vec::new();
+    let mut call_ids = HashSet::new();
+    for item in items {
+        parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
+    }
+    Ok(blocks)
 }
 
 fn parse_output_item(
@@ -1721,7 +1789,7 @@ fn parse_output_item(
                 let part = part
                     .as_object()
                     .context("ChatGPT response content was invalid")?;
-                exact_keys(part, &["type", "text"])?;
+                exact_keys(part, &["type", "text", "annotations", "logprobs"])?;
                 if part.get("type").and_then(Value::as_str) != Some("output_text") {
                     bail!("ChatGPT response contained an unknown message content type");
                 }
@@ -1730,6 +1798,21 @@ fn parse_output_item(
                     .and_then(Value::as_str)
                     .context("ChatGPT output text was invalid")?;
                 validate_bounded_text(text, MAX_RESPONSE_BYTES, "output text")?;
+                for field in ["annotations", "logprobs"] {
+                    if let Some(value) = part.get(field) {
+                        let values = value
+                            .as_array()
+                            .context("ChatGPT output text metadata was invalid")?;
+                        if values.len() > 256
+                            || serde_json::to_vec(values)
+                                .context("ChatGPT output text metadata was invalid")?
+                                .len()
+                                > MAX_TOOL_ARGUMENT_BYTES
+                        {
+                            bail!("ChatGPT output text metadata exceeded the size limit");
+                        }
+                    }
+                }
                 blocks.push(ContentBlock::Text {
                     text: text.to_string(),
                 });
@@ -1820,6 +1903,147 @@ fn parse_output_item(
             });
         }
         _ => bail!("ChatGPT response contained an unknown output item type"),
+    }
+    Ok(())
+}
+
+fn validate_documented_response_metadata(response: &Map<String, Value>) -> Result<()> {
+    let optional_number = |name: &str, minimum: f64, maximum: f64| -> Result<()> {
+        let Some(value) = response.get(name) else {
+            return Ok(());
+        };
+        if value.is_null() {
+            return Ok(());
+        }
+        let value = value
+            .as_f64()
+            .filter(|value| value.is_finite() && (*value >= minimum) && (*value <= maximum))
+            .with_context(|| format!("ChatGPT terminal response {name} was invalid"))?;
+        let _ = value;
+        Ok(())
+    };
+    optional_number("created_at", 0.0, u64::MAX as f64)?;
+    optional_number("completed_at", 0.0, u64::MAX as f64)
+        .context("ChatGPT terminal response completion timestamp was invalid")?;
+    optional_number("temperature", 0.0, 2.0)?;
+    optional_number("top_p", 0.0, 1.0)?;
+    optional_number("frequency_penalty", -2.0, 2.0)?;
+    optional_number("presence_penalty", -2.0, 2.0)?;
+
+    if response
+        .get("object")
+        .is_some_and(|value| value.as_str() != Some("response"))
+    {
+        bail!("ChatGPT terminal response object type was invalid");
+    }
+    for (name, expected) in [
+        ("parallel_tool_calls", false),
+        ("store", false),
+        ("end_turn", true),
+    ] {
+        if response
+            .get(name)
+            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(expected))
+        {
+            bail!("ChatGPT terminal response {name} was invalid");
+        }
+    }
+    for name in ["max_output_tokens", "max_tool_calls"] {
+        if response.get(name).is_some_and(|value| {
+            !value.is_null() && value.as_u64().is_none_or(|value| value > u32::MAX as u64)
+        }) {
+            bail!("ChatGPT terminal response {name} was invalid");
+        }
+    }
+    if response
+        .get("top_logprobs")
+        .is_some_and(|value| !value.is_null() && value.as_u64().is_none_or(|value| value > 20))
+    {
+        bail!("ChatGPT terminal response top_logprobs was invalid");
+    }
+    if let Some(value) = response
+        .get("conversation")
+        .filter(|value| !value.is_null())
+    {
+        let conversation = value
+            .as_object()
+            .context("ChatGPT terminal response conversation was invalid")?;
+        exact_keys(conversation, &["id"])?;
+        required_identifier(conversation, "id", 256)?;
+    }
+    if let Some(value) = response
+        .get("prompt_cache_options")
+        .filter(|value| !value.is_null())
+    {
+        let options = value
+            .as_object()
+            .context("ChatGPT terminal response prompt cache options were invalid")?;
+        exact_keys(options, &["mode", "ttl"])?;
+        if !matches!(
+            options.get("mode").and_then(Value::as_str),
+            Some("implicit" | "explicit")
+        ) || options.get("ttl").and_then(Value::as_str) != Some("30m")
+        {
+            bail!("ChatGPT terminal response prompt cache options were invalid");
+        }
+    }
+    if response.get("prompt_cache_retention").is_some_and(|value| {
+        !value.is_null() && !matches!(value.as_str(), Some("in_memory" | "24h"))
+    }) {
+        bail!("ChatGPT terminal response prompt cache retention was invalid");
+    }
+    if response.get("service_tier").is_some_and(|value| {
+        !value.is_null()
+            && !matches!(
+                value.as_str(),
+                Some("auto" | "default" | "flex" | "scale" | "priority" | "fast" | "ultrafast")
+            )
+    }) {
+        bail!("ChatGPT terminal response service tier was invalid");
+    }
+    for (name, maximum) in [
+        ("prompt_cache_key", 256usize),
+        ("safety_identifier", 64usize),
+        ("user", 256usize),
+    ] {
+        if let Some(value) = response.get(name).filter(|value| !value.is_null()) {
+            let value = value
+                .as_str()
+                .with_context(|| format!("ChatGPT terminal response {name} was invalid"))?;
+            validate_bounded_text(value, maximum, name)?;
+        }
+    }
+    if let Some(value) = response.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = value
+            .as_object()
+            .context("ChatGPT terminal response metadata was invalid")?;
+        if metadata.len() > 16 {
+            bail!("ChatGPT terminal response metadata was excessive");
+        }
+        for (key, value) in metadata {
+            if key.len() > 64 || value.as_str().is_none_or(|value| value.len() > 512) {
+                bail!("ChatGPT terminal response metadata was invalid");
+            }
+        }
+    }
+    for name in [
+        "moderation",
+        "prompt",
+        "reasoning",
+        "text",
+        "headers",
+        "usage_metadata",
+    ] {
+        if let Some(value) = response.get(name).filter(|value| !value.is_null()) {
+            if !value.is_object()
+                || serde_json::to_vec(value)
+                    .context("ChatGPT terminal response metadata was invalid")?
+                    .len()
+                    > MAX_TOOL_ARGUMENT_BYTES
+            {
+                bail!("ChatGPT terminal response {name} was invalid");
+            }
+        }
     }
     Ok(())
 }
@@ -1954,8 +2178,49 @@ fn model_is_compatible(requested: &str, actual: &str) -> bool {
 }
 
 fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        bail!("ChatGPT subscription response contained an unknown field");
+    if let Some(obfuscation) = object.get("obfuscation") {
+        let obfuscation = obfuscation
+            .as_str()
+            .context("ChatGPT subscription response obfuscation padding was invalid")?;
+        validate_bounded_text(
+            obfuscation,
+            MAX_SSE_LINE_BYTES,
+            "response obfuscation padding",
+        )?;
+    }
+    if let Some(key) = object
+        .keys()
+        .find(|key| key.as_str() != "obfuscation" && !allowed.contains(&key.as_str()))
+    {
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            bail!("ChatGPT subscription response metadata key was invalid");
+        }
+        // Field names are protocol metadata and safe to expose; values may
+        // contain credentials, private reasoning, or tool arguments and must
+        // never be included in this diagnostic.
+        bail!("ChatGPT subscription response contained unknown field `{key}`");
+    }
+    Ok(())
+}
+
+fn bounded_terminal_response_keys(object: &Map<String, Value>, documented: &[&str]) -> Result<()> {
+    if object.len() > documented.len().saturating_add(64) {
+        bail!("ChatGPT terminal response contained excessive metadata");
+    }
+    for (key, value) in object
+        .iter()
+        .filter(|(key, _)| !documented.contains(&key.as_str()))
+    {
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            bail!("ChatGPT terminal response metadata key was invalid");
+        }
+        if serde_json::to_vec(value)
+            .context("ChatGPT terminal response metadata was invalid")?
+            .len()
+            > MAX_TOOL_ARGUMENT_BYTES
+        {
+            bail!("ChatGPT terminal response metadata exceeded the size limit");
+        }
     }
     Ok(())
 }
@@ -1997,6 +2262,21 @@ fn bounded_header(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Op
             Ok(value.to_string())
         })
         .transpose()
+}
+
+fn classify_unexpected_content_type(value: &str) -> SubscriptionUnexpectedContentType {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "" => SubscriptionUnexpectedContentType::Missing,
+        "application/json" => SubscriptionUnexpectedContentType::Json,
+        "text/html" => SubscriptionUnexpectedContentType::Html,
+        _ => SubscriptionUnexpectedContentType::Other,
+    }
 }
 
 async fn read_bounded(
@@ -2203,6 +2483,60 @@ mod tests {
     }
 
     fn completed_sse(model: &str) -> String {
+        let mut completed_response = json!({
+            "id":"resp-1",
+            "object":"response",
+            "created_at":1_777_777_776.5,
+            "status":"completed",
+            "error":null,
+            "incomplete_details":null,
+            "instructions":null,
+            "metadata":{"fixture":"documented"},
+            "model":model,
+            "parallel_tool_calls":false,
+            "temperature":1.0,
+            "frequency_penalty":0.0,
+            "presence_penalty":0.0,
+            "tool_choice":"auto",
+            "tools":[],
+            "tool_usage":{"read":1},
+            "top_p":1.0,
+            "background":false,
+            "completed_at":1_777_777_777.5,
+            "conversation":{"id":"conv-fixture"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        completed_response.extend(
+            json!({
+                "max_output_tokens":null,
+                "max_tool_calls":null,
+                "moderation":null,
+                "previous_response_id":null,
+                "prompt":null,
+                "prompt_cache_key":null,
+                "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
+                "prompt_cache_retention":"24h",
+                "reasoning":{},
+                "safety_identifier":null,
+                "service_tier":"default",
+                "store":false,
+                "text":{},
+                "top_logprobs":0,
+                "truncation":"disabled",
+                "usage":{"input_tokens":12,"output_tokens":7},
+                "user":null
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let completed = json!({
+            "type":"response.completed",
+            "sequence_number":6,
+            "response":completed_response
+        });
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
@@ -2213,12 +2547,12 @@ mod tests {
                 "event: response.completed\ndata: {}\n\n",
                 "data: [DONE]\n\n"
             ),
-            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model},"obfuscation":"padding-created"}),
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
-            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
-            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello","obfuscation":"padding-delta"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]}}),
             json!({"type":"response.output_item.done","sequence_number":5,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
-            json!({"type":"response.completed","sequence_number":6,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
+            completed
         )
     }
 
@@ -2845,6 +3179,7 @@ mod tests {
             "reasoning": {"effort":"high","context":"all_turns"},
             "store": false,
             "stream": true,
+            "stream_options": {"include_obfuscation": false},
             "include": ["reasoning.encrypted_content"]
         });
         let inference = server
@@ -3466,6 +3801,277 @@ mod tests {
         assert!(display.len() < 256);
         models.assert_async().await;
         inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_success_json_is_typed_bounded_and_redacted() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let secret = "account-1 subscription-secret private-tool-argument";
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "application/json; charset=utf-8")
+            .with_body(format!("{secret}{}", "x".repeat(MAX_ERROR_BYTES)))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err();
+        let classification = error
+            .downcast_ref::<SubscriptionUnexpectedContentType>()
+            .expect("successful JSON response must retain its typed media classification");
+        assert_eq!(classification, &SubscriptionUnexpectedContentType::Json);
+        let display = error.to_string();
+        assert!(display.contains("HTTP success with application/json"));
+        assert!(!display.contains(secret));
+        assert!(!display.contains("size limit"));
+        assert!(display.len() < 256);
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn successful_sse_without_content_type_is_accepted_and_validated() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+
+        let response = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .expect("a valid SSE body does not require a Content-Type header");
+
+        assert_eq!(response.model, DEFAULT_MODEL);
+        assert_eq!(response.usage.unwrap().output_tokens, 7);
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[test]
+    fn unknown_response_field_diagnostic_names_only_the_field() {
+        let secret = "private-reasoning-and-tool-argument";
+        let object = json!({"known":true,"future_metadata":secret});
+        let error = exact_keys(object.as_object().unwrap(), &["known"])
+            .expect_err("an unknown protocol field must remain explicit until audited");
+        let display = error.to_string();
+        assert!(display.contains("`future_metadata`"));
+        assert!(!display.contains(secret));
+    }
+
+    #[test]
+    fn response_obfuscation_must_be_a_bounded_string() {
+        let invalid = json!({"known":true,"obfuscation":{"secret":"not padding"}});
+        let error = exact_keys(invalid.as_object().unwrap(), &["known"])
+            .expect_err("structured obfuscation must not bypass response validation");
+        assert!(error.to_string().contains("padding was invalid"));
+
+        let excessive = json!({
+            "known":true,
+            "obfuscation":"x".repeat(MAX_SSE_LINE_BYTES + 1)
+        });
+        let error = exact_keys(excessive.as_object().unwrap(), &["known"])
+            .expect_err("unbounded obfuscation must not bypass stream limits");
+        assert!(error.to_string().contains("exceeded the size limit"));
+    }
+
+    #[test]
+    fn terminal_background_response_is_rejected() {
+        let response = json!({"id":"resp-background","background":true});
+        let error = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("Finch does not submit or accept background Responses runs here");
+        assert!(error.to_string().contains("background state was invalid"));
+    }
+
+    #[test]
+    fn terminal_completion_timestamp_must_be_null_or_nonnegative_numeric_seconds() {
+        for invalid in [json!(-1), json!("1777777777")] {
+            let response = json!({"id":"resp-timestamp","completed_at":invalid});
+            let error = parse_completed(
+                response.as_object().unwrap(),
+                DEFAULT_MODEL,
+                None,
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .err()
+            .expect("invalid completion timestamps must fail before projection");
+            assert!(error
+                .to_string()
+                .contains("completion timestamp was invalid"));
+        }
+    }
+
+    #[test]
+    fn terminal_penalties_must_remain_within_documented_bounds() {
+        for name in ["frequency_penalty", "presence_penalty"] {
+            let mut response = Map::new();
+            response.insert("id".to_string(), json!("resp-penalty"));
+            response.insert(name.to_string(), json!(2.01));
+            let error = parse_completed(
+                &response,
+                DEFAULT_MODEL,
+                None,
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .err()
+            .expect("out-of-range response penalties must fail before projection");
+            assert!(error.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn terminal_extension_metadata_is_bounded_but_not_projected() {
+        let mut response = Map::new();
+        response.insert("id".to_string(), json!("resp-extension"));
+        response.insert(
+            "tool_usage".to_string(),
+            json!({"future_accounting_shape":{"read":1}}),
+        );
+        bounded_terminal_response_keys(&response, &["id"])
+            .expect("bounded terminal accounting metadata must be forward compatible");
+
+        response.insert(
+            "tool_usage".to_string(),
+            json!("x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)),
+        );
+        let error = bounded_terminal_response_keys(&response, &["id"])
+            .expect_err("terminal extension metadata must remain bounded");
+        assert!(error.to_string().contains("exceeded the size limit"));
+
+        let executable_event = json!({
+            "type":"response.output_item.done",
+            "sequence_number":1,
+            "output_index":0,
+            "item":{"type":"message"},
+            "unknown_executable_semantics":true
+        });
+        let error = parse_event(
+            executable_event,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("unknown event semantics must remain strict");
+        assert!(error
+            .to_string()
+            .contains("unknown field `unknown_executable_semantics`"));
+    }
+
+    #[test]
+    fn terminal_output_is_authoritative_over_streamed_item_snapshots() {
+        let streamed_item = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"hello"}]
+        });
+        let terminal_item = json!({
+            "id":"msg-terminal",
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "phase":"final_answer",
+            "content":[{
+                "type":"output_text",
+                "text":"hello",
+                "annotations":[],
+                "logprobs":[]
+            }]
+        });
+        let response = json!({
+            "id":"resp-semantic",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[terminal_item]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, streamed_item.clone());
+        let completed = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("terminal metadata enrichment must preserve semantic output equality");
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "hello"
+        ));
+
+        let changed = json!({
+            "id":"resp-changed",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"different"}]
+            }]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, streamed_item);
+        let completed = parse_completed(
+            changed.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("the validated terminal completion must supersede streamed snapshots");
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "different"
+        ));
     }
 
     #[tokio::test]
