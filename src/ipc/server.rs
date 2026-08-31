@@ -82,6 +82,7 @@ impl BrainRpcService {
 struct BrainTurnControlImpl {
     server: Arc<AgentServer>,
     brain: String,
+    run_id: crate::brain::store::RunId,
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
@@ -135,6 +136,7 @@ fn require_approval_connection(
 pub(crate) fn test_turn_control_client(
     server: Arc<AgentServer>,
     brain: String,
+    run_id: crate::brain::store::RunId,
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
@@ -142,6 +144,7 @@ pub(crate) fn test_turn_control_client(
     capnp_rpc::new_client(BrainTurnControlImpl {
         server,
         brain,
+        run_id,
         request_seq,
         expected_audience,
         expected_connection_id,
@@ -180,6 +183,7 @@ pub(crate) async fn request_test_turn_approval_with_client(
 pub(crate) async fn request_test_turn_approval(
     server: Arc<AgentServer>,
     brain: String,
+    run_id: crate::brain::store::RunId,
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
@@ -189,6 +193,7 @@ pub(crate) async fn request_test_turn_approval(
         test_turn_control_client(
             server,
             brain,
+            run_id,
             request_seq,
             expected_audience,
             expected_connection_id,
@@ -698,6 +703,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                         &self.brain,
                         audience.attachment_id,
                         connection_id,
+                        self.run_id,
                         self.request_seq,
                         approval_id.clone(),
                         approval_kind.clone(),
@@ -2168,6 +2174,7 @@ async fn forward_runner_request(
                             capnp_rpc::new_client(BrainTurnControlImpl {
                                 server: Arc::clone(&server),
                                 brain: request.brain.clone(),
+                                run_id: request.run_id,
                                 request_seq: request.request_seq,
                                 expected_audience: request.approval_audience.clone(),
                                 expected_connection_id: request.approval_connection_id,

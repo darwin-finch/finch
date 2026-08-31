@@ -5867,6 +5867,7 @@ mod handler_tests {
                 let approval = crate::ipc::server::request_test_turn_approval(
                     approval_server.clone(),
                     request.brain.clone(),
+                    request.run_id,
                     request.request_seq,
                     request.approval_audience.clone(),
                     request.approval_connection_id,

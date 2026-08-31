@@ -3120,6 +3120,7 @@ impl BrainStore {
         name: &str,
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
+        run_id: RunId,
         request_seq: u64,
         approval_id: String,
         approval_kind: String,
@@ -3141,12 +3142,18 @@ impl BrainStore {
             attachment.connected && attachment.connection_id == Some(connection_id),
             "approval audience connection is no longer current"
         );
-        let run_id = state
+        let run = state
             .runs
-            .values()
-            .find(|run| run.request_seq == request_seq && run.status == BrainRunStatus::Running)
-            .map(|run| run.run_id)
-            .context("approval request does not address a running Brain run")?;
+            .get(&run_id)
+            .context("approval request does not address a Brain run")?;
+        anyhow::ensure!(
+            run.request_seq == request_seq,
+            "approval request sequence does not match its Brain run"
+        );
+        anyhow::ensure!(
+            run.status == BrainRunStatus::Running,
+            "approval request does not address a running Brain run"
+        );
         anyhow::ensure!(
             !Self::state_has_run_cancellation_reservation(state, run_id),
             "named Brain run cancelled"
@@ -7592,6 +7599,86 @@ mod tests {
             BrainEventKind::ToolResult { tool_id, output, is_error: false, .. }
                 if tool_id == "tool-1" && output == "found"
         ));
+    }
+
+    #[test]
+    fn approval_targets_exact_run_when_parent_and_child_share_request_sequence() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = attachment.connection_id.unwrap();
+        store
+            .activate_connection("shared", attachment.attachment_id, connection_id)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "delegate work".into(),
+                },
+            )
+            .unwrap();
+        let parent = store
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let child_id = RunId::new();
+        let child = store
+            .start_run_with_parent_id(
+                "shared",
+                "alice",
+                child_id,
+                BrainRunKind::Subagent,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+                Some(parent.run_id),
+                Some("child task".into()),
+            )
+            .unwrap();
+        let snapshot = store.snapshot("shared").unwrap();
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: "shared".into(),
+            attachment_id: attachment.attachment_id,
+            subject: "alice".into(),
+            role: AttachmentRole::Driver,
+            environment_generation: snapshot.environment.generation,
+        };
+
+        let addressed = store
+            .begin_run_approval_for_connection(
+                "shared",
+                attachment.attachment_id,
+                connection_id,
+                parent.run_id,
+                prompt.seq,
+                "parent-poll".into(),
+                "tool".into(),
+                "poll_agent".into(),
+                audience,
+                serde_json::json!({"input": {"task_id": child.run_id.0}}),
+            )
+            .unwrap();
+
+        assert_eq!(addressed, parent.run_id);
+        assert_eq!(
+            store.inspect_run("shared", parent.run_id).unwrap().status,
+            BrainRunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            store.inspect_run("shared", child.run_id).unwrap().status,
+            BrainRunStatus::Running
+        );
     }
 
     #[test]
