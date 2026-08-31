@@ -2,7 +2,9 @@
 
 use std::sync::Mutex;
 
-use super::{Message, MessageId, MessageStatus, TranscriptRow, WorkUnit};
+use super::{
+    Message, MessageDisclosure, MessageId, MessageKind, MessageRef, MessageStatus, WorkUnit,
+};
 use crate::config::ColorScheme;
 
 /// Outcome of reconciling a canonical artifact with its live projection.
@@ -269,8 +271,16 @@ macro_rules! delegate_message {
                 self.unit.complete_transcript(colors)
             }
 
-            fn transcript_row(&self, colors: &ColorScheme) -> Option<TranscriptRow> {
-                self.unit.transcript_row(colors)
+            fn kind(&self) -> MessageKind {
+                self.unit.kind()
+            }
+
+            fn children(&self) -> Vec<MessageRef> {
+                self.unit.children()
+            }
+
+            fn disclosure(&self, colors: &ColorScheme) -> Option<MessageDisclosure> {
+                self.unit.disclosure(colors)
             }
 
             fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {

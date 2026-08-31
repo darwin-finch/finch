@@ -12,16 +12,20 @@ Full documentation lives at `docs/TUI_ARCHITECTURE.md`.
 Check: `scrollback.get_message(msg_id).is_none()` before calling.
 
 **Retained transcript accordions** (`accordion.rs`):
-- WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
+- Composite messages own append-stable child `Message` objects. Each child has
+  its own `MessageId`; the renderer walks those objects directly and does not
+  construct a parallel transcript-row tree.
 - Native scrollback always receives the fully expanded semantic projection;
   disclosure state only changes later reconstructed/live viewport projections.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
-  Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
-  same toggle behavior when terminal mouse reporting is available.
-- Disclosure labels include `expanded`/`collapsed`; neither color nor triangle
-  shape is the sole carrier of state.
+  Enter/Space toggles, and Escape returns focus to the draft. Left-click
+  toggles directly without stealing keyboard focus from the composer when
+  terminal mouse reporting is available.
+- Disclosure state is carried by the arrow and frontend interaction metadata;
+  labels do not repeat `[expanded]` or `[collapsed]`.
 - Hit regions are rebuilt from Unicode physical-row geometry after every frame
-  and resize. Never persist terminal coordinates as row identity.
+  and resize. Never persist terminal coordinates or synthetic tree paths as
+  message identity.
 
 **Dialog system** (`src/cli/tui/dialog.rs`):
 - `Select` — Enter submits immediately; `o`/`O` or typing on Other row activates custom input

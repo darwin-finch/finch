@@ -2669,12 +2669,12 @@ mod tests {
         assert_eq!(streaming_source.id(), nonstreaming_source.id());
         assert_eq!(streaming_output.id(), nonstreaming_output.id());
         assert_eq!(
-            streaming_source.transcript_row(&colors),
-            nonstreaming_source.transcript_row(&colors)
+            streaming_source.disclosure(&colors),
+            nonstreaming_source.disclosure(&colors)
         );
         assert_eq!(
-            streaming_output.transcript_row(&colors),
-            nonstreaming_output.transcript_row(&colors)
+            streaming_output.disclosure(&colors),
+            nonstreaming_output.disclosure(&colors)
         );
     }
 
@@ -2748,7 +2748,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_brain_repair_preserves_one_stable_source_and_output_identity() {
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::{Message, MessageKind};
 
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -2795,12 +2795,10 @@ mod tests {
         assert_eq!(messages[0].id(), source_id);
         assert_eq!(messages[1].id(), output_id);
         let colors = crate::config::ColorScheme::default();
-        let source_row = messages[0].transcript_row(&colors).unwrap();
-        let output_row = messages[1].transcript_row(&colors).unwrap();
-        assert_eq!(source_row.kind, TranscriptRowKind::Program);
-        assert_eq!(output_row.kind, TranscriptRowKind::Output);
-        assert!(source_row.children.is_empty());
-        assert!(output_row.children.is_empty());
+        assert_eq!(messages[0].kind(), MessageKind::Program);
+        assert_eq!(messages[1].kind(), MessageKind::Output);
+        assert!(messages[0].children().is_empty());
+        assert!(messages[1].children().is_empty());
         assert_eq!(source_projection.content(), "(say \"repaired\")");
         assert_eq!(execution.output_unit.content(), "repaired");
     }

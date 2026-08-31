@@ -369,7 +369,7 @@ impl ToolExecutionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::{Message, TranscriptRowKind};
+    use crate::cli::messages::{Message, MessageKind};
     use crate::runtime::VmEffectEnvelope;
     use crate::vm::{CapabilityKind, CapabilityRequirement, HostSideEffect, ResourceSelector};
 
@@ -469,34 +469,36 @@ mod tests {
 
         let messages = manager.get_messages();
         assert_eq!(messages.len(), 1, "tool execution must stay in Activity");
-        let root = messages[0]
-            .transcript_row(&crate::config::ColorScheme::default())
-            .expect("activity transcript tree");
-        assert_eq!(root.kind, TranscriptRowKind::Activity);
-        assert_eq!(root.children.len(), 1);
-        let tool = &root.children[0];
-        assert_eq!(tool.kind, TranscriptRowKind::ToolCall);
+        assert_eq!(messages[0].kind(), MessageKind::Activity);
+        let root_children = messages[0].children();
+        assert_eq!(root_children.len(), 1);
+        let tool = &root_children[0];
+        assert_eq!(tool.kind(), MessageKind::ToolCall);
         let outputs = tool
-            .children
-            .iter()
-            .filter(|row| row.kind == TranscriptRowKind::ToolOutput)
+            .children()
+            .into_iter()
+            .filter(|message| message.kind() == MessageKind::ToolOutput)
             .collect::<Vec<_>>();
         assert_eq!(outputs.len(), 1);
         assert_eq!(
             outputs[0]
+                .disclosure(&crate::config::ColorScheme::default())
+                .unwrap()
                 .body
                 .iter()
                 .filter(|line| line.contains("visible"))
                 .count(),
             1
         );
-        assert!(outputs[0].body.iter().any(|line| line == "live line"));
-        assert!(outputs[0].body.iter().any(|line| line == " after"));
-        assert!(messages.iter().all(|message| {
-            message
-                .transcript_row(&crate::config::ColorScheme::default())
-                .is_none_or(|row| row.kind != TranscriptRowKind::Output)
-        }));
+        let output_body = outputs[0]
+            .disclosure(&crate::config::ColorScheme::default())
+            .unwrap()
+            .body;
+        assert!(output_body.iter().any(|line| line == "live line"));
+        assert!(output_body.iter().any(|line| line == " after"));
+        assert!(messages
+            .iter()
+            .all(|message| message.kind() != MessageKind::Output));
 
         let canonical = activity.complete_transcript(&crate::config::ColorScheme::default());
         assert_eq!(canonical.matches("visible").count(), 1, "{canonical}");

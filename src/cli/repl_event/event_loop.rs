@@ -947,7 +947,8 @@ struct PendingVmApproval {
     approval_id: String,
 }
 
-struct RemoteBrainRunProjection {
+/// Retained UI projection for one remote named-Brain run.
+pub(crate) struct RemoteBrainRunProjection {
     activity: Arc<crate::cli::messages::ActivityMessage>,
     program: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
     output: Option<Arc<crate::cli::messages::ProgramOutputMessage>>,
@@ -955,10 +956,12 @@ struct RemoteBrainRunProjection {
     prompt_row: Option<usize>,
     result_row: Option<usize>,
     tool_rows: std::collections::HashMap<String, usize>,
-    /// This terminal cursor is deliberately independent of run completion.
-    /// A reconnect may receive a terminal run transition before a repaired
-    /// higher-sequence ToolResult; accepting that later result only replaces
-    /// semantic transcript state and never re-executes host effects.
+    /// A terminal root is immutable once it can be committed to native
+    /// scrollback. Snapshot replay orders canonical events before reaching
+    /// this fence; live events after it are deliberately ignored unless the
+    /// durable protocol gains an explicit correction transaction.
+    sealed_at: Option<u64>,
+    /// Highest accepted result sequence per tool before the terminal seal.
     tool_result_sequences: std::collections::HashMap<String, u64>,
     approval_rows: std::collections::HashMap<String, usize>,
     locally_rendered_tool_ids: std::collections::HashSet<String>,
@@ -1004,6 +1007,7 @@ fn ensure_remote_brain_run_projection<'a>(
             prompt_row: None,
             result_row: None,
             tool_rows: std::collections::HashMap::new(),
+            sealed_at: None,
             tool_result_sequences: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
             locally_rendered_tool_ids: std::collections::HashSet::new(),
@@ -1046,6 +1050,21 @@ fn project_remote_brain_run_event(
     let projection =
         ensure_remote_brain_run_projection(output_manager, projections, run_id, kind, status);
 
+    // A complete Activity may be committed to terminal history immediately.
+    // Never mutate its retained representation afterwards: native bytes
+    // cannot be repaired in place. Canonical snapshot replay sorts events by
+    // sequence before it reaches this fence; the live protocol has no durable
+    // post-terminal correction event, and server persistence rejects another
+    // result for the same tool id.
+    if projection.sealed_at.is_some() {
+        tracing::warn!(
+            run_id = %run_id.0,
+            event_seq = event.seq,
+            "ignoring named-Brain event after terminal transcript seal"
+        );
+        return true;
+    }
+
     match &event.kind {
         BrainEventKind::RunStarted { .. } => {}
         BrainEventKind::RunStatusChanged { status, detail, .. } => {
@@ -1061,6 +1080,9 @@ fn project_remote_brain_run_event(
                     .complete_row(projection.status_row, summary);
             }
             if status.is_terminal() {
+                // Set the fence before completing the root so no later live
+                // event can mutate a message that the TUI may commit.
+                projection.sealed_at = Some(event.seq);
                 projection.activity.set_complete();
             }
         }
@@ -1279,7 +1301,8 @@ fn project_remote_brain_run_event(
     true
 }
 
-struct LocalBrainProjection {
+/// Local-turn artifacts that suppress their echoed remote counterparts.
+pub(crate) struct LocalBrainProjection {
     run_id: crate::brain::store::RunId,
     source: String,
     output: String,
@@ -1525,7 +1548,8 @@ impl LocalBrainProjection {
     }
 }
 
-fn project_remote_brain_live_run_event(
+/// Apply one production live named-Brain event to retained message artifacts.
+pub(crate) fn project_remote_brain_live_run_event(
     output_manager: &crate::cli::output_manager::OutputManager,
     projections: &mut std::collections::HashMap<
         crate::brain::store::RunId,
@@ -8352,6 +8376,7 @@ struct BrainRunGroupProjection {
     run_id: crate::brain::store::RunId,
     kind: crate::brain::store::BrainRunKind,
     status: crate::brain::store::BrainRunStatus,
+    status_seq: u64,
     event_seqs: Vec<u64>,
 }
 
@@ -8369,6 +8394,7 @@ fn projected_brain_run_groups(
                     run_id: run.run_id,
                     kind: run.kind,
                     status: run.status,
+                    status_seq: event.seq,
                     event_seqs: Vec::new(),
                 })
             }
@@ -8384,7 +8410,10 @@ fn projected_brain_run_groups(
         };
         group.event_seqs.push(event.seq);
         if let crate::brain::store::BrainEventKind::RunStatusChanged { status, .. } = event.kind {
-            group.status = status;
+            if event.seq >= group.status_seq {
+                group.status = status;
+                group.status_seq = event.seq;
+            }
         }
     }
     groups
@@ -8409,7 +8438,12 @@ fn project_remote_brain_snapshot_runs(
             group.status,
         );
     }
-    for event in events.iter().filter(|event| event.run_id.is_some()) {
+    let mut ordered_events = events
+        .iter()
+        .filter(|event| event.run_id.is_some())
+        .collect::<Vec<_>>();
+    ordered_events.sort_by_key(|event| event.seq);
+    for event in ordered_events {
         project_remote_brain_live_run_event(
             output_manager,
             projections,
@@ -8908,6 +8942,8 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::messages::Message;
+
     fn admitting_llm_channel() -> (
         tokio::sync::mpsc::UnboundedSender<super::LlmRequest>,
         tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
@@ -9643,6 +9679,7 @@ mod tests {
                 run_id,
                 kind: BrainRunKind::Speculative,
                 status: BrainRunStatus::Completed,
+                status_seq: 6,
                 event_seqs: vec![1, 2, 3, 4, 5, 6],
             }]
         );
@@ -9655,7 +9692,7 @@ mod tests {
     #[test]
     fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
         use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::TranscriptRowKind;
 
         let output =
             crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
@@ -9732,7 +9769,7 @@ mod tests {
     #[test]
     fn named_brain_success_with_empty_result_still_has_one_output_identity() {
         use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::TranscriptRowKind;
 
         let output =
             crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
@@ -9807,7 +9844,7 @@ mod tests {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
         };
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::TranscriptRowKind;
 
         let output =
             crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
@@ -9868,19 +9905,28 @@ mod tests {
 
         let status = &projected.children[0];
         assert_eq!(status.kind, TranscriptRowKind::Activity);
-        assert_eq!(status.id.message_id, unit.id());
-        assert_eq!(status.id.path, vec![1, 0]);
 
         let tool = &projected.children[1];
         assert_eq!(tool.kind, TranscriptRowKind::ToolCall);
-        assert_eq!(tool.id.message_id, unit.id());
-        assert_eq!(tool.id.path, vec![1, 1]);
         assert_eq!(tool.children.len(), 2);
         assert_eq!(tool.children[0].kind, TranscriptRowKind::Input);
-        assert_eq!(tool.children[0].id.path, vec![1, 1, 0]);
         assert_eq!(tool.children[1].kind, TranscriptRowKind::ToolOutput);
-        assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
         assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
+
+        let children = unit.children();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].kind(), TranscriptRowKind::Activity);
+        assert_eq!(children[1].kind(), TranscriptRowKind::ToolCall);
+        assert_ne!(children[0].id(), children[1].id());
+        let tool_children = children[1].children();
+        assert_eq!(tool_children.len(), 2);
+        assert_eq!(tool_children[0].kind(), TranscriptRowKind::Input);
+        assert_eq!(tool_children[1].kind(), TranscriptRowKind::ToolOutput);
+        assert_ne!(tool_children[0].id(), tool_children[1].id());
+
+        let repeated_children = unit.children();
+        assert!(std::sync::Arc::ptr_eq(&children[0], &repeated_children[0]));
+        assert!(std::sync::Arc::ptr_eq(&children[1], &repeated_children[1]));
 
         let canonical = unit.complete_transcript(&crate::config::ColorScheme::default());
         assert!(canonical.contains("read_cache"));
@@ -9889,12 +9935,12 @@ mod tests {
     }
 
     #[test]
-    fn named_brain_submit_program_snapshot_repair_preserves_emit_once_after_terminal() {
+    fn named_brain_submit_program_snapshot_repair_orders_before_terminal_seal() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
             ToolResultPresentation,
         };
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::TranscriptRowKind;
 
         let output =
             crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
@@ -9956,7 +10002,9 @@ mod tests {
         call.run_id = Some(run_id);
 
         // A repaired snapshot can contain a result before its call, repeat an
-        // accepted event, and report the terminal transition before both.
+        // accepted event, and report the terminal transition before both. The
+        // canonical sequence, rather than transport vector order, controls
+        // replay before the terminal seal.
         let repaired_snapshot = vec![started, result.clone(), terminal, result.clone(), call];
         let mut projections = std::collections::HashMap::new();
         let mut local_projections = std::collections::VecDeque::new();
@@ -9975,9 +10023,9 @@ mod tests {
             &repaired_snapshot,
         );
 
-        // The terminal WorkUnit is not an output fence: a strictly newer
-        // canonical result can carry an accepted late VM emit. It replaces the
-        // semantic complete body, so the prefix is still rendered once.
+        // There is no durable post-terminal correction protocol. A live
+        // higher-sequence result is handled but rejected after the root seal,
+        // so it cannot mutate a WorkUnit that the TUI may already commit.
         let mut late = result;
         late.seq = 21;
         late.kind = BrainEventKind::ToolResult {
@@ -10027,7 +10075,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(output_row.body.iter().any(|line| line == " after"));
+        assert!(
+            !output_row.body.iter().any(|line| line == " after"),
+            "post-terminal repair must not alter sealed tool output"
+        );
         let canonical = messages[0].complete_transcript(&crate::config::ColorScheme::default());
         // `first` appears in the canonical ToolCall input as well as in the
         // rendered VM source and the one emitted ToolOutput chunk.
@@ -10048,7 +10099,7 @@ mod tests {
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
             RunId,
         };
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::TranscriptRowKind;
 
         let output =
             crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());

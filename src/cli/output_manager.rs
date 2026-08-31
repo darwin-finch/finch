@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn vm_tool_projection_retains_activity_semantics_without_extra_output_message() {
-        use crate::cli::messages::TranscriptRowKind;
+        use crate::cli::messages::MessageKind;
 
         let manager = Arc::new(silent_manager());
         let activity = manager.start_activity_with_id(MessageId::new(), "Brain activity");
@@ -760,24 +760,17 @@ mod tests {
 
         let messages = manager.get_messages();
         assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind(), MessageKind::Activity);
+        let activity_children = messages[0].children();
+        assert_eq!(activity_children[0].kind(), MessageKind::ToolCall);
+        let tool_children = activity_children[0].children();
+        assert_eq!(tool_children.len(), 2);
+        assert_eq!(tool_children[1].kind(), MessageKind::ToolOutput);
         assert_eq!(
-            messages[0]
-                .transcript_row(&crate::config::ColorScheme::default())
+            tool_children[1]
+                .disclosure(&crate::config::ColorScheme::default())
                 .unwrap()
-                .kind,
-            TranscriptRowKind::Activity
-        );
-        let activity_row = messages[0]
-            .transcript_row(&crate::config::ColorScheme::default())
-            .unwrap();
-        assert_eq!(activity_row.children[0].kind, TranscriptRowKind::ToolCall);
-        assert_eq!(activity_row.children[0].children.len(), 2);
-        assert_eq!(
-            activity_row.children[0].children[1].kind,
-            TranscriptRowKind::ToolOutput
-        );
-        assert_eq!(
-            activity_row.children[0].children[1].body,
+                .body,
             vec!["tool output"]
         );
     }

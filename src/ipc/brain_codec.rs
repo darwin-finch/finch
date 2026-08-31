@@ -2287,6 +2287,32 @@ mod tests {
     }
 
     #[test]
+    fn submit_program_tool_result_presentation_round_trips_through_capnp() {
+        let expected = BrainWireMessage::Event {
+            event: event(
+                BrainId(uuid::Uuid::new_v4()),
+                41,
+                BrainEventKind::ToolResult {
+                    request_seq: 7,
+                    tool_id: "submit-1".into(),
+                    output: r#"{"status":"completed","output":"first after"}"#.into(),
+                    is_error: false,
+                    presentation: crate::brain::store::ToolResultPresentation::SubmitProgram {
+                        language: "lisp".into(),
+                        source: "(begin (say \"first\") (say \" after\"))".into(),
+                        output_chunks: vec!["first".into(), " after".into()],
+                        summary: "completed".into(),
+                        diagnostics: Vec::new(),
+                    },
+                },
+            ),
+        };
+
+        let encoded = encode_brain_wire_message(&expected).unwrap();
+        assert_eq!(decode_brain_wire_message(&encoded).unwrap(), expected);
+    }
+
+    #[test]
     fn remote_brain_envelopes_round_trip_commands_and_correlated_replies() {
         let brain_id = BrainId(uuid::Uuid::new_v4());
         let attachment = BrainAttachment {

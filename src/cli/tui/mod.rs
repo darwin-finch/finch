@@ -4039,7 +4039,8 @@ mod tests {
         let projected = state.render_message(&message, &colors);
 
         assert_eq!(projected.len(), 1);
-        assert!(projected[0].text.contains("[collapsed]"));
+        assert_eq!(projected[0].row_expanded, Some(false));
+        assert!(!projected[0].text.contains("[collapsed]"));
         assert!(!projected[0].text.contains("line four"));
         assert!(work.complete_transcript(&colors).contains("line four"));
 
@@ -4056,7 +4057,7 @@ mod tests {
         let mut bytes = Vec::new();
         begin_full_viewport_paint(&mut bytes, plan, &text).expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
-        assert!(raw.contains("[collapsed]"));
+        assert!(!raw.contains("[collapsed]"));
         assert!(!raw.contains("line four"));
         assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
     }
@@ -4082,7 +4083,8 @@ mod tests {
             visible[0].row_id.is_some(),
             "disclosure control must stay visible"
         );
-        assert!(visible[0].text.contains("[expanded]"));
+        assert_eq!(visible[0].row_expanded, Some(true));
+        assert!(!visible[0].text.contains("[expanded]"));
         assert!(visible.iter().any(|line| line.text.contains("row 39")));
         assert!(
             visible
@@ -4103,6 +4105,171 @@ mod tests {
         let collapsed = collapsed_state.render_message(&message, &colors);
         let collapsed_tiny = viewport_tail_rendered_lines(&collapsed, 8, 1);
         assert_eq!(collapsed_tiny[0].text, "closed");
+    }
+
+    #[test]
+    fn terminal_named_brain_projection_seals_before_native_commit() {
+        use crate::brain::store::{
+            AttachmentId, BrainEvent, BrainEventKind, BrainId, BrainRun, BrainRunKind,
+            BrainRunStatus, RunId, ToolResultPresentation,
+        };
+        use crate::cli::repl_event::event_loop::{
+            project_remote_brain_live_run_event, LocalBrainProjection, RemoteBrainRunProjection,
+        };
+
+        let output = crate::cli::OutputManager::new(ColorScheme::default());
+        output.disable_stdout();
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let event = |seq: u64, sender: &str, kind: BrainEventKind| BrainEvent {
+            schema_version: 2,
+            brain_id,
+            seq,
+            environment_generation: 1,
+            sender: sender.into(),
+            created_ms: seq,
+            run_id: Some(run_id),
+            mutation: None,
+            kind,
+        };
+        let presentation = |chunks: &[&str]| ToolResultPresentation::SubmitProgram {
+            language: "lisp".into(),
+            source: "(say \"first\")".into(),
+            output_chunks: chunks.iter().map(|chunk| (*chunk).to_owned()).collect(),
+            summary: "completed".into(),
+            diagnostics: Vec::new(),
+        };
+        let live_events = vec![
+            event(
+                1,
+                "daemon",
+                BrainEventKind::RunStarted {
+                    run: BrainRun {
+                        run_id,
+                        kind: BrainRunKind::Interactive,
+                        parent_run_id: None,
+                        request_seq: 1,
+                        initiating_attachment_id: attachment_id,
+                        initiated_by: "alice".into(),
+                        status: BrainRunStatus::Running,
+                        started_ms: 1,
+                        updated_ms: 1,
+                        detail: None,
+                    },
+                },
+            ),
+            event(
+                10,
+                "provider",
+                BrainEventKind::ToolCall {
+                    request_seq: 1,
+                    tool_id: "submit-1".into(),
+                    name: "submit_program".into(),
+                    input: serde_json::json!({"language": "lisp", "source": "(say \"first\")"}),
+                },
+            ),
+            event(
+                12,
+                "runner",
+                BrainEventKind::ToolResult {
+                    request_seq: 1,
+                    tool_id: "submit-1".into(),
+                    output: r#"{"status":"completed","output":"first"}"#.into(),
+                    is_error: false,
+                    presentation: presentation(&["first"]),
+                },
+            ),
+            event(
+                20,
+                "daemon",
+                BrainEventKind::RunStatusChanged {
+                    run_id,
+                    status: BrainRunStatus::Completed,
+                    detail: None,
+                },
+            ),
+        ];
+        let mut projections: std::collections::HashMap<RunId, RemoteBrainRunProjection> =
+            std::collections::HashMap::new();
+        let mut local_projections: std::collections::VecDeque<LocalBrainProjection> =
+            std::collections::VecDeque::new();
+        for event in &live_events {
+            assert!(project_remote_brain_live_run_event(
+                &output,
+                &mut projections,
+                &mut local_projections,
+                false,
+                event,
+            ));
+        }
+
+        let colors = ColorScheme::default();
+        let messages = output.get_messages();
+        assert_eq!(messages.len(), 1);
+        let before_repair = messages[0].complete_transcript(&colors);
+        assert!(before_repair.contains("first"));
+        assert!(!before_repair.contains(" after"));
+
+        let mut accordion = AccordionState::default();
+        let mut printed = HashSet::new();
+        let mut native_bytes = Vec::new();
+        commit_complete_messages(
+            &mut native_bytes,
+            &messages,
+            &mut accordion,
+            &colors,
+            &mut printed,
+            8,
+        )
+        .unwrap();
+        let committed_len = native_bytes.len();
+        let committed = String::from_utf8(native_bytes.clone()).unwrap();
+        assert_eq!(
+            committed
+                .lines()
+                .filter(|line| line.trim() == "first")
+                .count(),
+            1,
+            "the committed ToolOutput contains the accepted emit once"
+        );
+        assert!(!committed.contains(" after"));
+
+        let late_repair = event(
+            21,
+            "runner",
+            BrainEventKind::ToolResult {
+                request_seq: 1,
+                tool_id: "submit-1".into(),
+                output: r#"{"status":"completed","output":"first after"}"#.into(),
+                is_error: false,
+                presentation: presentation(&["first", " after"]),
+            },
+        );
+        assert!(project_remote_brain_live_run_event(
+            &output,
+            &mut projections,
+            &mut local_projections,
+            false,
+            &late_repair,
+        ));
+        assert_eq!(
+            messages[0].complete_transcript(&colors),
+            before_repair,
+            "a post-terminal repair must not affect mutable state after native commit"
+        );
+
+        commit_complete_messages(
+            &mut native_bytes,
+            &output.get_messages(),
+            &mut accordion,
+            &colors,
+            &mut printed,
+            8,
+        )
+        .unwrap();
+        assert_eq!(native_bytes.len(), committed_len);
+        assert_eq!(String::from_utf8(native_bytes).unwrap(), committed);
     }
 
     #[test]
@@ -4130,7 +4297,8 @@ mod tests {
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
         let before = state.render_message(&message, &colors);
-        assert!(before[0].text.contains("[collapsed]"));
+        assert_eq!(before[0].row_expanded, Some(false));
+        assert!(!before[0].text.contains("[collapsed]"));
         let mut printed = HashSet::new();
         let mut failure = FlushFailure(Vec::new());
         assert!(commit_complete_messages(

@@ -12,7 +12,7 @@
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Instant;
 
 /// Curated word list for the thinking spinner verb.
@@ -54,7 +54,7 @@ pub fn random_spinner_verb() -> &'static str {
     SPINNER_WORDS[idx]
 }
 
-use super::{Message, MessageId, MessageStatus, TranscriptRow, TranscriptRowId, TranscriptRowKind};
+use super::{Message, MessageDisclosure, MessageId, MessageKind, MessageRef, MessageStatus};
 use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
 
@@ -158,6 +158,9 @@ struct WorkUnitInner {
     thinking: bool,
     /// Sub-rows for tool calls
     rows: Vec<WorkRow>,
+    /// Stable child Message objects allocated with their row. Row data remains
+    /// in this lock so existing streaming mutations stay atomic.
+    row_messages: Vec<Arc<WorkRowMessage>>,
     /// Overall status of this unit
     status: MessageStatus,
     /// Elapsed time captured when the unit completed (stable for scrollback display)
@@ -187,6 +190,69 @@ pub struct WorkUnit {
     /// When this unit started — drives time-driven animation
     started_at: Instant,
     inner: Arc<RwLock<WorkUnitInner>>,
+}
+
+/// One stable expandable child of a WorkUnit. It reads the append-only row at
+/// `index` from its owning unit; the weak edge avoids a parent/child cycle.
+struct WorkRowMessage {
+    id: MessageId,
+    owner: Weak<RwLock<WorkUnitInner>>,
+    index: usize,
+    input: Arc<WorkRowPartMessage>,
+    output: Arc<WorkRowPartMessage>,
+}
+
+#[derive(Clone, Copy)]
+enum WorkRowPart {
+    Input,
+    Output,
+}
+
+struct WorkRowPartMessage {
+    id: MessageId,
+    owner: Weak<RwLock<WorkUnitInner>>,
+    index: usize,
+    part: WorkRowPart,
+}
+
+impl WorkRowMessage {
+    fn new(id: MessageId, owner: Weak<RwLock<WorkUnitInner>>, index: usize) -> Self {
+        Self {
+            id,
+            input: Arc::new(WorkRowPartMessage {
+                id: MessageId::from_namespace(id.as_uuid(), "input"),
+                owner: owner.clone(),
+                index,
+                part: WorkRowPart::Input,
+            }),
+            output: Arc::new(WorkRowPartMessage {
+                id: MessageId::from_namespace(id.as_uuid(), "output"),
+                owner: owner.clone(),
+                index,
+                part: WorkRowPart::Output,
+            }),
+            owner,
+            index,
+        }
+    }
+
+    fn with_row<T>(&self, f: impl FnOnce(&WorkRow) -> T) -> Option<T> {
+        let owner = self.owner.upgrade()?;
+        let inner = owner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.rows.get(self.index).map(f)
+    }
+}
+
+impl WorkRowPartMessage {
+    fn with_row<T>(&self, f: impl FnOnce(&WorkRow) -> T) -> Option<T> {
+        let owner = self.owner.upgrade()?;
+        let inner = owner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.rows.get(self.index).map(f)
+    }
 }
 
 impl fmt::Debug for WorkUnit {
@@ -219,6 +285,7 @@ impl WorkUnit {
                 token_count: 0,
                 thinking: false,
                 rows: Vec::new(),
+                row_messages: Vec::new(),
                 status: MessageStatus::InProgress,
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
@@ -351,6 +418,12 @@ impl WorkUnit {
     ) -> usize {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let idx = inner.rows.len();
+        let row_id = MessageId::from_namespace(self.id.as_uuid(), &format!("row:{idx}"));
+        inner.row_messages.push(Arc::new(WorkRowMessage::new(
+            row_id,
+            Arc::downgrade(&self.inner),
+            idx,
+        )));
         inner.rows.push(WorkRow {
             label: label.into(),
             status: WorkRowStatus::Running,
@@ -525,6 +598,126 @@ impl WorkUnit {
 // ============================================================================
 // Message trait impl
 // ============================================================================
+
+impl Message for WorkRowMessage {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    fn format(&self, colors: &ColorScheme) -> String {
+        self.with_row(|row| format_row_themed(row, colors, DiffColorMode::production()))
+            .unwrap_or_default()
+    }
+
+    fn status(&self) -> MessageStatus {
+        self.with_row(|row| match row.status {
+            WorkRowStatus::Running => MessageStatus::InProgress,
+            WorkRowStatus::Complete(_) => MessageStatus::Complete,
+            WorkRowStatus::Error(_) => MessageStatus::Failed,
+        })
+        .unwrap_or(MessageStatus::Failed)
+    }
+
+    fn content(&self) -> String {
+        self.with_row(|row| row.label.clone()).unwrap_or_default()
+    }
+
+    fn kind(&self) -> MessageKind {
+        self.with_row(|row| match row.presentation {
+            WorkRowPresentation::Tool => MessageKind::ToolCall,
+            WorkRowPresentation::Activity => MessageKind::Activity,
+        })
+        .unwrap_or(MessageKind::Activity)
+    }
+
+    fn children(&self) -> Vec<MessageRef> {
+        self.with_row(|row| match row.presentation {
+            WorkRowPresentation::Activity => Vec::new(),
+            WorkRowPresentation::Tool => {
+                let mut children: Vec<MessageRef> = vec![self.input.clone()];
+                if !work_row_output_body(row, &ColorScheme::default()).is_empty() {
+                    children.push(self.output.clone());
+                }
+                children
+            }
+        })
+        .unwrap_or_default()
+    }
+
+    fn disclosure(&self, colors: &ColorScheme) -> Option<MessageDisclosure> {
+        self.with_row(|row| {
+            let summary = work_row_summary(row);
+            let activity = row.presentation == WorkRowPresentation::Activity;
+            MessageDisclosure {
+                label: format!("{} — {summary}", row.label),
+                body: activity
+                    .then(|| work_row_output_body(row, colors))
+                    .unwrap_or_default(),
+                default_expanded: if activity {
+                    tool_row_requires_default_expansion(row)
+                } else {
+                    matches!(row.status, WorkRowStatus::Running)
+                        || tool_row_requires_default_expansion(row)
+                },
+            }
+        })
+    }
+}
+
+impl Message for WorkRowPartMessage {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    fn format(&self, colors: &ColorScheme) -> String {
+        self.disclosure(colors)
+            .map(|disclosure| disclosure.body.join("\n"))
+            .unwrap_or_default()
+    }
+
+    fn status(&self) -> MessageStatus {
+        self.with_row(|row| match row.status {
+            WorkRowStatus::Running => MessageStatus::InProgress,
+            WorkRowStatus::Complete(_) => MessageStatus::Complete,
+            WorkRowStatus::Error(_) => MessageStatus::Failed,
+        })
+        .unwrap_or(MessageStatus::Failed)
+    }
+
+    fn content(&self) -> String {
+        self.with_row(|row| match self.part {
+            WorkRowPart::Input => row.label.clone(),
+            WorkRowPart::Output => row.body_lines.join("\n"),
+        })
+        .unwrap_or_default()
+    }
+
+    fn kind(&self) -> MessageKind {
+        match self.part {
+            WorkRowPart::Input => MessageKind::Input,
+            WorkRowPart::Output => MessageKind::ToolOutput,
+        }
+    }
+
+    fn disclosure(&self, colors: &ColorScheme) -> Option<MessageDisclosure> {
+        self.with_row(|row| match self.part {
+            WorkRowPart::Input => MessageDisclosure {
+                label: "Input".into(),
+                body: vec![row.label.clone()],
+                default_expanded: false,
+            },
+            WorkRowPart::Output => {
+                let body = work_row_output_body(row, colors);
+                MessageDisclosure {
+                    label: format!("Output ({})", body.len()),
+                    body,
+                    default_expanded: matches!(row.status, WorkRowStatus::Running)
+                        || tool_row_requires_default_expansion(row),
+                }
+            }
+        })
+    }
+}
 
 impl Message for WorkUnit {
     fn id(&self) -> MessageId {
@@ -727,31 +920,40 @@ impl Message for WorkUnit {
         out
     }
 
-    fn transcript_row(&self, colors: &ColorScheme) -> Option<TranscriptRow> {
+    fn kind(&self) -> MessageKind {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
-        let children = inner
-            .rows
+        match &inner.presentation {
+            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => MessageKind::ToolGroup,
+            WorkUnitPresentation::Assistant => MessageKind::Response,
+            WorkUnitPresentation::Activity { .. } => MessageKind::Activity,
+            WorkUnitPresentation::ProgramSource { .. } => MessageKind::Program,
+            WorkUnitPresentation::ProgramOutput { .. } => MessageKind::Output,
+        }
+    }
+
+    fn children(&self) -> Vec<MessageRef> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .row_messages
             .iter()
-            .enumerate()
-            .map(|(index, row)| match row.presentation {
-                WorkRowPresentation::Activity => {
-                    transcript_activity_row(self.id, index, row, colors)
-                }
-                WorkRowPresentation::Tool => transcript_tool_row(self.id, index, row, colors),
-            })
-            .collect();
-        let (kind, label, body, default_expanded) = match &inner.presentation {
+            .cloned()
+            .map(|row| row as MessageRef)
+            .collect()
+    }
+
+    fn disclosure(&self, _colors: &ColorScheme) -> Option<MessageDisclosure> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let (label, body, default_expanded) = match &inner.presentation {
             WorkUnitPresentation::Assistant if !inner.rows.is_empty() => {
                 let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
                 (
-                    TranscriptRowKind::ToolGroup,
                     compact_tool_group_label(&inner.rows),
                     lines(&inner.response_text),
                     inner.status == MessageStatus::InProgress || actionable,
                 )
             }
             WorkUnitPresentation::Assistant => (
-                TranscriptRowKind::Response,
                 "Assistant response".to_string(),
                 lines(&inner.response_text),
                 true,
@@ -759,21 +961,18 @@ impl Message for WorkUnit {
             WorkUnitPresentation::Activity { title } => {
                 let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
                 (
-                    TranscriptRowKind::Activity,
                     compact_activity_group_label(title, &inner.rows),
                     Vec::new(),
                     inner.status == MessageStatus::InProgress || actionable,
                 )
             }
             WorkUnitPresentation::ProgramSource { language } => (
-                TranscriptRowKind::Program,
                 format!("Program source ({language})"),
                 lines(&inner.response_text),
                 inner.status == MessageStatus::InProgress
                     || inner.response_text.lines().count() <= 3,
             ),
             WorkUnitPresentation::ProgramOutput { title } => (
-                TranscriptRowKind::Output,
                 title
                     .clone()
                     .unwrap_or_else(|| "Program output".to_string()),
@@ -782,15 +981,9 @@ impl Message for WorkUnit {
             ),
         };
 
-        Some(TranscriptRow {
-            id: TranscriptRowId {
-                message_id: self.id,
-                path: vec![0],
-            },
-            kind,
+        Some(MessageDisclosure {
             label,
             body,
-            children,
             default_expanded,
         })
     }
@@ -895,81 +1088,17 @@ fn program_output_lines(inner: &WorkUnitInner) -> Vec<String> {
     body
 }
 
-fn transcript_tool_row(
-    message_id: MessageId,
-    index: usize,
-    row: &WorkRow,
-    colors: &ColorScheme,
-) -> TranscriptRow {
-    let summary = match &row.status {
+fn work_row_summary(row: &WorkRow) -> String {
+    match &row.status {
         WorkRowStatus::Running => "running".to_string(),
         WorkRowStatus::Complete(summary) if summary.is_empty() => "complete".to_string(),
         WorkRowStatus::Complete(summary) => summary.clone(),
         WorkRowStatus::Error(error) => format!("failed: {error}"),
-    };
-    let input = TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: vec![1, index as u32, 0],
-        },
-        kind: TranscriptRowKind::Input,
-        label: "Input".to_string(),
-        body: vec![row.label.clone()],
-        children: Vec::new(),
-        default_expanded: false,
-    };
-    let output_body = if let Some(diffs) = &row.diffs {
-        let mut body = row.body_lines.clone();
-        body.extend(
-            render_files(diffs, colors, DiffColorMode::production())
-                .lines()
-                .map(str::to_owned),
-        );
-        body
-    } else {
-        row.body_lines.clone()
-    };
-    let actionable = tool_row_requires_default_expansion(row);
-    let mut children = vec![input];
-    if !output_body.is_empty() {
-        children.push(TranscriptRow {
-            id: TranscriptRowId {
-                message_id,
-                path: vec![1, index as u32, 1],
-            },
-            kind: TranscriptRowKind::ToolOutput,
-            label: format!("Output ({})", output_body.len()),
-            body: output_body,
-            children: Vec::new(),
-            default_expanded: matches!(row.status, WorkRowStatus::Running) || actionable,
-        });
-    }
-    TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: vec![1, index as u32],
-        },
-        kind: TranscriptRowKind::ToolCall,
-        label: format!("{} — {summary}", row.label),
-        body: Vec::new(),
-        children,
-        default_expanded: matches!(row.status, WorkRowStatus::Running) || actionable,
     }
 }
 
-fn transcript_activity_row(
-    message_id: MessageId,
-    index: usize,
-    row: &WorkRow,
-    colors: &ColorScheme,
-) -> TranscriptRow {
-    let summary = match &row.status {
-        WorkRowStatus::Running => "running".to_string(),
-        WorkRowStatus::Complete(summary) if summary.is_empty() => "complete".to_string(),
-        WorkRowStatus::Complete(summary) => summary.clone(),
-        WorkRowStatus::Error(error) => format!("failed: {error}"),
-    };
-    let body = if let Some(diffs) = &row.diffs {
+fn work_row_output_body(row: &WorkRow, colors: &ColorScheme) -> Vec<String> {
+    if let Some(diffs) = &row.diffs {
         let mut body = row.body_lines.clone();
         body.extend(
             render_files(diffs, colors, DiffColorMode::production())
@@ -979,17 +1108,6 @@ fn transcript_activity_row(
         body
     } else {
         row.body_lines.clone()
-    };
-    TranscriptRow {
-        id: TranscriptRowId {
-            message_id,
-            path: vec![1, index as u32],
-        },
-        kind: TranscriptRowKind::Activity,
-        label: format!("{} — {summary}", row.label),
-        body,
-        children: Vec::new(),
-        default_expanded: tool_row_requires_default_expansion(row),
     }
 }
 
@@ -1574,33 +1692,48 @@ mod tests {
         let unit = WorkUnit::new("Tools");
         let row = unit.add_row("catalog.validate provider=chatgpt");
 
-        let running = unit.transcript_row(&colors()).unwrap();
+        let running = unit.disclosure(&colors()).unwrap();
+        let running_children = unit.children();
         assert!(running.default_expanded);
-        assert!(running.children[0].default_expanded);
-        assert_eq!(running.children[0].children.len(), 1);
-        assert_eq!(
-            running.children[0].children[0].kind,
-            TranscriptRowKind::Input
+        assert!(
+            running_children[0]
+                .disclosure(&colors())
+                .unwrap()
+                .default_expanded
         );
+        assert_eq!(running_children[0].children().len(), 1);
+        assert_eq!(running_children[0].children()[0].kind(), MessageKind::Input);
 
         unit.fail_row(row, "catalog unavailable");
         unit.set_failed();
-        let failed = unit.transcript_row(&colors()).unwrap();
+        let failed = unit.disclosure(&colors()).unwrap();
+        let failed_children = unit.children();
         assert!(!failed.default_expanded);
-        assert!(!failed.children[0].default_expanded);
+        assert!(
+            !failed_children[0]
+                .disclosure(&colors())
+                .unwrap()
+                .default_expanded
+        );
         assert!(failed
             .label
             .contains("catalog.validate provider=chatgpt failed: catalog unavailable"));
-        assert_eq!(failed.children[0].children.len(), 1);
+        assert_eq!(failed_children[0].children().len(), 1);
 
         let completed = WorkUnit::new("Tools");
         let row = completed.add_row("read config");
         completed.complete_row_with_body(row, "3 lines", vec!["one".into(), "two".into()]);
         completed.set_complete();
-        let projected = completed.transcript_row(&colors()).unwrap();
+        let projected = completed.disclosure(&colors()).unwrap();
+        let projected_children = completed.children();
         assert!(!projected.default_expanded);
-        assert!(!projected.children[0].default_expanded);
-        assert_eq!(projected.children[0].children.len(), 2);
+        assert!(
+            !projected_children[0]
+                .disclosure(&colors())
+                .unwrap()
+                .default_expanded
+        );
+        assert_eq!(projected_children[0].children().len(), 2);
     }
 
     #[test]
@@ -1614,10 +1747,15 @@ mod tests {
                 MessageStatus::InProgress => unreachable!(),
             }
 
-            let projected = unit.transcript_row(&colors()).unwrap();
+            let projected = unit.disclosure(&colors()).unwrap();
+            let children = unit.children();
             assert!(projected.default_expanded);
-            assert!(projected.children[0].default_expanded);
-            assert!(projected.children[0].label.contains("running"));
+            assert!(children[0].disclosure(&colors()).unwrap().default_expanded);
+            assert!(children[0]
+                .disclosure(&colors())
+                .unwrap()
+                .label
+                .contains("running"));
         }
     }
 
@@ -1633,9 +1771,10 @@ mod tests {
         let canonical_before_activity_projection = unit.complete_transcript(&colors());
         unit.set_activity_presentation("Speculative run 1234");
 
-        let projected = unit.transcript_row(&colors()).unwrap();
+        let projected = unit.disclosure(&colors()).unwrap();
+        let children = unit.children();
         assert!(!projected.default_expanded);
-        assert_eq!(projected.kind, TranscriptRowKind::Activity);
+        assert_eq!(unit.kind(), MessageKind::Activity);
         assert!(!projected.label.contains("Tools"));
         assert!(!projected.label.contains("calls"));
         assert_eq!(
@@ -1643,9 +1782,17 @@ mod tests {
             1
         );
         assert!(projected.label.contains("status failed"));
-        assert_eq!(projected.children.len(), 2);
-        assert!(projected.children[0].label.contains("status"));
-        assert!(projected.children[1].label.starts_with("result"));
+        assert_eq!(children.len(), 2);
+        assert!(children[0]
+            .disclosure(&colors())
+            .unwrap()
+            .label
+            .contains("status"));
+        assert!(children[1]
+            .disclosure(&colors())
+            .unwrap()
+            .label
+            .starts_with("result"));
 
         let canonical = unit.complete_transcript(&colors());
         assert_eq!(canonical, canonical_before_activity_projection);
@@ -1661,8 +1808,8 @@ mod tests {
         unit.complete_row(row, "3 lines");
         unit.set_complete();
 
-        let projected = unit.transcript_row(&colors()).unwrap();
-        assert_eq!(projected.kind, TranscriptRowKind::ToolGroup);
+        let projected = unit.disclosure(&colors()).unwrap();
+        assert_eq!(unit.kind(), MessageKind::ToolGroup);
         assert_eq!(projected.label, "Tools (1 call)");
     }
 
@@ -1677,15 +1824,16 @@ mod tests {
         );
         unit.set_complete();
 
-        let projected = unit.transcript_row(&colors()).unwrap();
+        let projected = unit.disclosure(&colors()).unwrap();
+        let children = unit.children();
         assert!(projected.default_expanded);
-        assert!(projected.children[0].default_expanded);
-        let output = projected.children[0]
-            .children
-            .iter()
-            .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+        assert!(children[0].disclosure(&colors()).unwrap().default_expanded);
+        let output = children[0]
+            .children()
+            .into_iter()
+            .find(|child| child.kind() == MessageKind::ToolOutput)
             .unwrap();
-        assert!(output.default_expanded);
+        assert!(output.disclosure(&colors()).unwrap().default_expanded);
     }
 
     #[test]

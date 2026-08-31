@@ -5,22 +5,21 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::cli::messages::{
-    DisclosureLookup, MessageRef, RenderAction, RenderCapabilities, RenderContext, TranscriptRow,
-    TranscriptRowId,
+    DisclosureLookup, MessageId, MessageRef, RenderAction, RenderCapabilities, RenderContext,
 };
 use crate::config::ColorScheme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedTranscriptLine {
     pub text: String,
-    pub row_id: Option<TranscriptRowId>,
+    pub row_id: Option<MessageId>,
     pub row_expanded: Option<bool>,
     pub action: Option<RenderAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptHitRegion {
-    pub row_id: TranscriptRowId,
+    pub row_id: MessageId,
     pub action: RenderAction,
     pub top: u16,
     pub bottom: u16,
@@ -30,21 +29,14 @@ pub struct TranscriptHitRegion {
 
 #[derive(Debug, Default)]
 pub struct AccordionState {
-    expanded: HashMap<TranscriptRowId, bool>,
-    pub focused: Option<TranscriptRowId>,
+    expanded: HashMap<MessageId, bool>,
+    pub focused: Option<MessageId>,
     pub hit_regions: Vec<TranscriptHitRegion>,
-    visible_order: Vec<TranscriptRowId>,
-    visible_expanded: HashMap<TranscriptRowId, bool>,
+    visible_order: Vec<MessageId>,
+    visible_expanded: HashMap<MessageId, bool>,
 }
 
 impl AccordionState {
-    pub fn is_expanded(&self, row: &TranscriptRow) -> bool {
-        self.expanded
-            .get(&row.id)
-            .copied()
-            .unwrap_or(row.default_expanded)
-    }
-
     pub fn render_message(
         &self,
         message: &MessageRef,
@@ -100,14 +92,14 @@ impl AccordionState {
         let mut y = top;
         for line in lines {
             let rows = super::shadow_buffer::physical_rows(&line.text, width.max(1));
-            if let Some(row_id) = &line.row_id {
-                self.visible_order.push(row_id.clone());
+            if let Some(message_id) = line.row_id {
+                self.visible_order.push(message_id);
                 self.visible_expanded
-                    .insert(row_id.clone(), line.row_expanded.unwrap_or(false));
+                    .insert(message_id, line.row_expanded.unwrap_or(false));
             }
-            if let (Some(row_id), Some(action)) = (&line.row_id, &line.action) {
+            if let (Some(message_id), Some(action)) = (line.row_id, &line.action) {
                 self.hit_regions.push(TranscriptHitRegion {
-                    row_id: row_id.clone(),
+                    row_id: message_id,
                     action: action.clone(),
                     top: y as u16,
                     bottom: y.saturating_add(rows).saturating_sub(1) as u16,
@@ -185,25 +177,29 @@ impl AccordionState {
         }) else {
             return false;
         };
-        let RenderAction::ToggleDisclosure { row_id } = region.action.clone();
+        let RenderAction::ToggleDisclosure { row_id: message_id } = region.action.clone();
         // Mouse disclosure is direct manipulation, not keyboard traversal.
         // Clear keyboard focus so clicking never leaves a persistent `> `
         // marker on a differently indented row.
         self.focused = None;
-        let current = self.visible_expanded.get(&row_id).copied().unwrap_or(false);
-        self.expanded.insert(row_id.clone(), !current);
-        self.visible_expanded.insert(row_id, !current);
+        let current = self
+            .visible_expanded
+            .get(&message_id)
+            .copied()
+            .unwrap_or(false);
+        self.expanded.insert(message_id, !current);
+        self.visible_expanded.insert(message_id, !current);
         true
     }
 }
 
 impl DisclosureLookup for AccordionState {
-    fn expanded(&self, row_id: &TranscriptRowId) -> Option<bool> {
-        self.expanded.get(row_id).copied()
+    fn expanded(&self, message_id: &MessageId) -> Option<bool> {
+        self.expanded.get(message_id).copied()
     }
 
-    fn focused(&self, row_id: &TranscriptRowId) -> bool {
-        self.focused.as_ref() == Some(row_id)
+    fn focused(&self, message_id: &MessageId) -> bool {
+        self.focused.as_ref() == Some(message_id)
     }
 }
 
@@ -223,7 +219,7 @@ mod tests {
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
         let first = state.render_message(&message, &colors);
-        let call_id = work.transcript_row(&colors).unwrap().children[0].id.clone();
+        let call_id = work.children()[0].id();
         state.rebuild_hit_regions(&first, 0, 80);
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
@@ -236,10 +232,7 @@ mod tests {
         assert!(expanded.iter().any(|line| line.text.contains("Input")));
         assert_eq!(work.content(), "");
         assert!(work.complete_transcript(&colors).contains("世界"));
-        assert_eq!(
-            call_id,
-            work.transcript_row(&colors).unwrap().children[0].id
-        );
+        assert_eq!(call_id, work.children()[0].id());
         assert_ne!(first, expanded);
     }
 
@@ -298,15 +291,12 @@ mod tests {
 
     #[test]
     fn test_unicode_wrapped_hit_region_moves_after_resize() {
-        let id = TranscriptRowId {
-            message_id: crate::cli::messages::MessageId::new(),
-            path: vec![0],
-        };
+        let id = crate::cli::messages::MessageId::new();
         let lines = vec![RenderedTranscriptLine {
             text: "▶ 世界世界 [collapsed]".into(),
-            row_id: Some(id.clone()),
+            row_id: Some(id),
             row_expanded: Some(false),
-            action: Some(RenderAction::ToggleDisclosure { row_id: id.clone() }),
+            action: Some(RenderAction::ToggleDisclosure { row_id: id }),
         }];
         let mut state = AccordionState::default();
         state.rebuild_hit_regions(&lines, 8, 8);
@@ -328,8 +318,8 @@ mod tests {
 
         assert!(matches!(
             rendered[0].action,
-            Some(RenderAction::ToggleDisclosure { ref row_id })
-                if rendered[0].row_id.as_ref() == Some(row_id)
+            Some(RenderAction::ToggleDisclosure { row_id })
+                if rendered[0].row_id == Some(row_id)
         ));
     }
 
@@ -353,9 +343,7 @@ mod tests {
         assert_eq!(state.focused.as_ref(), Some(&focused));
         let after_append = state.render_message(&message, &colors);
         assert!(after_append.iter().any(|line| line.text.contains("Input")));
-        assert!(after_append
-            .iter()
-            .any(|line| line.row_id.as_ref() == Some(&focused)));
+        assert!(after_append.iter().any(|line| line.row_id == Some(focused)));
     }
 
     #[test]
@@ -411,11 +399,15 @@ mod tests {
         let output_message: MessageRef = output;
 
         let collapsed = state.render_message(&source_message, &colors);
-        assert!(collapsed[0].text.contains("[collapsed]"));
+        assert_eq!(collapsed[0].row_expanded, Some(false));
+        assert!(!collapsed[0].text.contains("[collapsed]"));
+        assert!(!collapsed[0].text.contains("[expanded]"));
         assert_eq!(collapsed.len(), 1);
         assert!(source.complete_transcript(&colors).contains("a\nb\nc\nd"));
         let visible = state.render_message(&output_message, &colors);
-        assert!(visible[0].text.contains("[expanded]"));
+        assert_eq!(visible[0].row_expanded, Some(true));
+        assert!(!visible[0].text.contains("[expanded]"));
+        assert!(!visible[0].text.contains("[collapsed]"));
         assert!(visible
             .iter()
             .any(|line| line.text.contains("visible output")));
@@ -442,7 +434,9 @@ mod tests {
         replayed.set_complete();
         let replayed_message: MessageRef = replayed;
         let rendered = state.render_message(&replayed_message, &colors);
-        assert!(rendered[0].text.contains("[expanded]"));
+        assert_eq!(rendered[0].row_expanded, Some(true));
+        assert!(!rendered[0].text.contains("[expanded]"));
+        assert!(!rendered[0].text.contains("[collapsed]"));
         assert!(rendered
             .iter()
             .any(|line| line.text.contains("after reconnect")));

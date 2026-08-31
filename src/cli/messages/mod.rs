@@ -28,19 +28,9 @@ pub use render::{
 };
 pub use work_unit::{random_spinner_verb, WorkRow, WorkRowStatus, WorkUnit};
 
-/// Stable identity for one expandable row within a retained message.
-///
-/// `path` is append-only semantic ancestry (unit, call index, input/output), so
-/// streamed appends and terminal reflow never change an existing row's key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TranscriptRowId {
-    pub message_id: MessageId,
-    pub path: Vec<u32>,
-}
-
-/// Semantic defaults used by the transcript disclosure renderer.
+/// Semantic role of one retained Message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptRowKind {
+pub enum MessageKind {
     Response,
     Activity,
     Program,
@@ -51,22 +41,34 @@ pub enum TranscriptRowKind {
     ToolOutput,
 }
 
-/// A frontend-neutral semantic tree projected from canonical message data.
+/// Message-owned disclosure metadata. Semantic ancestry lives in the actual
+/// `MessageRef` hierarchy returned by `Message::children`; this value is not a
+/// parallel transcript node and deliberately contains no child collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptRow {
-    /// Stable identity used by disclosure state and viewport reconstruction.
-    pub id: TranscriptRowId,
-    /// Semantic role of this row.
-    pub kind: TranscriptRowKind,
+pub struct MessageDisclosure {
     /// Human-readable row summary, independent of disclosure state.
     pub label: String,
     /// Complete body lines owned by this row.
     pub body: Vec<String>,
-    /// Append-stable semantic descendants.
-    pub children: Vec<TranscriptRow>,
     /// Message-owned disclosure default for a new frontend.
     pub default_expanded: bool,
 }
+
+/// Test-only immutable inspection snapshot. Production rendering never builds
+/// this parallel tree; it exists solely so lifecycle tests can assert a whole
+/// Message hierarchy without coupling themselves to frontend primitives.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRow {
+    pub kind: MessageKind,
+    pub label: String,
+    pub body: Vec<String>,
+    pub children: Vec<TranscriptRow>,
+    pub default_expanded: bool,
+}
+
+#[cfg(test)]
+pub type TranscriptRowKind = MessageKind;
 
 /// Unique identifier for messages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,6 +88,10 @@ impl MessageId {
     /// Derive a stable semantic child identity from a canonical namespace.
     pub fn from_namespace(namespace: Uuid, semantic_key: &str) -> Self {
         Self(Uuid::new_v5(&namespace, semantic_key.as_bytes()))
+    }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
     }
 }
 
@@ -129,12 +135,43 @@ pub trait Message: Send + Sync {
     /// Get the raw content (without formatting, for change detection)
     fn content(&self) -> String;
 
+    /// Semantic role of this retained object.
+    fn kind(&self) -> MessageKind {
+        MessageKind::Response
+    }
+
+    /// Stable child objects owned by this composite message.
+    fn children(&self) -> Vec<MessageRef> {
+        Vec::new()
+    }
+
+    /// Optional disclosure metadata for this exact Message object.
+    fn disclosure(&self, _colors: &crate::config::ColorScheme) -> Option<MessageDisclosure> {
+        None
+    }
+
+    #[cfg(test)]
+    fn transcript_row(&self, colors: &crate::config::ColorScheme) -> Option<TranscriptRow> {
+        let disclosure = self.disclosure(colors)?;
+        Some(TranscriptRow {
+            kind: self.kind(),
+            label: disclosure.label,
+            body: disclosure.body,
+            children: self
+                .children()
+                .into_iter()
+                .filter_map(|child| child.transcript_row(colors))
+                .collect(),
+            default_expanded: disclosure.default_expanded,
+        })
+    }
+
     /// Render this concrete semantic message through frontend-neutral
     /// primitives. The immutable context is the only frontend capability
     /// surface available to a message.
     fn render(&self, context: &RenderContext<'_>) -> RenderedMessage {
-        if let Some(root) = self.transcript_row(context.colors) {
-            return render::render_transcript_tree(self.id(), &root, context);
+        if let Some(disclosure) = self.disclosure(context.colors) {
+            return render::render_message_tree(self.id(), &disclosure, self.children(), context);
         }
         RenderedMessage {
             message_id: self.id(),
@@ -150,11 +187,6 @@ pub trait Message: Send + Sync {
     /// Presentation-only disclosure state must never affect this value.
     fn complete_transcript(&self, colors: &crate::config::ColorScheme) -> String {
         self.format(colors)
-    }
-
-    /// Optional semantic retained-row projection for interactive disclosure.
-    fn transcript_row(&self, _colors: &crate::config::ColorScheme) -> Option<TranscriptRow> {
-        None
     }
 
     /// Get the background style for this message type (for TUI rendering)
