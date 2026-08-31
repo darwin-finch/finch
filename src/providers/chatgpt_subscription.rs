@@ -3119,7 +3119,7 @@ mod tests {
             .mock("POST", RESPONSES_PATH)
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(401)
-            .with_body(attacker_body.clone())
+            .with_body("first-auth-rejection")
             .expect(1)
             .create_async()
             .await;
@@ -3144,9 +3144,7 @@ mod tests {
             .unwrap_err();
         let rejection = error
             .downcast_ref::<SubscriptionResponseRejected>()
-            .unwrap_or_else(|| {
-                panic!("the second HTTP rejection lost its typed status: {error:#}")
-            });
+            .expect("the second HTTP rejection must retain its typed status");
         assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
         let display = error.to_string();
