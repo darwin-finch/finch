@@ -436,6 +436,30 @@ impl WorkUnit {
         }
     }
 
+    /// Complete a row without discarding lines already streamed into its body.
+    ///
+    /// Typed program effects arrive on the event bus before the serialized
+    /// tool completion. The completion contributes source/audit context, but
+    /// must not replace the already-visible `say` output.
+    pub fn complete_row_preserving_body(
+        &self,
+        idx: usize,
+        summary: impl Into<String>,
+        body_lines: Vec<String>,
+    ) {
+        let existing = self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .rows
+            .get(idx)
+            .map(|row| row.body_lines.clone())
+            .unwrap_or_default();
+        let mut combined = existing;
+        combined.extend(body_lines);
+        self.complete_row_with_body(idx, summary, combined);
+    }
+
     /// Complete a tool row with a structured, theme-independent file diff.
     pub fn complete_row_with_diff(&self, idx: usize, diff: FileDiff) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());

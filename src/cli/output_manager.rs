@@ -49,7 +49,7 @@ pub struct VmOutputProjection {
 #[derive(Clone)]
 enum VmDefaultResponse {
     Program(Arc<ProgramOutputMessage>),
-    ToolActivity(Arc<WorkUnit>),
+    ToolActivity { unit: Arc<WorkUnit>, row_idx: usize },
 }
 
 impl VmDefaultResponse {
@@ -58,7 +58,9 @@ impl VmDefaultResponse {
             Self::Program(message) => {
                 message.append_output(text);
             }
-            Self::ToolActivity(unit) => unit.append_response(text),
+            Self::ToolActivity { unit, row_idx } => {
+                unit.append_row_body_line(*row_idx, text.to_string());
+            }
         }
     }
 }
@@ -95,10 +97,17 @@ impl VmOutputProjection {
 
     /// Bind VM effects to a genuine tool activity without creating a second
     /// top-level program-output artifact for the tool's internal execution.
-    pub fn for_tool_activity(output: Arc<OutputManager>, activity: Arc<WorkUnit>) -> Self {
+    pub fn for_tool_activity(
+        output: Arc<OutputManager>,
+        activity: Arc<WorkUnit>,
+        row_idx: usize,
+    ) -> Self {
         Self {
             output,
-            default_response: VmDefaultResponse::ToolActivity(activity),
+            default_response: VmDefaultResponse::ToolActivity {
+                unit: activity,
+                row_idx,
+            },
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
             pending_effects: Arc::new(Mutex::new(HashMap::new())),
@@ -729,8 +738,12 @@ mod tests {
 
         let manager = Arc::new(silent_manager());
         let activity = manager.start_activity_with_id(MessageId::new(), "Brain activity");
-        let projection =
-            VmOutputProjection::for_tool_activity(Arc::clone(&manager), activity.work_unit());
+        let row_idx = activity.add_tool("submit_program");
+        let projection = VmOutputProjection::for_tool_activity(
+            Arc::clone(&manager),
+            activity.work_unit(),
+            row_idx,
+        );
         projection.project(&VmSideEffect {
             protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
             sequence: 0,
@@ -753,6 +766,19 @@ mod tests {
                 .unwrap()
                 .kind,
             TranscriptRowKind::Activity
+        );
+        let activity_row = messages[0]
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        assert_eq!(activity_row.children[0].kind, TranscriptRowKind::ToolCall);
+        assert_eq!(activity_row.children[0].children.len(), 2);
+        assert_eq!(
+            activity_row.children[0].children[1].kind,
+            TranscriptRowKind::ToolOutput
+        );
+        assert_eq!(
+            activity_row.children[0].children[1].body,
+            vec!["tool output"]
         );
     }
 

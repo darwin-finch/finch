@@ -1855,6 +1855,73 @@ mod deferred_proposal_tests {
     }
 }
 
+/// Apply one event-bus VM envelope to its client-owned projection.
+///
+/// The projection owns exact-once sequence reconciliation. Keeping proposal
+/// notices behind the same accepted-prefix boundary prevents replayed or
+/// reordered envelopes from mutating the transcript through a second path.
+pub(super) fn project_vm_effect_event(
+    projection: &VmOutputProjection,
+    envelope: crate::runtime::VmEffectEnvelope,
+) -> bool {
+    let projected = projection.project_envelope(envelope);
+    if projected.is_empty() {
+        return false;
+    }
+    for envelope in projected {
+        if envelope.effect.requirement.capability != crate::vm::CapabilityKind::ProgramInvoke {
+            continue;
+        }
+        let intent = match &envelope.effect.event {
+            crate::vm::HostSideEffect::Request { arguments } => arguments
+                .get(1)
+                .and_then(|value| match value {
+                    crate::vm::TypedValue::String(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("Review proposed program"),
+            _ => "Review proposed program",
+        };
+        projection.append_default(&format!(
+            "Proposal awaiting review: {intent} [run {}, effect {}]",
+            envelope.execution_id, envelope.effect.sequence
+        ));
+    }
+    true
+}
+
+/// Commit a successful tool result to the exact row that owned its live
+/// output. `submit_program` keeps already-projected VM emits, then appends
+/// source/audit context without re-rendering the serialized outcome body.
+pub(super) fn complete_successful_tool_row(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    work_unit: &crate::cli::messages::WorkUnit,
+    row_idx: usize,
+    content: &str,
+) {
+    let (summary, mut body) = tool_result_to_display(tool_name, content);
+    if tool_name != "submit_program" {
+        work_unit.complete_row_with_body(row_idx, summary, body);
+        return;
+    }
+
+    // A provider-native VM submission is executable source, not an opaque
+    // tool argument. Preserve the exact source beside every `say` chunk and
+    // diagnostic without replacing the streamed row body.
+    let language = tool_input
+        .get("language")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("inferred");
+    if let Some(source) = tool_input.get("source").and_then(serde_json::Value::as_str) {
+        let mut source_body = vec![format!("VM source ({language}):")];
+        source_body.extend(source.lines().map(str::to_owned));
+        source_body.append(&mut body);
+        body = source_body;
+    }
+    work_unit.complete_row_preserving_body(row_idx, summary, body);
+}
+
 impl EventLoop {
     fn start_llm_worker(&mut self) {
         let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
@@ -4414,30 +4481,8 @@ Rules:\n\
                 // duplicates/gaps before rendering notices or mutating a
                 // WorkUnit; the durable acknowledgement belongs to the later
                 // Brain event-log layer.
-                let projected = projection.project_envelope(envelope);
-                if projected.is_empty() {
+                if !project_vm_effect_event(&projection, envelope) {
                     return Ok(());
-                }
-                for envelope in projected {
-                    if envelope.effect.requirement.capability
-                        != crate::vm::CapabilityKind::ProgramInvoke
-                    {
-                        continue;
-                    }
-                    let intent = match &envelope.effect.event {
-                        crate::vm::HostSideEffect::Request { arguments } => arguments
-                            .get(1)
-                            .and_then(|value| match value {
-                                crate::vm::TypedValue::String(text) => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .unwrap_or("Review proposed program"),
-                        _ => "Review proposed program",
-                    };
-                    projection.append_default(&format!(
-                        "Proposal awaiting review: {intent} [run {}, effect {}]",
-                        envelope.execution_id, envelope.effect.sequence
-                    ));
                 }
                 self.render_tui().await?;
             }
@@ -7037,26 +7082,7 @@ Rules:\n\
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
             Ok(content) => {
-                let (summary, mut body) = tool_result_to_display(&tool_name, content);
-                // A provider-native VM submission is executable source, not an
-                // opaque tool argument.  Preserve the exact source in the
-                // scrollback row so a user can reconcile every `say` chunk and
-                // diagnostic with the program that caused it.
-                if tool_name == "submit_program" {
-                    let language = tool_input
-                        .get("language")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("inferred");
-                    if let Some(source) =
-                        tool_input.get("source").and_then(serde_json::Value::as_str)
-                    {
-                        let mut source_body = vec![format!("VM source ({language}):")];
-                        source_body.extend(source.lines().map(str::to_owned));
-                        source_body.append(&mut body);
-                        body = source_body;
-                    }
-                }
-                work_unit.complete_row_with_body(row_idx, summary, body);
+                complete_successful_tool_row(&tool_name, &tool_input, &work_unit, row_idx, content)
             }
             Err(e) => {
                 // Truncate very long error messages for the row display

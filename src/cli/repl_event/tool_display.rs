@@ -284,6 +284,24 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
             (summary, body)
         }
 
+        // The provider receives the complete serialized ExecutionOutcome,
+        // but the transcript already owns the exact program source and each
+        // streamed output effect. Showing that JSON as a completion summary
+        // would repeat emitted text (often several times through output,
+        // output_chunks, and the effect journal).
+        "submit_program" => {
+            let summary = serde_json::from_str::<serde_json::Value>(trimmed)
+                .ok()
+                .and_then(|outcome| {
+                    outcome
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|status| status.replace('_', " "))
+                })
+                .unwrap_or_else(|| "program result received".to_string());
+            (summary, Vec::new())
+        }
+
         _ => (compact_tool_summary(content), Vec::new()),
     }
 }
