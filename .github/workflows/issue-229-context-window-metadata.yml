@@ -1,0 +1,48 @@
+name: Issue 229 ChatGPT context metadata
+
+on:
+  push:
+    branches:
+      - codex/issue-229-context-window-metadata
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-229-context-window-metadata-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  context-metadata:
+    name: Context metadata (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check focused formatting
+        run: rustfmt --edition 2021 --check src/providers/chatgpt_subscription.rs
+      - name: Compile library tests
+        run: cargo test --lib --no-run
+      - name: Run ChatGPT subscription protocol regressions
+        run: "cargo test --lib providers::chatgpt_subscription::tests:: -- --nocapture"
