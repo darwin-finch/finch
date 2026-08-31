@@ -1746,7 +1746,13 @@ fn parse_completed(
         bail!("ChatGPT completion returned too many output items");
     }
     if let Some(output) = terminal_output {
-        if !accumulator.output_items.is_empty() {
+        if output.is_empty() && !accumulator.output_items.is_empty() {
+            // Responses-Lite may use response.completed as a compact terminal
+            // marker and leave its output array empty after delivering the
+            // authoritative completed items through output_item.done events.
+            // Those items have already passed the same strict parser below;
+            // retaining them avoids turning a valid response into an empty one.
+        } else if !accumulator.output_items.is_empty() {
             // A completed response is the provider's authoritative snapshot.  The
             // preceding output_item.done events are useful for progressive UI, but
             // OpenAI may consolidate, replace, or enrich those snapshots before
@@ -1757,17 +1763,23 @@ fn parse_completed(
             let streamed = project_output_items(accumulator.output_items.values(), allowed_tools)?;
             let terminal = project_output_items(output.iter(), allowed_tools)?;
             if observable_blocks(&streamed) != observable_blocks(&terminal) {
-                bail!("ChatGPT terminal output did not match streamed output items");
+                bail!(
+                    "ChatGPT terminal output did not match streamed output items (streamed {}; terminal {})",
+                    observable_shape(&streamed),
+                    observable_shape(&terminal)
+                );
             }
         } else {
             project_output_items(output.iter(), allowed_tools)?;
         }
-        accumulator.output_items = output
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, item)| (index as u64, item))
-            .collect();
+        if !output.is_empty() || accumulator.output_items.is_empty() {
+            accumulator.output_items = output
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, item)| (index as u64, item))
+                .collect();
+        }
     }
     if accumulator
         .output_items
@@ -1803,6 +1815,20 @@ fn project_output_items<'a>(
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
     }
     Ok(blocks)
+}
+
+fn observable_shape(blocks: &[ContentBlock]) -> String {
+    observable_blocks(blocks)
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => format!("text:{}", text.len()),
+            ContentBlock::ToolUse { name, .. } => format!("tool:{name}"),
+            ContentBlock::ToolResult { .. } => "tool-result".to_string(),
+            ContentBlock::Image { .. } => "image".to_string(),
+            ContentBlock::OpaqueReasoning { .. } => "reasoning".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn observable_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
@@ -2681,6 +2707,30 @@ mod tests {
             json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
             json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":" there"}]}}),
+            completed
+        )
+    }
+
+    fn compact_terminal_text_sse(model: &str) -> String {
+        let body = completed_sse(model);
+        let marker = "event: response.completed\ndata: ";
+        let start = body.find(marker).unwrap() + marker.len();
+        let end = body[start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| start + offset)
+            .unwrap();
+        let mut completed: Value = serde_json::from_str(&body[start..end]).unwrap();
+        completed["sequence_number"] = json!(3);
+        completed["response"]["output"] = json!([]);
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Finch native subscription transport accepted"}]}}),
             completed
         )
     }
@@ -4574,6 +4624,47 @@ mod tests {
     }
 
     #[test]
+    fn empty_terminal_output_retains_validated_completed_stream_items() {
+        let streamed_item = json!({
+            "id":"msg-streamed",
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "phase":"final_answer",
+            "content":[{
+                "type":"output_text",
+                "text":"Finch native subscription transport accepted",
+                "annotations":[],
+                "logprobs":[]
+            }]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, streamed_item.clone());
+        let response = json!({
+            "id":"resp-compact-terminal",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[]
+        });
+
+        let completed = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("an empty compact terminal must retain completed stream items");
+
+        assert_eq!(accumulator.output_items.get(&0), Some(&streamed_item));
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::Text { text }]
+                if text == "Finch native subscription transport accepted"
+        ));
+    }
+
+    #[test]
     fn terminal_output_may_consolidate_adjacent_streamed_text_items() {
         let message = |text: &str| {
             json!({
@@ -4659,6 +4750,48 @@ mod tests {
         assert!(matches!(
             response.content.as_slice(),
             [ContentBlock::Text { text }] if text == "hello there"
+        ));
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn responses_lite_retains_done_item_when_terminal_output_is_compact() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(compact_terminal_text_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+
+        let response = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("compact terminal output must retain the validated done item");
+
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::Text { text }]
+                if text == "Finch native subscription transport accepted"
         ));
         models.assert_async().await;
         inference.assert_async().await;
