@@ -46,4 +46,4 @@ jobs:
       - name: Compile library tests
         run: cargo test --lib --no-run
       - name: Run ChatGPT subscription protocol regressions
-        run: cargo test --lib providers::chatgpt_subscription::tests:: -- --nocapture
+        run: "cargo test --lib providers::chatgpt_subscription::tests:: -- --nocapture"
