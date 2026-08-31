@@ -101,6 +101,15 @@ impl FallbackChain {
 
             match provider.send_message_validated(validated).await {
                 Ok(response) => {
+                    if let Err(error) = validate_selected_response(provider.as_ref(), &response) {
+                        tracing::warn!(
+                            provider = provider.name(),
+                            error = %error,
+                            "Provider response contradicted the selected fallback candidate"
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
                     if idx > 0 {
                         tracing::info!(
                             "Provider {} succeeded after {} failed attempts",
@@ -254,6 +263,22 @@ impl FallbackChain {
     }
 }
 
+fn validate_selected_response(
+    provider: &(impl LlmProvider + ?Sized),
+    response: &ProviderResponse,
+) -> Result<()> {
+    crate::generators::validate_response_model(&response.provider)
+        .map_err(|_| anyhow::anyhow!("Provider response provider metadata was invalid"))?;
+    anyhow::ensure!(
+        provider.accepts_actual_provider(&response.provider),
+        "Provider response contradicted the selected fallback candidate"
+    );
+    if !response.model.is_empty() {
+        crate::generators::validate_response_model(&response.model)?;
+    }
+    Ok(())
+}
+
 // Implement LlmProvider trait for FallbackChain
 #[async_trait::async_trait]
 impl ProviderBackend for FallbackChain {
@@ -342,6 +367,8 @@ mod tests {
     struct MockProvider {
         name: String,
         should_fail: bool,
+        reported_provider: Option<String>,
+        backend_calls: Option<Arc<AtomicUsize>>,
     }
 
     struct NoToolProvider;
@@ -513,6 +540,17 @@ mod tests {
             Self {
                 name: name.to_string(),
                 should_fail,
+                reported_provider: None,
+                backend_calls: None,
+            }
+        }
+
+        fn reporting(name: &str, reported_provider: &str, backend_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                should_fail: false,
+                reported_provider: Some(reported_provider.to_string()),
+                backend_calls: Some(backend_calls),
             }
         }
     }
@@ -523,6 +561,9 @@ mod tests {
             &self,
             _request: ValidatedProviderRequest,
         ) -> Result<ProviderResponse> {
+            if let Some(calls) = &self.backend_calls {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
             if self.should_fail {
                 anyhow::bail!("Mock provider {} failed", self.name);
             }
@@ -535,7 +576,10 @@ mod tests {
                 }],
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
-                provider: self.name.clone(),
+                provider: self
+                    .reported_provider
+                    .clone()
+                    .unwrap_or_else(|| self.name.clone()),
                 usage: None,
                 allowance: None,
             })
@@ -629,6 +673,31 @@ mod tests {
         let result = chain.send_message_with_fallback(&request).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().provider, "fallback");
+    }
+
+    #[tokio::test]
+    async fn buffered_primary_cannot_claim_a_secondary_provider() {
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let chain = FallbackChain::new(vec![
+            Box::new(MockProvider::reporting(
+                "primary",
+                "secondary",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(MockProvider::reporting(
+                "secondary",
+                "secondary",
+                Arc::clone(&secondary_calls),
+            )),
+        ]);
+
+        let response = chain
+            .send_message_with_fallback(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap();
+
+        assert_eq!(response.provider, "secondary");
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

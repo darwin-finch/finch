@@ -4556,6 +4556,7 @@ mod tests {
             super::super::brain_codec::encode_invocation_metadata(
                 result.reborrow().init_invocation_metadata(),
                 &crate::providers::types::InvocationMetadata {
+                    provenance: crate::providers::types::InvocationProvenance::Authoritative,
                     configured_profile: "chatgpt".into(),
                     requested_provider: "chatgpt_subscription".into(),
                     resolved_provider: "chatgpt_subscription".into(),

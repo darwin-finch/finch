@@ -281,17 +281,40 @@ pub(super) fn encode_invocation_metadata(
 pub(super) fn decode_invocation_metadata(
     reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
 ) -> anyhow::Result<crate::providers::types::InvocationMetadata> {
+    let configured_profile = text(reader.get_configured_profile()?)?;
+    let requested_provider = text(reader.get_requested_provider()?)?;
+    let resolved_provider = text(reader.get_resolved_provider()?)?;
+    let actual_provider = text(reader.get_actual_provider()?)?;
+    let legacy_actual_model = text(reader.get_actual_model()?)?;
+    let has_current_provenance = [
+        configured_profile.as_str(),
+        requested_provider.as_str(),
+        resolved_provider.as_str(),
+        actual_provider.as_str(),
+    ]
+    .iter()
+    .any(|component| !component.is_empty());
     let metadata = crate::providers::types::InvocationMetadata {
-        configured_profile: text(reader.get_configured_profile()?)?,
-        requested_provider: text(reader.get_requested_provider()?)?,
-        resolved_provider: text(reader.get_resolved_provider()?)?,
+        provenance: if has_current_provenance {
+            crate::providers::types::InvocationProvenance::Authoritative
+        } else {
+            crate::providers::types::InvocationProvenance::LegacyUnattributed
+        },
+        configured_profile,
+        requested_provider,
+        resolved_provider,
         requested_model: text(reader.get_requested_model()?)?,
         resolved_model: text(reader.get_resolved_model()?)?,
-        actual_provider: text(reader.get_actual_provider()?)?,
+        actual_provider,
         actual_model: if reader.get_has_actual_model() {
-            Some(text(reader.get_actual_model()?)?)
-        } else {
+            Some(legacy_actual_model)
+        } else if has_current_provenance || legacy_actual_model.is_empty() {
             None
+        } else {
+            // `actualModel @2` predates `hasActualModel` and provider
+            // provenance fields. Preserve it as historical model text, never
+            // as an attestation of an unknown provider.
+            Some(legacy_actual_model)
         },
         input_tokens: reader
             .get_has_input_tokens()
@@ -2141,6 +2164,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_invocation_frame_keeps_model_without_fabricating_provider() {
+        // Captured pre-provenance shape: `actualModel @2` existed, while the
+        // provider fields and `hasActualModel` flag did not. Cap'n Proto reads
+        // the later fields as their zero values.
+        let mut message = capnp::message::Builder::new_default();
+        let mut legacy = message.init_root::<finch_ipc_capnp::invocation_metadata::Builder<'_>>();
+        legacy.set_requested_model("gpt-5.6");
+        legacy.set_resolved_model("gpt-5.6");
+        legacy.set_actual_model("gpt-5.6-sol");
+        let words = capnp::serialize::write_message_to_words(&message);
+        let mut cursor = std::io::Cursor::new(words);
+        let decoded =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .unwrap();
+        let metadata = decode_invocation_metadata(
+            decoded
+                .get_root::<finch_ipc_capnp::invocation_metadata::Reader<'_>>()
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            metadata.provenance,
+            crate::providers::InvocationProvenance::LegacyUnattributed
+        );
+        assert_eq!(metadata.actual_model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(metadata.actual_provider.is_empty());
+    }
+
+    #[test]
     fn every_current_brain_event_round_trips_through_capnp() {
         let brain_id = BrainId(uuid::Uuid::new_v4());
         let attachment_id = AttachmentId(uuid::Uuid::new_v4());
@@ -2262,6 +2315,7 @@ mod tests {
                     ],
                 )],
                 invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                    provenance: crate::providers::types::InvocationProvenance::Authoritative,
                     configured_profile: "chatgpt".into(),
                     requested_provider: "chatgpt_subscription".into(),
                     resolved_provider: "chatgpt_subscription".into(),

@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 16;
 /// Completed audit histories retained per named Brain. Together with the
 /// bounded intent/outcome encodings this caps the audit projection and its
 /// share of `events.jsonl`; unresolved write-ahead entries are never pruned.
@@ -8612,6 +8612,39 @@ mod tests {
 
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(restarted.snapshot("legacy-v13").unwrap().revision, 1);
+    }
+
+    #[test]
+    fn legacy_result_invocation_metadata_replays_without_tail_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("legacy-result");
+        std::fs::create_dir_all(&directory).unwrap();
+        // This is the base-format Result envelope written before provider
+        // provenance was introduced. It is deliberately newline-terminated:
+        // failure to migrate its metadata must not be mistaken for a torn
+        // final append and truncate the only committed record.
+        let legacy = concat!(
+            "{\"schema_version\":15,\"brain_id\":\"00000000-0000-0000-0000-000000000000\",\"seq\":1,\"environment_generation\":1,\"sender\":\"alice\",\"created_ms\":0,\"kind\":\"result\",\"request_seq\":1,\"output\":\"done\",\"invocation_metadata\":{\"requested_model\":\"gpt-5.6\",\"resolved_model\":\"gpt-5.6\",\"actual_model\":\"gpt-5.6-sol\",\"input_tokens\":10,\"output_tokens\":2}}\n"
+        );
+        let path = directory.join("events.jsonl");
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = store.snapshot("legacy-result").unwrap();
+        let BrainEventKind::Result {
+            invocation_metadata: Some(metadata),
+            ..
+        } = &snapshot.events[0].kind
+        else {
+            panic!("legacy result invocation metadata was not retained");
+        };
+        assert_eq!(
+            metadata.provenance,
+            crate::providers::InvocationProvenance::LegacyUnattributed
+        );
+        assert_eq!(metadata.actual_model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(metadata.actual_provider.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), legacy.as_bytes());
     }
 
     #[test]

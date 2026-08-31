@@ -3910,7 +3910,7 @@ Rules:\n\
                     let profile_name = entry.profile_name();
                     tokio::spawn(async move {
                         let outcome = activate_local_when_ready(
-                            selection,
+                            selection.clone(),
                             token,
                             target_index,
                             local_generator,
@@ -3922,7 +3922,9 @@ Rules:\n\
                         )
                         .await;
                         match outcome {
-                            LocalActivationOutcome::Activated(model) => {
+                            LocalActivationOutcome::Activated(model)
+                                if should_publish_local_activation(selection.is_current(token)) =>
+                            {
                                 status_bar.update_line(
                                     crate::cli::status_bar::StatusLineType::ProviderIdentity,
                                     provider_display,
@@ -3931,6 +3933,7 @@ Rules:\n\
                                     "✓ Switched to {profile_name} · {model} (conversation preserved)"
                                 ));
                             }
+                            LocalActivationOutcome::Activated(_) => {}
                             LocalActivationOutcome::Failed(error) => output.write_error(format!(
                                 "Local model {profile_name} failed to start: {error}"
                             )),
@@ -8145,6 +8148,10 @@ Rules:\n\
     }
 }
 
+fn should_publish_local_activation(is_current: bool) -> bool {
+    is_current
+}
+
 fn brain_context_text(
     event: &crate::brain::store::BrainEvent,
     local_machine: Option<&str>,
@@ -8795,6 +8802,15 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_async_local_activation_cannot_publish_tui_provider_identity() {
+        // `complete_pending` may have returned Activated immediately before a
+        // newer /model command wins. The event handler rechecks the generation
+        // at the point where it would mutate the banner/output.
+        assert!(!super::should_publish_local_activation(false));
+        assert!(super::should_publish_local_activation(true));
+    }
+
     fn admitting_llm_channel() -> (
         tokio::sync::mpsc::UnboundedSender<super::LlmRequest>,
         tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,

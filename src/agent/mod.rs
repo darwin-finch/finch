@@ -16,6 +16,7 @@ use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
 use crate::config::{persona::Persona, Config};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
+use crate::providers::{InvocationMetadata, TurnIdentity};
 use crate::tools::implementations::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
 };
@@ -251,6 +252,10 @@ impl AgentLoop {
         }
 
         let mut messages = vec![Message::user(&user_msg)];
+        let turn_identity = client
+            .turn_identity()
+            .context("Agent provider identity was invalid")?;
+        let mut invocation_metadata = None;
 
         const MAX_TURNS: usize = 25;
 
@@ -259,7 +264,11 @@ impl AgentLoop {
                 model: model.clone(),
                 max_tokens: crate::config::constants::DEFAULT_MAX_TOKENS,
                 messages: messages.clone(),
-                system: Some(system.clone()),
+                system: Some(agent_system_with_identity(
+                    &system,
+                    &turn_identity,
+                    invocation_metadata.as_ref(),
+                )?),
                 tools: Some(tool_defs.clone()),
             };
 
@@ -267,6 +276,12 @@ impl AgentLoop {
                 .send_message(&request)
                 .await
                 .context("Teacher API request failed")?;
+            let admitted = admit_agent_response(client, &turn_identity, &response)?;
+            if let Some(current) = &mut invocation_metadata {
+                current.reconcile(&admitted)?;
+            } else {
+                invocation_metadata = Some(admitted);
+            }
 
             if !response.has_tool_uses() {
                 // Final answer — print it and commit any changes
@@ -314,16 +329,17 @@ impl AgentLoop {
                     let guard = executor.lock().await;
                     guard
                         .execute_tool::<fn() -> anyhow::Result<()>>(
-                            &tool_use, None, // conversation
-                            None, // save_models_fn
-                            None, // batch_trainer
-                            None, // local_generator
-                            None, // tokenizer
-                            None, // repl_mode
-                            None, // plan_content
-                            None, // live_output
-                            None, // provider_invocation
-                            None, // effect_audit
+                            &tool_use,
+                            None,                        // conversation
+                            None,                        // save_models_fn
+                            None,                        // batch_trainer
+                            None,                        // local_generator
+                            None,                        // tokenizer
+                            None,                        // repl_mode
+                            None,                        // plan_content
+                            None,                        // live_output
+                            invocation_metadata.clone(), // provider_invocation
+                            None,                        // effect_audit
                         )
                         .await
                 };
@@ -473,6 +489,36 @@ impl AgentLoop {
     }
 }
 
+fn agent_system_with_identity(
+    system: &str,
+    turn_identity: &TurnIdentity,
+    invocation: Option<&InvocationMetadata>,
+) -> Result<String> {
+    let identity_context = match invocation {
+        Some(invocation) => invocation.model_context()?,
+        None => turn_identity.model_context(),
+    };
+    Ok(format!("{system}\n\n{identity_context}"))
+}
+
+fn admit_agent_response(
+    client: &ClaudeClient,
+    turn_identity: &TurnIdentity,
+    response: &crate::claude::types::MessageResponse,
+) -> Result<InvocationMetadata> {
+    let actual_model = (!response.model.trim().is_empty()).then(|| response.model.clone());
+    let invocation =
+        InvocationMetadata::from_turn(turn_identity, response.provider.clone(), actual_model);
+    invocation
+        .validate()
+        .context("Agent response provider identity was invalid")?;
+    anyhow::ensure!(
+        client.accepts_actual_provider(&invocation.actual_provider),
+        "Agent response contradicted the dispatched provider identity"
+    );
+    Ok(invocation)
+}
+
 /// Build the tool executor for agent mode (auto-approve all tools)
 async fn build_tool_executor(
     _config: &Config,
@@ -520,6 +566,74 @@ fn truncate(s: &str, max_len: usize) -> &str {
 mod tests {
     use super::*;
     use crate::config::ProviderEntry;
+
+    struct AdmissionProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for AdmissionProvider {
+        async fn send_message_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<crate::providers::ProviderResponse> {
+            anyhow::bail!("agent admission test provider must not be invoked")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<
+            tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
+        > {
+            anyhow::bail!("agent admission test provider must not be invoked")
+        }
+
+        fn name(&self) -> &str {
+            "agent-admission"
+        }
+
+        fn default_model(&self) -> &str {
+            "agent-model"
+        }
+    }
+
+    fn admission_response(provider: &str, model: &str) -> crate::claude::types::MessageResponse {
+        crate::claude::types::MessageResponse {
+            id: "response".into(),
+            response_type: "message".into(),
+            role: "assistant".into(),
+            content: Vec::new(),
+            provider: provider.into(),
+            model: model.into(),
+            stop_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
+        }
+    }
+
+    #[test]
+    fn agent_admission_pins_provider_for_tool_continuations() {
+        let client = ClaudeClient::with_shared_provider(Arc::new(AdmissionProvider));
+        let turn = client.turn_identity().unwrap();
+        let mut current = admit_agent_response(
+            &client,
+            &turn,
+            &admission_response("agent-admission", "agent-model"),
+        )
+        .unwrap();
+        let drifted = admit_agent_response(
+            &client,
+            &turn,
+            &admission_response("agent-admission", "another-model"),
+        )
+        .unwrap();
+        assert!(current.reconcile(&drifted).is_err());
+        assert!(
+            admit_agent_response(&client, &turn, &admission_response("other", "agent-model"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_saved_legacy_chatgpt_only_config_rejects_agent_startup() {

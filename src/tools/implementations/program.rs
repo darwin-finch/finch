@@ -904,7 +904,10 @@ impl Tool for GetVmStateTool {
             "granted_capabilities": state.granted_capabilities,
             "languages": ["forth", "lisp"],
             "effects": ["pure", "vm_read", "vm_write", "external_read", "external_write"],
-            "provider_invocation": context.provider_invocation,
+            "provider_invocation": context
+                .provider_invocation
+                .as_ref()
+                .map(crate::providers::InvocationMetadata::tool_projection),
             "vocabulary_discovery": "Use search_word(query) followed by inspect_word(name) for targeted contracts.",
             "automation": self.runtime.automation().availability()
         })
@@ -985,7 +988,7 @@ mod tests {
     async fn vm_state_projects_the_exact_read_only_provider_invocation() {
         let tool = GetVmStateTool::new(Arc::new(ProgramRuntime::new()));
         let identity = crate::providers::TurnIdentity::new(
-            "fast",
+            "profile-token-secret",
             "openai",
             "openai_platform",
             "fast-alias",
@@ -1014,7 +1017,20 @@ mod tests {
         let result: Value =
             serde_json::from_str(&tool.execute(json!({}), &context).await.unwrap()).unwrap();
 
-        assert_eq!(result["provider_invocation"], json!(invocation));
+        assert_eq!(
+            result["provider_invocation"],
+            json!({
+                "provenance": "authoritative",
+                "requested_provider": "openai",
+                "resolved_provider": "openai_platform",
+                "requested_model": "fast-alias",
+                "resolved_model": "gpt-5.6-sol",
+                "actual_provider": "openai_platform",
+                "actual_model": "gpt-5.6-sol-2026-08-30",
+            })
+        );
+        assert!(result.to_string().contains("openai_platform"));
+        assert!(!result.to_string().contains("profile-token-secret"));
         assert!(result.get("credential_ref").is_none());
         assert!(result.get("api_key").is_none());
         assert!(result.get("base_url").is_none());

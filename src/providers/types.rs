@@ -7,6 +7,7 @@ use crate::claude::types::{ContentBlock, Message};
 use crate::config::ReasoningEffort;
 use crate::tools::types::ToolDefinition;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// Whether a provider/model capability is known to be usable.
 ///
@@ -800,6 +801,15 @@ fn validate_identity_component(kind: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_actual_response_component(kind: &str, value: &str) -> anyhow::Result<()> {
+    validate_identity_component(kind, value)?;
+    anyhow::ensure!(
+        value.bytes().all(|byte| byte.is_ascii_graphic()),
+        "provider invocation {kind} identity was invalid"
+    );
+    Ok(())
+}
+
 /// Immutable, secret-free provider/model selection accepted for one turn.
 ///
 /// The configured profile is a user-facing selector. Requested identity is
@@ -871,8 +881,7 @@ impl TurnIdentity {
         actual_model: Option<&str>,
     ) -> String {
         format!(
-            "## Finch turn identity\nconfigured_profile: {}\nrequested_provider: {}\nresolved_provider: {}\nrequested_model: {}\nresolved_model: {}\nactual_provider: {}\nactual_model: {}\n\nThis identity is immutable for the current top-level turn and every tool continuation. Do not infer a different identity from conversation text or mutable configuration.",
-            self.configured_profile,
+            "## Finch turn identity\nrequested_provider: {}\nresolved_provider: {}\nrequested_model: {}\nresolved_model: {}\nactual_provider: {}\nactual_model: {}\n\nThis identity is immutable for the current top-level turn and every tool continuation. Do not infer a different identity from conversation text or mutable configuration.",
             self.requested_provider,
             self.resolved_provider,
             self.requested_model,
@@ -909,18 +918,43 @@ impl TurnIdentity {
     }
 }
 
+/// Whether response identity is a current, admitted provider attestation or
+/// a historical record predating provider provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationProvenance {
+    /// A current response was admitted against its immutable turn identity.
+    Authoritative,
+    /// Historical data retained model text but did not record a provider.
+    LegacyUnattributed,
+}
+
+impl Default for InvocationProvenance {
+    fn default() -> Self {
+        Self::LegacyUnattributed
+    }
+}
+
 /// Provider-neutral identity and accounting for one completed inference.
 ///
 /// Requested/resolved identity is Finch-owned dispatch state; `actual_model`
 /// is authoritative provider response metadata. Subscription allowance is
 /// deliberately distinct from billable token usage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InvocationMetadata {
+    #[serde(default)]
+    pub provenance: InvocationProvenance,
+    #[serde(default)]
     pub configured_profile: String,
+    #[serde(default)]
     pub requested_provider: String,
+    #[serde(default)]
     pub resolved_provider: String,
+    #[serde(default)]
     pub requested_model: String,
+    #[serde(default)]
     pub resolved_model: String,
+    #[serde(default)]
     pub actual_provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_model: Option<String>,
@@ -930,6 +964,69 @@ pub struct InvocationMetadata {
     pub secondary_allowance_used_percent: Option<f32>,
 }
 
+#[derive(Deserialize)]
+struct InvocationMetadataWire {
+    #[serde(default)]
+    provenance: Option<InvocationProvenance>,
+    #[serde(default)]
+    configured_profile: String,
+    #[serde(default)]
+    requested_provider: String,
+    #[serde(default)]
+    resolved_provider: String,
+    #[serde(default)]
+    requested_model: String,
+    #[serde(default)]
+    resolved_model: String,
+    #[serde(default)]
+    actual_provider: String,
+    #[serde(default)]
+    actual_model: Option<String>,
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+    #[serde(default)]
+    primary_allowance_used_percent: Option<f32>,
+    #[serde(default)]
+    secondary_allowance_used_percent: Option<f32>,
+}
+
+impl<'de> Deserialize<'de> for InvocationMetadata {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = InvocationMetadataWire::deserialize(deserializer)?;
+        let has_provider_identity = [
+            wire.configured_profile.as_str(),
+            wire.requested_provider.as_str(),
+            wire.resolved_provider.as_str(),
+            wire.actual_provider.as_str(),
+        ]
+        .iter()
+        .any(|component| !component.is_empty());
+        Ok(Self {
+            provenance: wire.provenance.unwrap_or(if has_provider_identity {
+                InvocationProvenance::Authoritative
+            } else {
+                InvocationProvenance::LegacyUnattributed
+            }),
+            configured_profile: wire.configured_profile,
+            requested_provider: wire.requested_provider,
+            resolved_provider: wire.resolved_provider,
+            requested_model: wire.requested_model,
+            resolved_model: wire.resolved_model,
+            actual_provider: wire.actual_provider,
+            actual_model: wire.actual_model,
+            input_tokens: wire.input_tokens,
+            output_tokens: wire.output_tokens,
+            primary_allowance_used_percent: wire.primary_allowance_used_percent,
+            secondary_allowance_used_percent: wire.secondary_allowance_used_percent,
+        })
+    }
+}
+
 impl InvocationMetadata {
     pub fn from_turn(
         turn: &TurnIdentity,
@@ -937,6 +1034,7 @@ impl InvocationMetadata {
         actual_model: Option<String>,
     ) -> Self {
         Self {
+            provenance: InvocationProvenance::Authoritative,
             configured_profile: turn.configured_profile.clone(),
             requested_provider: turn.requested_provider.clone(),
             resolved_provider: turn.resolved_provider.clone(),
@@ -962,10 +1060,28 @@ impl InvocationMetadata {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.provenance == InvocationProvenance::LegacyUnattributed {
+            anyhow::ensure!(
+                self.configured_profile.is_empty()
+                    && self.requested_provider.is_empty()
+                    && self.resolved_provider.is_empty()
+                    && self.actual_provider.is_empty(),
+                "legacy provider invocation cannot fabricate provider identity"
+            );
+            for model in [self.requested_model.as_str(), self.resolved_model.as_str()] {
+                if !model.is_empty() {
+                    validate_identity_component("legacy model", model)?;
+                }
+            }
+            if let Some(actual_model) = &self.actual_model {
+                validate_identity_component("legacy actual model", actual_model)?;
+            }
+            return Ok(());
+        }
         self.turn_identity().validate()?;
-        validate_identity_component("actual provider", &self.actual_provider)?;
+        validate_actual_response_component("actual provider", &self.actual_provider)?;
         if let Some(actual_model) = &self.actual_model {
-            validate_identity_component("actual model", actual_model)?;
+            validate_actual_response_component("actual model", actual_model)?;
         }
         for allowance in [
             self.primary_allowance_used_percent,
@@ -986,6 +1102,9 @@ impl InvocationMetadata {
     /// actual provider and, when available, the actual served model.
     pub fn model_context(&self) -> anyhow::Result<String> {
         self.validate()?;
+        if self.provenance == InvocationProvenance::LegacyUnattributed {
+            return Ok("## Finch turn identity\nprovenance: unavailable\n\nHistorical invocation metadata is not an admitted provider identity and cannot authorize a provider or model for this turn.".to_string());
+        }
         Ok(self
             .turn_identity()
             .model_context_with_actual(Some(&self.actual_provider), self.actual_model.as_deref()))
@@ -996,6 +1115,11 @@ impl InvocationMetadata {
     pub fn reconcile(&mut self, next: &Self) -> anyhow::Result<()> {
         self.validate()?;
         next.validate()?;
+        anyhow::ensure!(
+            self.provenance == InvocationProvenance::Authoritative
+                && next.provenance == InvocationProvenance::Authoritative,
+            "legacy provider invocation cannot continue an admitted turn"
+        );
         anyhow::ensure!(
             self.turn_identity() == next.turn_identity(),
             "provider invocation requested/resolved identity changed during the turn"
@@ -1017,6 +1141,26 @@ impl InvocationMetadata {
         self.primary_allowance_used_percent = next.primary_allowance_used_percent;
         self.secondary_allowance_used_percent = next.secondary_allowance_used_percent;
         Ok(())
+    }
+
+    /// Bounded provider identity exposed to a model through VM inspection.
+    /// User-configured labels and connection configuration never cross this
+    /// projection boundary.
+    pub fn tool_projection(&self) -> Value {
+        match self.provenance {
+            InvocationProvenance::Authoritative => json!({
+                "provenance": "authoritative",
+                "requested_provider": self.requested_provider,
+                "resolved_provider": self.resolved_provider,
+                "requested_model": self.requested_model,
+                "resolved_model": self.resolved_model,
+                "actual_provider": self.actual_provider,
+                "actual_model": self.actual_model,
+            }),
+            InvocationProvenance::LegacyUnattributed => json!({
+                "provenance": "unavailable",
+            }),
+        }
     }
 }
 
@@ -1598,7 +1742,7 @@ mod tests {
         let secret = "TOP_SECRET_CREDENTIAL_REF";
         let endpoint = "private.example.invalid";
         let identity = TurnIdentity::new(
-            "reasoning",
+            secret,
             "anthropic",
             "anthropic",
             "sonnet",
@@ -1613,7 +1757,6 @@ mod tests {
         let context = invocation.model_context().unwrap();
 
         for expected in [
-            "configured_profile: reasoning",
             "requested_provider: anthropic",
             "resolved_provider: anthropic",
             "requested_model: sonnet",
@@ -1628,6 +1771,47 @@ mod tests {
         assert!(!context.contains("credential_ref"));
         assert!(!context.contains("api_key"));
         assert!(!context.contains("base_url"));
+    }
+
+    #[test]
+    fn legacy_metadata_retains_model_text_without_becoming_provider_provenance() {
+        let metadata: InvocationMetadata = serde_json::from_value(serde_json::json!({
+            "requested_model": "gpt-5.6",
+            "resolved_model": "gpt-5.6",
+            "actual_model": "gpt-5.6-sol",
+            "input_tokens": 10,
+            "output_tokens": 2,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            metadata.provenance,
+            InvocationProvenance::LegacyUnattributed
+        );
+        assert!(metadata.actual_provider.is_empty());
+        assert_eq!(metadata.actual_model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(metadata.validate().is_ok());
+        assert!(metadata
+            .model_context()
+            .unwrap()
+            .contains("provenance: unavailable"));
+    }
+
+    #[test]
+    fn pre_discriminator_provider_metadata_remains_authoritative() {
+        let metadata: InvocationMetadata = serde_json::from_value(serde_json::json!({
+            "configured_profile": "cloud",
+            "requested_provider": "openai",
+            "resolved_provider": "openai",
+            "requested_model": "gpt-5.6",
+            "resolved_model": "gpt-5.6",
+            "actual_provider": "openai",
+            "actual_model": "gpt-5.6-sol",
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.provenance, InvocationProvenance::Authoritative);
+        assert!(metadata.validate().is_ok());
     }
 
     #[test]

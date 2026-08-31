@@ -2247,6 +2247,9 @@ async fn run_query_teacher_only(
     eprintln!("⚠️  Running in teacher-only mode (no local model)");
 
     let claude_client = create_claude_client_with_provider(config)?;
+    let turn_identity = claude_client
+        .turn_identity()
+        .context("Teacher provider identity was invalid")?;
     let model = config
         .cloud_providers()
         .first()
@@ -2266,6 +2269,7 @@ async fn run_query_teacher_only(
     // Otherwise `finch --cloud-only query` is a misleading test surface: it
     // asks the provider for ordinary prose and never validates a VM program.
     let system = vm_wire_system_prompt();
+    let mut invocation_metadata = None;
 
     const MAX_TURNS: usize = 25;
     let mut wire_repair_requested = false;
@@ -2274,11 +2278,21 @@ async fn run_query_teacher_only(
             model: model.clone(),
             max_tokens: finch::config::constants::DEFAULT_MAX_TOKENS,
             messages: messages.clone(),
-            system: Some(system.clone()),
+            system: Some(one_shot_system_with_identity(
+                &system,
+                &turn_identity,
+                invocation_metadata.as_ref(),
+            )?),
             tools: (!wire_repair_requested).then(|| tool_definitions.clone()),
         };
 
         let response = claude_client.send_message(&request).await?;
+        let admitted = admit_one_shot_response(&claude_client, &turn_identity, &response)?;
+        if let Some(current) = &mut invocation_metadata {
+            current.reconcile(&admitted)?;
+        } else {
+            invocation_metadata = Some(admitted);
+        }
 
         // A text-only reply is the same raw Lisp/Co-Forth wire program used
         // by the interactive client. Execute it rather than displaying source
@@ -2388,16 +2402,17 @@ async fn run_query_teacher_only(
                 let guard = executor.lock().await;
                 guard
                     .execute_tool::<fn() -> anyhow::Result<()>>(
-                        &tool_use, None, // conversation
-                        None, // save_models_fn
-                        None, // batch_trainer
-                        None, // local_generator
-                        None, // tokenizer
-                        None, // repl_mode
-                        None, // plan_content
-                        None, // live_output
-                        None, // provider_invocation
-                        None, // effect_audit
+                        &tool_use,
+                        None,                        // conversation
+                        None,                        // save_models_fn
+                        None,                        // batch_trainer
+                        None,                        // local_generator
+                        None,                        // tokenizer
+                        None,                        // repl_mode
+                        None,                        // plan_content
+                        None,                        // live_output
+                        invocation_metadata.clone(), // provider_invocation
+                        None,                        // effect_audit
                     )
                     .await
             };
@@ -2420,6 +2435,39 @@ async fn run_query_teacher_only(
     }
     eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
+}
+
+fn one_shot_system_with_identity(
+    system: &str,
+    turn_identity: &finch::providers::TurnIdentity,
+    invocation: Option<&finch::providers::InvocationMetadata>,
+) -> Result<String> {
+    let identity_context = match invocation {
+        Some(invocation) => invocation.model_context()?,
+        None => turn_identity.model_context(),
+    };
+    Ok(format!("{system}\n\n{identity_context}"))
+}
+
+fn admit_one_shot_response(
+    client: &ClaudeClient,
+    turn_identity: &finch::providers::TurnIdentity,
+    response: &finch::claude::types::MessageResponse,
+) -> Result<finch::providers::InvocationMetadata> {
+    let actual_model = (!response.model.trim().is_empty()).then(|| response.model.clone());
+    let invocation = finch::providers::InvocationMetadata::from_turn(
+        turn_identity,
+        response.provider.clone(),
+        actual_model,
+    );
+    invocation
+        .validate()
+        .context("Teacher response provider identity was invalid")?;
+    anyhow::ensure!(
+        client.accepts_actual_provider(&invocation.actual_provider),
+        "Teacher response contradicted the dispatched provider identity"
+    );
+    Ok(invocation)
 }
 
 /// Render a raw model response for an explicit human inspection request.
@@ -3175,9 +3223,82 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_first_run_setup, register_query_vm_tools, Args, AuthCommand, Command};
+    use super::{
+        admit_one_shot_response, finish_first_run_setup, one_shot_system_with_identity,
+        register_query_vm_tools, Args, AuthCommand, Command,
+    };
     use clap::Parser;
     use std::sync::Arc;
+
+    struct AdmissionProvider;
+
+    #[async_trait::async_trait]
+    impl finch::providers::ProviderBackend for AdmissionProvider {
+        async fn send_message_validated(
+            &self,
+            _request: finch::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<finch::providers::ProviderResponse> {
+            anyhow::bail!("admission test provider must not be invoked")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: finch::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<
+            tokio::sync::mpsc::Receiver<anyhow::Result<finch::providers::StreamChunk>>,
+        > {
+            anyhow::bail!("admission test provider must not be invoked")
+        }
+
+        fn name(&self) -> &str {
+            "admission"
+        }
+
+        fn default_model(&self) -> &str {
+            "admission-model"
+        }
+    }
+
+    fn admitted_test_response(
+        provider: &str,
+        model: &str,
+    ) -> finch::claude::types::MessageResponse {
+        finch::claude::types::MessageResponse {
+            id: "response".into(),
+            response_type: "message".into(),
+            role: "assistant".into(),
+            content: Vec::new(),
+            provider: provider.into(),
+            model: model.into(),
+            stop_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
+        }
+    }
+
+    #[test]
+    fn cloud_only_admission_rejects_missing_or_drifted_provider_before_effects() {
+        let client = finch::claude::ClaudeClient::with_shared_provider(Arc::new(AdmissionProvider));
+        let turn = client.turn_identity().unwrap();
+        assert!(
+            admit_one_shot_response(&client, &turn, &admitted_test_response("", "model")).is_err()
+        );
+        assert!(
+            admit_one_shot_response(&client, &turn, &admitted_test_response("other", "model"))
+                .is_err()
+        );
+
+        let admitted = admit_one_shot_response(
+            &client,
+            &turn,
+            &admitted_test_response("admission", "model"),
+        )
+        .unwrap();
+        let system = one_shot_system_with_identity("wire", &turn, Some(&admitted)).unwrap();
+        assert!(system.contains("actual_provider: admission"));
+    }
 
     #[test]
     fn legacy_coforth_and_exchange_subcommands_are_not_public() {

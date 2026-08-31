@@ -6079,6 +6079,8 @@ mod handler_tests {
                             ],
                         )],
                         invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                            provenance:
+                                crate::providers::types::InvocationProvenance::Authoritative,
                             configured_profile: "chatgpt".into(),
                             requested_provider: "chatgpt_subscription".into(),
                             resolved_provider: "chatgpt_subscription".into(),

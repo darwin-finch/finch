@@ -48,9 +48,9 @@ pub use teacher_session::{
 };
 pub use types::{
     CapabilityProvenance, CapabilitySupport, ContextWindowCapability, InvocationMetadata,
-    ModelCapabilities, ModelFeature, OutputTokenLimitCapability, ProviderAllowance,
-    ProviderRequest, ProviderResponse, ProviderUsage, ReasoningCapability, StreamChunk,
-    TurnIdentity, WireProtocol, WireProtocolCapability,
+    InvocationProvenance, ModelCapabilities, ModelFeature, OutputTokenLimitCapability,
+    ProviderAllowance, ProviderRequest, ProviderResponse, ProviderUsage, ReasoningCapability,
+    StreamChunk, TurnIdentity, WireProtocol, WireProtocolCapability,
 };
 
 mod validated_boundary {

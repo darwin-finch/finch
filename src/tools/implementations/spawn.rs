@@ -9,7 +9,7 @@
 // parallel by the executor (see executor.rs).
 
 use crate::claude::types::{ContentBlock, Message};
-use crate::providers::{LlmProvider, ProviderRequest};
+use crate::providers::{LlmProvider, ProviderRequest, ProviderResponse};
 use crate::tools::implementations::bash::BashTool;
 use crate::tools::implementations::glob::GlobTool;
 use crate::tools::implementations::grep::GrepTool;
@@ -17,7 +17,7 @@ use crate::tools::implementations::read::ReadTool;
 use crate::tools::implementations::web_fetch::WebFetchTool;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolDefinition, ToolInputSchema, ToolUse};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -172,7 +172,18 @@ impl Tool for TaskTool {
         }
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
+        let parent_invocation = context
+            .provider_invocation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("spawn_task requires admitted provider provenance"))?;
+        parent_invocation
+            .validate()
+            .context("spawn_task received invalid provider provenance")?;
+        anyhow::ensure!(
+            parent_invocation.provenance == crate::providers::InvocationProvenance::Authoritative,
+            "spawn_task requires authoritative provider provenance"
+        );
         let task = input["task"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("spawn_task: missing required 'task' parameter"))?;
@@ -254,6 +265,9 @@ async fn run_subagent(
     max_turns: usize,
     depth: usize,
 ) -> Result<TaskResult> {
+    let turn_identity =
+        crate::providers::provider_turn_identity(provider.as_ref(), provider.name())
+            .context("Subagent provider identity was invalid")?;
     // Build system prompt
     let mut system = subagent_type.system_prompt().to_string();
     if let Some(bg) = background {
@@ -266,12 +280,17 @@ async fn run_subagent(
     let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 
     let mut messages: Vec<Message> = vec![Message::user(task)];
+    let mut invocation_metadata: Option<crate::providers::InvocationMetadata> = None;
 
     for turn in 0..max_turns {
         debug!("Subagent turn {}/{}", turn + 1, max_turns);
 
+        let identity_context = match invocation_metadata.as_ref() {
+            Some(invocation) => invocation.model_context()?,
+            None => turn_identity.model_context(),
+        };
         let mut request = ProviderRequest::new(messages.clone())
-            .with_system(system.clone())
+            .with_system(format!("{system}\n\n{identity_context}"))
             .with_max_tokens(4096);
 
         if !tool_defs.is_empty() {
@@ -283,6 +302,12 @@ async fn run_subagent(
             .send_message(&request)
             .await
             .map_err(|e| anyhow::anyhow!("Subagent provider error: {}", e))?;
+        let admitted = admit_subagent_response(provider.as_ref(), &turn_identity, &response)?;
+        if let Some(current) = &mut invocation_metadata {
+            current.reconcile(&admitted)?;
+        } else {
+            invocation_metadata = Some(admitted);
+        }
 
         if !response.has_tool_uses() {
             // No tool calls → subagent produced its final answer
@@ -304,10 +329,11 @@ async fn run_subagent(
 
         for tool_use in &tool_uses {
             debug!("Subagent calling tool: {}", tool_use.name);
-            let (content, is_error) = match execute_subagent_tool(&tools, tool_use).await {
-                Ok(output) => (output, false),
-                Err(e) => (format!("Error: {}", e), true),
-            };
+            let (content, is_error) =
+                match execute_subagent_tool(&tools, tool_use, invocation_metadata.clone()).await {
+                    Ok(output) => (output, false),
+                    Err(e) => (format!("Error: {}", e), true),
+                };
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: tool_use.id.clone(),
                 content,
@@ -325,8 +351,33 @@ async fn run_subagent(
     )))
 }
 
+fn admit_subagent_response(
+    provider: &(impl LlmProvider + ?Sized),
+    turn_identity: &crate::providers::TurnIdentity,
+    response: &ProviderResponse,
+) -> Result<crate::providers::InvocationMetadata> {
+    let actual_model = (!response.model.trim().is_empty()).then(|| response.model.clone());
+    let invocation = crate::providers::InvocationMetadata::from_turn(
+        turn_identity,
+        response.provider.clone(),
+        actual_model,
+    );
+    invocation
+        .validate()
+        .context("Subagent response provider identity was invalid")?;
+    anyhow::ensure!(
+        provider.accepts_actual_provider(&invocation.actual_provider),
+        "Subagent response contradicted the dispatched provider identity"
+    );
+    Ok(invocation)
+}
+
 /// Execute a single tool inside the subagent (no permission checks).
-async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> Result<String> {
+async fn execute_subagent_tool(
+    tools: &[Box<dyn Tool>],
+    tool_use: &ToolUse,
+    provider_invocation: Option<crate::providers::InvocationMetadata>,
+) -> Result<String> {
     let tool = tools
         .iter()
         .find(|t| t.name() == tool_use.name)
@@ -347,7 +398,7 @@ async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> R
         plan_content: None,
         live_output: None,
         effect_audit: None,
-        provider_invocation: None,
+        provider_invocation,
         poset: None,
     };
 
@@ -612,6 +663,32 @@ mod tests {
         assert!(allowed.contains(&"read"));
         assert!(allowed.contains(&"bash"));
         assert!(allowed.contains(&"spawn_task"));
+    }
+
+    #[tokio::test]
+    async fn spawn_task_rejects_missing_parent_provenance_before_provider_work() {
+        let tool = TaskTool::new(null_provider());
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            provider_invocation: None,
+            poset: None,
+        };
+
+        let error = tool
+            .execute(json!({"task": "must not run"}), &context)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires admitted provider provenance"));
     }
 
     #[test]
