@@ -1351,6 +1351,86 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tool_projection_collapses_after_running_and_omits_zero_output() {
+        let unit = WorkUnit::new("Tools");
+        let row = unit.add_row("catalog.validate provider=chatgpt");
+
+        let running = unit.transcript_row(&colors()).unwrap();
+        assert!(running.default_expanded);
+        assert!(running.children[0].default_expanded);
+        assert_eq!(running.children[0].children.len(), 1);
+        assert_eq!(
+            running.children[0].children[0].kind,
+            TranscriptRowKind::Input
+        );
+
+        unit.fail_row(row, "catalog unavailable");
+        unit.set_failed();
+        let failed = unit.transcript_row(&colors()).unwrap();
+        assert!(!failed.default_expanded);
+        assert!(!failed.children[0].default_expanded);
+        assert!(failed.label.contains("failed: catalog unavailable"));
+        assert_eq!(failed.children[0].children.len(), 1);
+
+        let completed = WorkUnit::new("Tools");
+        let row = completed.add_row("read config");
+        completed.complete_row_with_body(row, "3 lines", vec!["one".into(), "two".into()]);
+        completed.set_complete();
+        let projected = completed.transcript_row(&colors()).unwrap();
+        assert!(!projected.default_expanded);
+        assert!(!projected.children[0].default_expanded);
+        assert_eq!(projected.children[0].children.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_brain_status_and_result_failures_have_one_compact_summary() {
+        let unit = WorkUnit::new("Brain tools");
+        unit.set_response("Speculative run 1234");
+        let status = unit.add_row("Speculative run 1234 · status");
+        unit.fail_row(status, "catalog validation failed");
+        let result = unit.add_row("result");
+        unit.fail_row(result, "catalog validation failed");
+        unit.set_complete();
+
+        let projected = unit.transcript_row(&colors()).unwrap();
+        assert!(!projected.default_expanded);
+        assert_eq!(
+            projected.label.matches("catalog validation failed").count(),
+            1
+        );
+        assert_eq!(projected.children.len(), 2);
+        assert!(projected.children[0].label.contains("status"));
+        assert!(projected.children[1].label.starts_with("result"));
+
+        let canonical = unit.complete_transcript(&colors());
+        assert_eq!(canonical.matches("catalog validation failed").count(), 2);
+        assert!(canonical.contains("Speculative run 1234 · status"));
+        assert!(canonical.contains("result"));
+    }
+
+    #[test]
+    fn unsummarized_structured_output_remains_visible_by_default() {
+        let unit = WorkUnit::new("Tools");
+        let row = unit.add_row("edit config.toml");
+        unit.complete_row_with_diff(
+            row,
+            FileDiff::parse("--- a/config.toml\n+++ b/config.toml\n@@ -1 +1 @@\n-old\n+new")
+                .expect("valid diff"),
+        );
+        unit.set_complete();
+
+        let projected = unit.transcript_row(&colors()).unwrap();
+        assert!(projected.default_expanded);
+        assert!(projected.children[0].default_expanded);
+        let output = projected.children[0]
+            .children
+            .iter()
+            .find(|child| child.kind == TranscriptRowKind::ToolOutput)
+            .unwrap();
+        assert!(output.default_expanded);
+    }
+
+    #[test]
     fn explicit_output_handle_keeps_body_status_and_progress_separate() {
         let output = WorkUnit::new("ignored");
         output.set_output_handle("Download");

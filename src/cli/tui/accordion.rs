@@ -263,6 +263,55 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_tool_defaults_to_one_summary_and_full_expansion_preserves_details() {
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("catalog.validate provider=chatgpt");
+        work.append_row_body_line(call, "raw provider detail".into());
+        work.fail_row(call, "catalog unavailable");
+        work.set_failed();
+        let message: MessageRef = work.clone();
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+
+        let compact = state.render_message(&message, &colors);
+        assert_eq!(compact.len(), 1);
+        assert_eq!(compact[0].text.matches("catalog unavailable").count(), 1);
+        assert!(!compact[0].text.contains("Output (0)"));
+
+        state.rebuild_hit_regions(&compact, 3, 24);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        let keyboard_expanded = state.render_message(&message, &colors);
+        assert!(keyboard_expanded
+            .iter()
+            .any(|line| line.text.contains("catalog.validate")));
+
+        state.rebuild_hit_regions(&keyboard_expanded, 1, 9);
+        let root = state.hit_regions[0].clone();
+        assert!(state.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: root.left,
+            row: root.top,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(state.render_message(&message, &colors).len(), 1);
+
+        let fully_expanded = state.render_message_fully_expanded(&message, &colors);
+        assert!(fully_expanded
+            .iter()
+            .any(|line| line.text.contains("catalog.validate provider=chatgpt")));
+        assert!(fully_expanded
+            .iter()
+            .any(|line| line.text.contains("raw provider detail")));
+        assert!(!fully_expanded
+            .iter()
+            .any(|line| line.text.contains("Output (0)")));
+        assert!(work
+            .complete_transcript(&colors)
+            .contains("raw provider detail"));
+    }
+
+    #[test]
     fn test_unicode_wrapped_hit_region_moves_after_resize() {
         let id = TranscriptRowId {
             message_id: crate::cli::messages::MessageId::new(),
