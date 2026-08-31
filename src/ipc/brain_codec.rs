@@ -1548,12 +1548,16 @@ pub(super) fn encode_event(
             tool_id,
             output,
             is_error,
+            presentation,
         } => {
             let mut result = builder.init_tool_result();
             result.set_request_seq(*request_seq);
             result.set_tool_id(tool_id);
             result.set_output(output);
             result.set_is_error(*is_error);
+            let presentation = serde_json::to_value(presentation)
+                .map_err(|error| anyhow::anyhow!("encode tool-result presentation: {error}"))?;
+            encode_json_value(result.reborrow().init_presentation(), &presentation)?;
         }
         BrainEventKind::ApprovalRequested {
             request_seq,
@@ -1790,11 +1794,17 @@ pub(super) fn decode_event(
         }
         Which::ToolResult(result) => {
             let result = result?;
+            let presentation = match decode_json_value(result.get_presentation()?)? {
+                serde_json::Value::Null => crate::brain::store::ToolResultPresentation::Generic,
+                value => serde_json::from_value(value)
+                    .map_err(|error| anyhow::anyhow!("decode tool-result presentation: {error}"))?,
+            };
             BrainEventKind::ToolResult {
                 request_seq: result.get_request_seq(),
                 tool_id: text(result.get_tool_id()?)?,
                 output: text(result.get_output()?)?,
                 is_error: result.get_is_error(),
+                presentation,
             }
         }
         Which::ApprovalRequested(requested) => {
@@ -2198,6 +2208,7 @@ mod tests {
                 tool_id: "tool-1".into(),
                 output: "contents".into(),
                 is_error: false,
+                presentation: crate::brain::store::ToolResultPresentation::Generic,
             },
             BrainEventKind::ApprovalRequested {
                 request_seq: 5,

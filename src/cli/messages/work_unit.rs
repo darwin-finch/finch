@@ -363,6 +363,18 @@ impl WorkUnit {
         idx
     }
 
+    /// Replace a row label when a canonical call arrives after its result.
+    ///
+    /// Snapshot repair can legally deliver a result before the corresponding
+    /// call. Keeping the row identity stable avoids duplicating tool output
+    /// while allowing the later call metadata to repair its label.
+    pub fn set_row_label(&self, idx: usize, label: impl Into<String>) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.label = crate::cli::diff::sanitize_terminal(&label.into());
+        }
+    }
+
     /// Mark a sub-row complete with an optional compact one-line summary.
     pub fn complete_row(&self, idx: usize, summary: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
