@@ -1720,6 +1720,10 @@ fn is_exact_chatgpt_setup_credential(
                 crate::config::EndpointFamily::ChatgptSubscription,
             )
         && credential.secret_ref == format!("oauth-store:{reference}")
+        && credential
+            .account
+            .as_deref()
+            .is_some_and(|account| !account.is_empty())
         && crate::providers::chatgpt_oauth::chatgpt_required_scopes().is_subset(&credential.scopes)
 }
 
@@ -10548,6 +10552,33 @@ mod tests {
         let mut hostile = chatgpt_setup_credential("chatgpt:work", "acct-work");
         hostile.secret_ref = "keyring:finch/chatgpt/work".into();
         result.credentials = vec![hostile];
+        let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+        let authenticator = FakeChatGptSetupAuthenticator::default();
+
+        let error = prepare_chatgpt_setup_config(
+            &result,
+            &references,
+            &authenticator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exact ChatGPT setup authority"), "{error}");
+        assert!(authenticator.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn setup_rejects_chatgpt_credential_without_signed_account_before_authentication() {
+        let mut result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let mut incomplete = chatgpt_setup_credential("chatgpt:work", "acct-work");
+        incomplete.account = None;
+        result.credentials = vec![incomplete];
         let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
         let authenticator = FakeChatGptSetupAuthenticator::default();
 
