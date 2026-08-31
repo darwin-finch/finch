@@ -1260,6 +1260,41 @@ mod tests {
     /// its bounded turn limit without a final response.
     struct ToolLoopGenerator;
 
+    /// Completes one provider/tool turn and then blocks inside the next
+    /// provider call so cancellation and deadline accounting are observable.
+    struct ToolThenBlockGenerator {
+        calls: AtomicUsize,
+        blocked: Arc<Notify>,
+    }
+
+    struct ToolThenErrorGenerator {
+        calls: AtomicUsize,
+    }
+
+    fn one_tool_response(generator: &str) -> GeneratorResponse {
+        let tool_use = ToolUse {
+            id: Uuid::new_v4().to_string(),
+            name: "unavailable_test_tool".to_string(),
+            input: serde_json::json!({}),
+        };
+        GeneratorResponse {
+            text: String::new(),
+            content_blocks: vec![tool_use.to_content_block()],
+            tool_uses: vec![tool_use],
+            metadata: ResponseMetadata {
+                generator: generator.to_string(),
+                model: generator.to_string(),
+                confidence: None,
+                stop_reason: Some("tool_use".to_string()),
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        }
+    }
+
     struct BlockingGenerator {
         started: Arc<Notify>,
     }
@@ -1320,27 +1355,7 @@ mod tests {
             _messages: Vec<Message>,
             _tools: Option<Vec<ToolDefinition>>,
         ) -> Result<GeneratorResponse> {
-            let tool_use = ToolUse {
-                id: Uuid::new_v4().to_string(),
-                name: "unavailable_test_tool".to_string(),
-                input: serde_json::json!({}),
-            };
-            Ok(GeneratorResponse {
-                text: String::new(),
-                content_blocks: vec![tool_use.to_content_block()],
-                tool_uses: vec![tool_use],
-                metadata: ResponseMetadata {
-                    generator: "tool-loop".to_string(),
-                    model: "tool-loop".to_string(),
-                    confidence: None,
-                    stop_reason: Some("tool_use".to_string()),
-                    input_tokens: None,
-                    output_tokens: None,
-                    latency_ms: None,
-                    primary_allowance_used_percent: None,
-                    secondary_allowance_used_percent: None,
-                },
-            })
+            Ok(one_tool_response("tool-loop"))
         }
 
         async fn generate_stream(
@@ -1364,6 +1379,82 @@ mod tests {
 
         fn name(&self) -> &str {
             "tool-loop"
+        }
+    }
+
+    #[async_trait]
+    impl Generator for ToolThenBlockGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Ok(one_tool_response("tool-then-block"));
+            }
+            self.blocked.notify_one();
+            std::future::pending().await
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "tool-then-block"
+        }
+    }
+
+    #[async_trait]
+    impl Generator for ToolThenErrorGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(one_tool_response("tool-then-error"))
+            } else {
+                anyhow::bail!("provider failed after one completed turn")
+            }
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "tool-then-error"
         }
     }
 
@@ -1436,6 +1527,125 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("turn limit")));
+    }
+
+    #[tokio::test]
+    async fn deadline_reports_turns_completed_before_blocked_provider_call() {
+        let blocked = Arc::new(Notify::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(ToolThenBlockGenerator {
+                calls: AtomicUsize::new(0),
+                blocked,
+            })),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "complete one turn, then block".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget {
+                        max_turns: 4,
+                        timeout_ms: 50,
+                        max_output_bytes: 4_000,
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Failed);
+        assert_eq!(result.turns, 1);
+        assert_eq!(result.diagnostics, ["agent deadline exceeded"]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_reports_turns_completed_before_blocked_provider_call() {
+        let blocked = Arc::new(Notify::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(ToolThenBlockGenerator {
+                calls: AtomicUsize::new(0),
+                blocked: Arc::clone(&blocked),
+            })),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "complete one turn, then cancel".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget {
+                        max_turns: 4,
+                        timeout_ms: 5_000,
+                        max_output_bytes: 4_000,
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), blocked.notified())
+            .await
+            .expect("second provider call did not start");
+        scheduler.cancel(identity.task_id).await.unwrap();
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Cancelled);
+        assert_eq!(result.turns, 1);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("cancelled")));
+    }
+
+    #[tokio::test]
+    async fn provider_failure_reports_turns_completed_before_error() {
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(ToolThenErrorGenerator {
+                calls: AtomicUsize::new(0),
+            })),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "complete one turn, then fail".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget {
+                        max_turns: 4,
+                        timeout_ms: 5_000,
+                        max_output_bytes: 4_000,
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Failed);
+        assert_eq!(result.turns, 1);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("provider failed")));
     }
 
     #[tokio::test]
@@ -1951,6 +2161,8 @@ mod tests {
         let nested_result = scheduler.wait(nested.task_id).await.unwrap();
         assert_eq!(result.status, AgentTaskStatus::Cancelled);
         assert_eq!(nested_result.status, AgentTaskStatus::Cancelled);
+        assert_eq!(result.turns, 0);
+        assert_eq!(nested_result.turns, 0);
         let finished = cancelled_rx.await.unwrap();
         assert!(finished.contains(&crate::brain::store::RunId(identity.task_id)));
         assert!(finished.contains(&crate::brain::store::RunId(nested.task_id)));
