@@ -3144,7 +3144,9 @@ mod tests {
             .unwrap_err();
         let rejection = error
             .downcast_ref::<SubscriptionResponseRejected>()
-            .expect("the second HTTP rejection must retain its typed status");
+            .unwrap_or_else(|| {
+                panic!("the second HTTP rejection lost its typed status: {error:#}")
+            });
         assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
         let display = error.to_string();
