@@ -675,13 +675,13 @@ struct PendingNamedBrainTurn {
     /// Execute-once VM effects are returned independently of the reducible
     /// checkpoint, including when the provider program ultimately fails.
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
-    /// Keep the correlation record until cancellation reaches a terminal VM
-    /// boundary and all execute-once effects have been collected.
+    /// Mark that provider publication and the original callback response must
+    /// close as cancelled. Already-begun effects retain their own detached
+    /// audit completion authority after this turn record is removed.
     cancellation_requested: bool,
     /// Provider tool calls that have been published for this turn but have
-    /// not yet reached a result boundary. Cancellation retains the turn until
-    /// this set is empty so late physical outcomes can be audited without
-    /// publishing their ToolResult into conversation history.
+    /// not yet reached a result boundary. Query cancellation and the closed
+    /// staged round reject their late ToolResults independently of this set.
     active_tool_ids: std::collections::HashSet<String>,
     approval_audience: crate::brain::store::BrainApprovalAudience,
     approval_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>>,
@@ -4173,21 +4173,20 @@ Rules:\n\
                 // A terminal provider failure closes publication immediately;
                 // detached #163 effects may still finish their durable audit.
                 self.conversation.write().await.abort_staged(query_id);
-                if let Some(turn) = self.pending_named_brain_turns.get(&query_id) {
-                    if turn.cancellation_requested {
-                        // A cancelled provider may report its terminal error
-                        // before independently-running tools quiesce. Retain
-                        // the correlation record until every physical outcome
-                        // reaches the audit boundary, and never publish this
-                        // late provider error into Brain history.
-                        if turn.active_tool_ids.is_empty() {
-                            self.finish_named_brain_turn(query_id, String::new()).await;
-                            if *self.active_query_id.read().await == Some(query_id) {
-                                *self.active_query_id.write().await = None;
-                            }
-                        }
-                        return Ok(());
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.cancellation_requested)
+                {
+                    // Independently-running tools may still own begun effect
+                    // permits. They publish only their durable audit outcome;
+                    // this provider error and the original runner RPC must
+                    // settle without waiting for them.
+                    self.finish_named_brain_turn(query_id, String::new()).await;
+                    if *self.active_query_id.read().await == Some(query_id) {
+                        *self.active_query_id.write().await = None;
                     }
+                    return Ok(());
                 }
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
@@ -5348,18 +5347,18 @@ Rules:\n\
         self.conversation.write().await.abort_staged(query_id);
         self.close_active_tool_rows(query_id, "cancelled remotely")
             .await;
-        let should_finish = self
+        let cancellation_requested = self
             .pending_named_brain_turns
             .get_mut(&query_id)
             .map(|pending| {
                 pending.cancellation_requested = true;
-                pending.active_tool_ids.is_empty()
+                true
             })
             .unwrap_or(false);
         if let Some(cancellation_barrier) = cancellation_barrier {
             cancellation_barrier.wait().await;
         }
-        if should_finish {
+        if cancellation_requested {
             self.finish_named_brain_turn(query_id, String::new()).await;
             if *self.active_query_id.read().await == Some(query_id) {
                 *self.active_query_id.write().await = None;
@@ -5374,13 +5373,12 @@ Rules:\n\
         query_id: Uuid,
         run_id: crate::brain::store::RunId,
     ) {
-        let should_finish = match self.pending_named_brain_turns.get_mut(&query_id) {
+        match self.pending_named_brain_turns.get_mut(&query_id) {
             Some(pending) if pending.run_id == run_id => {
                 pending.cancellation_requested = true;
-                pending.active_tool_ids.is_empty()
             }
             _ => return,
-        };
+        }
         let cancellation_barrier = self.query_states.cancellation_barrier(query_id).await;
         let _ = self.query_states.cancel_query(query_id).await;
         self.conversation.write().await.abort_staged(query_id);
@@ -5388,9 +5386,6 @@ Rules:\n\
             .await;
         if let Some(cancellation_barrier) = cancellation_barrier {
             cancellation_barrier.wait().await;
-        }
-        if !should_finish {
-            return;
         }
         self.finish_named_brain_turn(query_id, String::new()).await;
         if *self.active_query_id.read().await == Some(query_id) {

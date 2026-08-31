@@ -3402,6 +3402,190 @@ mod tests {
         }
     }
 
+    struct NonQuiescentExpiredProgramRunner {
+        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+        late_effect_rejected: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for NonQuiescentExpiredProgramRunner {
+        fn run_program(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            mut results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let request = match params.get().and_then(|params| params.get_request()) {
+                Ok(request) => request,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let run_id = match request
+                .get_run_id()
+                .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(crate::brain::store::RunId)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                }) {
+                Ok(run_id) => run_id,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let control = match request.get_control() {
+                Ok(control) => control,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let started = self
+                .started
+                .take()
+                .expect("expired callback received more than one program");
+            let late_effect_rejected = self
+                .late_effect_rejected
+                .take()
+                .expect("expired callback attempted more than one late effect");
+            let release = std::sync::Arc::clone(&self.release);
+            capnp::capability::Promise::from_future(async move {
+                let _ = started.send(run_id);
+                release.notified().await;
+
+                let mut reserve = control.reserve_effect_request();
+                reserve
+                    .get()
+                    .set_execution_id(&uuid::Uuid::new_v4().to_string());
+                crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                    reserve.get().init_effect(),
+                    &crate::vm::VmSideEffect {
+                        protocol_version: 1,
+                        sequence: 0,
+                        requirement: crate::vm::CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::SessionEmit,
+                            selector: crate::vm::ResourceSelector::None,
+                        },
+                        output: Vec::new(),
+                        event: crate::vm::HostSideEffect::Emit {
+                            text: "stale generation effect".into(),
+                        },
+                        origin: crate::vm::SourceOrigin::generated("expired-runner-late-effect"),
+                    },
+                )
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let rejected = reserve.send().promise.await.is_err();
+                let _ = late_effect_rejected.send(rejected);
+                results
+                    .get()
+                    .init_result()
+                    .set_error("late stale generation result");
+                Ok(())
+            })
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let run_id = params
+                .get()
+                .and_then(|params| params.get_run_id())
+                .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(crate::brain::store::RunId)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                });
+            match run_id {
+                Ok(run_id) => {
+                    let _ = self.cancelled.send(run_id);
+                    results.get().set_cancelled(true);
+                    results.get().set_error("");
+                    capnp::capability::Promise::ok(())
+                }
+                Err(error) => capnp::capability::Promise::err(error),
+            }
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+    }
+
+    struct ImmediateProgramRunner {
+        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for ImmediateProgramRunner {
+        fn run_program(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            mut results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let run_id = match params
+                .get()
+                .and_then(|params| params.get_request())
+                .and_then(|request| request.get_run_id())
+                .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(crate::brain::store::RunId)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                }) {
+                Ok(run_id) => run_id,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let started = self
+                .started
+                .take()
+                .expect("replacement callback received more than one program");
+            let _ = started.send(run_id);
+            let mut result = results.get().init_result();
+            result.set_output("replacement completed");
+            result.set_runtime_revision(1);
+            if let Err(error) =
+                super::encode_checkpoint(result.reborrow().init_checkpoint(), &self.checkpoint)
+            {
+                return capnp::capability::Promise::err(capnp::Error::failed(error.to_string()));
+            }
+            result.set_error("");
+            capnp::capability::Promise::ok(())
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+    }
+
     async fn observe_cancel_before_forwarding_returns<F>(
         cancelled_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::brain::store::RunId>,
         forwarding: &mut F,
@@ -3517,6 +3701,285 @@ mod tests {
             forwarding.await;
         }
         assert!(response_rx.await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lease_expiry_waits_for_nonquiescent_ipc_callback_before_replacement_lane() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store.clone(),
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([92; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+                let attachment = lifecycle
+                    .attach(
+                        "shared",
+                        "alice",
+                        crate::brain::store::AttachmentRole::Driver,
+                        None,
+                    )
+                    .unwrap();
+                let attachment_id = attachment.attachment_id;
+                let connection_id = attachment.connection_id.unwrap();
+                let _watch = lifecycle
+                    .watch("shared", attachment_id, connection_id)
+                    .unwrap();
+                let environment = store.environment().clone();
+                let expired = lifecycle
+                    .acquire_runner(
+                        "shared",
+                        "runner@box.local/expired",
+                        &environment,
+                        None,
+                        300_000,
+                    )
+                    .unwrap();
+                let expired_lease_id = expired.lease_id;
+                let expired_expires_ms = expired.expires_ms;
+
+                let release_old = std::sync::Arc::new(tokio::sync::Notify::new());
+                let (old_started_tx, old_started_rx) = tokio::sync::oneshot::channel();
+                let (old_cancelled_tx, mut old_cancelled_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let (late_effect_tx, late_effect_rx) = tokio::sync::oneshot::channel();
+                let old_runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(NonQuiescentExpiredProgramRunner {
+                        started: Some(old_started_tx),
+                        cancelled: old_cancelled_tx,
+                        release: std::sync::Arc::clone(&release_old),
+                        late_effect_rejected: Some(late_effect_tx),
+                    });
+                let (old_tx, mut old_rx) = tokio::sync::mpsc::unbounded_channel();
+                let old_registration =
+                    server
+                        .brain_runners()
+                        .register("shared", expired_lease_id, old_tx);
+                let old_server = std::sync::Arc::clone(&server);
+                let old_bridge = tokio::task::spawn_local(async move {
+                    while let Some(request) = old_rx.recv().await {
+                        super::forward_runner_request(
+                            old_runner.clone(),
+                            std::sync::Arc::clone(&old_server),
+                            request,
+                            expired_lease_id,
+                            None,
+                            Some(old_registration),
+                        )
+                        .await;
+                    }
+                });
+
+                let old_lifecycle = lifecycle.clone();
+                let mut old_submission = tokio::task::spawn_local(async move {
+                    old_lifecycle
+                        .submit(
+                            "shared",
+                            attachment_id,
+                            connection_id,
+                            crate::brain::store::BrainEventKind::Program {
+                                language: crate::brain::store::ProgramLanguage::Lisp,
+                                source: "old callback".into(),
+                            },
+                        )
+                        .await
+                });
+                let old_run_id = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    async {
+                        tokio::select! {
+                            started = old_started_rx => started.expect("old IPC callback start signal dropped"),
+                            outcome = &mut old_submission => panic!(
+                                "old submission ended before its IPC callback started: {outcome:?}"
+                            ),
+                        }
+                    },
+                )
+                .await
+                .expect("old IPC callback did not start");
+
+                assert!(lifecycle
+                    .expire_runner_lease_if_due("shared", expired_lease_id, expired_expires_ms)
+                    .unwrap());
+                assert_eq!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        old_cancelled_rx.recv(),
+                    )
+                    .await
+                    .expect("expired IPC callback did not receive physical cancellation"),
+                    Some(old_run_id)
+                );
+
+                let replacement = lifecycle
+                    .acquire_runner(
+                        "shared",
+                        "runner@box.local/replacement",
+                        &environment,
+                        None,
+                        300_000,
+                    )
+                    .unwrap();
+                let replacement_lease_id = replacement.lease_id;
+                let checkpoint = crate::runtime::ProgramRuntime::new()
+                    .revision_history()
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+                    .checkpoint
+                    .unwrap();
+                let (replacement_started_tx, mut replacement_started_rx) =
+                    tokio::sync::oneshot::channel();
+                let replacement_runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(ImmediateProgramRunner {
+                        started: Some(replacement_started_tx),
+                        checkpoint,
+                    });
+                let (replacement_tx, mut replacement_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let replacement_registration = server.brain_runners().register(
+                    "shared",
+                    replacement_lease_id,
+                    replacement_tx,
+                );
+                let replacement_server = std::sync::Arc::clone(&server);
+                let replacement_bridge = tokio::task::spawn_local(async move {
+                    while let Some(request) = replacement_rx.recv().await {
+                        super::forward_runner_request(
+                            replacement_runner.clone(),
+                            std::sync::Arc::clone(&replacement_server),
+                            request,
+                            replacement_lease_id,
+                            None,
+                            Some(replacement_registration),
+                        )
+                        .await;
+                    }
+                });
+                let replacement_lifecycle = lifecycle.clone();
+                let replacement_submission = tokio::task::spawn_local(async move {
+                    replacement_lifecycle
+                        .submit(
+                            "shared",
+                            attachment_id,
+                            connection_id,
+                            crate::brain::store::BrainEventKind::Program {
+                                language: crate::brain::store::ProgramLanguage::Lisp,
+                                source: "replacement callback".into(),
+                            },
+                        )
+                        .await
+                });
+
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    !old_submission.is_finished(),
+                    "expired run lane returned before its physical IPC callback settled"
+                );
+                assert!(
+                    !replacement_submission.is_finished()
+                        && replacement_started_rx.try_recv().is_err(),
+                    "replacement callback overlapped the nonquiescent expired generation"
+                );
+
+                release_old.notify_one();
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        late_effect_rx,
+                    )
+                    .await
+                    .expect("stale callback did not reach its late effect boundary")
+                    .unwrap(),
+                    "expired callback admitted a new effect after cancellation"
+                );
+                let old_outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    old_submission,
+                )
+                .await
+                .expect("expired callback did not release its durable lane")
+                .unwrap()
+                .unwrap();
+                assert_eq!(old_outcome.run.unwrap().run_id, old_run_id);
+                let replacement_run_id = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    &mut replacement_started_rx,
+                )
+                .await
+                .expect("replacement callback did not start after cleanup")
+                .unwrap();
+                let replacement_outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    replacement_submission,
+                )
+                .await
+                .expect("replacement callback did not finish")
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    replacement_outcome.run.unwrap().run_id,
+                    replacement_run_id
+                );
+
+                let snapshot = store.snapshot("shared").unwrap();
+                let old_run = snapshot
+                    .runs
+                    .iter()
+                    .find(|run| run.run_id == old_run_id)
+                    .unwrap();
+                let replacement_run = snapshot
+                    .runs
+                    .iter()
+                    .find(|run| run.run_id == replacement_run_id)
+                    .unwrap();
+                assert_eq!(old_run.status, crate::brain::store::BrainRunStatus::Failed);
+                assert_eq!(
+                    replacement_run.status,
+                    crate::brain::store::BrainRunStatus::Completed
+                );
+                assert_eq!(
+                    snapshot
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            event.kind,
+                            crate::brain::store::BrainEventKind::RunStatusChanged {
+                                run_id,
+                                status,
+                                ..
+                            } if run_id == old_run_id && status.is_terminal()
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(snapshot.effect_audits.is_empty());
+                assert!(!snapshot.events.iter().any(|event| matches!(
+                    &event.kind,
+                    crate::brain::store::BrainEventKind::Result { output, error, .. }
+                        if output.contains("late stale generation")
+                            || error.as_deref().is_some_and(|error| error.contains("late stale generation"))
+                )));
+
+                server
+                    .brain_runners()
+                    .invalidate_lease("shared", replacement_lease_id);
+                old_bridge.await.unwrap();
+                replacement_bridge.await.unwrap();
+            })
+            .await;
     }
 
     async fn raw_effect_eof_states(
@@ -4533,8 +4996,15 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async {
             let temp = tempfile::tempdir().unwrap();
-            let socket_path = temp.path().join("finch.sock");
-            let _socket_path = crate::ipc::transport::set_test_sock_path(socket_path.clone());
+            let (socket_path, _socket_path_override) =
+                match std::env::var_os("FINCH_TEST_IPC_SOCKET") {
+                    Some(path) => (std::path::PathBuf::from(path), None),
+                    None => {
+                        let path = temp.path().join("finch.sock");
+                        let guard = crate::ipc::transport::set_test_sock_path(path.clone());
+                        (path, Some(guard))
+                    }
+                };
             let store = crate::brain::store::BrainStore::with_root(
                 "box.local",
                 Some(temp.path().join("brains")),
@@ -4551,17 +5021,19 @@ mod tests {
             let shutdown = tokio_util::sync::CancellationToken::new();
             let server_task =
                 tokio::task::spawn_local(super::start_ipc_server(server.clone(), shutdown.clone()));
-            tokio::time::timeout(std::time::Duration::from_millis(250), async {
-                while !socket_path.exists() {
-                    tokio::task::yield_now().await;
-                }
+            tokio::task::yield_now().await;
+            assert!(
+                !server_task.is_finished(),
+                "supervised IPC server exited before accepting connections"
+            );
+            let participant = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let participant = crate::ipc::IpcClient::connect_path(socket_path.clone()).await?;
+                participant.brain_snapshot("shared").await?;
+                Ok::<_, anyhow::Error>(participant)
             })
             .await
+            .expect("supervised IPC server did not answer a readiness RPC within two seconds")
             .unwrap();
-
-            let participant = crate::ipc::IpcClient::connect_path(socket_path.clone())
-                .await
-                .unwrap();
             let attachment = participant
                 .brain_attach(
                     "shared",

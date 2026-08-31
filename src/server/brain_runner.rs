@@ -1202,55 +1202,45 @@ impl BrainRunnerBroker {
             cancel.clone(),
         );
         let mut active = registration.active.subscribe();
-        if !*active.borrow() {
-            self.fence_run_cancellation(brain, run_id);
-            cancel.cancel();
-            return Err(RunnerDispatchError::new(
-                brain,
-                operation,
-                RunnerDispatchFailure::GenerationInvalidated,
-            )
-            .into());
-        }
-        let failure = tokio::select! {
-            biased;
-            _ = &mut abort_rx => Some(RunnerDispatchFailure::RunAborted),
-            _ = active.changed() => {
-                self.fence_run_cancellation(brain, run_id);
-                cancel.cancel();
-                return Err(RunnerDispatchError::new(
-                    brain, operation, RunnerDispatchFailure::GenerationInvalidated,
-                ).into());
-            }
-            response = &mut response_rx => {
-                let response = match response {
-                    Ok(response) => response,
-                    Err(_) => {
+        let failure = if !*active.borrow() {
+            RunnerDispatchFailure::GenerationInvalidated
+        } else {
+            tokio::select! {
+                biased;
+                _ = &mut abort_rx => RunnerDispatchFailure::RunAborted,
+                _ = active.changed() => RunnerDispatchFailure::GenerationInvalidated,
+                response = &mut response_rx => {
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(_) => {
+                            cancel.cancel();
+                            cancellation.disarm();
+                            return Err(RunnerDispatchError::new(
+                                brain,
+                                operation,
+                                RunnerDispatchFailure::ResponseDropped,
+                            ).into());
+                        }
+                    };
+                    if !*registration.active.borrow() {
+                        self.fence_run_cancellation(brain, run_id);
                         cancel.cancel();
                         cancellation.disarm();
                         return Err(RunnerDispatchError::new(
                             brain,
                             operation,
-                            RunnerDispatchFailure::ResponseDropped,
-                        ).into());
+                            RunnerDispatchFailure::GenerationInvalidated,
+                        )
+                        .into());
+                    } else {
+                        cancellation.disarm();
+                        return response.map_err(map_remote_error);
                     }
-                };
-                if !*registration.active.borrow() {
-                    self.fence_run_cancellation(brain, run_id);
-                    cancel.cancel();
-                    return Err(RunnerDispatchError::new(
-                        brain,
-                        operation,
-                        RunnerDispatchFailure::GenerationInvalidated,
-                    ).into());
                 }
-                cancellation.disarm();
-                return response.map_err(map_remote_error);
+                _ = tokio::time::sleep_until(deadline) => RunnerDispatchFailure::TimedOut,
             }
-            _ = tokio::time::sleep_until(deadline) => Some(RunnerDispatchFailure::TimedOut),
         };
 
-        let failure = failure.expect("runner wait exits only through a typed failure");
         self.fence_run_cancellation(brain, run_id);
         cancel.cancel();
 
@@ -1262,7 +1252,6 @@ impl BrainRunnerBroker {
             biased;
             response = &mut response_rx => response.is_err(),
             _ = tokio::time::sleep_until(cleanup_deadline) => false,
-            _ = active.changed() => true,
         };
         if !quiesced {
             self.unregister(brain, registration.id);
@@ -2337,16 +2326,22 @@ mod tests {
 
         let (new_tx, mut new_rx) = mpsc::unbounded_channel();
         broker.register("brain", new_lease, new_tx);
+        tokio::task::yield_now().await;
+        assert!(old_request.cancel.is_cancelled());
+        assert!(
+            !old_dispatch.is_finished(),
+            "replacement must not release the old dispatch before callback cleanup"
+        );
+        old_request
+            .response_tx
+            .send(Ok(program_result("late old")))
+            .unwrap();
         assert_dispatch_failure(
             &old_dispatch.await.unwrap().unwrap_err(),
             RunnerOperation::Program,
             RunnerDispatchFailure::GenerationInvalidated,
         );
         assert!(old_request.cancel.is_cancelled());
-        assert!(old_request
-            .response_tx
-            .send(Ok(program_result("late old")))
-            .is_err());
         assert!(!broker.invalidate_lease("brain", old_lease));
         assert!(broker.has_registration("brain", new_lease));
 

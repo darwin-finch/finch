@@ -1047,7 +1047,7 @@ impl BrainLifecycleService {
         });
     }
 
-    fn expire_runner_lease_if_due(
+    pub(crate) fn expire_runner_lease_if_due(
         &self,
         brain: &str,
         lease_id: RunnerLeaseId,
@@ -2581,6 +2581,28 @@ mod tests {
         assert!(service
             .expire_runner_lease_if_due("shared", expired.lease_id, expired.expires_ms)
             .unwrap());
+        tokio::task::yield_now().await;
+        assert!(request.cancel.is_cancelled());
+        assert!(
+            !dispatch.is_finished(),
+            "lease invalidation must retain the lane until the stale callback settles"
+        );
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        request
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: "late".into(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: Vec::new(),
+            }))
+            .unwrap();
         let error = dispatch.await.unwrap().unwrap_err();
         let error = error
             .downcast_ref::<crate::server::RunnerDispatchError>()
@@ -2590,22 +2612,6 @@ mod tests {
             crate::server::RunnerDispatchFailure::GenerationInvalidated
         );
         assert!(request.cancel.is_cancelled());
-        let checkpoint = crate::runtime::ProgramRuntime::new()
-            .revision_history()
-            .unwrap()
-            .pop()
-            .unwrap()
-            .checkpoint
-            .unwrap();
-        assert!(request
-            .response_tx
-            .send(Ok(crate::server::RunnerProgramResult {
-                output: "late".into(),
-                runtime_revision: 0,
-                checkpoint,
-                effect_journal: Vec::new(),
-            }))
-            .is_err());
 
         let replacement = service
             .acquire_runner("shared", "runner", &environment, None, 60_000)

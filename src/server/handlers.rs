@@ -1454,11 +1454,13 @@ async fn dispatch_named_brain_run(
         Err(error) => {
             let detail = error.to_string();
             if detail == "named Brain run cancelled" {
-                // Explicit cancellation has a durable reservation and owns a
-                // Cancelled outcome. An ordinary connection teardown only
-                // aborts the daemon wait; keep this guard armed so it publishes
-                // the disconnect Result+Failed batch.
-                terminalizer.armed = !store.run_cancellation_reserved(name, run.run_id)?;
+                // The child dispatch emits this sentinel only after observing
+                // the run's publication-cancellation fence (or its durable
+                // mutation reservation). Explicit cancellation therefore owns
+                // the terminal outcome even when the caller did not supply an
+                // idempotency receipt; this disconnect guard must not race it
+                // with a Failed transition.
+                terminalizer.armed = false;
                 store.prune_run_publication(name, run.run_id)?;
                 return Ok(None);
             }
