@@ -2655,6 +2655,36 @@ mod tests {
             .collect()
     }
 
+    fn consolidated_text_sse(model: &str) -> String {
+        let body = completed_sse(model);
+        let marker = "event: response.completed\ndata: ";
+        let start = body.find(marker).unwrap() + marker.len();
+        let end = body[start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| start + offset)
+            .unwrap();
+        let mut completed: Value = serde_json::from_str(&body[start..end]).unwrap();
+        completed["sequence_number"] = json!(4);
+        completed["response"]["output"] = json!([{
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"hello there"}]
+        }]);
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":" there"}]}}),
+            completed
+        )
+    }
+
     fn tool() -> ToolDefinition {
         named_tool("read")
     }
@@ -4593,6 +4623,102 @@ mod tests {
         .err()
         .expect("changed terminal text must remain rejected");
         assert!(error.to_string().contains("did not match"));
+    }
+
+    #[tokio::test]
+    async fn responses_lite_reconciles_consolidated_terminal_text_items() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(consolidated_text_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let response = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "hello there"
+        ));
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[test]
+    fn terminal_text_consolidation_cannot_cross_or_mutate_tool_calls() {
+        let text = |value: &str| ContentBlock::Text {
+            text: value.to_string(),
+        };
+        let tool = |id: &str, name: &str, path: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({"path":path}),
+        };
+        let streamed = vec![
+            text("before"),
+            tool("call-1", "read", "a"),
+            text("between"),
+            tool("call-2", "write", "b"),
+            text("after"),
+        ];
+        for terminal in [
+            vec![
+                text("beforebetween"),
+                tool("call-1", "read", "a"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("changed-id", "read", "a"),
+                text("between"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("call-1", "write", "a"),
+                text("between"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("call-1", "read", "changed"),
+                text("between"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("call-2", "write", "b"),
+                text("between"),
+                tool("call-1", "read", "a"),
+                text("after"),
+            ],
+        ] {
+            assert_ne!(observable_blocks(&streamed), observable_blocks(&terminal));
+        }
     }
 
     #[tokio::test]
