@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock, Semaphore};
@@ -775,32 +776,45 @@ impl AgentScheduler {
             }
         }
 
+        // This counter lives outside the timed/cancellable future so every
+        // terminal path can report provider turns that actually completed.
+        // A provider call interrupted before returning is not a completed
+        // turn and deliberately leaves the counter unchanged.
+        let completed_turns = AtomicUsize::new(0);
         let execution = tokio::time::timeout(
             std::time::Duration::from_millis(spec.budget.timeout_ms),
-            self.agent_loop(&identity, &spec, &resolved_context, provider, &cancellation),
+            self.agent_loop(
+                &identity,
+                &spec,
+                &resolved_context,
+                provider,
+                &cancellation,
+                &completed_turns,
+            ),
         )
         .await;
         drop(permit);
 
+        let completed_turns = completed_turns.load(Ordering::Relaxed);
         let (status, message, diagnostics, turns) = match execution {
             Ok(Ok((message, turns))) => (AgentTaskStatus::Completed, message, Vec::new(), turns),
             Ok(Err(error)) if cancellation.is_cancelled() => (
                 AgentTaskStatus::Cancelled,
                 String::new(),
                 vec![error.to_string()],
-                0,
+                completed_turns,
             ),
             Ok(Err(error)) => (
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec![error.to_string()],
-                0,
+                completed_turns,
             ),
             Err(_) => (
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec!["agent deadline exceeded".to_string()],
-                0,
+                completed_turns,
             ),
         };
         let result = AgentTaskResult {
@@ -888,6 +902,7 @@ impl AgentScheduler {
         resolved_context: &[ResolvedAgentContext],
         provider: Arc<dyn Generator>,
         cancellation: &CancellationToken,
+        completed_turns: &AtomicUsize,
     ) -> Result<(String, usize)> {
         let tools = self.child_tools(identity);
         let definitions = tools
@@ -920,6 +935,7 @@ impl AgentScheduler {
                 response = provider.generate(messages.clone(), Some(definitions.clone())) => response?,
                 _ = cancellation.cancelled() => bail!("agent cancelled"),
             };
+            completed_turns.store(turn, Ordering::Relaxed);
             if response.tool_uses.is_empty() {
                 return Ok((response.text, turn));
             }
@@ -1068,7 +1084,7 @@ mod tests {
         CredentialProvider, CredentialResolver, ProviderCredential, ProviderEntry,
         ResolvedCredential, ResolvedSecret,
     };
-    use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata};
+    use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata, ToolUse};
     use crate::tools::types::ToolDefinition;
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
@@ -1240,6 +1256,10 @@ mod tests {
 
     struct EchoGenerator;
 
+    /// Returns one tool call on every provider turn so the scheduler reaches
+    /// its bounded turn limit without a final response.
+    struct ToolLoopGenerator;
+
     struct BlockingGenerator {
         started: Arc<Notify>,
     }
@@ -1294,6 +1314,60 @@ mod tests {
     }
 
     #[async_trait]
+    impl Generator for ToolLoopGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            let tool_use = ToolUse {
+                id: Uuid::new_v4().to_string(),
+                name: "unavailable_test_tool".to_string(),
+                input: serde_json::json!({}),
+            };
+            Ok(GeneratorResponse {
+                text: String::new(),
+                content_blocks: vec![tool_use.to_content_block()],
+                tool_uses: vec![tool_use],
+                metadata: ResponseMetadata {
+                    generator: "tool-loop".to_string(),
+                    model: "tool-loop".to_string(),
+                    confidence: None,
+                    stop_reason: Some("tool_use".to_string()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "tool-loop"
+        }
+    }
+
+    #[async_trait]
     impl Generator for BlockingGenerator {
         async fn generate(
             &self,
@@ -1326,6 +1400,42 @@ mod tests {
         fn name(&self) -> &str {
             "blocking"
         }
+    }
+
+    #[tokio::test]
+    async fn turn_limit_failure_reports_every_completed_provider_turn() {
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(ToolLoopGenerator)),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "keep using tools".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget {
+                        max_turns: 4,
+                        timeout_ms: 5_000,
+                        max_output_bytes: 4_000,
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Failed);
+        assert_eq!(result.turns, 4);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("turn limit")));
     }
 
     #[tokio::test]
