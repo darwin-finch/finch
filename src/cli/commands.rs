@@ -1028,6 +1028,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_help_includes_terminal_specific_mouse_selection_hint() {
+        let help = format_help();
+        assert!(help.contains("Option (iTerm2)"));
+        assert!(help.contains("Shift (many terminals)"));
+        assert!(help.contains("drag to select text"));
+    }
+
+    #[test]
     fn forth_commands_have_only_the_typed_public_entry_point() {
         assert!(matches!(
             Command::parse(": square ( S n:int -- S int ! pure ) n n * ;"),
