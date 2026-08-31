@@ -1269,9 +1269,9 @@ impl TuiRenderer {
         // Shift+Enter — the SHIFT modifier is never set — so the newline-insertion
         // path in async_input.rs can never trigger.
         //
-        // Terminals that don't support the protocol silently ignore the push
-        // (crossterm returns an error we discard with `let _ =`), so there is no
-        // regression for unsupported terminals.
+        // Terminals that don't support the protocol silently ignore the escape
+        // sequence. I/O failures are returned and the initialization guard
+        // restores every mode enabled before the failure.
         //
         // Cleanup: the Drop impl and the panic hook registered below both call
         // PopKeyboardEnhancementFlags, so normal exit, panics, and most signals
@@ -2428,8 +2428,8 @@ impl TuiRenderer {
 impl Drop for TuiRenderer {
     fn drop(&mut self) {
         // Safety net: restore terminal if shutdown() was never explicitly called.
-        // shutdown() sets is_active = false before doing anything, so this is
-        // idempotent — if shutdown() already ran, this is a no-op.
+        // shutdown() sets is_active = false after cleanup completes, so this is
+        // a no-op after clean shutdown and remains armed during a cleanup panic.
         if self.is_active {
             emergency_restore_terminal();
         }
