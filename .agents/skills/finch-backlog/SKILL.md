@@ -7,6 +7,11 @@ description: Autonomously work Finch's highest-priority unblocked GitHub issues 
 
 Drive an outcome-level Finch goal until its stated gate is genuinely satisfied. Treat a merged patch as progress, not as the terminal condition.
 
+This is a repository-maintenance skill for Codex and Claude Code. It is not Finch's
+`finch agent` command, `src/agent` loop, or `.finch/tasks.toml` runtime. Do not fall
+back to those product features when this skill is requested or unavailable; report
+the missing repository discovery path instead.
+
 ## Establish authority
 
 1. Read `AGENTS.md` completely. It is the project invariant source (and currently resolves to `CLAUDE.md`).
@@ -45,7 +50,7 @@ Recompute this frontier after every merge, newly discovered blocker, or changed 
 - Give every collaborator a complete task packet using [the task-packet template](references/task-packet.md). A new agent has a new context; never rely on shared conversational memory.
 - Keep one coordinator responsible for integration, reviews, issue state, CI evidence, and worktree hygiene.
 - Avoid two implementers editing the same files. A reviewer may inspect another agent's frozen branch without editing it.
-- Use safe parallelism up to the configured thread limit, but stay within the machine's memory budget. On the 16 GB Finch development host, do not run local Cargo/rustc/build/test jobs; use bounded remote CI and lightweight static checks locally.
+- Use safe parallelism up to the configured thread limit, but stay within the machine's memory budget. On the 16 GB Finch development host, run at most one local Cargo command at a time with `CARGO_BUILD_JOBS=2` unless the user declares a different budget. Prefer focused supervised regressions locally; use CI for broad platform and feature matrices. Never make remote CI a substitute for a live workflow that only the local host can exercise.
 
 ## Implement narrowly
 
