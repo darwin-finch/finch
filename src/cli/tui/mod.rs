@@ -100,6 +100,10 @@ fn activate_default_terminal_modes<W: Write>(
 fn restore_default_terminal_modes<W: Write>(mut writer: W) -> io::Result<()> {
     execute!(
         writer,
+        // A begin/end pair is idempotent when no update is open and closes a
+        // synchronized update whose owner was interrupted before finalization.
+        BeginSynchronizedUpdate,
+        EndSynchronizedUpdate,
         crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
@@ -141,6 +145,11 @@ fn install_tui_panic_hook() {
             previous(info);
         }));
     });
+}
+
+fn supervised_initialization_failure_requested() -> bool {
+    std::env::var_os("FINCH_TEST_TUI_FAIL_AFTER_ACTIVATION").is_some()
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
 }
 
 /// Best-effort terminal restoration for an exit path that cannot acquire the
@@ -617,6 +626,63 @@ fn ellipsize(text: &str, width: usize) -> String {
     }
 }
 
+/// Convert untrusted live-only text into terminal-safe logical rows.
+///
+/// Newlines remain structure for the renderer, while every other terminal
+/// control is removed or made visible before physical-row accounting. No
+/// caller may pass the original payload to `Print` after using this helper.
+fn control_free_logical_rows(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(crate::cli::diff::sanitize_terminal)
+        .collect()
+}
+
+/// Collapse an untrusted payload into one visible row. Fixed-row projections
+/// (tasks, TODOs, separators, and overlays) use a visible newline marker so
+/// their planned and emitted row counts cannot diverge.
+fn control_free_single_line(text: &str) -> String {
+    control_free_logical_rows(text).join(" ↵ ")
+}
+
+fn bounded_control_free_line(text: &str, width: usize) -> String {
+    visible_prefix(&control_free_single_line(text), width)
+}
+
+fn todo_live_row(symbol: &str, content: &str, priority_tag: &str, width: usize) -> String {
+    bounded_control_free_line(
+        &format!(
+            "{symbol} {}{priority_tag}",
+            control_free_single_line(content)
+        ),
+        width.max(1),
+    )
+}
+
+fn agent_live_row(
+    depth: usize,
+    symbol: &str,
+    task: &str,
+    model: &str,
+    tool: Option<&str>,
+    width: usize,
+) -> String {
+    let tool = tool
+        .map(control_free_single_line)
+        .map(|name| format!(" · {name}"))
+        .unwrap_or_default();
+    bounded_control_free_line(
+        &format!(
+            "{}{symbol} {} · {}{tool}",
+            "  ".repeat(depth),
+            control_free_single_line(task),
+            control_free_single_line(model),
+        ),
+        width.max(1),
+    )
+}
+
 /// Build one separator row that can never wrap. Brain identity receives most
 /// of the width; the workspace is shortened first on narrow terminals.
 fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
@@ -629,6 +695,8 @@ fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
         return prefix;
     }
 
+    let cwd = control_free_single_line(cwd);
+    let session = control_free_single_line(session);
     let desired_right = if session.is_empty() {
         " ──".to_string()
     } else {
@@ -642,11 +710,11 @@ fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
     let right = if session.is_empty() || right_budget < 5 {
         ellipsize(&desired_right, right_budget)
     } else {
-        format!(" {} ──", ellipsize(session, right_budget - 4))
+        format!(" {} ──", ellipsize(&session, right_budget - 4))
     };
     let left_budget = remaining.saturating_sub(right.chars().count());
     let cwd_part = if left_budget >= 3 {
-        format!(" {} ", ellipsize(cwd, left_budget - 2))
+        format!(" {} ", ellipsize(&cwd, left_budget - 2))
     } else {
         String::new()
     };
@@ -936,9 +1004,41 @@ fn completion_row_budget(
 fn write_completion_pane(out: &mut impl Write, lines: &[String]) -> Result<usize> {
     for line in lines {
         advance_live_line(out)?;
-        execute!(out, Print(line))?;
+        execute!(out, Print(control_free_single_line(line)))?;
     }
     Ok(lines.len())
+}
+
+fn write_fixed_live_row(
+    out: &mut impl Write,
+    line: &str,
+    color: SetForegroundColor,
+    width: usize,
+) -> Result<usize> {
+    let line = bounded_control_free_line(line, width.max(1));
+    execute!(out, color, Print(&line), ResetColor)?;
+    advance_live_line(out)?;
+    Ok(shadow_buffer::physical_rows(&line, width.max(1)))
+}
+
+fn write_corner_overlay(out: &mut impl Write, text: &str, term_cols: u16) -> Result<bool> {
+    let text = control_free_single_line(text.trim());
+    if text.is_empty() {
+        return Ok(false);
+    }
+    let text = bounded_control_free_line(&text, term_cols.saturating_sub(1) as usize);
+    let start_col =
+        (term_cols as usize).saturating_sub(shadow_buffer::visible_length(&text) + 1) as u16;
+    execute!(
+        out,
+        cursor::SavePosition,
+        cursor::MoveTo(start_col, 0),
+        DIM_GRAY,
+        Print(&text),
+        RESET,
+        cursor::RestorePosition
+    )?;
+    Ok(true)
 }
 
 /// Advance inside Finch's redraw-only viewport without emitting a linefeed.
@@ -952,14 +1052,56 @@ fn advance_live_line(out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// Own one synchronized-update interval and close it on every return path.
+/// `finish` reports clean-path errors; `Drop` provides best-effort cleanup
+/// while an earlier rendering error is unwinding.
+struct SynchronizedWriter<W: Write> {
+    inner: W,
+    open: bool,
+}
+
+impl<W: Write> SynchronizedWriter<W> {
+    fn begin(inner: W) -> Result<Self> {
+        let mut synchronized = Self { inner, open: true };
+        crossterm::queue!(synchronized.inner, BeginSynchronizedUpdate)?;
+        Ok(synchronized)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        execute!(self.inner, EndSynchronizedUpdate)?;
+        self.open = false;
+        self.inner.flush()?;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for SynchronizedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Drop for SynchronizedWriter<W> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = execute!(self.inner, EndSynchronizedUpdate);
+            let _ = self.inner.flush();
+        }
+    }
+}
+
 fn write_live_area_erase(
     out: &mut impl Write,
     active_rows: usize,
     cursor_row_from_top: usize,
 ) -> Result<()> {
-    execute!(out, BeginSynchronizedUpdate)?;
+    let mut out = SynchronizedWriter::begin(out)?;
     if active_rows == 0 && cursor_row_from_top == 0 {
-        return Ok(());
+        return out.finish();
     }
     execute!(out, cursor::MoveToColumn(0))?;
     if cursor_row_from_top > 0 {
@@ -975,7 +1117,7 @@ fn write_live_area_erase(
         execute!(out, cursor::MoveUp((active_rows - 1) as u16))?;
         execute!(out, cursor::MoveToColumn(0))?;
     }
-    Ok(())
+    out.finish()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1008,9 +1150,15 @@ fn plan_tiny_live_frame(
     let width = terminal_width.max(1);
     let (input_row, input_col) = cursor;
     let line = input_lines.get(input_row).map(String::as_str).unwrap_or("");
+    let line = control_free_single_line(line);
     let prompt = if input_row == 0 { "❯ " } else { "  " };
     let input = ellipsize(&format!("{prompt}{line}"), width);
-    let cursor_col = (2 + line.chars().take(input_col).count()).min(width.saturating_sub(1));
+    let raw_prefix = input_lines
+        .get(input_row)
+        .map(|line| line.chars().take(input_col).collect::<String>())
+        .unwrap_or_default();
+    let cursor_col =
+        (2 + control_free_single_line(&raw_prefix).chars().count()).min(width.saturating_sub(1));
 
     let mut lines = Vec::with_capacity(terminal_rows);
     if terminal_rows >= 2 {
@@ -1019,7 +1167,13 @@ fn plan_tiny_live_frame(
     let cursor_row = lines.len();
     lines.push(input);
     if terminal_rows >= 3 {
-        lines.push(ellipsize(status.lines().next().unwrap_or(""), width));
+        lines.push(ellipsize(
+            control_free_logical_rows(status)
+                .first()
+                .map(String::as_str)
+                .unwrap_or(""),
+            width,
+        ));
     }
     TinyLiveFrame {
         lines,
@@ -1034,7 +1188,7 @@ fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<
     // normal editable-input renderer.
     execute!(out, cursor::Show)?;
     for (index, line) in frame.lines.iter().enumerate() {
-        execute!(out, Print(line))?;
+        execute!(out, Print(control_free_single_line(line)))?;
         if index + 1 < frame.lines.len() {
             advance_live_line(out)?;
         }
@@ -1065,12 +1219,19 @@ fn plan_live_content_frame(
         autocomplete.visible,
         critical_ui_active,
     );
-    let completion_lines = completion_pane_lines(autocomplete, terminal_width, completion_budget);
+    let completion_lines = completion_pane_lines(autocomplete, terminal_width, completion_budget)
+        .into_iter()
+        .map(|line| bounded_control_free_line(&line, terminal_width.max(1)))
+        .collect::<Vec<_>>();
     let live_budget = live_message_row_budget(terminal_rows, fixed_rows + completion_lines.len());
     let live_lines = if all_live_lines.is_empty() {
         Vec::new()
     } else {
-        live_viewport_lines(all_live_lines, terminal_width, live_budget).0
+        let normalized = all_live_lines
+            .iter()
+            .flat_map(|line| control_free_logical_rows(line))
+            .collect::<Vec<_>>();
+        live_viewport_lines(&normalized, terminal_width, live_budget).0
     };
     LiveContentFrame {
         live_lines,
@@ -1267,6 +1428,13 @@ impl TuiRenderer {
         // normal (unbounded) paste mode, which is safe.
         activate_default_terminal_modes(io::stdout(), TerminalActivation::Startup)
             .context("Failed to activate default terminal modes")?;
+
+        // Environment-owned PTY regression hook: fail only after Finch has
+        // changed terminal modes, so the initialization guard must restore
+        // every one of them. An unverified environment variable is inert.
+        if supervised_initialization_failure_requested() {
+            anyhow::bail!("injected TUI initialization failure after activation");
+        }
 
         // Enable DISAMBIGUATE_ESCAPE_CODES so terminals that support the kitty
         // keyboard protocol send distinct sequences for Shift+Enter (vs bare Enter).
@@ -1498,35 +1666,87 @@ fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
     // Previously committed rows are already in native history. Remove their
     // visible projection before the linefeed spool so a later commit cannot
     // append that projection to history a second time.
+    let mut stdout = SynchronizedWriter::begin(stdout)?;
     let mut staged = Vec::new();
     execute!(
         staged,
-        BeginSynchronizedUpdate,
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
         cursor::MoveTo(0, 0)
     )?;
     stdout.write_all(&staged)?;
     stdout.flush()?;
-    Ok(())
+    stdout.finish()
 }
 
 fn prepare_canonical_commit_guarded(stdout: &mut impl Write) -> Result<()> {
-    match prepare_canonical_commit(stdout) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // BeginSynchronizedUpdate is the first command in preparation. A
-            // later partial-write failure must never leave terminal updates
-            // suppressed indefinitely.
-            let _ = execute!(stdout, EndSynchronizedUpdate);
-            Err(error)
-        }
-    }
+    prepare_canonical_commit(stdout)
 }
 
 // ─── Live area management ─────────────────────────────────────────────────────
 
 impl TuiRenderer {
+    fn prepared_todo_rows(&self, width: usize) -> Vec<(String, SetForegroundColor)> {
+        let Some(todo_list) = self.todo_list.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(todo) = todo_list.try_read() else {
+            return Vec::new();
+        };
+        todo.active_items()
+            .into_iter()
+            .map(|item| {
+                let (symbol, color) = match item.status {
+                    crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
+                    crate::tools::todo::TodoStatus::Pending => ("○", DIM_GRAY),
+                    crate::tools::todo::TodoStatus::Completed => unreachable!(),
+                };
+                let priority_tag = match item.priority {
+                    crate::tools::todo::TodoPriority::High => " [!]",
+                    _ => "",
+                };
+                (
+                    todo_live_row(symbol, &item.content, priority_tag, width),
+                    color,
+                )
+            })
+            .collect()
+    }
+
+    fn prepared_agent_rows(&self, width: usize) -> Vec<(String, SetForegroundColor)> {
+        let mut tasks = self.agent_tasks.values().collect::<Vec<_>>();
+        tasks.sort_by_key(|task| (task.identity.depth, task.identity.task_id));
+        tasks
+            .into_iter()
+            .map(|task| {
+                let symbol = match task.status {
+                    crate::runtime::scheduler::AgentTaskStatus::Queued => "○",
+                    crate::runtime::scheduler::AgentTaskStatus::Running => "●",
+                    _ => "✓",
+                };
+                let line = agent_live_row(
+                    task.identity.depth,
+                    symbol,
+                    &task.task,
+                    &task.identity.provider_model,
+                    self.agent_active_tools
+                        .get(&task.identity.task_id)
+                        .map(String::as_str),
+                    width,
+                );
+                let color = if matches!(
+                    task.status,
+                    crate::runtime::scheduler::AgentTaskStatus::Running
+                ) {
+                    Color::Cyan
+                } else {
+                    Color::DarkGrey
+                };
+                (line, SetForegroundColor(color))
+            })
+            .collect()
+    }
+
     /// Move the cursor up to the top of the live area and clear everything
     /// below it, ready for a fresh draw.
     ///
@@ -1535,8 +1755,8 @@ impl TuiRenderer {
     /// `active_rows - 1` — to reach the top correctly.
     pub fn erase_live_area(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
-        // Begin the synchronized update here so erase + draw are one atomic
-        // terminal operation — eliminates the blank-flash between them.
+        // Erase is its own balanced synchronized update. Keeping the owner
+        // local guarantees that an error cannot leave terminal output frozen.
         // Never clear from the cursor to the bottom of the terminal here. A
         // one-row accounting error (especially around a wrapping streamed
         // program) would then erase committed scrollback above the live area.
@@ -1544,7 +1764,7 @@ impl TuiRenderer {
         // ever short, a stale live row is recoverable; lost transcript is not.
         write_live_area_erase(&mut stdout, self.active_rows, self.cursor_row_from_top)?;
         if self.active_rows == 0 && self.cursor_row_from_top == 0 {
-            return Ok(()); // Sync block is closed by the following draw.
+            return Ok(());
         }
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
@@ -1553,8 +1773,7 @@ impl TuiRenderer {
 
     /// Draw the live area from scratch and track `active_rows`.
     pub fn draw_live_area(&mut self) -> Result<()> {
-        let mut stdout = io::stdout();
-
+        let mut stdout = SynchronizedWriter::begin(io::stdout())?;
         let mut rows: usize = 0;
 
         // ── 1. Active WorkUnit ────────────────────────────────────────────────
@@ -1563,13 +1782,18 @@ impl TuiRenderer {
         // viewport when context lines wrap, permanently duplicating live rows.
         let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let input_lines = self.input_textarea.lines().to_vec();
+        let raw_input_lines = self.input_textarea.lines().to_vec();
+        let input_lines = raw_input_lines
+            .iter()
+            .map(|line| control_free_single_line(line))
+            .collect::<Vec<_>>();
+        let ghost_text = self.ghost_text.as_deref().map(control_free_single_line);
         let raw_status = self
             .status_bar
             .get_status_without(&StatusLineType::SessionLabel);
         let current_input = input_lines.join("\n");
         let effective_status = compute_effective_status(
-            self.ghost_text.as_deref(),
+            ghost_text.as_deref(),
             &raw_status,
             &current_input,
             &self.command_registry,
@@ -1584,29 +1808,22 @@ impl TuiRenderer {
                 term_width,
             );
             let rows = write_tiny_live_frame(&mut stdout, &frame)?;
-            execute!(stdout, EndSynchronizedUpdate)?;
-            stdout.flush()?;
             self.active_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
             self.accordion.rebuild_hit_regions(&[], 0, term_width);
-            return Ok(());
+            return stdout.finish();
         }
-        let todo_rows = self
-            .todo_list
-            .as_ref()
-            .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
-            .unwrap_or(0);
-        let status_rows = 1 + effective_status
-            .lines()
+        let todo_lines = self.prepared_todo_rows(term_width);
+        let agent_lines = self.prepared_agent_rows(term_width);
+        let status_lines = control_free_logical_rows(&effective_status);
+        let status_rows = 1 + status_lines
+            .iter()
             .map(|line| shadow_buffer::physical_rows(line, term_width))
             .sum::<usize>();
-        let input_rows = input_line_physical_rows_with_ghost(
-            &input_lines,
-            term_width,
-            self.ghost_text.as_deref(),
-        )
-        .into_iter()
-        .sum::<usize>();
+        let input_rows =
+            input_line_physical_rows_with_ghost(&input_lines, term_width, ghost_text.as_deref())
+                .into_iter()
+                .sum::<usize>();
         let dialog_active = self.active_dialog.is_some();
         let base_reserved_rows = if dialog_active {
             // A critical dialog owns the viewport. Streaming, tasks, draft,
@@ -1617,8 +1834,8 @@ impl TuiRenderer {
             1 // upper separator
                 + input_rows
                 + status_rows
-                + todo_rows
-                + self.agent_tasks.len()
+                + todo_lines.len()
+                + agent_lines.len()
         };
         let live_messages = self.find_live_messages();
         let all_live_rendered = self.projected_lines(live_messages);
@@ -1643,95 +1860,25 @@ impl TuiRenderer {
             // Rendering only the newest one made earlier source appear, then
             // vanish on the next redraw. Keep the uncommitted suffix ordered.
             for line in &content_frame.live_lines {
-                let line = line.trim_end_matches('\r');
-                execute!(stdout, Print(line))?;
+                let line = control_free_single_line(line);
+                execute!(stdout, Print(&line))?;
                 advance_live_line(&mut stdout)?;
-                rows += shadow_buffer::physical_rows(line, term_width);
+                rows += shadow_buffer::physical_rows(&line, term_width);
             }
         }
 
         // ── 1b. Session task list (active items only) ─────────────────────────
         if !dialog_active {
-            if let Some(ref todo_arc) = self.todo_list {
-                if let Ok(todo) = todo_arc.try_read() {
-                    let active = todo.active_items();
-                    if !active.is_empty() {
-                        let term_w = term_width;
-                        for item in &active {
-                            let (symbol, color) = match item.status {
-                                crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
-                                crate::tools::todo::TodoStatus::Pending => ("○", DIM_GRAY),
-                                crate::tools::todo::TodoStatus::Completed => unreachable!(),
-                            };
-                            let priority_tag = match item.priority {
-                                crate::tools::todo::TodoPriority::High => " [!]",
-                                _ => "",
-                            };
-                            // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
-                            let max_content = term_w.saturating_sub(2 + priority_tag.len());
-                            let content: String = item.content.chars().take(max_content).collect();
-                            execute!(
-                                stdout,
-                                Print(format!(
-                                    "{}{} {}{}{}",
-                                    color, symbol, content, priority_tag, RESET
-                                ))
-                            )?;
-                            advance_live_line(&mut stdout)?;
-                            rows += shadow_buffer::physical_rows(&content, term_w);
-                        }
-                    }
-                }
+            for (line, color) in &todo_lines {
+                rows += write_fixed_live_row(&mut stdout, line, *color, term_width)?;
             }
         }
 
         // ── 1c. Child-agent task tree ─────────────────────────────────────────
-        let mut agent_tasks = if dialog_active {
-            Vec::new()
-        } else {
-            self.agent_tasks.values().collect::<Vec<_>>()
-        };
-        agent_tasks.sort_by_key(|task| (task.identity.depth, task.identity.task_id));
-        for task in agent_tasks {
-            let indent = "  ".repeat(task.identity.depth);
-            let symbol = match task.status {
-                crate::runtime::scheduler::AgentTaskStatus::Queued => "○",
-                crate::runtime::scheduler::AgentTaskStatus::Running => "●",
-                _ => "✓",
-            };
-            let model = &task.identity.provider_model;
-            let tool = self
-                .agent_active_tools
-                .get(&task.identity.task_id)
-                .map(|name| format!(" · {name}"))
-                .unwrap_or_default();
-            let prefix_width = indent.chars().count() + 2;
-            let available = term_width
-                .saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
-            let task_text = task.task.chars().take(available).collect::<String>();
-            execute!(
-                stdout,
-                SetForegroundColor(
-                    if matches!(
-                        task.status,
-                        crate::runtime::scheduler::AgentTaskStatus::Running
-                    ) {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGrey
-                    }
-                ),
-                Print(&indent),
-                Print(symbol),
-                ResetColor,
-                Print(" "),
-                Print(task_text),
-                SetForegroundColor(Color::DarkGrey),
-                Print(format!(" · {model}{tool}")),
-                ResetColor
-            )?;
-            advance_live_line(&mut stdout)?;
-            rows += 1;
+        if !dialog_active {
+            for (line, color) in &agent_lines {
+                rows += write_fixed_live_row(&mut stdout, line, *color, term_width)?;
+            }
         }
 
         // ── 1d. Co-Forth panel ────────────────────────────────────────────────
@@ -1769,10 +1916,11 @@ impl TuiRenderer {
                 term_h.saturating_sub(rows),
             )?;
             rows += dialog_rows;
-            // Dialog drawing ends each line with \r\n, so the cursor is one row
-            // PAST the last drawn row (at row `rows`, 0-indexed from the start of
-            // the live area).  erase_live_area() moves up by cursor_row_from_top to
-            // reach row 0, so we need cursor_row_from_top = rows (not rows - 1).
+            // Bounded dialog replay advances once after each retained row, so
+            // the cursor is one row PAST the last drawn row (at row `rows`,
+            // 0-indexed from the start of the live area). erase_live_area()
+            // moves up by cursor_row_from_top to reach row 0, so we need
+            // cursor_row_from_top = rows (not rows - 1).
             // Using rows - 1 caused the top row to be skipped on every erase, making
             // the dialog shift down by one row on each render tick and producing the
             // cascading duplicate dialog boxes the user sees.
@@ -1781,7 +1929,7 @@ impl TuiRenderer {
             execute!(stdout, cursor::Show)?;
             // ── 4. Input area ─────────────────────────────────────────────────
             let (cursor_row, cursor_col) = self.input_textarea.cursor();
-            let lines = self.input_textarea.lines().to_vec();
+            let lines = input_lines.clone();
 
             let prompt = format!("{}❯{} ", CYAN, RESET);
             let prompt_vis_len: usize = 2; // visible chars: "❯ "
@@ -1793,7 +1941,7 @@ impl TuiRenderer {
 
             // Track physical terminal rows consumed by each input line (accounts for wrapping).
             let input_phys_rows =
-                input_line_physical_rows_with_ghost(&lines, term_width, self.ghost_text.as_deref());
+                input_line_physical_rows_with_ghost(&lines, term_width, ghost_text.as_deref());
 
             if lines.is_empty() {
                 execute!(stdout, Print(&prompt))?;
@@ -1814,7 +1962,7 @@ impl TuiRenderer {
             rows += total_input_phys;
 
             // ── 4b. Ghost text (dim suffix for command completions) ───────────
-            if let Some(ref ghost) = self.ghost_text {
+            if let Some(ref ghost) = ghost_text {
                 execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, ghost, RESET)))?;
                 // ghost text is on the same row as the last input line — no extra row
             }
@@ -1854,7 +2002,7 @@ impl TuiRenderer {
             // after MoveUp, which caused erase_live_area() to miss the separator row and
             // draw a new one on every render tick.
             let mut status_phys_rows: usize = 1; // 1 for the separator line itself
-            for line in effective_status.lines() {
+            for line in &status_lines {
                 advance_live_line(&mut stdout)?;
                 execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, line, RESET)))?;
                 let phys = shadow_buffer::physical_rows(line, term_width);
@@ -1877,11 +2025,11 @@ impl TuiRenderer {
             };
 
             // Which physical sub-row within cursor_row's logical line is the cursor on?
-            let cursor_text_width = lines
+            let cursor_text_width = raw_input_lines
                 .get(cursor_row)
                 .map(|line| {
                     let prefix: String = line.chars().take(cursor_col).collect();
-                    shadow_buffer::visible_length(&prefix)
+                    shadow_buffer::visible_length(&control_free_single_line(&prefix))
                 })
                 .unwrap_or(0);
             let cursor_sub_row = if term_width > 0 {
@@ -1920,13 +2068,10 @@ impl TuiRenderer {
             cursor_row_from_top = rows_before_input + cursor_phys_above + cursor_sub_row;
         }
 
-        execute!(stdout, EndSynchronizedUpdate)?;
-        stdout.flush()?;
-
         self.active_rows = rows;
         self.cursor_row_from_top = cursor_row_from_top;
         self.rebuild_transcript_hit_regions(&visible_live_rendered, rows, term_width, term_h);
-        Ok(())
+        stdout.finish()
     }
 
     /// Return the whole uncommitted transcript suffix in order.
@@ -2163,16 +2308,17 @@ fn viewport_redraw_plan(
     }
 }
 
-/// Start an absolute full-viewport paint and leave the synchronized update
-/// open for `draw_live_area` to finish. Keeping this byte emission separate
-/// makes the resize invariant testable without a real terminal emulator.
+/// Paint an absolute full viewport inside one balanced synchronized update.
+/// Keeping this byte emission separate makes the resize invariant testable
+/// without a real terminal emulator.
 fn begin_full_viewport_paint(
     stdout: &mut impl Write,
     plan: ViewportRedrawPlan,
     transcript: &[String],
 ) -> Result<()> {
-    execute!(stdout, BeginSynchronizedUpdate)?;
-    continue_full_viewport_paint(stdout, plan, transcript)
+    let mut stdout = SynchronizedWriter::begin(stdout)?;
+    continue_full_viewport_paint(&mut stdout, plan, transcript)?;
+    stdout.finish()
 }
 
 fn continue_full_viewport_paint(
@@ -2187,11 +2333,8 @@ fn continue_full_viewport_paint(
         cursor::MoveTo(0, plan.transcript_top as u16)
     )?;
     for line in transcript {
-        execute!(
-            stdout,
-            Clear(ClearType::CurrentLine),
-            Print(line.trim_end_matches('\r'))
-        )?;
+        let line = control_free_single_line(line);
+        execute!(stdout, Clear(ClearType::CurrentLine), Print(&line))?;
         advance_live_line(stdout)?;
     }
     execute!(stdout, cursor::MoveTo(0, plan.live_top as u16))?;
@@ -2249,13 +2392,10 @@ impl TuiRenderer {
                 &mut self.printed_ids,
                 usize::from(crossterm::terminal::size().unwrap_or((80, 24)).1),
             );
-            if let Err(error) = commit_result {
-                let _ = execute!(stdout, EndSynchronizedUpdate);
-                return Err(error);
-            }
+            commit_result?;
             self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
             self.viewport_invalidated = true;
-            self.redraw_full_viewport_inner(true)?;
+            self.redraw_full_viewport_inner()?;
             self.live_area_dirty = false;
         } else {
             // Only redraw when something actually changed: a message is streaming
@@ -2300,21 +2440,9 @@ impl TuiRenderer {
         let Some(text) = text else {
             return Ok(());
         };
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return Ok(());
-        }
-
         let (term_cols, _term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let vis_len = text.chars().count();
-        let start_col = (term_cols as usize).saturating_sub(vis_len + 1) as u16;
-
-        let label = format!("{}{}{}", DIM_GRAY, text, RESET);
         let mut stdout = io::stdout();
-        execute!(stdout, cursor::SavePosition)?;
-        execute!(stdout, cursor::MoveTo(start_col, 0))?;
-        execute!(stdout, Print(&label))?;
-        execute!(stdout, cursor::RestorePosition)?;
+        write_corner_overlay(&mut stdout, &text, term_cols)?;
         stdout.flush()?;
         Ok(())
     }
@@ -2520,7 +2648,20 @@ impl TuiRenderer {
     ) -> Vec<RenderedTranscriptLine> {
         let mut rendered = Vec::new();
         for message in messages {
-            rendered.extend(self.projected_message_lines(&message));
+            for line in self.projected_message_lines(&message) {
+                let row_id = line.row_id;
+                let row_expanded = line.row_expanded;
+                for (index, text) in control_free_logical_rows(&line.text)
+                    .into_iter()
+                    .enumerate()
+                {
+                    rendered.push(RenderedTranscriptLine {
+                        text,
+                        row_id: if index == 0 { row_id.clone() } else { None },
+                        row_expanded: if index == 0 { row_expanded } else { None },
+                    });
+                }
+            }
             rendered.push(RenderedTranscriptLine {
                 text: String::new(),
                 row_id: None,
@@ -2636,12 +2777,17 @@ impl TuiRenderer {
         let term_width = usize::from(width).max(1);
         let draw_width = term_width;
         let draw_height = usize::from(height);
-        let input_lines = self.input_textarea.lines().to_vec();
+        let raw_input_lines = self.input_textarea.lines().to_vec();
+        let input_lines = raw_input_lines
+            .iter()
+            .map(|line| control_free_single_line(line))
+            .collect::<Vec<_>>();
+        let ghost_text = self.ghost_text.as_deref().map(control_free_single_line);
         let raw_status = self
             .status_bar
             .get_status_without(&StatusLineType::SessionLabel);
         let effective_status = compute_effective_status(
-            self.ghost_text.as_deref(),
+            ghost_text.as_deref(),
             &raw_status,
             &input_lines.join("\n"),
             &self.command_registry,
@@ -2656,24 +2802,19 @@ impl TuiRenderer {
             );
             return Some((frame.lines.len(), frame.cursor_row));
         }
-        let todo_rows = self
-            .todo_list
-            .as_ref()
-            .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
-            .unwrap_or(0);
-        let drawn_status_rows = 1 + effective_status
-            .lines()
+        let todo_lines = self.prepared_todo_rows(draw_width);
+        let agent_lines = self.prepared_agent_rows(draw_width);
+        let status_lines = control_free_logical_rows(&effective_status);
+        let drawn_status_rows = 1 + status_lines
+            .iter()
             .map(|line| shadow_buffer::physical_rows(line, draw_width))
             .sum::<usize>();
-        let drawn_input_rows = input_line_physical_rows_with_ghost(
-            &input_lines,
-            draw_width,
-            self.ghost_text.as_deref(),
-        )
-        .into_iter()
-        .sum::<usize>();
+        let drawn_input_rows =
+            input_line_physical_rows_with_ghost(&input_lines, draw_width, ghost_text.as_deref())
+                .into_iter()
+                .sum::<usize>();
         let base_reserved_rows =
-            1 + drawn_input_rows + drawn_status_rows + todo_rows + self.agent_tasks.len();
+            1 + drawn_input_rows + drawn_status_rows + todo_lines.len() + agent_lines.len();
         let all_live_rendered = self.projected_lines(self.find_live_messages());
         let all_live_lines = all_live_rendered
             .iter()
@@ -2697,34 +2838,11 @@ impl TuiRenderer {
             .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
             .sum::<usize>();
 
-        if let Some(ref todo_arc) = self.todo_list {
-            if let Ok(todo) = todo_arc.try_read() {
-                for item in todo.active_items() {
-                    let priority_tag = match item.priority {
-                        crate::tools::todo::TodoPriority::High => " [!]",
-                        _ => "",
-                    };
-                    let max_content = draw_width.saturating_sub(2 + priority_tag.len());
-                    let content = item.content.chars().take(max_content).collect::<String>();
-                    let line = format!("● {content}{priority_tag}");
-                    rows += shadow_buffer::physical_rows(&line, term_width);
-                }
-            }
+        for (line, _) in &todo_lines {
+            rows += shadow_buffer::physical_rows(line, term_width);
         }
-        for task in self.agent_tasks.values() {
-            let indent = "  ".repeat(task.identity.depth);
-            let model = &task.identity.provider_model;
-            let tool = self
-                .agent_active_tools
-                .get(&task.identity.task_id)
-                .map(|name| format!(" · {name}"))
-                .unwrap_or_default();
-            let prefix_width = indent.chars().count() + 2;
-            let available = draw_width
-                .saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
-            let task_text = task.task.chars().take(available).collect::<String>();
-            let line = format!("{indent}● {task_text} · {model}{tool}");
-            rows += shadow_buffer::physical_rows(&line, term_width);
+        for (line, _) in &agent_lines {
+            rows += shadow_buffer::physical_rows(line, term_width);
         }
         let session_label = self
             .status_bar
@@ -2736,21 +2854,19 @@ impl TuiRenderer {
         let rows_before_input = rows;
 
         let (cursor_row, cursor_col) = self.input_textarea.cursor();
-        let input_phys_rows = input_line_physical_rows_with_ghost(
-            &input_lines,
-            term_width,
-            self.ghost_text.as_deref(),
-        );
+        let input_phys_rows =
+            input_line_physical_rows_with_ghost(&input_lines, term_width, ghost_text.as_deref());
         let status_rows = shadow_buffer::physical_rows(&"─".repeat(draw_width), term_width)
-            + effective_status
-                .lines()
+            + status_lines
+                .iter()
                 .map(|line| shadow_buffer::physical_rows(line, term_width))
                 .sum::<usize>();
         rows += input_phys_rows.iter().sum::<usize>() + completion_rows + status_rows;
-        let cursor_text_width = input_lines
+        let cursor_text_width = raw_input_lines
             .get(cursor_row)
             .map(|line| {
-                shadow_buffer::visible_length(&line.chars().take(cursor_col).collect::<String>())
+                let prefix = line.chars().take(cursor_col).collect::<String>();
+                shadow_buffer::visible_length(&control_free_single_line(&prefix))
             })
             .unwrap_or(0);
         let cursor_sub_row = (2 + cursor_text_width) / term_width;
@@ -2764,10 +2880,10 @@ impl TuiRenderer {
     /// reflow. `ClearType::All` clears only the visible screen; terminal-native
     /// scrollback that has already left the viewport remains untouched.
     fn redraw_full_viewport(&mut self) -> Result<()> {
-        self.redraw_full_viewport_inner(false)
+        self.redraw_full_viewport_inner()
     }
 
-    fn redraw_full_viewport_inner(&mut self, synchronized_update_open: bool) -> Result<()> {
+    fn redraw_full_viewport_inner(&mut self) -> Result<()> {
         let (width, height) = self
             .pending_viewport_size
             .take()
@@ -2799,25 +2915,13 @@ impl TuiRenderer {
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
 
         let mut stdout = io::stdout();
-        let paint = if synchronized_update_open {
-            continue_full_viewport_paint(&mut stdout, plan, &transcript)
-        } else {
-            begin_full_viewport_paint(&mut stdout, plan, &transcript)
-        };
-        if let Err(error) = paint {
-            let _ = execute!(stdout, EndSynchronizedUpdate);
-            return Err(error);
-        }
+        begin_full_viewport_paint(&mut stdout, plan, &transcript)?;
 
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
         self.viewport_invalidated = false;
-        // draw_live_area closes the synchronized update begun above.
-        let draw = self.draw_live_area();
-        if draw.is_err() {
-            let _ = execute!(io::stdout(), EndSynchronizedUpdate);
-        }
-        draw
+        // draw_live_area owns a separate balanced synchronized update.
+        self.draw_live_area()
     }
 }
 
@@ -3027,6 +3131,49 @@ fn render_other_row_inline(
     Ok(1)
 }
 
+fn normalize_live_dialog(dialog: &Dialog) -> Dialog {
+    let mut normalized = dialog.clone();
+    let preserve_rows = |text: &str| control_free_logical_rows(text).join("\n");
+    normalized.title = preserve_rows(&normalized.title);
+    normalized.help_message = normalized.help_message.as_deref().map(preserve_rows);
+    normalized.body = normalized.body.as_deref().map(preserve_rows);
+    normalized.custom_input = normalized
+        .custom_input
+        .as_deref()
+        .map(control_free_single_line);
+    if let Some(input) = normalized.custom_input.as_ref() {
+        normalized.custom_cursor_pos = normalized.custom_cursor_pos.min(input.chars().count());
+    }
+
+    let normalize_options = |options: &mut Vec<DialogOption>| {
+        for option in options {
+            option.label = control_free_single_line(&option.label);
+            option.description = option.description.as_deref().map(control_free_single_line);
+            option.markdown = option.markdown.as_deref().map(preserve_rows);
+        }
+    };
+    match &mut normalized.dialog_type {
+        DialogType::Select { options, .. } | DialogType::MultiSelect { options, .. } => {
+            normalize_options(options);
+        }
+        DialogType::TextInput {
+            prompt,
+            input,
+            cursor_pos,
+            default,
+        } => {
+            *prompt = preserve_rows(prompt);
+            *input = control_free_single_line(input);
+            *cursor_pos = (*cursor_pos).min(input.chars().count());
+            *default = default.as_deref().map(control_free_single_line);
+        }
+        DialogType::Confirm { prompt, .. } => {
+            *prompt = preserve_rows(prompt);
+        }
+    }
+    normalized
+}
+
 impl TuiRenderer {
     /// Draw a `Dialog` inline, borderless and spanning the full terminal width.
     ///
@@ -3040,6 +3187,8 @@ impl TuiRenderer {
         dialog: &Dialog,
         box_width: usize,
     ) -> Result<usize> {
+        let normalized_dialog = normalize_live_dialog(dialog);
+        let dialog = &normalized_dialog;
         // Wrap width inside the 2-space left indent (no right border to reserve for).
         let inner = box_width.saturating_sub(2).max(1);
 
@@ -3187,8 +3336,8 @@ impl TuiRenderer {
                 rows += 1;
             }
             DialogType::TextInput { prompt, input, .. } => {
-                if !prompt.is_empty() {
-                    print_dialog_line(out, prompt, None, false)?;
+                for line in wrap_text(prompt, inner) {
+                    print_dialog_line(out, &line, None, false)?;
                     rows += 1;
                 }
                 let line = format!("> {}", input);
@@ -3962,6 +4111,10 @@ mod tests {
         )
         .unwrap();
         assert!(contains_bytes(&bytes, &pop_keyboard));
+
+        let raw = String::from_utf8(bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
     }
 
     #[test]
@@ -4040,6 +4193,83 @@ mod tests {
         assert_eq!(line.chars().count(), 60);
         assert!(line.contains("◆ brain:"), "{line:?}");
         assert!(line.contains('…'), "{line:?}");
+    }
+
+    #[test]
+    fn hostile_fixed_live_payloads_are_control_free_and_counted_as_one_row() {
+        for payload in [
+            todo_live_row("●", "first\nsecond\x1b[31mred\x07", " [!]", 32),
+            agent_live_row(
+                1,
+                "●",
+                "task\r\nnext\x1b]0;owned\x07",
+                "provider\nmodel",
+                Some("tool\x1b[2J\nname"),
+                32,
+            ),
+            session_separator_line(32, "cwd\nowned\x1b[3J", "session\rname"),
+            bounded_control_free_line("corner\nowned\x1b]0;title\x07", 32),
+        ] {
+            let mut output = Vec::new();
+            let rows = write_fixed_live_row(&mut output, &payload, DIM_GRAY, 32).unwrap();
+            let raw = String::from_utf8(output).unwrap();
+            assert_eq!(rows, 1, "{raw:?}");
+            assert_eq!(raw.matches("\x1b[1E").count(), 1);
+            assert!(!raw.contains('\n'), "{raw:?}");
+            assert!(!raw.contains("\x1b[31m"), "{raw:?}");
+            assert!(!raw.contains("\x1b]0;"), "{raw:?}");
+            assert!(!raw.contains("\x1b[2J"), "{raw:?}");
+            assert!(!raw.contains("\x1b[3J"), "{raw:?}");
+            assert!(!raw.contains('\x07'), "{raw:?}");
+        }
+
+        let mut corner = Vec::new();
+        assert!(write_corner_overlay(&mut corner, "corner\nowned\x1b]0;title\x07", 32,).unwrap());
+        let raw = String::from_utf8(corner).unwrap();
+        assert!(raw.contains("corner ↵ owned"), "{raw:?}");
+        assert!(!raw.contains('\n'), "{raw:?}");
+        assert!(!raw.contains("\x1b]0;title"), "{raw:?}");
+        assert!(!raw.contains('\x07'), "{raw:?}");
+    }
+
+    #[test]
+    fn hostile_work_unit_projection_is_normalized_before_live_planning() {
+        let output = Arc::new(OutputManager::new(ColorScheme::default()));
+        let status = Arc::new(StatusBar::new());
+        let renderer = TuiRenderer::new_headless(output, status, ColorScheme::default());
+        let work = Arc::new(WorkUnit::new("task\nname\x1b]0;owned\x07"));
+        work.set_response("first\r\nsecond\x1b[31mred\x07");
+        let message: MessageRef = work;
+
+        let projected = renderer.projected_lines([message]);
+
+        assert!(projected.len() >= 2);
+        assert!(projected.iter().all(|line| !line.text.contains('\n')));
+        assert!(projected.iter().all(|line| !line.text.contains('\r')));
+        assert!(projected.iter().all(|line| !line.text.contains('\x07')));
+        assert!(projected.iter().all(|line| !line.text.contains("\x1b[31m")));
+        assert!(projected.iter().all(|line| !line.text.contains("\x1b]0;")));
+    }
+
+    #[test]
+    fn hostile_input_and_status_are_normalized_at_the_tiny_production_writer() {
+        let frame = plan_tiny_live_frame(
+            &["draft\x1b[31mred\x07\nowned".into()],
+            (0, 8),
+            "status\r\nsecond\x1b]0;owned\x07",
+            3,
+            24,
+        );
+        let mut output = Vec::new();
+        let rows = write_tiny_live_frame(&mut output, &frame).unwrap();
+        let raw = String::from_utf8(output).unwrap();
+
+        assert_eq!(rows, frame.lines.len());
+        assert_eq!(raw.matches("\x1b[1E").count(), rows - 1);
+        assert!(!raw.contains('\n'), "{raw:?}");
+        assert!(!raw.contains("\x1b[31m"), "{raw:?}");
+        assert!(!raw.contains("\x1b]0;"), "{raw:?}");
+        assert!(!raw.contains('\x07'), "{raw:?}");
     }
 
     #[test]
@@ -4305,18 +4535,17 @@ mod tests {
             8,
         )
         .unwrap();
-        continue_full_viewport_paint(
+        begin_full_viewport_paint(
             &mut bytes,
             viewport_redraw_plan(8, 2, 1),
             &["final projection".into()],
         )
         .unwrap();
-        execute!(bytes, EndSynchronizedUpdate).unwrap();
         let raw = String::from_utf8(bytes).unwrap();
         assert!(raw.find("\x1b[2J").unwrap() < raw.find("secret canonical body").unwrap());
         assert_eq!(raw.matches("secret canonical body").count(), 1);
-        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
-        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 2);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 2);
         assert!(raw.find("secret canonical body").unwrap() < raw.find("final projection").unwrap());
         assert_eq!(resize_printed.len(), 1);
 
@@ -5039,6 +5268,67 @@ mod tests {
     }
 
     #[test]
+    fn test_production_dialog_writer_normalizes_every_untrusted_field_before_replay() {
+        let hostile = "first\r\nsecond\x1b[31mred\x1b]0;owned\x07\x07";
+        let mut select = Dialog::select_with_custom(
+            hostile,
+            vec![DialogOption::with_description(hostile, hostile).with_markdown(hostile)],
+        );
+        select.help_message = Some(hostile.into());
+        select.body = Some(hostile.into());
+        select.custom_input = Some(hostile.into());
+        select.custom_cursor_pos = hostile.chars().count();
+        let markdown_select = select.clone();
+        if let DialogType::Select { selected_index, .. } = &mut select.dialog_type {
+            *selected_index = 1;
+        }
+
+        let mut text_input = Dialog::text_input(hostile, Some(hostile.into()));
+        if let DialogType::TextInput {
+            prompt,
+            input,
+            cursor_pos,
+            ..
+        } = &mut text_input.dialog_type
+        {
+            *prompt = hostile.into();
+            *input = hostile.into();
+            *cursor_pos = hostile.chars().count();
+        }
+        let mut confirm = Dialog::confirm(hostile, true);
+        if let DialogType::Confirm { prompt, .. } = &mut confirm.dialog_type {
+            *prompt = hostile.into();
+        }
+
+        for dialog in [select, markdown_select, text_input, confirm] {
+            let normalized = normalize_live_dialog(&dialog);
+            match &normalized.dialog_type {
+                DialogType::Select { options, .. } => {
+                    assert!(!options[0].description.as_deref().unwrap().contains('\x1b'));
+                }
+                DialogType::TextInput { default, .. } => {
+                    assert!(!default.as_deref().unwrap().contains('\x1b'));
+                }
+                DialogType::Confirm { .. } => {}
+                DialogType::MultiSelect { .. } => unreachable!(),
+            }
+
+            let mut output = Vec::new();
+            let rows = TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, 48, 20)
+                .expect("production dialog render");
+            let raw = String::from_utf8(output).unwrap();
+            assert_eq!(raw.matches("\x1b[1E").count(), rows);
+            assert!(
+                !raw.contains('\n'),
+                "live replay emitted a linefeed: {raw:?}"
+            );
+            assert!(!raw.contains("\x1b[31m"), "{raw:?}");
+            assert!(!raw.contains("\x1b]0;owned"), "{raw:?}");
+            assert!(!raw.contains('\x07'), "{raw:?}");
+        }
+    }
+
+    #[test]
     fn test_stream_resize_reconnect_and_dialog_repaint_preserve_selection() {
         let registry = CommandRegistry::new();
         let mut autocomplete = AutocompleteState::new();
@@ -5106,6 +5396,40 @@ mod tests {
             !raw.contains("\x1b[J"),
             "must not clear below the owned frame"
         );
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+    }
+
+    #[test]
+    fn test_production_live_erase_closes_synchronized_update_after_write_error() {
+        struct ClearFailsOnce {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for ClearFailsOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.failed && bytes.windows(3).any(|window| window == b"[2K") {
+                    self.failed = true;
+                    return Err(io::Error::other("injected clear failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = ClearFailsOnce {
+            bytes: Vec::new(),
+            failed: false,
+        };
+        assert!(write_live_area_erase(&mut output, 2, 1).is_err());
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
     }
 
     #[test]

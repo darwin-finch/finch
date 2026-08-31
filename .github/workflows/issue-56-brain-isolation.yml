@@ -92,7 +92,8 @@ jobs:
       timeout-minutes: 15
       run: |
         CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_binary_never_captures_native_mouse_input -- --exact --nocapture --test-threads=1
-        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_renderer_restores_mouse_mode_on_all_terminations -- --exact --nocapture --test-threads=1
+        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_renderer_restores_all_terminal_modes_on_all_terminations -- --exact --nocapture --test-threads=1
+        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_repeated_live_render_and_resize_never_emits_history_linefeeds -- --exact --nocapture --test-threads=1
 
     - name: Reject self-issued proof authority
       timeout-minutes: 15

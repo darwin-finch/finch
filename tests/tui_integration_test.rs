@@ -185,20 +185,30 @@ fn test_tui_binary_never_captures_native_mouse_input() {
     assert_eq!(count_bytes(&transcript, enable_mouse), 0);
 }
 
-/// Child-only probe used by `test_tui_renderer_restores_mouse_mode_on_all_terminations`.
+/// Child-only probe used by the supervised terminal lifecycle regressions.
 #[cfg(unix)]
 #[test]
 fn tui_renderer_terminal_lifecycle_child() -> Result<(), &'static str> {
     let Ok(termination) = std::env::var("FINCH_TEST_TUI_TERMINATION") else {
         return Ok(());
     };
+    if termination == "init-error" {
+        std::env::set_var("FINCH_TEST_TUI_FAIL_AFTER_ACTIVATION", "1");
+    }
     let output = std::sync::Arc::new(finch::cli::OutputManager::new(
         finch::config::ColorScheme::default(),
     ));
     let status = std::sync::Arc::new(finch::cli::StatusBar::new());
-    let mut renderer =
-        finch::cli::tui::TuiRenderer::new(output, status, finch::config::ColorScheme::default())
-            .map_err(|_| "renderer initialization failed")?;
+    let renderer =
+        finch::cli::tui::TuiRenderer::new(output, status, finch::config::ColorScheme::default());
+    if termination == "init-error" {
+        std::env::remove_var("FINCH_TEST_TUI_FAIL_AFTER_ACTIVATION");
+        return renderer
+            .is_err()
+            .then_some(())
+            .ok_or("injected renderer initialization unexpectedly succeeded");
+    }
+    let mut renderer = renderer.map_err(|_| "renderer initialization failed")?;
 
     match termination.as_str() {
         "clean" => renderer.shutdown().map_err(|_| "renderer shutdown failed"),
@@ -208,22 +218,44 @@ fn tui_renderer_terminal_lifecycle_child() -> Result<(), &'static str> {
         }
         "error" => Err("intentional post-activation error"),
         "panic" => panic!("intentional post-activation panic"),
+        "render-resize" => {
+            std::io::stdout()
+                .write_all(b"FINCH_LIVE_HISTORY_PROBE_BEGIN")
+                .map_err(|_| "failed to write live-history marker")?;
+            std::io::stdout()
+                .flush()
+                .map_err(|_| "failed to flush live-history marker")?;
+            renderer.set_operation_status("TRANSIENT\x1b[31mRED\nSECOND\x07ROW");
+            renderer.set_session_label("SESSION\nINJECT\x1b]0;owned\x07");
+            for (width, height) in [(120, 24), (63, 11), (100, 20), (41, 9)] {
+                renderer.render().map_err(|_| "live render failed")?;
+                renderer
+                    .handle_resize(width, height)
+                    .map_err(|_| "resize invalidation failed")?;
+                renderer.render().map_err(|_| "resize render failed")?;
+            }
+            renderer.shutdown().map_err(|_| "renderer shutdown failed")
+        }
         other => panic!("unknown terminal lifecycle probe: {other}"),
     }
 }
 
-/// The real renderer must never acquire mouse reporting, including startup,
-/// clean shutdown, unwind, and ordinary `Result::Err` paths.
+/// The real renderer must restore every terminal mode it owns on startup
+/// failure, clean shutdown, unwind, and ordinary `Result::Err` paths.
 #[cfg(unix)]
 #[test]
-fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
+fn test_tui_renderer_restores_all_terminal_modes_on_all_terminations() {
     if !supervised_pty_authority_or_skip() {
         return;
     }
     let enable_mouse = b"\x1b[?1000h";
     let disable_mouse = b"\x1b[?1000l";
+    let disable_paste = b"\x1b[?2004l";
+    let pop_keyboard = b"\x1b[<1u";
+    let begin_sync = b"\x1b[?2026h";
+    let end_sync = b"\x1b[?2026l";
 
-    for termination in ["clean", "drop", "error", "panic"] {
+    for termination in ["clean", "drop", "error", "panic", "init-error"] {
         let (mut master, slave) = open_owned_pty();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -244,9 +276,19 @@ fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
             &mut master,
             &mut transcript,
             Instant::now() + Duration::from_secs(10),
-            |bytes| count_bytes(bytes, disable_mouse) > 0,
+            |bytes| {
+                count_bytes(bytes, disable_mouse) > 0
+                    && count_bytes(bytes, disable_paste) > 0
+                    && count_bytes(bytes, pop_keyboard) > 0
+            },
         );
         let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+        let _ = read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(1),
+            |_| false,
+        );
         assert!(
             observed_cleanup,
             "{termination} path omitted the defensive mouse reset: {}",
@@ -257,7 +299,15 @@ fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
             0,
             "{termination} path enabled mouse reporting"
         );
-        if matches!(termination, "clean" | "drop") {
+        assert!(count_bytes(&transcript, disable_paste) > 0);
+        assert!(count_bytes(&transcript, pop_keyboard) > 0);
+        assert_eq!(
+            count_bytes(&transcript, begin_sync),
+            count_bytes(&transcript, end_sync),
+            "{termination} path left synchronized update unbalanced: {}",
+            String::from_utf8_lossy(&transcript)
+        );
+        if matches!(termination, "clean" | "drop" | "init-error") {
             assert!(status.success(), "{termination} probe failed: {status}");
         } else {
             assert!(
@@ -266,6 +316,75 @@ fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
             );
         }
     }
+}
+
+/// Repeated live rendering and viewport reconstruction must use cursor motion,
+/// never linefeeds that make transient rows eligible for native history.
+#[cfg(unix)]
+#[test]
+fn test_tui_repeated_live_render_and_resize_never_emits_history_linefeeds() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let marker = b"FINCH_LIVE_HISTORY_PROBE_BEGIN";
+    let disable_paste = b"\x1b[?2004l";
+    let begin_sync = b"\x1b[?2026h";
+    let end_sync = b"\x1b[?2026l";
+    let (mut master, slave) = open_owned_pty();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tui_renderer_terminal_lifecycle_child",
+            "--nocapture",
+        ])
+        .env("FINCH_TEST_TUI_TERMINATION", "render-resize")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("failed to spawn live-history probe in owned PTY");
+    drop(slave);
+
+    let mut transcript = Vec::new();
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(10),
+            |bytes| count_bytes(bytes, disable_paste) > 0,
+        ),
+        "live-history probe omitted terminal cleanup: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+    let _ = read_pty_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(1),
+        |_| false,
+    );
+    assert!(status.success(), "live-history probe failed: {status}");
+
+    let start = transcript
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("live-history marker missing")
+        + marker.len();
+    let end = transcript[start..]
+        .windows(disable_paste.len())
+        .position(|window| window == disable_paste)
+        .map(|offset| start + offset)
+        .expect("terminal cleanup boundary missing");
+    let live = &transcript[start..end];
+    assert!(count_bytes(live, b"TRANSIENTRED") > 0);
+    assert!(count_bytes(live, b"SECOND") > 0);
+    assert_eq!(count_bytes(live, b"\x1b[31m"), 0);
+    assert!(!live.contains(&b'\n'), "live output emitted a linefeed");
+    assert_eq!(count_bytes(live, begin_sync), count_bytes(live, end_sync));
+    assert!(
+        count_bytes(live, begin_sync) >= 8,
+        "expected repeated renders"
+    );
 }
 
 /// Test that TUI initializes without crashing

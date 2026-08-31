@@ -718,7 +718,7 @@ pub fn spawn_input_task(
                 }
                 Err(e) => {
                     // Error reading input, log and continue
-                    eprintln!("Input error: {}", e);
+                    tracing::warn!(error = %e, "TUI input read failed");
                 }
             }
 
