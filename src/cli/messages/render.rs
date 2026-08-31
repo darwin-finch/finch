@@ -70,6 +70,18 @@ impl RenderCapabilities {
             frontend: FrontendKind::Test,
         }
     }
+
+    /// Plain, speakable transcript capabilities. Disclosure state is emitted
+    /// as words because this consumer cannot rely on visual arrow direction.
+    pub const fn plain_text(viewport_width: usize) -> Self {
+        Self {
+            viewport_width,
+            color_depth: ColorDepth::Monochrome,
+            unicode: false,
+            hyperlinks: false,
+            frontend: FrontendKind::PlainText,
+        }
+    }
 }
 
 /// Frontend-local disclosure and focus state.
@@ -213,12 +225,22 @@ fn render_message(
         "  "
     };
     let action = expandable.then(|| RenderAction::ToggleDisclosure { row_id: message_id });
+    let accessible_state = (context.capabilities.frontend == FrontendKind::PlainText && expandable)
+        .then(|| {
+            if expanded {
+                " [expanded]"
+            } else {
+                " [collapsed]"
+            }
+        })
+        .unwrap_or_default();
     lines.push(RenderedLine {
         text: format!(
-            "{focus}{}{} {}",
+            "{focus}{}{} {}{}",
             "  ".repeat(depth),
             marker,
-            disclosure.label
+            disclosure.label,
+            accessible_state,
         ),
         row_id: expandable.then_some(message_id),
         row_expanded: expandable.then_some(expanded),
@@ -261,6 +283,24 @@ mod tests {
     use super::*;
     use crate::cli::messages::{Message, MessageDisclosure, MessageStatus};
     use std::sync::Arc;
+
+    #[test]
+    fn plain_text_disclosure_is_speakable_without_polluting_visual_terminal() {
+        let message = crate::cli::messages::WorkUnit::new("Tools");
+        message.add_row("read file");
+        let colors = ColorScheme::default();
+        let plain = message.render(&RenderContext::new(
+            &colors,
+            RenderCapabilities::plain_text(80),
+        ));
+        let visual = message.render(&RenderContext::new(
+            &colors,
+            RenderCapabilities::terminal(80),
+        ));
+        assert!(plain.lines[0].text.contains("[expanded]"));
+        assert!(!visual.lines[0].text.contains("[expanded]"));
+        assert!(!visual.lines[0].text.contains("[collapsed]"));
+    }
 
     struct SyntheticDisclosure {
         message_id: MessageId,

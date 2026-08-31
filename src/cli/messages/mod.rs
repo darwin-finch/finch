@@ -54,10 +54,11 @@ pub struct MessageDisclosure {
     pub default_expanded: bool,
 }
 
-/// Test-only immutable inspection snapshot. Production rendering never builds
-/// this parallel tree; it exists solely so lifecycle tests can assert a whole
-/// Message hierarchy without coupling themselves to frontend primitives.
-#[cfg(test)]
+/// Deprecated compatibility snapshot derived from the canonical Message tree.
+///
+/// Production rendering never stores or traverses this facade; callers should
+/// use [`Message::render`] and [`Message::children`] instead.
+#[deprecated(note = "use Message::render and Message::children")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRow {
     pub kind: MessageKind,
@@ -67,7 +68,7 @@ pub struct TranscriptRow {
     pub default_expanded: bool,
 }
 
-#[cfg(test)]
+#[deprecated(note = "use MessageKind")]
 pub type TranscriptRowKind = MessageKind;
 
 /// Unique identifier for messages
@@ -150,7 +151,8 @@ pub trait Message: Send + Sync {
         None
     }
 
-    #[cfg(test)]
+    /// Build the legacy transcript snapshot from canonical render semantics.
+    #[deprecated(note = "use Message::render and Message::children")]
     fn transcript_row(&self, colors: &crate::config::ColorScheme) -> Option<TranscriptRow> {
         let disclosure = self.disclosure(colors)?;
         Some(TranscriptRow {

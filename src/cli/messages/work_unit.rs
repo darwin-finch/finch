@@ -161,6 +161,8 @@ struct WorkUnitInner {
     /// Stable child Message objects allocated with their row. Row data remains
     /// in this lock so existing streaming mutations stay atomic.
     row_messages: Vec<Arc<WorkRowMessage>>,
+    /// Stable non-row semantic children owned by this root.
+    artifacts: Vec<MessageRef>,
     /// Overall status of this unit
     status: MessageStatus,
     /// Elapsed time captured when the unit completed (stable for scrollback display)
@@ -286,6 +288,7 @@ impl WorkUnit {
                 thinking: false,
                 rows: Vec::new(),
                 row_messages: Vec::new(),
+                artifacts: Vec::new(),
                 status: MessageStatus::InProgress,
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
@@ -297,29 +300,45 @@ impl WorkUnit {
 
     // ── Update API ──────────────────────────────────────────────────────────
 
+    /// Attach one stable semantic child while this unit is live. Insertion
+    /// and the terminal-state check are atomic with respect to sealing.
+    pub fn add_artifact(&self, artifact: MessageRef) -> bool {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress
+            || inner
+                .artifacts
+                .iter()
+                .any(|existing| existing.id() == artifact.id())
+        {
+            return false;
+        }
+        inner.artifacts.push(artifact);
+        true
+    }
+
     /// Accumulate tokens from a text delta (approximate: counts whitespace words).
     pub fn add_tokens(&self, text: &str) {
         let count = text.split_whitespace().count();
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .token_count += count;
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.token_count += count;
+        }
     }
 
     /// Set the "thinking" flag shown in the animated status line.
     pub fn set_thinking(&self, thinking: bool) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .thinking = thinking;
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.thinking = thinking;
+        }
     }
 
     /// Set the final response text (call after streaming ends).
     pub fn set_response(&self, text: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .response_text = text.into();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.response_text = text.into();
+        }
     }
 
     /// Return a generation unit to ordinary assistant/tool presentation.
@@ -327,78 +346,77 @@ impl WorkUnit {
     /// block reveals tool calls; that provisional text must not remain labelled
     /// as an executable program.
     pub fn set_assistant_presentation(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::Assistant;
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.presentation = WorkUnitPresentation::Assistant;
+        }
     }
 
     /// Render retained rows as internal lifecycle activity rather than model
     /// tool calls.
     pub fn set_activity_presentation(&self, title: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::Activity {
-            title: title.into(),
-        };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.presentation = WorkUnitPresentation::Activity {
+                title: title.into(),
+            };
+        }
     }
 
     /// Append a chunk to the response text (for partial updates).
     pub fn append_response(&self, text: &str) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .response_text
-            .push_str(text);
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.response_text.push_str(text);
+        }
     }
 
     /// Render this unit as the exact program received from the provider.
     pub fn set_program_source(&self, language: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramSource {
-            language: language.into(),
-        };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.presentation = WorkUnitPresentation::ProgramSource {
+                language: language.into(),
+            };
+        }
     }
 
     /// Render this unit as output emitted by a VM program, not an assistant
     /// message. `say` itself remains append-only; this only chooses UI chrome.
     pub fn set_program_output(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        }
     }
 
     /// Render this unit as an independently addressable VM output handle.
     /// The title is presentation metadata supplied by `output-open`, not an
     /// emitted response fragment.
     pub fn set_output_handle(&self, title: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput {
-            title: Some(title.into()),
-        };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.presentation = WorkUnitPresentation::ProgramOutput {
+                title: Some(title.into()),
+            };
+        }
     }
 
     /// Update transient status independently from the durable visible body.
     pub fn set_transient_status(&self, status: Option<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .transient_status = status;
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.transient_status = status;
+        }
     }
 
     /// Update an explicit output handle's progress independently from its
     /// body and status. `None` represents indeterminate progress.
     pub fn set_output_progress(&self, completed: u64, total: Option<u64>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .progress = Some((completed, total));
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status == MessageStatus::InProgress {
+            inner.progress = Some((completed, total));
+        }
     }
 
     /// Add a running tool-call sub-row; returns its index for later updates.
@@ -417,6 +435,9 @@ impl WorkUnit {
         presentation: WorkRowPresentation,
     ) -> usize {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return usize::MAX;
+        }
         let idx = inner.rows.len();
         let row_id = MessageId::from_namespace(self.id.as_uuid(), &format!("row:{idx}"));
         inner.row_messages.push(Arc::new(WorkRowMessage::new(
@@ -443,6 +464,9 @@ impl WorkUnit {
     /// while allowing the later call metadata to repair its label.
     pub fn set_row_label(&self, idx: usize, label: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         if let Some(row) = inner.rows.get_mut(idx) {
             row.label = crate::cli::diff::sanitize_terminal(&label.into());
         }
@@ -451,6 +475,9 @@ impl WorkUnit {
     /// Mark a sub-row complete with an optional compact one-line summary.
     pub fn complete_row(&self, idx: usize, summary: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status =
@@ -507,6 +534,9 @@ impl WorkUnit {
             body_lines
         };
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
             // The structured renderer owns the path/count header. Suppress the
@@ -548,6 +578,9 @@ impl WorkUnit {
     /// Complete a tool row with a structured, theme-independent file diff.
     pub fn complete_row_with_diff(&self, idx: usize, diff: FileDiff) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status = WorkRowStatus::Complete(String::new());
@@ -563,6 +596,9 @@ impl WorkUnit {
     /// creating a live scrolling preview while the command executes.
     pub fn append_row_body_line(&self, idx: usize, line: String) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         if let Some(row) = inner.rows.get_mut(idx) {
             row.body_lines
                 .push(crate::cli::diff::sanitize_terminal(&line));
@@ -572,6 +608,9 @@ impl WorkUnit {
     /// Mark a sub-row as failed.
     pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status = WorkRowStatus::Error(crate::cli::diff::sanitize_terminal(&error.into()));
@@ -582,6 +621,9 @@ impl WorkUnit {
     pub fn set_complete(&self) {
         let elapsed = self.started_at.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Complete;
     }
@@ -590,6 +632,9 @@ impl WorkUnit {
     pub fn set_failed(&self) {
         let elapsed = self.started_at.elapsed();
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if inner.status != MessageStatus::InProgress {
+            return;
+        }
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
     }
@@ -899,7 +944,18 @@ impl Message for WorkUnit {
     }
 
     fn status(&self) -> MessageStatus {
-        self.inner.read().unwrap_or_else(|p| p.into_inner()).status
+        let (status, artifacts) = {
+            let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+            (inner.status, inner.artifacts.clone())
+        };
+        if status != MessageStatus::InProgress
+            && artifacts
+                .iter()
+                .any(|artifact| artifact.status() == MessageStatus::InProgress)
+        {
+            return MessageStatus::InProgress;
+        }
+        status
     }
 
     fn content(&self) -> String {
@@ -932,14 +988,18 @@ impl Message for WorkUnit {
     }
 
     fn children(&self) -> Vec<MessageRef> {
-        self.inner
+        let inner = self
+            .inner
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut children: Vec<MessageRef> = inner
             .row_messages
             .iter()
             .cloned()
             .map(|row| row as MessageRef)
-            .collect()
+            .collect();
+        children.extend(inner.artifacts.iter().cloned());
+        children
     }
 
     fn disclosure(&self, _colors: &ColorScheme) -> Option<MessageDisclosure> {
@@ -1767,9 +1827,9 @@ mod tests {
         unit.fail_row(status, "catalog validation failed");
         let result = unit.add_activity_row("result");
         unit.fail_row(result, "catalog validation failed");
+        unit.set_activity_presentation("Speculative run 1234");
         unit.set_complete();
         let canonical_before_activity_projection = unit.complete_transcript(&colors());
-        unit.set_activity_presentation("Speculative run 1234");
 
         let projected = unit.disclosure(&colors()).unwrap();
         let children = unit.children();

@@ -46,6 +46,11 @@ impl ActivityMessage {
         Arc::clone(&self.unit)
     }
 
+    /// Own a stable semantic artifact beneath this run root.
+    pub fn add_artifact(&self, artifact: MessageRef) -> bool {
+        self.unit.add_artifact(artifact)
+    }
+
     /// Add one lifecycle activity row.
     pub fn add_activity(&self, label: impl Into<String>) -> usize {
         self.unit.add_activity_row(label)
@@ -148,5 +153,26 @@ impl Message for ActivityMessage {
     ) -> Option<ratatui::style::Style> {
         self.unit
             .background_style_for_line(colors, line_index, line_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_activity_rejects_late_rows_and_artifacts_atomically() {
+        let activity = ActivityMessage::new("run");
+        let row = activity.add_activity("status");
+        activity.complete_row(row, "done");
+        activity.set_complete();
+        let before = activity.children();
+
+        assert_eq!(activity.add_activity("late"), usize::MAX);
+        assert!(!activity.add_artifact(Arc::new(crate::cli::messages::ProgramOutputMessage::new())));
+        activity.complete_row(row, "rewritten");
+
+        assert_eq!(activity.children().len(), before.len());
+        assert_eq!(activity.content(), "");
     }
 }

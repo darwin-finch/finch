@@ -64,6 +64,12 @@ impl ProgramSourceMessage {
         true
     }
 
+    /// Attach a diagnostic or output artifact to this immutable source
+    /// attempt before sealing it.
+    pub fn add_artifact(&self, artifact: MessageRef) -> bool {
+        self.unit.add_artifact(artifact)
+    }
+
     /// Commit the provisional source successfully.
     pub fn set_complete(&self) {
         self.unit.set_complete();

@@ -47,9 +47,32 @@ pub struct VmOutputProjection {
 }
 
 #[derive(Clone)]
-enum VmDefaultResponse {
+#[doc(hidden)]
+pub enum VmDefaultResponse {
     Program(Arc<ProgramOutputMessage>),
     ToolActivity { unit: Arc<WorkUnit>, row_idx: usize },
+}
+
+/// Compatibility adapter accepted by [`VmOutputProjection::new`].
+pub trait IntoVmDefaultResponse {
+    #[doc(hidden)]
+    fn into_vm_default_response(self) -> VmDefaultResponse;
+}
+
+impl IntoVmDefaultResponse for Arc<ProgramOutputMessage> {
+    fn into_vm_default_response(self) -> VmDefaultResponse {
+        VmDefaultResponse::Program(self)
+    }
+}
+
+impl IntoVmDefaultResponse for Arc<WorkUnit> {
+    fn into_vm_default_response(self) -> VmDefaultResponse {
+        let row_idx = self.add_activity_row("program output");
+        VmDefaultResponse::ToolActivity {
+            unit: self,
+            row_idx,
+        }
+    }
 }
 
 impl VmDefaultResponse {
@@ -85,10 +108,10 @@ impl std::fmt::Debug for VmOutputProjection {
 }
 
 impl VmOutputProjection {
-    pub fn new(output: Arc<OutputManager>, default_response: Arc<ProgramOutputMessage>) -> Self {
+    pub fn new<T: IntoVmDefaultResponse>(output: Arc<OutputManager>, default_response: T) -> Self {
         Self {
             output,
-            default_response: VmDefaultResponse::Program(default_response),
+            default_response: default_response.into_vm_default_response(),
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
             pending_effects: Arc::new(Mutex::new(HashMap::new())),
@@ -301,8 +324,21 @@ pub struct OutputManager {
     pending_flush: Arc<RwLock<Vec<String>>>,
     /// Trait-based message storage (reactive updates)
     messages: Arc<RwLock<Vec<MessageRef>>>,
+    /// Roots whose canonical bytes reached native history. Only these roots
+    /// are eligible for bounded retention eviction.
+    committed_ids: Arc<RwLock<std::collections::HashSet<MessageId>>>,
+    /// Bounded tombstones for roots evicted after native commit. This closes
+    /// the retention/re-registration race without growing exact-once state
+    /// for the lifetime of the process.
+    retired_ids: Arc<Mutex<RetiredMessageIds>>,
     /// Color scheme for message formatting
     colors: crate::config::ColorScheme,
+}
+
+#[derive(Default)]
+struct RetiredMessageIds {
+    order: std::collections::VecDeque<MessageId>,
+    ids: std::collections::HashSet<MessageId>,
 }
 
 impl OutputManager {
@@ -313,6 +349,8 @@ impl OutputManager {
             buffering_mode: Arc::new(RwLock::new(false)), // Default: immediate write
             pending_flush: Arc::new(RwLock::new(Vec::new())),
             messages: Arc::new(RwLock::new(Vec::new())),
+            committed_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            retired_ids: Arc::new(Mutex::new(RetiredMessageIds::default())),
             colors,
         }
     }
@@ -356,18 +394,25 @@ impl OutputManager {
 
     /// Add a trait-based message to the buffer
     pub fn add_trait_message(&self, message: MessageRef) {
-        // Write to terminal if not a status message
-        self.write_trait_to_terminal(&message);
-
-        // Add to messages vector
         let mut messages = self.messages.write().unwrap();
-
-        // Simple circular buffer (no complex ring buffer needed here)
-        if messages.len() >= MAX_BUFFER_SIZE {
-            messages.remove(0); // Remove oldest
+        if messages
+            .iter()
+            .any(|existing| existing.id() == message.id())
+            || self
+                .retired_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .ids
+                .contains(&message.id())
+        {
+            return;
         }
-
-        messages.push(message);
+        messages.push(Arc::clone(&message));
+        drop(messages);
+        // Immediate/buffered output happens only after registration wins the
+        // object-level MessageId dedupe race.
+        self.write_trait_to_terminal(&message);
+        self.prune_committed_roots();
     }
 
     // get_trait_messages(), trait_message_count(), clear_trait_messages() removed
@@ -571,6 +616,40 @@ impl OutputManager {
             .retain(|message| message.id() != id);
     }
 
+    /// Record an exact native-history commit and prune only old committed
+    /// roots. Live and completed-but-uncommitted roots are never evicted.
+    pub fn mark_committed(&self, ids: impl IntoIterator<Item = MessageId>) {
+        self.committed_ids.write().unwrap().extend(ids);
+        self.prune_committed_roots();
+    }
+
+    fn prune_committed_roots(&self) {
+        let committed = self.committed_ids.read().unwrap().clone();
+        let mut messages = self.messages.write().unwrap();
+        while messages.len() > MAX_BUFFER_SIZE {
+            let Some(index) = messages
+                .iter()
+                .position(|message| committed.contains(&message.id()))
+            else {
+                break;
+            };
+            let removed = messages.remove(index).id();
+            self.committed_ids.write().unwrap().remove(&removed);
+            let mut retired = self
+                .retired_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if retired.ids.insert(removed) {
+                retired.order.push_back(removed);
+            }
+            while retired.order.len() > MAX_BUFFER_SIZE {
+                if let Some(expired) = retired.order.pop_front() {
+                    retired.ids.remove(&expired);
+                }
+            }
+        }
+    }
+
     /// Get the number of messages in the buffer
     pub fn len(&self) -> usize {
         self.messages.read().unwrap().len()
@@ -595,6 +674,8 @@ impl Clone for OutputManager {
             buffering_mode: Arc::clone(&self.buffering_mode),
             pending_flush: Arc::clone(&self.pending_flush),
             messages: Arc::clone(&self.messages),
+            committed_ids: Arc::clone(&self.committed_ids),
+            retired_ids: Arc::clone(&self.retired_ids),
             colors: self.colors.clone(),
         }
     }
@@ -621,6 +702,67 @@ mod tests {
 
         assert_eq!(manager.len(), 3);
         assert_eq!(manager.get_messages().len(), 3);
+    }
+
+    #[test]
+    fn duplicate_root_message_id_registers_once() {
+        let manager = silent_manager();
+        let id = MessageId::new();
+        let first: MessageRef = Arc::new(WorkUnit::with_id(id, "first"));
+        let duplicate: MessageRef = Arc::new(WorkUnit::with_id(id, "duplicate"));
+        manager.add_trait_message(first);
+        manager.add_trait_message(duplicate);
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn retention_never_evicts_live_or_uncommitted_roots() {
+        let manager = silent_manager();
+        let live = manager.start_work_unit("live");
+        for index in 0..=MAX_BUFFER_SIZE {
+            let message = Arc::new(WorkUnit::new(format!("complete-{index}")));
+            message.set_complete();
+            let id = message.id();
+            manager.add_trait_message(message);
+            manager.mark_committed([id]);
+        }
+        assert!(manager
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == live.id()));
+        assert!(manager.len() <= MAX_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn evicted_committed_root_id_cannot_be_registered_again() {
+        let manager = silent_manager();
+        let first = Arc::new(WorkUnit::new("first"));
+        first.set_complete();
+        let retired_id = first.id();
+        manager.add_trait_message(first);
+        manager.mark_committed([retired_id]);
+        for index in 0..MAX_BUFFER_SIZE {
+            let message = Arc::new(WorkUnit::new(format!("retained-{index}")));
+            message.set_complete();
+            let id = message.id();
+            manager.add_trait_message(message);
+            manager.mark_committed([id]);
+        }
+        assert!(!manager
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == retired_id));
+
+        let duplicate: MessageRef = Arc::new(WorkUnit::with_id(retired_id, "duplicate"));
+        manager.add_trait_message(duplicate);
+        assert_eq!(manager.len(), MAX_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn vm_output_projection_new_accepts_legacy_work_unit() {
+        let manager = Arc::new(silent_manager());
+        let legacy = Arc::new(WorkUnit::new("legacy output"));
+        let _projection = VmOutputProjection::new(manager, legacy);
     }
 
     fn output_effect(
