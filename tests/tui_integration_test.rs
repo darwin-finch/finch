@@ -117,6 +117,18 @@ fn wait_for_child(child: &mut std::process::Child, deadline: Instant) -> std::pr
     }
 }
 
+#[cfg(unix)]
+fn supervised_pty_authority_or_skip() -> bool {
+    match finch::brain::isolated_test_proof_if_present() {
+        Ok(Some(_proof)) => true,
+        Ok(None) => {
+            eprintln!("skipping environment-owned PTY regression outside scripts/test_brains.sh");
+            false
+        }
+        Err(error) => panic!("invalid supervisor authority for PTY regression: {error:#}"),
+    }
+}
+
 /// Production-boundary regression for Finch's real terminal lifecycle.
 ///
 /// The child inherits the repository test supervisor's isolated process group
@@ -125,9 +137,9 @@ fn wait_for_child(child: &mut std::process::Child, deadline: Instant) -> std::pr
 #[cfg(unix)]
 #[test]
 fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
-    let isolated_home = std::env::var_os("FINCH_BRAIN_TEST_ROOT")
-        .expect("run this PTY regression through scripts/test_brains.sh");
-    assert!(!isolated_home.is_empty());
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
 
     let (mut master, slave) = open_owned_pty();
     let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
@@ -267,8 +279,9 @@ fn tui_renderer_terminal_lifecycle_child() -> Result<(), &'static str> {
 #[cfg(unix)]
 #[test]
 fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
-    std::env::var_os("FINCH_BRAIN_TEST_ROOT")
-        .expect("run this PTY regression through scripts/test_brains.sh");
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
     let enable_mouse = b"\x1b[?1000h";
     let disable_mouse = b"\x1b[?1000l";
 
