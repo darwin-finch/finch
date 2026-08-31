@@ -44,6 +44,10 @@ unrelated same-name process survives the TUI smoke.
 - `tests/no_external_provider_binary_test.rs` is the independent #173
   binary-removal regression. It uses its own `tempfile` HOME and process group;
   it neither constructs a Brain nor reads the user's Finch state.
+- `tests/tui_integration_test.rs` contains environment-owned PTY regressions.
+  Direct runs skip them only when supervisor proof is absent, malformed proof is
+  rejected, and the Ubuntu/macOS isolation matrix runs both exact tests through
+  `scripts/test_brains.sh` with authenticated supervisor authority.
 - `tests/live.rs` and `tests/live/{impcpd,parity,providers}.rs` are ignored,
   credentialed live-provider tests. They do not construct Brains, and their
   documented invocation still uses `scripts/test_brains.sh` so config/cache
