@@ -14,9 +14,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub mod concrete;
+pub mod render;
 pub mod work_unit;
 
 pub use concrete::*;
+pub use render::{
+    ColorDepth, DisclosureLookup, FrontendKind, RenderAction, RenderCapabilities, RenderContext,
+    RenderedLine, RenderedMessage,
+};
 pub use work_unit::{random_spinner_verb, WorkRow, WorkRowStatus, WorkUnit};
 
 /// Stable identity for one expandable row within a retained message.
@@ -42,14 +47,20 @@ pub enum TranscriptRowKind {
     ToolOutput,
 }
 
-/// A presentation-only tree projected from canonical message data.
-#[derive(Debug, Clone)]
+/// A frontend-neutral semantic tree projected from canonical message data.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRow {
+    /// Stable identity used by disclosure state and viewport reconstruction.
     pub id: TranscriptRowId,
+    /// Semantic role of this row.
     pub kind: TranscriptRowKind,
+    /// Human-readable row summary, independent of disclosure state.
     pub label: String,
+    /// Complete body lines owned by this row.
     pub body: Vec<String>,
+    /// Append-stable semantic descendants.
     pub children: Vec<TranscriptRow>,
+    /// Message-owned disclosure default for a new frontend.
     pub default_expanded: bool,
 }
 
@@ -66,6 +77,11 @@ impl MessageId {
     /// Restore a stable ID supplied by a canonical transcript event.
     pub fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
+    }
+
+    /// Derive a stable semantic child identity from a canonical namespace.
+    pub fn from_namespace(namespace: Uuid, semantic_key: &str) -> Self {
+        Self(Uuid::new_v5(&namespace, semantic_key.as_bytes()))
     }
 }
 
@@ -108,6 +124,23 @@ pub trait Message: Send + Sync {
 
     /// Get the raw content (without formatting, for change detection)
     fn content(&self) -> String;
+
+    /// Render this concrete semantic message through frontend-neutral
+    /// primitives. The immutable context is the only frontend capability
+    /// surface available to a message.
+    fn render(&self, context: &RenderContext<'_>) -> RenderedMessage {
+        if let Some(root) = self.transcript_row(context.colors) {
+            return render::render_transcript_tree(self.id(), &root, context);
+        }
+        RenderedMessage {
+            message_id: self.id(),
+            lines: self
+                .format(context.colors)
+                .split('\n')
+                .map(RenderedLine::plain)
+                .collect(),
+        }
+    }
 
     /// Complete canonical text for permanent terminal scrollback and copying.
     /// Presentation-only disclosure state must never affect this value.
