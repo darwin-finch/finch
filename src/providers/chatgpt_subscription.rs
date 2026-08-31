@@ -128,9 +128,7 @@ struct SubscriptionRequestedModelUnavailable;
 
 impl fmt::Display for SubscriptionRequestedModelUnavailable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(
-            "ChatGPT account does not advertise the configured supported model",
-        )
+        formatter.write_str("ChatGPT account does not advertise the configured supported model")
     }
 }
 
