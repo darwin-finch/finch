@@ -70,7 +70,7 @@ For every fix, record the exact commit and exact evidence:
 - source identity when a temporary CI-only commit/workflow is removed;
 - known inherited failures, clearly separated from branch-caused failures.
 
-Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Freeze the reviewed commit; if production code changes, repeat review and affected tests.
+Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Run it with [the review protocol](references/review-protocol.md): derive the reviewer panel from the diff, review each perspective in its own context, verify every finding against a concrete failure scenario before reporting it, iterate at the new exact tip until a round yields no new confirmed findings, stopping after at most three rounds and escalating any still-unresolved confirmed findings to the coordinator, and record the panel, findings, rounds, and verdict on the pull request. Freeze the reviewed commit; if production code changes, repeat review and affected tests.
 
 Do not describe compilation, mocks, or configuration as live provider/model conformance. Keep manual or live acceptance issues open until the exact real-world workflow succeeds.
 
