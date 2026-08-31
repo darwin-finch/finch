@@ -2002,6 +2002,7 @@ fn rendered_tail_without_pinning(
                     text: fragment,
                     row_id: None,
                     row_expanded: None,
+                    action: None,
                 });
             }
             break;
@@ -2033,6 +2034,7 @@ fn rendered_metadata_for_visible(
                     text: text.clone(),
                     row_id: None,
                     row_expanded: None,
+                    action: None,
                 }
             }
         })
@@ -2455,6 +2457,7 @@ impl TuiRenderer {
                 text: String::new(),
                 row_id: None,
                 row_expanded: None,
+                action: None,
             });
         }
         rendered
@@ -2493,6 +2496,7 @@ impl TuiRenderer {
             text: String::new(),
             row_id: None,
             row_expanded: None,
+            action: None,
         }));
         combined.extend_from_slice(live);
         self.accordion

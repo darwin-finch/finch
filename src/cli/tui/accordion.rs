@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::cli::messages::{
-    DisclosureLookup, MessageRef, RenderCapabilities, RenderContext, TranscriptRow, TranscriptRowId,
+    DisclosureLookup, MessageRef, RenderAction, RenderCapabilities, RenderContext, TranscriptRow,
+    TranscriptRowId,
 };
 use crate::config::ColorScheme;
 
@@ -14,11 +15,13 @@ pub struct RenderedTranscriptLine {
     pub text: String,
     pub row_id: Option<TranscriptRowId>,
     pub row_expanded: Option<bool>,
+    pub action: Option<RenderAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptHitRegion {
     pub row_id: TranscriptRowId,
+    pub action: RenderAction,
     pub top: u16,
     pub bottom: u16,
     pub left: u16,
@@ -58,6 +61,7 @@ impl AccordionState {
                 text: line.text,
                 row_id: line.row_id,
                 row_expanded: line.row_expanded,
+                action: line.action,
             })
             .collect()
     }
@@ -79,6 +83,7 @@ impl AccordionState {
                 text: line.text,
                 row_id: line.row_id,
                 row_expanded: line.row_expanded,
+                action: line.action,
             })
             .collect()
     }
@@ -99,8 +104,11 @@ impl AccordionState {
                 self.visible_order.push(row_id.clone());
                 self.visible_expanded
                     .insert(row_id.clone(), line.row_expanded.unwrap_or(false));
+            }
+            if let (Some(row_id), Some(action)) = (&line.row_id, &line.action) {
                 self.hit_regions.push(TranscriptHitRegion {
                     row_id: row_id.clone(),
+                    action: action.clone(),
                     top: y as u16,
                     bottom: y.saturating_add(rows).saturating_sub(1) as u16,
                     left: 0,
@@ -177,7 +185,7 @@ impl AccordionState {
         }) else {
             return false;
         };
-        let row_id = region.row_id.clone();
+        let RenderAction::ToggleDisclosure { row_id } = region.action.clone();
         // Mouse disclosure is direct manipulation, not keyboard traversal.
         // Clear keyboard focus so clicking never leaves a persistent `> `
         // marker on a differently indented row.
@@ -298,6 +306,7 @@ mod tests {
             text: "▶ 世界世界 [collapsed]".into(),
             row_id: Some(id.clone()),
             row_expanded: Some(false),
+            action: Some(RenderAction::ToggleDisclosure { row_id: id.clone() }),
         }];
         let mut state = AccordionState::default();
         state.rebuild_hit_regions(&lines, 8, 8);
@@ -308,6 +317,20 @@ mod tests {
             (2, 2)
         );
         assert_eq!(state.hit_regions[0].row_id, id);
+    }
+
+    #[test]
+    fn message_render_action_survives_frontend_adapter() {
+        let work = Arc::new(WorkUnit::new("Tools"));
+        work.add_row("submit_program");
+        let message: MessageRef = work;
+        let rendered = AccordionState::default().render_message(&message, &ColorScheme::default());
+
+        assert!(matches!(
+            rendered[0].action,
+            Some(RenderAction::ToggleDisclosure { ref row_id })
+                if rendered[0].row_id.as_ref() == Some(row_id)
+        ));
     }
 
     #[test]

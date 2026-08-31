@@ -69,11 +69,7 @@ struct WorkUnitPresentation {
 
 impl LiveOutputSink for WorkUnitPresentation {
     fn line(&self, text: String) {
-        if self.program {
-            self.work_unit.append_response(&text);
-        } else {
-            self.work_unit.append_row_body_line(self.row_idx, text);
-        }
+        self.work_unit.append_row_body_line(self.row_idx, text);
     }
 
     fn vm_side_effect(&self, effect: crate::vm::VmSideEffect) {
@@ -176,6 +172,7 @@ impl ToolExecutionCoordinator {
             VmOutputProjection::for_tool_activity(
                 Arc::clone(&output_manager),
                 Arc::clone(&work_unit),
+                row_idx,
             )
         });
         let live_output: LiveOutput = Arc::new(WorkUnitPresentation {
@@ -366,5 +363,143 @@ impl ToolExecutionCoordinator {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::messages::{Message, TranscriptRowKind};
+    use crate::runtime::VmEffectEnvelope;
+    use crate::vm::{CapabilityKind, CapabilityRequirement, HostSideEffect, ResourceSelector};
+
+    fn emit(execution_id: Uuid, sequence: u64, text: &str) -> VmEffectEnvelope {
+        VmEffectEnvelope {
+            execution_id,
+            effect: crate::vm::VmSideEffect {
+                protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                sequence,
+                requirement: CapabilityRequirement {
+                    capability: CapabilityKind::SessionEmit,
+                    selector: ResourceSelector::None,
+                },
+                event: HostSideEffect::Emit { text: text.into() },
+                output: Vec::new(),
+                origin: crate::vm::SourceOrigin::generated("named-brain-submit-program-test"),
+            },
+        }
+    }
+
+    #[test]
+    fn named_brain_submit_program_event_bus_commits_emit_once_inside_tool_output() {
+        let manager = Arc::new(OutputManager::new(crate::config::ColorScheme::default()));
+        manager.disable_stdout();
+        let run_id = Uuid::new_v4();
+        let activity = manager.start_activity_with_id(
+            crate::cli::messages::MessageId::from_uuid(run_id),
+            format!("Speculative run {run_id}"),
+        );
+        let row_idx = activity.add_tool("submit_program (inspect state)");
+        let projection = VmOutputProjection::for_tool_activity(
+            Arc::clone(&manager),
+            activity.work_unit(),
+            row_idx,
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let presentation = WorkUnitPresentation {
+            work_unit: activity.work_unit(),
+            row_idx,
+            program: true,
+            vm_output: Some(projection),
+            event_tx,
+        };
+
+        // Compatibility line output and typed `say` output share the tool's
+        // semantic body. Deliver a suffix first, duplicate it while pending,
+        // then replay the whole accepted prefix after the gap closes.
+        presentation.line("live line".into());
+        let execution_id = Uuid::new_v4();
+        for envelope in [
+            emit(execution_id, 1, " after"),
+            emit(execution_id, 1, " after"),
+            emit(execution_id, 0, "visible"),
+            emit(execution_id, 0, "visible"),
+            emit(execution_id, 1, " after"),
+        ] {
+            presentation.vm_effect_envelope(envelope);
+        }
+
+        let mut accepted = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            let ReplEvent::VmEffect {
+                projection,
+                envelope,
+            } = event
+            else {
+                panic!("unexpected event-bus message");
+            };
+            accepted.push(super::super::event_loop::project_vm_effect_event(
+                &projection,
+                envelope,
+            ));
+        }
+        assert_eq!(accepted, vec![false, false, true, false, false]);
+
+        // The real tool completion contains `visible` in several serialized
+        // outcome fields. Only the accepted VM Emit belongs in the transcript.
+        let serialized_outcome = serde_json::json!({
+            "status": "completed",
+            "output": "visible after",
+            "output_chunks": ["visible", " after"],
+            "vm_side_effects": [{"event": {"emit": {"text": "visible"}}}]
+        })
+        .to_string();
+        super::super::event_loop::complete_successful_tool_row(
+            "submit_program",
+            &serde_json::json!({
+                "language": "lisp",
+                "source": "(begin)",
+                "intent": "inspect state"
+            }),
+            activity.work_unit().as_ref(),
+            row_idx,
+            &serialized_outcome,
+        );
+        activity.set_complete();
+
+        let messages = manager.get_messages();
+        assert_eq!(messages.len(), 1, "tool execution must stay in Activity");
+        let root = messages[0]
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("activity transcript tree");
+        assert_eq!(root.kind, TranscriptRowKind::Activity);
+        assert_eq!(root.children.len(), 1);
+        let tool = &root.children[0];
+        assert_eq!(tool.kind, TranscriptRowKind::ToolCall);
+        let outputs = tool
+            .children
+            .iter()
+            .filter(|row| row.kind == TranscriptRowKind::ToolOutput)
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0]
+                .body
+                .iter()
+                .filter(|line| line.contains("visible"))
+                .count(),
+            1
+        );
+        assert!(outputs[0].body.iter().any(|line| line == "live line"));
+        assert!(outputs[0].body.iter().any(|line| line == " after"));
+        assert!(messages.iter().all(|message| {
+            message
+                .transcript_row(&crate::config::ColorScheme::default())
+                .is_none_or(|row| row.kind != TranscriptRowKind::Output)
+        }));
+
+        let canonical = activity.complete_transcript(&crate::config::ColorScheme::default());
+        assert_eq!(canonical.matches("visible").count(), 1, "{canonical}");
+        assert_eq!(canonical.matches("live line").count(), 1, "{canonical}");
     }
 }
