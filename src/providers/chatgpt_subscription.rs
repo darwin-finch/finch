@@ -963,8 +963,16 @@ fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
     }
 }
 
-fn chatgpt_wire_namespace_is_valid(name: &str, namespace: &str) -> bool {
-    namespace == "functions" || (namespace == "collaboration" && is_chatgpt_agent_wire_alias(name))
+fn chatgpt_wire_namespace_is_valid(name: &str, namespace: Option<&str>) -> bool {
+    match namespace {
+        // Tools in this dialect are advertised inside the `functions`
+        // namespace object. Responses-Lite may omit the field on a returned
+        // custom function call; omission therefore denotes that advertised
+        // namespace, not an arbitrary provider-native namespace.
+        None | Some("functions") => true,
+        Some("collaboration") => is_chatgpt_agent_wire_alias(name),
+        Some(_) => false,
+    }
 }
 
 fn advertised_tool_names(request: &ProviderRequest) -> HashSet<String> {
@@ -1966,8 +1974,12 @@ fn parse_output_item(
             let wire_name = required_identifier(object, "name", 128)?;
             let namespace = object
                 .get("namespace")
-                .and_then(Value::as_str)
-                .context("ChatGPT function call omitted namespace")?;
+                .map(|namespace| {
+                    namespace
+                        .as_str()
+                        .context("ChatGPT function call namespace was invalid")
+                })
+                .transpose()?;
             if !chatgpt_wire_namespace_is_valid(&wire_name, namespace) {
                 bail!("ChatGPT function call namespace was invalid");
             }
@@ -2681,6 +2693,31 @@ mod tests {
             .collect()
     }
 
+    fn completed_sse_with_unnamespaced_tool(model: &str, name: &str) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                if event["item"]["type"] == "function_call" {
+                    event["item"]["name"] = json!(name);
+                    event["item"].as_object_mut().unwrap().remove("namespace");
+                    event["item"]["arguments"] = json!("{\"path\":\"README.md\"}");
+                    format!("data: {event}\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+
     fn consolidated_text_sse(model: &str) -> String {
         let body = completed_sse(model);
         let marker = "event: response.completed\ndata: ";
@@ -3043,6 +3080,24 @@ mod tests {
                     "ChatGPT requested a function Finch did not advertise"
                 );
             }
+
+            let mut blocks = Vec::new();
+            parse_output_item(
+                &json!({
+                    "type":"function_call",
+                    "call_id":format!("call-{wire_name}-default"),
+                    "name":wire_name,
+                    "arguments":"{\"path\":\"README.md\"}"
+                }),
+                &mut blocks,
+                &mut HashSet::new(),
+                &HashSet::from([local_name.to_string()]),
+            )
+            .expect("an omitted namespace must bind to the advertised functions group");
+            assert!(matches!(
+                blocks.as_slice(),
+                [ContentBlock::ToolUse { name, .. }] if name == local_name
+            ));
         }
 
         for (name, namespace) in [("finch_spawn_agent", "other"), ("read", "collaboration")] {
@@ -3085,6 +3140,41 @@ mod tests {
                     | "ChatGPT function call namespace was invalid"
             ));
         }
+
+        let reserved_without_namespace = parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"reserved-default",
+                "name":"spawn_agent",
+                "arguments":"{}"
+            }),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &HashSet::from(["spawn_agent".to_string()]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            reserved_without_namespace.to_string(),
+            "ChatGPT requested a reserved native function name"
+        );
+
+        let malformed_namespace = parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"malformed-namespace",
+                "name":"read",
+                "namespace":false,
+                "arguments":"{}"
+            }),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &HashSet::from(["read".to_string()]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            malformed_namespace.to_string(),
+            "ChatGPT function call namespace was invalid"
+        );
 
         for alias in [
             "finch_spawn_agent",
@@ -3222,6 +3312,53 @@ mod tests {
                     | StreamChunk::Allowance { .. })
             )));
         }
+    }
+
+    #[tokio::test]
+    async fn responses_lite_binds_omitted_namespace_to_advertised_functions_group() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_unnamespaced_tool(
+                DEFAULT_MODEL,
+                "finch_spawn_agent",
+            ))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+
+        let response = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("delegate")])
+                    .with_tools(vec![named_tool("spawn_agent"), tool()]),
+            )
+            .await
+            .expect("an omitted namespace must bind to the request's functions group");
+
+        assert!(response.content.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolUse { name, .. } if name == "spawn_agent"
+        )));
+        models.assert_async().await;
+        inference.assert_async().await;
     }
 
     #[test]
