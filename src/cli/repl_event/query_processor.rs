@@ -76,6 +76,16 @@ fn has_streamed_wire_source(source: &str) -> bool {
     !source.trim_start().is_empty()
 }
 
+fn fail_stream_projection(
+    source: &mut Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
+    work_unit: &crate::cli::messages::WorkUnit,
+) {
+    if let Some(source) = source.take() {
+        source.set_failed();
+    }
+    work_unit.set_failed();
+}
+
 fn brain_artifact_message_id(
     provenance: &super::query_state::BrainTurnProvenance,
     artifact: &str,
@@ -1264,10 +1274,7 @@ pub(crate) async fn process_query_with_tools(
                         }
                         Err(e) => {
                             tracing::error!("Stream error in event loop: {}", e);
-                            if let Some(source) = streamed_source_unit.take() {
-                                source.set_failed();
-                            }
-                            work_unit.set_failed();
+                            fail_stream_projection(&mut streamed_source_unit, &work_unit);
                             let _ = event_tx.send(ReplEvent::QueryFailed {
                                 query_id,
                                 error: format!("{}", e),
@@ -1290,10 +1297,7 @@ pub(crate) async fn process_query_with_tools(
                         work_unit.add_tokens(&text);
                     }
                 } else if !completed_text.is_empty() && completed_text != text {
-                    if let Some(source) = streamed_source_unit.take() {
-                        source.set_failed();
-                    }
-                    work_unit.set_failed();
+                    fail_stream_projection(&mut streamed_source_unit, &work_unit);
                     let _ = event_tx.send(ReplEvent::QueryFailed {
                         query_id,
                         error: "Provider streaming text did not match its completed content"
@@ -2066,6 +2070,31 @@ mod tests {
         assert!(!should_stream_responses(false, true));
         assert!(!should_stream_responses(true, false));
         assert!(!should_stream_responses(false, false));
+    }
+
+    #[test]
+    fn stream_error_and_final_text_mismatch_fail_the_production_source_projection() {
+        use crate::cli::messages::Message;
+
+        for failure in ["receive error", "final-text mismatch"] {
+            let output = OutputManager::default();
+            output.disable_stdout();
+            let work = output.start_work_unit("streaming");
+            let source = output.start_program_source("lisp");
+            source.replace_source("(say \"prefix\"");
+            let mut projected_source = Some(Arc::clone(&source));
+
+            // This is the exact terminal transition used by both error exits
+            // in the production streaming receive branch.
+            fail_stream_projection(&mut projected_source, &work);
+
+            assert!(projected_source.is_none(), "{failure}");
+            assert_eq!(source.status(), crate::cli::messages::MessageStatus::Failed);
+            assert_eq!(work.status(), crate::cli::messages::MessageStatus::Failed);
+            assert!(output.get_messages().iter().all(|message| {
+                message.status() != crate::cli::messages::MessageStatus::InProgress
+            }));
+        }
     }
 
     #[test]
