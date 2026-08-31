@@ -894,8 +894,8 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
         bail!("ChatGPT subscription request advertised too many tools");
     }
     let mut names = BTreeSet::new();
+    let mut wire_names = BTreeSet::new();
     let mut functions = Vec::with_capacity(tools.len());
-    let mut collaboration = Vec::new();
     for tool in tools {
         validate_identifier(&tool.name, 128, "tool name")?;
         validate_bounded_text(
@@ -906,9 +906,14 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
         if !names.insert(tool.name.clone()) {
             bail!("ChatGPT subscription request repeated a tool name");
         }
-        let function = json!({
+        let wire_name = chatgpt_wire_tool_name(&tool.name);
+        validate_identifier(wire_name, 128, "ChatGPT wire tool name")?;
+        if !wire_names.insert(wire_name.to_string()) {
+            bail!("ChatGPT subscription request repeated a wire tool name");
+        }
+        functions.push(json!({
             "type":"function",
-            "name":tool.name,
+            "name":wire_name,
             "description":tool.description,
             "strict":false,
             "parameters": {
@@ -917,34 +922,34 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
                 "required":tool.input_schema.required,
                 "additionalProperties":false
             }
-        });
-        match chatgpt_tool_namespace(&tool.name) {
-            "functions" => functions.push(function),
-            "collaboration" => collaboration.push(function),
-            _ => unreachable!("Finch ChatGPT tool namespaces are closed"),
-        }
-    }
-    let mut namespaces = Vec::with_capacity(2);
-    if !functions.is_empty() {
-        namespaces.push(
-            json!({"type":"namespace","name":"functions","description":"","tools":functions}),
-        );
-    }
-    if !collaboration.is_empty() {
-        namespaces.push(json!({
-            "type":"namespace",
-            "name":"collaboration",
-            "description":"Bounded child-agent lifecycle tools.",
-            "tools":collaboration
         }));
     }
-    Ok(namespaces)
+    Ok(if functions.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"type":"namespace","name":"functions","description":"","tools":functions})]
+    })
 }
 
-fn chatgpt_tool_namespace(name: &str) -> &'static str {
+fn chatgpt_wire_tool_name(name: &str) -> &str {
     match name {
-        "spawn_agent" | "await_agent" | "poll_agent" | "cancel_agent" => "collaboration",
-        _ => "functions",
+        "spawn_agent" => "finch_spawn_agent",
+        "await_agent" => "finch_await_agent",
+        "poll_agent" => "finch_poll_agent",
+        "cancel_agent" => "finch_cancel_agent",
+        _ => name,
+    }
+}
+
+fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
+    match name {
+        "finch_spawn_agent" => Some("spawn_agent"),
+        "finch_await_agent" => Some("await_agent"),
+        "finch_poll_agent" => Some("poll_agent"),
+        "finch_cancel_agent" => Some("cancel_agent"),
+        // These names have a distinct first-party Codex collaboration contract.
+        "spawn_agent" | "await_agent" | "poll_agent" | "cancel_agent" => None,
+        _ => Some(name),
     }
 }
 
@@ -1028,8 +1033,8 @@ fn map_message(
                     .context("Failed to serialize ChatGPT function arguments")?;
                 validate_bounded_text(&arguments, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
                 input.push(json!({
-                    "type":"function_call","call_id":id,"name":name,
-                    "namespace":chatgpt_tool_namespace(name),"arguments":arguments
+                    "type":"function_call","call_id":id,"name":chatgpt_wire_tool_name(name),
+                    "namespace":"functions","arguments":arguments
                 }));
             }
             ContentBlock::ToolResult {
@@ -1907,13 +1912,13 @@ fn parse_output_item(
             )?;
             validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
-            let name = required_identifier(object, "name", 128)?;
-            if object.get("namespace").and_then(Value::as_str)
-                != Some(chatgpt_tool_namespace(&name))
-            {
+            let wire_name = required_identifier(object, "name", 128)?;
+            if object.get("namespace").and_then(Value::as_str) != Some("functions") {
                 bail!("ChatGPT function call namespace was invalid");
             }
-            if !allowed_tools.contains(&name) {
+            let name = chatgpt_local_tool_name(&wire_name)
+                .context("ChatGPT requested a reserved native function name")?;
+            if !allowed_tools.contains(name) {
                 bail!("ChatGPT requested a function Finch did not advertise");
             }
             let arguments = object
@@ -1949,7 +1954,7 @@ fn parse_output_item(
             }
             blocks.push(ContentBlock::ToolUse {
                 id: call_id,
-                name,
+                name: name.to_string(),
                 input,
             });
         }
@@ -2817,7 +2822,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_advertises_and_replays_agent_tools_in_collaboration_namespace() {
+    fn responses_lite_uses_non_reserved_wire_names_for_finch_agent_tools() {
         let request = ProviderRequest::new(vec![
             Message::user("delegate"),
             Message::with_content(
@@ -2842,11 +2847,10 @@ mod tests {
 
         let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
         let namespaces = body["input"][0]["tools"].as_array().unwrap();
-        assert_eq!(namespaces.len(), 2);
+        assert_eq!(namespaces.len(), 1);
         assert_eq!(namespaces[0]["name"], "functions");
         assert_eq!(namespaces[0]["tools"][0]["name"], "read");
-        assert_eq!(namespaces[1]["name"], "collaboration");
-        assert_eq!(namespaces[1]["tools"][0]["name"], "spawn_agent");
+        assert_eq!(namespaces[0]["tools"][1]["name"], "finch_spawn_agent");
 
         let replayed_call = body["input"]
             .as_array()
@@ -2854,11 +2858,12 @@ mod tests {
             .iter()
             .find(|item| item["type"] == "function_call")
             .unwrap();
-        assert_eq!(replayed_call["namespace"], "collaboration");
+        assert_eq!(replayed_call["name"], "finch_spawn_agent");
+        assert_eq!(replayed_call["namespace"], "functions");
     }
 
     #[test]
-    fn function_call_namespace_is_bound_to_the_advertised_tool() {
+    fn function_call_wire_alias_is_bound_to_the_advertised_finch_tool() {
         let allowed = HashSet::from(["spawn_agent".to_string(), "read".to_string()]);
         let mut blocks = Vec::new();
         let mut call_ids = HashSet::new();
@@ -2866,8 +2871,8 @@ mod tests {
             &json!({
                 "type":"function_call",
                 "call_id":"call-agent",
-                "name":"spawn_agent",
-                "namespace":"collaboration",
+                "name":"finch_spawn_agent",
+                "namespace":"functions",
                 "arguments":"{\"task\":\"inspect\"}"
             }),
             &mut blocks,
@@ -2881,8 +2886,8 @@ mod tests {
         ));
 
         for (name, namespace) in [
-            ("spawn_agent", "functions"),
-            ("spawn_agent", "other"),
+            ("finch_spawn_agent", "collaboration"),
+            ("finch_spawn_agent", "other"),
             ("read", "collaboration"),
         ] {
             let error = parse_output_item(
@@ -2903,6 +2908,40 @@ mod tests {
                 "ChatGPT function call namespace was invalid"
             );
         }
+
+        for namespace in ["functions", "collaboration"] {
+            let error = parse_output_item(
+                &json!({
+                    "type":"function_call",
+                    "call_id":format!("reserved-{namespace}"),
+                    "name":"spawn_agent",
+                    "namespace":namespace,
+                    "arguments":"{\"task_name\":\"worker\"}"
+                }),
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &allowed,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.to_string().as_str(),
+                "ChatGPT requested a reserved native function name"
+                    | "ChatGPT function call namespace was invalid"
+            ));
+        }
+
+        let collision = ProviderRequest::new(vec![Message::user("delegate")])
+            .with_model(DEFAULT_MODEL)
+            .with_tools(vec![
+                named_tool("spawn_agent"),
+                named_tool("finch_spawn_agent"),
+            ]);
+        assert_eq!(
+            responses_lite_request(&collision, ReasoningEffort::High)
+                .unwrap_err()
+                .to_string(),
+            "ChatGPT subscription request repeated a wire tool name"
+        );
     }
 
     #[test]
