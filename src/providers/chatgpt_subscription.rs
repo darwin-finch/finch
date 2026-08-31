@@ -451,7 +451,7 @@ impl ChatGptSubscriptionProvider {
             .header("ChatGPT-Account-ID", &lease.account)
             .header("originator", "finch")
             .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
-            .header("version", CHATGPT_CATALOG_CLIENT_VERSION)
+            .header("version", env!("CARGO_PKG_VERSION"))
             .header(
                 "x-finch-chatgpt-protocol",
                 CHATGPT_INFERENCE_PROTOCOL_REVISION,
@@ -535,7 +535,7 @@ impl ChatGptSubscriptionProvider {
                     .header("ChatGPT-Account-ID", &lease.account)
                     .header("originator", "finch")
                     .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
-                    .header("version", CHATGPT_CATALOG_CLIENT_VERSION)
+                    .header("version", env!("CARGO_PKG_VERSION"))
                     .header("x-finch-chatgpt-protocol", CHATGPT_INFERENCE_PROTOCOL_REVISION)
                     .header("x-openai-internal-codex-responses-lite", "true")
                     .header(reqwest::header::ACCEPT, "text/event-stream")
