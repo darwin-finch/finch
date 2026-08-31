@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+wrapper="$script_dir/with-cargo-slot"
+fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch-cargo-slot-test.XXXXXX")"
+holder_pid=""
+
+cleanup() {
+    if [[ -n "$holder_pid" ]]; then
+        kill "$holder_pid" 2>/dev/null || true
+        wait "$holder_pid" 2>/dev/null || true
+    fi
+    rm -rf "$fixture_root"
+}
+trap cleanup EXIT
+
+repo="$fixture_root/repo"
+worktree="$fixture_root/worktree"
+ready="$fixture_root/holder-ready"
+git init -q "$repo"
+printf 'fixture\n' >"$repo/README"
+git -C "$repo" add README
+git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid commit -qm fixture
+git -C "$repo" worktree add -q "$worktree" -b second-worktree
+
+jobs="$(cd "$repo" && env -u CARGO_BUILD_JOBS "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
+if [[ "$jobs" != "2" ]]; then
+    echo "expected default CARGO_BUILD_JOBS=2, got $jobs" >&2
+    exit 1
+fi
+
+jobs="$(cd "$repo" && CARGO_BUILD_JOBS=1 "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
+if [[ "$jobs" != "1" ]]; then
+    echo "wrapper replaced an explicit CARGO_BUILD_JOBS value" >&2
+    exit 1
+fi
+
+set +e
+(cd "$repo" && "$wrapper" sh -c 'exit 23')
+status=$?
+set -e
+if [[ $status -ne 23 ]]; then
+    echo "expected wrapped exit status 23, got $status" >&2
+    exit 1
+fi
+
+(cd "$repo" && "$wrapper" sh -c 'touch "$1"; sleep 2' sh "$ready") &
+holder_pid=$!
+for _ in {1..100}; do
+    [[ -e "$ready" ]] && break
+    sleep 0.02
+done
+if [[ ! -e "$ready" ]]; then
+    echo "lock holder did not start" >&2
+    exit 1
+fi
+
+if (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true); then
+    echo "a second worktree acquired the repository-wide slot concurrently" >&2
+    exit 1
+fi
+
+wait "$holder_pid"
+holder_pid=""
+(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true)
+
+echo "with-cargo-slot regression passed"
