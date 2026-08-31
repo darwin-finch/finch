@@ -1610,7 +1610,7 @@ fn parse_completed(
     allowed_tools: &HashSet<String>,
     accumulator: &mut StreamAccumulator,
 ) -> Result<CompletedResponse> {
-    bounded_terminal_response_keys(
+    exact_keys(
         response,
         &[
             "id",
@@ -1653,8 +1653,21 @@ fn parse_completed(
             "top_logprobs",
             "frequency_penalty",
             "presence_penalty",
+            // Audited passive accounting extension observed on the live
+            // Responses-Lite terminal object. It cannot cause execution and
+            // is bounded below before being ignored.
+            "tool_usage",
         ],
     )?;
+    if let Some(tool_usage) = response.get("tool_usage") {
+        if serde_json::to_vec(tool_usage)
+            .context("ChatGPT terminal response tool usage metadata was invalid")?
+            .len()
+            > MAX_TOOL_ARGUMENT_BYTES
+        {
+            bail!("ChatGPT terminal response tool usage metadata exceeded the size limit");
+        }
+    }
     validate_documented_response_metadata(response)?;
     if response
         .get("background")
@@ -1696,11 +1709,17 @@ fn parse_completed(
             // preceding output_item.done events are useful for progressive UI, but
             // OpenAI may consolidate, replace, or enrich those snapshots before
             // response.completed (notably opaque reasoning continuations).  Fully
-            // validate both representations, then retain the terminal snapshot;
-            // requiring equality here rejects valid Responses streams.
-            project_output_items(accumulator.output_items.values(), allowed_tools)?;
+            // validate both representations and require identical user-visible
+            // text and executable tool calls. Opaque reasoning continuations may
+            // legitimately be replaced, so retain their terminal snapshot.
+            let streamed = project_output_items(accumulator.output_items.values(), allowed_tools)?;
+            let terminal = project_output_items(output.iter(), allowed_tools)?;
+            if observable_blocks(&streamed) != observable_blocks(&terminal) {
+                bail!("ChatGPT terminal output did not match streamed output items");
+            }
+        } else {
+            project_output_items(output.iter(), allowed_tools)?;
         }
-        project_output_items(output.iter(), allowed_tools)?;
         accumulator.output_items = output
             .iter()
             .cloned()
@@ -1742,6 +1761,13 @@ fn project_output_items<'a>(
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
     }
     Ok(blocks)
+}
+
+fn observable_blocks(blocks: &[ContentBlock]) -> Vec<&ContentBlock> {
+    blocks
+        .iter()
+        .filter(|block| !matches!(block, ContentBlock::OpaqueReasoning { .. }))
+        .collect()
 }
 
 fn parse_output_item(
@@ -2195,32 +2221,11 @@ fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
         if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
             bail!("ChatGPT subscription response metadata key was invalid");
         }
-        // Field names are protocol metadata and safe to expose; values may
-        // contain credentials, private reasoning, or tool arguments and must
-        // never be included in this diagnostic.
-        bail!("ChatGPT subscription response contained unknown field `{key}`");
-    }
-    Ok(())
-}
-
-fn bounded_terminal_response_keys(object: &Map<String, Value>, documented: &[&str]) -> Result<()> {
-    if object.len() > documented.len().saturating_add(64) {
-        bail!("ChatGPT terminal response contained excessive metadata");
-    }
-    for (key, value) in object
-        .iter()
-        .filter(|(key, _)| !documented.contains(&key.as_str()))
-    {
-        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
-            bail!("ChatGPT terminal response metadata key was invalid");
-        }
-        if serde_json::to_vec(value)
-            .context("ChatGPT terminal response metadata was invalid")?
-            .len()
-            > MAX_TOOL_ARGUMENT_BYTES
-        {
-            bail!("ChatGPT terminal response metadata exceeded the size limit");
-        }
+        // Both JSON keys and values are untrusted response-body data. Never
+        // reflect either one into diagnostics: an adversarial key can contain
+        // credentials, private reasoning, or tool arguments just as easily as
+        // a value can.
+        bail!("ChatGPT subscription response contained an unknown field");
     }
     Ok(())
 }
@@ -2996,12 +3001,12 @@ mod tests {
     }
 
     #[test]
-    fn actual_model_uses_authoritative_header_and_never_payload_model() {
+    fn actual_model_provenance_accepts_agreement_and_rejects_conflict_or_absence() {
         let allowed = HashSet::new();
         let terminal = json!({
             "id":"resp-1",
             "status":"completed",
-            "model":"attacker-payload-model",
+            "model":DEFAULT_MODEL,
             "output":[],
             "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}
         });
@@ -3016,16 +3021,35 @@ mod tests {
         .unwrap();
         assert_eq!(completed.model, DEFAULT_MODEL);
 
+        let conflicting = json!({
+            "id":"resp-conflict",
+            "status":"completed",
+            "model":"attacker-payload-model",
+            "output":[]
+        });
         let mut accumulator = StreamAccumulator::default();
         let error = parse_completed(
-            terminal.as_object().unwrap(),
+            conflicting.as_object().unwrap(),
             DEFAULT_MODEL,
-            None,
+            Some(DEFAULT_MODEL),
             &allowed,
             &mut accumulator,
         )
         .err()
-        .expect("missing authoritative model header must fail")
+        .expect("conflicting payload and header provenance must fail")
+        .to_string();
+        assert!(error.contains("incompatible actual model"));
+
+        let missing = json!({"id":"resp-missing","status":"completed","output":[]});
+        let error = parse_completed(
+            missing.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &allowed,
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("absent payload and header provenance must fail")
         .to_string();
         assert!(error.contains("omitted actual model provenance"));
     }
@@ -3433,6 +3457,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let initial_catalog = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(200)
             .with_body(catalog_body())
@@ -3440,6 +3468,10 @@ mod tests {
             .await;
         let refreshed_catalog = server
             .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
             .match_header("authorization", "Bearer refreshed-subscription-secret")
             .with_status(200)
             .with_body(catalog_body())
@@ -3477,11 +3509,15 @@ mod tests {
             .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
             .await
             .unwrap_err();
-        let rejection = error
-            .downcast_ref::<SubscriptionResponseRejected>()
-            .unwrap_or_else(|| {
-                panic!("the second HTTP rejection lost its typed status: {error:#}")
-            });
+        let Some(rejection) = error.downcast_ref::<SubscriptionResponseRejected>() else {
+            panic!(
+                "the second HTTP rejection lost its typed status: {error:#}; matches: initial_catalog={}, refreshed_catalog={}, first={}, second={}",
+                initial_catalog.matched_async().await,
+                refreshed_catalog.matched_async().await,
+                first.matched_async().await,
+                second.matched_async().await,
+            );
+        };
         assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
         let display = error.to_string();
@@ -3863,7 +3899,6 @@ mod tests {
         let inference = server
             .mock("POST", RESPONSES_PATH)
             .with_status(200)
-            .with_header("openai-model", DEFAULT_MODEL)
             .with_body(completed_sse(DEFAULT_MODEL))
             .create_async()
             .await;
@@ -3888,14 +3923,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_response_field_diagnostic_names_only_the_field() {
-        let secret = "private-reasoning-and-tool-argument";
-        let object = json!({"known":true,"future_metadata":secret});
-        let error = exact_keys(object.as_object().unwrap(), &["known"])
+    fn unknown_response_field_diagnostic_reflects_neither_key_nor_value() {
+        let secret_key = "private-key-that-is-also-a-secret";
+        let secret_value = "private-reasoning-and-tool-argument";
+        let mut object = Map::new();
+        object.insert("known".to_string(), json!(true));
+        object.insert(secret_key.to_string(), json!(secret_value));
+        let error = exact_keys(&object, &["known"])
             .expect_err("an unknown protocol field must remain explicit until audited");
         let display = error.to_string();
-        assert!(display.contains("`future_metadata`"));
-        assert!(!display.contains(secret));
+        assert!(display.contains("unknown field"));
+        assert!(!display.contains(secret_key));
+        assert!(!display.contains(secret_value));
     }
 
     #[test]
@@ -3968,23 +4007,52 @@ mod tests {
     }
 
     #[test]
-    fn terminal_extension_metadata_is_bounded_but_not_projected() {
+    fn audited_terminal_tool_usage_is_bounded_but_not_projected() {
         let mut response = Map::new();
         response.insert("id".to_string(), json!("resp-extension"));
+        response.insert("model".to_string(), json!(DEFAULT_MODEL));
+        response.insert("status".to_string(), json!("completed"));
+        response.insert("output".to_string(), json!([]));
         response.insert(
             "tool_usage".to_string(),
             json!({"future_accounting_shape":{"read":1}}),
         );
-        bounded_terminal_response_keys(&response, &["id"])
-            .expect("bounded terminal accounting metadata must be forward compatible");
+        parse_completed(
+            &response,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .expect("audited bounded terminal accounting metadata must be accepted");
 
         response.insert(
             "tool_usage".to_string(),
             json!("x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)),
         );
-        let error = bounded_terminal_response_keys(&response, &["id"])
-            .expect_err("terminal extension metadata must remain bounded");
+        let error = parse_completed(
+            &response,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("terminal extension metadata must remain bounded");
         assert!(error.to_string().contains("exceeded the size limit"));
+
+        response.remove("tool_usage");
+        response.insert("unknown_future_semantics".to_string(), json!(false));
+        let error = parse_completed(
+            &response,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("unaudited terminal fields must remain fail closed");
+        assert!(error.to_string().contains("unknown field"));
 
         let executable_event = json!({
             "type":"response.output_item.done",
@@ -4002,13 +4070,11 @@ mod tests {
         )
         .err()
         .expect("unknown event semantics must remain strict");
-        assert!(error
-            .to_string()
-            .contains("unknown field `unknown_executable_semantics`"));
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
-    fn terminal_output_is_authoritative_over_streamed_item_snapshots() {
+    fn terminal_output_may_replace_only_opaque_streamed_state() {
         let streamed_item = json!({
             "type":"message",
             "role":"assistant",
@@ -4034,7 +4100,22 @@ mod tests {
             "output":[terminal_item]
         });
         let mut accumulator = StreamAccumulator::default();
-        accumulator.output_items.insert(0, streamed_item.clone());
+        accumulator.output_items.insert(
+            0,
+            json!({
+                "type":"reasoning",
+                "summary":[],
+                "encrypted_content":"streamed-opaque"
+            }),
+        );
+        accumulator.output_items.insert(1, streamed_item.clone());
+        let terminal_reasoning = json!({
+            "type":"reasoning",
+            "summary":[],
+            "encrypted_content":"terminal-opaque"
+        });
+        let mut response = response;
+        response["output"] = json!([terminal_reasoning, terminal_item]);
         let completed = parse_completed(
             response.as_object().unwrap(),
             DEFAULT_MODEL,
@@ -4045,7 +4126,8 @@ mod tests {
         .expect("terminal metadata enrichment must preserve semantic output equality");
         assert!(matches!(
             completed.blocks.as_slice(),
-            [ContentBlock::Text { text }] if text == "hello"
+            [ContentBlock::OpaqueReasoning { encrypted_content }, ContentBlock::Text { text }]
+                if encrypted_content == "terminal-opaque" && text == "hello"
         ));
 
         let changed = json!({
@@ -4060,18 +4142,16 @@ mod tests {
         });
         let mut accumulator = StreamAccumulator::default();
         accumulator.output_items.insert(0, streamed_item);
-        let completed = parse_completed(
+        let error = parse_completed(
             changed.as_object().unwrap(),
             DEFAULT_MODEL,
             None,
             &HashSet::new(),
             &mut accumulator,
         )
-        .expect("the validated terminal completion must supersede streamed snapshots");
-        assert!(matches!(
-            completed.blocks.as_slice(),
-            [ContentBlock::Text { text }] if text == "different"
-        ));
+        .err()
+        .expect("terminal text drift must remain rejected");
+        assert!(error.to_string().contains("did not match"));
     }
 
     #[tokio::test]
