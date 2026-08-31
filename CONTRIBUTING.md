@@ -4,6 +4,16 @@ Thank you for improving Finch. The project accepts focused fixes, tests, documen
 discussion. Before starting a large change, open or join an issue so implementation and conformance
 work can be coordinated.
 
+Codex contributors can invoke `$finch-backlog`, and Claude Code contributors can invoke
+`/finch-backlog`, to audit the current GitHub dependency frontier and carry an issue through an
+isolated worktree, regression, review, CI, merge evidence, and cleanup. The canonical skill lives in
+`.agents/skills/finch-backlog`; `.claude/skills/finch-backlog` links to the same directory so both
+tools use one reviewable workflow rather than private or duplicated assistant configuration.
+Before editing an issue, the workflow requires a versioned `finch-work-claim:v1` GitHub comment
+with the worker, branch, worktree, base commit, and bounded scope. That comment is the sole ownership
+record; assignees, labels, branches, and pull requests do not substitute for it. This gives every
+tool and person the same deterministic collision rule even when they share a GitHub account.
+
 ## Development setup
 
 Finch's supported CI targets are Apple Silicon macOS and x86-64 Linux. Install stable Rust and the
