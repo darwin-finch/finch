@@ -544,7 +544,7 @@ impl ChatGptSubscriptionProvider {
                     .send() => response.context("Failed to start ChatGPT subscription response")?,
             };
             if response.status() == StatusCode::UNAUTHORIZED && !unauthorized_retry_used {
-                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
+                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
                 lease = self
                     .source
                     .refresh_after_unauthorized(&lease.generation, &cancel)
@@ -562,7 +562,7 @@ impl ChatGptSubscriptionProvider {
             }
             if !response.status().is_success() {
                 let status = response.status();
-                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
+                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
                 return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
