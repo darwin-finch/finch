@@ -61,6 +61,14 @@ The account catalog is bounded and cached by account plus credential
 generation. ETags may revalidate an expired cache, but an entry from another
 account is never reused. Both `gpt-5.6-sol` and `gpt-5.6` must be explicitly
 advertised with text, image, API, and Responses-Lite support before inference.
+Their numeric `context_window` values are authoritative account-catalog
+metadata when they fall in the defensive range `1..=10,000,000`; Finch does
+not treat one exact window size as a dialect or authorization discriminator.
+Missing, non-numeric, zero, and excessive values fail closed without exposing
+the catalog body or account credentials. The synchronous capability descriptor
+reports the context window as unknown because it cannot perform credentialed
+account discovery; the validated catalog retains the exact value for each
+selected model.
 
 ## Request and continuation semantics
 

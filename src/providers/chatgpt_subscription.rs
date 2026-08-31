@@ -52,6 +52,7 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -86,6 +87,28 @@ impl fmt::Display for SubscriptionCatalogUnavailable {
 }
 
 impl std::error::Error for SubscriptionCatalogUnavailable {}
+
+#[derive(Debug)]
+enum SubscriptionCatalogContextWindowInvalid {
+    MissingOrMalformed,
+    OutOfBounds(u64),
+}
+
+impl fmt::Display for SubscriptionCatalogContextWindowInvalid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOrMalformed => formatter.write_str(
+                "ChatGPT catalog model context window was missing or malformed",
+            ),
+            Self::OutOfBounds(value) => write!(
+                formatter,
+                "ChatGPT catalog model context window {value} was outside the supported range 1..={MAX_CATALOG_CONTEXT_WINDOW}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubscriptionCatalogContextWindowInvalid {}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -460,11 +483,7 @@ impl ChatGptSubscriptionProvider {
             .models
             .get(&request.model)
             .context("ChatGPT account does not advertise the configured model")?;
-        if !selected.responses_lite
-            || !selected.image_input
-            || selected.context_window != 1_050_000
-            || selected.slug != request.model
-        {
+        if !catalog_model_matches_request(selected, &request.model) {
             bail!("ChatGPT account model is not compatible with the pinned Responses-Lite dialect");
         }
         let url = self.route(RESPONSES_PATH, None)?;
@@ -495,11 +514,7 @@ impl ChatGptSubscriptionProvider {
                     .models
                     .get(&request.model)
                     .context("ChatGPT account model changed while refreshing credentials")?;
-                if !refreshed_model.responses_lite
-                    || !refreshed_model.image_input
-                    || refreshed_model.context_window != 1_050_000
-                    || refreshed_model.slug != request.model
-                {
+                if !catalog_model_matches_request(refreshed_model, &request.model) {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
                 unauthorized_retry_used = true;
@@ -635,7 +650,9 @@ fn subscription_capabilities(model: &str) -> ModelCapabilities {
             "2026-08-30",
             source,
         ),
-        Some(1_050_000),
+        // The account-scoped catalog is authoritative for this value. The
+        // synchronous capability API cannot perform credentialed discovery.
+        None,
         Some(128_000),
         None,
     )
@@ -651,6 +668,13 @@ fn subscription_capabilities(model: &str) -> ModelCapabilities {
     capabilities.usage_reporting =
         ModelFeature::static_metadata(CapabilitySupport::Supported, "2026-08-30", source);
     capabilities
+}
+
+fn catalog_model_matches_request(model: &CatalogModel, requested_model: &str) -> bool {
+    model.responses_lite
+        && model.image_input
+        && (1..=MAX_CATALOG_CONTEXT_WINDOW as usize).contains(&model.context_window)
+        && model.slug == requested_model
 }
 
 fn validate_model(model: &str) -> Result<()> {
@@ -967,14 +991,7 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
         {
             continue;
         }
-        let context_window = object
-            .get("context_window")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .context("ChatGPT catalog model omitted a valid context window")?;
-        if context_window != 1_050_000 {
-            bail!("ChatGPT catalog model context window was invalid");
-        }
+        let context_window = parse_catalog_context_window(object)?;
         if supported {
             if !responses_lite || !image_input {
                 bail!("ChatGPT GPT-5.6 Sol catalog capabilities drifted");
@@ -994,6 +1011,18 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
         bail!("ChatGPT account does not advertise both pinned GPT-5.6 Sol identifiers");
     }
     Ok(Catalog { models: parsed })
+}
+
+fn parse_catalog_context_window(object: &Map<String, Value>) -> Result<usize> {
+    let value = object
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .ok_or(SubscriptionCatalogContextWindowInvalid::MissingOrMalformed)?;
+    if value == 0 || value > MAX_CATALOG_CONTEXT_WINDOW {
+        return Err(SubscriptionCatalogContextWindowInvalid::OutOfBounds(value).into());
+    }
+    usize::try_from(value)
+        .map_err(|_| SubscriptionCatalogContextWindowInvalid::OutOfBounds(value).into())
 }
 
 #[derive(Default)]
@@ -2051,6 +2080,10 @@ mod tests {
     }
 
     fn catalog_body() -> String {
+        catalog_body_with_context_windows(1_050_000, 1_050_000)
+    }
+
+    fn catalog_body_with_context_windows(sol: u64, alias: u64) -> String {
         json!({
             "models":[
                 {
@@ -2058,14 +2091,14 @@ mod tests {
                     "supported_in_api":true,
                     "use_responses_lite":true,
                     "input_modalities":["text","image"],
-                    "context_window":1050000
+                    "context_window":sol
                 },
                 {
                     "slug":"gpt-5.6",
                     "supported_in_api":true,
                     "use_responses_lite":true,
                     "input_modalities":["text","image"],
-                    "context_window":1050000
+                    "context_window":alias
                 }
             ]
         })
@@ -2303,11 +2336,91 @@ mod tests {
             );
             assert!(capability.image_input.is_supported());
             assert!(capability.continuation.is_supported());
+            assert_eq!(capability.context_window.max_tokens, None);
         }
         assert!(subscription_capabilities("gpt-4o")
             .wire_protocol
             .protocol
             .is_none());
+    }
+
+    #[test]
+    fn catalog_accepts_and_preserves_authoritative_bounded_context_windows() {
+        for (sol, alias) in [(200_000, 262_144), (1_000_000, 1_050_000)] {
+            let catalog =
+                parse_catalog(catalog_body_with_context_windows(sol, alias).as_bytes()).unwrap();
+            assert_eq!(catalog.models[DEFAULT_MODEL].context_window, sol as usize);
+            assert_eq!(catalog.models[MODEL_ALIAS].context_window, alias as usize);
+        }
+    }
+
+    #[test]
+    fn catalog_rejects_missing_malformed_zero_and_excessive_context_windows() {
+        let assert_invalid = |catalog: Value| {
+            let error = parse_catalog(catalog.to_string().as_bytes())
+                .err()
+                .expect("invalid context window must fail");
+            assert!(error.is::<SubscriptionCatalogContextWindowInvalid>());
+            error.to_string()
+        };
+
+        let mut missing: Value = serde_json::from_str(&catalog_body()).unwrap();
+        missing["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_window");
+        assert!(assert_invalid(missing).contains("missing or malformed"));
+
+        let mut malformed: Value = serde_json::from_str(&catalog_body()).unwrap();
+        malformed["models"][0]["context_window"] = json!("1000000");
+        assert!(assert_invalid(malformed).contains("missing or malformed"));
+
+        let mut zero: Value = serde_json::from_str(&catalog_body()).unwrap();
+        zero["models"][0]["context_window"] = json!(0);
+        let zero_error = assert_invalid(zero);
+        assert!(zero_error.contains("context window 0"));
+        assert!(!zero_error.contains("models"));
+
+        let mut excessive: Value = serde_json::from_str(&catalog_body()).unwrap();
+        excessive["models"][0]["context_window"] = json!(MAX_CATALOG_CONTEXT_WINDOW + 1);
+        let excessive_error = assert_invalid(excessive);
+        assert!(excessive_error.contains(&(MAX_CATALOG_CONTEXT_WINDOW + 1).to_string()));
+        assert!(!excessive_error.contains("models"));
+    }
+
+    #[test]
+    fn catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
+        let mut wrong_slug: Value = serde_json::from_str(&catalog_body()).unwrap();
+        wrong_slug["models"][0]["slug"] = json!("gpt-5.6-sol-impostor");
+        assert!(parse_catalog(wrong_slug.to_string().as_bytes())
+            .err()
+            .expect("wrong slug must fail")
+            .to_string()
+            .contains("both pinned GPT-5.6 Sol identifiers"));
+
+        let mut unsupported_api: Value = serde_json::from_str(&catalog_body()).unwrap();
+        unsupported_api["models"][0]["supported_in_api"] = json!(false);
+        assert!(parse_catalog(unsupported_api.to_string().as_bytes())
+            .err()
+            .expect("unsupported API model must fail")
+            .to_string()
+            .contains("both pinned GPT-5.6 Sol identifiers"));
+
+        let mut missing_image: Value = serde_json::from_str(&catalog_body()).unwrap();
+        missing_image["models"][0]["input_modalities"] = json!(["text"]);
+        assert!(parse_catalog(missing_image.to_string().as_bytes())
+            .err()
+            .expect("missing image modality must fail")
+            .to_string()
+            .contains("catalog capabilities drifted"));
+
+        let mut missing_text: Value = serde_json::from_str(&catalog_body()).unwrap();
+        missing_text["models"][0]["input_modalities"] = json!(["image"]);
+        assert!(parse_catalog(missing_text.to_string().as_bytes())
+            .err()
+            .expect("missing text modality must fail")
+            .to_string()
+            .contains("both pinned GPT-5.6 Sol identifiers"));
     }
 
     #[test]
@@ -2619,7 +2732,7 @@ mod tests {
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
-            .with_body(catalog_body())
+            .with_body(catalog_body_with_context_windows(1_000_000, 1_000_000))
             .expect(1)
             .create_async()
             .await;
