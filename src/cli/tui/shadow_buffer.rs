@@ -665,7 +665,10 @@ mod tests {
 
         buf.render_lines(&lines);
 
-        assert_eq!(buf.get(0, 0).unwrap().ch, ' ');
+        assert_eq!(buf.get(0, 0).unwrap().ch, '❯');
+        for column in 0..buf.width {
+            assert_eq!(buf.get(column, 0).unwrap().style, expected);
+        }
         for column in 0..buf.width {
             assert_eq!(buf.get(column, 1).unwrap().style, expected);
         }
@@ -681,7 +684,8 @@ mod tests {
 
         buf.render_lines(&lines);
 
-        for row in 0..buf.height {
+        assert_eq!(buf.get(0, 0).unwrap().style, Style::default());
+        for row in 1..buf.height {
             for column in 0..buf.width {
                 assert_eq!(buf.get(column, row).unwrap().style, expected);
             }
