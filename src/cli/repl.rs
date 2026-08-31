@@ -2091,6 +2091,15 @@ impl Repl {
         use crate::cli::global_output::get_global_tui_renderer;
         use crate::cli::repl_event::EventLoop;
 
+        // The terminal signal listener is installed before TUI activation and
+        // can run while the rest of Repl construction is still synchronous.
+        // Do not fall back to the traditional reader after it has restored the
+        // terminal during that early-startup window.
+        if crate::cli::tui::terminal_shutdown_requested().is_some() {
+            crate::cli::tui::wait_for_terminal_shutdown().await;
+            return Ok(());
+        }
+
         // Check if TUI is available (required for event loop).
         // Lock scope ends at the closing brace — tui_lock is NOT in scope at the await below.
         let tui_renderer_opt = {

@@ -21,6 +21,9 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 - Finch owns raw mode, bracketed paste, and keyboard enhancement as one
   lifecycle: suspend releases all three, resume reacquires all three, and
   clean/error/panic/SIGTERM/SIGHUP paths attempt every reset independently.
+  SIGTERM/SIGHUP ownership is installed before terminal activation; a dedicated
+  listener thread restores modes without waiting for startup or an event-loop
+  branch, then notifies the ordinary async shutdown path.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Finch does not
   enable terminal mouse reporting by default, so selection, copying, and

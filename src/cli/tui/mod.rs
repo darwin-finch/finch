@@ -31,8 +31,8 @@ use crossterm::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, OnceLock,
 };
 use std::time::Duration;
 use tui_textarea::TextArea;
@@ -66,6 +66,157 @@ enum TerminalActivation {
     Startup,
     Resume,
     EmergencyRestore,
+}
+
+const NO_TERMINAL_SHUTDOWN_SIGNAL: u8 = 0;
+const TERMINAL_SHUTDOWN_SIGTERM: u8 = 1;
+const TERMINAL_SHUTDOWN_SIGHUP: u8 = 2;
+
+struct TerminalShutdownState {
+    signal: AtomicU8,
+    cleanup_complete: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TerminalShutdownState {
+    fn new() -> Self {
+        Self {
+            signal: AtomicU8::new(NO_TERMINAL_SHUTDOWN_SIGNAL),
+            cleanup_complete: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn signal_name(&self) -> Option<&'static str> {
+        match self.signal.load(Ordering::Acquire) {
+            TERMINAL_SHUTDOWN_SIGTERM => Some("SIGTERM"),
+            TERMINAL_SHUTDOWN_SIGHUP => Some("SIGHUP"),
+            _ => None,
+        }
+    }
+
+    fn dispatch(&self, signal: u8) {
+        if self
+            .signal
+            .compare_exchange(
+                NO_TERMINAL_SHUTDOWN_SIGNAL,
+                signal,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        // This runs on the dedicated listener thread, not in an OS signal
+        // handler. It stays responsive while startup or an event-loop branch
+        // is synchronously busy and never needs the renderer mutex.
+        emergency_restore_terminal();
+        self.cleanup_complete.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+}
+
+static TERMINAL_SHUTDOWN_STATE: OnceLock<Result<Arc<TerminalShutdownState>, String>> =
+    OnceLock::new();
+
+#[cfg(unix)]
+fn initialize_terminal_shutdown_state() -> Result<Arc<TerminalShutdownState>, String> {
+    let state = Arc::new(TerminalShutdownState::new());
+    let listener_state = Arc::clone(&state);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("finch-terminal-signals".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("create signal runtime: {error}")));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+
+                let mut terminate = match signal(SignalKind::terminate()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("install SIGTERM listener: {error}")));
+                        return;
+                    }
+                };
+                let mut hangup = match signal(SignalKind::hangup()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(format!("install SIGHUP listener: {error}")));
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                loop {
+                    let received = tokio::select! {
+                        signal = terminate.recv() => signal.map(|_| TERMINAL_SHUTDOWN_SIGTERM),
+                        signal = hangup.recv() => signal.map(|_| TERMINAL_SHUTDOWN_SIGHUP),
+                    };
+                    let Some(signal) = received else {
+                        return;
+                    };
+                    listener_state.dispatch(signal);
+                }
+            });
+        })
+        .map_err(|error| format!("spawn terminal signal listener: {error}"))?;
+    ready_rx
+        .recv()
+        .map_err(|error| format!("await terminal signal listener: {error}"))??;
+    Ok(state)
+}
+
+#[cfg(not(unix))]
+fn initialize_terminal_shutdown_state() -> Result<Arc<TerminalShutdownState>, String> {
+    Ok(Arc::new(TerminalShutdownState::new()))
+}
+
+fn install_terminal_shutdown_listener() -> Result<&'static Arc<TerminalShutdownState>> {
+    match TERMINAL_SHUTDOWN_STATE.get_or_init(initialize_terminal_shutdown_state) {
+        Ok(state) => Ok(state),
+        Err(error) => anyhow::bail!(error.clone()),
+    }
+}
+
+pub(crate) fn terminal_shutdown_requested() -> Option<&'static str> {
+    TERMINAL_SHUTDOWN_STATE
+        .get()
+        .and_then(|state| state.as_ref().ok())
+        .and_then(|state| state.signal_name())
+}
+
+fn terminal_shutdown_cleanup_complete() -> bool {
+    TERMINAL_SHUTDOWN_STATE
+        .get()
+        .and_then(|state| state.as_ref().ok())
+        .is_some_and(|state| state.cleanup_complete.load(Ordering::Acquire))
+}
+
+pub(crate) async fn wait_for_terminal_shutdown() -> &'static str {
+    let state = install_terminal_shutdown_listener()
+        .expect("terminal shutdown listener was installed before TUI activation");
+    loop {
+        if let Some(signal) = state
+            .cleanup_complete
+            .load(Ordering::Acquire)
+            .then(|| state.signal_name())
+            .flatten()
+        {
+            return signal;
+        }
+        state.notify.notified().await;
+    }
 }
 
 /// Enable the terminal modes owned by Finch's default REPL.
@@ -184,7 +335,7 @@ impl TerminalInitializationGuard {
 
 impl Drop for TerminalInitializationGuard {
     fn drop(&mut self) {
-        if self.armed {
+        if self.armed && terminal_shutdown_requested().is_none() {
             emergency_restore_terminal();
         }
     }
@@ -203,6 +354,11 @@ fn install_tui_panic_hook() {
 
 fn supervised_initialization_failure_requested() -> bool {
     std::env::var_os("FINCH_TEST_TUI_FAIL_AFTER_ACTIVATION").is_some()
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+}
+
+fn supervised_startup_signal_pause_requested() -> bool {
+    std::env::var_os("FINCH_TEST_TUI_PAUSE_AFTER_ACTIVATION").is_some()
         && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
 }
 
@@ -1111,19 +1267,47 @@ fn advance_live_line(out: &mut impl Write) -> Result<()> {
 /// while an earlier rendering error is unwinding.
 struct SynchronizedWriter<W: Write> {
     inner: W,
-    open: bool,
+    end_state: SynchronizedEndState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SynchronizedEndState {
+    Open,
+    Accepted,
 }
 
 impl<W: Write> SynchronizedWriter<W> {
     fn begin(inner: W) -> Result<Self> {
-        let mut synchronized = Self { inner, open: true };
+        let mut synchronized = Self {
+            inner,
+            end_state: SynchronizedEndState::Open,
+        };
         crossterm::queue!(synchronized.inner, BeginSynchronizedUpdate)?;
         Ok(synchronized)
     }
 
     fn finish(mut self) -> Result<()> {
-        execute!(self.inner, EndSynchronizedUpdate)?;
-        self.open = false;
+        let mut encoded_end = Vec::new();
+        crossterm::queue!(&mut encoded_end, EndSynchronizedUpdate)?;
+        let mut offset = 0;
+        while offset < encoded_end.len() {
+            match self.inner.write(&encoded_end[offset..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write synchronized-update end",
+                    )
+                    .into());
+                }
+                Ok(written) => {
+                    offset += written;
+                    // Once any End bytes are accepted, a later write or flush
+                    // error is ambiguous: retrying could emit a duplicate End.
+                    self.end_state = SynchronizedEndState::Accepted;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         self.inner.flush()?;
         Ok(())
     }
@@ -1141,7 +1325,10 @@ impl<W: Write> Write for SynchronizedWriter<W> {
 
 impl<W: Write> Drop for SynchronizedWriter<W> {
     fn drop(&mut self) {
-        if self.open {
+        if self.end_state == SynchronizedEndState::Open {
+            // A failure before the first End byte was accepted is unambiguous,
+            // so Drop owns exactly one safe cleanup attempt.
+            self.end_state = SynchronizedEndState::Accepted;
             let _ = execute!(self.inner, EndSynchronizedUpdate);
             let _ = self.inner.flush();
         }
@@ -1471,6 +1658,11 @@ impl TuiRenderer {
         status_bar: Arc<StatusBar>,
         colors: ColorScheme,
     ) -> Result<Self> {
+        install_terminal_shutdown_listener()
+            .context("Failed to install terminal shutdown listener")?;
+        if let Some(signal) = terminal_shutdown_requested() {
+            anyhow::bail!("terminal shutdown already requested by {signal}");
+        }
         enable_raw_mode().context("Failed to enable raw mode")?;
         let mut initialization_guard = TerminalInitializationGuard::new();
 
@@ -1482,6 +1674,19 @@ impl TuiRenderer {
         // normal (unbounded) paste mode, which is safe.
         activate_default_terminal_modes(io::stdout(), TerminalActivation::Startup)
             .context("Failed to activate default terminal modes")?;
+
+        // Production-boundary timing hook: keep the real Finch constructor in
+        // the vulnerable post-activation/pre-prompt window until the dedicated
+        // listener observes a supervised signal. Unverified environments
+        // cannot activate this path.
+        if supervised_startup_signal_pause_requested() {
+            while !terminal_shutdown_cleanup_complete() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if let Some(signal) = terminal_shutdown_requested() {
+            anyhow::bail!("terminal shutdown requested during initialization by {signal}");
+        }
 
         // Environment-owned PTY regression hook: fail only after Finch has
         // changed terminal modes, so the initialization guard must restore
@@ -1565,6 +1770,11 @@ impl TuiRenderer {
 
             live_area_dirty: true,
         };
+        if let Some(signal) = terminal_shutdown_requested() {
+            anyhow::bail!(
+                "terminal shutdown requested before initialization completed by {signal}"
+            );
+        }
         initialization_guard.disarm();
         Ok(renderer)
     }
@@ -2401,6 +2611,9 @@ impl TuiRenderer {
     /// Called from the event loop on every tick.
     /// Commits newly-completed messages to permanent scrollback, then redraws.
     pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
+        if terminal_shutdown_requested().is_some() {
+            return Ok(());
+        }
         let messages = self.output_manager.get_messages();
 
         let unprinted: Vec<MessageRef> = messages
@@ -2471,6 +2684,9 @@ impl TuiRenderer {
 
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
+        if terminal_shutdown_requested().is_some() {
+            return Ok(());
+        }
         if self.viewport_invalidated {
             self.redraw_full_viewport()?;
             return self.draw_poset_overlay();
@@ -2546,16 +2762,18 @@ impl TuiRenderer {
         if !self.is_active {
             return Ok(());
         }
-        let _ = self.erase_live_area();
-        // Reset terminal state: show cursor, reset colours, move to a clean line.
-        // The `\r\n` ensures the shell prompt lands on its own fresh line rather
-        // than overwriting content from the erased live area.
-        let _ = restore_default_terminal_modes(io::stdout());
-        print!("\r\n");
-        // Flush pending output BEFORE leaving raw mode — otherwise some terminals
-        // silently discard buffered bytes after the mode switch.
-        let _ = io::stdout().flush();
-        let _ = disable_raw_mode();
+        if terminal_shutdown_requested().is_none() {
+            let _ = self.erase_live_area();
+            // Reset terminal state: show cursor, reset colours, move to a clean line.
+            // The `\r\n` ensures the shell prompt lands on its own fresh line rather
+            // than overwriting content from the erased live area.
+            let _ = restore_default_terminal_modes(io::stdout());
+            print!("\r\n");
+            // Flush pending output BEFORE leaving raw mode — otherwise some terminals
+            // silently discard buffered bytes after the mode switch.
+            let _ = io::stdout().flush();
+            let _ = disable_raw_mode();
+        }
         Self::save_history(&self.command_history);
         self.output_manager.enable_stdout();
         self.is_active = false;
@@ -2569,6 +2787,9 @@ impl TuiRenderer {
     /// Temporarily release the terminal so another full-screen TUI (e.g. the
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
+        if let Some(signal) = terminal_shutdown_requested() {
+            anyhow::bail!("terminal shutdown requested by {signal}");
+        }
         let _ = io::stdout().flush();
         let modes = restore_default_terminal_modes(io::stdout());
         let raw_mode = disable_raw_mode();
@@ -2580,12 +2801,19 @@ impl TuiRenderer {
 
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
+        if let Some(signal) = terminal_shutdown_requested() {
+            anyhow::bail!("terminal shutdown requested by {signal}");
+        }
         enable_raw_mode()?;
         if let Err(error) =
             activate_default_terminal_modes(io::stdout(), TerminalActivation::Resume)
         {
             emergency_restore_terminal();
             return Err(error.into());
+        }
+        if let Some(signal) = terminal_shutdown_requested() {
+            emergency_restore_terminal();
+            anyhow::bail!("terminal shutdown requested during resume by {signal}");
         }
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
@@ -2608,12 +2836,19 @@ impl TuiRenderer {
     /// deliberately stronger than [`Self::resume`]: emergency restoration
     /// also pops keyboard enhancements and disables bracketed paste.
     pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
+        if let Some(signal) = terminal_shutdown_requested() {
+            anyhow::bail!("terminal shutdown requested by {signal}");
+        }
         enable_raw_mode()?;
         if let Err(error) =
             activate_default_terminal_modes(io::stdout(), TerminalActivation::EmergencyRestore)
         {
             emergency_restore_terminal();
             return Err(error.into());
+        }
+        if let Some(signal) = terminal_shutdown_requested() {
+            emergency_restore_terminal();
+            anyhow::bail!("terminal shutdown requested during emergency resume by {signal}");
         }
         self.output_manager.disable_stdout();
         self.active_rows = 0;
@@ -2629,7 +2864,7 @@ impl Drop for TuiRenderer {
         // Safety net: restore terminal if shutdown() was never explicitly called.
         // shutdown() sets is_active = false before doing anything, so this is
         // idempotent — if shutdown() already ran, this is a no-op.
-        if self.is_active {
+        if self.is_active && terminal_shutdown_requested().is_none() {
             emergency_restore_terminal();
         }
     }
@@ -4788,6 +5023,74 @@ mod tests {
             flushes: 0,
         };
         assert!(prepare_canonical_commit_guarded(&mut output).is_err());
+
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+    }
+
+    #[test]
+    fn synchronized_finish_does_not_duplicate_accepted_end_after_flush_error() {
+        struct EndFlushFailsOnce {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for EndFlushFailsOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if !self.failed && self.bytes.ends_with(b"\x1b[?2026l") {
+                    self.failed = true;
+                    return Err(io::Error::other("ambiguous End flush failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let mut output = EndFlushFailsOnce {
+            bytes: Vec::new(),
+            failed: false,
+        };
+        let synchronized = SynchronizedWriter::begin(&mut output).unwrap();
+        assert!(synchronized.finish().is_err());
+
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+    }
+
+    #[test]
+    fn synchronized_finish_drop_retries_one_prewrite_end_failure() {
+        struct EndWriteFailsOnce {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for EndWriteFailsOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.failed && bytes.windows(7).any(|window| window == b"[?2026l") {
+                    self.failed = true;
+                    return Err(io::Error::other("End failed before accepting bytes"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = EndWriteFailsOnce {
+            bytes: Vec::new(),
+            failed: false,
+        };
+        let synchronized = SynchronizedWriter::begin(&mut output).unwrap();
+        assert!(synchronized.finish().is_err());
 
         let raw = String::from_utf8(output.bytes).unwrap();
         assert_eq!(raw.matches("\x1b[?2026h").count(), 1);

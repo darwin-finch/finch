@@ -62,43 +62,21 @@ type PendingApprovalsMap = Arc<
     >,
 >;
 
-#[cfg(unix)]
-struct TerminalShutdownSignals {
-    terminate: tokio::signal::unix::Signal,
-    hangup: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-impl TerminalShutdownSignals {
-    fn install() -> Result<Self> {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        Ok(Self {
-            terminate: signal(SignalKind::terminate()).context("install SIGTERM listener")?,
-            hangup: signal(SignalKind::hangup()).context("install SIGHUP listener")?,
-        })
+async fn supervised_busy_terminal_branch(input: &str) -> bool {
+    if input != "__finch_test_busy_terminal_branch__"
+        || std::env::var_os("FINCH_TEST_TUI_BUSY_BRANCH").is_none()
+        || !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        return false;
     }
-
-    async fn receive(&mut self) -> &'static str {
-        tokio::select! {
-            _ = self.terminate.recv() => "SIGTERM",
-            _ = self.hangup.recv() => "SIGHUP",
-        }
-    }
-}
-
-#[cfg(not(unix))]
-struct TerminalShutdownSignals;
-
-#[cfg(not(unix))]
-impl TerminalShutdownSignals {
-    fn install() -> Result<Self> {
-        Ok(Self)
-    }
-
-    async fn receive(&mut self) -> &'static str {
-        std::future::pending::<&'static str>().await
-    }
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"FINCH_BUSY_TERMINAL_BRANCH_BEGIN");
+    let _ = stdout.flush();
+    // Keep this selected branch pending long enough for the PTY parent to
+    // prove that the dedicated listener restores modes independently.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    true
 }
 
 async fn commit_tool_round_and_continue(
@@ -2242,7 +2220,6 @@ impl EventLoop {
         // Signal that the TUI owns the terminal so proposal editors perform a
         // complete terminal-protocol handoff before launching $VISUAL/$EDITOR.
         crate::set_tui_active(true);
-        let mut terminal_shutdown_signals = TerminalShutdownSignals::install()?;
 
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
@@ -2442,7 +2419,7 @@ impl EventLoop {
 
         while !should_exit {
             tokio::select! {
-                signal = terminal_shutdown_signals.receive() => {
+                signal = crate::cli::tui::wait_for_terminal_shutdown() => {
                     tracing::info!(signal, "received terminal shutdown signal");
                     // Restore the user's terminal before durable/session
                     // cleanup awaits any external resource. The final normal
@@ -2462,6 +2439,9 @@ impl EventLoop {
                     match event {
                         InputEvent::Submitted(input) => {
                             tracing::debug!("Received input: {}", input);
+                            if supervised_busy_terminal_branch(&input).await {
+                                continue;
+                            }
                             // Clear typing words — restore panel to previous mode.
                             {
                                 let mut tui = self.tui_renderer.lock().await;
