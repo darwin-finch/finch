@@ -1805,11 +1805,22 @@ fn project_output_items<'a>(
     Ok(blocks)
 }
 
-fn observable_blocks(blocks: &[ContentBlock]) -> Vec<&ContentBlock> {
-    blocks
-        .iter()
-        .filter(|block| !matches!(block, ContentBlock::OpaqueReasoning { .. }))
-        .collect()
+fn observable_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut observable = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block {
+            ContentBlock::OpaqueReasoning { .. } => {}
+            ContentBlock::Text { text } => {
+                if let Some(ContentBlock::Text { text: previous }) = observable.last_mut() {
+                    previous.push_str(text);
+                } else {
+                    observable.push(block.clone());
+                }
+            }
+            _ => observable.push(block.clone()),
+        }
+    }
+    observable
 }
 
 fn parse_output_item(
@@ -4529,6 +4540,58 @@ mod tests {
         )
         .err()
         .expect("terminal text drift must remain rejected");
+        assert!(error.to_string().contains("did not match"));
+    }
+
+    #[test]
+    fn terminal_output_may_consolidate_adjacent_streamed_text_items() {
+        let message = |text: &str| {
+            json!({
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":text}]
+            })
+        };
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, message("hello"));
+        accumulator.output_items.insert(1, message(" there"));
+        let response = json!({
+            "id":"resp-consolidated",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[message("hello there")]
+        });
+        let completed = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("message item boundaries must not change ordered visible text semantics");
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "hello there"
+        ));
+
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, message("hello"));
+        accumulator.output_items.insert(1, message(" there"));
+        let changed = json!({
+            "id":"resp-changed-consolidation",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[message("hello world")]
+        });
+        let error = parse_completed(
+            changed.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .err()
+        .expect("changed terminal text must remain rejected");
         assert!(error.to_string().contains("did not match"));
     }
 
