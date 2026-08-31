@@ -106,6 +106,11 @@ pub enum WorkRowStatus {
 pub enum WorkUnitPresentation {
     #[default]
     Assistant,
+    /// Internal lifecycle activity that must not be presented as model tool
+    /// calls (for example, a named Brain run's status/result projection).
+    Activity {
+        title: String,
+    },
     ProgramSource {
         language: String,
     },
@@ -252,6 +257,17 @@ impl WorkUnit {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .presentation = WorkUnitPresentation::Assistant;
+    }
+
+    /// Render retained rows as internal lifecycle activity rather than model
+    /// tool calls.
+    pub fn set_activity_presentation(&self, title: impl Into<String>) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .presentation = WorkUnitPresentation::Activity {
+            title: title.into(),
+        };
     }
 
     /// Append a chunk to the response text (for partial updates).
@@ -498,6 +514,23 @@ impl Message for WorkUnit {
                     return format_program_output(&inner);
                 }
 
+                if let WorkUnitPresentation::Activity { title } = &inner.presentation {
+                    let secs = elapsed.as_secs();
+                    let mut out = format!(
+                        "{}⏺{} {title} {}({} · working){}",
+                        CYAN,
+                        RESET,
+                        GRAY_DIM,
+                        fmt_elapsed(secs),
+                        RESET
+                    );
+                    for row in &inner.rows {
+                        out.push('\n');
+                        out.push_str(&format_row_themed(row, colors, DiffColorMode::production()));
+                    }
+                    return out;
+                }
+
                 // Once a provider turn has requested tools, the unit represents
                 // the entire query-level tool loop rather than a generic model
                 // spinner. Keep that stable title while later tool-result
@@ -579,6 +612,9 @@ impl Message for WorkUnit {
                             format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
                         }
                     }
+                    WorkUnitPresentation::Activity { title } => {
+                        format!("{}⏺{} {title}{timing}", CYAN, RESET)
+                    }
                     WorkUnitPresentation::ProgramSource { language } => {
                         let mut source = format!("{}→ program ({language}){}", GRAY, RESET);
                         if !inner.response_text.is_empty() {
@@ -640,7 +676,12 @@ impl Message for WorkUnit {
             .rows
             .iter()
             .enumerate()
-            .map(|(index, row)| transcript_tool_row(self.id, index, row, colors))
+            .map(|(index, row)| match &inner.presentation {
+                WorkUnitPresentation::Activity { .. } => {
+                    transcript_activity_row(self.id, index, row, colors)
+                }
+                _ => transcript_tool_row(self.id, index, row, colors),
+            })
             .collect();
         let (kind, label, body, default_expanded) = match &inner.presentation {
             WorkUnitPresentation::Assistant if !inner.rows.is_empty() => {
@@ -658,6 +699,15 @@ impl Message for WorkUnit {
                 lines(&inner.response_text),
                 true,
             ),
+            WorkUnitPresentation::Activity { title } => {
+                let actionable = inner.rows.iter().any(tool_row_requires_default_expansion);
+                (
+                    TranscriptRowKind::Activity,
+                    compact_activity_group_label(title, &inner.rows),
+                    Vec::new(),
+                    inner.status == MessageStatus::InProgress || actionable,
+                )
+            }
             WorkUnitPresentation::ProgramSource { language } => (
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
@@ -693,7 +743,9 @@ impl Message for WorkUnit {
         let band = match &inner.presentation {
             WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
             WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-            WorkUnitPresentation::Assistant => MessageBand::Assistant,
+            WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
+                MessageBand::Assistant
+            }
         };
         Some(colors.message_band_style(band))
     }
@@ -709,7 +761,9 @@ impl Message for WorkUnit {
             let band = match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
                 WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-                WorkUnitPresentation::Assistant => MessageBand::Assistant,
+                WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
+                    MessageBand::Assistant
+                }
             };
             return Some(colors.message_band_style(band));
         }
@@ -742,7 +796,9 @@ impl Message for WorkUnit {
             match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
                 WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-                WorkUnitPresentation::Assistant => MessageBand::Assistant,
+                WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
+                    MessageBand::Assistant
+                }
             }
         };
         Some(colors.message_band_style(band))
@@ -844,6 +900,42 @@ fn transcript_tool_row(
     }
 }
 
+fn transcript_activity_row(
+    message_id: MessageId,
+    index: usize,
+    row: &WorkRow,
+    colors: &ColorScheme,
+) -> TranscriptRow {
+    let summary = match &row.status {
+        WorkRowStatus::Running => "running".to_string(),
+        WorkRowStatus::Complete(summary) if summary.is_empty() => "complete".to_string(),
+        WorkRowStatus::Complete(summary) => summary.clone(),
+        WorkRowStatus::Error(error) => format!("failed: {error}"),
+    };
+    let body = if let Some(diffs) = &row.diffs {
+        let mut body = row.body_lines.clone();
+        body.extend(
+            render_files(diffs, colors, DiffColorMode::production())
+                .lines()
+                .map(str::to_owned),
+        );
+        body
+    } else {
+        row.body_lines.clone()
+    };
+    TranscriptRow {
+        id: TranscriptRowId {
+            message_id,
+            path: vec![1, index as u32],
+        },
+        kind: TranscriptRowKind::Activity,
+        label: format!("{} — {summary}", row.label),
+        body,
+        children: Vec::new(),
+        default_expanded: tool_row_requires_default_expansion(row),
+    }
+}
+
 fn tool_row_requires_default_expansion(row: &WorkRow) -> bool {
     matches!(row.status, WorkRowStatus::Running)
         || (matches!(&row.status, WorkRowStatus::Complete(summary) if summary.trim().is_empty())
@@ -852,7 +944,8 @@ fn tool_row_requires_default_expansion(row: &WorkRow) -> bool {
 }
 
 fn compact_tool_group_label(rows: &[WorkRow]) -> String {
-    let mut label = format!("Tools ({} calls)", rows.len());
+    let noun = if rows.len() == 1 { "call" } else { "calls" };
+    let mut label = format!("Tools ({} {noun})", rows.len());
     let Some((call, error)) = rows.iter().find_map(|row| match &row.status {
         WorkRowStatus::Error(error) => Some((
             compact_summary_text(&row.label, 60),
@@ -864,6 +957,33 @@ fn compact_tool_group_label(rows: &[WorkRow]) -> String {
     };
     label.push_str(" — ");
     label.push_str(&call);
+    label.push_str(" failed: ");
+    label.push_str(&error);
+    label
+}
+
+fn compact_activity_group_label(title: &str, rows: &[WorkRow]) -> String {
+    let mut label = title.to_string();
+    let Some((activity, error)) = rows.iter().find_map(|row| match &row.status {
+        WorkRowStatus::Error(error) => {
+            let activity = row
+                .label
+                .strip_prefix(title)
+                .map(|suffix| suffix.trim_start_matches(|c| c == ' ' || c == '·'))
+                .filter(|suffix| !suffix.is_empty())
+                .unwrap_or(&row.label);
+            let error = error.strip_prefix("failed: ").unwrap_or(error);
+            Some((
+                compact_summary_text(activity, 60),
+                compact_summary_text(error, 120),
+            ))
+        }
+        _ => None,
+    }) else {
+        return label;
+    };
+    label.push_str(" — ");
+    label.push_str(&activity);
     label.push_str(" failed: ");
     label.push_str(&error);
     label
@@ -884,6 +1004,7 @@ fn format_work_unit_header(inner: &WorkUnitInner) -> String {
             format!("⏺ Tools ({})", inner.rows.len())
         }
         WorkUnitPresentation::Assistant => format!("⏺ {}", inner.response_text),
+        WorkUnitPresentation::Activity { title } => format!("⏺ {title}"),
         WorkUnitPresentation::ProgramSource { language } => {
             if inner.response_text.is_empty() {
                 format!("→ program ({language})")
@@ -1451,9 +1572,14 @@ mod tests {
         let result = unit.add_row("result");
         unit.fail_row(result, "catalog validation failed");
         unit.set_complete();
+        let canonical_before_activity_projection = unit.complete_transcript(&colors());
+        unit.set_activity_presentation("Speculative run 1234");
 
         let projected = unit.transcript_row(&colors()).unwrap();
         assert!(!projected.default_expanded);
+        assert_eq!(projected.kind, TranscriptRowKind::Activity);
+        assert!(!projected.label.contains("Tools"));
+        assert!(!projected.label.contains("calls"));
         assert_eq!(
             projected.label.matches("catalog validation failed").count(),
             1
@@ -1464,9 +1590,22 @@ mod tests {
         assert!(projected.children[1].label.starts_with("result"));
 
         let canonical = unit.complete_transcript(&colors());
+        assert_eq!(canonical, canonical_before_activity_projection);
         assert_eq!(canonical.matches("catalog validation failed").count(), 2);
         assert!(canonical.contains("Speculative run 1234 · status"));
         assert!(canonical.contains("result"));
+    }
+
+    #[test]
+    fn assistant_tool_rows_keep_tool_group_semantics() {
+        let unit = WorkUnit::new("Tools");
+        let row = unit.add_row("read config");
+        unit.complete_row(row, "3 lines");
+        unit.set_complete();
+
+        let projected = unit.transcript_row(&colors()).unwrap();
+        assert_eq!(projected.kind, TranscriptRowKind::ToolGroup);
+        assert_eq!(projected.label, "Tools (1 call)");
     }
 
     #[test]

@@ -982,8 +982,9 @@ fn ensure_remote_brain_run_projection<'a>(
         let label = brain_run_group_label(run_id, kind);
         let unit = output_manager.start_work_unit(&label);
         // WorkUnit's completed row presentation otherwise uses the generic
-        // "Tools" title. Keep the canonical kind/id visible on the group.
-        unit.set_response(&label);
+        // "Tools" title. Keep the canonical kind/id visible without
+        // misclassifying lifecycle rows as model tool calls.
+        unit.set_activity_presentation(&label);
         let status_row = unit.add_row(format!("{label} · status"));
         unit.complete_row(status_row, format!("{status:?}").to_lowercase());
         RemoteBrainRunProjection {
@@ -9509,6 +9510,83 @@ mod tests {
             brain_run_group_label(run_id, Some(BrainRunKind::Speculative)),
             format!("Speculative run {}", run_id.0)
         );
+    }
+
+    #[test]
+    fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
+        use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut projections = std::collections::HashMap::new();
+        super::ensure_remote_brain_run_projection(
+            &output,
+            &mut projections,
+            run_id,
+            Some(BrainRunKind::Speculative),
+            BrainRunStatus::Running,
+        );
+
+        let mut result = brain_event(
+            1,
+            "provider",
+            BrainEventKind::Result {
+                request_seq: 1,
+                output: String::new(),
+                error: Some("catalog unavailable".into()),
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        );
+        result.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &result,
+        ));
+
+        let mut terminal = brain_event(
+            2,
+            "daemon",
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Failed,
+                detail: Some("catalog unavailable".into()),
+            },
+        );
+        terminal.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &terminal,
+        ));
+
+        let unit = projections.get(&run_id).unwrap().unit.clone();
+        let projected = unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        assert_eq!(projected.kind, TranscriptRowKind::Activity);
+        assert!(projected.label.contains("Speculative run"));
+        assert!(projected
+            .label
+            .contains("status failed: catalog unavailable"));
+        assert!(!projected.label.contains("Tools"));
+        assert!(!projected.label.contains("calls"));
+        assert_eq!(projected.children.len(), 2);
+        assert!(projected
+            .children
+            .iter()
+            .all(|row| row.kind == TranscriptRowKind::Activity));
+        assert!(projected.children[0].label.contains("status"));
+        assert!(projected.children[1].label.starts_with("result"));
+
+        let canonical = unit.complete_transcript(&crate::config::ColorScheme::default());
+        assert!(canonical.contains("Speculative run"));
+        assert!(canonical.contains("result"));
+        assert!(canonical.contains("catalog unavailable"));
     }
 
     #[test]
