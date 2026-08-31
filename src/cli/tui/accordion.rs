@@ -206,7 +206,15 @@ impl AccordionState {
                 self.focused = None;
                 true
             }
-            _ => false,
+            _ => {
+                // Accordion focus is an explicit keyboard mode entered with F6.
+                // As soon as the user types or invokes an unrelated composer
+                // command, return focus to the draft before allowing that key to
+                // continue through normal input routing. This prevents a stale
+                // highlighted row from coexisting with live composer input.
+                self.focused = None;
+                false
+            }
         }
     }
 
@@ -223,7 +231,11 @@ impl AccordionState {
             return false;
         };
         let row_id = region.row_id.clone();
-        self.focused = Some(row_id.clone());
+        // Clicking is a direct disclosure action, not a transfer of keyboard
+        // focus. Keeping focus in the composer means the next Space or Enter
+        // behaves like text input/submission instead of unexpectedly toggling
+        // the row again. Keyboard disclosure mode remains available via F6.
+        self.focused = None;
         let current = self.visible_expanded.get(&row_id).copied().unwrap_or(false);
         self.expanded.insert(row_id.clone(), !current);
         self.visible_expanded.insert(row_id, !current);
@@ -310,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mouse_uses_reflowed_region_and_matches_keyboard_toggle() {
+    fn test_mouse_uses_reflowed_region_without_stealing_composer_focus() {
         let work = Arc::new(WorkUnit::new("response"));
         work.set_response("one\ntwo");
         work.set_complete();
@@ -330,11 +342,30 @@ mod tests {
             .render_message(&message, &colors)
             .iter()
             .all(|line| !line.text.contains("one")));
-        assert!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(state.focused.is_none());
+        assert!(!state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(state
             .render_message(&message, &colors)
             .iter()
-            .any(|line| line.text.contains("one")));
+            .all(|line| !line.text.contains("one")));
+    }
+
+    #[test]
+    fn test_printable_key_leaves_explicit_keyboard_focus_for_composer() {
+        let work = Arc::new(WorkUnit::new("response"));
+        work.set_response("one\ntwo");
+        work.set_complete();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let lines = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&lines, 0, 80);
+
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.focused.is_some());
+        assert!(!state.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)));
+        assert!(state.focused.is_none());
+        assert!(!state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
     }
 
     #[test]
