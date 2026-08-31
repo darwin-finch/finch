@@ -12,12 +12,14 @@ pub mod openai_types; // Public for client access
 
 pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
-    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectAuditControl,
+    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerDeadlines,
+    RunnerDispatchError, RunnerDispatchFailure, RunnerEffectAuditControl,
     RunnerEffectAuditReservation, RunnerEffectRecord, RunnerHostEffectOutcome,
-    RunnerHostEffectPermit, RunnerMemoryProjectionRequest, RunnerProgramControlRequest,
-    RunnerProgramError, RunnerProgramInteraction, RunnerProgramRequest, RunnerProgramResult,
-    RunnerRegistrationId, RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice,
-    RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
+    RunnerHostEffectPermit, RunnerMemoryProjectionRequest, RunnerOperation,
+    RunnerProgramControlRequest, RunnerProgramError, RunnerProgramInteraction,
+    RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId, RunnerRequest,
+    RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
+    RunnerTurnRequest, RunnerTurnResult,
 };
 pub(crate) use brain_runner::{
     RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,

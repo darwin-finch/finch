@@ -284,6 +284,12 @@ pub struct EventLoop {
     /// so tool continuations use the exact same pipeline as local turns.
     pending_named_brain_turns: std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
 
+    /// Drop watchers that bridge one Cap'n Proto callback lifetime into the
+    /// frontend query cancellation path. They are aborted when the exact turn
+    /// reaches its normal terminal boundary.
+    pending_named_brain_turn_callback_watches:
+        std::collections::HashMap<Uuid, tokio::task::JoinHandle<()>>,
+
     /// Cancellation controls for typed programs delegated by the Brain daemon.
     pending_named_brain_programs:
         std::collections::HashMap<crate::brain::store::RunId, tokio_util::sync::CancellationToken>,
@@ -2020,6 +2026,7 @@ impl EventLoop {
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
+            pending_named_brain_turn_callback_watches: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
             local_brain_projections: std::collections::VecDeque::new(),
             brain_projection_revisions: std::collections::HashMap::new(),
@@ -2454,6 +2461,9 @@ impl EventLoop {
                         }
                         ReplEvent::NamedBrainRunCancelRequested(_) => {
                             "NamedBrainRunCancelRequested"
+                        }
+                        ReplEvent::NamedBrainTurnCallbackCancelled { .. } => {
+                            "NamedBrainTurnCallbackCancelled"
                         }
                         ReplEvent::NamedBrainProgramFinished(_) => "NamedBrainProgramFinished",
                         ReplEvent::FrontendRestartReady { .. } => "FrontendRestartReady",
@@ -4206,6 +4216,12 @@ Rules:\n\
                 self.output_manager
                     .write_error(format!("Query failed: {}", error));
 
+                if let Some(watch) = self
+                    .pending_named_brain_turn_callback_watches
+                    .remove(&query_id)
+                {
+                    watch.abort();
+                }
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                     self.agent_scheduler.set_active_brain_parent(None).await;
                     self.local_brain_projections
@@ -4873,14 +4889,26 @@ Rules:\n\
                         .await
                     {
                         Ok(bootstrap) => {
-                            match self
-                                .program_runtime
-                                .hydrate_reducible_state_if_newer(
+                            // Same-connection lease renewal repairs the
+                            // callback bridge while preserving admitted work.
+                            // Once idle, exact reconciliation rolls back any
+                            // local revision that crossed a prior cancellation
+                            // boundary instead of treating it as newer truth.
+                            let runner_work_active = self.active_query_id.read().await.is_some()
+                                || !self.pending_named_brain_turns.is_empty()
+                                || !self.pending_named_brain_programs.is_empty();
+                            let reconciliation = if runner_work_active {
+                                Ok(())
+                            } else {
+                                reconcile_runner_checkpoint(
+                                    &self.program_runtime,
                                     bootstrap.checkpoint,
                                     bootstrap.runtime_revision,
+                                    false,
                                 )
                                 .await
-                            {
+                            };
+                            match reconciliation {
                                 Ok(_) => {
                                     self.agent_scheduler
                                         .bind_brain_control(bootstrap.subagent_control)
@@ -4964,6 +4992,10 @@ Rules:\n\
             ReplEvent::NamedBrainRunCancelRequested(request) => {
                 self.cancel_named_brain_run(request).await;
             }
+            ReplEvent::NamedBrainTurnCallbackCancelled { query_id, run_id } => {
+                self.cancel_named_brain_turn_callback(query_id, run_id)
+                    .await;
+            }
             ReplEvent::NamedBrainProgramFinished(run_id) => {
                 self.pending_named_brain_programs.remove(&run_id);
             }
@@ -5012,7 +5044,7 @@ Rules:\n\
         let event_tx = self.event_tx.clone();
         let run_id = request.run_id;
         let request_seq = request.request_seq;
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = request.cancel.clone();
         self.pending_named_brain_programs
             .insert(run_id, cancel.clone());
         tokio::task::spawn_local(async move {
@@ -5048,15 +5080,24 @@ Rules:\n\
             let execution = async {
                 let fixed_grant_ceiling = request.grant_ceiling.clone();
                 let (effect_sink, effect_rx) = crate::runtime::typed_effect_channel();
-                let outcome = runtime
-                    .submit_typed_only_with_deferred_schedule_effects(
-                        submission,
-                        effect_sink,
-                        fixed_grant_ceiling.clone(),
-                        request.effect_audit.clone(),
-                    )
-                    .await
-                    .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
+                let submission = runtime.submit_typed_only_with_deferred_schedule_effects(
+                    submission,
+                    effect_sink,
+                    fixed_grant_ceiling.clone(),
+                    request.effect_audit.clone(),
+                );
+                tokio::pin!(submission);
+                let outcome = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        return Err(crate::server::RunnerProgramError::from(
+                            "named Brain run cancelled".to_string(),
+                        ));
+                    }
+                    outcome = &mut submission => outcome.map_err(|error| {
+                        crate::server::RunnerProgramError::from(error.to_string())
+                    })?,
+                };
                 let execution_id = outcome.execution_id;
                 let mut resumed = Box::pin(async {
                     resume_named_brain_program_boundaries(
@@ -5152,6 +5193,7 @@ Rules:\n\
                 }));
             return Ok(());
         }
+        let callback_cancel = request.cancel.clone();
         if self.active_query_id.read().await.is_some() {
             let _ = request
                 .response_tx
@@ -5207,6 +5249,15 @@ Rules:\n\
             .set_tool_work_unit(query_id, Some(run_unit))
             .await;
         *self.active_query_id.write().await = Some(query_id);
+        let callback_event_tx = self.event_tx.clone();
+        let callback_run_id = request.run_id;
+        let callback_watch = tokio::task::spawn_local(async move {
+            callback_cancel.cancelled().await;
+            let _ = callback_event_tx.send(ReplEvent::NamedBrainTurnCallbackCancelled {
+                query_id,
+                run_id: callback_run_id,
+            });
+        });
         self.pending_named_brain_turns.insert(
             query_id,
             PendingNamedBrainTurn {
@@ -5223,6 +5274,8 @@ Rules:\n\
                 restart: None,
             },
         );
+        self.pending_named_brain_turn_callback_watches
+            .insert(query_id, callback_watch);
         self.agent_scheduler
             .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
                 run_id: request.run_id,
@@ -5245,6 +5298,12 @@ Rules:\n\
         {
             *self.active_query_id.write().await = None;
             self.agent_scheduler.set_active_brain_parent(None).await;
+            if let Some(watch) = self
+                .pending_named_brain_turn_callback_watches
+                .remove(&query_id)
+            {
+                watch.abort();
+            }
             if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                 let _ = pending
                     .response_tx
@@ -5281,6 +5340,7 @@ Rules:\n\
             let _ = request.response_tx.send(Ok(false));
             return;
         };
+        let cancellation_barrier = self.query_states.cancellation_barrier(query_id).await;
         if !self.query_states.cancel_query(query_id).await {
             let _ = request.response_tx.send(Ok(false));
             return;
@@ -5288,10 +5348,55 @@ Rules:\n\
         self.conversation.write().await.abort_staged(query_id);
         self.close_active_tool_rows(query_id, "cancelled remotely")
             .await;
-        if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
-            pending.cancellation_requested = true;
+        let should_finish = self
+            .pending_named_brain_turns
+            .get_mut(&query_id)
+            .map(|pending| {
+                pending.cancellation_requested = true;
+                pending.active_tool_ids.is_empty()
+            })
+            .unwrap_or(false);
+        if let Some(cancellation_barrier) = cancellation_barrier {
+            cancellation_barrier.wait().await;
+        }
+        if should_finish {
+            self.finish_named_brain_turn(query_id, String::new()).await;
+            if *self.active_query_id.read().await == Some(query_id) {
+                *self.active_query_id.write().await = None;
+            }
+            self.tool_call_history.write().await.remove(&query_id);
         }
         let _ = request.response_tx.send(Ok(true));
+    }
+
+    async fn cancel_named_brain_turn_callback(
+        &mut self,
+        query_id: Uuid,
+        run_id: crate::brain::store::RunId,
+    ) {
+        let should_finish = match self.pending_named_brain_turns.get_mut(&query_id) {
+            Some(pending) if pending.run_id == run_id => {
+                pending.cancellation_requested = true;
+                pending.active_tool_ids.is_empty()
+            }
+            _ => return,
+        };
+        let cancellation_barrier = self.query_states.cancellation_barrier(query_id).await;
+        let _ = self.query_states.cancel_query(query_id).await;
+        self.conversation.write().await.abort_staged(query_id);
+        self.close_active_tool_rows(query_id, "runner callback abandoned")
+            .await;
+        if let Some(cancellation_barrier) = cancellation_barrier {
+            cancellation_barrier.wait().await;
+        }
+        if !should_finish {
+            return;
+        }
+        self.finish_named_brain_turn(query_id, String::new()).await;
+        if *self.active_query_id.read().await == Some(query_id) {
+            *self.active_query_id.write().await = None;
+        }
+        self.tool_call_history.write().await.remove(&query_id);
     }
 
     async fn project_named_brain_memory(
@@ -5321,19 +5426,32 @@ Rules:\n\
                 ("user", request.prompt.as_str()),
                 ("assistant", request.source.as_str()),
             ] {
-                if !content.trim().is_empty()
-                    && memory
-                        .insert_brain_conversation(
-                            role,
-                            content,
-                            None,
-                            Some(&request.brain),
-                            &provenance,
-                        )
-                        .await?
-                {
-                    inserted += 1;
+                if request.cancel.is_cancelled() {
+                    anyhow::bail!("named Brain memory projection cancelled");
                 }
+                if !content.trim().is_empty() {
+                    let insertion = memory.insert_brain_conversation(
+                        role,
+                        content,
+                        None,
+                        Some(&request.brain),
+                        &provenance,
+                    );
+                    tokio::pin!(insertion);
+                    let inserted_new = tokio::select! {
+                        biased;
+                        _ = request.cancel.cancelled() => {
+                            anyhow::bail!("named Brain memory projection cancelled");
+                        }
+                        result = &mut insertion => result?,
+                    };
+                    if inserted_new {
+                        inserted += 1;
+                    }
+                }
+            }
+            if request.cancel.is_cancelled() {
+                anyhow::bail!("named Brain memory projection cancelled");
             }
             Ok::<usize, anyhow::Error>(inserted)
         }
@@ -5355,6 +5473,12 @@ Rules:\n\
         self.query_states
             .set_brain_output_work_unit(query_id, None)
             .await;
+        if let Some(watch) = self
+            .pending_named_brain_turn_callback_watches
+            .remove(&query_id)
+        {
+            watch.abort();
+        }
         let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
             return;
         };

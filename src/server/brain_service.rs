@@ -1010,6 +1010,11 @@ impl BrainLifecycleService {
             environment == self.store.environment(),
             "runner environment does not match the daemon Brain environment"
         );
+        let previous_lease = self
+            .store
+            .snapshot(brain)?
+            .runner_lease
+            .map(|lease| lease.lease_id);
         let lease = self.store.acquire_runner_lease(
             brain,
             subject,
@@ -1017,12 +1022,15 @@ impl BrainLifecycleService {
             lease_id,
             ttl_ms,
         )?;
+        if let Some(previous_lease) = previous_lease.filter(|id| *id != lease.lease_id) {
+            self.runners.invalidate_lease(brain, previous_lease);
+        }
         self.expire_runner_lease(brain.to_owned(), lease.lease_id, lease.expires_ms);
         Ok(lease)
     }
 
     fn expire_runner_lease(&self, brain: String, lease_id: RunnerLeaseId, expires_ms: u64) {
-        let store = self.store.clone();
+        let service = self.clone();
         tokio::spawn(async move {
             loop {
                 let delay_ms = expires_ms.saturating_sub(crate::brain::store::unix_millis());
@@ -1031,17 +1039,31 @@ impl BrainLifecycleService {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-            if store
-                .expire_runner_lease(&brain, lease_id, crate::brain::store::unix_millis())
-                .is_ok_and(|expired| expired)
-            {
-                let _ = store.remove_if_unused(&brain);
-            }
+            let _ = service.expire_runner_lease_if_due(
+                &brain,
+                lease_id,
+                crate::brain::store::unix_millis(),
+            );
         });
+    }
+
+    fn expire_runner_lease_if_due(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        now_ms: u64,
+    ) -> Result<bool> {
+        if !self.store.expire_runner_lease(brain, lease_id, now_ms)? {
+            return Ok(false);
+        }
+        self.runners.invalidate_lease(brain, lease_id);
+        self.store.remove_if_unused(brain)?;
+        Ok(true)
     }
 
     pub fn release_runner(&self, brain: &str, lease_id: RunnerLeaseId) -> Result<()> {
         self.store.release_runner_lease(brain, lease_id)?;
+        self.runners.invalidate_lease(brain, lease_id);
         self.store.remove_if_unused(brain)?;
         Ok(())
     }
@@ -1121,6 +1143,11 @@ impl BrainLifecycleService {
             environment == self.store.environment(),
             "runner handoff environment does not match the daemon Brain environment"
         );
+        let previous_lease = self
+            .store
+            .snapshot(brain)?
+            .runner_lease
+            .map(|lease| lease.lease_id);
         let lease = self.store.accept_runner_handoff(
             brain,
             target_subject,
@@ -1128,6 +1155,9 @@ impl BrainLifecycleService {
             environment.generation,
             ttl_ms,
         )?;
+        if let Some(previous_lease) = previous_lease.filter(|id| *id != lease.lease_id) {
+            self.runners.invalidate_lease(brain, previous_lease);
+        }
         self.expire_runner_lease(brain.to_owned(), lease.lease_id, lease.expires_ms);
         Ok(lease)
     }
@@ -2514,6 +2544,81 @@ mod tests {
             service.snapshot("shared").unwrap().runner_lease,
             Some(replacement)
         );
+    }
+
+    #[tokio::test]
+    async fn test_lease_expiry_cancels_the_exact_callback_and_allows_a_fresh_generation() {
+        let service = service();
+        let _driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let expired = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", expired.lease_id, tx);
+        let dispatch_runners = service.runners.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_runners
+                .dispatch_program(
+                    "shared",
+                    expired.lease_id,
+                    run_id,
+                    1,
+                    ProgramLanguage::Lisp,
+                    "stuck".into(),
+                    crate::server::RunnerProgramInteraction::Interactive,
+                    None,
+                )
+                .await
+        });
+        let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+            panic!("expected running callback")
+        };
+
+        assert!(service
+            .expire_runner_lease_if_due("shared", expired.lease_id, expired.expires_ms)
+            .unwrap());
+        let error = dispatch.await.unwrap().unwrap_err();
+        let error = error
+            .downcast_ref::<crate::server::RunnerDispatchError>()
+            .expect("lease expiry must preserve typed runner failure");
+        assert_eq!(
+            error.failure,
+            crate::server::RunnerDispatchFailure::GenerationInvalidated
+        );
+        assert!(request.cancel.is_cancelled());
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        assert!(request
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: "late".into(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: Vec::new(),
+            }))
+            .is_err());
+
+        let replacement = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        assert_ne!(replacement.lease_id, expired.lease_id);
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::unbounded_channel();
+        service
+            .runners
+            .register("shared", replacement.lease_id, replacement_tx);
+        assert!(!service.runners.invalidate_lease("shared", expired.lease_id));
+        assert!(service
+            .runners
+            .has_registration("shared", replacement.lease_id));
     }
 
     #[tokio::test]

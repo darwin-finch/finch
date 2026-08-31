@@ -238,6 +238,12 @@ pub enum ReplEvent {
     NamedBrainMemoryProjectionRequested(crate::server::RunnerMemoryProjectionRequest),
     /// Cancel one exact ProgramRun currently owned by this frontend.
     NamedBrainRunCancelRequested(crate::server::RunnerCancelRequest),
+    /// The daemon stopped awaiting one exact turn callback. This is scoped to
+    /// the callback request, not to the frontend's current runner generation.
+    NamedBrainTurnCallbackCancelled {
+        query_id: uuid::Uuid,
+        run_id: crate::brain::store::RunId,
+    },
     /// Release frontend-local cancellation state after a delegated program ends.
     NamedBrainProgramFinished(crate::brain::store::RunId),
 

@@ -87,6 +87,24 @@ fn lease_id_after_registration(
     }
 }
 
+/// Reconcile the frontend VM to the daemon's canonical checkpoint. Recovery
+/// must be able to roll back a locally advanced revision left behind by a
+/// callback that crossed its cancellation boundary; ordinary idle renewal
+/// avoids replacing an already-identical lineage.
+async fn reconcile_runner_checkpoint(
+    runtime: &crate::runtime::ProgramRuntime,
+    checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    revision: u64,
+    force_exact: bool,
+) -> Result<()> {
+    if !force_exact && runtime.revision() == revision {
+        return Ok(());
+    }
+    runtime
+        .replace_reducible_state(checkpoint, revision)
+        .await
+}
+
 struct HomeRunnerRegistration {
     target: RunnerReconnectTarget,
     registration: std::result::Result<crate::brain::store::RunnerLeaseId, String>,
@@ -180,13 +198,13 @@ impl EventLoop {
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
                 .await
             {
-                Ok(bootstrap) => match self
-                    .program_runtime
-                    .hydrate_reducible_state_if_newer(
-                        bootstrap.checkpoint,
-                        bootstrap.runtime_revision,
-                    )
-                    .await
+                Ok(bootstrap) => match reconcile_runner_checkpoint(
+                    &self.program_runtime,
+                    bootstrap.checkpoint,
+                    bootstrap.runtime_revision,
+                    true,
+                )
+                .await
                 {
                     Ok(_) => {
                         self.agent_scheduler
@@ -542,13 +560,13 @@ impl EventLoop {
                 )));
             }
         };
-        if let Err(error) = self
-            .program_runtime
-            .hydrate_reducible_state_if_newer(
-                bootstrap.checkpoint,
-                bootstrap.runtime_revision,
-            )
-            .await
+        if let Err(error) = reconcile_runner_checkpoint(
+            &self.program_runtime,
+            bootstrap.checkpoint,
+            bootstrap.runtime_revision,
+            true,
+        )
+        .await
         {
             let _ = ipc
                 .brain_release_runner(&target.brain, lease.lease_id)
@@ -1106,13 +1124,13 @@ impl EventLoop {
                 return Err(error.context(format!("restore runner callback for {brain}")));
             }
         };
-        if let Err(error) = self
-            .program_runtime
-            .hydrate_reducible_state_if_newer(
-                bootstrap.checkpoint,
-                bootstrap.runtime_revision,
-            )
-            .await
+        if let Err(error) = reconcile_runner_checkpoint(
+            &self.program_runtime,
+            bootstrap.checkpoint,
+            bootstrap.runtime_revision,
+            true,
+        )
+        .await
         {
             let _ = ipc.brain_release_runner(&brain, lease.lease_id).await;
             return Err(error.context(format!("restore runtime checkpoint for {brain}")));
@@ -1294,6 +1312,51 @@ impl EventLoop {
 #[cfg(test)]
 mod brain_handler_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_reconnect_rolls_ahead_vm_back_to_canonical_checkpoint() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let canonical = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == 0)
+            .unwrap();
+        let canonical_checkpoint = canonical.checkpoint.unwrap();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("cancelled-run-that-committed-late".into()),
+                source: "1".into(),
+                intent: "simulate a late local callback commit".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert!(outcome.output_revision > canonical.revision);
+
+        reconcile_runner_checkpoint(
+            &runtime,
+            canonical_checkpoint,
+            canonical.revision,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.revision(), canonical.revision);
+        assert!(runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == canonical.revision)
+            .unwrap()
+            .stack
+            .is_empty());
+    }
 
     #[test]
     fn frontend_environment_requires_the_exact_machine_and_workspace() {
