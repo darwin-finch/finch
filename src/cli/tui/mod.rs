@@ -73,11 +73,7 @@ fn activate_default_terminal_modes<W: Write>(
 ) -> io::Result<()> {
     match activation {
         TerminalActivation::Startup => {
-            execute!(
-                writer,
-                crossterm::event::EnableBracketedPaste,
-                crossterm::event::EnableMouseCapture
-            )?;
+            execute!(writer, crossterm::event::EnableBracketedPaste)?;
             execute!(
                 writer,
                 crossterm::event::PushKeyboardEnhancementFlags(
@@ -85,13 +81,10 @@ fn activate_default_terminal_modes<W: Write>(
                 )
             )?;
         }
-        TerminalActivation::Resume => {
-            execute!(writer, crossterm::event::EnableMouseCapture)?;
-        }
+        TerminalActivation::Resume => {}
         TerminalActivation::EmergencyRestore => {
             execute!(
                 writer,
-                crossterm::event::EnableMouseCapture,
                 crossterm::event::EnableBracketedPaste,
                 crossterm::event::PushKeyboardEnhancementFlags(
                     crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
@@ -942,9 +935,21 @@ fn completion_row_budget(
 
 fn write_completion_pane(out: &mut impl Write, lines: &[String]) -> Result<usize> {
     for line in lines {
-        execute!(out, Print("\r\n"), Print(line))?;
+        advance_live_line(out)?;
+        execute!(out, Print(line))?;
     }
     Ok(lines.len())
+}
+
+/// Advance inside Finch's redraw-only viewport without emitting a linefeed.
+///
+/// A linefeed at the terminal's bottom margin permanently copies the top
+/// visible row into native history. Live composer, status, completion, and
+/// streaming rows are projections rather than transcript commits, so they
+/// must navigate with cursor commands that clamp at the viewport edge.
+fn advance_live_line(out: &mut impl Write) -> Result<()> {
+    execute!(out, cursor::MoveToNextLine(1))?;
+    Ok(())
 }
 
 fn write_live_area_erase(
@@ -1031,7 +1036,7 @@ fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<
     for (index, line) in frame.lines.iter().enumerate() {
         execute!(out, Print(line))?;
         if index + 1 < frame.lines.len() {
-            execute!(out, Print("\r\n"))?;
+            advance_live_line(out)?;
         }
     }
     let rows_below = frame
@@ -1639,7 +1644,8 @@ impl TuiRenderer {
             // vanish on the next redraw. Keep the uncommitted suffix ordered.
             for line in &content_frame.live_lines {
                 let line = line.trim_end_matches('\r');
-                execute!(stdout, Print(line), Print("\r\n"))?;
+                execute!(stdout, Print(line))?;
+                advance_live_line(&mut stdout)?;
                 rows += shadow_buffer::physical_rows(line, term_width);
             }
         }
@@ -1667,10 +1673,11 @@ impl TuiRenderer {
                             execute!(
                                 stdout,
                                 Print(format!(
-                                    "{}{} {}{}{}\r\n",
+                                    "{}{} {}{}{}",
                                     color, symbol, content, priority_tag, RESET
                                 ))
                             )?;
+                            advance_live_line(&mut stdout)?;
                             rows += shadow_buffer::physical_rows(&content, term_w);
                         }
                     }
@@ -1721,9 +1728,9 @@ impl TuiRenderer {
                 Print(task_text),
                 SetForegroundColor(Color::DarkGrey),
                 Print(format!(" · {model}{tool}")),
-                ResetColor,
-                Print("\r\n")
+                ResetColor
             )?;
+            advance_live_line(&mut stdout)?;
             rows += 1;
         }
 
@@ -1743,10 +1750,8 @@ impl TuiRenderer {
             .unwrap_or_else(|| self.session_label.clone());
         let separator = session_separator_line(term_width, &cwd_label, &session_label);
         if rows < term_h {
-            execute!(
-                stdout,
-                Print(format!("{}{}{}\r\n", DIM_GRAY, separator, RESET))
-            )?;
+            execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, separator, RESET)))?;
+            advance_live_line(&mut stdout)?;
             rows += 1;
         }
 
@@ -1800,7 +1805,7 @@ impl TuiRenderer {
                         execute!(stdout, Print(format!("{}{}", continuation, line)))?;
                     }
                     if i < lines.len() - 1 {
-                        execute!(stdout, Print("\r\n"))?;
+                        advance_live_line(&mut stdout)?;
                     }
                 }
             }
@@ -1835,9 +1840,10 @@ impl TuiRenderer {
             // here as well wastes a row and makes the Brain appear twice.
             // Thin separator between input area and status line(s) — full terminal width
             let status_sep: String = "─".repeat(term_width);
+            advance_live_line(&mut stdout)?;
             execute!(
                 stdout,
-                Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET))
+                Print(format!("{}{}{}", DIM_GRAY, status_sep, RESET))
             )?;
 
             // Count physical terminal rows consumed by status lines.  Long lines wrap,
@@ -1849,7 +1855,8 @@ impl TuiRenderer {
             // draw a new one on every render tick.
             let mut status_phys_rows: usize = 1; // 1 for the separator line itself
             for line in effective_status.lines() {
-                execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, line, RESET)))?;
+                advance_live_line(&mut stdout)?;
+                execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, line, RESET)))?;
                 let phys = shadow_buffer::physical_rows(line, term_width);
                 status_phys_rows += phys;
             }
@@ -2183,9 +2190,9 @@ fn continue_full_viewport_paint(
         execute!(
             stdout,
             Clear(ClearType::CurrentLine),
-            Print(line.trim_end_matches('\r')),
-            Print("\r\n")
+            Print(line.trim_end_matches('\r'))
         )?;
+        advance_live_line(stdout)?;
     }
     execute!(stdout, cursor::MoveTo(0, plan.live_top as u16))?;
     Ok(())
@@ -2345,8 +2352,7 @@ impl TuiRenderer {
     pub fn startup_header(model: &str, cwd: &str, session_label: &str) -> String {
         let version = env!("CARGO_PKG_VERSION");
         format!(
-            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲\n\n{}",
-            crate::cli::commands::MOUSE_SELECTION_HINT,
+            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲"
         )
     }
 }
@@ -2382,8 +2388,6 @@ impl TuiRenderer {
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
         let _ = io::stdout().flush();
-        execute!(io::stdout(), crossterm::event::DisableMouseCapture)
-            .context("Failed to release mouse capture")?;
         disable_raw_mode().context("Failed to disable raw mode")?;
         Ok(())
     }
@@ -3326,20 +3330,27 @@ impl TuiRenderer {
         let mut rendered = Vec::new();
         let total_rows =
             Self::draw_dialog_inline_static_with_width(&mut rendered, dialog, width.max(1))?;
-        if total_rows <= max_rows {
-            out.write_all(&rendered)?;
-            return Ok(total_rows);
-        }
-
-        let retained_rows = max_rows.saturating_sub(1);
-        for line in rendered
+        let retained_rows = if total_rows <= max_rows {
+            total_rows
+        } else {
+            max_rows.saturating_sub(1)
+        };
+        for row in rendered
             .split_inclusive(|byte| *byte == b'\n')
             .take(retained_rows)
         {
-            out.write_all(line)?;
+            let content_len = row
+                .len()
+                .saturating_sub(if row.ends_with(b"\r\n") { 2 } else { 0 });
+            out.write_all(&row[..content_len])?;
+            advance_live_line(out)?;
+        }
+        if total_rows <= max_rows {
+            return Ok(total_rows);
         }
         let marker = ellipsize("… dialog clipped to viewport; use navigation keys …", width);
-        execute!(out, Print(marker), Print("\r\n"))?;
+        execute!(out, Print(marker))?;
+        advance_live_line(out)?;
         Ok(max_rows)
     }
 
@@ -3919,7 +3930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_terminal_activation_enables_clickable_transcript_mouse_capture() {
+    fn test_default_terminal_activation_never_captures_native_mouse_input() {
         let enable_mouse = mouse_capture_sequence(true);
         for activation in [
             TerminalActivation::Startup,
@@ -3928,7 +3939,7 @@ mod tests {
         ] {
             let mut bytes = Vec::new();
             activate_default_terminal_modes(&mut bytes, activation).unwrap();
-            assert!(contains_bytes(&bytes, &enable_mouse));
+            assert!(!contains_bytes(&bytes, &enable_mouse));
         }
     }
 
@@ -3959,8 +3970,7 @@ mod tests {
         assert!(header.contains("finch v"));
         assert!(header.contains("grok-code-fast-1"));
         assert!(header.contains("amber-river  ·  ~/repo"));
-        assert!(header.contains("Option (iTerm2)"));
-        assert!(header.contains("Shift (many terminals)"));
+        assert!(!header.contains("Mouse transcript controls"));
         assert!(!header.contains('\x1b'));
     }
 
@@ -4128,6 +4138,11 @@ mod tests {
             !commands.contains("\x1b[3J"),
             "must not purge scrollback: {commands:?}"
         );
+        assert!(
+            !commands.contains('\n'),
+            "viewport reconstruction must not scroll native history: {commands:?}"
+        );
+        assert_eq!(commands.matches("\x1b[1E").count(), 2);
         assert!(
             commands.contains("\x1b[5;1H"),
             "transcript row is absolute: {commands:?}"
@@ -4980,7 +4995,11 @@ mod tests {
             assert_eq!(written, height, "height {height}");
             assert_eq!(tiny.lines.len(), height, "height {height}");
             assert!(tiny.lines.iter().all(|line| line.chars().count() <= 12));
-            assert_eq!(raw.matches("\r\n").count(), height.saturating_sub(1));
+            assert_eq!(raw.matches("\x1b[1E").count(), height.saturating_sub(1));
+            assert!(
+                !raw.contains('\n'),
+                "live redraw must not mutate scrollback"
+            );
             assert!(!raw.contains("\x1b[3J"));
             let hide = raw.find("\x1b[?25l").expect("dialog hid cursor");
             let show = raw.find("\x1b[?25h").expect("tiny input restored cursor");
@@ -4999,7 +5018,11 @@ mod tests {
         let rows = TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, 40, 5).unwrap();
         let raw = String::from_utf8(output).unwrap();
         assert_eq!(rows, 5);
-        assert_eq!(raw.matches("\r\n").count(), 5);
+        assert_eq!(raw.matches("\x1b[1E").count(), 5);
+        assert!(
+            !raw.contains('\n'),
+            "live dialog must not mutate scrollback"
+        );
         assert!(raw.contains("Critical approval"));
         assert!(raw.contains("dialog clipped to viewport"));
         assert!(!raw.contains("\x1b[3J"));
@@ -5053,7 +5076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_production_raw_completion_writer_is_plain_live_region_output() {
+    fn test_production_completion_writer_cannot_scroll_live_rows_into_history() {
         let registry = CommandRegistry::new();
         let mut autocomplete = AutocompleteState::new();
         autocomplete.show_matches(registry.match_prefix("/brain list"));
@@ -5064,17 +5087,10 @@ mod tests {
 
         let raw = String::from_utf8(output).unwrap();
         assert_eq!(rows, lines.len());
-        assert!(raw.contains("\r\nCommands 1-1 of 1"));
-        assert!(raw.contains("\r\n> /brain list - List named Brain sessions"));
-        assert!(
-            !raw.contains('\x1b'),
-            "no-color output must contain no ANSI"
-        );
+        assert!(raw.contains("\x1b[1ECommands 1-1 of 1"));
+        assert!(raw.contains("\x1b[1E> /brain list - List named Brain sessions"));
+        assert!(!raw.contains('\n'), "live rows must never emit linefeeds");
         assert!(!raw.contains("\x1b[3J"), "must not clear native scrollback");
-        assert!(
-            !raw.contains("\n\n"),
-            "must not emit committed-message spacing"
-        );
     }
 
     #[test]

@@ -15,6 +15,9 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
 - Native scrollback always receives the fully expanded semantic projection;
   disclosure state only changes later reconstructed/live viewport projections.
+- Live composer, status, completion, dialog, streaming, and resize projections
+  move the cursor without linefeeds. Only the canonical completion path may
+  deliberately scroll rows into terminal-native history.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Finch does not
   enable terminal mouse reporting by default, so selection, copying, and

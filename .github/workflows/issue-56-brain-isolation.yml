@@ -88,6 +88,12 @@ jobs:
         install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
         install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
 
+    - name: Exercise supervised native terminal history lifecycle
+      timeout-minutes: 15
+      run: |
+        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_binary_never_captures_native_mouse_input -- --exact --nocapture --test-threads=1
+        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_renderer_restores_mouse_mode_on_all_terminations -- --exact --nocapture --test-threads=1
+
     - name: Reject self-issued proof authority
       timeout-minutes: 15
       run: >-

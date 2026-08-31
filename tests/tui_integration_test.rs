@@ -51,13 +51,6 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
 }
 
 #[cfg(unix)]
-fn last_byte_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-}
-
-#[cfg(unix)]
 fn open_owned_pty() -> (std::fs::File, std::fs::File) {
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -117,6 +110,18 @@ fn wait_for_child(child: &mut std::process::Child, deadline: Instant) -> std::pr
     }
 }
 
+#[cfg(unix)]
+fn supervised_pty_authority_or_skip() -> bool {
+    match finch::brain::isolated_test_proof_if_present() {
+        Ok(Some(_proof)) => true,
+        Ok(None) => {
+            eprintln!("skipping environment-owned PTY regression outside scripts/test_brains.sh");
+            false
+        }
+        Err(error) => panic!("invalid supervisor authority for PTY regression: {error:#}"),
+    }
+}
+
 /// Production-boundary regression for Finch's real terminal lifecycle.
 ///
 /// The child inherits the repository test supervisor's isolated process group
@@ -124,10 +129,10 @@ fn wait_for_child(child: &mut std::process::Child, deadline: Instant) -> std::pr
 /// quit normally; it never signals a PID or starts a daemon.
 #[cfg(unix)]
 #[test]
-fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
-    let isolated_home = std::env::var_os("FINCH_BRAIN_TEST_ROOT")
-        .expect("run this PTY regression through scripts/test_brains.sh");
-    assert!(!isolated_home.is_empty());
+fn test_tui_binary_never_captures_native_mouse_input() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
 
     let (mut master, slave) = open_owned_pty();
     let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
@@ -143,78 +148,26 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
         .expect("failed to spawn Finch in owned PTY");
     drop(slave);
 
-    let hint = finch::cli::MOUSE_SELECTION_HINT.as_bytes();
     let enable_mouse = b"\x1b[?1000h";
     let disable_mouse = b"\x1b[?1000l";
+    let ready = b"accept edits on";
     let mut transcript = Vec::new();
     assert!(
         read_pty_until(
             &mut master,
             &mut transcript,
             Instant::now() + Duration::from_secs(20),
-            |bytes| bytes.windows(hint.len()).any(|window| window == hint)
-                && bytes
-                    .windows(enable_mouse.len())
-                    .any(|window| window == enable_mouse),
+            |bytes| bytes.windows(ready.len()).any(|window| window == ready),
         ),
-        "Finch startup did not advertise selection and enable mouse capture: {}",
+        "Finch did not reach its input surface: {}",
         String::from_utf8_lossy(&transcript)
+    );
+    assert!(
+        count_bytes(&transcript, enable_mouse) == 0,
+        "Finch enabled mouse reporting before input: {}",
+        String::from_utf8_lossy(&transcript),
     );
 
-    master.write_all(b"/setup\r").unwrap();
-    master.flush().unwrap();
-    let alternate_screen = b"\x1b[?1049h";
-    let wizard_ready = b"Ctrl+C: Cancel";
-    assert!(
-        read_pty_until(
-            &mut master,
-            &mut transcript,
-            Instant::now() + Duration::from_secs(10),
-            |bytes| {
-                bytes
-                    .windows(alternate_screen.len())
-                    .any(|window| window == alternate_screen)
-                    && bytes
-                        .windows(wizard_ready.len())
-                        .any(|window| window == wizard_ready)
-            },
-        ),
-        "setup wizard did not take exclusive ownership of the PTY: {}",
-        String::from_utf8_lossy(&transcript)
-    );
-    master.write_all(b"\x03").unwrap();
-    master.flush().unwrap();
-    let cancel_confirmation = b"Cancel setup?";
-    assert!(
-        read_pty_until(
-            &mut master,
-            &mut transcript,
-            Instant::now() + Duration::from_secs(10),
-            |bytes| bytes
-                .windows(cancel_confirmation.len())
-                .any(|window| window == cancel_confirmation),
-        ),
-        "setup wizard did not request cancellation confirmation: {}",
-        String::from_utf8_lossy(&transcript)
-    );
-    master.write_all(b"y").unwrap();
-    master.flush().unwrap();
-    assert!(
-        read_pty_until(
-            &mut master,
-            &mut transcript,
-            Instant::now() + Duration::from_secs(10),
-            |bytes| count_bytes(bytes, enable_mouse) >= 3,
-        ),
-        "Finch did not restore mouse capture after setup: {}",
-        String::from_utf8_lossy(&transcript)
-    );
-    assert!(
-        !String::from_utf8_lossy(&transcript).contains("❯ y"),
-        "wizard confirmation leaked into the REPL input"
-    );
-
-    let disables_before_quit = count_bytes(&transcript, disable_mouse);
     master.write_all(b"/quit\r").unwrap();
     master.flush().unwrap();
     assert!(
@@ -222,17 +175,14 @@ fn test_tui_binary_advertises_selection_override_and_restores_mouse_mode() {
             &mut master,
             &mut transcript,
             Instant::now() + Duration::from_secs(10),
-            |bytes| count_bytes(bytes, disable_mouse) > disables_before_quit,
+            |bytes| count_bytes(bytes, disable_mouse) > 0,
         ),
-        "Finch shutdown did not disable mouse capture: {}",
+        "Finch shutdown did not emit its defensive mouse reset: {}",
         String::from_utf8_lossy(&transcript)
     );
     let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
     assert!(status.success(), "Finch exited unsuccessfully: {status}");
-    assert!(
-        last_byte_offset(&transcript, enable_mouse) < last_byte_offset(&transcript, disable_mouse),
-        "Finch did not leave mouse reporting disabled"
-    );
+    assert_eq!(count_bytes(&transcript, enable_mouse), 0);
 }
 
 /// Child-only probe used by `test_tui_renderer_restores_mouse_mode_on_all_terminations`.
@@ -262,13 +212,14 @@ fn tui_renderer_terminal_lifecycle_child() -> Result<(), &'static str> {
     }
 }
 
-/// The real renderer must always release mouse reporting, including unwind
-/// and ordinary `Result::Err` paths where explicit shutdown is skipped.
+/// The real renderer must never acquire mouse reporting, including startup,
+/// clean shutdown, unwind, and ordinary `Result::Err` paths.
 #[cfg(unix)]
 #[test]
 fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
-    std::env::var_os("FINCH_BRAIN_TEST_ROOT")
-        .expect("run this PTY regression through scripts/test_brains.sh");
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
     let enable_mouse = b"\x1b[?1000h";
     let disable_mouse = b"\x1b[?1000l";
 
@@ -293,18 +244,18 @@ fn test_tui_renderer_restores_mouse_mode_on_all_terminations() {
             &mut master,
             &mut transcript,
             Instant::now() + Duration::from_secs(10),
-            |bytes| count_bytes(bytes, enable_mouse) > 0 && count_bytes(bytes, disable_mouse) > 0,
+            |bytes| count_bytes(bytes, disable_mouse) > 0,
         );
         let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
         assert!(
             observed_cleanup,
-            "{termination} path left mouse reporting enabled: {}",
+            "{termination} path omitted the defensive mouse reset: {}",
             String::from_utf8_lossy(&transcript)
         );
-        assert!(
-            last_byte_offset(&transcript, enable_mouse)
-                < last_byte_offset(&transcript, disable_mouse),
-            "{termination} path ended with mouse reporting enabled"
+        assert_eq!(
+            count_bytes(&transcript, enable_mouse),
+            0,
+            "{termination} path enabled mouse reporting"
         );
         if matches!(termination, "clean" | "drop") {
             assert!(status.success(), "{termination} probe failed: {status}");
