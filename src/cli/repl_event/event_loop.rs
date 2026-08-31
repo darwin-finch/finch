@@ -306,6 +306,9 @@ pub struct EventLoop {
     /// unrelated flat messages.
     remote_brain_run_units:
         std::collections::HashMap<crate::brain::store::RunId, RemoteBrainRunProjection>,
+    /// Bounded terminal-run tombstones. Heavy message state remains owned by
+    /// OutputManager while this metadata suppresses late live events.
+    terminal_remote_brain_runs: std::collections::VecDeque<crate::brain::store::RunId>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
     remote_brain_approval_rows: std::collections::HashMap<String, usize>,
     queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
@@ -1263,12 +1266,17 @@ fn project_remote_brain_run_event(
                 ProgramLanguage::Forth => "forth",
                 ProgramLanguage::Lisp => "lisp",
             };
-            let program = projection.program.get_or_insert_with(|| {
-                output_manager.start_program_source_with_id(
+            if projection.program.is_none() {
+                let program = Arc::new(crate::cli::messages::ProgramSourceMessage::with_id(
                     brain_run_message_id(run_id, "program-source"),
                     language,
-                )
-            });
+                ));
+                projection
+                    .activity
+                    .add_artifact(Arc::clone(&program) as crate::cli::messages::MessageRef);
+                projection.program = Some(program);
+            }
+            let program = projection.program.as_ref().expect("installed above");
             if program.adopt_canonical_source(source)
                 == crate::cli::messages::CanonicalAdoption::Conflict
             {
@@ -1283,12 +1291,17 @@ fn project_remote_brain_run_event(
                 projection.activity.fail_row(row, error);
             } else {
                 projection.activity.complete_row(row, "completed");
-                let output_message = projection.output.get_or_insert_with(|| {
-                    output_manager.start_program_output_with_id(brain_run_message_id(
-                        run_id,
-                        "program-output",
-                    ))
-                });
+                if projection.output.is_none() {
+                    let output_message =
+                        Arc::new(crate::cli::messages::ProgramOutputMessage::with_id(
+                            brain_run_message_id(run_id, "program-output"),
+                        ));
+                    projection.activity.add_artifact(
+                        Arc::clone(&output_message) as crate::cli::messages::MessageRef
+                    );
+                    projection.output = Some(output_message);
+                }
+                let output_message = projection.output.as_ref().expect("installed above");
                 if output_message.adopt_canonical_output(output)
                     == crate::cli::messages::CanonicalAdoption::Conflict
                 {
@@ -1591,6 +1604,11 @@ pub(crate) fn project_remote_brain_live_run_event(
                 }
                 crate::brain::store::BrainEventKind::Program { .. } => {
                     if let Some(source) = local_source {
+                        projection
+                            .activity
+                            .add_artifact(Arc::clone(&source) as crate::cli::messages::MessageRef);
+                        output_manager
+                            .remove_message(crate::cli::messages::Message::id(source.as_ref()));
                         projection.program = Some(source);
                     }
                 }
@@ -1598,6 +1616,11 @@ pub(crate) fn project_remote_brain_live_run_event(
                     if projection_match == LocalProjectionMatch::SuppressAndComplete =>
                 {
                     if let Some(output) = local_output {
+                        projection
+                            .activity
+                            .add_artifact(Arc::clone(&output) as crate::cli::messages::MessageRef);
+                        output_manager
+                            .remove_message(crate::cli::messages::Message::id(output.as_ref()));
                         projection.output = Some(output);
                     }
                 }
@@ -1620,6 +1643,30 @@ pub(crate) fn project_remote_brain_live_run_event(
         }
     }
     projected
+}
+
+const MAX_TERMINAL_REMOTE_RUNS: usize = 1_000;
+
+fn prune_terminal_remote_run_units(
+    projections: &mut std::collections::HashMap<
+        crate::brain::store::RunId,
+        RemoteBrainRunProjection,
+    >,
+    tombstones: &mut std::collections::VecDeque<crate::brain::store::RunId>,
+) {
+    let terminal = projections
+        .iter()
+        .filter_map(|(run_id, projection)| projection.sealed_at.map(|_| *run_id))
+        .collect::<Vec<_>>();
+    for run_id in terminal {
+        projections.remove(&run_id);
+        if !tombstones.contains(&run_id) {
+            tombstones.push_back(run_id);
+        }
+    }
+    while tombstones.len() > MAX_TERMINAL_REMOTE_RUNS {
+        tombstones.pop_front();
+    }
 }
 
 fn deferred_vm_approval_from_tool_result(
@@ -2219,6 +2266,7 @@ impl EventLoop {
             brain_projection_revisions: std::collections::HashMap::new(),
             remote_brain_tool_unit: None,
             remote_brain_run_units: std::collections::HashMap::new(),
+            terminal_remote_brain_runs: std::collections::VecDeque::new(),
             remote_brain_tool_rows: std::collections::HashMap::new(),
             remote_brain_approval_rows: std::collections::HashMap::new(),
             queued_remote_brain_approvals: std::collections::VecDeque::new(),
@@ -6358,6 +6406,17 @@ Rules:\n\
         match message {
             crate::brain::store::BrainWireMessage::Snapshot { brain } => {
                 self.update_remote_brain_status(brain.runner_lease.is_some());
+                let projected_seq = self
+                    .brain_projection_revisions
+                    .get(&brain.brain_id)
+                    .copied()
+                    .unwrap_or(0);
+                let replay_events = brain
+                    .events
+                    .iter()
+                    .filter(|event| event.seq > projected_seq)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let local_machine = self
                     .selected_brain()
                     .is_some_and(|client| !client.target.secure)
@@ -6368,7 +6427,11 @@ Rules:\n\
                     &mut self.remote_brain_run_units,
                     &mut self.local_brain_projections,
                     selected_brain_is_home,
-                    &brain.events,
+                    &replay_events,
+                );
+                prune_terminal_remote_run_units(
+                    &mut self.remote_brain_run_units,
+                    &mut self.terminal_remote_brain_runs,
                 );
                 self.todo_list
                     .write()
@@ -6380,16 +6443,7 @@ Rules:\n\
                     self.context_lines.saturating_sub(1),
                     local_machine,
                 );
-                let acknowledged_seq = self
-                    .selected_brain()
-                    .and_then(|client| client.attachment())
-                    .map(|attachment| attachment.acknowledged_seq)
-                    .unwrap_or(0);
-                for event in brain
-                    .events
-                    .iter()
-                    .filter(|event| event.seq > acknowledged_seq)
-                {
+                for event in &replay_events {
                     if event.run_id.is_none() && replay_event_belongs_in_transcript(event) {
                         self.render_remote_brain_event(event).await;
                     }
@@ -6619,6 +6673,12 @@ Rules:\n\
 
     async fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
         use crate::brain::store::BrainEventKind;
+        if event
+            .run_id
+            .is_some_and(|run_id| self.terminal_remote_brain_runs.contains(&run_id))
+        {
+            return;
+        }
         let selected_brain_is_home = self.selected_brain_is_home();
         if project_remote_brain_live_run_event(
             &self.output_manager,
@@ -6627,6 +6687,10 @@ Rules:\n\
             selected_brain_is_home,
             event,
         ) {
+            prune_terminal_remote_run_units(
+                &mut self.remote_brain_run_units,
+                &mut self.terminal_remote_brain_runs,
+            );
             return;
         }
         let local_machine = self
@@ -8429,15 +8493,6 @@ fn project_remote_brain_snapshot_runs(
     selected_brain_is_home: bool,
     events: &[crate::brain::store::BrainEvent],
 ) {
-    for group in projected_brain_run_groups(events) {
-        ensure_remote_brain_run_projection(
-            output_manager,
-            projections,
-            group.run_id,
-            Some(group.kind),
-            group.status,
-        );
-    }
     let mut ordered_events = events
         .iter()
         .filter(|event| event.run_id.is_some())
@@ -9690,6 +9745,67 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replay_registers_multi_run_roots_in_canonical_event_order() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
+            RunId,
+        };
+
+        let output = crate::cli::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_a = RunId(uuid::Uuid::new_v4());
+        let run_b = RunId(uuid::Uuid::new_v4());
+        let run = |run_id| BrainRun {
+            run_id,
+            kind: BrainRunKind::Interactive,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::Running,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let mut a_start = brain_event(1, "daemon", BrainEventKind::RunStarted { run: run(run_a) });
+        a_start.run_id = Some(run_a);
+        let mut a_program = brain_event(
+            2,
+            "provider",
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(say \"a\")".into(),
+            },
+        );
+        a_program.run_id = Some(run_a);
+        let mut b_start = brain_event(3, "daemon", BrainEventKind::RunStarted { run: run(run_b) });
+        b_start.run_id = Some(run_b);
+        let mut projections = std::collections::HashMap::new();
+        let mut locals = std::collections::VecDeque::new();
+        super::project_remote_brain_snapshot_runs(
+            &output,
+            &mut projections,
+            &mut locals,
+            false,
+            &[a_start, a_program, b_start],
+        );
+        let roots = output.get_messages();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(
+            roots[0].id(),
+            super::brain_run_message_id(run_a, "activity")
+        );
+        assert_eq!(
+            roots[1].id(),
+            super::brain_run_message_id(run_b, "activity")
+        );
+        assert!(roots[0]
+            .children()
+            .iter()
+            .any(|child| child.kind() == crate::cli::messages::MessageKind::Program));
+    }
+
+    #[test]
     fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
         use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
         use crate::cli::messages::TranscriptRowKind;
@@ -9817,10 +9933,11 @@ mod tests {
         ));
 
         let messages = output.get_messages();
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages
                 .iter()
+                .flat_map(|message| message.children())
                 .filter(|message| {
                     message
                         .transcript_row(&crate::config::ColorScheme::default())
@@ -10194,16 +10311,20 @@ mod tests {
         let approval_row =
             activity.add_activity("approval (tool) for legacy audience unspecified: write_cache");
         activity.complete_row(approval_row, "approve_once by daemon");
-        let source_message = output.start_program_source_with_id(
+        let source_message = Arc::new(crate::cli::messages::ProgramSourceMessage::with_id(
             super::brain_run_message_id(run_id, "program-source"),
             "lisp",
-        );
+        ));
         source_message.replace_source("(say \"cache checked\")");
         source_message.set_complete();
-        let transient_output_unit = output
-            .start_program_output_with_id(super::brain_run_message_id(run_id, "program-output"));
+        let transient_output_unit = Arc::new(crate::cli::messages::ProgramOutputMessage::with_id(
+            super::brain_run_message_id(run_id, "program-output"),
+        ));
         transient_output_unit.replace_output("cache checked");
         transient_output_unit.set_complete();
+        activity.add_artifact(Arc::clone(&source_message) as crate::cli::messages::MessageRef);
+        activity
+            .add_artifact(Arc::clone(&transient_output_unit) as crate::cli::messages::MessageRef);
         let before_canonical = output
             .get_messages()
             .iter()
@@ -10214,21 +10335,7 @@ mod tests {
                     .kind
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            before_canonical,
-            vec![
-                TranscriptRowKind::Activity,
-                TranscriptRowKind::Program,
-                TranscriptRowKind::Output,
-            ]
-        );
-        assert_eq!(
-            before_canonical
-                .iter()
-                .filter(|kind| **kind == TranscriptRowKind::Output)
-                .count(),
-            1
-        );
+        assert_eq!(before_canonical, vec![TranscriptRowKind::Activity]);
         let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
             run_id,
             source: "(say \"cache checked\")".into(),
@@ -10254,10 +10361,22 @@ mod tests {
         assert!(local_projections.is_empty());
 
         let messages = output.get_messages();
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 1);
         let rendered = messages
             .iter()
-            .map(|message| message.format(&crate::config::ColorScheme::default()))
+            .flat_map(|message| {
+                message
+                    .render(
+                        &crate::cli::messages::RenderContext::new(
+                            &crate::config::ColorScheme::default(),
+                            crate::cli::messages::RenderCapabilities::plain_text(usize::MAX),
+                        )
+                        .fully_expanded(),
+                    )
+                    .lines
+                    .into_iter()
+                    .map(|line| line.text)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         for expected in [
@@ -10267,7 +10386,7 @@ mod tests {
             "cache hit",
             "approval (tool)",
             "approve_once by daemon",
-            "program (lisp)",
+            "Program source (lisp)",
             "(say \"cache checked\")",
             "cache checked",
             "completed",
@@ -10278,18 +10397,21 @@ mod tests {
             );
         }
         assert_eq!(rendered.matches("inspect the cache").count(), 1);
-        assert_eq!(rendered.matches("read_cache").count(), 1);
+        assert_eq!(rendered.matches("read_cache").count(), 2);
         assert_eq!(rendered.matches("approval (tool)").count(), 1);
-        assert_eq!(rendered.matches("program (lisp)").count(), 1);
+        assert_eq!(rendered.matches("Program source (lisp)").count(), 1);
         assert_eq!(rendered.matches("result").count(), 1);
         assert_eq!(rendered.matches("cache checked").count(), 2);
         assert!(source_message.canonical_adopted());
         let projection = projections.get(&run_id).unwrap();
         assert_eq!(projection.activity.id(), messages[0].id());
-        assert_eq!(projection.program.as_ref().unwrap().id(), messages[1].id());
-        assert_eq!(projection.output.as_ref().unwrap().id(), messages[2].id());
-        assert_ne!(messages[0].id(), messages[1].id());
-        assert_ne!(messages[1].id(), messages[2].id());
+        let root_children = messages[0].children();
+        assert!(root_children
+            .iter()
+            .any(|child| child.id() == projection.program.as_ref().unwrap().id()));
+        assert!(root_children
+            .iter()
+            .any(|child| child.id() == projection.output.as_ref().unwrap().id()));
         let activity_row = projection
             .activity
             .transcript_row(&crate::config::ColorScheme::default())
@@ -10313,8 +10435,11 @@ mod tests {
         assert!(activity_row
             .children
             .iter()
-            .all(|row| row.kind != TranscriptRowKind::Program
-                && row.kind != TranscriptRowKind::Output));
+            .any(|row| row.kind == TranscriptRowKind::Program));
+        assert!(activity_row
+            .children
+            .iter()
+            .any(|row| row.kind == TranscriptRowKind::Output));
         assert_eq!(program_row.kind, TranscriptRowKind::Program);
         assert!(program_row.children.is_empty());
         assert_eq!(output_row.kind, TranscriptRowKind::Output);
@@ -10332,15 +10457,12 @@ mod tests {
             &events,
         );
         let replayed_messages = output.get_messages();
-        assert_eq!(replayed_messages.len(), 3);
+        assert_eq!(replayed_messages.len(), 1);
         assert_eq!(
             replayed_messages
                 .iter()
-                .filter(|message| {
-                    message
-                        .transcript_row(&crate::config::ColorScheme::default())
-                        .is_some_and(|row| row.kind == TranscriptRowKind::Output)
-                })
+                .flat_map(|message| message.children())
+                .filter(|message| message.kind() == TranscriptRowKind::Output)
                 .count(),
             1
         );
@@ -10385,7 +10507,7 @@ mod tests {
             projection.output.as_ref().unwrap().content(),
             "cache checked"
         );
-        assert_eq!(output.get_messages().len(), 3);
+        assert_eq!(output.get_messages().len(), 1);
 
         // A fresh reconnect reconstructs the same semantic identities from
         // the durable run namespace, independent of frontend construction.
@@ -10402,7 +10524,7 @@ mod tests {
             &events,
         );
         let reconnect_messages = reconnect_output.get_messages();
-        assert_eq!(reconnect_messages.len(), 3);
+        assert_eq!(reconnect_messages.len(), 1);
         assert_eq!(
             reconnect_messages
                 .iter()
@@ -10423,11 +10545,7 @@ mod tests {
                         .kind
                 })
                 .collect::<Vec<_>>(),
-            vec![
-                TranscriptRowKind::Activity,
-                TranscriptRowKind::Program,
-                TranscriptRowKind::Output,
-            ]
+            vec![TranscriptRowKind::Activity]
         );
     }
 

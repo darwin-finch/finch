@@ -356,13 +356,15 @@ impl EventLoop {
         };
         client.target.machine = snapshot.environment.machine.clone();
         let target_name = client.target.display_name();
-        client.acknowledge(snapshot.revision).await?;
         self.home_brain = Some(client);
         self.todo_journal_target.set(self.home_brain.clone());
         self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
             brain: snapshot.clone(),
         })
         .await?;
+        if let Some(client) = self.home_brain.as_mut() {
+            client.acknowledge(snapshot.revision).await?;
+        }
         let event_tx = self.event_tx.clone();
         tokio::task::spawn_local(async move {
             let mut watch_error = None;

@@ -1385,9 +1385,10 @@ fn commit_complete_messages(
     terminal_height: usize,
 ) -> Result<()> {
     let mut accepted = Vec::new();
+    let mut accepted_this_batch = HashSet::new();
     let mut staged = Vec::new();
     for message in messages {
-        if printed_ids.contains(&message.id()) {
+        if printed_ids.contains(&message.id()) || !accepted_this_batch.insert(message.id()) {
             continue;
         }
         let complete = accordion
@@ -1901,6 +1902,15 @@ fn uncommitted_suffix(
         .collect()
 }
 
+fn collect_message_tree_ids(message: &MessageRef, ids: &mut HashSet<MessageId>) {
+    if !ids.insert(message.id()) {
+        return;
+    }
+    for child in message.children() {
+        collect_message_tree_ids(&child, ids);
+    }
+}
+
 /// Select the newest transcript rows that fit in a visible viewport slice.
 /// Unlike `live_viewport_lines`, this has no synthetic clipping row: a full
 /// viewport rebuild is a projection of retained transcript, not new scrollback.
@@ -2180,6 +2190,19 @@ impl TuiRenderer {
                 return Err(error);
             }
             self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
+            self.output_manager
+                .mark_committed(to_commit.iter().map(|message| message.id()));
+            let retained_roots = self.output_manager.get_messages();
+            let retained_root_ids = retained_roots
+                .iter()
+                .map(|message| message.id())
+                .collect::<HashSet<_>>();
+            let mut retained_tree_ids = HashSet::new();
+            for message in &retained_roots {
+                collect_message_tree_ids(message, &mut retained_tree_ids);
+            }
+            self.printed_ids.retain(|id| retained_root_ids.contains(id));
+            self.accordion.retain_message_ids(&retained_tree_ids);
             self.viewport_invalidated = true;
             self.redraw_full_viewport_inner(true)?;
             self.live_area_dirty = false;
@@ -4270,6 +4293,90 @@ mod tests {
         .unwrap();
         assert_eq!(native_bytes.len(), committed_len);
         assert_eq!(String::from_utf8(native_bytes).unwrap(), committed);
+    }
+
+    #[test]
+    fn durable_utf8_hard_break_survives_restart_wire_replay_and_native_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = "first  \n2. 世界 — complete";
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        store
+            .push(
+                "shared",
+                "alice",
+                crate::brain::store::BrainEventKind::ParticipantMessage {
+                    text: text.to_string(),
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let restarted = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        let snapshot = restarted.snapshot("shared").unwrap();
+        let wire = crate::brain::store::BrainWireMessage::Snapshot { brain: snapshot };
+        let encoded = crate::ipc::brain_codec::encode_brain_wire_message(&wire).unwrap();
+        let decoded = crate::ipc::brain_codec::decode_brain_wire_message(&encoded).unwrap();
+        let crate::brain::store::BrainWireMessage::Snapshot { brain } = decoded else {
+            panic!("wire changed snapshot variant");
+        };
+        let replayed = brain
+            .events
+            .into_iter()
+            .find_map(|event| match event.kind {
+                crate::brain::store::BrainEventKind::ParticipantMessage { text } => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(replayed.as_bytes(), text.as_bytes());
+
+        let output = crate::cli::OutputManager::new(ColorScheme::default());
+        output.disable_stdout();
+        output.write_brain_participant("alice", replayed, false);
+        let mut native = Vec::new();
+        let mut accordion = AccordionState::default();
+        let mut printed = HashSet::new();
+        commit_complete_messages(
+            &mut native,
+            &output.get_messages(),
+            &mut accordion,
+            &ColorScheme::default(),
+            &mut printed,
+            0,
+        )
+        .unwrap();
+        let native = String::from_utf8(native).unwrap().replace("\r\n", "\n");
+        assert!(
+            native.contains(text),
+            "native transcript changed bytes: {native:?}"
+        );
+    }
+
+    #[test]
+    fn tui_renderer_repeated_flush_ticks_commit_one_root_exactly_once() {
+        let output = Arc::new(crate::cli::OutputManager::new(ColorScheme::default()));
+        output.disable_stdout();
+        let status = Arc::new(crate::cli::StatusBar::new());
+        let mut tui =
+            TuiRenderer::new_headless(Arc::clone(&output), status, ColorScheme::default());
+        let activity =
+            output.start_activity_with_id(crate::cli::messages::MessageId::new(), "named run");
+        let source = Arc::new(crate::cli::messages::ProgramSourceMessage::new("lisp"));
+        source.replace_source("(say \"once\")");
+        source.set_complete();
+        activity.add_artifact(source);
+        activity.set_complete();
+
+        tui.flush_output_safe(&output).unwrap();
+        assert_eq!(tui.printed_ids.len(), 1);
+        tui.flush_output_safe(&output).unwrap();
+        assert_eq!(tui.printed_ids.len(), 1);
+        assert_eq!(output.get_messages().len(), 1);
     }
 
     #[test]

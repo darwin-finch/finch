@@ -1,6 +1,6 @@
 //! Presentation-only disclosure state for retained transcript rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -37,6 +37,16 @@ pub struct AccordionState {
 }
 
 impl AccordionState {
+    pub fn retain_message_ids(&mut self, retained: &HashSet<MessageId>) {
+        self.expanded.retain(|id, _| retained.contains(id));
+        self.visible_expanded.retain(|id, _| retained.contains(id));
+        self.visible_order.retain(|id| retained.contains(id));
+        self.hit_regions
+            .retain(|region| retained.contains(&region.row_id));
+        if self.focused.is_some_and(|id| !retained.contains(&id)) {
+            self.focused = None;
+        }
+    }
     pub fn render_message(
         &self,
         message: &MessageRef,

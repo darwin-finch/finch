@@ -327,6 +327,7 @@ fn vm_manifest_query(messages: &[crate::claude::Message], query: &str) -> String
 
 struct WireExecution {
     source_for_history: String,
+    source_unit: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
     response: String,
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
     output_unit: Arc<crate::cli::messages::ProgramOutputMessage>,
@@ -387,11 +388,15 @@ async fn execute_wire_with_single_repair(
         crate::programs::corpus::WireCorpusAttempt::FirstPass,
         &source,
     );
-    let reuse_output_for_repair = output_id.is_some();
     let output_unit = output_id.map_or_else(
         || output_manager.start_program_output(),
         |id| output_manager.start_program_output_with_id(id),
     );
+    if let Some(source_projection) = source_projection.as_ref() {
+        source_projection
+            .add_artifact(Arc::clone(&output_unit) as crate::cli::messages::MessageRef);
+        output_manager.remove_message(crate::cli::messages::Message::id(output_unit.as_ref()));
+    }
     let initial = execute_direct_wire_response(
         runtime,
         Arc::clone(&output_manager),
@@ -418,6 +423,7 @@ async fn execute_wire_with_single_repair(
             let effect_journal = runner_effect_records(&outcome);
             return WireExecution {
                 source_for_history: source,
+                source_unit: source_projection.clone(),
                 response: outcome.output,
                 effect_journal,
                 output_unit,
@@ -451,6 +457,7 @@ async fn execute_wire_with_single_repair(
         });
         return WireExecution {
             source_for_history: source,
+            source_unit: source_projection.clone(),
             response: diagnostic,
             effect_journal,
             output_unit,
@@ -462,6 +469,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
+            source_unit: source_projection.clone(),
             response: diagnostic,
             effect_journal,
             output_unit,
@@ -486,6 +494,7 @@ async fn execute_wire_with_single_repair(
             output_unit.set_complete();
             return WireExecution {
                 source_for_history: source,
+                source_unit: source_projection.clone(),
                 response: diagnostic,
                 effect_journal,
                 output_unit,
@@ -500,6 +509,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
+            source_unit: source_projection.clone(),
             response: diagnostic,
             effect_journal,
             output_unit,
@@ -511,6 +521,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
+            source_unit: source_projection.clone(),
             response: diagnostic,
             effect_journal,
             output_unit,
@@ -522,6 +533,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
+            source_unit: source_projection.clone(),
             response: diagnostic,
             effect_journal,
             output_unit,
@@ -536,23 +548,50 @@ async fn execute_wire_with_single_repair(
         crate::programs::corpus::WireCorpusAttempt::Repair,
         &repaired_source,
     );
-    if let Some(source_projection) = source_projection {
-        source_projection.replace_source(repaired_source.clone());
-    } else {
-        let repair_source_unit = output_manager.start_program_source(
-            crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
-        );
-        repair_source_unit.replace_source(repaired_source.clone());
-        repair_source_unit.set_complete();
+    // Seal attempt A and its diagnostic before creating attempt B. Repair is
+    // append-only audit history: neither the rejected source nor D is reused.
+    if let Some(source_projection) = source_projection.as_ref() {
+        source_projection.set_failed();
+    }
+    output_unit.set_complete();
+    let repair_source_id = output_id
+        .map(|id| crate::cli::messages::MessageId::from_namespace(id.as_uuid(), "repair-source"));
+    let repair_source_unit = repair_source_id.map_or_else(
+        || {
+            output_manager.start_program_source(
+                crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+            )
+        },
+        |id| {
+            output_manager.start_program_source_with_id(
+                id,
+                crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+            )
+        },
+    );
+    repair_source_unit.replace_source(repaired_source.clone());
+    if let Some(rejected_source_unit) = source_projection.as_ref() {
+        repair_source_unit
+            .add_artifact(Arc::clone(rejected_source_unit) as crate::cli::messages::MessageRef);
+        output_manager.remove_message(crate::cli::messages::Message::id(
+            rejected_source_unit.as_ref(),
+        ));
     }
 
-    let repair_output_unit = if reuse_output_for_repair {
-        output_unit.reset_provisional_output();
-        Arc::clone(&output_unit)
-    } else {
-        output_unit.set_complete();
-        output_manager.start_program_output()
-    };
+    let repair_output_unit = output_id.map_or_else(
+        || output_manager.start_program_output(),
+        |id| {
+            output_manager.start_program_output_with_id(
+                crate::cli::messages::MessageId::from_namespace(id.as_uuid(), "repair-output"),
+            )
+        },
+    );
+    repair_source_unit
+        .add_artifact(Arc::clone(&repair_output_unit) as crate::cli::messages::MessageRef);
+    output_manager.remove_message(crate::cli::messages::Message::id(
+        repair_output_unit.as_ref(),
+    ));
+    repair_source_unit.set_complete();
     match execute_direct_wire_response(
         runtime,
         output_manager,
@@ -577,6 +616,7 @@ async fn execute_wire_with_single_repair(
             });
             WireExecution {
                 source_for_history: repaired_source,
+                source_unit: Some(Arc::clone(&repair_source_unit)),
                 response: outcome.output,
                 effect_journal,
                 output_unit: repair_output_unit,
@@ -597,6 +637,7 @@ async fn execute_wire_with_single_repair(
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
+                source_unit: Some(Arc::clone(&repair_source_unit)),
                 response: detail,
                 effect_journal,
                 output_unit: repair_output_unit,
@@ -612,6 +653,7 @@ async fn execute_wire_with_single_repair(
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
+                source_unit: Some(repair_source_unit),
                 response: detail,
                 effect_journal,
                 output_unit: repair_output_unit,
@@ -1222,6 +1264,9 @@ pub(crate) async fn process_query_with_tools(
                         }
                         Err(e) => {
                             tracing::error!("Stream error in event loop: {}", e);
+                            if let Some(source) = streamed_source_unit.take() {
+                                source.set_failed();
+                            }
                             work_unit.set_failed();
                             let _ = event_tx.send(ReplEvent::QueryFailed {
                                 query_id,
@@ -1245,6 +1290,9 @@ pub(crate) async fn process_query_with_tools(
                         work_unit.add_tokens(&text);
                     }
                 } else if !completed_text.is_empty() && completed_text != text {
+                    if let Some(source) = streamed_source_unit.take() {
+                        source.set_failed();
+                    }
                     work_unit.set_failed();
                     let _ = event_tx.send(ReplEvent::QueryFailed {
                         query_id,
@@ -1392,7 +1440,6 @@ pub(crate) async fn process_query_with_tools(
                     work_unit.set_complete();
                     query_states.set_tool_work_unit(query_id, None).await;
                 } else if !reusing_tool_unit {
-                    work_unit.set_complete();
                     output_manager
                         .remove_message(crate::cli::messages::Message::id(work_unit.as_ref()));
                 }
@@ -1439,12 +1486,16 @@ pub(crate) async fn process_query_with_tools(
                         )
                         .await;
                 }
+                let final_source_unit = wire_execution
+                    .source_unit
+                    .clone()
+                    .unwrap_or_else(|| Arc::clone(&source_unit));
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
-                commit_wire_source_projection(source_unit.as_ref(), &source_for_history);
+                commit_wire_source_projection(final_source_unit.as_ref(), &source_for_history);
                 if named_brain_turn {
                     query_states
-                        .set_brain_source_message(query_id, Some(Arc::clone(&source_unit)))
+                        .set_brain_source_message(query_id, Some(final_source_unit))
                         .await;
                 }
                 let history_content =
@@ -1643,7 +1694,6 @@ pub(crate) async fn process_query_with_tools(
                 work_unit.set_complete();
                 query_states.set_tool_work_unit(query_id, None).await;
             } else if !reusing_tool_unit {
-                work_unit.set_complete();
                 output_manager
                     .remove_message(crate::cli::messages::Message::id(work_unit.as_ref()));
             }
@@ -1687,13 +1737,17 @@ pub(crate) async fn process_query_with_tools(
                     )
                     .await;
             }
+            let final_source_unit = wire_execution
+                .source_unit
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&source_unit));
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
             let source_for_history = wire_execution.source_for_history;
-            commit_wire_source_projection(source_unit.as_ref(), &source_for_history);
+            commit_wire_source_projection(final_source_unit.as_ref(), &source_for_history);
             if named_brain_turn {
                 query_states
-                    .set_brain_source_message(query_id, Some(Arc::clone(&source_unit)))
+                    .set_brain_source_message(query_id, Some(final_source_unit))
                     .await;
             }
             let history_content = match history_content_with_source(
@@ -2738,8 +2792,8 @@ mod tests {
         let messages = output.get_messages();
         assert_eq!(
             messages.len(),
-            3,
-            "source, failed output, repaired source/output"
+            2,
+            "failed output plus repaired source/output tree"
         );
         assert!(messages.iter().all(|message| !message
             .format(&crate::config::ColorScheme::default())
@@ -2747,7 +2801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn named_brain_repair_preserves_one_stable_source_and_output_identity() {
+    async fn named_brain_repair_preserves_rejected_attempt_and_diagnostic_children() {
         use crate::cli::messages::{Message, MessageKind};
 
         let runtime = crate::runtime::ProgramRuntime::new();
@@ -2780,27 +2834,58 @@ mod tests {
             Some(output_id),
         )
         .await;
-        while let Ok(ReplEvent::VmEffect {
-            projection,
-            envelope,
-        }) = event_rx.try_recv()
-        {
-            projection.project_envelope(envelope);
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    projection.project_envelope(envelope);
+                }
+                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                _ => {}
+            }
         }
-        source_projection.replace_source(execution.source_for_history.clone());
-        source_projection.set_complete();
-
         let messages = output.get_messages();
-        assert_eq!(messages.len(), 2, "one source and one output artifact");
-        assert_eq!(messages[0].id(), source_id);
-        assert_eq!(messages[1].id(), output_id);
+        assert_eq!(
+            messages.len(),
+            1,
+            "the repaired attempt is the sole root and owns rejected attempt A"
+        );
         let colors = crate::config::ColorScheme::default();
         assert_eq!(messages[0].kind(), MessageKind::Program);
-        assert_eq!(messages[1].kind(), MessageKind::Output);
-        assert!(messages[0].children().is_empty());
-        assert!(messages[1].children().is_empty());
-        assert_eq!(source_projection.content(), "(say \"repaired\")");
+        assert_eq!(messages[0].children().len(), 2);
+        let rejected_attempt = &messages[0].children()[0];
+        assert_eq!(rejected_attempt.id(), source_id);
+        assert_eq!(rejected_attempt.children().len(), 1);
+        assert_eq!(rejected_attempt.children()[0].id(), output_id);
+        assert!(rejected_attempt.children()[0]
+            .content()
+            .contains("VM wire error"));
+        assert_eq!(
+            source_projection.content(),
+            "```lisp\n(say \"must not run\")\n```"
+        );
+        assert_eq!(
+            source_projection.status(),
+            crate::cli::messages::MessageStatus::Failed
+        );
+        assert_eq!(
+            execution.source_unit.as_ref().unwrap().content(),
+            "(say \"repaired\")"
+        );
         assert_eq!(execution.output_unit.content(), "repaired");
+        assert!(messages[0]
+            .render(
+                &crate::cli::messages::RenderContext::new(
+                    &colors,
+                    crate::cli::messages::RenderCapabilities::plain_text(80),
+                )
+                .fully_expanded()
+            )
+            .lines
+            .iter()
+            .any(|line| line.text.contains("repaired")));
     }
 
     #[tokio::test]
