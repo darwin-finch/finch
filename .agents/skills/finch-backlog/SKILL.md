@@ -37,12 +37,12 @@ Recompute this frontier after every merge, newly discovered blocker, or changed 
 
 ## Claim work before mutation
 
-1. Query and parse active `finch-work-claim:v1` events across all open repository issues, then inspect assignees, open pull requests, branches, worktrees, and running agents before taking an issue. If claim discovery is unavailable or incomplete, do not mutate; retry or ask the coordinator.
+1. Query and parse active `finch-work-claim:v1` events across all open repository issues, including immutable comment metadata and issuer authority, then inspect assignees, open pull requests, branches, worktrees, and running agents before taking an issue. If claim discovery is unavailable, edited, or incomplete, do not mutate; retry or ask the coordinator.
 2. If another active claim overlaps the files or semantic scope, coordinate with that worker or choose another ready issue. Do not create a competing implementation merely because the other worker is a different tool or person.
 3. After creating the dedicated branch/worktree and before editing production files, post exactly one `finch-work-claim:v1` GitHub issue comment using [the work-claim protocol](references/work-claims.md). This versioned comment is the sole authoritative ownership mechanism; do not substitute an assignee, label, project field, branch, draft PR, or unstructured prose.
 4. Require the returned issue-comment URL, then repeat the repository-wide claim query and apply the protocol's deterministic collision rule. If the comment cannot be posted or verified, do not begin implementation; ask a coordinator to establish the claim.
 5. Optionally assign the responsible GitHub user for human accountability. Assignment is informational and never establishes or releases ownership.
-6. Repeat the repository-wide authoritative-claim check immediately before widening scope and immediately before merging. Publish the exact terminal event when ownership ends so stale claims do not strand work.
+6. Repeat the repository-wide authoritative-claim check immediately before widening scope and immediately before merging. Publish the exact append-only, issuer-authorized terminal event when ownership ends so stale claims do not strand work.
 
 ## Isolate and delegate work
 

@@ -28,19 +28,27 @@ Use a lowercase UUID for `claim-id`, a full 40-character commit for `base`, a si
 
 Save the returned GitHub comment URL. Immediately reread all `finch-work-claim:v1` events on the issue before editing. If two active claims overlap, the claim whose GitHub comment has the earlier `createdAt` wins; if equal, the lower numeric GitHub comment ID wins. The later claimant must post a `release` event and select non-overlapping work. Client-supplied `timestamp` never decides a collision.
 
+Claim events are append-only records. Never edit or delete an event comment. Record
+its comment ID, URL, author login, `createdAt`, `updatedAt`/`lastEditedAt`, and a
+SHA-256 digest of its exact body when first observed. An event is valid only when
+GitHub reports that it has never been edited (`updatedAt == createdAt` through the
+REST API, or `lastEditedAt == null` through GraphQL). Treat an edited event, a
+changed digest, or a previously recorded event URL that no longer resolves as an
+ownership-integrity failure and stop rather than reconstructing intent.
+
 ## Determine whether a claim is active
 
-Process claim events in GitHub `createdAt` order, breaking ties by numeric comment ID. A claim remains active until a later `release`, `complete`, or `supersede` event names the same `claim-id`. Ignore malformed blocks as ownership records and report them as diagnostics rather than guessing their intent.
+Process immutable claim events in GitHub `createdAt` order, breaking ties by numeric comment ID. A claim remains active until a later valid, issuer-authorized `release`, `complete`, or `supersede` event names the same `claim-id`. Ignore malformed blocks as ownership records and report them as diagnostics rather than guessing their intent.
 
 At every required claim check:
 
 1. Search all open issues in the repository for comments containing the exact marker `finch-work-claim:v1`.
 2. Fetch the full comments for every matching issue; do not decide ownership from truncated search snippets.
-3. Parse valid events, reduce each `claim-id` to active or terminal state, and retain the GitHub comment URL, `createdAt`, and numeric comment ID.
+3. Parse valid events, verify their immutable metadata and issuer authority, reduce each `claim-id` to active or terminal state, and retain the GitHub comment URL, author login, `createdAt`, `updatedAt`/`lastEditedAt`, body digest, and numeric comment ID.
 4. Compare the proposed issue, files, and semantic authority against every active claim, including claims on different issues.
 5. Cross-check matching branches, pull requests, worktrees, and running workers. These are evidence about scope and liveness, not substitute claim records.
 
-Fail closed if GitHub pagination, authentication, rate limits, network errors, or malformed response data make the repository-wide result incomplete. Do not interpret “search failed” as “no claims.”
+Fail closed if GitHub pagination, authentication, rate limits, network errors, comment immutability, saved-event retrieval, or malformed response data make the repository-wide result incomplete. Do not interpret “search failed” or “event disappeared” as “no claims.”
 
 Do not treat age alone as proof that a claim is abandoned. Cross-check the named branch, pull request, worktree, running-agent state, and recent issue activity. If ownership cannot be established safely, ask or select another unblocked issue.
 
@@ -56,10 +64,25 @@ Releasing claim `<claim-id>`: <merged, handed off, blocked, or superseded reason
 <!-- finch-work-claim:v1
 event: <release|complete|supersede>
 claim-id: <the original claim id>
-worker: <tool/person and stable session or agent identity>
+worker: <the exact worker value from the original claim>
 timestamp: <UTC RFC 3339>
 replacement-claim: <claim id or none>
+authority-comment: <none or immutable prior GitHub comment URL>
 -->
 ```
 
-Do not remove another worker's assignee or declare its claim superseded without evidence. A coordinator may record a transfer after confirming it with the current worker or proving its branch/worktree safely abandoned.
+The terminal event's GitHub comment author must equal the original claim comment
+author, and its `worker` must byte-for-byte equal the original claim's `worker`.
+Use `authority-comment: none` in that ordinary case. A different GitHub author is
+valid only when `authority-comment` links to an earlier, unedited comment by the
+original claim author that explicitly names the claim ID, the substitute GitHub
+login, and the permitted terminal event. Verify the linked comment directly and
+record its immutable metadata before accepting the terminal event. A repository
+role, assignee, label, branch, or claimed coordinator title does not substitute
+for that authorization.
+
+Do not remove another worker's assignee or terminalize its claim without this
+issuer evidence. If the original author is unavailable and no immutable prior
+authorization exists, leave the claim active, report the impasse, and obtain user
+direction rather than inventing abandonment authority. A handoff creates a new
+claim; the old claim's authorized terminal event names it in `replacement-claim`.
