@@ -82,11 +82,16 @@ struct StreamChunk {
     responseMetadata @5 :StreamResponseMetadata;
     allowanceUpdate  @6 :AllowanceUpdate;
     contentBlockComplete @7 :ContentBlock;
+    responseProviderMetadata @8 :StreamResponseProviderMetadata;
   }
 }
 
 struct StreamResponseMetadata {
   model @0 :Text;
+}
+
+struct StreamResponseProviderMetadata {
+  provider @0 :Text;
 }
 
 struct InvocationMetadata {
@@ -101,6 +106,11 @@ struct InvocationMetadata {
   primaryAllowanceUsedPercent @8 :Float32;
   hasSecondaryAllowance @9 :Bool;
   secondaryAllowanceUsedPercent @10 :Float32;
+  configuredProfile @11 :Text;
+  requestedProvider @12 :Text;
+  resolvedProvider @13 :Text;
+  actualProvider @14 :Text;
+  hasActualModel @15 :Bool;
 }
 
 struct UsageUpdate {

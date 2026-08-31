@@ -1743,6 +1743,19 @@ impl finch_daemon::Server for FinchDaemonImpl {
                             .set_model(model.as_str());
                         r.send().promise.await?;
                     }
+                    Ok(StreamChunk::ResponseProviderMetadata { provider }) => {
+                        crate::generators::validate_response_model(&provider).map_err(|_| {
+                            capnp::Error::failed(
+                                "IPC response provider metadata was invalid".into(),
+                            )
+                        })?;
+                        let mut r = receiver.on_chunk_request();
+                        r.get()
+                            .init_chunk()
+                            .init_response_provider_metadata()
+                            .set_provider(provider.as_str());
+                        r.send().promise.await?;
+                    }
                     Ok(StreamChunk::Allowance {
                         primary_used_percent,
                         secondary_used_percent,
@@ -4543,9 +4556,13 @@ mod tests {
             super::super::brain_codec::encode_invocation_metadata(
                 result.reborrow().init_invocation_metadata(),
                 &crate::providers::types::InvocationMetadata {
+                    configured_profile: "chatgpt".into(),
+                    requested_provider: "chatgpt_subscription".into(),
+                    resolved_provider: "chatgpt_subscription".into(),
                     requested_model: "gpt-5.6".into(),
                     resolved_model: "gpt-5.6".into(),
-                    actual_model: "gpt-5.6-sol".into(),
+                    actual_provider: "chatgpt_subscription".into(),
+                    actual_model: Some("gpt-5.6-sol".into()),
                     input_tokens: Some(5),
                     output_tokens: Some(3),
                     primary_allowance_used_percent: Some(40.0),
@@ -4638,8 +4655,8 @@ mod tests {
             ] if encrypted_content == "opaque-runner-token" && text == "(say \"done\")"
         ));
         assert_eq!(
-            decoded.invocation_metadata.unwrap().actual_model,
-            "gpt-5.6-sol"
+            decoded.invocation_metadata.unwrap().actual_model.as_deref(),
+            Some("gpt-5.6-sol")
         );
     }
 

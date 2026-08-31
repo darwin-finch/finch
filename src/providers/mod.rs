@@ -47,9 +47,10 @@ pub use teacher_session::{
     ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
 };
 pub use types::{
-    CapabilityProvenance, CapabilitySupport, ContextWindowCapability, ModelCapabilities,
-    ModelFeature, OutputTokenLimitCapability, ProviderAllowance, ProviderRequest, ProviderResponse,
-    ProviderUsage, ReasoningCapability, StreamChunk, WireProtocol, WireProtocolCapability,
+    CapabilityProvenance, CapabilitySupport, ContextWindowCapability, InvocationMetadata,
+    ModelCapabilities, ModelFeature, OutputTokenLimitCapability, ProviderAllowance,
+    ProviderRequest, ProviderResponse, ProviderUsage, ReasoningCapability, StreamChunk,
+    TurnIdentity, WireProtocol, WireProtocolCapability,
 };
 
 mod validated_boundary {
@@ -170,6 +171,19 @@ pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
     /// Get the default model for this provider
     fn default_model(&self) -> &str;
 
+    /// Resolve a configured/requested alias to the exact model ID dispatched
+    /// to this adapter. The default is identity-preserving.
+    fn resolve_model(&self, requested_model: &str) -> Result<String> {
+        Ok(requested_model.to_string())
+    }
+
+    /// Whether this adapter may truthfully return a response from `provider`.
+    /// Direct adapters accept only their own identity; explicit dispatch
+    /// wrappers such as a fallback chain must override this narrowly.
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        provider == self.name()
+    }
+
     /// Capabilities of an exact model. Unknown models must remain fail-closed.
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         ModelCapabilities::unknown(self.name(), model)
@@ -193,6 +207,7 @@ pub(crate) fn resolve_effective_request(
     if effective.model.trim().is_empty() {
         effective.model = provider.default_model().to_string();
     }
+    effective.model = provider.resolve_model(&effective.model)?;
     let capabilities = provider.capabilities(&effective.model);
     if capabilities.provider != provider.name() || capabilities.model != effective.model {
         anyhow::bail!(
@@ -206,13 +221,47 @@ pub(crate) fn resolve_effective_request(
     Ok((effective, capabilities))
 }
 
+/// Capture the immutable secret-free dispatch identity before provider work.
+pub fn provider_turn_identity(
+    provider: &(impl ProviderBackend + ?Sized),
+    configured_profile: &str,
+) -> Result<TurnIdentity> {
+    let requested_model = provider.default_model().to_string();
+    let resolved_model = provider.resolve_model(&requested_model)?;
+    TurnIdentity::new(
+        configured_profile,
+        provider.name(),
+        provider.name(),
+        requested_model,
+        resolved_model,
+    )
+}
+
+fn validate_provider_response(
+    provider: &(impl ProviderBackend + ?Sized),
+    response: &ProviderResponse,
+) -> Result<()> {
+    crate::generators::validate_response_model(&response.provider)
+        .map_err(|_| anyhow::anyhow!("Provider response provider metadata was invalid"))?;
+    anyhow::ensure!(
+        provider.accepts_actual_provider(&response.provider),
+        "Provider response contradicted the dispatched provider identity"
+    );
+    if !response.model.is_empty() {
+        crate::generators::validate_response_model(&response.model)?;
+    }
+    Ok(())
+}
+
 /// Non-overridable validated dispatch API shared by every provider backend.
 #[async_trait]
 pub trait LlmProvider: ProviderBackend {
     /// Send a message and get a complete response.
     async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let validated = validate_provider_request(self, request, false)?;
-        self.send_message_validated(validated).await
+        let response = self.send_message_validated(validated).await?;
+        validate_provider_response(self, &response)?;
+        Ok(response)
     }
 
     /// Send a message and stream the response.
@@ -221,7 +270,42 @@ pub trait LlmProvider: ProviderBackend {
         request: &ProviderRequest,
     ) -> Result<Receiver<Result<StreamChunk>>> {
         let validated = validate_provider_request(self, request, true)?;
-        self.send_message_stream_validated(validated).await
+        let mut upstream = self.send_message_stream_validated(validated).await?;
+        let default_actual_provider = self.name().to_string();
+        let (sender, receiver) = tokio::sync::mpsc::channel(100);
+        tokio::spawn(async move {
+            let mut provider_attested = false;
+            loop {
+                let Some(chunk) = (tokio::select! {
+                    _ = sender.closed() => return,
+                    chunk = upstream.recv() => chunk,
+                }) else {
+                    return;
+                };
+                match &chunk {
+                    Ok(StreamChunk::ResponseProviderMetadata { .. }) => {
+                        provider_attested = true;
+                    }
+                    Ok(_) if !provider_attested => {
+                        if sender
+                            .send(Ok(StreamChunk::ResponseProviderMetadata {
+                                provider: default_actual_provider.clone(),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        provider_attested = true;
+                    }
+                    _ => {}
+                }
+                if sender.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(receiver)
     }
 
     /// Compatibility view derived from the exact default-model descriptor.
@@ -248,6 +332,7 @@ impl From<ProviderResponse> for crate::claude::types::MessageResponse {
             response_type: "message".to_string(),
             role: response.role,
             content: response.content,
+            provider: response.provider,
             model: response.model,
             stop_reason: response.stop_reason,
             input_tokens: response.usage.as_ref().map(|usage| usage.input_tokens),
@@ -334,6 +419,68 @@ mod capability_contract_tests {
         }
     }
 
+    struct StreamingProvenanceProvider {
+        explicit_provider: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl ProviderBackend for StreamingProvenanceProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            anyhow::bail!("streaming provenance fixture does not support complete responses")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<Receiver<Result<StreamChunk>>> {
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            if let Some(provider) = self.explicit_provider {
+                sender
+                    .send(Ok(StreamChunk::ResponseProviderMetadata {
+                        provider: provider.to_string(),
+                    }))
+                    .await
+                    .expect("fixture receiver remains open");
+            }
+            sender
+                .send(Ok(StreamChunk::TextDelta("ok".to_string())))
+                .await
+                .expect("fixture receiver remains open");
+            Ok(receiver)
+        }
+
+        fn name(&self) -> &str {
+            "primary"
+        }
+
+        fn default_model(&self) -> &str {
+            "model-a"
+        }
+
+        fn accepts_actual_provider(&self, provider: &str) -> bool {
+            provider == self.name() || self.explicit_provider == Some(provider)
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-30",
+                "test fixture",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-08-30", "test fixture"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
+        }
+    }
+
     #[tokio::test]
     async fn descriptor_identity_mismatch_fails_before_provider_effect() {
         let provider = ContractProvider {
@@ -401,5 +548,45 @@ mod capability_contract_tests {
             .to_string()
             .contains("supports at most 10000 output tokens, but 10001 were requested"));
         assert_eq!(output_provider.effects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_without_adapter_metadata_is_attested_by_the_direct_dispatch_boundary() {
+        let provider = StreamingProvenanceProvider {
+            explicit_provider: None,
+        };
+        let mut stream = provider
+            .send_message_stream(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamChunk::ResponseProviderMetadata { provider } if provider == "primary"
+        ));
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamChunk::TextDelta(text) if text == "ok"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_explicit_dispatch_provider_without_fabricating_primary() {
+        let provider = StreamingProvenanceProvider {
+            explicit_provider: Some("fallback"),
+        };
+        let mut stream = provider
+            .send_message_stream(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamChunk::ResponseProviderMetadata { provider } if provider == "fallback"
+        ));
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            StreamChunk::TextDelta(text) if text == "ok"
+        ));
     }
 }

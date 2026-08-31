@@ -27,6 +27,7 @@ fn dummy_ctx() -> ToolContext<'static> {
         live_output: None,
         poset: None,
         effect_audit: None,
+        provider_invocation: None,
     }
 }
 

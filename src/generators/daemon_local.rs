@@ -115,4 +115,18 @@ impl Generator for DaemonLocalGenerator {
     fn name(&self) -> &str {
         &self.profile_name
     }
+
+    fn turn_identity(&self) -> Result<crate::providers::TurnIdentity> {
+        crate::providers::TurnIdentity::new(
+            self.profile_name.clone(),
+            "local",
+            "local",
+            self.profile_name.clone(),
+            self.profile_name.clone(),
+        )
+    }
+
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        provider == "local"
+    }
 }

@@ -81,6 +81,16 @@ impl Generator for ProfiledGenerator {
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
+
+    fn turn_identity(&self) -> Result<crate::providers::TurnIdentity> {
+        self.inner
+            .turn_identity()?
+            .with_configured_profile(self.profile_name.clone())
+    }
+
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        self.inner.accepts_actual_provider(provider)
+    }
 }
 
 /// Unified generator interface for Claude, Qwen, and future generators
@@ -119,6 +129,23 @@ pub trait Generator: Send + Sync {
     /// compatibility generators may retain the profile name as a fallback.
     fn model_name(&self) -> &str {
         self.name()
+    }
+
+    /// Immutable secret-free provider/model selection accepted for a turn.
+    fn turn_identity(&self) -> Result<crate::providers::TurnIdentity> {
+        crate::providers::TurnIdentity::new(
+            self.name(),
+            self.name(),
+            self.name(),
+            self.model_name(),
+            self.model_name(),
+        )
+    }
+
+    /// Validate provider provenance returned by this exact generator. Dispatch
+    /// wrappers override this to recognize only their configured candidates.
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        provider == self.name()
     }
 }
 
@@ -168,6 +195,12 @@ pub enum StreamChunk {
     /// Provider-reported model that actually served the streaming response.
     ResponseMetadata {
         model: String,
+    },
+    /// Provider selected by the exact streaming dispatch boundary. Direct
+    /// generators can derive this from their immutable turn identity; explicit
+    /// fallback wrappers emit it when the selected adapter differs.
+    ResponseProviderMetadata {
+        provider: String,
     },
     /// Usage metadata from message_start — carries the input token count
     /// reported by the API before any text arrives.

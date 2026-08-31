@@ -891,7 +891,7 @@ impl Tool for GetVmStateTool {
         }
     }
 
-    async fn execute(&self, _input: Value, _context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, _input: Value, context: &ToolContext<'_>) -> Result<String> {
         let state = self.runtime.inspect().await?;
         Ok(json!({
             "manifest_generation": state.manifest_generation,
@@ -904,6 +904,7 @@ impl Tool for GetVmStateTool {
             "granted_capabilities": state.granted_capabilities,
             "languages": ["forth", "lisp"],
             "effects": ["pure", "vm_read", "vm_write", "external_read", "external_write"],
+            "provider_invocation": context.provider_invocation,
             "vocabulary_discovery": "Use search_word(query) followed by inspect_word(name) for targeted contracts.",
             "automation": self.runtime.automation().availability()
         })
@@ -929,6 +930,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let definition = tool
@@ -961,6 +963,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result: Value =
@@ -979,6 +982,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vm_state_projects_the_exact_read_only_provider_invocation() {
+        let tool = GetVmStateTool::new(Arc::new(ProgramRuntime::new()));
+        let identity = crate::providers::TurnIdentity::new(
+            "fast",
+            "openai",
+            "openai_platform",
+            "fast-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        let invocation = crate::providers::InvocationMetadata::from_turn(
+            &identity,
+            "openai_platform",
+            Some("gpt-5.6-sol-2026-08-30".to_string()),
+        );
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            provider_invocation: Some(invocation.clone()),
+            poset: None,
+        };
+
+        let result: Value =
+            serde_json::from_str(&tool.execute(json!({}), &context).await.unwrap()).unwrap();
+
+        assert_eq!(result["provider_invocation"], json!(invocation));
+        assert!(result.get("credential_ref").is_none());
+        assert!(result.get("api_key").is_none());
+        assert!(result.get("base_url").is_none());
+    }
+
+    #[tokio::test]
     async fn built_in_vm_vocabulary_is_searchable_without_source_tree_access() {
         let tool = SearchVmVocabularyTool::new(Arc::new(ProgramRuntime::new()));
         let context = ToolContext {
@@ -991,6 +1033,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1022,6 +1065,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1059,6 +1103,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 
@@ -1099,6 +1144,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let found: Value = serde_json::from_str(
@@ -1156,6 +1202,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1319,6 +1366,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result = tool
@@ -1376,6 +1424,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: Some(effect_audit),
+            provider_invocation: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1420,6 +1469,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 
@@ -1475,6 +1525,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 
@@ -1520,6 +1571,7 @@ mod tests {
                 Arc::new(move |text| emitted.lock().unwrap().push(text))
             }),
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 

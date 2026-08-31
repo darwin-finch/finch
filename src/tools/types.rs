@@ -91,6 +91,11 @@ pub struct ToolContext<'a> {
     /// `None`; provenance fields can never manufacture this capability.
     pub effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 
+    /// Immutable, secret-free provider response provenance for the tool round
+    /// that admitted this call. Read-only inspection tools may project it;
+    /// tools cannot mutate or reconstruct dispatch authority from it.
+    pub provider_invocation: Option<crate::providers::InvocationMetadata>,
+
     /// Co-Forth poset VM — partially-ordered task graph.
     pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }

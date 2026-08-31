@@ -296,6 +296,7 @@ struct WireExecution {
     response: String,
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
     output_unit: Arc<crate::cli::messages::WorkUnit>,
+    invocation_metadata: crate::providers::InvocationMetadata,
 }
 
 pub(super) fn runner_effect_records(
@@ -337,7 +338,20 @@ async fn execute_wire_with_single_repair(
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
-) -> WireExecution {
+    turn_identity: &crate::providers::TurnIdentity,
+    mut invocation_metadata: crate::providers::InvocationMetadata,
+) -> anyhow::Result<WireExecution> {
+    turn_identity.validate()?;
+    invocation_metadata.validate()?;
+    anyhow::ensure!(
+        invocation_metadata.turn_identity() == *turn_identity
+            && generator.turn_identity()? == *turn_identity,
+        "wire execution provider identity changed after turn admission"
+    );
+    anyhow::ensure!(
+        generator.accepts_actual_provider(&invocation_metadata.actual_provider),
+        "wire execution actual provider contradicted turn admission"
+    );
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
         generator.model_name(),
@@ -377,12 +391,13 @@ async fn execute_wire_with_single_repair(
                 output_unit: Arc::clone(&output_unit),
             });
             let effect_journal = runner_effect_records(&outcome);
-            return WireExecution {
+            return Ok(WireExecution {
                 source_for_history: source,
                 response: outcome.output,
                 effect_journal,
                 output_unit,
-            };
+                invocation_metadata,
+            });
         }
         Ok(outcome) => {
             effect_journal.extend(runner_effect_records(&outcome));
@@ -410,23 +425,25 @@ async fn execute_wire_with_single_repair(
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
             output_unit: Arc::clone(&output_unit),
         });
-        return WireExecution {
+        return Ok(WireExecution {
             source_for_history: source,
             response: diagnostic,
             effect_journal,
             output_unit,
-        };
+            invocation_metadata,
+        });
     }
     if cancel.is_cancelled() {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
-        return WireExecution {
+        return Ok(WireExecution {
             source_for_history: source,
             response: diagnostic,
             effect_journal,
             output_unit,
-        };
+            invocation_metadata,
+        });
     }
     metric.repair_attempted = true;
 
@@ -437,7 +454,12 @@ async fn execute_wire_with_single_repair(
     output_unit.set_transient_status(Some(
         "requesting one corrected ProgramSubmission from the provider…".to_string(),
     ));
-    let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
+    let mut repair_messages = wire_repair_messages(messages, &source, &diagnostic);
+    inject_turn_identity(
+        &mut repair_messages,
+        turn_identity,
+        Some(&invocation_metadata),
+    );
     let repair = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -445,12 +467,13 @@ async fn execute_wire_with_single_repair(
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             output_unit.set_complete();
-            return WireExecution {
+            return Ok(WireExecution {
                 source_for_history: source,
                 response: diagnostic,
                 effect_journal,
                 output_unit,
-            };
+                invocation_metadata,
+            });
         }
         repair = generator.generate(repair_messages, None) => repair,
     };
@@ -459,34 +482,61 @@ async fn execute_wire_with_single_repair(
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
-        return WireExecution {
+        return Ok(WireExecution {
             source_for_history: source,
             response: diagnostic,
             effect_journal,
             output_unit,
-        };
+            invocation_metadata,
+        });
     }
     let Ok(repair) = repair else {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
-        return WireExecution {
+        return Ok(WireExecution {
             source_for_history: source,
             response: diagnostic,
             effect_journal,
             output_unit,
-        };
+            invocation_metadata,
+        });
     };
+    let actual_provider = repair.metadata.generator.clone();
+    anyhow::ensure!(
+        crate::generators::validate_response_model(&actual_provider).is_ok()
+            && generator.accepts_actual_provider(&actual_provider),
+        "repair response contradicted the immutable provider identity"
+    );
+    let actual_model = if repair.metadata.model.is_empty() {
+        None
+    } else {
+        crate::generators::validate_response_model(&repair.metadata.model)?;
+        Some(repair.metadata.model.clone())
+    };
+    let mut repair_invocation = crate::providers::InvocationMetadata::from_turn(
+        turn_identity,
+        actual_provider,
+        actual_model,
+    );
+    repair_invocation.input_tokens = repair.metadata.input_tokens;
+    repair_invocation.output_tokens = repair.metadata.output_tokens;
+    repair_invocation.primary_allowance_used_percent =
+        repair.metadata.primary_allowance_used_percent;
+    repair_invocation.secondary_allowance_used_percent =
+        repair.metadata.secondary_allowance_used_percent;
+    invocation_metadata.reconcile(&repair_invocation)?;
     if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
-        return WireExecution {
+        return Ok(WireExecution {
             source_for_history: source,
             response: diagnostic,
             effect_journal,
             output_unit,
-        };
+            invocation_metadata,
+        });
     }
     output_unit.set_complete();
 
@@ -508,7 +558,7 @@ async fn execute_wire_with_single_repair(
 
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
     repair_output_unit.set_program_output();
-    match execute_direct_wire_response(
+    let execution = match execute_direct_wire_response(
         runtime,
         output_manager,
         Arc::clone(&repair_output_unit),
@@ -535,6 +585,7 @@ async fn execute_wire_with_single_repair(
                 response: outcome.output,
                 effect_journal,
                 output_unit: repair_output_unit,
+                invocation_metadata,
             }
         }
         Ok(outcome) => {
@@ -555,6 +606,7 @@ async fn execute_wire_with_single_repair(
                 response: detail,
                 effect_journal,
                 output_unit: repair_output_unit,
+                invocation_metadata,
             }
         }
         Err(error) => {
@@ -570,9 +622,11 @@ async fn execute_wire_with_single_repair(
                 response: detail,
                 effect_journal,
                 output_unit: repair_output_unit,
+                invocation_metadata,
             }
         }
-    }
+    };
+    Ok(execution)
 }
 
 use super::events::ReplEvent;
@@ -671,7 +725,7 @@ async fn persist_completed_turn_memory(
     query_states: &QueryStateManager,
     query: &str,
     assistant_source: &str,
-    model: &str,
+    model: Option<&str>,
     session_label: &str,
     cwd: &str,
     status_bar: &StatusBar,
@@ -708,17 +762,12 @@ async fn persist_completed_turn_memory(
     };
     if !user_text.is_empty() {
         let _ = memory_system
-            .insert_conversation("user", &user_text, Some(model), Some(session_label))
+            .insert_conversation("user", &user_text, model, Some(session_label))
             .await;
     }
     if !assistant_source.trim().is_empty() {
         let _ = memory_system
-            .insert_conversation(
-                "assistant",
-                assistant_source,
-                Some(model),
-                Some(session_label),
-            )
+            .insert_conversation("assistant", assistant_source, model, Some(session_label))
             .await;
     }
     status_bar.update_line(
@@ -773,10 +822,20 @@ pub(super) async fn dispatch_tool_uses(
         query_id,
         tool_uses: tool_uses.clone(),
     });
-    let effect_audit = query_states
-        .get_metadata(query_id)
-        .await
-        .and_then(|metadata| metadata.effect_audit);
+    let query_metadata = query_states.get_metadata(query_id).await;
+    let effect_audit = query_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.effect_audit.clone());
+    let Some(provider_invocation) =
+        query_metadata.and_then(|metadata| metadata.invocation_metadata)
+    else {
+        let _ = event_tx.send(ReplEvent::QueryFailed {
+            query_id,
+            error: "Tool dispatch was denied because provider invocation provenance was missing"
+                .to_string(),
+        });
+        return;
+    };
     let current_mode = mode.read().await;
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
@@ -899,6 +958,7 @@ pub(super) async fn dispatch_tool_uses(
                 tool_use,
                 Arc::clone(work_unit),
                 row_idx,
+                provider_invocation.clone(),
                 effect_audit.clone(),
             );
         }
@@ -990,6 +1050,41 @@ pub(crate) async fn process_query_with_tools(
         }
     };
 
+    let turn_identity = match generator.turn_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = event_tx.send(ReplEvent::QueryFailed {
+                query_id,
+                error: format!("Provider turn identity was invalid: {error}"),
+            });
+            return;
+        }
+    };
+    if let Err(error) = query_states
+        .bind_turn_identity(query_id, turn_identity.clone())
+        .await
+    {
+        let _ = event_tx.send(ReplEvent::QueryFailed {
+            query_id,
+            error: error.to_string(),
+        });
+        return;
+    }
+    let prior_invocation = query_states
+        .get_metadata(query_id)
+        .await
+        .and_then(|metadata| metadata.invocation_metadata);
+    if prior_invocation
+        .as_ref()
+        .is_some_and(|invocation| invocation.turn_identity() != turn_identity)
+    {
+        let _ = event_tx.send(ReplEvent::QueryFailed {
+            query_id,
+            error: "Provider continuation carried contradictory invocation provenance".to_string(),
+        });
+        return;
+    }
+
     // Get conversation context, optionally injecting relevant memories
     let mut memory_recall_count: usize = 0;
     let messages = {
@@ -1047,6 +1142,7 @@ pub(crate) async fn process_query_with_tools(
             None => fallback_vm_manifest(),
         };
         inject_persona_system_prompt(&mut msgs, persona_system_prompt);
+        inject_turn_identity(&mut msgs, &turn_identity, prior_invocation.as_ref());
         inject_vm_manifest(&mut msgs, &manifest);
         msgs
     };
@@ -1110,6 +1206,7 @@ pub(crate) async fn process_query_with_tools(
                 let mut blocks = Vec::new();
                 let mut text = String::new();
                 let mut completed_text = String::new();
+                let mut actual_provider: Option<String> = None;
                 let mut actual_model: Option<String> = None;
                 let mut output_token_count: Option<u32> = None;
                 let mut primary_allowance_used_percent: Option<f32> = None;
@@ -1132,7 +1229,35 @@ pub(crate) async fn process_query_with_tools(
                             secondary_allowance_used_percent = secondary_used_percent;
                         }
                         Ok(StreamChunk::ResponseMetadata { model }) => {
+                            if crate::generators::validate_response_model(&model).is_err()
+                                || actual_model
+                                    .as_ref()
+                                    .is_some_and(|observed| observed != &model)
+                            {
+                                work_unit.set_failed();
+                                let _ = event_tx.send(ReplEvent::QueryFailed {
+                                    query_id,
+                                    error: "Provider streaming actual model provenance was invalid or contradictory".to_string(),
+                                });
+                                return;
+                            }
                             actual_model = Some(model);
+                        }
+                        Ok(StreamChunk::ResponseProviderMetadata { provider }) => {
+                            if crate::generators::validate_response_model(&provider).is_err()
+                                || !generator.accepts_actual_provider(&provider)
+                                || actual_provider
+                                    .as_ref()
+                                    .is_some_and(|observed| observed != &provider)
+                            {
+                                work_unit.set_failed();
+                                let _ = event_tx.send(ReplEvent::QueryFailed {
+                                    query_id,
+                                    error: "Provider streaming actual provider provenance was invalid or contradictory".to_string(),
+                                });
+                                return;
+                            }
+                            actual_provider = Some(provider);
                         }
                         Ok(StreamChunk::TextDelta(delta)) => {
                             tracing::debug!("Received TextDelta: {} bytes", delta.len());
@@ -1202,27 +1327,41 @@ pub(crate) async fn process_query_with_tools(
                     });
                     return;
                 }
-                let actual_model =
-                    actual_model.unwrap_or_else(|| generator.model_name().to_string());
-
-                query_states
-                    .set_invocation_metadata(
+                let Some(actual_provider) = actual_provider else {
+                    work_unit.set_failed();
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
                         query_id,
-                        crate::providers::types::InvocationMetadata {
-                            requested_model: generator.model_name().to_string(),
-                            resolved_model: generator.model_name().to_string(),
-                            actual_model: actual_model.clone(),
-                            input_tokens: input_token_count,
-                            output_tokens: output_token_count.or(Some(token_count as u32)),
-                            primary_allowance_used_percent,
-                            secondary_allowance_used_percent,
-                        },
-                    )
-                    .await;
+                        error: "Provider streaming completion omitted authoritative actual-provider provenance"
+                            .to_string(),
+                    });
+                    return;
+                };
+                let mut invocation = crate::providers::InvocationMetadata::from_turn(
+                    &turn_identity,
+                    actual_provider,
+                    actual_model.clone(),
+                );
+                invocation.input_tokens = input_token_count;
+                invocation.output_tokens = output_token_count.or(Some(token_count as u32));
+                invocation.primary_allowance_used_percent = primary_allowance_used_percent;
+                invocation.secondary_allowance_used_percent = secondary_allowance_used_percent;
+                if let Err(error) = query_states
+                    .set_invocation_metadata(query_id, invocation)
+                    .await
+                {
+                    work_unit.set_failed();
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: error.to_string(),
+                    });
+                    return;
+                }
 
                 // Send stats update
                 let _ = event_tx.send(ReplEvent::StatsUpdate {
-                    model: actual_model.clone(),
+                    model: actual_model
+                        .clone()
+                        .unwrap_or_else(|| "unknown actual model".to_string()),
                     input_tokens: input_token_count,
                     output_tokens: output_token_count.or(Some(token_count as u32)),
                     latency_ms: Some(stream_start.elapsed().as_millis() as u64),
@@ -1266,30 +1405,35 @@ pub(crate) async fn process_query_with_tools(
                         role: "assistant".to_string(),
                         content: blocks.clone(),
                     };
-                    tracing::debug!("[EVENT_LOOP] Acquiring conversation write lock...");
-                    let round_token = match conversation
-                        .write()
+                    let invocation_metadata = query_states
+                        .get_metadata(query_id)
                         .await
-                        .stage_assistant(query_id, assistant_message)
-                    {
-                        Ok(token) => token,
-                        Err(crate::cli::conversation::ToolRoundError::StageAlreadyExists) => {
-                            tracing::warn!(
-                                "Ignoring duplicate provider tool completion for query {}",
-                                query_id
-                            );
-                            work_unit.set_complete();
-                            return;
-                        }
-                        Err(error) => {
-                            work_unit.set_failed();
-                            let _ = event_tx.send(ReplEvent::QueryFailed {
-                                query_id,
-                                error: format!("Could not stage tool round: {error}"),
-                            });
-                            return;
-                        }
-                    };
+                        .and_then(|metadata| metadata.invocation_metadata);
+                    tracing::debug!("[EVENT_LOOP] Acquiring conversation write lock...");
+                    let round_token =
+                        match conversation.write().await.stage_assistant_with_invocation(
+                            query_id,
+                            assistant_message,
+                            invocation_metadata,
+                        ) {
+                            Ok(token) => token,
+                            Err(crate::cli::conversation::ToolRoundError::StageAlreadyExists) => {
+                                tracing::warn!(
+                                    "Ignoring duplicate provider tool completion for query {}",
+                                    query_id
+                                );
+                                work_unit.set_complete();
+                                return;
+                            }
+                            Err(error) => {
+                                work_unit.set_failed();
+                                let _ = event_tx.send(ReplEvent::QueryFailed {
+                                    query_id,
+                                    error: format!("Could not stage tool round: {error}"),
+                                });
+                                return;
+                            }
+                        };
                     if !query_states
                         .begin_tool_execution(query_id, tool_uses.len())
                         .await
@@ -1349,8 +1493,20 @@ pub(crate) async fn process_query_with_tools(
                     .as_ref()
                     .map(|metadata| metadata.cancellation_token.clone())
                     .unwrap_or_default();
-                let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
-                let wire_execution = execute_wire_with_single_repair(
+                let effect_audit = query_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.effect_audit.clone());
+                let Some(invocation_metadata) = query_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.invocation_metadata.clone())
+                else {
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: "Wire execution was denied because provider invocation provenance was missing".to_string(),
+                    });
+                    return;
+                };
+                let wire_execution = match execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
                     event_tx.clone(),
@@ -1360,8 +1516,32 @@ pub(crate) async fn process_query_with_tools(
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
                     effect_audit,
+                    &turn_identity,
+                    invocation_metadata,
                 )
-                .await;
+                .await
+                {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        work_unit.set_failed();
+                        let _ = event_tx.send(ReplEvent::QueryFailed {
+                            query_id,
+                            error: error.to_string(),
+                        });
+                        return;
+                    }
+                };
+                if let Err(error) = query_states
+                    .set_invocation_metadata(query_id, wire_execution.invocation_metadata.clone())
+                    .await
+                {
+                    work_unit.set_failed();
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: error.to_string(),
+                    });
+                    return;
+                }
                 if query_states
                     .get_metadata(query_id)
                     .await
@@ -1414,7 +1594,7 @@ pub(crate) async fn process_query_with_tools(
                             query_states.as_ref(),
                             &query,
                             &source_for_history,
-                            &actual_model,
+                            actual_model.as_deref(),
                             &session_label,
                             &cwd,
                             &status_bar,
@@ -1454,24 +1634,52 @@ pub(crate) async fn process_query_with_tools(
         .await
     {
         Ok(response) => {
-            query_states
-                .set_invocation_metadata(
+            let actual_provider = response.metadata.generator.clone();
+            if crate::generators::validate_response_model(&actual_provider).is_err()
+                || !generator.accepts_actual_provider(&actual_provider)
+            {
+                work_unit.set_failed();
+                let _ = event_tx.send(ReplEvent::QueryFailed {
                     query_id,
-                    crate::providers::types::InvocationMetadata {
-                        requested_model: generator.model_name().to_string(),
-                        resolved_model: generator.model_name().to_string(),
-                        actual_model: response.metadata.model.clone(),
-                        input_tokens: response.metadata.input_tokens,
-                        output_tokens: response.metadata.output_tokens,
-                        primary_allowance_used_percent: response
-                            .metadata
-                            .primary_allowance_used_percent,
-                        secondary_allowance_used_percent: response
-                            .metadata
-                            .secondary_allowance_used_percent,
-                    },
-                )
-                .await;
+                    error: "Provider response contradicted the dispatched provider identity"
+                        .to_string(),
+                });
+                return;
+            }
+            let actual_model = if response.metadata.model.is_empty() {
+                None
+            } else if crate::generators::validate_response_model(&response.metadata.model).is_ok() {
+                Some(response.metadata.model.clone())
+            } else {
+                work_unit.set_failed();
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: "Provider response actual model provenance was invalid".to_string(),
+                });
+                return;
+            };
+            let mut invocation = crate::providers::InvocationMetadata::from_turn(
+                &turn_identity,
+                actual_provider,
+                actual_model,
+            );
+            invocation.input_tokens = response.metadata.input_tokens;
+            invocation.output_tokens = response.metadata.output_tokens;
+            invocation.primary_allowance_used_percent =
+                response.metadata.primary_allowance_used_percent;
+            invocation.secondary_allowance_used_percent =
+                response.metadata.secondary_allowance_used_percent;
+            if let Err(error) = query_states
+                .set_invocation_metadata(query_id, invocation)
+                .await
+            {
+                work_unit.set_failed();
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: error.to_string(),
+                });
+                return;
+            }
             // Set response text on the WorkUnit
             if !response.text.is_empty() {
                 work_unit.set_response(&response.text);
@@ -1512,11 +1720,15 @@ pub(crate) async fn process_query_with_tools(
                     role: "assistant".to_string(),
                     content: response.content_blocks.clone(),
                 };
-                let round_token = match conversation
-                    .write()
+                let invocation_metadata = query_states
+                    .get_metadata(query_id)
                     .await
-                    .stage_assistant(query_id, assistant_message)
-                {
+                    .and_then(|metadata| metadata.invocation_metadata);
+                let round_token = match conversation.write().await.stage_assistant_with_invocation(
+                    query_id,
+                    assistant_message,
+                    invocation_metadata,
+                ) {
                     Ok(token) => token,
                     Err(crate::cli::conversation::ToolRoundError::StageAlreadyExists) => {
                         tracing::warn!(
@@ -1587,8 +1799,20 @@ pub(crate) async fn process_query_with_tools(
                 .as_ref()
                 .map(|metadata| metadata.cancellation_token.clone())
                 .unwrap_or_default();
-            let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
-            let wire_execution = execute_wire_with_single_repair(
+            let effect_audit = query_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.effect_audit.clone());
+            let Some(invocation_metadata) = query_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.invocation_metadata.clone())
+            else {
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: "Wire execution was denied because provider invocation provenance was missing".to_string(),
+                });
+                return;
+            };
+            let wire_execution = match execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
                 event_tx.clone(),
@@ -1598,8 +1822,32 @@ pub(crate) async fn process_query_with_tools(
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
                 effect_audit,
+                &turn_identity,
+                invocation_metadata,
             )
-            .await;
+            .await
+            {
+                Ok(execution) => execution,
+                Err(error) => {
+                    work_unit.set_failed();
+                    let _ = event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: error.to_string(),
+                    });
+                    return;
+                }
+            };
+            if let Err(error) = query_states
+                .set_invocation_metadata(query_id, wire_execution.invocation_metadata.clone())
+                .await
+            {
+                work_unit.set_failed();
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: error.to_string(),
+                });
+                return;
+            }
             if query_states
                 .get_metadata(query_id)
                 .await
@@ -1650,7 +1898,8 @@ pub(crate) async fn process_query_with_tools(
             // Store the completed turn and refresh its Brain-local summary.
             if published {
                 if let Some(ref mem) = memory_system {
-                    let model_name = response.metadata.model.clone();
+                    let model_name = (!response.metadata.model.is_empty())
+                        .then_some(response.metadata.model.as_str());
                     persist_completed_turn_memory(
                         mem,
                         &conversation,
@@ -1658,7 +1907,7 @@ pub(crate) async fn process_query_with_tools(
                         query_states.as_ref(),
                         &query,
                         &source_for_history,
-                        &model_name,
+                        model_name,
                         &session_label,
                         &cwd,
                         &status_bar,
@@ -1693,6 +1942,27 @@ fn inject_persona_system_prompt(
             content: vec![ContentBlock::Text {
                 text: persona_system_prompt,
             }],
+        },
+    );
+}
+
+fn inject_turn_identity(
+    messages: &mut Vec<crate::claude::Message>,
+    identity: &crate::providers::TurnIdentity,
+    invocation: Option<&crate::providers::InvocationMetadata>,
+) {
+    let section = invocation
+        .and_then(|invocation| invocation.model_context().ok())
+        .unwrap_or_else(|| identity.model_context());
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        system.content.push(ContentBlock::Text { text: section });
+        return;
+    }
+    messages.insert(
+        0,
+        crate::claude::Message {
+            role: "system".to_string(),
+            content: vec![ContentBlock::Text { text: section }],
         },
     );
 }
@@ -2003,7 +2273,7 @@ mod tests {
             &query_states,
             "",
             "(say \"test\")",
-            "test-model",
+            Some("test-model"),
             "test-brain",
             "/workspace",
             &status,
@@ -2075,7 +2345,7 @@ mod tests {
                 &query_states,
                 "",
                 "(say \"done\")",
-                "test-model",
+                Some("test-model"),
                 "test-brain",
                 "/workspace",
                 &status,
@@ -2103,6 +2373,21 @@ mod tests {
         started: tokio::sync::Notify,
     }
 
+    fn admitted_test_invocation(
+        generator: &dyn Generator,
+    ) -> (
+        crate::providers::TurnIdentity,
+        crate::providers::InvocationMetadata,
+    ) {
+        let identity = generator.turn_identity().unwrap();
+        let invocation = crate::providers::InvocationMetadata::from_turn(
+            &identity,
+            identity.resolved_provider.clone(),
+            Some(identity.resolved_model.clone()),
+        );
+        (identity, invocation)
+    }
+
     #[async_trait::async_trait]
     impl Generator for SingleRepairGenerator {
         async fn generate(
@@ -2122,8 +2407,8 @@ mod tests {
                 content_blocks: vec![ContentBlock::text("(say \"repaired\")")],
                 tool_uses: Vec::new(),
                 metadata: crate::generators::ResponseMetadata {
-                    generator: "test".to_string(),
-                    model: "test".to_string(),
+                    generator: "single-repair".to_string(),
+                    model: "single-repair".to_string(),
                     confidence: None,
                     stop_reason: None,
                     input_tokens: None,
@@ -2568,6 +2853,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let metrics_dir = tempfile::tempdir().unwrap();
         let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
+        let (turn_identity, invocation_metadata) = admitted_test_invocation(generator.as_ref());
 
         let execution = execute_wire_with_single_repair(
             &runtime,
@@ -2579,8 +2865,11 @@ mod tests {
             source.clone(),
             Some(&metrics),
             None,
+            &turn_identity,
+            invocation_metadata,
         )
-        .await;
+        .await
+        .unwrap();
 
         // The worker only emits portable effects. The client event loop owns
         // the WorkUnit mutation, so apply the queued projection exactly as it
@@ -2634,6 +2923,7 @@ mod tests {
         cancel.cancel();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let (turn_identity, invocation_metadata) = admitted_test_invocation(generator.as_ref());
 
         let execution = execute_wire_with_single_repair(
             &runtime,
@@ -2645,8 +2935,11 @@ mod tests {
             source.clone(),
             None,
             None,
+            &turn_identity,
+            invocation_metadata,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
         assert_eq!(execution.source_for_history, source);
@@ -2665,12 +2958,14 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (turn_identity, invocation_metadata) = admitted_test_invocation(generator.as_ref());
         let execution = {
             let runtime = Arc::clone(&runtime);
             let output = Arc::clone(&output);
             let generator = Arc::clone(&generator);
             let cancel = cancel.clone();
             let source = source.clone();
+            let turn_identity = turn_identity.clone();
             tokio::spawn(async move {
                 execute_wire_with_single_repair(
                     runtime.as_ref(),
@@ -2682,8 +2977,11 @@ mod tests {
                     source,
                     None,
                     None,
+                    &turn_identity,
+                    invocation_metadata,
                 )
                 .await
+                .unwrap()
             })
         };
         generator.started.notified().await;

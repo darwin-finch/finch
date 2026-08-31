@@ -250,9 +250,16 @@ pub(super) fn encode_invocation_metadata(
     mut builder: finch_ipc_capnp::invocation_metadata::Builder<'_>,
     metadata: &crate::providers::types::InvocationMetadata,
 ) {
+    builder.set_configured_profile(&metadata.configured_profile);
+    builder.set_requested_provider(&metadata.requested_provider);
+    builder.set_resolved_provider(&metadata.resolved_provider);
     builder.set_requested_model(&metadata.requested_model);
     builder.set_resolved_model(&metadata.resolved_model);
-    builder.set_actual_model(&metadata.actual_model);
+    builder.set_actual_provider(&metadata.actual_provider);
+    if let Some(actual_model) = &metadata.actual_model {
+        builder.set_has_actual_model(true);
+        builder.set_actual_model(actual_model);
+    }
     if let Some(value) = metadata.input_tokens {
         builder.set_has_input_tokens(true);
         builder.set_input_tokens(value);
@@ -275,9 +282,17 @@ pub(super) fn decode_invocation_metadata(
     reader: finch_ipc_capnp::invocation_metadata::Reader<'_>,
 ) -> anyhow::Result<crate::providers::types::InvocationMetadata> {
     let metadata = crate::providers::types::InvocationMetadata {
+        configured_profile: text(reader.get_configured_profile()?)?,
+        requested_provider: text(reader.get_requested_provider()?)?,
+        resolved_provider: text(reader.get_resolved_provider()?)?,
         requested_model: text(reader.get_requested_model()?)?,
         resolved_model: text(reader.get_resolved_model()?)?,
-        actual_model: text(reader.get_actual_model()?)?,
+        actual_provider: text(reader.get_actual_provider()?)?,
+        actual_model: if reader.get_has_actual_model() {
+            Some(text(reader.get_actual_model()?)?)
+        } else {
+            None
+        },
         input_tokens: reader
             .get_has_input_tokens()
             .then(|| reader.get_input_tokens()),
@@ -2247,9 +2262,13 @@ mod tests {
                     ],
                 )],
                 invocation_metadata: Some(crate::providers::types::InvocationMetadata {
+                    configured_profile: "chatgpt".into(),
+                    requested_provider: "chatgpt_subscription".into(),
+                    resolved_provider: "chatgpt_subscription".into(),
                     requested_model: "gpt-5.6".into(),
                     resolved_model: "gpt-5.6".into(),
-                    actual_model: "gpt-5.6-sol".into(),
+                    actual_provider: "chatgpt_subscription".into(),
+                    actual_model: Some("gpt-5.6-sol".into()),
                     input_tokens: Some(11),
                     output_tokens: Some(7),
                     primary_allowance_used_percent: Some(12.5),

@@ -1636,6 +1636,9 @@ impl stream_receiver::Server for StreamReceiverImpl {
             Ok(Which::ResponseMetadata(metadata)) => metadata
                 .and_then(decode_stream_response_metadata)
                 .map_err(|error| anyhow::anyhow!("{}", error)),
+            Ok(Which::ResponseProviderMetadata(metadata)) => metadata
+                .and_then(decode_stream_response_provider_metadata)
+                .map_err(|error| anyhow::anyhow!("{}", error)),
             Ok(Which::AllowanceUpdate(update)) => update
                 .map(|value| StreamChunk::Allowance {
                     primary_used_percent: value
@@ -1764,6 +1767,20 @@ fn decode_stream_response_metadata(
         .map_err(|_| capnp::Error::failed("IPC response model metadata was invalid".into()))?;
     Ok(StreamChunk::ResponseMetadata {
         model: model.to_string(),
+    })
+}
+
+fn decode_stream_response_provider_metadata(
+    metadata: finch_ipc_capnp::stream_response_provider_metadata::Reader<'_>,
+) -> std::result::Result<StreamChunk, capnp::Error> {
+    let provider = metadata
+        .get_provider()?
+        .to_str()
+        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+    crate::generators::validate_response_model(provider)
+        .map_err(|_| capnp::Error::failed("IPC response provider metadata was invalid".into()))?;
+    Ok(StreamChunk::ResponseProviderMetadata {
+        provider: provider.to_string(),
     })
 }
 

@@ -163,7 +163,7 @@ impl ClaudeGenerator {
                 // `ClaudeClient` is a compatibility facade over every
                 // configured provider. Do not let its historical name leak
                 // into transcripts, logs, or provider-selection UI.
-                generator: self.client.provider_name().to_string(),
+                generator: response.provider,
                 model: response.model,
                 confidence: None,
                 stop_reason: response.stop_reason,
@@ -234,6 +234,14 @@ impl Generator for ClaudeGenerator {
 
     fn model_name(&self) -> &str {
         self.client.model_name()
+    }
+
+    fn turn_identity(&self) -> Result<crate::providers::TurnIdentity> {
+        self.client.turn_identity()
+    }
+
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        self.client.accepts_actual_provider(provider)
     }
 }
 

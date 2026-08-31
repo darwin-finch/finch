@@ -94,6 +94,14 @@ impl ProviderBackend for CredentialBoundProvider {
         self.inner.default_model()
     }
 
+    fn resolve_model(&self, requested_model: &str) -> Result<String> {
+        self.inner.resolve_model(requested_model)
+    }
+
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        self.inner.accepts_actual_provider(provider)
+    }
+
     fn capabilities(&self, model: &str) -> super::ModelCapabilities {
         self.inner.capabilities(model)
     }

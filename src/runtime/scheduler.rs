@@ -398,6 +398,9 @@ pub struct AgentIdentity {
     pub root_agent_id: Uuid,
     pub depth: usize,
     pub provider_model: String,
+    /// Immutable requested/resolved provider-model identity captured at spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_identity: Option<crate::providers::TurnIdentity>,
     pub vm_revision: u64,
     pub manifest_generation: u64,
     pub starting_context_hash: String,
@@ -430,6 +433,8 @@ pub struct AgentTaskResult {
     pub diagnostics: Vec<String>,
     pub turns: usize,
     pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_metadata: Option<crate::providers::InvocationMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +579,7 @@ impl AgentScheduler {
             .resolver
             .resolve(spec.provider.as_deref(), spec.model.as_deref())
             .await?;
+        let provider_identity = provider.turn_identity()?;
         if !provider.capabilities().supports_tools && spec.role != AgentRole::Research {
             bail!("selected model does not support tools required by this role");
         }
@@ -600,7 +606,7 @@ impl AgentScheduler {
             &spec,
             parent,
             parent_brain_run_id,
-            provider.name(),
+            &provider_identity.display_name(),
             vm_revision,
             manifest_generation,
             &grant_ceiling,
@@ -637,7 +643,8 @@ impl AgentScheduler {
             parent_agent_id: parent.map(|identity| identity.agent_id),
             root_agent_id: parent.map_or(agent_id, |identity| identity.root_agent_id),
             depth,
-            provider_model: provider.name().to_string(),
+            provider_model: provider_identity.display_name(),
+            provider_identity: Some(provider_identity),
             vm_revision,
             manifest_generation,
             starting_context_hash,
@@ -782,25 +789,34 @@ impl AgentScheduler {
         .await;
         drop(permit);
 
-        let (status, message, diagnostics, turns) = match execution {
-            Ok(Ok((message, turns))) => (AgentTaskStatus::Completed, message, Vec::new(), turns),
+        let (status, message, diagnostics, turns, invocation_metadata) = match execution {
+            Ok(Ok((message, turns, invocation_metadata))) => (
+                AgentTaskStatus::Completed,
+                message,
+                Vec::new(),
+                turns,
+                Some(invocation_metadata),
+            ),
             Ok(Err(error)) if cancellation.is_cancelled() => (
                 AgentTaskStatus::Cancelled,
                 String::new(),
                 vec![error.to_string()],
                 0,
+                None,
             ),
             Ok(Err(error)) => (
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec![error.to_string()],
                 0,
+                None,
             ),
             Err(_) => (
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec!["agent deadline exceeded".to_string()],
                 0,
+                None,
             ),
         };
         let result = AgentTaskResult {
@@ -810,6 +826,7 @@ impl AgentScheduler {
             diagnostics,
             turns,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            invocation_metadata,
         };
         self.store_result(result).await;
     }
@@ -822,6 +839,7 @@ impl AgentScheduler {
             diagnostics: vec!["cancelled before execution".to_string()],
             turns: 0,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            invocation_metadata: None,
         })
         .await;
     }
@@ -888,12 +906,17 @@ impl AgentScheduler {
         resolved_context: &[ResolvedAgentContext],
         provider: Arc<dyn Generator>,
         cancellation: &CancellationToken,
-    ) -> Result<(String, usize)> {
+    ) -> Result<(String, usize, crate::providers::InvocationMetadata)> {
         let tools = self.child_tools(identity);
         let definitions = tools
             .iter()
             .map(|tool| tool.definition())
             .collect::<Vec<_>>();
+        let turn_identity = provider.turn_identity()?;
+        anyhow::ensure!(
+            identity.provider_identity.as_ref() == Some(&turn_identity),
+            "child provider identity changed after task admission"
+        );
         let preamble = format!(
             "You are child agent {} of root {} at depth {}. Your model is {}. \
              VM revision={} manifest_generation={} starting_context_sha256={}. Stay within the assigned task and return a final answer. \
@@ -913,15 +936,63 @@ impl AgentScheduler {
                 .unwrap_or_default(),
             context_reference_preamble(resolved_context),
         );
-        let mut messages = vec![Message::user(preamble)];
+        let mut messages = vec![
+            Message::with_content(
+                "system",
+                vec![ContentBlock::text(turn_identity.model_context())],
+            ),
+            Message::user(preamble),
+        ];
+        let mut invocation_metadata: Option<crate::providers::InvocationMetadata> = None;
 
         for turn in 1..=spec.budget.max_turns.clamp(1, MAX_TURNS) {
             let response = tokio::select! {
                 response = provider.generate(messages.clone(), Some(definitions.clone())) => response?,
                 _ = cancellation.cancelled() => bail!("agent cancelled"),
             };
+            let actual_provider = response.metadata.generator.clone();
+            anyhow::ensure!(
+                crate::generators::validate_response_model(&actual_provider).is_ok()
+                    && provider.accepts_actual_provider(&actual_provider),
+                "child provider response contradicted its immutable provider identity"
+            );
+            let actual_model = if response.metadata.model.is_empty() {
+                None
+            } else {
+                crate::generators::validate_response_model(&response.metadata.model)?;
+                Some(response.metadata.model.clone())
+            };
+            let mut invocation = crate::providers::InvocationMetadata::from_turn(
+                &turn_identity,
+                actual_provider,
+                actual_model,
+            );
+            invocation.input_tokens = response.metadata.input_tokens;
+            invocation.output_tokens = response.metadata.output_tokens;
+            invocation.primary_allowance_used_percent =
+                response.metadata.primary_allowance_used_percent;
+            invocation.secondary_allowance_used_percent =
+                response.metadata.secondary_allowance_used_percent;
+            if let Some(current) = &mut invocation_metadata {
+                current.reconcile(&invocation)?;
+            } else {
+                invocation_metadata = Some(invocation);
+            }
+            messages[0] = Message::with_content(
+                "system",
+                vec![ContentBlock::text(
+                    invocation_metadata
+                        .as_ref()
+                        .expect("current response installed invocation metadata")
+                        .model_context()?,
+                )],
+            );
             if response.tool_uses.is_empty() {
-                return Ok((response.text, turn));
+                return Ok((
+                    response.text,
+                    turn,
+                    invocation_metadata.expect("current response installed invocation metadata"),
+                ));
             }
             messages.push(Message::with_content("assistant", response.content_blocks));
             let mut results = Vec::with_capacity(response.tool_uses.len());
@@ -930,7 +1001,13 @@ impl AgentScheduler {
                     task_id: identity.task_id,
                     name: tool_use.name.clone(),
                 });
-                let execution = execute_child_tool(&tools, &tool_use.name, tool_use.input).await;
+                let execution = execute_child_tool(
+                    &tools,
+                    &tool_use.name,
+                    tool_use.input,
+                    invocation_metadata.as_ref(),
+                )
+                .await;
                 let (content, is_error) = match execution {
                     Ok(content) => (content, false),
                     Err(error) => (format!("Error: {error}"), true),
@@ -1021,7 +1098,12 @@ fn context_reference_preamble(references: &[ResolvedAgentContext]) -> String {
     output
 }
 
-async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Result<String> {
+async fn execute_child_tool(
+    tools: &[Box<dyn Tool>],
+    name: &str,
+    input: Value,
+    provider_invocation: Option<&crate::providers::InvocationMetadata>,
+) -> Result<String> {
     let tool = tools
         .iter()
         .find(|tool| tool.name() == name)
@@ -1042,6 +1124,7 @@ async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -
         plan_content: None,
         live_output: None,
         effect_audit: None,
+        provider_invocation: provider_invocation.cloned(),
         poset: None,
     };
     tool.execute(input, &context).await
@@ -2057,6 +2140,7 @@ mod tests {
             root_agent_id: Uuid::new_v4(),
             depth: 0,
             provider_model: "echo".into(),
+            provider_identity: None,
             vm_revision: runtime.revision(),
             manifest_generation: runtime.manifest_generation(),
             starting_context_hash: "test-context".into(),
@@ -2101,6 +2185,7 @@ mod tests {
             root_agent_id: Uuid::new_v4(),
             depth: 0,
             provider_model: "echo".into(),
+            provider_identity: None,
             vm_revision: runtime.revision(),
             manifest_generation: runtime.manifest_generation(),
             starting_context_hash: "wait-race-test".into(),
@@ -2139,6 +2224,7 @@ mod tests {
                 diagnostics: Vec::new(),
                 turns: 1,
                 elapsed_ms: 1,
+                invocation_metadata: None,
             })
             .await;
         resume.notify_one();

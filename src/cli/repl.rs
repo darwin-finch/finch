@@ -1830,6 +1830,7 @@ impl Repl {
                         None, // repl_mode (not available in raw mode)
                         None, // plan_content
                         None, // live_output
+                        None, // provider_invocation
                         None, // effect_audit
                     )
                     .await?;
@@ -2029,6 +2030,9 @@ impl Repl {
                 Ok(crate::generators::StreamChunk::ResponseMetadata { .. }) => {
                     // This legacy display-only path has no response record to
                     // attach provider metadata to.
+                }
+                Ok(crate::generators::StreamChunk::ResponseProviderMetadata { .. }) => {
+                    // The event-driven path persists canonical turn identity.
                 }
                 Ok(crate::generators::StreamChunk::Allowance { .. }) => {}
                 Err(e) => {

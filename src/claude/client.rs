@@ -51,6 +51,14 @@ impl ClaudeClient {
         self.provider.default_model()
     }
 
+    pub fn turn_identity(&self) -> Result<crate::providers::TurnIdentity> {
+        crate::providers::provider_turn_identity(self.provider.as_ref(), self.provider.name())
+    }
+
+    pub fn accepts_actual_provider(&self, provider: &str) -> bool {
+        self.provider.accepts_actual_provider(provider)
+    }
+
     /// Convert MessageRequest to ProviderRequest
     fn to_provider_request(&self, request: &MessageRequest) -> ProviderRequest {
         // The provider profile owns the upstream model. `MessageRequest`

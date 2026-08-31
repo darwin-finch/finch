@@ -783,6 +783,7 @@ mod script_tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let before = runtime.revision();
@@ -2395,6 +2396,7 @@ async fn run_query_teacher_only(
                         None, // repl_mode
                         None, // plan_content
                         None, // live_output
+                        None, // provider_invocation
                         None, // effect_audit
                     )
                     .await

@@ -85,6 +85,14 @@ impl Generator for QwenGenerator {
     fn name(&self) -> &str {
         "Local"
     }
+
+    fn turn_identity(&self) -> Result<crate::providers::TurnIdentity> {
+        crate::providers::TurnIdentity::new("local", "local", "local", "local", "local")
+    }
+
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        provider == "local"
+    }
 }
 
 impl QwenGenerator {
@@ -381,6 +389,7 @@ impl QwenGenerator {
                     None,                                    // repl_mode
                     None,                                    // plan_content
                     None,                                    // live_output
+                    None,                                    // provider_invocation
                     None,                                    // effect_audit
                 )
                 .await

@@ -123,6 +123,7 @@ mod tests {
             plan_content: Some(plan_content),
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 
@@ -154,6 +155,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 
@@ -175,6 +177,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 

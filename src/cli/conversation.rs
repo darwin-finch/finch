@@ -71,12 +71,23 @@ struct StagedToolRound {
     assistant: Message,
     expected_ids: Vec<String>,
     results: HashMap<String, ToolRoundResult>,
+    invocation_metadata: Option<crate::providers::InvocationMetadata>,
+}
+
+/// Provider identity/accounting attached to one committed assistant message.
+/// The index is adjusted with the message vector during trimming/compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConversationInvocation {
+    pub message_index: usize,
+    pub metadata: crate::providers::InvocationMetadata,
 }
 
 /// Manages conversation history for multi-turn interactions with context window management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationHistory {
     messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    invocations: Vec<ConversationInvocation>,
     /// Provider-invisible tool rounds. Staged state is deliberately neither
     /// returned by history reads nor serialized during crash recovery.
     #[serde(skip)]
@@ -96,6 +107,7 @@ impl ConversationHistory {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            invocations: Vec::new(),
             staged_tool_rounds: HashMap::new(),
             max_messages: 500, // ~250 turns — plenty for a full coding session
             max_tokens_estimate: 600_000, // ~150k tokens * 4 chars/token (Claude: 200k context)
@@ -108,6 +120,7 @@ impl ConversationHistory {
     pub fn with_limits(max_messages: usize, max_tokens_estimate: usize) -> Self {
         Self {
             messages: Vec::new(),
+            invocations: Vec::new(),
             staged_tool_rounds: HashMap::new(),
             max_messages,
             max_tokens_estimate,
@@ -156,12 +169,42 @@ impl ConversationHistory {
         self.trim_if_needed();
     }
 
+    /// Add a provider assistant message with its authoritative invocation.
+    pub fn add_message_with_invocation(
+        &mut self,
+        message: Message,
+        metadata: crate::providers::InvocationMetadata,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            message.role == "assistant",
+            "provider invocation metadata may only annotate an assistant message"
+        );
+        metadata.validate()?;
+        let message_index = self.messages.len();
+        self.messages.push(message);
+        self.invocations.push(ConversationInvocation {
+            message_index,
+            metadata,
+        });
+        self.trim_if_needed();
+        Ok(())
+    }
+
     /// Stage a complete provider assistant payload without making it visible
     /// to request builders, snapshots, compaction, or persistence.
     pub fn stage_assistant(
         &mut self,
         query_id: Uuid,
         assistant: Message,
+    ) -> std::result::Result<ToolRoundToken, ToolRoundError> {
+        self.stage_assistant_with_invocation(query_id, assistant, None)
+    }
+
+    pub fn stage_assistant_with_invocation(
+        &mut self,
+        query_id: Uuid,
+        assistant: Message,
+        invocation_metadata: Option<crate::providers::InvocationMetadata>,
     ) -> std::result::Result<ToolRoundToken, ToolRoundError> {
         if self.staged_tool_rounds.contains_key(&query_id) {
             return Err(ToolRoundError::StageAlreadyExists);
@@ -189,6 +232,14 @@ impl ConversationHistory {
                 "tool_use ids must be unique".to_string(),
             ));
         }
+        if invocation_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.validate().is_err())
+        {
+            return Err(ToolRoundError::InvalidAssistant(
+                "provider invocation metadata was invalid".to_string(),
+            ));
+        }
 
         let token = ToolRoundToken(Uuid::new_v4());
         self.staged_tool_rounds.insert(
@@ -198,6 +249,7 @@ impl ConversationHistory {
                 assistant,
                 expected_ids,
                 results: HashMap::new(),
+                invocation_metadata,
             },
         );
         Ok(token)
@@ -298,7 +350,14 @@ impl ConversationHistory {
                 })
                 .collect(),
         };
+        let assistant_index = self.messages.len();
         self.messages.push(stage.assistant);
+        if let Some(metadata) = stage.invocation_metadata {
+            self.invocations.push(ConversationInvocation {
+                message_index: assistant_index,
+                metadata,
+            });
+        }
         self.messages.push(tool_results);
         Ok(ordered_results)
     }
@@ -322,11 +381,23 @@ impl ConversationHistory {
         query_id: Uuid,
         token: ToolRoundToken,
     ) -> std::result::Result<(), ToolRoundError> {
+        let assistant_index = self.messages.len().saturating_sub(2);
+        let invocation_metadata = self
+            .invocations
+            .iter()
+            .position(|invocation| invocation.message_index == assistant_index)
+            .map(|index| self.invocations.remove(index).metadata);
         let results_message = self.messages.pop().ok_or(ToolRoundError::NoActiveStage)?;
         let assistant = match self.messages.pop() {
             Some(assistant) => assistant,
             None => {
                 self.messages.push(results_message);
+                if let Some(metadata) = invocation_metadata {
+                    self.invocations.push(ConversationInvocation {
+                        message_index: assistant_index,
+                        metadata,
+                    });
+                }
                 return Err(ToolRoundError::NoActiveStage);
             }
         };
@@ -362,6 +433,12 @@ impl ConversationHistory {
             || expected_ids.iter().any(|id| !results.contains_key(id))
         {
             self.messages.push(assistant);
+            if let Some(metadata) = invocation_metadata {
+                self.invocations.push(ConversationInvocation {
+                    message_index: assistant_index,
+                    metadata,
+                });
+            }
             self.messages.push(Message {
                 role: "user".to_string(),
                 content: results
@@ -384,6 +461,7 @@ impl ConversationHistory {
                 assistant,
                 expected_ids,
                 results,
+                invocation_metadata,
             },
         );
         Ok(())
@@ -403,6 +481,7 @@ impl ConversationHistory {
     /// Clear conversation history (start fresh)
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.invocations.clear();
         self.staged_tool_rounds.clear();
     }
 
@@ -427,9 +506,14 @@ impl ConversationHistory {
         self.messages.clone()
     }
 
+    pub fn invocations(&self) -> &[ConversationInvocation] {
+        &self.invocations
+    }
+
     /// Restore conversation from a snapshot
     pub fn restore_snapshot(&mut self, snapshot: Vec<Message>) {
         self.messages = snapshot;
+        self.invocations.clear();
         self.staged_tool_rounds.clear();
     }
 
@@ -438,7 +522,7 @@ impl ConversationHistory {
         // Trim by message count
         if self.messages.len() > self.max_messages {
             let remove_count = self.messages.len() - self.max_messages;
-            self.messages.drain(0..remove_count);
+            self.remove_front(remove_count);
         }
 
         // Estimate token count (rough: 1 token ≈ 4 characters)
@@ -452,7 +536,7 @@ impl ConversationHistory {
                 && self.messages.iter().map(|m| m.text().len()).sum::<usize>()
                     > self.max_tokens_estimate
             {
-                self.messages.remove(0);
+                self.remove_front(1);
             }
         }
 
@@ -465,7 +549,17 @@ impl ConversationHistory {
                     .iter()
                     .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
         }) {
-            self.messages.remove(0);
+            self.remove_front(1);
+        }
+    }
+
+    fn remove_front(&mut self, count: usize) {
+        let count = count.min(self.messages.len());
+        self.messages.drain(0..count);
+        self.invocations
+            .retain(|invocation| invocation.message_index >= count);
+        for invocation in &mut self.invocations {
+            invocation.message_index -= count;
         }
     }
 
@@ -521,6 +615,7 @@ impl ConversationHistory {
 
     /// Save conversation to JSON file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.validate_invocations()?;
         let json =
             serde_json::to_string_pretty(self).context("Failed to serialize conversation")?;
         let path = path.as_ref();
@@ -552,8 +647,26 @@ impl ConversationHistory {
         history.compaction_threshold_percent = 0.9;
         history.auto_compact_enabled = true;
         history.staged_tool_rounds = HashMap::new();
+        history.validate_invocations()?;
 
         Ok(history)
+    }
+
+    fn validate_invocations(&self) -> Result<()> {
+        let mut indices = HashSet::new();
+        for invocation in &self.invocations {
+            invocation.metadata.validate()?;
+            anyhow::ensure!(
+                invocation.message_index < self.messages.len()
+                    && self.messages[invocation.message_index].role == "assistant",
+                "conversation invocation metadata referenced a non-assistant message"
+            );
+            anyhow::ensure!(
+                indices.insert(invocation.message_index),
+                "conversation carried duplicate invocation metadata"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -787,8 +900,21 @@ impl<'a> ConversationCompactor<'a> {
         // Add recent messages
         compacted_messages.extend(to_keep.iter().cloned());
 
-        // Replace conversation history with compacted version
-        history.restore_snapshot(compacted_messages);
+        // Replace conversation history while retaining the exact invocation
+        // attached to each preserved recent assistant message. The synthetic
+        // summary has no provider identity of its own.
+        let mut preserved_invocations = history
+            .invocations
+            .iter()
+            .filter(|invocation| invocation.message_index >= split_point)
+            .cloned()
+            .collect::<Vec<_>>();
+        for invocation in &mut preserved_invocations {
+            invocation.message_index = 1 + invocation.message_index - split_point;
+        }
+        history.messages = compacted_messages;
+        history.invocations = preserved_invocations;
+        history.staged_tool_rounds.clear();
 
         tracing::info!(
             "Conversation compacted: {} → {} messages (saved ~{} tokens)",
@@ -1061,6 +1187,38 @@ mod tests {
         assert_eq!(messages[0].text_content(), "Test message");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "Test response");
+    }
+
+    #[test]
+    fn provider_invocation_survives_durable_conversation_replay_without_model_fallback() {
+        let identity = crate::providers::TurnIdentity::new(
+            "coding",
+            "openai",
+            "openai",
+            "fast-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        let invocation = crate::providers::InvocationMetadata::from_turn(&identity, "openai", None);
+        let mut conversation = ConversationHistory::new();
+        conversation.add_user_message("Inspect the repository".to_string());
+        conversation
+            .add_message_with_invocation(Message::assistant("(say \"done\")"), invocation.clone())
+            .unwrap();
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        conversation.save(file.path()).unwrap();
+        let replayed = ConversationHistory::load(file.path()).unwrap();
+
+        assert_eq!(replayed.invocations().len(), 1);
+        assert_eq!(replayed.invocations()[0].message_index, 1);
+        assert_eq!(replayed.invocations()[0].metadata, invocation);
+        assert_eq!(replayed.invocations()[0].metadata.actual_model, None);
+        assert!(replayed.invocations()[0]
+            .metadata
+            .model_context()
+            .unwrap()
+            .contains("actual_model: unknown (not reported by the provider)"));
     }
 
     #[test]

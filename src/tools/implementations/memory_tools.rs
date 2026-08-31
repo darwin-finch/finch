@@ -351,6 +351,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result = tool
@@ -401,6 +402,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let output = tool
@@ -432,6 +434,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
 
@@ -482,6 +485,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let result = tool

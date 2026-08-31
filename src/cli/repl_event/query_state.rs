@@ -67,6 +67,7 @@ pub struct QueryMetadata {
 
     /// Completed provider identity/accounting retained until a named-Brain
     /// turn crosses its durable daemon commit boundary.
+    pub turn_identity: Option<crate::providers::TurnIdentity>,
     pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
 
     /// When this query was created
@@ -105,6 +106,7 @@ impl QueryStateManager {
             brain_turn_provenance: None,
             effect_audit: None,
             cancellation_token: CancellationToken::new(),
+            turn_identity: None,
             invocation_metadata: None,
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
@@ -204,13 +206,25 @@ impl QueryStateManager {
         {
             return false;
         }
-        conversation
-            .write()
-            .await
-            .add_message(crate::claude::Message {
+        let Some(invocation) = metadata.invocation_metadata.clone() else {
+            metadata.state = QueryState::Failed {
+                error: "provider completion omitted authoritative invocation provenance"
+                    .to_string(),
+            };
+            return false;
+        };
+        if let Err(error) = conversation.write().await.add_message_with_invocation(
+            crate::claude::Message {
                 role: "assistant".to_string(),
                 content,
-            });
+            },
+            invocation,
+        ) {
+            metadata.state = QueryState::Failed {
+                error: error.to_string(),
+            };
+            return false;
+        }
         metadata.state = QueryState::Completed { response };
         true
     }
@@ -229,14 +243,50 @@ impl QueryStateManager {
         self.states.read().await.get(&query_id).cloned()
     }
 
+    pub async fn bind_turn_identity(
+        &self,
+        query_id: Uuid,
+        identity: crate::providers::TurnIdentity,
+    ) -> anyhow::Result<()> {
+        identity.validate()?;
+        let mut states = self.states.write().await;
+        let metadata = states
+            .get_mut(&query_id)
+            .ok_or_else(|| anyhow::anyhow!("provider query state was not found"))?;
+        if let Some(current) = &metadata.turn_identity {
+            anyhow::ensure!(
+                current == &identity,
+                "provider turn identity changed after dispatch"
+            );
+        } else {
+            metadata.turn_identity = Some(identity);
+        }
+        Ok(())
+    }
+
     pub async fn set_invocation_metadata(
         &self,
         query_id: Uuid,
         invocation: crate::providers::types::InvocationMetadata,
-    ) {
-        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+    ) -> anyhow::Result<()> {
+        invocation.validate()?;
+        let mut states = self.states.write().await;
+        let metadata = states
+            .get_mut(&query_id)
+            .ok_or_else(|| anyhow::anyhow!("provider query state was not found"))?;
+        let identity = metadata.turn_identity.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("provider turn identity was not bound before response")
+        })?;
+        anyhow::ensure!(
+            identity == &invocation.turn_identity(),
+            "provider response contradicted the immutable turn identity"
+        );
+        if let Some(current) = &mut metadata.invocation_metadata {
+            current.reconcile(&invocation)?;
+        } else {
             metadata.invocation_metadata = Some(invocation);
         }
+        Ok(())
     }
 
     pub async fn set_tool_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
@@ -328,6 +378,17 @@ impl Default for QueryStateManager {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn test_identity() -> crate::providers::TurnIdentity {
+        crate::providers::TurnIdentity::new(
+            "coding",
+            "openai",
+            "openai",
+            "fast-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn test_create_query_returns_unique_ids() {
@@ -486,6 +547,22 @@ mod tests {
         let conversation = Arc::new(RwLock::new(
             crate::cli::conversation::ConversationHistory::new(),
         ));
+        let identity = test_identity();
+        manager
+            .bind_turn_identity(id, identity.clone())
+            .await
+            .unwrap();
+        manager
+            .set_invocation_metadata(
+                id,
+                crate::providers::InvocationMetadata::from_turn(
+                    &identity,
+                    "openai",
+                    Some("gpt-5.6-sol-2026-08-30".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
 
         assert!(
             manager
@@ -500,9 +577,101 @@ mod tests {
         assert!(!manager.cancel_query(id).await);
 
         assert_eq!(conversation.read().await.get_messages().len(), 1);
+        assert_eq!(conversation.read().await.invocations().len(), 1);
         assert!(matches!(
             manager.get_state(id).await,
             Some(QueryState::Completed { response }) if response == "rendered"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invocation_admission_pins_tool_continuations_and_rejects_drift() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let identity = test_identity();
+        manager
+            .bind_turn_identity(id, identity.clone())
+            .await
+            .unwrap();
+
+        manager
+            .set_invocation_metadata(
+                id,
+                crate::providers::InvocationMetadata::from_turn(&identity, "openai", None),
+            )
+            .await
+            .unwrap();
+        manager
+            .set_invocation_metadata(
+                id,
+                crate::providers::InvocationMetadata::from_turn(
+                    &identity,
+                    "openai",
+                    Some("gpt-5.6-sol-2026-08-30".to_string()),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let drifted = crate::providers::InvocationMetadata::from_turn(
+            &identity,
+            "openai",
+            Some("different-served-model".to_string()),
+        );
+        assert!(manager.set_invocation_metadata(id, drifted).await.is_err());
+        assert_eq!(
+            manager
+                .get_metadata(id)
+                .await
+                .unwrap()
+                .invocation_metadata
+                .unwrap()
+                .actual_model
+                .as_deref(),
+            Some("gpt-5.6-sol-2026-08-30")
+        );
+    }
+
+    #[tokio::test]
+    async fn invocation_without_turn_admission_fails_closed() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let identity = test_identity();
+
+        let error = manager
+            .set_invocation_metadata(
+                id,
+                crate::providers::InvocationMetadata::from_turn(&identity, "openai", None),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("turn identity was not bound before response"));
+    }
+
+    #[tokio::test]
+    async fn completion_without_provenance_is_not_persisted_or_presented_as_a_provider_turn() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let conversation = Arc::new(RwLock::new(
+            crate::cli::conversation::ConversationHistory::new(),
+        ));
+
+        assert!(
+            !manager
+                .try_publish_completion(
+                    id,
+                    "rendered".to_string(),
+                    "provider source".to_string(),
+                    &conversation,
+                )
+                .await
+        );
+        assert!(conversation.read().await.get_messages().is_empty());
+        assert!(matches!(
+            manager.get_state(id).await,
+            Some(QueryState::Failed { error }) if error.contains("omitted authoritative invocation provenance")
         ));
     }
 

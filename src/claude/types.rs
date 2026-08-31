@@ -285,6 +285,9 @@ pub struct MessageResponse {
     pub response_type: String,
     pub role: String,
     pub content: Vec<ContentBlock>,
+    /// Exact provider adapter that returned this response.
+    #[serde(default)]
+    pub provider: String,
     pub model: String,
     pub stop_reason: Option<String>,
     #[serde(default)]

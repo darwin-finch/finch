@@ -193,7 +193,7 @@ impl FallbackChain {
                 };
 
             match provider.send_message_stream_validated(validated).await {
-                Ok(receiver) => {
+                Ok(mut receiver) => {
                     if idx > 0 {
                         tracing::info!(
                             "Provider {} streaming succeeded after {} failed attempts",
@@ -203,8 +203,36 @@ impl FallbackChain {
                     } else {
                         tracing::debug!("Primary provider {} streaming succeeded", provider.name());
                     }
-                    // Return provider's receiver DIRECTLY (no wrapper, no race condition)
-                    return Ok(receiver);
+                    // Attribute the exact candidate chosen by this explicit
+                    // dispatch wrapper. Exit immediately if the caller drops
+                    // the returned receiver so no forwarding task is retained.
+                    let (sender, attributed) = mpsc::channel(100);
+                    let actual_provider = provider.name().to_string();
+                    tokio::spawn(async move {
+                        if sender
+                            .send(Ok(StreamChunk::ResponseProviderMetadata {
+                                provider: actual_provider,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        loop {
+                            tokio::select! {
+                                _ = sender.closed() => return,
+                                next = receiver.recv() => match next {
+                                    Some(chunk) => {
+                                        if sender.send(chunk).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    None => return,
+                                }
+                            }
+                        }
+                    });
+                    return Ok(attributed);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -255,6 +283,18 @@ impl ProviderBackend for FallbackChain {
         self.primary_provider()
             .map(|p| p.default_model())
             .unwrap_or("default")
+    }
+
+    fn resolve_model(&self, requested_model: &str) -> Result<String> {
+        self.primary_provider()
+            .ok_or_else(|| anyhow::anyhow!("No providers available"))?
+            .resolve_model(requested_model)
+    }
+
+    fn accepts_actual_provider(&self, provider: &str) -> bool {
+        self.providers
+            .iter()
+            .any(|candidate| candidate.accepts_actual_provider(provider))
     }
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {

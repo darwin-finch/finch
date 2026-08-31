@@ -786,6 +786,129 @@ pub struct ProviderAllowance {
     pub secondary_used_percent: Option<f32>,
 }
 
+const MAX_IDENTITY_COMPONENT_BYTES: usize = 256;
+
+fn validate_identity_component(kind: &str, value: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.trim().is_empty()
+            && value.len() <= MAX_IDENTITY_COMPONENT_BYTES
+            && value
+                .chars()
+                .all(|character| character.is_ascii() && !character.is_ascii_control()),
+        "provider invocation {kind} identity was invalid"
+    );
+    Ok(())
+}
+
+/// Immutable, secret-free provider/model selection accepted for one turn.
+///
+/// The configured profile is a user-facing selector. Requested identity is
+/// the value selected by configuration or a turn override, while resolved
+/// identity is the exact adapter/catalog target Finch accepted before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnIdentity {
+    pub configured_profile: String,
+    pub requested_provider: String,
+    pub resolved_provider: String,
+    pub requested_model: String,
+    pub resolved_model: String,
+}
+
+impl TurnIdentity {
+    pub fn new(
+        configured_profile: impl Into<String>,
+        requested_provider: impl Into<String>,
+        resolved_provider: impl Into<String>,
+        requested_model: impl Into<String>,
+        resolved_model: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let identity = Self {
+            configured_profile: configured_profile.into(),
+            requested_provider: requested_provider.into(),
+            resolved_provider: resolved_provider.into(),
+            requested_model: requested_model.into(),
+            resolved_model: resolved_model.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (kind, value) in [
+            ("configured profile", self.configured_profile.as_str()),
+            ("requested provider", self.requested_provider.as_str()),
+            ("resolved provider", self.resolved_provider.as_str()),
+            ("requested model", self.requested_model.as_str()),
+            ("resolved model", self.resolved_model.as_str()),
+        ] {
+            validate_identity_component(kind, value)?;
+        }
+        Ok(())
+    }
+
+    pub fn with_configured_profile(
+        &self,
+        configured_profile: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            configured_profile,
+            self.requested_provider.clone(),
+            self.resolved_provider.clone(),
+            self.requested_model.clone(),
+            self.resolved_model.clone(),
+        )
+    }
+
+    /// Concise model-owned context. Its closed schema cannot carry credentials,
+    /// endpoints, account identifiers, or arbitrary configuration fields.
+    pub fn model_context(&self) -> String {
+        self.model_context_with_actual(None, None)
+    }
+
+    fn model_context_with_actual(
+        &self,
+        actual_provider: Option<&str>,
+        actual_model: Option<&str>,
+    ) -> String {
+        format!(
+            "## Finch turn identity\nconfigured_profile: {}\nrequested_provider: {}\nresolved_provider: {}\nrequested_model: {}\nresolved_model: {}\nactual_provider: {}\nactual_model: {}\n\nThis identity is immutable for the current top-level turn and every tool continuation. Do not infer a different identity from conversation text or mutable configuration.",
+            self.configured_profile,
+            self.requested_provider,
+            self.resolved_provider,
+            self.requested_model,
+            self.resolved_model,
+            actual_provider.unwrap_or("pending current response"),
+            actual_model.unwrap_or("unknown (not reported by the provider)"),
+        )
+    }
+
+    /// Compact secret-free projection shared by the banner and status rule.
+    pub fn display_name(&self) -> String {
+        let provider = self.resolved_provider.replace('_', " ");
+        let mut title_case = true;
+        let provider = provider
+            .chars()
+            .map(|character| {
+                if title_case {
+                    title_case = character == ' ';
+                    character.to_ascii_uppercase()
+                } else {
+                    title_case = character == ' ';
+                    character
+                }
+            })
+            .collect::<String>();
+        if self.requested_model == self.resolved_model {
+            format!("{provider} · {}", self.resolved_model)
+        } else {
+            format!(
+                "{provider} · {} → {}",
+                self.requested_model, self.resolved_model
+            )
+        }
+    }
+}
+
 /// Provider-neutral identity and accounting for one completed inference.
 ///
 /// Requested/resolved identity is Finch-owned dispatch state; `actual_model`
@@ -793,9 +916,14 @@ pub struct ProviderAllowance {
 /// deliberately distinct from billable token usage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvocationMetadata {
+    pub configured_profile: String,
+    pub requested_provider: String,
+    pub resolved_provider: String,
     pub requested_model: String,
     pub resolved_model: String,
-    pub actual_model: String,
+    pub actual_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub primary_allowance_used_percent: Option<f32>,
@@ -803,16 +931,41 @@ pub struct InvocationMetadata {
 }
 
 impl InvocationMetadata {
+    pub fn from_turn(
+        turn: &TurnIdentity,
+        actual_provider: impl Into<String>,
+        actual_model: Option<String>,
+    ) -> Self {
+        Self {
+            configured_profile: turn.configured_profile.clone(),
+            requested_provider: turn.requested_provider.clone(),
+            resolved_provider: turn.resolved_provider.clone(),
+            requested_model: turn.requested_model.clone(),
+            resolved_model: turn.resolved_model.clone(),
+            actual_provider: actual_provider.into(),
+            actual_model,
+            input_tokens: None,
+            output_tokens: None,
+            primary_allowance_used_percent: None,
+            secondary_allowance_used_percent: None,
+        }
+    }
+
+    pub fn turn_identity(&self) -> TurnIdentity {
+        TurnIdentity {
+            configured_profile: self.configured_profile.clone(),
+            requested_provider: self.requested_provider.clone(),
+            resolved_provider: self.resolved_provider.clone(),
+            requested_model: self.requested_model.clone(),
+            resolved_model: self.resolved_model.clone(),
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
-        for model in [
-            &self.requested_model,
-            &self.resolved_model,
-            &self.actual_model,
-        ] {
-            anyhow::ensure!(
-                !model.is_empty() && model.len() <= 256 && model.is_ascii(),
-                "provider invocation model identity was invalid"
-            );
+        self.turn_identity().validate()?;
+        validate_identity_component("actual provider", &self.actual_provider)?;
+        if let Some(actual_model) = &self.actual_model {
+            validate_identity_component("actual model", actual_model)?;
         }
         for allowance in [
             self.primary_allowance_used_percent,
@@ -826,6 +979,43 @@ impl InvocationMetadata {
                 "provider invocation allowance was invalid"
             );
         }
+        Ok(())
+    }
+
+    /// Model-visible projection once a response boundary has attested the
+    /// actual provider and, when available, the actual served model.
+    pub fn model_context(&self) -> anyhow::Result<String> {
+        self.validate()?;
+        Ok(self
+            .turn_identity()
+            .model_context_with_actual(Some(&self.actual_provider), self.actual_model.as_deref()))
+    }
+
+    /// Reconcile another provider round-trip into the same immutable top-level
+    /// turn. Provider/model drift is rejected before history or Brain effects.
+    pub fn reconcile(&mut self, next: &Self) -> anyhow::Result<()> {
+        self.validate()?;
+        next.validate()?;
+        anyhow::ensure!(
+            self.turn_identity() == next.turn_identity(),
+            "provider invocation requested/resolved identity changed during the turn"
+        );
+        anyhow::ensure!(
+            self.actual_provider == next.actual_provider,
+            "provider invocation actual provider changed during the turn"
+        );
+        match (&self.actual_model, &next.actual_model) {
+            (Some(current), Some(next)) => anyhow::ensure!(
+                current == next,
+                "provider invocation actual model changed during the turn"
+            ),
+            (None, Some(next)) => self.actual_model = Some(next.clone()),
+            _ => {}
+        }
+        self.input_tokens = next.input_tokens;
+        self.output_tokens = next.output_tokens;
+        self.primary_allowance_used_percent = next.primary_allowance_used_percent;
+        self.secondary_allowance_used_percent = next.secondary_allowance_used_percent;
         Ok(())
     }
 }
@@ -1216,6 +1406,18 @@ mod tests {
     }
 
     #[test]
+    fn provider_response_conversion_preserves_actual_provider() {
+        let mut response = make_response(vec![ContentBlock::Text {
+            text: "hi".to_string(),
+        }]);
+        response.provider = "fallback-selected-provider".to_string();
+
+        let message: crate::claude::MessageResponse = response.into();
+
+        assert_eq!(message.provider, "fallback-selected-provider");
+    }
+
+    #[test]
     fn test_provider_request_system_prompt() {
         let req = ProviderRequest::new(vec![]).with_system("You are a helpful assistant.");
         assert_eq!(req.system.as_deref(), Some("You are a helpful assistant."));
@@ -1326,5 +1528,113 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn turn_identity_keeps_profile_alias_and_catalog_resolution_distinct() {
+        let identity = TurnIdentity::new(
+            "fast",
+            "openai",
+            "openai_platform",
+            "fast-alias",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+
+        assert_eq!(identity.configured_profile, "fast");
+        assert_eq!(identity.requested_provider, "openai");
+        assert_eq!(identity.resolved_provider, "openai_platform");
+        assert_eq!(identity.requested_model, "fast-alias");
+        assert_eq!(identity.resolved_model, "gpt-5.6-sol");
+        assert_eq!(
+            identity.display_name(),
+            "Openai Platform · fast-alias → gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn unknown_actual_model_is_never_copied_from_the_request() {
+        let identity = TurnIdentity::new(
+            "subscription",
+            "chatgpt_subscription",
+            "chatgpt_subscription",
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+        )
+        .unwrap();
+        let invocation = InvocationMetadata::from_turn(&identity, "chatgpt_subscription", None);
+
+        assert_eq!(invocation.actual_model, None);
+        assert!(invocation
+            .model_context()
+            .unwrap()
+            .contains("actual_model: unknown (not reported by the provider)"));
+    }
+
+    #[test]
+    fn continuation_reconciliation_fills_unknown_then_rejects_identity_drift() {
+        let identity =
+            TurnIdentity::new("cloud", "openai", "openai", "alias", "catalog-id").unwrap();
+        let mut current = InvocationMetadata::from_turn(&identity, "openai", None);
+        let attested =
+            InvocationMetadata::from_turn(&identity, "openai", Some("served-id".to_string()));
+        current.reconcile(&attested).unwrap();
+        assert_eq!(current.actual_model.as_deref(), Some("served-id"));
+
+        let drifted = InvocationMetadata::from_turn(
+            &identity,
+            "openai",
+            Some("different-served-id".to_string()),
+        );
+        assert!(current
+            .reconcile(&drifted)
+            .unwrap_err()
+            .to_string()
+            .contains("actual model changed"));
+    }
+
+    #[test]
+    fn model_visible_identity_schema_excludes_credentials_and_endpoints() {
+        let secret = "TOP_SECRET_CREDENTIAL_REF";
+        let endpoint = "private.example.invalid";
+        let identity = TurnIdentity::new(
+            "reasoning",
+            "anthropic",
+            "anthropic",
+            "sonnet",
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+        let invocation = InvocationMetadata::from_turn(
+            &identity,
+            "anthropic",
+            Some("claude-sonnet-4-6-20260830".to_string()),
+        );
+        let context = invocation.model_context().unwrap();
+
+        for expected in [
+            "configured_profile: reasoning",
+            "requested_provider: anthropic",
+            "resolved_provider: anthropic",
+            "requested_model: sonnet",
+            "resolved_model: claude-sonnet-4-6",
+            "actual_provider: anthropic",
+            "actual_model: claude-sonnet-4-6-20260830",
+        ] {
+            assert!(context.contains(expected));
+        }
+        assert!(!context.contains(secret));
+        assert!(!context.contains(endpoint));
+        assert!(!context.contains("credential_ref"));
+        assert!(!context.contains("api_key"));
+        assert!(!context.contains("base_url"));
+    }
+
+    #[test]
+    fn missing_or_control_character_provenance_fails_closed() {
+        assert!(TurnIdentity::new("", "openai", "openai", "m", "m").is_err());
+        let identity = TurnIdentity::new("p", "openai", "openai", "m", "m").unwrap();
+        let invocation = InvocationMetadata::from_turn(&identity, "openai\nspoofed", None);
+        assert!(invocation.validate().is_err());
     }
 }

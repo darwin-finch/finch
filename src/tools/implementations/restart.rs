@@ -220,6 +220,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let input = serde_json::json!({
@@ -244,6 +245,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let input = serde_json::json!({
@@ -269,6 +271,7 @@ mod tests {
             plan_content: None,
             live_output: None,
             effect_audit: None,
+            provider_invocation: None,
             poset: None,
         };
         let binary = std::env::current_exe().unwrap();

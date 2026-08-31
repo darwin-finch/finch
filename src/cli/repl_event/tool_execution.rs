@@ -155,6 +155,7 @@ impl ToolExecutionCoordinator {
         tool_use: ToolUse,
         work_unit: Arc<WorkUnit>,
         row_idx: usize,
+        provider_invocation: crate::providers::InvocationMetadata,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) {
         let event_tx = self.event_tx.clone();
@@ -305,6 +306,7 @@ impl ToolExecutionCoordinator {
                 Some(Arc::clone(&repl_mode)),
                 Some(Arc::clone(&plan_content)),
                 Some(Arc::clone(&live_output)),
+                Some(provider_invocation),
                 effect_audit,
             );
             let result = match timeout_duration {
