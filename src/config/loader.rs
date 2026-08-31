@@ -12,7 +12,7 @@ use crate::errors;
 /// Load configuration from Shammah config file or environment
 pub fn load_config() -> Result<Config> {
     // Try loading from ~/.finch/config.toml first
-    if let Some(config) = try_load_from_finch_config()? {
+    if let Some(config) = load_persisted_config()? {
         return Ok(config);
     }
 
@@ -45,12 +45,41 @@ pub fn load_config() -> Result<Config> {
     );
 }
 
+/// Load the persisted configuration without substituting environment or empty
+/// state when an existing file is invalid.
+///
+/// `None` means the file is genuinely absent. Any read, parse, or validation
+/// failure is returned so setup cannot overwrite a provider graph it failed to
+/// understand.
+pub fn load_persisted_config() -> Result<Option<Config>> {
+    try_load_from_finch_config()
+}
+
 fn try_load_from_finch_config() -> Result<Option<Config>> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".finch/config.toml");
 
-    if !config_path.exists() {
-        return Ok(None);
+    try_load_from_path(&config_path)
+}
+
+fn try_load_from_path(config_path: &std::path::Path) -> Result<Option<Config>> {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "Existing Finch configuration at {} is a symbolic link; setup will not follow or overwrite it",
+                config_path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Could not inspect existing Finch configuration at {}",
+                    config_path.display()
+                )
+            });
+        }
     }
 
     Ok(Some(load_config_from_path(&config_path)?))
@@ -253,5 +282,48 @@ mod tests {
         assert_eq!(resolver_calls.get(), 0);
         assert_eq!(loaded.metrics_dir, metrics_dir);
         assert_eq!(loaded.constitution_path, None);
+    }
+
+    #[test]
+    fn test_setup_loader_distinguishes_absent_from_broken_existing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+
+        assert!(try_load_from_path(&config_path).unwrap().is_none());
+
+        std::fs::write(&config_path, "this is not valid Finch TOML = [").unwrap();
+        let error = try_load_from_path(&config_path).unwrap_err().to_string();
+        assert!(error.contains("Failed to parse config file"), "{error}");
+        assert!(
+            config_path.exists(),
+            "a failed load must not remove the file"
+        );
+
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "sentinel").unwrap();
+        let inaccessible = blocked_parent.join("config.toml");
+        let error = try_load_from_path(&inaccessible)
+            .expect_err("filesystem inspection errors must not look like first run")
+            .to_string();
+        assert!(error.contains("Could not inspect existing Finch configuration"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_setup_loader_rejects_dangling_config_symlink_as_existing_state() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        symlink(directory.path().join("missing-target.toml"), &config_path).unwrap();
+
+        let error = try_load_from_path(&config_path)
+            .expect_err("a dangling config symlink must not look like first run")
+            .to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&config_path).is_ok(),
+            "failed inspection must preserve the link"
+        );
     }
 }

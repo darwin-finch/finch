@@ -22,7 +22,7 @@ pub use credential::{
     CredentialResolver, EndpointFamily, EnvironmentCredentialResolver, ProviderCredential,
     ResolvedCredential, ResolvedSecret,
 };
-pub use loader::load_config;
+pub use loader::{load_config, load_persisted_config};
 #[cfg(test)]
 pub(crate) use loader::{load_config_from_path, load_config_from_path_with_paths};
 pub use persona::Persona;
