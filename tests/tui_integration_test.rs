@@ -122,6 +122,16 @@ fn supervised_pty_authority_or_skip() -> bool {
     }
 }
 
+#[cfg(unix)]
+fn write_probe_marker(marker: &[u8]) -> Result<(), &'static str> {
+    std::io::stdout()
+        .write_all(marker)
+        .map_err(|_| "failed to write PTY probe marker")?;
+    std::io::stdout()
+        .flush()
+        .map_err(|_| "failed to flush PTY probe marker")
+}
+
 /// Production-boundary regression for Finch's real terminal lifecycle.
 ///
 /// The child inherits the repository test supervisor's isolated process group
@@ -218,13 +228,31 @@ fn tui_renderer_terminal_lifecycle_child() -> Result<(), &'static str> {
         }
         "error" => Err("intentional post-activation error"),
         "panic" => panic!("intentional post-activation panic"),
+        "cleanup-end-error" => {
+            std::env::set_var("FINCH_TEST_TUI_CLEANUP_FAIL_ONCE", "end_sync");
+            write_probe_marker(b"FINCH_CLEANUP_FAILURE_BEGIN")?;
+            let result = renderer.shutdown().map_err(|_| "renderer shutdown failed");
+            std::env::remove_var("FINCH_TEST_TUI_CLEANUP_FAIL_ONCE");
+            result
+        }
+        "suspend-resume" => {
+            write_probe_marker(b"FINCH_SUSPEND_BEGIN")?;
+            renderer.suspend().map_err(|_| "renderer suspend failed")?;
+            if crossterm::terminal::is_raw_mode_enabled().unwrap_or(true) {
+                return Err("raw mode remained enabled after suspend");
+            }
+            write_probe_marker(b"FINCH_SUSPENDED_RAW_OFF")?;
+            write_probe_marker(b"FINCH_RESUME_BEGIN")?;
+            renderer.resume().map_err(|_| "renderer resume failed")?;
+            if !crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+                return Err("raw mode remained disabled after resume");
+            }
+            write_probe_marker(b"FINCH_RESUMED_RAW_ON")?;
+            write_probe_marker(b"FINCH_SHUTDOWN_BEGIN")?;
+            renderer.shutdown().map_err(|_| "renderer shutdown failed")
+        }
         "render-resize" => {
-            std::io::stdout()
-                .write_all(b"FINCH_LIVE_HISTORY_PROBE_BEGIN")
-                .map_err(|_| "failed to write live-history marker")?;
-            std::io::stdout()
-                .flush()
-                .map_err(|_| "failed to flush live-history marker")?;
+            write_probe_marker(b"FINCH_LIVE_HISTORY_PROBE_BEGIN")?;
             renderer.set_operation_status("TRANSIENT\x1b[31mRED\nSECOND\x07ROW");
             renderer.set_session_label("SESSION\nINJECT\x1b]0;owned\x07");
             for (width, height) in [(120, 24), (63, 11), (100, 20), (41, 9)] {
@@ -238,6 +266,21 @@ fn tui_renderer_terminal_lifecycle_child() -> Result<(), &'static str> {
         }
         other => panic!("unknown terminal lifecycle probe: {other}"),
     }
+}
+
+#[cfg(unix)]
+fn slice_between_markers<'a>(transcript: &'a [u8], start: &[u8], end: &[u8]) -> &'a [u8] {
+    let start = transcript
+        .windows(start.len())
+        .position(|window| window == start)
+        .expect("start marker missing")
+        + start.len();
+    let end = transcript[start..]
+        .windows(end.len())
+        .position(|window| window == end)
+        .map(|offset| start + offset)
+        .expect("end marker missing");
+    &transcript[start..end]
 }
 
 /// The real renderer must restore every terminal mode it owns on startup
@@ -315,6 +358,207 @@ fn test_tui_renderer_restores_all_terminal_modes_on_all_terminations() {
                 "{termination} probe unexpectedly succeeded"
             );
         }
+    }
+}
+
+/// A cleanup write failure at synchronized-update finalization must not skip
+/// later keyboard/paste/mouse/cursor resets, and its retry must close exactly
+/// the one cleanup interval that was opened.
+#[cfg(unix)]
+#[test]
+fn test_tui_cleanup_continues_after_injected_end_sync_failure() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tui_renderer_terminal_lifecycle_child",
+            "--nocapture",
+        ])
+        .env("FINCH_TEST_TUI_TERMINATION", "cleanup-end-error")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("failed to spawn cleanup-failure probe in owned PTY");
+    drop(slave);
+
+    let mut transcript = Vec::new();
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(10),
+            |bytes| count_bytes(bytes, b"\x1b[?2004l") > 0,
+        ),
+        "cleanup-failure probe omitted paste reset: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+    let _ = read_pty_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(1),
+        |_| false,
+    );
+    assert!(status.success(), "cleanup-failure probe failed: {status}");
+
+    let marker = b"FINCH_CLEANUP_FAILURE_BEGIN";
+    let start = transcript
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("cleanup-failure marker missing")
+        + marker.len();
+    let cleanup = &transcript[start..];
+    assert_eq!(count_bytes(cleanup, b"\x1b[?1000h"), 0);
+    assert!(count_bytes(cleanup, b"\x1b[?1000l") > 0);
+    assert!(count_bytes(cleanup, b"\x1b[?2004l") > 0);
+    assert!(count_bytes(cleanup, b"\x1b[<1u") > 0);
+    assert!(count_bytes(cleanup, b"\x1b[?25h") > 0);
+    assert_eq!(
+        count_bytes(cleanup, b"\x1b[?2026h"),
+        count_bytes(cleanup, b"\x1b[?2026l")
+    );
+    assert_eq!(count_bytes(cleanup, b"\x1b[?2026h"), 2);
+}
+
+/// Suspend and resume must symmetrically hand off raw mode, bracketed paste,
+/// and kitty keyboard enhancement state without ever enabling mouse capture.
+#[cfg(unix)]
+#[test]
+fn test_tui_suspend_resume_releases_and_reacquires_owned_terminal_modes() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tui_renderer_terminal_lifecycle_child",
+            "--nocapture",
+        ])
+        .env("FINCH_TEST_TUI_TERMINATION", "suspend-resume")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("failed to spawn suspend/resume probe in owned PTY");
+    drop(slave);
+
+    let mut transcript = Vec::new();
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(10),
+            |bytes| count_bytes(bytes, b"FINCH_SHUTDOWN_BEGIN") > 0,
+        ),
+        "suspend/resume probe did not complete: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+    let _ = read_pty_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(1),
+        |_| false,
+    );
+    assert!(status.success(), "suspend/resume probe failed: {status}");
+
+    let suspended = slice_between_markers(
+        &transcript,
+        b"FINCH_SUSPEND_BEGIN",
+        b"FINCH_SUSPENDED_RAW_OFF",
+    );
+    assert_eq!(count_bytes(suspended, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(suspended, b"\x1b[<1u"), 1);
+    assert_eq!(count_bytes(suspended, b"\x1b[?2026h"), 1);
+    assert_eq!(count_bytes(suspended, b"\x1b[?2026l"), 1);
+
+    let resumed =
+        slice_between_markers(&transcript, b"FINCH_RESUME_BEGIN", b"FINCH_RESUMED_RAW_ON");
+    assert_eq!(count_bytes(resumed, b"\x1b[?2004h"), 1);
+    assert_eq!(count_bytes(resumed, b"\x1b[>1u"), 1);
+    assert_eq!(count_bytes(resumed, b"\x1b[<1u"), 0);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000h"), 0);
+}
+
+/// SIGTERM and SIGHUP received by the real Finch event loop must take the
+/// ordinary shutdown path. The test signals only the exact child it spawned;
+/// the repository supervisor retains ownership of the enclosing process group.
+#[cfg(unix)]
+#[test]
+fn test_tui_binary_restores_terminal_modes_on_sigterm_and_sighup() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    for signal in [
+        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGHUP,
+    ] {
+        let (mut master, slave) = open_owned_pty();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+            .arg("--cloud-only")
+            .env(
+                "ANTHROPIC_API_KEY",
+                "sk-ant-finch-pty-regression-placeholder",
+            )
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()))
+            .spawn()
+            .expect("failed to spawn Finch signal probe in owned PTY");
+        drop(slave);
+
+        let ready = b"accept edits on";
+        let mut transcript = Vec::new();
+        assert!(
+            read_pty_until(
+                &mut master,
+                &mut transcript,
+                Instant::now() + Duration::from_secs(20),
+                |bytes| bytes.windows(ready.len()).any(|window| window == ready),
+            ),
+            "Finch signal probe did not reach input: {}",
+            String::from_utf8_lossy(&transcript)
+        );
+
+        let owned_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        nix::sys::signal::kill(owned_pid, signal).expect("failed to signal owned Finch child");
+        assert!(
+            read_pty_until(
+                &mut master,
+                &mut transcript,
+                Instant::now() + Duration::from_secs(10),
+                |bytes| {
+                    count_bytes(bytes, b"\x1b[?2004l") > 0 && count_bytes(bytes, b"\x1b[<1u") > 0
+                },
+            ),
+            "signal {signal:?} omitted terminal cleanup: {}",
+            String::from_utf8_lossy(&transcript)
+        );
+        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+        let _ = read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(1),
+            |_| false,
+        );
+        assert!(
+            status.success(),
+            "signal {signal:?} Finch exit failed: {status}"
+        );
+        assert_eq!(count_bytes(&transcript, b"\x1b[?1000h"), 0);
+        assert!(count_bytes(&transcript, b"\x1b[?1000l") > 0);
+        assert!(count_bytes(&transcript, b"\x1b[?2004l") > 0);
+        assert!(count_bytes(&transcript, b"\x1b[<1u") > 0);
+        assert_eq!(
+            count_bytes(&transcript, b"\x1b[?2026h"),
+            count_bytes(&transcript, b"\x1b[?2026l"),
+            "signal {signal:?} left synchronized output open"
+        );
     }
 }
 
