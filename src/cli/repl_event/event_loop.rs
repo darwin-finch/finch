@@ -948,16 +948,23 @@ struct PendingVmApproval {
 }
 
 struct RemoteBrainRunProjection {
-    unit: Arc<crate::cli::messages::WorkUnit>,
+    activity: Arc<crate::cli::messages::ActivityMessage>,
+    program: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
+    output: Option<Arc<crate::cli::messages::ProgramOutputMessage>>,
     status_row: usize,
     prompt_row: Option<usize>,
-    program_row: Option<usize>,
     result_row: Option<usize>,
     tool_rows: std::collections::HashMap<String, usize>,
     approval_rows: std::collections::HashMap<String, usize>,
     locally_rendered_tool_ids: std::collections::HashSet<String>,
     locally_rendered_approval_ids: std::collections::HashSet<String>,
-    locally_rendered_program: bool,
+}
+
+fn brain_run_message_id(
+    run_id: crate::brain::store::RunId,
+    artifact: &str,
+) -> crate::cli::messages::MessageId {
+    crate::cli::messages::MessageId::from_namespace(run_id.0, artifact)
 }
 
 fn brain_run_group_label(
@@ -980,24 +987,21 @@ fn ensure_remote_brain_run_projection<'a>(
 ) -> &'a mut RemoteBrainRunProjection {
     projections.entry(run_id).or_insert_with(|| {
         let label = brain_run_group_label(run_id, kind);
-        let unit = output_manager.start_work_unit(&label);
-        // WorkUnit's completed row presentation otherwise uses the generic
-        // "Tools" title. Keep the canonical kind/id visible without
-        // misclassifying lifecycle rows as model tool calls.
-        unit.set_activity_presentation(&label);
-        let status_row = unit.add_activity_row(format!("{label} · status"));
-        unit.complete_row(status_row, format!("{status:?}").to_lowercase());
+        let activity =
+            output_manager.start_activity_with_id(brain_run_message_id(run_id, "activity"), &label);
+        let status_row = activity.add_activity(format!("{label} · status"));
+        activity.complete_row(status_row, format!("{status:?}").to_lowercase());
         RemoteBrainRunProjection {
-            unit,
+            activity,
+            program: None,
+            output: None,
             status_row,
             prompt_row: None,
-            program_row: None,
             result_row: None,
             tool_rows: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
             locally_rendered_tool_ids: std::collections::HashSet::new(),
             locally_rendered_approval_ids: std::collections::HashSet::new(),
-            locally_rendered_program: false,
         }
     })
 }
@@ -1044,19 +1048,21 @@ fn project_remote_brain_run_event(
                 .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
                 .unwrap_or_else(|| format!("{status:?}").to_lowercase());
             if *status == BrainRunStatus::Failed {
-                projection.unit.fail_row(projection.status_row, summary);
+                projection.activity.fail_row(projection.status_row, summary);
             } else {
-                projection.unit.complete_row(projection.status_row, summary);
+                projection
+                    .activity
+                    .complete_row(projection.status_row, summary);
             }
             if status.is_terminal() {
-                projection.unit.set_complete();
+                projection.activity.set_complete();
             }
         }
         BrainEventKind::SpeculativePrompt { text } => {
             let row = *projection
                 .prompt_row
-                .get_or_insert_with(|| projection.unit.add_activity_row("prompt"));
-            projection.unit.complete_row_with_body(
+                .get_or_insert_with(|| projection.activity.add_activity("prompt"));
+            projection.activity.complete_row_with_body(
                 row,
                 "accepted",
                 text.lines().map(str::to_owned).collect(),
@@ -1081,7 +1087,7 @@ fn project_remote_brain_run_event(
                     } else {
                         input
                     };
-                    projection.unit.add_row(format!("{name} {input}"))
+                    projection.activity.add_tool(format!("{name} {input}"))
                 });
         }
         BrainEventKind::ToolResult {
@@ -1096,9 +1102,9 @@ fn project_remote_brain_run_event(
             let row = *projection
                 .tool_rows
                 .entry(tool_id.clone())
-                .or_insert_with(|| projection.unit.add_row(tool_id));
+                .or_insert_with(|| projection.activity.add_tool(tool_id));
             if *is_error {
-                projection.unit.fail_row(row, output);
+                projection.activity.fail_row(row, output);
             } else {
                 let first = output.lines().next().unwrap_or_default();
                 let summary = if first.chars().count() > 80 {
@@ -1106,7 +1112,7 @@ fn project_remote_brain_run_event(
                 } else {
                     first.to_string()
                 };
-                projection.unit.complete_row_with_body(
+                projection.activity.complete_row_with_body(
                     row,
                     summary,
                     output.lines().skip(1).map(str::to_owned).collect(),
@@ -1137,14 +1143,16 @@ fn project_remote_brain_run_event(
                         )
                     })
                     .unwrap_or_else(|| "legacy audience unspecified".to_string());
-                let row = projection.unit.add_activity_row(format!(
+                let row = projection.activity.add_activity(format!(
                     "approval ({approval_kind}) for {audience_summary}: {subject}"
                 ));
                 for line in serde_json::to_string_pretty(detail)
                     .unwrap_or_else(|_| detail.to_string())
                     .lines()
                 {
-                    projection.unit.append_row_body_line(row, line.to_owned());
+                    projection
+                        .activity
+                        .append_row_body_line(row, line.to_owned());
                 }
                 projection.approval_rows.insert(approval_id.clone(), row);
             }
@@ -1165,8 +1173,8 @@ fn project_remote_brain_run_event(
                 .entry(approval_id.clone())
                 .or_insert_with(|| {
                     projection
-                        .unit
-                        .add_activity_row(format!("approval {approval_id}"))
+                        .activity
+                        .add_activity(format!("approval {approval_id}"))
                 });
             let choice = decision
                 .get("choice")
@@ -1174,42 +1182,47 @@ fn project_remote_brain_run_event(
                 .unwrap_or("decided");
             let summary = format!("{choice} by {}", event.sender);
             if choice == "deny" {
-                projection.unit.fail_row(row, summary);
+                projection.activity.fail_row(row, summary);
             } else {
-                projection.unit.complete_row(row, summary);
+                projection.activity.complete_row(row, summary);
             }
         }
         BrainEventKind::Program { language, source } => {
-            if projection.locally_rendered_program {
-                return true;
-            }
             let language = match language {
-                ProgramLanguage::Forth => "Co-Forth",
-                ProgramLanguage::Lisp => "Lisp",
+                ProgramLanguage::Forth => "forth",
+                ProgramLanguage::Lisp => "lisp",
             };
-            let row = *projection.program_row.get_or_insert_with(|| {
-                projection
-                    .unit
-                    .add_activity_row(format!("{language} program"))
+            let program = projection.program.get_or_insert_with(|| {
+                output_manager.start_program_source_with_id(
+                    brain_run_message_id(run_id, "program-source"),
+                    language,
+                )
             });
-            projection.unit.complete_row_with_body(
-                row,
-                format!("event #{}", event.seq),
-                source.lines().map(str::to_owned).collect(),
-            );
+            if program.adopt_canonical_source(source)
+                == crate::cli::messages::CanonicalAdoption::Conflict
+            {
+                tracing::warn!(run_id = %run_id.0, event_seq = event.seq, "late canonical Program conflicts with committed source projection");
+            }
         }
         BrainEventKind::Result { output, error, .. } => {
             let row = *projection
                 .result_row
-                .get_or_insert_with(|| projection.unit.add_activity_row("result"));
+                .get_or_insert_with(|| projection.activity.add_activity("result"));
             if let Some(error) = error {
-                projection.unit.fail_row(row, error);
+                projection.activity.fail_row(row, error);
             } else {
-                projection.unit.complete_row_with_body(
-                    row,
-                    "completed",
-                    output.lines().map(str::to_owned).collect(),
-                );
+                projection.activity.complete_row(row, "completed");
+                let output_message = projection.output.get_or_insert_with(|| {
+                    output_manager.start_program_output_with_id(brain_run_message_id(
+                        run_id,
+                        "program-output",
+                    ))
+                });
+                if output_message.adopt_canonical_output(output)
+                    == crate::cli::messages::CanonicalAdoption::Conflict
+                {
+                    tracing::warn!(run_id = %run_id.0, event_seq = event.seq, "late canonical Result conflicts with committed output projection");
+                }
             }
         }
         _ => unreachable!("correlated run event was filtered above"),
@@ -1224,14 +1237,15 @@ struct LocalBrainProjection {
     tool_ids: std::collections::HashSet<String>,
     approval_ids: std::collections::HashSet<String>,
     program_seq: Option<u64>,
-    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    source_message: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
+    transient_output_unit: Option<Arc<crate::cli::messages::ProgramOutputMessage>>,
     failed: bool,
 }
 
 fn failed_local_brain_projection(
     run_id: crate::brain::store::RunId,
     turn_events: &[crate::server::RunnerTurnEvent],
-    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    transient_output_unit: Option<Arc<crate::cli::messages::ProgramOutputMessage>>,
 ) -> LocalBrainProjection {
     let tool_ids = turn_events
         .iter()
@@ -1258,6 +1272,7 @@ fn failed_local_brain_projection(
         tool_ids,
         approval_ids,
         program_seq: None,
+        source_message: None,
         transient_output_unit,
         failed: true,
     }
@@ -1267,7 +1282,8 @@ fn register_named_brain_turn_projection(
     projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     run_id: crate::brain::store::RunId,
     result: &std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
-    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    source_message: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
+    transient_output_unit: Option<Arc<crate::cli::messages::ProgramOutputMessage>>,
 ) {
     match result {
         Ok(result) => {
@@ -1300,6 +1316,7 @@ fn register_named_brain_turn_projection(
                 tool_ids,
                 approval_ids,
                 program_seq: None,
+                source_message,
                 transient_output_unit,
                 failed: false,
             });
@@ -1362,7 +1379,8 @@ fn assemble_named_brain_turn(
     turn_events: Vec<crate::server::RunnerTurnEvent>,
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
     commit_ack: Option<crate::server::RunnerTurnCommitAck>,
-    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    source_message: Option<Arc<crate::cli::messages::ProgramSourceMessage>>,
+    transient_output_unit: Option<Arc<crate::cli::messages::ProgramOutputMessage>>,
     invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
     initial_message_count: usize,
 ) -> std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
@@ -1396,7 +1414,13 @@ fn assemble_named_brain_turn(
         turn_events,
         effect_journal,
     });
-    register_named_brain_turn_projection(projections, run_id, &result, transient_output_unit);
+    register_named_brain_turn_projection(
+        projections,
+        run_id,
+        &result,
+        source_message,
+        transient_output_unit,
+    );
     result
 }
 
@@ -1465,11 +1489,20 @@ fn project_remote_brain_live_run_event(
     if event.run_id.is_none() {
         return false;
     }
-    let projection_match = selected_brain_is_home
-        .then(|| local_projections.front_mut())
-        .flatten()
-        .map(|projection| projection.observe(event))
-        .unwrap_or(LocalProjectionMatch::None);
+    let (projection_match, local_source, local_output) = if selected_brain_is_home {
+        local_projections.front_mut().map_or(
+            (LocalProjectionMatch::None, None, None),
+            |projection| {
+                (
+                    projection.observe(event),
+                    projection.source_message.clone(),
+                    projection.transient_output_unit.clone(),
+                )
+            },
+        )
+    } else {
+        (LocalProjectionMatch::None, None, None)
+    };
     if projection_match != LocalProjectionMatch::None {
         if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
             match &event.kind {
@@ -1484,7 +1517,16 @@ fn project_remote_brain_live_run_event(
                         .insert(approval_id.clone());
                 }
                 crate::brain::store::BrainEventKind::Program { .. } => {
-                    projection.locally_rendered_program = true;
+                    if let Some(source) = local_source {
+                        projection.program = Some(source);
+                    }
+                }
+                crate::brain::store::BrainEventKind::Result { error: None, .. }
+                    if projection_match == LocalProjectionMatch::SuppressAndComplete =>
+                {
+                    if let Some(output) = local_output {
+                        projection.output = Some(output);
+                    }
                 }
                 _ => {}
             }
@@ -1493,9 +1535,14 @@ fn project_remote_brain_live_run_event(
     let projected = project_remote_brain_run_event(output_manager, projections, event);
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
         if let Some(local) = local_projections.pop_front() {
-            if let Some(output_unit) = local.transient_output_unit {
-                output_manager
-                    .remove_message(crate::cli::messages::Message::id(output_unit.as_ref()));
+            if matches!(
+                &event.kind,
+                crate::brain::store::BrainEventKind::Result { error: Some(_), .. }
+            ) {
+                if let Some(output) = local.transient_output_unit {
+                    output_manager
+                        .remove_message(crate::cli::messages::Message::id(output.as_ref()));
+                }
             }
         }
     }
@@ -3549,12 +3596,10 @@ Rules:\n\
         language: crate::programs::ProgramLanguage,
         source: String,
     ) -> Result<()> {
-        let source_unit = self.output_manager.start_work_unit("typed program");
-        source_unit.set_program_source(language.as_str());
-        source_unit.set_response(source.clone());
+        let source_unit = self.output_manager.start_program_source(language.as_str());
+        source_unit.replace_source(source.clone());
         source_unit.set_complete();
-        let output_unit = self.output_manager.start_work_unit("VM program output");
-        output_unit.set_program_output();
+        let output_unit = self.output_manager.start_program_output();
         let projection =
             VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
         let event_tx = self.event_tx.clone();
@@ -4199,11 +4244,19 @@ Rules:\n\
                     )
                     .await;
 
-                let transient_output_unit =
-                    self.query_states.brain_output_work_unit(query_id).await;
+                let transient_output_unit = self.query_states.brain_output_message(query_id).await;
+                let transient_source_message =
+                    self.query_states.brain_source_message(query_id).await;
                 self.query_states
-                    .set_brain_output_work_unit(query_id, None)
+                    .set_brain_output_message(query_id, None)
                     .await;
+                self.query_states
+                    .set_brain_source_message(query_id, None)
+                    .await;
+                if let Some(source) = transient_source_message {
+                    self.output_manager
+                        .remove_message(crate::cli::messages::Message::id(source.as_ref()));
+                }
                 if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
                     unit.set_failed();
                     self.query_states.set_tool_work_unit(query_id, None).await;
@@ -4413,9 +4466,11 @@ Rules:\n\
                             outcome.diagnostics.first().cloned().unwrap_or_else(|| {
                                 format!("VM program ended as {:?}", outcome.status)
                             });
-                        output_unit.append_response(&format!("VM error: {detail}"));
+                        output_unit.append_output(&format!("VM error: {detail}"));
                     }
-                    Err(error) => output_unit.append_response(&format!("VM error: {error}")),
+                    Err(error) => {
+                        output_unit.append_output(&format!("VM error: {error}"));
+                    }
                 }
                 output_unit.set_complete();
                 self.render_tui().await?;
@@ -5208,8 +5263,8 @@ Rules:\n\
                 None,
                 crate::brain::store::BrainRunStatus::Running,
             )
-            .unit
-            .clone();
+            .activity
+            .work_unit();
         self.query_states
             .set_tool_work_unit(query_id, Some(run_unit))
             .await;
@@ -5357,10 +5412,14 @@ Rules:\n\
         let initial_message_count = query_metadata
             .as_ref()
             .map_or(0, |metadata| metadata.conversation_snapshot.len());
-        let transient_output_unit = self.query_states.brain_output_work_unit(query_id).await;
+        let transient_output_unit = self.query_states.brain_output_message(query_id).await;
+        let source_message = self.query_states.brain_source_message(query_id).await;
         self.query_states.set_tool_work_unit(query_id, None).await;
         self.query_states
-            .set_brain_output_work_unit(query_id, None)
+            .set_brain_output_message(query_id, None)
+            .await;
+        self.query_states
+            .set_brain_source_message(query_id, None)
             .await;
         let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
             return;
@@ -5429,6 +5488,7 @@ Rules:\n\
             turn_events,
             effect_journal,
             commit_ack,
+            source_message,
             transient_output_unit,
             invocation_metadata,
             initial_message_count,
@@ -6507,12 +6567,14 @@ Rules:\n\
                     .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
                     .unwrap_or_else(|| format!("{status:?}").to_lowercase());
                 if *status == crate::brain::store::BrainRunStatus::Failed {
-                    projection.unit.fail_row(projection.status_row, summary);
+                    projection.activity.fail_row(projection.status_row, summary);
                 } else {
-                    projection.unit.complete_row(projection.status_row, summary);
+                    projection
+                        .activity
+                        .complete_row(projection.status_row, summary);
                 }
                 if status.is_terminal() {
-                    projection.unit.set_complete();
+                    projection.activity.set_complete();
                 }
             }
             BrainEventKind::Prompt { text } => {
@@ -6526,8 +6588,8 @@ Rules:\n\
                         Some(crate::brain::store::BrainRunKind::Speculative),
                         crate::brain::store::BrainRunStatus::QueuedForEnvironment,
                     );
-                    let row = projection.unit.add_activity_row("prompt");
-                    projection.unit.complete_row_with_body(
+                    let row = projection.activity.add_activity("prompt");
+                    projection.activity.complete_row_with_body(
                         row,
                         "accepted",
                         text.lines().map(str::to_owned).collect(),
@@ -6701,26 +6763,23 @@ Rules:\n\
                             projection.observe(event) == LocalProjectionMatch::Suppress
                         });
                 if let Some(run_id) = event.run_id {
+                    let output_manager = Arc::clone(&self.output_manager);
                     let projection = self.ensure_remote_brain_run_projection(
                         run_id,
                         None,
                         crate::brain::store::BrainRunStatus::Running,
                     );
                     let language = match language {
-                        crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
-                        crate::brain::store::ProgramLanguage::Lisp => "Lisp",
+                        crate::brain::store::ProgramLanguage::Forth => "forth",
+                        crate::brain::store::ProgramLanguage::Lisp => "lisp",
                     };
-                    let row = projection.program_row.unwrap_or_else(|| {
-                        projection
-                            .unit
-                            .add_activity_row(format!("{language} program"))
+                    let program = projection.program.get_or_insert_with(|| {
+                        output_manager.start_program_source_with_id(
+                            brain_run_message_id(run_id, "program-source"),
+                            language,
+                        )
                     });
-                    projection.program_row = Some(row);
-                    projection.unit.complete_row_with_body(
-                        row,
-                        format!("event #{}", event.seq),
-                        source.lines().map(str::to_owned).collect(),
-                    );
+                    program.adopt_canonical_source(source);
                     return;
                 }
                 if locally_projected {
@@ -6730,12 +6789,9 @@ Rules:\n\
                     crate::brain::store::ProgramLanguage::Forth => "forth",
                     crate::brain::store::ProgramLanguage::Lisp => "lisp",
                 };
-                let unit = self
-                    .output_manager
-                    .start_work_unit(format!("{} program", event.sender));
-                unit.set_program_source(language);
-                unit.set_response(source);
-                unit.set_complete();
+                let message = self.output_manager.start_program_source(language);
+                message.replace_source(source);
+                message.set_complete();
             }
             BrainEventKind::ProgramPopped { program_seq } => self
                 .output_manager
@@ -6753,20 +6809,26 @@ Rules:\n\
                     .map(|projection| projection.observe(event))
                     .unwrap_or(LocalProjectionMatch::None);
                 if let Some(run_id) = event.run_id {
+                    let output_manager = Arc::clone(&self.output_manager);
                     let projection = self.ensure_remote_brain_run_projection(
                         run_id,
                         None,
                         crate::brain::store::BrainRunStatus::Running,
                     );
-                    let row = projection.unit.add_activity_row("result");
+                    let row = projection.activity.add_activity("result");
                     if let Some(error) = error {
-                        projection.unit.fail_row(row, error);
+                        projection.activity.fail_row(row, error);
                     } else {
-                        projection.unit.complete_row_with_body(
-                            row,
-                            "completed",
-                            output.lines().map(str::to_owned).collect(),
-                        );
+                        projection.activity.complete_row(row, "completed");
+                        if !output.is_empty() {
+                            let output_message = projection.output.get_or_insert_with(|| {
+                                output_manager.start_program_output_with_id(brain_run_message_id(
+                                    run_id,
+                                    "program-output",
+                                ))
+                            });
+                            output_message.adopt_canonical_output(output);
+                        }
                     }
                     if projection_match == LocalProjectionMatch::SuppressAndComplete {
                         self.local_brain_projections.pop_front();
@@ -6780,14 +6842,9 @@ Rules:\n\
                 if let Some(error) = error {
                     self.output_manager.write_info(format!("error: {error}"));
                 } else if !output.is_empty() {
-                    let label = event
-                        .run_id
-                        .map(|run_id| format!("Brain run {} output", &run_id.0.to_string()[..8]))
-                        .unwrap_or_else(|| "Brain program output".to_string());
-                    let unit = self.output_manager.start_work_unit(label);
-                    unit.set_program_output();
-                    unit.set_response(output);
-                    unit.set_complete();
+                    let message = self.output_manager.start_program_output();
+                    message.replace_output(output);
+                    message.set_complete();
                 }
             }
             // Internal durable VM state is intentionally not rendered as a
@@ -9572,7 +9629,7 @@ mod tests {
             &terminal,
         ));
 
-        let unit = projections.get(&run_id).unwrap().unit.clone();
+        let unit = projections.get(&run_id).unwrap().activity.clone();
         let projected = unit
             .transcript_row(&crate::config::ColorScheme::default())
             .unwrap();
@@ -9595,6 +9652,79 @@ mod tests {
         assert!(canonical.contains("Speculative run"));
         assert!(canonical.contains("result"));
         assert!(canonical.contains("catalog unavailable"));
+    }
+
+    #[test]
+    fn named_brain_success_with_empty_result_still_has_one_output_identity() {
+        use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        let mut projections = std::collections::HashMap::new();
+        super::ensure_remote_brain_run_projection(
+            &output,
+            &mut projections,
+            run_id,
+            Some(BrainRunKind::Speculative),
+            BrainRunStatus::Running,
+        );
+        let mut program = brain_event(
+            1,
+            "provider",
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(begin)".into(),
+            },
+        );
+        program.run_id = Some(run_id);
+        let mut result = brain_event(
+            2,
+            "daemon",
+            BrainEventKind::Result {
+                request_seq: 1,
+                output: String::new(),
+                error: None,
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        );
+        result.run_id = Some(run_id);
+
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &program,
+        ));
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &result,
+        ));
+
+        let messages = output.get_messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .transcript_row(&crate::config::ColorScheme::default())
+                        .is_some_and(|row| row.kind == TranscriptRowKind::Output)
+                })
+                .count(),
+            1
+        );
+        let projected = projections.get(&run_id).unwrap();
+        let output_message = projected.output.as_ref().unwrap();
+        assert_eq!(
+            output_message.id(),
+            super::brain_run_message_id(run_id, "program-output")
+        );
+        assert!(output_message.content().is_empty());
+        assert!(output_message.canonical_adopted());
     }
 
     #[test]
@@ -9651,7 +9781,7 @@ mod tests {
             ));
         }
 
-        let unit = projections.get(&run_id).unwrap().unit.clone();
+        let unit = projections.get(&run_id).unwrap().activity.clone();
         let projected = unit
             .transcript_row(&crate::config::ColorScheme::default())
             .unwrap();
@@ -9683,11 +9813,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
+    fn named_brain_success_separates_activity_program_and_output_exactly_once() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
             RunId,
         };
+        use crate::cli::messages::{Message, TranscriptRowKind};
 
         let output =
             crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
@@ -9767,28 +9898,55 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut projections = std::collections::HashMap::new();
-        let local_unit = super::ensure_remote_brain_run_projection(
+        let activity = super::ensure_remote_brain_run_projection(
             &output,
             &mut projections,
             run_id,
             Some(BrainRunKind::Speculative),
             BrainRunStatus::Running,
         )
-        .unit
+        .activity
         .clone();
-        let tool_row = local_unit.add_row("read_cache {\"key\":\"alpha\"}");
-        local_unit.complete_row_with_body(tool_row, "cache hit", vec!["value=7".to_string()]);
+        let tool_row = activity.add_tool("read_cache {\"key\":\"alpha\"}");
+        activity.complete_row_with_body(tool_row, "cache hit", vec!["value=7".to_string()]);
         let approval_row =
-            local_unit.add_row("approval (tool) for legacy audience unspecified: write_cache");
-        local_unit.complete_row(approval_row, "approve_once by daemon");
-        local_unit.set_program_source("lisp");
-        local_unit.set_response("(say \"cache checked\")");
-        local_unit.set_complete();
-        let transient_output_unit = output.start_work_unit("VM program output");
-        transient_output_unit.set_program_output();
-        transient_output_unit.set_response("cache checked");
+            activity.add_activity("approval (tool) for legacy audience unspecified: write_cache");
+        activity.complete_row(approval_row, "approve_once by daemon");
+        let source_message = output.start_program_source_with_id(
+            super::brain_run_message_id(run_id, "program-source"),
+            "lisp",
+        );
+        source_message.replace_source("(say \"cache checked\")");
+        source_message.set_complete();
+        let transient_output_unit = output
+            .start_program_output_with_id(super::brain_run_message_id(run_id, "program-output"));
+        transient_output_unit.replace_output("cache checked");
         transient_output_unit.set_complete();
-        assert_eq!(output.get_messages().len(), 2);
+        let before_canonical = output
+            .get_messages()
+            .iter()
+            .map(|message| {
+                message
+                    .transcript_row(&crate::config::ColorScheme::default())
+                    .unwrap()
+                    .kind
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before_canonical,
+            vec![
+                TranscriptRowKind::Activity,
+                TranscriptRowKind::Program,
+                TranscriptRowKind::Output,
+            ]
+        );
+        assert_eq!(
+            before_canonical
+                .iter()
+                .filter(|kind| **kind == TranscriptRowKind::Output)
+                .count(),
+            1
+        );
         let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
             run_id,
             source: "(say \"cache checked\")".into(),
@@ -9796,13 +9954,14 @@ mod tests {
             tool_ids: std::collections::HashSet::from(["tool-1".into()]),
             approval_ids: std::collections::HashSet::from(["approval-1".into()]),
             program_seq: None,
+            source_message: Some(Arc::clone(&source_message)),
             transient_output_unit: Some(transient_output_unit),
             failed: false,
         }]);
 
         // No live canonical events arrive. A replacement snapshot containing
-        // the acknowledged history must reconcile the local rows, adopt the
-        // durable Result, and retire transient VM output by itself.
+        // the acknowledged history must reconcile by adopting the live source
+        // and output in place, with no zero-output or double-output frame.
         super::project_remote_brain_snapshot_runs(
             &output,
             &mut projections,
@@ -9813,8 +9972,12 @@ mod tests {
         assert!(local_projections.is_empty());
 
         let messages = output.get_messages();
-        assert_eq!(messages.len(), 1);
-        let rendered = messages[0].format(&crate::config::ColorScheme::default());
+        assert_eq!(messages.len(), 3);
+        let rendered = messages
+            .iter()
+            .map(|message| message.format(&crate::config::ColorScheme::default()))
+            .collect::<Vec<_>>()
+            .join("\n");
         for expected in [
             &format!("Speculative run {}", run_id.0),
             "inspect the cache",
@@ -9829,7 +9992,7 @@ mod tests {
         ] {
             assert!(
                 rendered.contains(expected),
-                "missing {expected:?} from projected WorkUnit:\n{rendered}"
+                "missing {expected:?} from projected transcript:\n{rendered}"
             );
         }
         assert_eq!(rendered.matches("inspect the cache").count(), 1);
@@ -9837,6 +10000,153 @@ mod tests {
         assert_eq!(rendered.matches("approval (tool)").count(), 1);
         assert_eq!(rendered.matches("program (lisp)").count(), 1);
         assert_eq!(rendered.matches("result").count(), 1);
+        assert_eq!(rendered.matches("cache checked").count(), 2);
+        assert!(source_message.canonical_adopted());
+        let projection = projections.get(&run_id).unwrap();
+        assert_eq!(projection.activity.id(), messages[0].id());
+        assert_eq!(projection.program.as_ref().unwrap().id(), messages[1].id());
+        assert_eq!(projection.output.as_ref().unwrap().id(), messages[2].id());
+        assert_ne!(messages[0].id(), messages[1].id());
+        assert_ne!(messages[1].id(), messages[2].id());
+        let activity_row = projection
+            .activity
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        let program_row = projection
+            .program
+            .as_ref()
+            .unwrap()
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        let output_row = projection
+            .output
+            .as_ref()
+            .unwrap()
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        assert_eq!(activity_row.kind, TranscriptRowKind::Activity);
+        assert!(activity_row.children.iter().any(|row| {
+            row.kind == TranscriptRowKind::ToolCall && row.label.contains("read_cache")
+        }));
+        assert!(activity_row
+            .children
+            .iter()
+            .all(|row| row.kind != TranscriptRowKind::Program
+                && row.kind != TranscriptRowKind::Output));
+        assert_eq!(program_row.kind, TranscriptRowKind::Program);
+        assert!(program_row.children.is_empty());
+        assert_eq!(output_row.kind, TranscriptRowKind::Output);
+        assert!(output_row.children.is_empty());
+        assert_eq!(output_row.body, vec!["cache checked"]);
+        assert!(projection.output.as_ref().unwrap().canonical_adopted());
+
+        // Duplicate snapshot delivery is idempotent: canonical adoption is
+        // exact-once and never creates a second semantic output.
+        super::project_remote_brain_snapshot_runs(
+            &output,
+            &mut projections,
+            &mut local_projections,
+            true,
+            &events,
+        );
+        let replayed_messages = output.get_messages();
+        assert_eq!(replayed_messages.len(), 3);
+        assert_eq!(
+            replayed_messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .transcript_row(&crate::config::ColorScheme::default())
+                        .is_some_and(|row| row.kind == TranscriptRowKind::Output)
+                })
+                .count(),
+            1
+        );
+
+        let mut late_program = brain_event(
+            100,
+            "provider",
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(say \"late rewrite\")".into(),
+            },
+        );
+        late_program.run_id = Some(run_id);
+        let mut late_result = brain_event(
+            101,
+            "daemon",
+            BrainEventKind::Result {
+                request_seq: 100,
+                output: "late rewrite".into(),
+                error: None,
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        );
+        late_result.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &late_program,
+        ));
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &late_result,
+        ));
+        let projection = projections.get(&run_id).unwrap();
+        assert_eq!(
+            projection.program.as_ref().unwrap().content(),
+            "(say \"cache checked\")"
+        );
+        assert_eq!(
+            projection.output.as_ref().unwrap().content(),
+            "cache checked"
+        );
+        assert_eq!(output.get_messages().len(), 3);
+
+        // A fresh reconnect reconstructs the same semantic identities from
+        // the durable run namespace, independent of frontend construction.
+        let reconnect_output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        reconnect_output.disable_stdout();
+        let mut reconnect_projections = std::collections::HashMap::new();
+        let mut reconnect_locals = std::collections::VecDeque::new();
+        super::project_remote_brain_snapshot_runs(
+            &reconnect_output,
+            &mut reconnect_projections,
+            &mut reconnect_locals,
+            false,
+            &events,
+        );
+        let reconnect_messages = reconnect_output.get_messages();
+        assert_eq!(reconnect_messages.len(), 3);
+        assert_eq!(
+            reconnect_messages
+                .iter()
+                .map(|message| message.id())
+                .collect::<Vec<_>>(),
+            messages
+                .iter()
+                .map(|message| message.id())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reconnect_messages
+                .iter()
+                .map(|message| {
+                    message
+                        .transcript_row(&crate::config::ColorScheme::default())
+                        .unwrap()
+                        .kind
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                TranscriptRowKind::Activity,
+                TranscriptRowKind::Program,
+                TranscriptRowKind::Output,
+            ]
+        );
     }
 
     #[test]
@@ -9883,24 +10193,23 @@ mod tests {
             detail: None,
         };
         let mut projections = std::collections::HashMap::new();
-        let local_unit = super::ensure_remote_brain_run_projection(
+        let activity = super::ensure_remote_brain_run_projection(
             &output,
             &mut projections,
             run_id,
             Some(BrainRunKind::Speculative),
             BrainRunStatus::Running,
         )
-        .unit
+        .activity
         .clone();
         for (tool, summary) in [("tool-one", "first ok"), ("tool-two", "second ok")] {
-            let row = local_unit.add_row(tool);
-            local_unit.complete_row(row, summary);
+            let row = activity.add_tool(tool);
+            activity.complete_row(row, summary);
         }
-        let approval_row = local_unit.add_row("approval (tool) for write_cache");
-        local_unit.complete_row(approval_row, "approve_once by daemon");
-        let transient_output_unit = output.start_work_unit("VM program output");
-        transient_output_unit.set_program_output();
-        transient_output_unit.set_response("named Brain turn produced no wire source");
+        let approval_row = activity.add_activity("approval (tool) for write_cache");
+        activity.complete_row(approval_row, "approve_once by daemon");
+        let transient_output_unit = output.start_program_output();
+        transient_output_unit.replace_output("named Brain turn produced no wire source");
         transient_output_unit.set_failed();
         assert_eq!(output.get_messages().len(), 2);
 
@@ -10001,6 +10310,7 @@ mod tests {
             failed_turn_events,
             Vec::new(),
             None,
+            None,
             Some(transient_output_unit),
             None,
             0,
@@ -10061,6 +10371,7 @@ mod tests {
             tool_ids: std::collections::HashSet::new(),
             approval_ids: std::collections::HashSet::new(),
             program_seq: None,
+            source_message: None,
             transient_output_unit: None,
             failed: false,
         };
@@ -10103,6 +10414,7 @@ mod tests {
             tool_ids: std::collections::HashSet::new(),
             approval_ids: std::collections::HashSet::new(),
             program_seq: Some(12),
+            source_message: None,
             transient_output_unit: None,
             failed: false,
         };

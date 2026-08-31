@@ -13,11 +13,15 @@ use std::fmt;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub mod activity;
 pub mod concrete;
+pub mod program;
 pub mod render;
 pub mod work_unit;
 
+pub use activity::ActivityMessage;
 pub use concrete::*;
+pub use program::{CanonicalAdoption, ProgramOutputMessage, ProgramSourceMessage};
 pub use render::{
     ColorDepth, DisclosureLookup, FrontendKind, RenderAction, RenderCapabilities, RenderContext,
     RenderedLine, RenderedMessage,
