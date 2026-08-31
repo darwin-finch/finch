@@ -1315,7 +1315,7 @@ fn parse_event(
         .context("ChatGPT subscription stream event omitted type")?;
     match kind {
         "response.created" | "response.in_progress" => {
-            exact_keys(object, &["type", "sequence_number", "response", "headers"])?;
+            exact_event_keys(object, &["type", "sequence_number", "response", "headers"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1326,7 +1326,7 @@ fn parse_event(
             Ok(None)
         }
         "response.metadata" | "codex.response.metadata" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1357,7 +1357,7 @@ fn parse_event(
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
-            exact_keys(object, &["type", "sequence_number", "output_index", "item"])?;
+            exact_event_keys(object, &["type", "sequence_number", "output_index", "item"])?;
             required_sequence(object)?;
             let output_index = required_index(object, "output_index")?;
             let item = object
@@ -1375,7 +1375,7 @@ fn parse_event(
             Ok(None)
         }
         "response.content_part.added" | "response.content_part.done" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1425,7 +1425,7 @@ fn parse_event(
             Ok(None)
         }
         "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1447,7 +1447,7 @@ fn parse_event(
             Ok(None)
         }
         "response.completed" => {
-            exact_keys(object, &["type", "sequence_number", "response"])?;
+            exact_event_keys(object, &["type", "sequence_number", "response"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1562,7 +1562,7 @@ fn validate_text_event(
     if has_content_index {
         keys.extend(["content_index", "logprobs"]);
     }
-    exact_keys(object, &keys)?;
+    exact_event_keys(object, &keys)?;
     required_sequence(object)?;
     required_identifier(object, "item_id", 256)?;
     required_index(object, "output_index")?;
@@ -1581,7 +1581,7 @@ fn validate_reasoning_text_event(
     field: &str,
     index_field: &str,
 ) -> Result<()> {
-    exact_keys(
+    exact_event_keys(
         object,
         &[
             "type",
@@ -2204,6 +2204,25 @@ fn model_is_compatible(requested: &str, actual: &str) -> bool {
 }
 
 fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            bail!("ChatGPT subscription response metadata key was invalid");
+        }
+        // Both JSON keys and values are untrusted response-body data. Never
+        // reflect either one into diagnostics: an adversarial key can contain
+        // credentials, private reasoning, or tool arguments just as easily as
+        // a value can.
+        bail!("ChatGPT subscription response contained an unknown field");
+    }
+    Ok(())
+}
+
+/// Validate the outer envelope of one audited SSE event.
+///
+/// OpenAI may add bounded `obfuscation` padding to event envelopes even when
+/// the request disables it. That compatibility exception must not leak into
+/// nested response or output-item objects, where every field is semantic.
+fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
     if let Some(obfuscation) = object.get("obfuscation") {
         let obfuscation = obfuscation
             .as_str()
@@ -2214,19 +2233,10 @@ fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
             "response obfuscation padding",
         )?;
     }
-    if let Some(key) = object
-        .keys()
-        .find(|key| key.as_str() != "obfuscation" && !allowed.contains(&key.as_str()))
-    {
-        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
-            bail!("ChatGPT subscription response metadata key was invalid");
-        }
-        // Both JSON keys and values are untrusted response-body data. Never
-        // reflect either one into diagnostics: an adversarial key can contain
-        // credentials, private reasoning, or tool arguments just as easily as
-        // a value can.
-        bail!("ChatGPT subscription response contained an unknown field");
-    }
+    let mut event_fields = Vec::with_capacity(allowed.len() + 1);
+    event_fields.extend_from_slice(allowed);
+    event_fields.push("obfuscation");
+    exact_keys(object, &event_fields)?;
     Ok(())
 }
 
@@ -3024,7 +3034,7 @@ mod tests {
         let conflicting = json!({
             "id":"resp-conflict",
             "status":"completed",
-            "model":"attacker-payload-model",
+            "model":MODEL_ALIAS,
             "output":[]
         });
         let mut accumulator = StreamAccumulator::default();
@@ -3038,7 +3048,7 @@ mod tests {
         .err()
         .expect("conflicting payload and header provenance must fail")
         .to_string();
-        assert!(error.contains("incompatible actual model"));
+        assert!(error.contains("actual model changed"));
 
         let missing = json!({"id":"resp-missing","status":"completed","output":[]});
         let error = parse_completed(
@@ -3940,7 +3950,7 @@ mod tests {
     #[test]
     fn response_obfuscation_must_be_a_bounded_string() {
         let invalid = json!({"known":true,"obfuscation":{"secret":"not padding"}});
-        let error = exact_keys(invalid.as_object().unwrap(), &["known"])
+        let error = exact_event_keys(invalid.as_object().unwrap(), &["known"])
             .expect_err("structured obfuscation must not bypass response validation");
         assert!(error.to_string().contains("padding was invalid"));
 
@@ -3948,9 +3958,27 @@ mod tests {
             "known":true,
             "obfuscation":"x".repeat(MAX_SSE_LINE_BYTES + 1)
         });
-        let error = exact_keys(excessive.as_object().unwrap(), &["known"])
+        let error = exact_event_keys(excessive.as_object().unwrap(), &["known"])
             .expect_err("unbounded obfuscation must not bypass stream limits");
         assert!(error.to_string().contains("exceeded the size limit"));
+
+        let terminal = json!({
+            "id":"resp-obfuscation",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[],
+            "obfuscation":"padding-is-not-terminal-metadata"
+        });
+        let error = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("event padding must not bypass terminal response validation");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -4152,6 +4180,89 @@ mod tests {
         .err()
         .expect("terminal text drift must remain rejected");
         assert!(error.to_string().contains("did not match"));
+    }
+
+    #[tokio::test]
+    async fn streamed_terminal_text_drift_emits_no_terminal_projection() {
+        let mut body = completed_sse(DEFAULT_MODEL);
+        let completed_marker = "event: response.completed\ndata: ";
+        let completed_start = body
+            .find(completed_marker)
+            .expect("fixture must contain a completed event")
+            + completed_marker.len();
+        let completed_end = body[completed_start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| completed_start + offset)
+            .expect("fixture must terminate the completed event");
+        let mut completed_event: Value =
+            serde_json::from_str(&body[completed_start..completed_end]).unwrap();
+        completed_event["response"]["output"] = json!([{
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"different"}]
+        }]);
+        body.replace_range(completed_start..completed_end, &completed_event.to_string());
+
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_delta = false;
+        let mut saw_terminal_projection = false;
+        let mut error = None;
+        while let Some(chunk) = receiver.recv().await {
+            match chunk {
+                Ok(StreamChunk::TextDelta(delta)) => {
+                    saw_delta |= delta == "hello";
+                }
+                Ok(StreamChunk::ResponseMetadata { .. })
+                | Ok(StreamChunk::Usage { .. })
+                | Ok(StreamChunk::Allowance { .. })
+                | Ok(StreamChunk::ContentBlockComplete(_)) => {
+                    saw_terminal_projection = true;
+                }
+                Err(stream_error) => error = Some(stream_error.to_string()),
+            }
+        }
+        assert!(
+            saw_delta,
+            "the test must cross the progressive streaming boundary"
+        );
+        assert!(
+            !saw_terminal_projection,
+            "a rejected terminal snapshot must not emit metadata or completed blocks"
+        );
+        assert!(error.is_some_and(|error| error.contains("did not match")));
+        models.assert_async().await;
+        inference.assert_async().await;
     }
 
     #[tokio::test]
