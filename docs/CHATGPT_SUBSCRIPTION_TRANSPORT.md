@@ -27,12 +27,13 @@ public OpenAI Codex source at commit
 Finch records that pin as
 `openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4`.
 Protocol drift fails closed; it is not silently treated as Platform behavior.
-Catalog discovery separately sends `client_version=0.151.0`, the released
-Codex compatibility version associated with that audited source revision. It
-must not use Finch's unrelated package version. Updating either compatibility
-pin requires auditing the newer public Codex catalog and Responses-Lite
-contracts, updating both pins together, and rerunning the focused tests plus
-the explicit live acceptance test.
+Catalog discovery sends `client_version=0.151.0`, and both catalog and
+inference requests send `version: 0.151.0`. This is the released Codex
+compatibility version associated with that audited source revision, not
+Finch's application version or a claim that Finch is Codex. Updating either
+compatibility pin requires auditing the newer public Codex catalog and
+Responses-Lite contracts, updating both pins together, and rerunning the
+focused tests plus the explicit live acceptance test.
 
 ## Identity and routing
 
@@ -46,13 +47,15 @@ The production origin is exactly `https://chatgpt.com` with these routes:
 - `POST /backend-api/codex/responses`
 
 Requests use bearer authorization, `ChatGPT-Account-ID`, honest
-`originator: finch`, Finch's version, and the pinned protocol revision. Both
-routes use the bounded static client identifier
+`originator: finch`, the pinned compatibility `version`, and the pinned
+protocol revision. Application identity remains separate: both routes use the
+bounded static client identifier
 `finch/<version> (+https://darwin-finch.github.io/)` as their
-`User-Agent`; it contains no username, hostname, Brain/session, account, or
-credential identifier. This provides honest client identification and project
-discoverability only; it does not guarantee that OpenAI exposes telemetry or
-metrics to Finch. Sol requests additionally send
+`User-Agent`, where `<version>` is Finch's package version. It contains no
+username, hostname, Brain/session, account, or credential identifier. This
+provides honest client identification and project discoverability only; it
+does not guarantee that OpenAI exposes telemetry or metrics to Finch. Sol
+requests additionally send
 `x-openai-internal-codex-responses-lite: true`.
 Redirects, custom endpoints, userinfo, fragments, FedRAMP, Platform fallback,
 and model fallback are rejected.

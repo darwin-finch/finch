@@ -451,7 +451,7 @@ impl ChatGptSubscriptionProvider {
             .header("ChatGPT-Account-ID", &lease.account)
             .header("originator", "finch")
             .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
-            .header("version", env!("CARGO_PKG_VERSION"))
+            .header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .header(
                 "x-finch-chatgpt-protocol",
                 CHATGPT_INFERENCE_PROTOCOL_REVISION,
@@ -535,7 +535,7 @@ impl ChatGptSubscriptionProvider {
                     .header("ChatGPT-Account-ID", &lease.account)
                     .header("originator", "finch")
                     .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
-                    .header("version", env!("CARGO_PKG_VERSION"))
+                    .header("version", CHATGPT_CATALOG_CLIENT_VERSION)
                     .header("x-finch-chatgpt-protocol", CHATGPT_INFERENCE_PROTOCOL_REVISION)
                     .header("x-openai-internal-codex-responses-lite", "true")
                     .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -2544,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_client_version_is_pinned_to_audited_codex_not_finch_package() {
+    fn compatibility_version_is_pinned_to_audited_codex_not_finch_package() {
         assert_eq!(CHATGPT_CATALOG_CLIENT_VERSION, "0.151.0");
         assert_ne!(CHATGPT_CATALOG_CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
     }
@@ -2782,6 +2782,7 @@ mod tests {
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
             .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_header("etag", "account-etag")
@@ -2828,6 +2829,7 @@ mod tests {
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
             .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .match_header("x-openai-internal-codex-responses-lite", "true")
             .match_body(mockito::Matcher::Json(expected))
             .with_status(200)
@@ -2877,6 +2879,9 @@ mod tests {
                 "client_version".into(),
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_body(single_model_catalog_body(DEFAULT_MODEL, 1_000_000))
             .expect(1)
@@ -2884,6 +2889,9 @@ mod tests {
             .await;
         let inference = server
             .mock("POST", RESPONSES_PATH)
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_header("content-type", "text/event-stream")
             .with_header("openai-model", DEFAULT_MODEL)
