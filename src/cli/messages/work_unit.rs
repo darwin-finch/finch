@@ -96,6 +96,12 @@ pub enum WorkRowStatus {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkRowPresentation {
+    Tool,
+    Activity,
+}
+
 /// How a completed unit is projected into the transcript.
 ///
 /// Most units are ordinary assistant turns and retain the familiar `⏺` marker.
@@ -128,6 +134,7 @@ pub struct WorkRow {
     /// Pre-formatted label, e.g. "bash(git status)"
     pub label: String,
     pub status: WorkRowStatus,
+    presentation: WorkRowPresentation,
     /// When this row started — used for the Running animation
     started_at: Instant,
     /// Elapsed time captured at the moment the row completed (not recalculated)
@@ -329,11 +336,25 @@ impl WorkUnit {
 
     /// Add a running tool-call sub-row; returns its index for later updates.
     pub fn add_row(&self, label: impl Into<String>) -> usize {
+        self.add_row_with_presentation(label, WorkRowPresentation::Tool)
+    }
+
+    /// Add a running internal lifecycle row that is not a model tool call.
+    pub fn add_activity_row(&self, label: impl Into<String>) -> usize {
+        self.add_row_with_presentation(label, WorkRowPresentation::Activity)
+    }
+
+    fn add_row_with_presentation(
+        &self,
+        label: impl Into<String>,
+        presentation: WorkRowPresentation,
+    ) -> usize {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let idx = inner.rows.len();
         inner.rows.push(WorkRow {
             label: label.into(),
             status: WorkRowStatus::Running,
+            presentation,
             started_at: Instant::now(),
             elapsed_at_finish: None,
             body_lines: Vec::new(),
@@ -676,11 +697,11 @@ impl Message for WorkUnit {
             .rows
             .iter()
             .enumerate()
-            .map(|(index, row)| match &inner.presentation {
-                WorkUnitPresentation::Activity { .. } => {
+            .map(|(index, row)| match row.presentation {
+                WorkRowPresentation::Activity => {
                     transcript_activity_row(self.id, index, row, colors)
                 }
-                _ => transcript_tool_row(self.id, index, row, colors),
+                WorkRowPresentation::Tool => transcript_tool_row(self.id, index, row, colors),
             })
             .collect();
         let (kind, label, body, default_expanded) = match &inner.presentation {
@@ -1327,6 +1348,7 @@ mod tests {
         let row = WorkRow {
             label: "edit(x)".into(),
             status: WorkRowStatus::Complete("+1 -1".into()),
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: None,
             body_lines: Vec::new(),
@@ -1567,9 +1589,9 @@ mod tests {
     fn duplicate_brain_status_and_result_failures_have_one_compact_summary() {
         let unit = WorkUnit::new("Brain tools");
         unit.set_response("Speculative run 1234");
-        let status = unit.add_row("Speculative run 1234 · status");
+        let status = unit.add_activity_row("Speculative run 1234 · status");
         unit.fail_row(status, "catalog validation failed");
-        let result = unit.add_row("result");
+        let result = unit.add_activity_row("result");
         unit.fail_row(result, "catalog validation failed");
         unit.set_complete();
         let canonical_before_activity_projection = unit.complete_transcript(&colors());
@@ -1822,6 +1844,7 @@ mod tests {
         let row = WorkRow {
             label: "bash(echo hi)".into(),
             status: WorkRowStatus::Running,
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: None,
             body_lines: Vec::new(),
@@ -1838,6 +1861,7 @@ mod tests {
         let row = WorkRow {
             label: "read(foo.rs)".into(),
             status: WorkRowStatus::Complete("42 lines".into()),
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: None,
             body_lines: Vec::new(),
@@ -1854,6 +1878,7 @@ mod tests {
         let row = WorkRow {
             label: "bash(true)".into(),
             status: WorkRowStatus::Complete(String::new()),
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: None,
             body_lines: Vec::new(),
@@ -1871,6 +1896,7 @@ mod tests {
         let row = WorkRow {
             label: "bash(bad cmd)".into(),
             status: WorkRowStatus::Error("exit 1".into()),
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: None,
             body_lines: Vec::new(),
@@ -2032,6 +2058,7 @@ mod tests {
         let row = WorkRow {
             label: "bash(true)".into(),
             status: WorkRowStatus::Complete("ok".into()),
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: Some(std::time::Duration::from_millis(800)),
             body_lines: Vec::new(),
@@ -2057,6 +2084,7 @@ mod tests {
         let row = WorkRow {
             label: "bash(slow)".into(),
             status: WorkRowStatus::Complete("done".into()),
+            presentation: WorkRowPresentation::Tool,
             started_at: Instant::now(),
             elapsed_at_finish: Some(std::time::Duration::from_secs(3)),
             body_lines: Vec::new(),
