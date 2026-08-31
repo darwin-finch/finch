@@ -562,6 +562,161 @@ fn test_tui_binary_restores_terminal_modes_on_sigterm_and_sighup() {
     }
 }
 
+/// The listener must own SIGTERM before `TuiRenderer::new` changes raw,
+/// bracketed-paste, or keyboard state. This pauses the real Finch constructor
+/// after activation and proves cleanup occurs before the final input prompt.
+#[cfg(unix)]
+#[test]
+fn test_tui_binary_restores_terminal_modes_on_signal_during_early_startup() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-pty-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_PAUSE_AFTER_ACTIVATION", "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("failed to spawn early-startup signal probe in owned PTY");
+    drop(slave);
+
+    let mut transcript = Vec::new();
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(20),
+            |bytes| {
+                count_bytes(bytes, b"\x1b[?2004h") > 0 && count_bytes(bytes, b"\x1b[>1u") > 0
+            },
+        ),
+        "Finch did not reach the post-activation startup window: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    assert_eq!(count_bytes(&transcript, b"accept edits on"), 0);
+
+    let owned_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    nix::sys::signal::kill(owned_pid, nix::sys::signal::Signal::SIGTERM)
+        .expect("failed to signal owned early-startup Finch child");
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(2),
+            |bytes| count_bytes(bytes, b"\x1b[?2004l") > 0 && count_bytes(bytes, b"\x1b[<1u") > 0,
+        ),
+        "early-startup SIGTERM did not restore modes promptly: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
+    let _ = read_pty_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(1),
+        |_| false,
+    );
+    assert!(
+        status.success(),
+        "early-startup signal probe failed: {status}"
+    );
+    assert_eq!(count_bytes(&transcript, b"accept edits on"), 0);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000h"), 0);
+    assert_eq!(
+        count_bytes(&transcript, b"\x1b[?2026h"),
+        count_bytes(&transcript, b"\x1b[?2026l")
+    );
+}
+
+/// Terminal restoration must not wait for an already-selected event-loop
+/// branch to finish. The branch remains pending for four seconds; SIGHUP must
+/// reset modes within two seconds through the independently scheduled owner.
+#[cfg(unix)]
+#[test]
+fn test_tui_binary_restores_terminal_modes_while_event_branch_is_busy() {
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-pty-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_BUSY_BRANCH", "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("failed to spawn busy-branch signal probe in owned PTY");
+    drop(slave);
+
+    let mut transcript = Vec::new();
+    let ready = b"accept edits on";
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(20),
+            |bytes| bytes.windows(ready.len()).any(|window| window == ready),
+        ),
+        "busy-branch signal probe did not reach input: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    master
+        .write_all(b"__finch_test_busy_terminal_branch__\r")
+        .expect("failed to submit busy-branch probe");
+    master.flush().expect("failed to flush busy-branch probe");
+    let busy = b"FINCH_BUSY_TERMINAL_BRANCH_BEGIN";
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(10),
+            |bytes| bytes.windows(busy.len()).any(|window| window == busy),
+        ),
+        "event loop did not enter the supervised busy branch: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+
+    let owned_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    nix::sys::signal::kill(owned_pid, nix::sys::signal::Signal::SIGHUP)
+        .expect("failed to signal owned busy-branch Finch child");
+    assert!(
+        read_pty_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(2),
+            |bytes| count_bytes(bytes, b"\x1b[?2004l") > 0 && count_bytes(bytes, b"\x1b[<1u") > 0,
+        ),
+        "busy-branch SIGHUP waited for the selected branch: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+    let _ = read_pty_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(1),
+        |_| false,
+    );
+    assert!(
+        status.success(),
+        "busy-branch signal probe failed: {status}"
+    );
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000h"), 0);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004h"), 1);
+    assert_eq!(
+        count_bytes(&transcript, b"\x1b[?2026h"),
+        count_bytes(&transcript, b"\x1b[?2026l")
+    );
+}
+
 /// Repeated live rendering and viewport reconstruction must use cursor motion,
 /// never linefeeds that make transient rows eligible for native history.
 #[cfg(unix)]

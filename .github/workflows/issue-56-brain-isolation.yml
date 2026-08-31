@@ -96,6 +96,8 @@ jobs:
         CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_cleanup_continues_after_injected_end_sync_failure -- --exact --nocapture --test-threads=1
         CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_suspend_resume_releases_and_reacquires_owned_terminal_modes -- --exact --nocapture --test-threads=1
         CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_binary_restores_terminal_modes_on_sigterm_and_sighup -- --exact --nocapture --test-threads=1
+        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_binary_restores_terminal_modes_on_signal_during_early_startup -- --exact --nocapture --test-threads=1
+        CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_binary_restores_terminal_modes_while_event_branch_is_busy -- --exact --nocapture --test-threads=1
         CARGO_BUILD_JOBS=2 ./scripts/test_brains.sh cargo test --test tui_integration_test test_tui_repeated_live_render_and_resize_never_emits_history_linefeeds -- --exact --nocapture --test-threads=1
 
     - name: Reject self-issued proof authority

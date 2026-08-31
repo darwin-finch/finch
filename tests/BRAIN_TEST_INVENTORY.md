@@ -44,7 +44,7 @@ unrelated same-name process survives the TUI smoke.
 - `tests/no_external_provider_binary_test.rs` is the independent #173
   binary-removal regression. It uses its own `tempfile` HOME and process group;
   it neither constructs a Brain nor reads the user's Finch state.
-- `tests/tui_integration_test.rs` contains six environment-owned PTY lifecycle
+- `tests/tui_integration_test.rs` contains eight environment-owned PTY lifecycle
   regressions. Direct runs skip only when supervisor proof is absent, reject
   malformed proof, and run fully through `scripts/test_brains.sh` on Ubuntu and
   macOS CI.
