@@ -544,7 +544,7 @@ impl ChatGptSubscriptionProvider {
                     .send() => response.context("Failed to start ChatGPT subscription response")?,
             };
             if response.status() == StatusCode::UNAUTHORIZED && !unauthorized_retry_used {
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
+                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
                 lease = self
                     .source
                     .refresh_after_unauthorized(&lease.generation, &cancel)
@@ -562,7 +562,7 @@ impl ChatGptSubscriptionProvider {
             }
             if !response.status().is_success() {
                 let status = response.status();
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
+                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
                 return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
@@ -2021,6 +2021,30 @@ async fn read_bounded(
     Ok(body)
 }
 
+/// Discards at most a bounded prefix of a rejected response without retaining its body.
+///
+/// Once the server has supplied an HTTP rejection status, an oversized or broken body must not
+/// replace that typed status with a body-reading error. Dropping the response after this bounded
+/// prefix closes the remaining stream while keeping cancellation responsive and memory bounded.
+async fn discard_bounded_response_prefix(
+    response: Response,
+    maximum: usize,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut stream = response.bytes_stream();
+    let mut discarded = 0usize;
+    while discarded < maximum {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => bail!("ChatGPT subscription response read was cancelled"),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else { break };
+        let Ok(chunk) = chunk else { break };
+        discarded = discarded.saturating_add(chunk.len());
+    }
+    Ok(())
+}
+
 fn find_event_end(bytes: &[u8]) -> Option<(usize, usize)> {
     let lf = bytes
         .windows(2)
@@ -3032,7 +3056,10 @@ mod tests {
             .mock("POST", RESPONSES_PATH)
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(401)
-            .with_body("do-not-log-this-secret")
+            .with_body(format!(
+                "do-not-log-this-secret{}",
+                "x".repeat(MAX_ERROR_BYTES)
+            ))
             .expect(1)
             .create_async()
             .await;
@@ -3060,6 +3087,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
+        initial_catalog.assert_async().await;
+        refreshed_catalog.assert_async().await;
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_oversized_unauthorized_is_typed_after_one_refresh() {
+        let mut server = mockito::Server::new_async().await;
+        let initial_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let refreshed_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let attacker_body = format!(
+            "account-1 subscription-secret private-tool-argument{}",
+            "x".repeat(MAX_ERROR_BYTES)
+        );
+        let first = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(401)
+            .with_body(attacker_body.clone())
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(401)
+            .with_body(attacker_body.clone())
+            .expect(1)
+            .create_async()
+            .await;
+        let source = Arc::new(StaticSource::new());
+        let provider = ChatGptSubscriptionProvider::for_test(
+            source.clone(),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("the second HTTP rejection must retain its typed status");
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
+        let display = error.to_string();
+        assert!(display.contains("HTTP 401 Unauthorized"));
+        assert!(!display.contains("account-1"));
+        assert!(!display.contains("subscription-secret"));
+        assert!(!display.contains("private-tool-argument"));
+        assert!(display.len() < 256);
         initial_catalog.assert_async().await;
         refreshed_catalog.assert_async().await;
         first.assert_async().await;
@@ -3358,12 +3451,17 @@ mod tests {
         let error = provider
             .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains(secret));
-        assert!(!error.contains("subscription-secret"));
-        assert!(error.contains("size limit"));
-        assert!(error.len() < 256);
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("oversized HTTP rejection must retain its typed status");
+        assert_eq!(rejection.0, StatusCode::TOO_MANY_REQUESTS);
+        let display = error.to_string();
+        assert!(display.contains("HTTP 429 Too Many Requests"));
+        assert!(!display.contains(secret));
+        assert!(!display.contains("subscription-secret"));
+        assert!(!display.contains("size limit"));
+        assert!(display.len() < 256);
         models.assert_async().await;
         inference.assert_async().await;
     }
@@ -3381,11 +3479,14 @@ mod tests {
             .with_body(catalog_body())
             .create_async()
             .await;
-        let attacker_body = "account-1 subscription-secret private-tool-argument private-reasoning";
+        let attacker_body = format!(
+            "account-1 subscription-secret private-tool-argument private-reasoning{}",
+            "x".repeat(MAX_ERROR_BYTES)
+        );
         let inference = server
             .mock("POST", RESPONSES_PATH)
             .with_status(400)
-            .with_body(attacker_body)
+            .with_body(attacker_body.clone())
             .create_async()
             .await;
         let provider = ChatGptSubscriptionProvider::for_test(
@@ -3405,7 +3506,7 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("HTTP 400 Bad Request"));
         assert!(display.contains("pinned protocol contract may have changed"));
-        assert!(!display.contains(attacker_body));
+        assert!(!display.contains(attacker_body.as_str()));
         assert!(!display.contains("account-1"));
         assert!(!display.contains("subscription-secret"));
         assert!(display.len() < 256);
