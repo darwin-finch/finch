@@ -3842,6 +3842,8 @@ mod tests {
         assert!(header.contains("finch v"));
         assert!(header.contains("grok-code-fast-1"));
         assert!(header.contains("amber-river  ·  ~/repo"));
+        assert!(header.contains("Option (iTerm2)"));
+        assert!(header.contains("Shift (many terminals)"));
         assert!(!header.contains('\x1b'));
     }
 

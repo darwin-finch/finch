@@ -408,6 +408,32 @@ mod tests {
     }
 
     #[test]
+    fn test_selection_modifiers_do_not_trigger_mouse_disclosure() {
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            let work = Arc::new(WorkUnit::new("response"));
+            work.set_response("selectable transcript text");
+            work.set_complete();
+            let message: MessageRef = work;
+            let colors = ColorScheme::default();
+            let mut state = AccordionState::default();
+            let lines = state.render_message(&message, &colors);
+            state.rebuild_hit_regions(&lines, 3, 80);
+            let region = state.hit_regions[0].clone();
+
+            assert!(!state.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.left,
+                row: region.top,
+                modifiers,
+            }));
+            assert!(state
+                .render_message(&message, &colors)
+                .iter()
+                .any(|line| line.text.contains("selectable transcript text")));
+        }
+    }
+
+    #[test]
     fn test_semantic_defaults_collapse_long_completed_source_but_not_output() {
         let source = Arc::new(WorkUnit::new("program"));
         source.set_program_source("forth");
