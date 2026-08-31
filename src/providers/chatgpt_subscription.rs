@@ -963,6 +963,10 @@ fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
     }
 }
 
+fn chatgpt_wire_namespace_is_valid(name: &str, namespace: &str) -> bool {
+    namespace == "functions" || (namespace == "collaboration" && is_chatgpt_agent_wire_alias(name))
+}
+
 fn advertised_tool_names(request: &ProviderRequest) -> HashSet<String> {
     request
         .tools
@@ -1923,7 +1927,11 @@ fn parse_output_item(
             validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
             let wire_name = required_identifier(object, "name", 128)?;
-            if object.get("namespace").and_then(Value::as_str) != Some("functions") {
+            let namespace = object
+                .get("namespace")
+                .and_then(Value::as_str)
+                .context("ChatGPT function call omitted namespace")?;
+            if !chatgpt_wire_namespace_is_valid(&wire_name, namespace) {
                 bail!("ChatGPT function call namespace was invalid");
             }
             let name = chatgpt_local_tool_name(&wire_name)
@@ -2611,6 +2619,31 @@ mod tests {
         )
     }
 
+    fn completed_sse_with_tool(model: &str, name: &str, namespace: &str) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                if event["item"]["type"] == "function_call" {
+                    event["item"]["name"] = json!(name);
+                    event["item"]["namespace"] = json!(namespace);
+                    event["item"]["arguments"] = json!("{\"path\":\"README.md\"}");
+                    format!("data: {event}\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+
     fn tool() -> ToolDefinition {
         named_tool("read")
     }
@@ -2874,32 +2907,54 @@ mod tests {
 
     #[test]
     fn function_call_wire_alias_is_bound_to_the_advertised_finch_tool() {
-        let allowed = HashSet::from(["spawn_agent".to_string(), "read".to_string()]);
-        let mut blocks = Vec::new();
-        let mut call_ids = HashSet::new();
-        parse_output_item(
-            &json!({
-                "type":"function_call",
-                "call_id":"call-agent",
-                "name":"finch_spawn_agent",
-                "namespace":"functions",
-                "arguments":"{\"task\":\"inspect\"}"
-            }),
-            &mut blocks,
-            &mut call_ids,
-            &allowed,
-        )
-        .unwrap();
-        assert!(matches!(
-            blocks.as_slice(),
-            [ContentBlock::ToolUse { name, .. }] if name == "spawn_agent"
-        ));
-
-        for (name, namespace) in [
-            ("finch_spawn_agent", "collaboration"),
-            ("finch_spawn_agent", "other"),
-            ("read", "collaboration"),
+        for (wire_name, local_name) in [
+            ("finch_spawn_agent", "spawn_agent"),
+            ("finch_await_agent", "await_agent"),
+            ("finch_poll_agent", "poll_agent"),
+            ("finch_cancel_agent", "cancel_agent"),
         ] {
+            for namespace in ["functions", "collaboration"] {
+                let allowed = HashSet::from([local_name.to_string()]);
+                let mut blocks = Vec::new();
+                parse_output_item(
+                    &json!({
+                        "type":"function_call",
+                        "call_id":format!("call-{wire_name}-{namespace}"),
+                        "name":wire_name,
+                        "namespace":namespace,
+                        "arguments":"{\"path\":\"README.md\"}"
+                    }),
+                    &mut blocks,
+                    &mut HashSet::new(),
+                    &allowed,
+                )
+                .unwrap();
+                assert!(matches!(
+                    blocks.as_slice(),
+                    [ContentBlock::ToolUse { name, .. }] if name == local_name
+                ));
+
+                let error = parse_output_item(
+                    &json!({
+                        "type":"function_call",
+                        "call_id":format!("unadvertised-{wire_name}-{namespace}"),
+                        "name":wire_name,
+                        "namespace":namespace,
+                        "arguments":"{}"
+                    }),
+                    &mut Vec::new(),
+                    &mut HashSet::new(),
+                    &HashSet::new(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "ChatGPT requested a function Finch did not advertise"
+                );
+            }
+        }
+
+        for (name, namespace) in [("finch_spawn_agent", "other"), ("read", "collaboration")] {
             let error = parse_output_item(
                 &json!({
                     "type":"function_call",
@@ -2910,7 +2965,7 @@ mod tests {
                 }),
                 &mut Vec::new(),
                 &mut HashSet::new(),
-                &allowed,
+                &HashSet::from(["spawn_agent".to_string(), "read".to_string()]),
             )
             .unwrap_err();
             assert_eq!(
@@ -2930,7 +2985,7 @@ mod tests {
                 }),
                 &mut Vec::new(),
                 &mut HashSet::new(),
-                &allowed,
+                &HashSet::from(["spawn_agent".to_string()]),
             )
             .unwrap_err();
             assert!(matches!(
@@ -2960,6 +3015,121 @@ mod tests {
                     "ChatGPT subscription request used a reserved wire tool name"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn collaboration_namespaced_agent_alias_replays_as_the_advertised_function() {
+        let mut blocks = Vec::new();
+        parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"call-agent",
+                "name":"finch_spawn_agent",
+                "namespace":"collaboration",
+                "arguments":"{\"path\":\"README.md\"}"
+            }),
+            &mut blocks,
+            &mut HashSet::new(),
+            &HashSet::from(["spawn_agent".to_string()]),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![
+            Message::user("delegate"),
+            Message::with_content("assistant", blocks),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-agent".to_string(),
+                    content: "queued".to_string(),
+                    is_error: None,
+                }],
+            ),
+        ])
+        .with_model(DEFAULT_MODEL)
+        .with_tools(vec![named_tool("spawn_agent")]);
+        let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        let replayed = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(replayed["call_id"], "call-agent");
+        assert_eq!(replayed["name"], "finch_spawn_agent");
+        assert_eq!(replayed["namespace"], "functions");
+        assert_eq!(replayed["arguments"], "{\"path\":\"README.md\"}");
+        assert!(body["input"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "call-agent"
+                && item["output"] == "queued"
+        }));
+    }
+
+    #[tokio::test]
+    async fn responses_lite_stream_binds_only_the_advertised_collaboration_alias() {
+        async fn run(name: &str, namespace: &str) -> Vec<Result<StreamChunk, String>> {
+            let mut server = mockito::Server::new_async().await;
+            let _models = server
+                .mock("GET", "/backend-api/codex/models")
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "client_version".into(),
+                    CHATGPT_CATALOG_CLIENT_VERSION.into(),
+                ))
+                .with_status(200)
+                .with_body(catalog_body())
+                .create_async()
+                .await;
+            let _inference = server
+                .mock("POST", RESPONSES_PATH)
+                .with_status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_header("openai-model", DEFAULT_MODEL)
+                .with_body(completed_sse_with_tool(DEFAULT_MODEL, name, namespace))
+                .create_async()
+                .await;
+            let provider = ChatGptSubscriptionProvider::for_test(
+                Arc::new(StaticSource::new()),
+                &format!("{}/backend-api/codex", server.url()),
+                DEFAULT_MODEL,
+            )
+            .unwrap();
+            let mut receiver = provider
+                .send_message_stream(
+                    &ProviderRequest::new(vec![Message::user("delegate")])
+                        .with_tools(vec![named_tool("spawn_agent"), tool()]),
+                )
+                .await
+                .unwrap();
+            let mut chunks = Vec::new();
+            while let Some(chunk) = receiver.recv().await {
+                chunks.push(chunk.map_err(|error| error.to_string()));
+            }
+            chunks
+        }
+
+        let accepted = run("finch_spawn_agent", "collaboration").await;
+        assert!(accepted.iter().any(|chunk| matches!(
+            chunk,
+            Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { name, .. }))
+                if name == "spawn_agent"
+        )));
+        assert!(!accepted.iter().any(Result::is_err));
+
+        for (name, namespace) in [
+            ("spawn_agent", "collaboration"),
+            ("read", "collaboration"),
+            ("finch_spawn_agent", "other"),
+        ] {
+            let rejected = run(name, namespace).await;
+            assert!(rejected.iter().any(Result::is_err));
+            assert!(!rejected.iter().any(|chunk| matches!(
+                chunk,
+                Ok(StreamChunk::ContentBlockComplete(_)
+                    | StreamChunk::ResponseMetadata { .. }
+                    | StreamChunk::Usage { .. }
+                    | StreamChunk::Allowance { .. })
+            )));
         }
     }
 
