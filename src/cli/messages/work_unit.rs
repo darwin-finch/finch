@@ -845,8 +845,10 @@ fn transcript_tool_row(
 }
 
 fn tool_row_requires_default_expansion(row: &WorkRow) -> bool {
-    matches!(&row.status, WorkRowStatus::Complete(summary) if summary.trim().is_empty())
-        && (row.diffs.as_ref().is_some_and(|diffs| !diffs.is_empty()) || !row.body_lines.is_empty())
+    matches!(row.status, WorkRowStatus::Running)
+        || (matches!(&row.status, WorkRowStatus::Complete(summary) if summary.trim().is_empty())
+            && (row.diffs.as_ref().is_some_and(|diffs| !diffs.is_empty())
+                || !row.body_lines.is_empty()))
 }
 
 fn compact_tool_group_label(rows: &[WorkRow]) -> String {
@@ -1420,6 +1422,24 @@ mod tests {
         assert!(!projected.default_expanded);
         assert!(!projected.children[0].default_expanded);
         assert_eq!(projected.children[0].children.len(), 2);
+    }
+
+    #[test]
+    fn terminal_parent_status_does_not_hide_unresolved_running_tool() {
+        for terminal_status in [MessageStatus::Complete, MessageStatus::Failed] {
+            let unit = WorkUnit::new("Tools");
+            unit.add_row("brain.call still running");
+            match terminal_status {
+                MessageStatus::Complete => unit.set_complete(),
+                MessageStatus::Failed => unit.set_failed(),
+                MessageStatus::InProgress => unreachable!(),
+            }
+
+            let projected = unit.transcript_row(&colors()).unwrap();
+            assert!(projected.default_expanded);
+            assert!(projected.children[0].default_expanded);
+            assert!(projected.children[0].label.contains("running"));
+        }
     }
 
     #[test]
