@@ -110,6 +110,32 @@ impl fmt::Display for SubscriptionCatalogContextWindowInvalid {
 
 impl std::error::Error for SubscriptionCatalogContextWindowInvalid {}
 
+#[derive(Debug)]
+struct SubscriptionCatalogNoSelectableModel;
+
+impl fmt::Display for SubscriptionCatalogNoSelectableModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "ChatGPT account catalog did not advertise a supported GPT-5.6 Sol identifier",
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionCatalogNoSelectableModel {}
+
+#[derive(Debug)]
+struct SubscriptionRequestedModelUnavailable;
+
+impl fmt::Display for SubscriptionRequestedModelUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "ChatGPT account does not advertise the configured supported model",
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionRequestedModelUnavailable {}
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
     access_token: String,
@@ -482,7 +508,7 @@ impl ChatGptSubscriptionProvider {
         let selected = catalog
             .models
             .get(&request.model)
-            .context("ChatGPT account does not advertise the configured model")?;
+            .ok_or(SubscriptionRequestedModelUnavailable)?;
         if !catalog_model_matches_request(selected, &request.model) {
             bail!("ChatGPT account model is not compatible with the pinned Responses-Lite dialect");
         }
@@ -513,7 +539,7 @@ impl ChatGptSubscriptionProvider {
                 let refreshed_model = catalog
                     .models
                     .get(&request.model)
-                    .context("ChatGPT account model changed while refreshing credentials")?;
+                    .ok_or(SubscriptionRequestedModelUnavailable)?;
                 if !catalog_model_matches_request(refreshed_model, &request.model) {
                     bail!("ChatGPT account model changed while refreshing credentials");
                 }
@@ -1007,8 +1033,8 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
             );
         }
     }
-    if !parsed.contains_key(DEFAULT_MODEL) || !parsed.contains_key(MODEL_ALIAS) {
-        bail!("ChatGPT account does not advertise both pinned GPT-5.6 Sol identifiers");
+    if parsed.is_empty() {
+        return Err(SubscriptionCatalogNoSelectableModel.into());
     }
     Ok(Catalog { models: parsed })
 }
@@ -2105,6 +2131,19 @@ mod tests {
         .to_string()
     }
 
+    fn single_model_catalog_body(slug: &str, context_window: u64) -> String {
+        json!({
+            "models":[{
+                "slug":slug,
+                "supported_in_api":true,
+                "use_responses_lite":true,
+                "input_modalities":["text","image"],
+                "context_window":context_window
+            }]
+        })
+        .to_string()
+    }
+
     fn completed_sse(model: &str) -> String {
         format!(
             concat!(
@@ -2352,6 +2391,12 @@ mod tests {
             assert_eq!(catalog.models[DEFAULT_MODEL].context_window, sol as usize);
             assert_eq!(catalog.models[MODEL_ALIAS].context_window, alias as usize);
         }
+        for slug in [DEFAULT_MODEL, MODEL_ALIAS] {
+            let catalog = parse_catalog(single_model_catalog_body(slug, 1_000_000).as_bytes())
+                .expect("either exact selectable identifier is sufficient");
+            assert_eq!(catalog.models.len(), 1);
+            assert_eq!(catalog.models[slug].context_window, 1_000_000);
+        }
     }
 
     #[test]
@@ -2390,23 +2435,24 @@ mod tests {
 
     #[test]
     fn catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
-        let mut wrong_slug: Value = serde_json::from_str(&catalog_body()).unwrap();
+        let mut wrong_slug: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
         wrong_slug["models"][0]["slug"] = json!("gpt-5.6-sol-impostor");
-        assert!(parse_catalog(wrong_slug.to_string().as_bytes())
+        let wrong_slug_error = parse_catalog(wrong_slug.to_string().as_bytes())
             .err()
-            .expect("wrong slug must fail")
-            .to_string()
-            .contains("both pinned GPT-5.6 Sol identifiers"));
+            .expect("wrong slug must fail");
+        assert!(wrong_slug_error.is::<SubscriptionCatalogNoSelectableModel>());
 
-        let mut unsupported_api: Value = serde_json::from_str(&catalog_body()).unwrap();
+        let mut unsupported_api: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
         unsupported_api["models"][0]["supported_in_api"] = json!(false);
-        assert!(parse_catalog(unsupported_api.to_string().as_bytes())
+        let unsupported_error = parse_catalog(unsupported_api.to_string().as_bytes())
             .err()
-            .expect("unsupported API model must fail")
-            .to_string()
-            .contains("both pinned GPT-5.6 Sol identifiers"));
+            .expect("unsupported API model must fail");
+        assert!(unsupported_error.is::<SubscriptionCatalogNoSelectableModel>());
 
-        let mut missing_image: Value = serde_json::from_str(&catalog_body()).unwrap();
+        let mut missing_image: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
         missing_image["models"][0]["input_modalities"] = json!(["text"]);
         assert!(parse_catalog(missing_image.to_string().as_bytes())
             .err()
@@ -2414,13 +2460,13 @@ mod tests {
             .to_string()
             .contains("catalog capabilities drifted"));
 
-        let mut missing_text: Value = serde_json::from_str(&catalog_body()).unwrap();
+        let mut missing_text: Value =
+            serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
         missing_text["models"][0]["input_modalities"] = json!(["image"]);
-        assert!(parse_catalog(missing_text.to_string().as_bytes())
+        let missing_text_error = parse_catalog(missing_text.to_string().as_bytes())
             .err()
-            .expect("missing text modality must fail")
-            .to_string()
-            .contains("both pinned GPT-5.6 Sol identifiers"));
+            .expect("missing text modality must fail");
+        assert!(missing_text_error.is::<SubscriptionCatalogNoSelectableModel>());
     }
 
     #[test]
@@ -2498,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ignores_unrelated_models_but_requires_both_pinned_identifiers() {
+    fn catalog_ignores_unrelated_models_and_accepts_one_pinned_identifier() {
         let mut catalog: Value = serde_json::from_str(&catalog_body()).unwrap();
         catalog["models"].as_array_mut().unwrap().push(json!({
             "slug":"unrelated-account-model",
@@ -2511,11 +2557,10 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .retain(|model| model["slug"] != MODEL_ALIAS);
-        let error = parse_catalog(catalog.to_string().as_bytes())
-            .err()
-            .expect("missing alias must fail")
-            .to_string();
-        assert!(error.contains("both pinned GPT-5.6 Sol identifiers"));
+        let parsed = parse_catalog(catalog.to_string().as_bytes())
+            .expect("one exact selectable identifier is sufficient");
+        assert_eq!(parsed.models.len(), 1);
+        assert!(parsed.models.contains_key(DEFAULT_MODEL));
     }
 
     #[test]
@@ -2732,7 +2777,7 @@ mod tests {
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
             .with_status(200)
-            .with_body(catalog_body_with_context_windows(1_000_000, 1_000_000))
+            .with_body(single_model_catalog_body(DEFAULT_MODEL, 1_000_000))
             .expect(1)
             .create_async()
             .await;
@@ -2779,6 +2824,48 @@ mod tests {
         assert_eq!(streamed_text, "hello");
         models.assert_async().await;
         inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn buffered_and_streaming_require_the_exact_requested_catalog_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(single_model_catalog_body(MODEL_ALIAS, 1_000_000))
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let buffered_error = provider
+            .send_message(&request)
+            .await
+            .err()
+            .expect("buffered request must require its exact catalog entry");
+        assert!(buffered_error.is::<SubscriptionRequestedModelUnavailable>());
+        assert!(!buffered_error.to_string().contains("subscription-secret"));
+        assert!(!buffered_error.to_string().contains("account-1"));
+
+        let streaming_error = provider
+            .send_message_stream(&request)
+            .await
+            .err()
+            .expect("streaming request must require its exact catalog entry");
+        assert!(streaming_error.is::<SubscriptionRequestedModelUnavailable>());
+        assert!(!streaming_error.to_string().contains("subscription-secret"));
+        assert!(!streaming_error.to_string().contains("account-1"));
+        models.assert_async().await;
     }
 
     #[tokio::test]
