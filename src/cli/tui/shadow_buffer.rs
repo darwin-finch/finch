@@ -13,8 +13,27 @@
 // - No truncation or text bleeding
 // - Efficient updates (only changed cells)
 
-use crate::cli::messages::MessageRef;
 use ratatui::style::Style;
+
+/// Text and style resolved by a compositor before physical cell layout.
+/// Shadow buffering deliberately has no dependency on semantic message kinds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedLine {
+    /// Text already resolved by the compositor.
+    pub text: String,
+    /// Physical terminal style already resolved by the compositor.
+    pub style: Style,
+}
+
+impl ResolvedLine {
+    /// Create one compositor-resolved line.
+    pub fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
 
 /// A single cell in the shadow buffer (character + style)
 #[derive(Debug, Clone, PartialEq)]
@@ -173,38 +192,21 @@ impl ShadowBuffer {
         }
     }
 
-    /// Render messages to shadow buffer with proper wrapping
+    /// Render compositor-resolved lines with proper wrapping.
     /// Returns bottom-aligned content (last N rows that fit)
-    pub fn render_messages(
-        &mut self,
-        messages: &[MessageRef],
-        colors: &crate::config::ColorScheme,
-    ) {
+    pub fn render_lines(&mut self, lines: &[ResolvedLine]) {
         // Clear buffer first
         self.clear();
 
-        // Format all messages and collect lines with their styles
-        let mut all_lines: Vec<(String, Style)> = Vec::new(); // (line_text, style)
-        for msg in messages {
-            let formatted = msg.format(colors);
-            let lines: Vec<_> = formatted.lines().collect();
-            for (line_index, line) in lines.iter().enumerate() {
-                let style = msg
-                    .background_style_for_line(colors, line_index, lines.len())
-                    .unwrap_or_default();
-                all_lines.push((line.to_string(), style));
-            }
-        }
-
-        if all_lines.is_empty() {
+        if lines.is_empty() {
             return;
         }
 
         // Calculate how many lines we need (with wrapping)
         let mut line_row_counts: Vec<usize> = Vec::new();
 
-        for (line, _style) in &all_lines {
-            let visible_len = visible_length(line);
+        for line in lines {
+            let visible_len = visible_length(&line.text);
             let rows = if visible_len == 0 {
                 1
             } else {
@@ -218,13 +220,11 @@ impl ShadowBuffer {
         let mut accumulated_rows = 0;
 
         // Walk backwards from last line
-        for (line_idx, ((line, style), row_count)) in
-            all_lines.iter().zip(&line_row_counts).enumerate().rev()
-        {
+        for (line_idx, (line, row_count)) in lines.iter().zip(&line_row_counts).enumerate().rev() {
             if accumulated_rows + row_count > self.height {
                 break; // Stop when can't fit more
             }
-            lines_to_render.push((line_idx, line, *style));
+            lines_to_render.push((line_idx, &line.text, line.style));
             accumulated_rows += row_count;
         }
 
@@ -452,9 +452,7 @@ pub fn diff_buffers(current: &ShadowBuffer, previous: &ShadowBuffer) -> Vec<(usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::UserQueryMessage;
     use crate::config::{ColorTheme, MessageBand};
-    use std::sync::Arc;
 
     #[test]
     fn test_visible_length() {
@@ -644,10 +642,10 @@ mod tests {
     fn message_band_fills_the_complete_terminal_row() {
         let colors = ColorTheme::Dark.to_scheme();
         let expected = colors.message_band_style(MessageBand::LocalUser);
-        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("hello"))];
+        let lines = vec![ResolvedLine::new("❯ hello", expected)];
         let mut buf = ShadowBuffer::new(24, 2);
 
-        buf.render_messages(&messages, &colors);
+        buf.render_lines(&lines);
 
         for column in 0..buf.width {
             assert_eq!(buf.get(column, 1).unwrap().style, expected);
@@ -658,10 +656,14 @@ mod tests {
     fn message_band_paints_interior_blank_rows() {
         let colors = ColorTheme::Dark.to_scheme();
         let expected = colors.message_band_style(MessageBand::LocalUser);
-        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("top\n\nbottom"))];
+        let lines = vec![
+            ResolvedLine::new("❯ top", expected),
+            ResolvedLine::new("", expected),
+            ResolvedLine::new("bottom", expected),
+        ];
         let mut buf = ShadowBuffer::new(12, 3);
 
-        buf.render_messages(&messages, &colors);
+        buf.render_lines(&lines);
 
         assert_eq!(buf.get(0, 0).unwrap().ch, ' ');
         for column in 0..buf.width {
@@ -674,16 +676,33 @@ mod tests {
     fn message_band_paints_every_wrapped_physical_row() {
         let colors = ColorTheme::Dark.to_scheme();
         let expected = colors.message_band_style(MessageBand::LocalUser);
-        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("abcdefghij"))];
+        let lines = vec![ResolvedLine::new("❯ abcdefghij", expected)];
         let mut buf = ShadowBuffer::new(6, 3);
 
-        buf.render_messages(&messages, &colors);
+        buf.render_lines(&lines);
 
         for row in 0..buf.height {
             for column in 0..buf.width {
                 assert_eq!(buf.get(column, row).unwrap().style, expected);
             }
         }
+    }
+
+    #[test]
+    fn shadow_buffer_accepts_resolved_primitives_without_message_dependency() {
+        let style = Style::default();
+        let lines = vec![
+            ResolvedLine::new("activity", style),
+            ResolvedLine::new("program", style),
+            ResolvedLine::new("output", style),
+        ];
+        let mut buffer = ShadowBuffer::new(12, 3);
+
+        buffer.render_lines(&lines);
+
+        assert_eq!(buffer.get(0, 0).unwrap().ch, 'a');
+        assert_eq!(buffer.get(0, 1).unwrap().ch, 'p');
+        assert_eq!(buffer.get(0, 2).unwrap().ch, 'o');
     }
 
     #[test]
