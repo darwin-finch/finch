@@ -851,22 +851,26 @@ fn tool_row_requires_default_expansion(row: &WorkRow) -> bool {
 
 fn compact_tool_group_label(rows: &[WorkRow]) -> String {
     let mut label = format!("Tools ({} calls)", rows.len());
-    let Some(error) = rows.iter().find_map(|row| match &row.status {
-        WorkRowStatus::Error(error) => Some(compact_failure_text(error)),
+    let Some((call, error)) = rows.iter().find_map(|row| match &row.status {
+        WorkRowStatus::Error(error) => Some((
+            compact_summary_text(&row.label, 60),
+            compact_summary_text(error, 120),
+        )),
         _ => None,
     }) else {
         return label;
     };
-    label.push_str(" — failed: ");
+    label.push_str(" — ");
+    label.push_str(&call);
+    label.push_str(" failed: ");
     label.push_str(&error);
     label
 }
 
-fn compact_failure_text(error: &str) -> String {
-    const MAX_CHARS: usize = 120;
-    let first_line = error.lines().next().unwrap_or_default().trim();
-    let mut compact = first_line.chars().take(MAX_CHARS).collect::<String>();
-    if first_line.chars().count() > MAX_CHARS {
+fn compact_summary_text(text: &str, max_chars: usize) -> String {
+    let first_line = text.lines().next().unwrap_or_default().trim();
+    let mut compact = first_line.chars().take(max_chars).collect::<String>();
+    if first_line.chars().count() > max_chars {
         compact.push('…');
     }
     compact
@@ -1403,7 +1407,9 @@ mod tests {
         let failed = unit.transcript_row(&colors()).unwrap();
         assert!(!failed.default_expanded);
         assert!(!failed.children[0].default_expanded);
-        assert!(failed.label.contains("failed: catalog unavailable"));
+        assert!(failed
+            .label
+            .contains("catalog.validate provider=chatgpt failed: catalog unavailable"));
         assert_eq!(failed.children[0].children.len(), 1);
 
         let completed = WorkUnit::new("Tools");
@@ -1432,6 +1438,7 @@ mod tests {
             projected.label.matches("catalog validation failed").count(),
             1
         );
+        assert!(projected.label.contains("status failed"));
         assert_eq!(projected.children.len(), 2);
         assert!(projected.children[0].label.contains("status"));
         assert!(projected.children[1].label.starts_with("result"));

@@ -275,6 +275,7 @@ mod tests {
 
         let compact = state.render_message(&message, &colors);
         assert_eq!(compact.len(), 1);
+        assert!(compact[0].text.contains("catalog.validate"));
         assert_eq!(compact[0].text.matches("catalog unavailable").count(), 1);
         assert!(!compact[0].text.contains("Output (0)"));
 
