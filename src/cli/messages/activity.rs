@@ -54,6 +54,12 @@ impl ActivityMessage {
         self.unit.add_row(label)
     }
 
+    /// Repair a tool label when canonical call metadata arrives after its
+    /// result during snapshot replay.
+    pub fn set_row_label(&self, index: usize, label: impl Into<String>) {
+        self.unit.set_row_label(index, label);
+    }
+
     /// Append a live body line to an existing activity or tool row.
     pub fn append_row_body_line(&self, index: usize, line: String) {
         self.unit.append_row_body_line(index, line);

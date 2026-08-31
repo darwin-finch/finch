@@ -2159,6 +2159,72 @@ fn validate_runner_effect_journal(
     Ok(())
 }
 
+/// Derive a durable transcript projection for provider-native VM submissions.
+///
+/// The raw `ExecutionOutcome` remains the provider's continuation payload,
+/// while this bounded semantic view is what a fresh frontend uses.  In
+/// particular, replaying the view never replays VM host effects: ordered
+/// `output_chunks` are already-accepted `say` observations.
+fn named_brain_tool_result_presentation(
+    tool_name: &str,
+    input: &serde_json::Value,
+    output: &str,
+    is_error: bool,
+) -> crate::brain::store::ToolResultPresentation {
+    if tool_name != "submit_program" || is_error {
+        return crate::brain::store::ToolResultPresentation::Generic;
+    }
+    let Some(source) = input.get("source").and_then(serde_json::Value::as_str) else {
+        return crate::brain::store::ToolResultPresentation::Generic;
+    };
+    let Some(outcome) = serde_json::from_str::<serde_json::Value>(output).ok() else {
+        return crate::brain::store::ToolResultPresentation::Generic;
+    };
+    let Some(status) = outcome.get("status").and_then(serde_json::Value::as_str) else {
+        return crate::brain::store::ToolResultPresentation::Generic;
+    };
+    let mut output_chunks = outcome
+        .get("output_chunks")
+        .and_then(serde_json::Value::as_array)
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if output_chunks.is_empty() {
+        if let Some(output) = outcome.get("output").and_then(serde_json::Value::as_str) {
+            if !output.is_empty() {
+                output_chunks.push(output.to_owned());
+            }
+        }
+    }
+    let diagnostics = outcome
+        .get("diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .map(|diagnostics| {
+            diagnostics
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::brain::store::ToolResultPresentation::SubmitProgram {
+        language: input
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("inferred")
+            .to_owned(),
+        source: source.to_owned(),
+        output_chunks,
+        summary: status.replace('_', " "),
+        diagnostics,
+    }
+}
+
 fn persist_named_brain_turn_events(
     store: &crate::brain::store::BrainStore,
     name: &str,
@@ -2168,34 +2234,44 @@ fn persist_named_brain_turn_events(
     expected_approval_audience: &crate::brain::store::BrainApprovalAudience,
     turn_events: Vec<crate::server::RunnerTurnEvent>,
 ) -> anyhow::Result<()> {
-    let mut persisted = store
-        .snapshot(name)?
-        .events
-        .into_iter()
-        .filter_map(|event| match event.kind {
+    let snapshot = store.snapshot(name)?;
+    let mut persisted = std::collections::HashSet::new();
+    let mut tool_calls = std::collections::HashMap::new();
+    for event in snapshot.events {
+        match event.kind {
             crate::brain::store::BrainEventKind::ToolCall {
                 request_seq: event_request,
                 tool_id,
-                ..
-            } if event_request == request_seq => Some(format!("call:{tool_id}")),
+                name,
+                input,
+            } if event_request == request_seq => {
+                persisted.insert(format!("call:{tool_id}"));
+                tool_calls.insert(tool_id, (name, input));
+            }
             crate::brain::store::BrainEventKind::ToolResult {
                 request_seq: event_request,
                 tool_id,
                 ..
-            } if event_request == request_seq => Some(format!("result:{tool_id}")),
+            } if event_request == request_seq => {
+                persisted.insert(format!("result:{tool_id}"));
+            }
             crate::brain::store::BrainEventKind::ApprovalRequested {
                 request_seq: event_request,
                 approval_id,
                 ..
-            } if event_request == request_seq => Some(format!("approval:{approval_id}")),
+            } if event_request == request_seq => {
+                persisted.insert(format!("approval:{approval_id}"));
+            }
             crate::brain::store::BrainEventKind::ApprovalDecided {
                 request_seq: event_request,
                 approval_id,
                 ..
-            } if event_request == request_seq => Some(format!("decision:{approval_id}")),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>();
+            } if event_request == request_seq => {
+                persisted.insert(format!("decision:{approval_id}"));
+            }
+            _ => {}
+        }
+    }
     for turn_event in turn_events {
         match turn_event {
             crate::server::RunnerTurnEvent::Call {
@@ -2203,6 +2279,7 @@ fn persist_named_brain_turn_events(
                 name: tool_name,
                 input,
             } => {
+                tool_calls.insert(tool_id.clone(), (tool_name.clone(), input.clone()));
                 if !persisted.insert(format!("call:{tool_id}")) {
                     continue;
                 }
@@ -2227,6 +2304,12 @@ fn persist_named_brain_turn_events(
                 if !persisted.insert(format!("result:{tool_id}")) {
                     continue;
                 }
+                let presentation = tool_calls.get(&tool_id).map_or(
+                    crate::brain::store::ToolResultPresentation::Generic,
+                    |(tool_name, input)| {
+                        named_brain_tool_result_presentation(tool_name, input, &output, is_error)
+                    },
+                );
                 push_named_brain_correlated_event(
                     store,
                     name,
@@ -2237,6 +2320,7 @@ fn persist_named_brain_turn_events(
                         tool_id,
                         output,
                         is_error,
+                        presentation,
                     },
                 )?;
             }
@@ -6169,6 +6253,7 @@ mod handler_tests {
                         tool_id: "tool-1".into(),
                         output: "found fib".into(),
                         is_error: false,
+                        presentation: crate::brain::store::ToolResultPresentation::Generic,
                     },
                 ),
                 event(
@@ -6179,6 +6264,7 @@ mod handler_tests {
                         tool_id: "tool-2".into(),
                         output: "revision 7".into(),
                         is_error: false,
+                        presentation: crate::brain::store::ToolResultPresentation::Generic,
                     },
                 ),
                 event(
@@ -7202,6 +7288,97 @@ mod handler_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn named_brain_submit_program_persists_ordered_semantic_output_chunks() {
+        use crate::brain::store::{BrainEventKind, ToolResultPresentation};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        let request_seq = store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::Prompt {
+                    text: "run the program".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice@box.local");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name,
+            attachment_id: attachment.attachment_id,
+            subject: attachment.subject,
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        let outcome = serde_json::json!({
+            "status": "completed",
+            "output": "first after",
+            "output_chunks": ["first", " after"],
+            "diagnostics": []
+        })
+        .to_string();
+
+        persist_named_brain_turn_events(
+            &store,
+            "shared",
+            None,
+            request_seq,
+            "runner@box.local",
+            &audience,
+            vec![
+                crate::server::RunnerTurnEvent::Call {
+                    tool_id: "submit-1".into(),
+                    name: "submit_program".into(),
+                    input: serde_json::json!({
+                        "language": "lisp",
+                        "source": "(begin (say \"first\") (say \" after\"))"
+                    }),
+                },
+                crate::server::RunnerTurnEvent::Result {
+                    tool_id: "submit-1".into(),
+                    output: outcome.clone(),
+                    is_error: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let snapshot = store.snapshot("shared").unwrap();
+        let result = snapshot
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                BrainEventKind::ToolResult {
+                    tool_id,
+                    output,
+                    presentation,
+                    ..
+                } if tool_id == "submit-1" => Some((output, presentation)),
+                _ => None,
+            })
+            .expect("durable submit_program ToolResult");
+        assert_eq!(result.0, &outcome, "provider continuation stays exact");
+        assert!(matches!(
+            result.1,
+            ToolResultPresentation::SubmitProgram {
+                language,
+                source,
+                output_chunks,
+                summary,
+                diagnostics,
+            } if language == "lisp"
+                && source.contains("say")
+                && output_chunks.as_slice() == ["first", " after"]
+                && summary == "completed"
+                && diagnostics.is_empty()
+        ));
     }
 
     #[test]
@@ -8489,6 +8666,7 @@ mod handler_tests {
                     tool_id: "v13-tool".into(),
                     output: "v13-secret-tool-result".into(),
                     is_error: false,
+                    presentation: crate::brain::store::ToolResultPresentation::Generic,
                 },
             )
             .unwrap();
