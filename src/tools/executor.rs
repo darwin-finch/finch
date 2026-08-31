@@ -291,11 +291,12 @@ impl ToolExecutor {
     /// bound the subprocess it eventually launches.
     ///
     /// MCP servers can configure longer operations than Finch's built-in-tool
-    /// default. The editor-backed compatibility tools are the one exception:
-    /// timing a human review as though it were a subprocess made ordinary
-    /// proposal review fail after thirty seconds.
+    /// default. Editor-backed compatibility tools and `await_agent` are the
+    /// exceptions: they suspend on an explicitly bounded external lifecycle,
+    /// so an unrelated thirty-second wrapper would race the editor or child's
+    /// own deadline and discard a valid eventual result.
     pub fn execution_timeout(&self, tool_name: &str) -> Option<std::time::Duration> {
-        if matches!(tool_name, "bash" | "edit" | "write") {
+        if matches!(tool_name, "bash" | "edit" | "write" | "await_agent") {
             return None;
         }
         self.mcp_client
@@ -827,11 +828,12 @@ mod tests {
     }
 
     #[test]
-    fn editor_backed_tools_do_not_time_out_human_review() {
+    fn lifecycle_tools_do_not_get_the_generic_tool_timeout() {
         let executor = create_test_executor(true, false);
         assert!(executor.execution_timeout("bash").is_none());
         assert!(executor.execution_timeout("edit").is_none());
         assert!(executor.execution_timeout("write").is_none());
+        assert!(executor.execution_timeout("await_agent").is_none());
         assert_eq!(
             executor
                 .execution_timeout("mock")
