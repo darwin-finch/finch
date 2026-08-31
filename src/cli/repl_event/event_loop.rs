@@ -955,6 +955,11 @@ struct RemoteBrainRunProjection {
     prompt_row: Option<usize>,
     result_row: Option<usize>,
     tool_rows: std::collections::HashMap<String, usize>,
+    /// This terminal cursor is deliberately independent of run completion.
+    /// A reconnect may receive a terminal run transition before a repaired
+    /// higher-sequence ToolResult; accepting that later result only replaces
+    /// semantic transcript state and never re-executes host effects.
+    tool_result_sequences: std::collections::HashMap<String, u64>,
     approval_rows: std::collections::HashMap<String, usize>,
     locally_rendered_tool_ids: std::collections::HashSet<String>,
     locally_rendered_approval_ids: std::collections::HashSet<String>,
@@ -999,6 +1004,7 @@ fn ensure_remote_brain_run_projection<'a>(
             prompt_row: None,
             result_row: None,
             tool_rows: std::collections::HashMap::new(),
+            tool_result_sequences: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
             locally_rendered_tool_ids: std::collections::HashSet::new(),
             locally_rendered_approval_ids: std::collections::HashSet::new(),
@@ -1077,7 +1083,7 @@ fn project_remote_brain_run_event(
             if projection.locally_rendered_tool_ids.contains(tool_id) {
                 return true;
             }
-            projection
+            let row = *projection
                 .tool_rows
                 .entry(tool_id.clone())
                 .or_insert_with(|| {
@@ -1089,16 +1095,36 @@ fn project_remote_brain_run_event(
                     };
                     projection.activity.add_tool(format!("{name} {input}"))
                 });
+            let input = input.to_string();
+            let input = if input.chars().count() > 80 {
+                format!("{}…", input.chars().take(79).collect::<String>())
+            } else {
+                input
+            };
+            projection
+                .activity
+                .set_row_label(row, format!("{name} {input}"));
         }
         BrainEventKind::ToolResult {
             tool_id,
             output,
             is_error,
+            presentation,
             ..
         } => {
             if projection.locally_rendered_tool_ids.contains(tool_id) {
                 return true;
             }
+            if projection
+                .tool_result_sequences
+                .get(tool_id)
+                .is_some_and(|sequence| *sequence >= event.seq)
+            {
+                return true;
+            }
+            projection
+                .tool_result_sequences
+                .insert(tool_id.clone(), event.seq);
             let row = *projection
                 .tool_rows
                 .entry(tool_id.clone())
@@ -1106,17 +1132,40 @@ fn project_remote_brain_run_event(
             if *is_error {
                 projection.activity.fail_row(row, output);
             } else {
-                let first = output.lines().next().unwrap_or_default();
-                let summary = if first.chars().count() > 80 {
-                    format!("{}…", first.chars().take(79).collect::<String>())
-                } else {
-                    first.to_string()
-                };
-                projection.activity.complete_row_with_body(
-                    row,
-                    summary,
-                    output.lines().skip(1).map(str::to_owned).collect(),
-                );
+                match presentation {
+                    crate::brain::store::ToolResultPresentation::Generic => {
+                        let first = output.lines().next().unwrap_or_default();
+                        let summary = if first.chars().count() > 80 {
+                            format!("{}…", first.chars().take(79).collect::<String>())
+                        } else {
+                            first.to_string()
+                        };
+                        projection.activity.complete_row_with_body(
+                            row,
+                            summary,
+                            output.lines().skip(1).map(str::to_owned).collect(),
+                        );
+                    }
+                    crate::brain::store::ToolResultPresentation::SubmitProgram {
+                        language,
+                        source,
+                        output_chunks,
+                        summary,
+                        diagnostics,
+                    } => {
+                        let mut body = vec![format!("VM source ({language}):")];
+                        body.extend(source.lines().map(str::to_owned));
+                        body.extend(output_chunks.iter().cloned());
+                        body.extend(
+                            diagnostics
+                                .iter()
+                                .map(|diagnostic| format!("diagnostic: {diagnostic}")),
+                        );
+                        projection
+                            .activity
+                            .complete_row_with_body(row, summary, body);
+                    }
+                }
             }
         }
         BrainEventKind::ApprovalRequested {
@@ -9789,6 +9838,7 @@ mod tests {
                 tool_id: "tool-1".into(),
                 output: "cache hit\nvalue=7".into(),
                 is_error: false,
+                presentation: crate::brain::store::ToolResultPresentation::Generic,
             },
             BrainEventKind::RunStatusChanged {
                 run_id,
@@ -9839,6 +9889,160 @@ mod tests {
     }
 
     #[test]
+    fn named_brain_submit_program_snapshot_repair_preserves_emit_once_after_terminal() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+            ToolResultPresentation,
+        };
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::Running,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let presentation = |chunks: &[&str]| ToolResultPresentation::SubmitProgram {
+            language: "lisp".into(),
+            source: "(say \"first\")".into(),
+            output_chunks: chunks.iter().map(|chunk| (*chunk).to_owned()).collect(),
+            summary: "completed".into(),
+            diagnostics: Vec::new(),
+        };
+        let mut started = brain_event(1, "daemon", BrainEventKind::RunStarted { run });
+        started.run_id = Some(run_id);
+        let mut result = brain_event(
+            12,
+            "runner",
+            BrainEventKind::ToolResult {
+                request_seq: 1,
+                tool_id: "submit-1".into(),
+                output: r#"{"status":"completed","output":"first"}"#.into(),
+                is_error: false,
+                presentation: presentation(&["first"]),
+            },
+        );
+        result.run_id = Some(run_id);
+        let mut terminal = brain_event(
+            20,
+            "daemon",
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Completed,
+                detail: None,
+            },
+        );
+        terminal.run_id = Some(run_id);
+        let mut call = brain_event(
+            10,
+            "provider",
+            BrainEventKind::ToolCall {
+                request_seq: 1,
+                tool_id: "submit-1".into(),
+                name: "submit_program".into(),
+                input: serde_json::json!({"language": "lisp", "source": "(say \"first\")"}),
+            },
+        );
+        call.run_id = Some(run_id);
+
+        // A repaired snapshot can contain a result before its call, repeat an
+        // accepted event, and report the terminal transition before both.
+        let repaired_snapshot = vec![started, result.clone(), terminal, result.clone(), call];
+        let mut projections = std::collections::HashMap::new();
+        let mut local_projections = std::collections::VecDeque::new();
+        super::project_remote_brain_snapshot_runs(
+            &output,
+            &mut projections,
+            &mut local_projections,
+            false,
+            &repaired_snapshot,
+        );
+        super::project_remote_brain_snapshot_runs(
+            &output,
+            &mut projections,
+            &mut local_projections,
+            false,
+            &repaired_snapshot,
+        );
+
+        // The terminal WorkUnit is not an output fence: a strictly newer
+        // canonical result can carry an accepted late VM emit. It replaces the
+        // semantic complete body, so the prefix is still rendered once.
+        let mut late = result;
+        late.seq = 21;
+        late.kind = BrainEventKind::ToolResult {
+            request_seq: 1,
+            tool_id: "submit-1".into(),
+            output: r#"{"status":"completed","output":"first after"}"#.into(),
+            is_error: false,
+            presentation: presentation(&["first", " after"]),
+        };
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &late,
+        ));
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &late,
+        ));
+
+        let messages = output.get_messages();
+        assert_eq!(
+            messages.len(),
+            1,
+            "no default ProgramOutput may be replayed"
+        );
+        let root = messages[0]
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("canonical activity transcript");
+        assert_eq!(root.kind, TranscriptRowKind::Activity);
+        let tool = root
+            .children
+            .iter()
+            .find(|row| row.kind == TranscriptRowKind::ToolCall)
+            .expect("submit_program ToolCall");
+        assert!(tool.label.contains("submit_program"));
+        let output_row = tool
+            .children
+            .iter()
+            .find(|row| row.kind == TranscriptRowKind::ToolOutput)
+            .expect("submit_program ToolOutput");
+        assert_eq!(
+            output_row
+                .body
+                .iter()
+                .filter(|line| *line == "first")
+                .count(),
+            1
+        );
+        assert!(output_row.body.iter().any(|line| line == " after"));
+        let canonical = messages[0].complete_transcript(&crate::config::ColorScheme::default());
+        // `first` appears in the canonical ToolCall input as well as in the
+        // rendered VM source and the one emitted ToolOutput chunk.
+        assert_eq!(
+            canonical.matches("first").count(),
+            3,
+            "tool input + source + one emit"
+        );
+        assert!(
+            !canonical.contains("output_chunks"),
+            "raw outcome leaked: {canonical}"
+        );
+    }
+
+    #[test]
     fn named_brain_success_separates_activity_program_and_output_exactly_once() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
@@ -9878,6 +10082,7 @@ mod tests {
                 tool_id: "tool-1".into(),
                 output: "cache hit\nvalue=7".into(),
                 is_error: false,
+                presentation: crate::brain::store::ToolResultPresentation::Generic,
             },
             BrainEventKind::ApprovalRequested {
                 request_seq: 1,
@@ -10252,6 +10457,7 @@ mod tests {
                 tool_id: "tool-1".into(),
                 output: "first ok".into(),
                 is_error: false,
+                presentation: crate::brain::store::ToolResultPresentation::Generic,
             },
             BrainEventKind::ToolCall {
                 request_seq: 1,
@@ -10264,6 +10470,7 @@ mod tests {
                 tool_id: "tool-2".into(),
                 output: "second ok".into(),
                 is_error: false,
+                presentation: crate::brain::store::ToolResultPresentation::Generic,
             },
             BrainEventKind::ApprovalRequested {
                 request_seq: 1,

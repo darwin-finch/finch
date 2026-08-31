@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 16;
 /// Completed audit histories retained per named Brain. Together with the
 /// bounded intent/outcome encodings this caps the audit projection and its
 /// share of `events.jsonl`; unresolved write-ahead entries are never pruned.
@@ -387,6 +387,34 @@ pub enum ProgramLanguage {
     Lisp,
 }
 
+/// Durable, frontend-safe interpretation of a tool result.
+///
+/// The raw result remains the provider continuation payload.  This companion
+/// records the semantic UI state needed to reconstruct a fresh named-Brain
+/// transcript without reparsing an opaque transport response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolResultPresentation {
+    /// Historical/general tool results retain the existing plain-text view.
+    #[default]
+    Generic,
+    /// A provider-native VM submission. `output_chunks` are the ordered
+    /// accepted `say` effects; they are not a request to re-execute effects.
+    SubmitProgram {
+        language: String,
+        source: String,
+        output_chunks: Vec<String>,
+        summary: String,
+        diagnostics: Vec<String>,
+    },
+}
+
+impl ToolResultPresentation {
+    fn is_generic(&self) -> bool {
+        matches!(self, Self::Generic)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainScheduleDeliveryPolicy {
@@ -541,6 +569,10 @@ pub enum BrainEventKind {
         tool_id: String,
         output: String,
         is_error: bool,
+        /// Semantic replay data for transcript projection. Legacy records
+        /// decode as `Generic` and preserve their historical raw rendering.
+        #[serde(default, skip_serializing_if = "ToolResultPresentation::is_generic")]
+        presentation: ToolResultPresentation,
     },
     ApprovalRequested {
         request_seq: u64,
@@ -7566,6 +7598,7 @@ mod tests {
                     tool_id: "tool-1".into(),
                     output: "found".into(),
                     is_error: false,
+                    presentation: ToolResultPresentation::Generic,
                 },
             )
             .unwrap();

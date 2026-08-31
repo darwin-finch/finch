@@ -1070,6 +1070,7 @@ struct BrainToolResult {
   toolId     @1 :Text;
   output     @2 :Text;
   isError    @3 :Bool;
+  presentation @4 :JsonValue;
 }
 
 struct BrainApprovalRequested {
