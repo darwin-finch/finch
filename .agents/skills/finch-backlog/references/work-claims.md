@@ -6,10 +6,10 @@ If a worker cannot post a comment and obtain its GitHub URL, it must not start i
 
 ## Claim an issue
 
-After creating the branch/worktree and before editing production files, post a human-readable summary followed by exactly this machine-readable block:
+After creating the branch/worktree and before editing production files, post a human-readable summary followed by exactly this machine-readable block. The machine-readable block is an HTML comment and does not render on GitHub, so the human-readable line must itself name the owning worker and its GitHub actor; a reader must be able to tell who holds the issue without viewing the comment source. The names in that line must match the block's `worker` and `github-actor` values exactly.
 
 ```text
-Claiming implementation of #<issue> for <bounded outcome and file/semantic scope>.
+`<worker>` (<github-actor>) is claiming implementation of #<issue> for <bounded outcome and file/semantic scope>.
 
 <!-- finch-work-claim:v1
 event: claim
@@ -24,7 +24,7 @@ timestamp: <UTC RFC 3339>
 -->
 ```
 
-Use a lowercase UUID for `claim-id`, a full 40-character commit for `base`, a single-line `scope`, and UTC RFC 3339 seconds for `timestamp`. Every field is required; use the literal `none` only for `github-actor` or `worktree` when genuinely unavailable. Never put credentials, host secrets, private prompts, or untrusted multiline content in the block.
+Use a lowercase UUID for `claim-id`, a full 40-character commit for `base`, a single-line `scope`, and UTC RFC 3339 seconds for `timestamp`. Make `worker` identify the tool and session distinctly enough that a reader can tell two concurrent workers apart, including when both post under the same `github-actor`. Every field is required; use the literal `none` only for `github-actor` or `worktree` when genuinely unavailable. Never put credentials, host secrets, private prompts, or untrusted multiline content in the block.
 
 Save the returned GitHub comment URL. Immediately reread all `finch-work-claim:v1` events on the issue before editing. If two active claims overlap, the claim whose GitHub comment has the earlier `createdAt` wins; if equal, the lower numeric GitHub comment ID wins. The later claimant must post a `release` event and select non-overlapping work. Client-supplied `timestamp` never decides a collision.
 
@@ -38,7 +38,7 @@ ownership-integrity failure and stop rather than reconstructing intent.
 
 ## Determine whether a claim is active
 
-Process immutable claim events in GitHub `createdAt` order, breaking ties by numeric comment ID. A claim remains active until a later valid, issuer-authorized `release`, `complete`, or `supersede` event names the same `claim-id`. Ignore malformed blocks as ownership records and report them as diagnostics rather than guessing their intent.
+Process immutable claim events in GitHub `createdAt` order, breaking ties by numeric comment ID. A claim remains active until a later valid, issuer-authorized `release`, `complete`, or `supersede` event names the same `claim-id`. Ignore malformed blocks as ownership records and report them as diagnostics rather than guessing their intent. A block is malformed when it is not wrapped in an HTML comment, omits `event`, or renames a required field (for example `base-sha` for `base`, or `claimed-at` for `timestamp`). When a malformed block is nonetheless corroborated by a live branch, worktree, or running worker, do not take the issue: treat the corroborated work as active, report the defect, and select other work.
 
 At every required claim check:
 
@@ -59,7 +59,7 @@ Two claims conflict when their promised file sets or semantic authority overlap,
 Post exactly one terminal event when the work merges, pauses indefinitely, is handed off, or is proven superseded:
 
 ```text
-Releasing claim `<claim-id>`: <merged, handed off, blocked, or superseded reason and evidence>.
+`<worker>` (<github-actor>) is releasing claim `<claim-id>`: <merged, handed off, blocked, or superseded reason and evidence>.
 
 <!-- finch-work-claim:v1
 event: <release|complete|supersede>
