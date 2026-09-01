@@ -415,43 +415,55 @@ impl MemTree {
             .unwrap_or(0)
     }
 
-    /// Update parent node's embedding to be average of children
+    /// Update a node's embedding to the average of its children, then do the
+    /// same for each of its ancestors.
+    ///
+    /// Iterative with a visited set, not recursive. `parent` links come from
+    /// `tree_nodes` rows on disk, and a corrupt or self-referential chain — a
+    /// node that is its own ancestor — made this recurse until the thread
+    /// overflowed its stack, which aborts the **process** (SIGABRT) rather than
+    /// returning an error. That is unrecoverable and takes down whatever else
+    /// the process was doing. A cycle is now a plain `Err` naming the node
+    /// (#274).
     fn update_parent_aggregation(&mut self, node_id: NodeId) -> Result<()> {
-        let node = self.nodes.get(&node_id).ok_or_else(|| {
-            anyhow::anyhow!("memtree: node {} not found during aggregation", node_id)
-        })?;
+        let mut visited: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        let mut current = node_id;
 
-        if node.children.is_empty() {
-            return Ok(());
+        loop {
+            anyhow::ensure!(
+                visited.insert(current),
+                "memtree: parent chain from node {node_id} cycles at node {current}; \
+                 the stored tree is corrupt"
+            );
+
+            let node = self.nodes.get(&current).ok_or_else(|| {
+                anyhow::anyhow!("memtree: node {} not found during aggregation", current)
+            })?;
+
+            // A childless node keeps its own embedding, but its ancestors are
+            // still walked: the caller may have just moved a child away from
+            // one of them.
+            if !node.children.is_empty() {
+                let child_embeddings: Vec<_> = node
+                    .children
+                    .iter()
+                    .filter_map(|child_id| self.nodes.get(child_id))
+                    .map(|child| &child.embedding)
+                    .collect();
+                if !child_embeddings.is_empty() {
+                    let aggregated = average_embeddings(&child_embeddings);
+                    let node = self.nodes.get_mut(&current).ok_or_else(|| {
+                        anyhow::anyhow!("memtree: node {} not found for embedding update", current)
+                    })?;
+                    node.embedding = aggregated;
+                }
+            }
+
+            let Some(parent_id) = self.nodes.get(&current).and_then(|node| node.parent) else {
+                return Ok(());
+            };
+            current = parent_id;
         }
-
-        // Collect child embeddings
-        let child_embeddings: Vec<_> = node
-            .children
-            .iter()
-            .filter_map(|child_id| self.nodes.get(child_id))
-            .map(|child| &child.embedding)
-            .collect();
-
-        if child_embeddings.is_empty() {
-            return Ok(());
-        }
-
-        // Compute average
-        let aggregated = average_embeddings(&child_embeddings);
-
-        // Update parent embedding
-        let parent = self.nodes.get_mut(&node_id).ok_or_else(|| {
-            anyhow::anyhow!("memtree: node {} not found for embedding update", node_id)
-        })?;
-        parent.embedding = aggregated;
-
-        // Recursively update ancestors
-        if let Some(parent_id) = parent.parent {
-            self.update_parent_aggregation(parent_id)?;
-        }
-
-        Ok(())
     }
 
     /// Retrieve top-k most relevant nodes (flat retrieval with importance weighting).
@@ -538,6 +550,121 @@ mod tests {
         v[axis] = 1.0;
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         v.iter().map(|x| x / norm).collect()
+    }
+
+    #[test]
+    fn test_aggregation_reports_a_parent_cycle_instead_of_aborting_the_process() {
+        // `parent` links are rebuilt from `tree_nodes` rows on disk. A corrupt
+        // chain — a node that is its own ancestor — made
+        // `update_parent_aggregation` recurse until the thread overflowed its
+        // stack, which is SIGABRT: the whole process dies, taking down whatever
+        // else it was doing, and no `Result` is ever returned (#274).
+        let mut tree = MemTree::new_with_dim(4);
+        let a = tree
+            .insert("first stored memory".to_string(), vec_on(0, 4, 0.0), 1)
+            .unwrap();
+        let b = tree
+            .insert("second stored memory".to_string(), vec_on(1, 4, 0.0), 1)
+            .unwrap();
+        assert_ne!(a, b, "the two memories must be distinct nodes");
+
+        // Point the root at one of its own descendants, the way a bad
+        // `parent_id` column does.
+        {
+            let nodes = tree.all_nodes_mut();
+            let root = nodes.get_mut(&0).expect("root");
+            root.parent = Some(a);
+        }
+
+        let error = tree
+            .update_parent_aggregation(b)
+            .expect_err("a parent cycle must be an error, not a stack overflow");
+        let message = error.to_string();
+        assert!(
+            message.contains("cycles at node"),
+            "the error must name the cycle so a corrupt store is diagnosable; \
+             got {message:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_reports_a_self_parenting_node() {
+        // The degenerate case: one node whose parent is itself. This is what an
+        // off-by-one in `set_next_id` produces, and it recursed forever too.
+        let mut tree = MemTree::new_with_dim(4);
+        let leaf = tree
+            .insert("a stored memory".to_string(), vec_on(0, 4, 0.0), 1)
+            .unwrap();
+        {
+            let nodes = tree.all_nodes_mut();
+            nodes.get_mut(&leaf).expect("leaf").parent = Some(leaf);
+        }
+
+        let error = tree
+            .update_parent_aggregation(leaf)
+            .expect_err("a self-parenting node must be an error");
+        assert!(error.to_string().contains("cycles at node"), "got {error}");
+    }
+
+    #[test]
+    fn test_aggregation_from_a_leaf_updates_every_ancestor() {
+        // The guard must not stop the walk, and the walk must not stop at a
+        // childless node. Aggregating from a leaf used to return immediately
+        // without touching a single ancestor — dead in production only because
+        // both callers happen to pass a node that just gained children, and a
+        // trap for the next caller. A change at a leaf must reach the root.
+        let mut tree = MemTree::new_with_dim(4);
+        tree.insert("shared topic alpha".to_string(), vec_on(0, 4, 0.05), 1)
+            .unwrap();
+        tree.insert(
+            "shared topic alpha again".to_string(),
+            vec_on(0, 4, 0.06),
+            1,
+        )
+        .unwrap();
+        tree.insert("unrelated topic beta".to_string(), vec_on(2, 4, 0.05), 1)
+            .unwrap();
+
+        // A leaf at least two levels below the root, so the walk has to pass
+        // through an intermediate node to reach it.
+        let deep_leaf = *tree
+            .all_nodes()
+            .iter()
+            .find(|(id, node)| {
+                **id != tree.root
+                    && node.children.is_empty()
+                    && node.parent.is_some_and(|parent| parent != tree.root)
+            })
+            .map(|(id, _)| id)
+            .expect("promotion must produce a leaf below an intermediate node");
+        let intermediate = tree
+            .all_nodes()
+            .get(&deep_leaf)
+            .and_then(|node| node.parent)
+            .expect("the leaf has a parent");
+
+        let root_before = tree.all_nodes()[&tree.root].embedding.clone();
+        let intermediate_before = tree.all_nodes()[&intermediate].embedding.clone();
+
+        // Rewrite the leaf behind the tree's back, then re-aggregate from it.
+        tree.all_nodes_mut()
+            .get_mut(&deep_leaf)
+            .expect("leaf")
+            .embedding = vec_on(3, 4, 0.0);
+        tree.update_parent_aggregation(deep_leaf)
+            .expect("a well-formed chain must aggregate");
+
+        assert_ne!(
+            intermediate_before,
+            tree.all_nodes()[&intermediate].embedding,
+            "the leaf's parent must be recomputed"
+        );
+        assert_ne!(
+            root_before,
+            tree.all_nodes()[&tree.root].embedding,
+            "the change must reach the root; an early return leaves stale \
+             aggregates all the way up"
+        );
     }
 
     #[test]
