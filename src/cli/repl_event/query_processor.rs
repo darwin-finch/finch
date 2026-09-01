@@ -619,33 +619,7 @@ pub(super) async fn refresh_context_strip(
         return;
     };
 
-    let n = summary.lines.len();
-
-    // Format each line with an appropriate prefix:
-    //   single line                → "   └─ now: <text>"
-    //   first of multiple          → "📋 <text>"
-    //   middle lines               → "   ├─ <text>"
-    //   last of multiple           → "   └─ now: <text>"
-    for (i, text) in summary.lines.iter().enumerate() {
-        let label = if n == 1 {
-            format!("   └─ now: {}", text)
-        } else if i == 0 {
-            format!("📋 {}", text)
-        } else if i == n - 1 {
-            format!("   └─ now: {}", text)
-        } else {
-            format!("   ├─ {}", text)
-        };
-        status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::ContextLine(i),
-            label,
-        );
-    }
-
-    // Remove stale slots beyond what we just wrote (depth change or short history)
-    for i in n..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::ContextLine(i));
-    }
+    apply_context_summary_lines(status_bar, &summary.lines, context_lines);
 
     // OSC 0 — set terminal window title + tab title
     let title_topic = summary.lines.first().map(|s| {
@@ -662,6 +636,39 @@ pub(super) async fn refresh_context_strip(
     {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
     }
+}
+
+pub(super) fn apply_context_summary_lines(
+    status_bar: &StatusBar,
+    summary_lines: &[String],
+    context_lines: usize,
+) {
+    let depth = context_lines.saturating_sub(1).min(7);
+    let visible_lines = &summary_lines[..summary_lines.len().min(depth)];
+    let n = visible_lines.len();
+
+    // Format each line with an appropriate prefix:
+    //   single line                → "   └─ now: <text>"
+    //   first of multiple          → "📋 <text>"
+    //   middle lines               → "   ├─ <text>"
+    //   last of multiple           → "   └─ now: <text>"
+    let labels = visible_lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let label = if n == 1 {
+                format!("   └─ now: {}", text)
+            } else if i == 0 {
+                format!("📋 {}", text)
+            } else if i == n - 1 {
+                format!("   └─ now: {}", text)
+            } else {
+                format!("   ├─ {}", text)
+            };
+            label
+        })
+        .collect::<Vec<_>>();
+    status_bar.replace_semantic_context(&labels);
 }
 
 async fn persist_completed_turn_memory(
@@ -1924,6 +1931,71 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_context_strip_uses_selected_budget_and_removes_stale_rows() {
+        let status_bar = StatusBar::new();
+        let summary = (0..10)
+            .map(|index| format!("summary-{index}"))
+            .collect::<Vec<_>>();
+
+        for budget in 1..=8 {
+            apply_context_summary_lines(&status_bar, &summary, budget);
+            let visible = status_bar
+                .get_lines()
+                .into_iter()
+                .filter(|line| {
+                    matches!(
+                        line.line_type,
+                        crate::cli::status_bar::StatusLineType::ContextLine(_)
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(visible.len(), budget - 1, "budget {budget}");
+            assert!(visible
+                .iter()
+                .all(|line| !line.content.contains("summary-7")));
+        }
+
+        apply_context_summary_lines(&status_bar, &summary, 1);
+        assert!(status_bar.get_lines().iter().all(|line| !matches!(
+            line.line_type,
+            crate::cli::status_bar::StatusLineType::ContextLine(_)
+        )));
+    }
+
+    #[test]
+    fn test_semantic_refresh_cannot_erase_active_brain_until_explicit_release() {
+        let status_bar = StatusBar::new();
+        status_bar.replace_brain_context(&["durable Brain row".to_string()]);
+
+        apply_context_summary_lines(&status_bar, &[], 5);
+        let active = status_bar.get_lines();
+        assert!(active.iter().any(|line| {
+            matches!(
+                line.line_type,
+                crate::cli::status_bar::StatusLineType::BrainContextLine(0)
+            ) && line.content == "durable Brain row"
+        }));
+        assert!(active.iter().all(|line| !matches!(
+            line.line_type,
+            crate::cli::status_bar::StatusLineType::ContextLine(_)
+        )));
+
+        status_bar.release_brain_context();
+        apply_context_summary_lines(&status_bar, &["semantic after detach".to_string()], 5);
+        let detached = status_bar.get_lines();
+        assert!(detached.iter().any(|line| {
+            matches!(
+                line.line_type,
+                crate::cli::status_bar::StatusLineType::ContextLine(0)
+            ) && line.content.contains("semantic after detach")
+        }));
+        assert!(detached.iter().all(|line| !matches!(
+            line.line_type,
+            crate::cli::status_bar::StatusLineType::BrainContextLine(_)
+        )));
+    }
 
     #[test]
     fn streaming_requires_both_user_opt_in_and_provider_support() {

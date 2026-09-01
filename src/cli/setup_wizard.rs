@@ -1030,7 +1030,10 @@ impl WizardState {
                     .unwrap_or(true),
                 memory_context_lines: existing_config
                     .map(|c| c.features.memory_context_lines)
-                    .unwrap_or(4),
+                    .unwrap_or_else(|| {
+                        crate::config::FeaturesConfig::default().memory_context_lines
+                    })
+                    .clamp(MIN_MEMORY_CONTEXT_LINES, MAX_MEMORY_CONTEXT_LINES),
                 selected_idx: 0,
             },
         );
@@ -1227,7 +1230,11 @@ pub fn run_setup_wizard() -> Result<Option<SetupResult>> {
 ///
 /// Used both by `main.rs` (first-run) and by the `/setup` REPL command.
 pub fn apply_and_save(result: &SetupResult) -> Result<()> {
-    config_from_setup_result(result).save()?;
+    apply_and_save_for(SetupInvocation::Command, result)
+}
+
+fn apply_and_save_for(invocation: SetupInvocation, result: &SetupResult) -> Result<()> {
+    config_from_setup_result_for(invocation, result).save()?;
     if let Some(prompt) = result.custom_system_prompt.as_deref() {
         crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
     }
@@ -1376,6 +1383,17 @@ pub async fn validate_and_apply_for(
     invocation: SetupInvocation,
     result: &SetupResult,
 ) -> Result<SetupApplyOutcome> {
+    validate_and_apply_for_with_save(invocation, result, &|config| config.save()).await
+}
+
+async fn validate_and_apply_for_with_save<F>(
+    invocation: SetupInvocation,
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
     tracing::debug!(?invocation, "Starting shared setup commit ceremony");
     if result
         .providers
@@ -1387,7 +1405,11 @@ pub async fn validate_and_apply_for(
         );
     }
     if chatgpt_setup_references(result).is_empty() {
-        apply_and_save(result)?;
+        let config = config_from_setup_result_for(invocation, result);
+        save_config(&config)?;
+        if let Some(prompt) = result.custom_system_prompt.as_deref() {
+            crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
+        }
         return Ok(SetupApplyOutcome::Saved);
     }
     let service = crate::cli::chatgpt_auth::ChatGptAuthService::production()?;
@@ -1397,7 +1419,7 @@ pub async fn validate_and_apply_for(
     else {
         return Ok(SetupApplyOutcome::Cancelled);
     };
-    save_chatgpt_setup_config(&config, &compensations, &service, |config| config.save())?;
+    save_chatgpt_setup_config(&config, &compensations, &service, save_config)?;
     if let Some(prompt) = committed_result.custom_system_prompt.as_deref() {
         crate::config::Persona::save_system_prompt_override(
             &committed_result.default_persona,
@@ -1840,17 +1862,47 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
 
 /// Run the shared ceremony for automatic first-run setup.
 pub async fn validate_first_run_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
-    validate_and_apply_for(SetupInvocation::FirstRun, result).await
+    validate_first_run_and_apply_with_save(result, &|config| config.save()).await
+}
+
+async fn validate_first_run_and_apply_with_save<F>(
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
+    validate_and_apply_for_with_save(SetupInvocation::FirstRun, result, save_config).await
 }
 
 /// Run the shared ceremony for the explicit `finch setup` command.
 pub async fn validate_command_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
-    validate_and_apply_for(SetupInvocation::Command, result).await
+    validate_command_and_apply_with_save(result, &|config| config.save()).await
+}
+
+async fn validate_command_and_apply_with_save<F>(
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
+    validate_and_apply_for_with_save(SetupInvocation::Command, result, save_config).await
 }
 
 /// Run the shared ceremony for the in-session `/setup` command.
 pub async fn validate_repl_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
-    validate_and_apply_for(SetupInvocation::Repl, result).await
+    validate_repl_and_apply_with_save(result, &|config| config.save()).await
+}
+
+async fn validate_repl_and_apply_with_save<F>(
+    result: &SetupResult,
+    save_config: &F,
+) -> Result<SetupApplyOutcome>
+where
+    F: Fn(&crate::config::Config) -> Result<()>,
+{
+    validate_and_apply_for_with_save(SetupInvocation::Repl, result, save_config).await
 }
 
 /// Convert wizard output into the complete configuration written to disk.
@@ -1859,8 +1911,19 @@ pub async fn validate_repl_and_apply(result: &SetupResult) -> Result<SetupApplyO
 /// in-REPL `/setup` command cannot silently persist different subsets of the
 /// settings shown by the wizard.
 fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
+    config_from_setup_result_for(SetupInvocation::Command, result)
+}
+
+fn config_from_setup_result_for(
+    invocation: SetupInvocation,
+    result: &SetupResult,
+) -> crate::config::Config {
     use crate::config::Config;
 
+    tracing::debug!(
+        ?invocation,
+        "Mapping setup result through shared configuration path"
+    );
     let providers = result.providers.clone();
     apply_setup_result_to_config(
         result,
@@ -2136,6 +2199,17 @@ fn handle_wizard_key(
         return Ok(WizardAction::Save);
     }
 
+    // Left/Right normally changes top-level tabs. The selected Context lines
+    // row owns those keys, however, so route them to the Settings control
+    // before global navigation can swallow them.
+    if !nested
+        && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        && features_context_lines_selected(state)
+    {
+        handle_section_input(state, key)?;
+        return Ok(WizardAction::Continue);
+    }
+
     match key.code {
         KeyCode::Tab if !nested => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -2159,6 +2233,15 @@ fn handle_wizard_key(
     }
 
     Ok(WizardAction::Continue)
+}
+
+fn features_context_lines_selected(state: &WizardState) -> bool {
+    state.current_section == WizardSection::Features
+        && matches!(
+            state.sections.get(&WizardSection::Features),
+            Some(SectionState::Features { selected_idx, .. })
+                if *selected_idx == SETTINGS_CONTEXT_IDX
+        )
 }
 
 /// If a network scan has finished, advance to SelectAgent (or close overlay if no agents)
@@ -3423,6 +3506,8 @@ const SETTINGS_AUTO_DISCOVER_IDX: usize = 7;
 const SETTINGS_CONTEXT_IDX: usize = 9;
 #[cfg(not(target_os = "macos"))]
 const SETTINGS_CONTEXT_IDX: usize = 8;
+const MIN_MEMORY_CONTEXT_LINES: usize = 1;
+const MAX_MEMORY_CONTEXT_LINES: usize = 8;
 
 /// Handle input for Features section (with arrow key navigation)
 fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -3588,14 +3673,16 @@ fn handle_features_input_impl(
                 }
             }
             KeyCode::Left => {
-                // Decrement context_lines spinner (min 1)
-                if *selected_idx == SETTINGS_CONTEXT_IDX && *memory_context_lines > 1 {
+                if *selected_idx == SETTINGS_CONTEXT_IDX
+                    && *memory_context_lines > MIN_MEMORY_CONTEXT_LINES
+                {
                     *memory_context_lines -= 1;
                 }
             }
             KeyCode::Right => {
-                // Increment context_lines spinner (max 8)
-                if *selected_idx == SETTINGS_CONTEXT_IDX && *memory_context_lines < 8 {
+                if *selected_idx == SETTINGS_CONTEXT_IDX
+                    && *memory_context_lines < MAX_MEMORY_CONTEXT_LINES
+                {
                     *memory_context_lines += 1;
                 }
             }
@@ -5830,8 +5917,16 @@ fn render_features_section(
             Line::from(vec![
                 Span::raw("        "),
                 Span::styled(
-                    "Status-strip summary lines shown below the prompt (1–8)",
-                    Style::default().fg(Color::DarkGray),
+                    if is_selected {
+                        "Left/Right: change status-strip lines (1–8)"
+                    } else {
+                        "Status-strip summary lines shown below the prompt (1–8)"
+                    },
+                    if is_selected {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
             ]),
         ];
@@ -5887,7 +5982,7 @@ fn render_features_section(
             if show_gui_details {
                 "R: Check | P: Prompt | O/D: More"
             } else {
-                "↑/↓: Move | Space: Toggle | E: Edit | Enter: Continue"
+                "↑/↓: Move | Left/Right: Context lines | Space: Toggle | E: Edit | Enter: Continue"
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -6226,6 +6321,141 @@ mod tests {
         assert_ne!(SETTINGS_FINCH_API_KEY_IDX, SETTINGS_AUTO_DISCOVER_IDX);
         assert_eq!(SETTINGS_AUTO_DISCOVER_IDX + 1, SETTINGS_CONTEXT_IDX);
         assert_eq!(SETTINGS_CONTEXT_IDX, SETTINGS_FEATURE_COUNT - 1);
+    }
+
+    #[test]
+    fn test_context_lines_selected_row_owns_left_right_across_full_range() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features {
+            selected_idx,
+            memory_context_lines,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *selected_idx = SETTINGS_CONTEXT_IDX;
+            assert_eq!(*memory_context_lines, 5);
+        } else {
+            panic!("expected settings section");
+        }
+
+        for expected in 6..=MAX_MEMORY_CONTEXT_LINES {
+            handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+            assert_eq!(state.current_section, WizardSection::Features);
+            assert_eq!(context_lines_from_state(&state), expected);
+        }
+        handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+        assert_eq!(context_lines_from_state(&state), MAX_MEMORY_CONTEXT_LINES);
+
+        for expected in (MIN_MEMORY_CONTEXT_LINES..MAX_MEMORY_CONTEXT_LINES).rev() {
+            handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+            assert_eq!(state.current_section, WizardSection::Features);
+            assert_eq!(context_lines_from_state(&state), expected);
+        }
+        handle_wizard_key(&mut state, key(KeyCode::Left)).unwrap();
+        assert_eq!(context_lines_from_state(&state), MIN_MEMORY_CONTEXT_LINES);
+    }
+
+    fn context_lines_from_state(state: &WizardState) -> usize {
+        match state.sections.get(&WizardSection::Features) {
+            Some(SectionState::Features {
+                memory_context_lines,
+                ..
+            }) => *memory_context_lines,
+            _ => panic!("expected settings section"),
+        }
+    }
+
+    #[test]
+    fn test_context_lines_selected_row_is_discoverable_on_narrow_terminals() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features { selected_idx, .. }) =
+            state.sections.get_mut(&WizardSection::Features)
+        {
+            *selected_idx = SETTINGS_CONTEXT_IDX;
+        }
+
+        for (width, height) in [(80, 24), (40, 18)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_tabbed_wizard(frame, &state))
+                .unwrap();
+            let rendered = test_buffer_text(terminal.backend().buffer());
+            assert!(
+                rendered.contains("Context lines: 5"),
+                "selected value missing at {width}x{height}: {rendered}"
+            );
+            assert!(
+                rendered.contains("Left/Right"),
+                "editing keys missing at {width}x{height}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_lines_save_and_reopen_through_all_setup_invocations() {
+        for invocation in [
+            SetupInvocation::FirstRun,
+            SetupInvocation::Command,
+            SetupInvocation::Repl,
+        ] {
+            for selected in MIN_MEMORY_CONTEXT_LINES..=MAX_MEMORY_CONTEXT_LINES {
+                let mut state = WizardState::new(None);
+                if let Some(SectionState::Features {
+                    memory_context_lines,
+                    ..
+                }) = state.sections.get_mut(&WizardSection::Features)
+                {
+                    *memory_context_lines = selected;
+                }
+                let mut result = build_setup_result(&state).unwrap();
+                // This regression targets the shared setup persistence boundary,
+                // not provider authentication or environment API-key discovery.
+                result.providers = vec![ProviderEntry::Local {
+                    inference_provider: InferenceProvider::Onnx,
+                    execution_target: ExecutionTarget::Auto,
+                    model_family: ModelFamily::Qwen2,
+                    model_size: ModelSize::Medium,
+                    model_repo: None,
+                    model_path: None,
+                    enabled: true,
+                    name: Some("context-lines-persistence-test".to_string()),
+                }];
+                result.credentials.clear();
+                let directory = tempfile::tempdir().unwrap();
+                let config_path = directory.path().join("config.toml");
+                let save = |config: &crate::config::Config| config.save_to(&config_path);
+                let outcome = match invocation {
+                    SetupInvocation::FirstRun => {
+                        validate_first_run_and_apply_with_save(&result, &save).await
+                    }
+                    SetupInvocation::Command => {
+                        validate_command_and_apply_with_save(&result, &save).await
+                    }
+                    SetupInvocation::Repl => {
+                        validate_repl_and_apply_with_save(&result, &save).await
+                    }
+                }
+                .unwrap();
+                assert_eq!(outcome, SetupApplyOutcome::Saved);
+                let reopened_config = crate::config::load_config_from_path_with_paths(
+                    &config_path,
+                    directory.path().join("metrics"),
+                    None,
+                )
+                .unwrap();
+                let reopened = WizardState::new(Some(&reopened_config));
+                assert_eq!(
+                    context_lines_from_state(&reopened),
+                    selected,
+                    "{invocation:?} did not preserve the selected budget"
+                );
+            }
+        }
     }
 
     #[test]

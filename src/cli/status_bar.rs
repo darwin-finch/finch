@@ -10,6 +10,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextProjectionAuthority {
+    Semantic,
+    Brain,
+}
+
 /// Types of status lines
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StatusLineType {
@@ -57,6 +63,7 @@ pub struct StatusLine {
 pub struct StatusBar {
     /// Active status lines (keyed by type)
     lines: Arc<RwLock<HashMap<StatusLineType, String>>>,
+    context_projection: Arc<RwLock<ContextProjectionAuthority>>,
 }
 
 impl StatusBar {
@@ -64,7 +71,45 @@ impl StatusBar {
     pub fn new() -> Self {
         Self {
             lines: Arc::new(RwLock::new(HashMap::new())),
+            context_projection: Arc::new(RwLock::new(ContextProjectionAuthority::Semantic)),
         }
+    }
+
+    /// Replace semantic-memory context rows unless a selected Brain owns the
+    /// projection. Returns false when the durable Brain projection wins.
+    pub(crate) fn replace_semantic_context(&self, contents: &[String]) -> bool {
+        let authority = self.context_projection.write().unwrap();
+        if *authority == ContextProjectionAuthority::Brain {
+            return false;
+        }
+        let mut lines = self.lines.write().unwrap();
+        remove_context_family(&mut lines, false);
+        for (index, content) in contents.iter().enumerate() {
+            lines.insert(StatusLineType::ContextLine(index), content.clone());
+        }
+        true
+    }
+
+    /// Make a selected Brain authoritative and atomically replace all semantic
+    /// and prior Brain context rows.
+    pub(crate) fn replace_brain_context(&self, contents: &[String]) {
+        let mut authority = self.context_projection.write().unwrap();
+        let mut lines = self.lines.write().unwrap();
+        remove_context_family(&mut lines, false);
+        remove_context_family(&mut lines, true);
+        for (index, content) in contents.iter().enumerate() {
+            lines.insert(StatusLineType::BrainContextLine(index), content.clone());
+        }
+        *authority = ContextProjectionAuthority::Brain;
+    }
+
+    /// Release Brain projection ownership on detach. Semantic rows remain empty
+    /// until the caller refreshes them from memory.
+    pub(crate) fn release_brain_context(&self) {
+        let mut authority = self.context_projection.write().unwrap();
+        let mut lines = self.lines.write().unwrap();
+        remove_context_family(&mut lines, true);
+        *authority = ContextProjectionAuthority::Semantic;
     }
 
     /// Add or update a status line
@@ -372,8 +417,18 @@ impl Clone for StatusBar {
     fn clone(&self) -> Self {
         Self {
             lines: Arc::clone(&self.lines),
+            context_projection: Arc::clone(&self.context_projection),
         }
     }
+}
+
+fn remove_context_family(lines: &mut HashMap<StatusLineType, String>, brain: bool) {
+    lines.retain(|line_type, _| {
+        !matches!(
+            (brain, line_type),
+            (false, StatusLineType::ContextLine(_)) | (true, StatusLineType::BrainContextLine(_))
+        )
+    });
 }
 
 #[cfg(test)]
