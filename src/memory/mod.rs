@@ -920,14 +920,22 @@ impl MemorySystem {
             let conn = db.lock().await;
             Self::load_child_edges(&conn)
         };
-        let edges = match edges {
-            Ok(edges) => edges,
-            Err(error) => {
-                tracing::error!(%error, "MemTree hydration could not read child links");
-                state.fail(error.to_string());
-                return;
-            }
-        };
+        // Degrade, do not abandon hydration. This query only buys read purity
+        // during the window; failing it used to call `fail()`, which opens the
+        // write gate against a tree holding nothing but a fresh root — so the
+        // next write would attach under that root and `save_all_nodes_to_db`
+        // would persist it, which is the durable misplacement the gate exists
+        // to prevent. Falling back to an empty map reproduces exactly the
+        // pre-#242 behaviour: flat until the final pass, then a complete and
+        // correctly linked tree.
+        let edges = edges.unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                "MemTree hydration could not read child links; reads during \
+                 hydration may return internal nodes until the final pass"
+            );
+            HashMap::new()
+        });
 
         let mut cursor: Option<u64> = None;
         loop {
@@ -1002,6 +1010,19 @@ impl MemorySystem {
     /// on hydration finishing, so the only way one can reach a write is a
     /// hydration that *failed* partway: this pass runs there too, and the
     /// rebuild is what prunes them.
+    ///
+    /// Do not add an await after the guard is taken. Clearing before
+    /// repopulating means a reader that observed the tree mid-pass would see
+    /// every node in a fully loaded tree looking like a leaf — the defect this
+    /// linking exists to prevent, at maximum blast radius. The pass is
+    /// currently await-free from `tree.lock()` to the end, and that is what
+    /// makes clearing safe rather than an accident worth preserving silently.
+    ///
+    /// It also means read purity is a success-path property. After a *failed*
+    /// hydration an internal node whose children never loaded is pruned to an
+    /// empty child list and does answer queries as a leaf for the rest of the
+    /// session. That is the deliberate trade: a partial index that writes
+    /// safely, over a pure one that corrupts.
     async fn link_loaded_children(tree: &Arc<Mutex<MemTree>>) {
         let mut guard = tree.lock().await;
         let parents: Vec<(u64, u64)> = guard
@@ -1026,12 +1047,17 @@ impl MemorySystem {
     /// Every parent's child list, as one compact query.
     ///
     /// Two integers per row and no embeddings, so this is cheap enough to run
-    /// before the first batch. `idx_tree_nodes_parent` covers the scan.
+    /// before the first batch: about 8 ms and a couple of megabytes resident
+    /// for the dogfood store's 16,782 rows, against 131 MiB of embeddings and
+    /// the 3.25 s this change exists to remove.
+    ///
+    /// No `ORDER BY`. Adding one on `node_id` turns this into a full table
+    /// scan; without it `idx_tree_nodes_parent` covers the query outright. The
+    /// order is not needed either way — every consumer of these lists reads
+    /// only `is_empty()` or `len()`, and `link_loaded_children` sorts.
     fn load_child_edges(conn: &Connection) -> Result<HashMap<u64, Vec<u64>>> {
-        let mut stmt = conn.prepare(
-            "SELECT parent_id, node_id FROM tree_nodes
-             WHERE parent_id IS NOT NULL ORDER BY node_id ASC",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT parent_id, node_id FROM tree_nodes WHERE parent_id IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
         })?;
@@ -1925,6 +1951,53 @@ mod tests {
             vec![5],
             "a child in an earlier batch must be linked to its later parent"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_child_edges_are_read_in_one_query_before_any_node_loads() -> Result<()> {
+        // The seeding this depends on is what keeps an internal node from
+        // looking like a leaf mid-hydration, so the query itself is worth
+        // pinning: it must return every parent's full child list, including a
+        // parent whose id is higher than its child's.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config)?);
+        seed_tree_nodes(temp.path(), 6, &[(2, 5)])?;
+
+        let conn = Connection::open(temp.path())?;
+        let edges = MemorySystem::load_child_edges(&conn)?;
+
+        let mut root_children = edges.get(&0).cloned().unwrap_or_default();
+        root_children.sort_unstable();
+        assert_eq!(
+            root_children,
+            vec![1, 3, 4, 5],
+            "every child of the root must be listed"
+        );
+        assert_eq!(
+            edges.get(&5).cloned().unwrap_or_default(),
+            vec![2],
+            "a parent whose id is higher than its child's must still be linked"
+        );
+        assert!(
+            !edges.contains_key(&1),
+            "a leaf must have no entry, so its `children` stays empty and \
+             retrieval still treats it as a leaf"
+        );
+
+        // An empty store is not an error — that is the fallback the hydration
+        // failure path relies on.
+        let empty = NamedTempFile::new()?;
+        drop(MemorySystem::new(MemoryConfig {
+            db_path: empty.path().to_path_buf(),
+            ..Default::default()
+        })?);
+        let conn = Connection::open(empty.path())?;
+        assert!(MemorySystem::load_child_edges(&conn)?.is_empty());
         Ok(())
     }
 
