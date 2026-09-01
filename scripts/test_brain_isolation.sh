@@ -687,6 +687,8 @@ integration_inventory="$(
 )"
 expected_integration_inventory="$(cat <<'EOF'
 tests/daemon_integration_test.rs
+tests/daemon_log_rotation.rs
+tests/daemon_stdio_binding.rs
 tests/daemon_upgrade_preflight_test.rs
 tests/live.rs
 tests/live/impcpd.rs
@@ -779,7 +781,7 @@ expected_escape_uses="$(cat <<'EOF'
 src/bin/finch-test-supervisor.rs:if libc::setpgid(0, 0) == -1 {
 src/brain/mod.rs:.process_group(0)
 src/brain/mod.rs:if nix::libc::setpgid(0, 0) == -1 {
-src/daemon/spawn.rs:.process_group(0)
+src/daemon/spawn.rs:if nix::libc::setsid() == -1 {
 tests/no_external_provider_binary_test.rs:.process_group(0);
 EOF
 )"

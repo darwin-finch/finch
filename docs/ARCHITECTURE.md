@@ -669,7 +669,11 @@ Match the code style in src/lib.rs.
 
 **Sliding Window (Phase 1 — active):**
 - `apply_sliding_window(msgs, max)` trims to the most recent N messages (default: 20)
-- Older messages are accessible via MemTree semantic recall (injected per-query)
+- Older messages are accessible via MemTree semantic recall (injected per-query).
+  Recall quality is limited by open defects in #250: retrieval does not use the
+  tree structure, and parent nodes hold a provisional label rather than a
+  generated summary, so this is not yet the hierarchical narrative summary the
+  design intends.
 - Set `max_verbatim_messages = 0` in config to disable windowing
 
 **Conversation Summarization (Phase 2 — opt-in):**
@@ -704,11 +708,19 @@ The prefix pair keeps the required alternating user→assistant role ordering ex
 ```
 User query
     ↓
-NeuralEmbeddingEngine.embed(query)   ← all-MiniLM-L6-v2 ONNX (384-dim)
+EmbeddingEngine.embed(query)
+    ← all-MiniLM-L6-v2 ONNX (384-dim) when the model is in the HF cache
+    ← otherwise TfIdfEmbedding (2048-dim lexical), the fallback in
+      MemorySystem::new; this is what a machine that never downloaded
+      the model actually runs
     ↓
-MemTree ANN search (cosine similarity)
+Linear scan over every MemTree node, scored by cosine similarity
+    ← not an approximate-nearest-neighbour index: MemTree::retrieve
+      iterates all nodes. The tree structure is not used for search.
     ↓
-Top-K recalled snippets (default k=5)
+Top-K recalled snippets
+    ← k = context_recall_k (default 2) on the automatic per-turn path
+    ← k = max_context_items (default 5) for the search_memory tool
     ↓
 Injected into last user message:
   [Relevant memories from past sessions:

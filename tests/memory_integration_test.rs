@@ -102,9 +102,28 @@ async fn test_memory_stats() -> Result<()> {
     let stats = memory.stats().await?;
     // conversation_count is the raw SQL history — always incremented regardless of quality.
     assert_eq!(stats.conversation_count, 10);
-    // tree_node_count is the semantic index — incremented only for non-noise content.
-    // All 10 messages pass the quality filter, so they should all be indexed.
-    assert_eq!(stats.tree_node_count, 10);
+    // tree_node_count is the semantic index. All 10 messages pass the quality
+    // filter, so all 10 are indexed — but the count is not 10, because the
+    // index is a tree: promoting a matched leaf adds an internal node. Asserting
+    // equality with the input count asserted a flat list, which is the defect
+    // #250 was filed about. Assert the invariants instead: every message is
+    // present as a leaf, and the structure has not degenerated into a chain.
+    let (leaves, depth, _widest) = memory.index_shape().await;
+    assert_eq!(
+        leaves, 10,
+        "every indexed message must be present exactly once"
+    );
+    assert!(
+        stats.tree_node_count >= leaves,
+        "internal nodes are expected in addition to leaves"
+    );
+    // A constant bound, not `depth < leaves`: the latter permits a 9-deep
+    // chain for 10 memories, which is the regression it is named for.
+    assert!(
+        depth <= 4,
+        "ten near-identical turns must cluster, not chain; got depth {depth} \
+         for {leaves} memories"
+    );
 
     Ok(())
 }
@@ -174,7 +193,15 @@ async fn test_memtree_insertion() -> Result<()> {
         tree.insert(text.to_string(), emb, 1)?;
     }
 
-    assert_eq!(tree.size(), 4);
+    // Four distinct memories, stored as four leaves. `size()` also counts the
+    // internal nodes the tree creates, so equality with the input count would
+    // be asserting flatness.
+    let leaves = tree
+        .all_nodes()
+        .values()
+        .filter(|node| node.id != 0 && node.children.is_empty())
+        .count();
+    assert_eq!(leaves, 4, "each distinct memory is stored exactly once");
 
     // Query for similar content
     let query_emb = engine.embed("rust language")?;

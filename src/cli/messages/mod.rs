@@ -33,6 +33,7 @@ pub struct TranscriptRowId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptRowKind {
     Response,
+    Activity,
     Program,
     Output,
     ToolGroup,

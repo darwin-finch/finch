@@ -1018,9 +1018,10 @@ fn ensure_remote_brain_run_projection<'a>(
         let label = brain_run_group_label(run_id, kind);
         let unit = output_manager.start_work_unit(&label);
         // WorkUnit's completed row presentation otherwise uses the generic
-        // "Tools" title. Keep the canonical kind/id visible on the group.
-        unit.set_response(&label);
-        let status_row = unit.add_row(format!("{label} · status"));
+        // "Tools" title. Keep the canonical kind/id visible without
+        // misclassifying lifecycle rows as model tool calls.
+        unit.set_activity_presentation(&label);
+        let status_row = unit.add_activity_row(format!("{label} · status"));
         unit.complete_row(status_row, format!("{status:?}").to_lowercase());
         RemoteBrainRunProjection {
             unit,
@@ -1090,7 +1091,7 @@ fn project_remote_brain_run_event(
         BrainEventKind::SpeculativePrompt { text } => {
             let row = *projection
                 .prompt_row
-                .get_or_insert_with(|| projection.unit.add_row("prompt"));
+                .get_or_insert_with(|| projection.unit.add_activity_row("prompt"));
             projection.unit.complete_row_with_body(
                 row,
                 "accepted",
@@ -1172,7 +1173,7 @@ fn project_remote_brain_run_event(
                         )
                     })
                     .unwrap_or_else(|| "legacy audience unspecified".to_string());
-                let row = projection.unit.add_row(format!(
+                let row = projection.unit.add_activity_row(format!(
                     "approval ({approval_kind}) for {audience_summary}: {subject}"
                 ));
                 for line in serde_json::to_string_pretty(detail)
@@ -1198,7 +1199,11 @@ fn project_remote_brain_run_event(
             let row = *projection
                 .approval_rows
                 .entry(approval_id.clone())
-                .or_insert_with(|| projection.unit.add_row(format!("approval {approval_id}")));
+                .or_insert_with(|| {
+                    projection
+                        .unit
+                        .add_activity_row(format!("approval {approval_id}"))
+                });
             let choice = decision
                 .get("choice")
                 .and_then(serde_json::Value::as_str)
@@ -1218,9 +1223,11 @@ fn project_remote_brain_run_event(
                 ProgramLanguage::Forth => "Co-Forth",
                 ProgramLanguage::Lisp => "Lisp",
             };
-            let row = *projection
-                .program_row
-                .get_or_insert_with(|| projection.unit.add_row(format!("{language} program")));
+            let row = *projection.program_row.get_or_insert_with(|| {
+                projection
+                    .unit
+                    .add_activity_row(format!("{language} program"))
+            });
             projection.unit.complete_row_with_body(
                 row,
                 format!("event #{}", event.seq),
@@ -1230,7 +1237,7 @@ fn project_remote_brain_run_event(
         BrainEventKind::Result { output, error, .. } => {
             let row = *projection
                 .result_row
-                .get_or_insert_with(|| projection.unit.add_row("result"));
+                .get_or_insert_with(|| projection.unit.add_activity_row("result"));
             if let Some(error) = error {
                 projection.unit.fail_row(row, error);
             } else {
@@ -6938,7 +6945,7 @@ Rules:\n\
                         Some(crate::brain::store::BrainRunKind::Speculative),
                         crate::brain::store::BrainRunStatus::QueuedForEnvironment,
                     );
-                    let row = projection.unit.add_row("prompt");
+                    let row = projection.unit.add_activity_row("prompt");
                     projection.unit.complete_row_with_body(
                         row,
                         "accepted",
@@ -7122,9 +7129,11 @@ Rules:\n\
                         crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
                         crate::brain::store::ProgramLanguage::Lisp => "Lisp",
                     };
-                    let row = projection
-                        .program_row
-                        .unwrap_or_else(|| projection.unit.add_row(format!("{language} program")));
+                    let row = projection.program_row.unwrap_or_else(|| {
+                        projection
+                            .unit
+                            .add_activity_row(format!("{language} program"))
+                    });
                     projection.program_row = Some(row);
                     projection.unit.complete_row_with_body(
                         row,
@@ -7168,7 +7177,7 @@ Rules:\n\
                         None,
                         crate::brain::store::BrainRunStatus::Running,
                     );
-                    let row = projection.unit.add_row("result");
+                    let row = projection.unit.add_activity_row("result");
                     if let Some(error) = error {
                         projection.unit.fail_row(row, error);
                     } else {
@@ -9943,6 +9952,168 @@ mod tests {
             brain_run_group_label(run_id, Some(BrainRunKind::Speculative)),
             format!("Speculative run {}", run_id.0)
         );
+    }
+
+    #[test]
+    fn pre_inference_brain_provider_failure_is_activity_not_tool_group() {
+        use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, RunId};
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let mut projections = std::collections::HashMap::new();
+        super::ensure_remote_brain_run_projection(
+            &output,
+            &mut projections,
+            run_id,
+            Some(BrainRunKind::Speculative),
+            BrainRunStatus::Running,
+        );
+
+        let mut result = brain_event(
+            1,
+            "provider",
+            BrainEventKind::Result {
+                request_seq: 1,
+                output: String::new(),
+                error: Some("catalog unavailable".into()),
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        );
+        result.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &result,
+        ));
+
+        let mut terminal = brain_event(
+            2,
+            "daemon",
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Failed,
+                detail: Some("catalog unavailable".into()),
+            },
+        );
+        terminal.run_id = Some(run_id);
+        assert!(super::project_remote_brain_run_event(
+            &output,
+            &mut projections,
+            &terminal,
+        ));
+
+        let unit = projections.get(&run_id).unwrap().unit.clone();
+        let projected = unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        assert_eq!(projected.kind, TranscriptRowKind::Activity);
+        assert!(projected.label.contains("Speculative run"));
+        assert!(projected
+            .label
+            .contains("status failed: catalog unavailable"));
+        assert!(!projected.label.contains("Tools"));
+        assert!(!projected.label.contains("calls"));
+        assert_eq!(projected.children.len(), 2);
+        assert!(projected
+            .children
+            .iter()
+            .all(|row| row.kind == TranscriptRowKind::Activity));
+        assert!(projected.children[0].label.contains("status"));
+        assert!(projected.children[1].label.starts_with("result"));
+
+        let canonical = unit.complete_transcript(&crate::config::ColorScheme::default());
+        assert!(canonical.contains("Speculative run"));
+        assert!(canonical.contains("result"));
+        assert!(canonical.contains("catalog unavailable"));
+    }
+
+    #[test]
+    fn named_brain_run_preserves_tool_semantics_inside_activity_group() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+        };
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::Running,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let kinds = [
+            BrainEventKind::RunStarted { run },
+            BrainEventKind::ToolCall {
+                request_seq: 1,
+                tool_id: "tool-1".into(),
+                name: "read_cache".into(),
+                input: serde_json::json!({"key": "alpha"}),
+            },
+            BrainEventKind::ToolResult {
+                request_seq: 1,
+                tool_id: "tool-1".into(),
+                output: "cache hit\nvalue=7".into(),
+                is_error: false,
+            },
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Completed,
+                detail: None,
+            },
+        ];
+        let mut projections = std::collections::HashMap::new();
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let mut event = brain_event(index as u64 + 1, "daemon", kind);
+            event.run_id = Some(run_id);
+            assert!(super::project_remote_brain_run_event(
+                &output,
+                &mut projections,
+                &event,
+            ));
+        }
+
+        let unit = projections.get(&run_id).unwrap().unit.clone();
+        let projected = unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        assert_eq!(projected.kind, TranscriptRowKind::Activity);
+        assert!(!projected.default_expanded);
+        assert!(!projected.label.contains("Tools"));
+        assert_eq!(projected.children.len(), 2);
+
+        let status = &projected.children[0];
+        assert_eq!(status.kind, TranscriptRowKind::Activity);
+        assert_eq!(status.id.message_id, unit.id());
+        assert_eq!(status.id.path, vec![1, 0]);
+
+        let tool = &projected.children[1];
+        assert_eq!(tool.kind, TranscriptRowKind::ToolCall);
+        assert_eq!(tool.id.message_id, unit.id());
+        assert_eq!(tool.id.path, vec![1, 1]);
+        assert_eq!(tool.children.len(), 2);
+        assert_eq!(tool.children[0].kind, TranscriptRowKind::Input);
+        assert_eq!(tool.children[0].id.path, vec![1, 1, 0]);
+        assert_eq!(tool.children[1].kind, TranscriptRowKind::ToolOutput);
+        assert_eq!(tool.children[1].id.path, vec![1, 1, 1]);
+        assert!(tool.children[1].body.iter().any(|line| line == "value=7"));
+
+        let canonical = unit.complete_transcript(&crate::config::ColorScheme::default());
+        assert!(canonical.contains("read_cache"));
+        assert!(canonical.contains("cache hit"));
+        assert!(canonical.contains("value=7"));
     }
 
     #[test]

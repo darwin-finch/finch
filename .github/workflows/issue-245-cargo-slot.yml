@@ -1,0 +1,42 @@
+name: Issue 245 Cargo Slot
+
+on:
+  pull_request:
+    paths:
+      - ".agents/skills/finch-backlog/**"
+      - ".claude/skills/finch-backlog"
+      - ".github/workflows/issue-245-cargo-slot.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".agents/skills/finch-backlog/**"
+      - ".claude/skills/finch-backlog"
+      - ".github/workflows/issue-245-cargo-slot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-slot:
+    name: ${{ matrix.os }} repository-wide lock
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify shared skill discovery
+        shell: bash
+        run: |
+          test -L .claude/skills/finch-backlog
+          test "$(cd .agents/skills/finch-backlog && pwd -P)" = "$(cd .claude/skills/finch-backlog && pwd -P)"
+      - name: Check and exercise the Cargo slot
+        shell: bash
+        run: |
+          bash -n \
+            .agents/skills/finch-backlog/scripts/with-cargo-slot \
+            .agents/skills/finch-backlog/scripts/test-with-cargo-slot
+          .agents/skills/finch-backlog/scripts/test-with-cargo-slot
