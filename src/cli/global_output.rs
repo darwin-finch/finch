@@ -52,7 +52,32 @@ pub fn global_status() -> Arc<StatusBar> {
 
 /// Set the global TUI renderer (called when TUI mode is enabled)
 pub fn set_global_tui_renderer(renderer: TuiRenderer) {
-    *GLOBAL_TUI_RENDERER.lock().unwrap() = Some(renderer);
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut renderer = Some(renderer);
+    loop {
+        match GLOBAL_TUI_RENDERER.try_lock() {
+            Ok(mut slot) => {
+                *slot = renderer.take();
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                *poisoned.into_inner() = renderer.take();
+                return;
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Dropping the renderer rolls back its terminal session. Never
+                // wait forever merely to publish the global convenience handle.
+                drop(renderer.take());
+                super::tui::emergency_restore_terminal();
+                return;
+            }
+        }
+    }
 }
 
 /// Get a reference to the global TUI renderer
@@ -79,31 +104,20 @@ pub fn shutdown_global_tui() -> anyhow::Result<()> {
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 if start.elapsed() > timeout {
-                    // Timeout - force cleanup without taking the lock
-                    // Emergency terminal cleanup
-                    use crossterm::{cursor, execute, terminal};
-                    let _ = terminal::disable_raw_mode();
-                    let _ = execute!(
-                        std::io::stdout(),
-                        cursor::Show,
-                        terminal::Clear(terminal::ClearType::FromCursorDown)
-                    );
-
+                    // The restore path owns a separate nonblocking tty
+                    // descriptor on Unix, so stdout backpressure cannot turn a
+                    // lock timeout into another unbounded wait.
+                    super::tui::emergency_restore_terminal();
                     return Ok(());
                 }
                 // Wait a bit and try again
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                // Mutex was poisoned - do emergency cleanup
-                use crossterm::{cursor, execute, terminal};
-                let _ = terminal::disable_raw_mode();
-                let _ = execute!(
-                    std::io::stdout(),
-                    cursor::Show,
-                    terminal::Clear(terminal::ClearType::FromCursorDown)
-                );
-
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut tui_lock = poisoned.into_inner();
+                if let Some(mut tui) = tui_lock.take() {
+                    tui.shutdown()?;
+                }
                 return Ok(());
             }
         }

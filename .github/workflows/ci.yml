@@ -48,6 +48,9 @@ jobs:
     - name: Verify clean-checkout formatting
       run: cargo fmt --all -- --check
 
+    - name: Compile exact portable terminal lifecycle source
+      run: cargo check --manifest-path .github/issue-264-windows-probe/Cargo.toml
+
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
     runs-on: ${{ matrix.os }}
@@ -110,6 +113,10 @@ jobs:
 
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+
+    - name: Run supervised PTY terminal lifecycle regressions
+      if: matrix.feature_name == 'default'
+      run: ./scripts/test_brains.sh cargo test --test tui_integration_test -- --nocapture
 
     - name: Verify binary reports its version
       # Exercise Cargo's default binary selection so adding a test-only binary

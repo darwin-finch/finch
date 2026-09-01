@@ -11,6 +11,17 @@ Full documentation lives at `docs/TUI_ARCHITECTURE.md`.
 **Critical invariant:** Each message is passed to `insert_before()` exactly once.
 Check: `scrollback.get_message(msg_id).is_none()` before calling.
 
+**Terminal-session lifecycle:**
+- A process-global generation token is `ACTIVATING`, `ACTIVE`, or `CLEANING` for the complete
+  interval in which its tty snapshot, protocol modes, or restore descriptor can still be used.
+- A replacement session may activate only after the prior generation restored termios and protocol
+  modes, closed its descriptor, and returned to `INACTIVE`; stale generation cleanup is a no-op.
+- Public `TuiRenderer` construction never changes process signal handlers. The Finch binary creates
+  `BinaryTerminalSession` before renderer activation; SIGINT/SIGTERM/SIGHUP are armed and restored
+  with each active terminal generation.
+- Emergency cleanup uses the generation's nonblocking, close-on-exec tty descriptor and never waits
+  for the renderer/global mutex or ordinary stdout.
+
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
 - Native scrollback always receives the fully expanded semantic projection;

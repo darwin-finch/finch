@@ -153,9 +153,104 @@ fn wait_for_child(child: &mut std::process::Child, deadline: Instant) -> std::pr
         if let Some(status) = child.try_wait().expect("inspect terminal probe") {
             return status;
         }
-        assert!(Instant::now() < deadline, "terminal probe did not exit");
+        if Instant::now() >= deadline {
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .ok();
+            let status = child.wait().expect("reap timed-out terminal probe");
+            panic!("terminal probe did not exit before timeout; killed and reaped as {status}");
+        }
         std::thread::yield_now();
     }
+}
+
+#[cfg(unix)]
+fn read_control_byte(
+    child: &mut std::process::Child,
+    fd: nix::libc::c_int,
+    deadline: Instant,
+) -> u8 {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = wait_for_child(child, Instant::now());
+            unreachable!("wait_for_child reports timeout by panicking");
+        }
+        let mut poll_fd = nix::libc::pollfd {
+            fd,
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = remaining.as_millis().min(100) as i32;
+        let ready = unsafe { nix::libc::poll(&mut poll_fd, 1, timeout.max(1)) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            panic!(
+                "poll backpressure control failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut byte = 0_u8;
+        let read = unsafe { nix::libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if read == 1 {
+            return byte;
+        }
+        let status = wait_for_child(child, Instant::now() + Duration::from_millis(100));
+        panic!("backpressure probe closed control fd before readiness: {status}");
+    }
+}
+
+#[cfg(unix)]
+fn drain_pty(file: &mut std::fs::File, transcript: &mut Vec<u8>, deadline: Instant) {
+    let marker = b"FINCH_TERMINAL_DRAIN_SENTINEL_THAT_NEVER_APPEARS";
+    let _ = read_until(file, transcript, deadline, marker);
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+unsafe fn set_test_errno(error: nix::libc::c_int) {
+    unsafe { *nix::libc::__errno_location() = error };
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+unsafe fn test_errno() -> nix::libc::c_int {
+    unsafe { *nix::libc::__errno_location() }
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+unsafe fn set_test_errno(error: nix::libc::c_int) {
+    unsafe { *nix::libc::__error() = error };
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )
+))]
+unsafe fn test_errno() -> nix::libc::c_int {
+    unsafe { *nix::libc::__error() }
 }
 
 #[cfg(unix)]
@@ -244,22 +339,30 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         return Ok(());
     };
     if mode == "fd-check" {
-        let fd: i32 = std::env::var("FINCH_TEST_RESTORE_FD")?.parse()?;
-        let result = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
-        anyhow::ensure!(
-            result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EBADF),
-            "restore descriptor {fd} survived exec"
-        );
+        for fd in std::env::var("FINCH_TEST_RESTORE_FDS")?
+            .split(',')
+            .map(str::parse::<i32>)
+        {
+            let fd = fd?;
+            let result = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+            anyhow::ensure!(
+                result < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::EBADF),
+                "terminal descriptor {fd} survived exec"
+            );
+        }
         return Ok(());
     }
-    if mode.starts_with("init-") {
+    if mode.starts_with("init-") || mode.starts_with("short-") {
         let stdout_flags = stdout_status_flags()?;
-        std::env::set_var(
-            "FINCH_TEST_TUI_FAIL_AFTER",
-            mode.trim_start_matches("init-"),
-        );
+        if let Some(stage) = mode.strip_prefix("init-") {
+            std::env::set_var("FINCH_TEST_TUI_FAIL_AFTER", stage);
+        } else if let Some(stage) = mode.strip_prefix("short-") {
+            std::env::set_var("FINCH_TEST_TUI_SHORT_WRITE", format!("{stage}:1"));
+        }
         let result = new_renderer();
         std::env::remove_var("FINCH_TEST_TUI_FAIL_AFTER");
+        std::env::remove_var("FINCH_TEST_TUI_SHORT_WRITE");
         anyhow::ensure!(result.is_err(), "injected activation failure succeeded");
         anyhow::ensure!(
             stdout_status_flags()? == stdout_flags,
@@ -267,6 +370,63 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         );
         marker(b"FINCH_INIT_ROLLED_BACK")?;
         return Ok(());
+    }
+    if mode == "signal-create-failure" {
+        std::env::set_var("FINCH_TEST_TUI_FAIL_SIGNAL_TRANSPORT", "1");
+        let failed = finch::cli::tui::BinaryTerminalSession::install();
+        std::env::remove_var("FINCH_TEST_TUI_FAIL_SIGNAL_TRANSPORT");
+        anyhow::ensure!(
+            failed.is_err(),
+            "injected signal transport failure succeeded"
+        );
+        let signals = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("signal owner was not reusable after failure"))?;
+        let mut renderer = new_renderer()?;
+        renderer.shutdown()?;
+        drop(signals);
+        marker(b"FINCH_SIGNAL_TRANSPORT_ROLLED_BACK")?;
+        return Ok(());
+    }
+
+    let preserves_host_signal = matches!(mode.as_str(), "binary-owner-drop" | "owner-windows");
+    if preserves_host_signal {
+        let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+        action.sa_sigaction = embedding_signal_handler as *const () as usize;
+        unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
+        anyhow::ensure!(
+            unsafe { nix::libc::sigaction(nix::libc::SIGTERM, &action, std::ptr::null_mut()) } == 0,
+            "install host handler before binary ownership"
+        );
+    }
+    let needs_binary_owner = matches!(
+        mode.as_str(),
+        "signal"
+            | "backpressure-signal"
+            | "binary-owner-drop"
+            | "owner-windows"
+            | "cloexec"
+            | "signal-full"
+            | "signal-stop-full"
+            | "handler-reuse"
+    );
+    let mut signals = if needs_binary_owner {
+        finch::cli::tui::BinaryTerminalSession::install()?
+    } else {
+        None
+    };
+    if needs_binary_owner {
+        anyhow::ensure!(
+            signals.is_some(),
+            "binary signal transport was not installed before terminal activation"
+        );
+    }
+    if mode == "owner-windows" {
+        EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
+        unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+        anyhow::ensure!(
+            EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire),
+            "binary owner changed the host contract before terminal activation"
+        );
     }
 
     let stdout_flags = stdout_status_flags()?;
@@ -290,8 +450,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         "error" => anyhow::bail!("intentional terminal-session error"),
         "panic" => panic!("intentional terminal-session panic"),
         "signal" => {
-            let _signals = finch::cli::tui::BinaryTerminalSession::install()?
-                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
+            anyhow::ensure!(signals.is_some(), "binary signal owner missing");
             marker(b"FINCH_SIGNAL_READY")?;
             loop {
                 std::thread::park();
@@ -302,8 +461,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             renderer.shutdown()
         }
         "backpressure-signal" => {
-            let _signals = finch::cli::tui::BinaryTerminalSession::install()?
-                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
+            anyhow::ensure!(signals.is_some(), "binary signal owner missing");
             fill_terminal_and_notify_control()?;
             loop {
                 std::thread::park();
@@ -337,19 +495,9 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             Ok(())
         }
         "binary-owner-drop" => {
-            let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
-            action.sa_sigaction = embedding_signal_handler as *const () as usize;
-            unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
-            anyhow::ensure!(
-                unsafe { nix::libc::sigaction(nix::libc::SIGTERM, &action, std::ptr::null_mut()) }
-                    == 0,
-                "install host handler before binary ownership"
-            );
-            let signals = finch::cli::tui::BinaryTerminalSession::install()?
-                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
             renderer.shutdown()?;
             drop(renderer);
-            drop(signals);
+            drop(signals.take());
             EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
             unsafe { nix::libc::raise(nix::libc::SIGTERM) };
             while !EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire) {
@@ -358,22 +506,39 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             marker(b"FINCH_BINARY_OWNER_RELEASED")?;
             Ok(())
         }
-        "embedding-listener-mutation" => {
-            let _signals = finch::cli::tui::BinaryTerminalSession::install()?
-                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
+        "owner-windows" => {
             renderer.shutdown()?;
             drop(renderer);
-            marker(b"FINCH_STALE_LISTENER_READY")?;
+            EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
             unsafe { nix::libc::raise(nix::libc::SIGTERM) };
-            anyhow::bail!("stale listener mutation allowed embedding host to continue")
+            anyhow::ensure!(
+                EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire),
+                "binary owner changed the host contract after terminal cleanup"
+            );
+            marker(b"FINCH_OWNER_WINDOWS_PRESERVED")?;
+            Ok(())
         }
         "cloexec" => {
             let fd = finch::cli::tui::supervised_terminal_restore_fd()?;
-            let status = Command::new(std::env::current_exe()?)
+            let (signal_read, signal_write) = signals
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?
+                .supervised_signal_fds()?;
+            for signal_fd in [signal_read, signal_write] {
+                let descriptor = unsafe { nix::libc::fcntl(signal_fd, nix::libc::F_GETFD) };
+                let status = unsafe { nix::libc::fcntl(signal_fd, nix::libc::F_GETFL) };
+                anyhow::ensure!(descriptor & nix::libc::FD_CLOEXEC != 0);
+                anyhow::ensure!(status & nix::libc::O_NONBLOCK != 0);
+            }
+            let mut exec_child = Command::new(std::env::current_exe()?)
                 .args(["--exact", "tui_terminal_session_child"])
                 .env("FINCH_TEST_TERMINAL_SESSION_CHILD", "fd-check")
-                .env("FINCH_TEST_RESTORE_FD", fd.to_string())
-                .status()?;
+                .env(
+                    "FINCH_TEST_RESTORE_FDS",
+                    format!("{fd},{signal_read},{signal_write}"),
+                )
+                .spawn()?;
+            let status = wait_for_child(&mut exec_child, Instant::now() + Duration::from_secs(2));
             anyhow::ensure!(status.success(), "restore fd inherited by exec child");
             renderer.shutdown()
         }
@@ -407,6 +572,131 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             unsafe { nix::libc::tcsetattr(nix::libc::STDOUT_FILENO, nix::libc::TCSANOW, &changed) };
             Ok(())
         }
+        "repeated" => {
+            renderer.shutdown()?;
+            for _ in 0..8 {
+                let mut next = new_renderer()?;
+                next.shutdown()?;
+            }
+            marker(b"FINCH_REPEATED_SESSIONS_COMPLETE")?;
+            Ok(())
+        }
+        "signal-stop-full" => {
+            let signals = signals
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
+            signals.supervised_fill_signal_transport()?;
+            renderer.shutdown()?;
+            let started = Instant::now();
+            drop(signals);
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_millis(250),
+                "binary signal owner Drop exceeded its bound"
+            );
+            marker(b"FINCH_SIGNAL_STOP_BOUNDED")?;
+            Ok(())
+        }
+        "signal-full" => {
+            let signals = signals
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
+            signals.supervised_fill_signal_transport()?;
+            marker(b"FINCH_SIGNAL_QUEUE_FULL")?;
+            let mut acknowledge = 0_u8;
+            std::io::stdin().read_exact(std::slice::from_mut(&mut acknowledge))?;
+            anyhow::ensure!(acknowledge == b'G', "invalid full-queue acknowledgement");
+            signals.supervised_resume_signal_listener()?;
+            loop {
+                std::thread::park();
+            }
+        }
+        "handler-reuse" => {
+            finch::cli::tui::supervised_set_terminal_signal_handler_pause(true)?;
+            let observed_errno = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let observed_errno_clone = std::sync::Arc::clone(&observed_errno);
+            let handler_thread = std::thread::spawn(move || {
+                let sentinel = nix::libc::EDOM;
+                unsafe {
+                    set_test_errno(sentinel);
+                    nix::libc::pthread_kill(nix::libc::pthread_self(), nix::libc::SIGTERM);
+                    observed_errno_clone.store(test_errno(), Ordering::Release);
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_signal_handler_is_paused()? {
+                anyhow::ensure!(Instant::now() < deadline, "signal handler did not pause");
+                std::thread::yield_now();
+            }
+            renderer.shutdown()?;
+            drop(renderer);
+            drop(signals.take());
+
+            let second_signals = finch::cli::tui::BinaryTerminalSession::install()?
+                .ok_or_else(|| anyhow::anyhow!("replacement binary signal owner missing"))?;
+            let mut second = new_renderer()?;
+            finch::cli::tui::supervised_set_terminal_signal_handler_pause(false)?;
+            handler_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("paused signal handler thread panicked"))?;
+            anyhow::ensure!(
+                observed_errno.load(Ordering::Acquire) == nix::libc::EDOM,
+                "terminal signal handler changed the interrupted thread's errno"
+            );
+            for _ in 0..10_000 {
+                std::thread::yield_now();
+            }
+            second.shutdown()?;
+            drop(second_signals);
+            marker(b"FINCH_HANDLER_REUSE_SAFE")?;
+            Ok(())
+        }
+        "overlapping-cleanup" => {
+            finch::cli::tui::supervised_set_terminal_cleanup_pause(true)?;
+            let cleanup = std::thread::spawn(move || renderer.shutdown());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_cleanup_is_paused()? {
+                anyhow::ensure!(Instant::now() < deadline, "terminal cleanup did not pause");
+                std::thread::yield_now();
+            }
+            let overlap = new_renderer();
+            anyhow::ensure!(
+                overlap.is_err(),
+                "replacement activated before prior cleanup published restoration"
+            );
+            finch::cli::tui::supervised_set_terminal_cleanup_pause(false)?;
+            cleanup
+                .join()
+                .map_err(|_| anyhow::anyhow!("cleanup thread panicked"))??;
+            let mut replacement = new_renderer()?;
+            replacement.shutdown()?;
+            marker(b"FINCH_OVERLAP_REJECTED")?;
+            Ok(())
+        }
+        "global-lock-backpressure" => {
+            finch::cli::global_output::set_global_tui_renderer(renderer);
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _guard = finch::cli::global_output::get_global_tui_renderer()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = locked_tx.send(());
+                loop {
+                    std::thread::park();
+                }
+            });
+            locked_rx.recv_timeout(Duration::from_secs(2))?;
+            fill_terminal_and_notify_control()?;
+            let started = Instant::now();
+            finch::cli::global_output::shutdown_global_tui()?;
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_secs(1),
+                "global TUI fallback blocked on stdout"
+            );
+            Ok(())
+        }
+        "hang" => loop {
+            std::thread::park();
+        },
         other => anyhow::bail!("unknown terminal-session mode {other}"),
     }
 }
@@ -443,7 +733,21 @@ fn test_tui_session_restores_normal_error_panic_and_partial_activation() {
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    for mode in ["clean", "drop", "error", "panic", "init-raw", "init-paste"] {
+    for mode in [
+        "clean",
+        "drop",
+        "error",
+        "panic",
+        "init-raw",
+        "init-paste",
+        "init-mouse",
+        "init-keyboard",
+        "init-cursor",
+        "short-paste",
+        "short-mouse",
+        "short-keyboard",
+        "short-cursor",
+    ] {
         let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
         let mut transcript = Vec::new();
         if matches!(mode, "clean" | "drop" | "error" | "panic") {
@@ -457,11 +761,10 @@ fn test_tui_session_restores_normal_error_panic_and_partial_activation() {
             master.flush().unwrap();
         }
         let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
-        let _ = read_until(
+        drain_pty(
             &mut master,
             &mut transcript,
             Instant::now() + Duration::from_millis(100),
-            b"FINCH_INIT_ROLLED_BACK",
         );
         assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
         if matches!(mode, "error" | "panic") {
@@ -472,16 +775,27 @@ fn test_tui_session_restores_normal_error_panic_and_partial_activation() {
         if mode == "init-raw" {
             assert_eq!(count_bytes(&transcript, b"\x1b[?2004h"), 0);
             assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 0);
-        } else if mode == "init-paste" {
+        } else if mode == "init-paste" || mode == "short-paste" {
             assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
             assert_eq!(count_bytes(&transcript, b"\x1b[?1000h"), 0);
             assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 0);
-        } else {
+        } else if mode == "init-mouse" || mode == "short-mouse" {
+            assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+            assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+            assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 0);
+        } else if matches!(mode, "clean" | "drop" | "error" | "panic") {
             assert_eq!(count_bytes(&transcript, b"\x1b[?2004h"), 1);
             assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
             assert_eq!(count_bytes(&transcript, b"\x1b[?1000h"), 1);
             assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
             assert_eq!(count_bytes(&transcript, b"\x1b[>1u"), 1);
+            assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+        } else {
+            // Immediate rollback flushes activation bytes that the PTY parent
+            // has not consumed. Reset bytes are emitted after that flush and
+            // therefore are the deterministic partial-activation contract.
+            assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+            assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
             assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
         }
     }
@@ -509,9 +823,55 @@ fn test_binary_terminal_session_restores_all_external_signals() {
         ));
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), signal).unwrap();
         let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(2));
+        drain_pty(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_millis(100),
+        );
         assert_eq!(status.code(), Some(128 + signal as i32));
         assert_eq!(terminal_modes(&slave), original);
+        assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[?1006l"), 1, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[?25h"), 2, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[0m"), 1, "{signal:?}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_binary_terminal_signal_is_not_lost_when_transport_is_full() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut child, mut master, slave, original) = spawn_terminal_child("signal-full");
+    let mut transcript = Vec::new();
+    assert!(read_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(5),
+        b"FINCH_SIGNAL_QUEUE_FULL",
+    ));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    master.write_all(b"G").unwrap();
+    master.flush().unwrap();
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(2));
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
 }
 
 /// The executable, rather than public renderer construction, explicitly owns
@@ -554,9 +914,59 @@ fn test_finch_binary_owns_external_terminal_signals() {
         );
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.id() as i32), signal).unwrap();
         let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(2));
+        drain_pty(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_millis(100),
+        );
         assert_eq!(status.code(), Some(128 + signal as i32));
         assert_eq!(terminal_modes(&slave), original);
+        assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1, "{signal:?}");
+        assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1, "{signal:?}");
     }
+}
+
+/// Exercise Finch's installed panic hook rather than relying on Rust's ordinary
+/// stack unwinding to drop a renderer owned by this integration-test process.
+#[cfg(unix)]
+#[test]
+fn test_finch_main_panic_hook_restores_terminal_protocols() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let original = terminal_modes(&slave);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-terminal-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE", "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("spawn Finch main panic-hook probe");
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert!(
+        !status.success(),
+        "supervised main panic unexpectedly succeeded"
+    );
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+    assert!(String::from_utf8_lossy(&transcript)
+        .contains("supervised panic after Finch terminal activation"));
 }
 
 #[cfg(unix)]
@@ -572,6 +982,7 @@ fn test_public_renderer_preserves_embedding_signal_contract() {
             "binary-owner-drop",
             b"FINCH_BINARY_OWNER_RELEASED".as_slice(),
         ),
+        ("owner-windows", b"FINCH_OWNER_WINDOWS_PRESERVED".as_slice()),
     ] {
         let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
         let mut transcript = Vec::new();
@@ -588,12 +999,18 @@ fn test_public_renderer_preserves_embedding_signal_contract() {
 
 #[cfg(unix)]
 #[test]
-fn test_restore_fd_is_cloexec_and_sessions_take_fresh_snapshots() {
+fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
     let _serial = terminal_pty_test_lock();
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    for mode in ["cloexec", "sequential"] {
+    for mode in [
+        "cloexec",
+        "signal-create-failure",
+        "sequential",
+        "repeated",
+        "overlapping-cleanup",
+    ] {
         let (mut child, _master, slave, original) = spawn_terminal_child(mode);
         assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(5)).success());
         assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
@@ -607,7 +1024,11 @@ fn test_terminal_cleanup_is_bounded_under_unread_backpressure() {
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    for mode in ["backpressure-clean", "backpressure-signal"] {
+    for mode in [
+        "backpressure-clean",
+        "backpressure-signal",
+        "global-lock-backpressure",
+    ] {
         let (master, slave) = open_owned_pty();
         let original = terminal_modes(&slave);
         let mut control = [-1; 2];
@@ -622,11 +1043,10 @@ fn test_terminal_cleanup_is_bounded_under_unread_backpressure() {
             .spawn()
             .expect("spawn backpressure probe");
         unsafe { nix::libc::close(control[1]) };
-        let mut ready = 0_u8;
-        assert_eq!(
-            unsafe { nix::libc::read(control[0], (&mut ready as *mut u8).cast(), 1) },
-            1,
-            "backpressure probe did not fill the PTY"
+        let ready = read_control_byte(
+            &mut child,
+            control[0],
+            Instant::now() + Duration::from_secs(5),
         );
         unsafe { nix::libc::close(control[0]) };
         assert_eq!(ready, b'R');
@@ -648,10 +1068,61 @@ fn test_terminal_cleanup_is_bounded_under_unread_backpressure() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn test_signal_transport_drop_is_bounded_and_fd_reuse_is_stale_safe() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    for mode in ["signal-stop-full", "handler-reuse"] {
+        let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
+        let marker = if mode == "signal-stop-full" {
+            b"FINCH_SIGNAL_STOP_BOUNDED".as_slice()
+        } else {
+            b"FINCH_HANDLER_REUSE_SAFE".as_slice()
+        };
+        let mut transcript = Vec::new();
+        assert!(read_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(5),
+            marker,
+        ));
+        assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(2)).success());
+        assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_wait_for_child_timeout_kills_and_reaps_terminal_probe() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut child, _master, _slave, _original) = spawn_terminal_child("hang");
+    let timed_out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_child(&mut child, Instant::now() + Duration::from_millis(50))
+    }));
+    assert!(
+        timed_out.is_err(),
+        "timeout helper did not report its causal hang"
+    );
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect reaped timeout child")
+            .is_some(),
+        "timeout helper left the killed child unreaped"
+    );
+}
+
 /// Causal controls replay the rejected mechanisms through the same PTY
 /// boundary. They are expected to observe the old failure, proving the
-/// positive regressions are sensitive to signal omission, a permanent
-/// listener, and a blocking reset write.
+/// positive regressions are sensitive to signal omission and a blocking reset
+/// write. The owner-window, overlap, main-hook, short-write, and fd-reuse tests
+/// exercise their rejected implementations directly at the same boundary.
 #[cfg(unix)]
 #[test]
 fn test_terminal_session_causal_mutations_reproduce_reported_failures() {
@@ -699,20 +1170,6 @@ fn test_terminal_session_causal_mutations_reproduce_reported_failures() {
     );
     unsafe { nix::libc::tcsetattr(slave.as_raw_fd(), nix::libc::TCSANOW, &original) };
 
-    let (mut child, mut master, _slave, _original) =
-        spawn_terminal_child("embedding-listener-mutation");
-    let mut transcript = Vec::new();
-    assert!(read_until(
-        &mut master,
-        &mut transcript,
-        Instant::now() + Duration::from_secs(5),
-        b"FINCH_STALE_LISTENER_READY",
-    ));
-    assert_eq!(
-        wait_for_child(&mut child, Instant::now() + Duration::from_secs(2)).code(),
-        Some(128 + nix::libc::SIGTERM)
-    );
-
     let (master, slave) = open_owned_pty();
     let original = terminal_attributes(&slave);
     let mut control = [-1; 2];
@@ -730,11 +1187,12 @@ fn test_terminal_session_causal_mutations_reproduce_reported_failures() {
         .spawn()
         .unwrap();
     unsafe { nix::libc::close(control[1]) };
-    let mut ready = 0_u8;
-    assert_eq!(
-        unsafe { nix::libc::read(control[0], (&mut ready as *mut u8).cast(), 1) },
-        1
+    let ready = read_control_byte(
+        &mut child,
+        control[0],
+        Instant::now() + Duration::from_secs(5),
     );
+    assert_eq!(ready, b'R');
     unsafe { nix::libc::close(control[0]) };
     let deadline = Instant::now() + Duration::from_millis(100);
     while Instant::now() < deadline {

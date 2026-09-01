@@ -1120,6 +1120,12 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(finch::brain::names::generate);
 
+    // Install the binary-only signal transport before terminal activation.
+    // TuiRenderer::new arms it transactionally with the terminal session, and
+    // renderer cleanup restores the embedding host's prior handlers before the
+    // session becomes replaceable.
+    let _terminal_session = finch::cli::tui::BinaryTerminalSession::install()
+        .context("Failed to install terminal signal ownership")?;
     let mut repl = Repl::new(
         config,
         claude_client,
@@ -1129,9 +1135,11 @@ async fn main() -> Result<()> {
         brain_name,
     )
     .await;
-    let _terminal_session = finch::cli::tui::BinaryTerminalSession::install()
-        .context("Failed to install terminal signal ownership")?;
-
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        panic!("supervised panic after Finch terminal activation");
+    }
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
         args.resume.as_deref().and_then(|uuid| {
@@ -2553,8 +2561,6 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
     use finch::cli::chatgpt_auth::{
         render_status_line, save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
     };
-    use tokio_util::sync::CancellationToken;
-
     let service = ChatGptAuthService::production()?;
     match command {
         AuthCommand::Status {
