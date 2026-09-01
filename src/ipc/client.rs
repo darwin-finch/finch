@@ -1431,7 +1431,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         run_id,
                         request_seq: request.get_request_seq(),
                         prompt: text(request.get_prompt()),
-                        source: text(request.get_source()),
+                        rendered: text(request.get_rendered()),
                         response_tx,
                     },
                 ),

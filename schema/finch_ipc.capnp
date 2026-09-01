@@ -914,7 +914,8 @@ struct BrainMemoryProjectionRequest {
   runId      @2 :Text;
   requestSeq @3 :UInt64;
   prompt     @4 :Text;
-  source     @5 :Text;
+  # The rendered output the user saw, not the program source (#254).
+  rendered   @5 :Text;
 }
 
 enum BrainTurnEventKind {

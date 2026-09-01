@@ -2213,7 +2213,7 @@ async fn forward_runner_request(
                 payload.set_run_id(&request.run_id.0.to_string());
                 payload.set_request_seq(request.request_seq);
                 payload.set_prompt(&request.prompt);
-                payload.set_source(&request.source);
+                payload.set_rendered(&request.rendered);
             }
             let result = match call.send().promise.await {
                 Ok(reply) => match reply.get() {

@@ -1483,7 +1483,7 @@ async fn project_committed_named_brain_memory(
         .iter()
         .find(|candidate| candidate.run_id == run.run_id)
         .ok_or_else(|| anyhow::anyhow!("committed Brain run disappeared before projection"))?;
-    let (prompt, source) = committed_named_brain_memory_pair(&snapshot, committed_run)?;
+    let (prompt, rendered) = committed_named_brain_memory_pair(&snapshot, committed_run)?;
     let lease = snapshot
         .runner_lease
         .as_ref()
@@ -1500,11 +1500,13 @@ async fn project_committed_named_brain_memory(
             committed_run.run_id,
             committed_run.request_seq,
             prompt,
-            source,
+            rendered,
         )
         .await
 }
 
+/// The `(prompt, rendered)` pair for one committed Brain turn. The second
+/// element is the rendered output the user saw, never the program source.
 fn committed_named_brain_memory_pair(
     snapshot: &crate::brain::store::BrainSnapshot,
     run: &crate::brain::store::BrainRun,
@@ -1553,10 +1555,11 @@ fn committed_named_brain_memory_pair(
     //
     // `persist_completed_turn_memory` deliberately hands named-Brain turns off
     // to this path, so returning `Program { source }` here left the Brain half
-    // of #254 unfixed: memory kept indexing raw `(say ...)`, and
-    // `replay_committed_named_brain_memory` re-drove it on every runner
-    // registration. The correlated Result was already located to assert
-    // success; its `output` is what the user saw.
+    // of #254 unfixed: every projected Brain turn indexed raw `(say ...)`
+    // instead of what the user read. Replay did not multiply that — projection
+    // is idempotent by identity, so the wrong content was stored once per turn,
+    // not once per reconnect. The correlated Result was already located to
+    // assert success; its `output` is what the user saw.
     let output = snapshot
         .events
         .iter()
@@ -1601,10 +1604,21 @@ pub(crate) async fn replay_committed_named_brain_memory(
         .iter()
         .filter(|run| run.status == crate::brain::store::BrainRunStatus::Completed)
     {
-        let Ok((prompt, source)) = committed_named_brain_memory_pair(&snapshot, run) else {
+        let Ok((prompt, rendered)) = committed_named_brain_memory_pair(&snapshot, run) else {
             continue;
         };
-        runners
+        // Per-run isolation, not `?`.
+        //
+        // Memory keys a projected Brain turn on `brain:{id}:run:{id}:role:{r}`
+        // and rejects the same identity arriving with different content. A
+        // Brain that ran under the previous code has an assistant row holding
+        // the program source; this build re-projects that identity with the
+        // rendered output, so the store returns that conflict. With `?` the
+        // first such run aborted the entire replay, skipping every later run in
+        // the Brain — permanently, on every reconnect, defeating the recovery
+        // this function exists to provide. One unprojectable run must cost only
+        // that run.
+        match runners
             .project_memory(
                 &name,
                 lease_id,
@@ -1612,10 +1626,21 @@ pub(crate) async fn replay_committed_named_brain_memory(
                 run.run_id,
                 run.request_seq,
                 prompt,
-                source,
+                rendered,
             )
-            .await?;
-        projected += 1;
+            .await
+        {
+            Ok(_) => projected += 1,
+            Err(error) => {
+                tracing::warn!(
+                    brain = %name,
+                    run_id = %run.run_id.0,
+                    %error,
+                    "skipping memory replay for one Brain run; the rest of the \
+                     replay continues"
+                );
+            }
+        }
     }
     Ok(projected)
 }
@@ -8739,9 +8764,9 @@ mod handler_tests {
             // defers Brain turns to this path, so leaving it on `source` kept
             // memory indexing raw `(say ...)` while the non-Brain path was
             // fixed.
-            assert_eq!(request.source, "remembered");
+            assert_eq!(request.rendered, "remembered");
             assert_ne!(
-                request.source, source,
+                request.rendered, source,
                 "the emitted program must not be what gets remembered"
             );
             let snapshot = callback_store.snapshot("shared").unwrap();
@@ -8869,7 +8894,10 @@ mod handler_tests {
         let runners = crate::server::BrainRunnerBroker::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
-        tokio::spawn(async move {
+        // Bound the handle and await it below. Dropping it made a failed
+        // assertion here surface as "runner dropped memory response" from the
+        // body instead of the assertion text.
+        let runner = tokio::spawn(async move {
             for _ in 0..2 {
                 let crate::server::RunnerRequest::ProjectMemory(request) = rx.recv().await.unwrap()
                 else {
@@ -8879,11 +8907,8 @@ mod handler_tests {
                 assert_eq!(request.request_seq, prompt.seq);
                 assert_eq!(request.prompt, "remember after restart");
                 // #254: replay projects the rendered output, not the program.
-                // This path re-drives on every runner registration, so leaving
-                // it on the source re-flooded memory with `(say ...)` on each
-                // reconnect.
-                assert_eq!(request.source, "after restart");
-                assert_ne!(request.source, "(say \"after restart\")");
+                assert_eq!(request.rendered, "after restart");
+                assert_ne!(request.rendered, "(say \"after restart\")");
                 request.response_tx.send(Ok(0)).unwrap();
             }
         });
@@ -8901,6 +8926,130 @@ mod handler_tests {
                 1
             );
         }
+        runner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_skips_one_unprojectable_run_and_continues() {
+        // A Brain that ran under the previous code has an assistant memory row
+        // holding the program source; re-projecting that identity with the
+        // rendered output is rejected as conflicting content. With `?` the
+        // first such run aborted the whole replay, so every later completed run
+        // in that Brain was skipped too — on every reconnect, forever.
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let driver = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        for turn in 0..2 {
+            let prompt = store
+                .push(
+                    "shared",
+                    &driver.subject,
+                    BrainEventKind::Prompt {
+                        text: format!("prompt {turn}"),
+                    },
+                )
+                .unwrap();
+            let run = store
+                .start_run(
+                    "shared",
+                    &driver.subject,
+                    crate::brain::store::BrainRunKind::Interactive,
+                    prompt.seq,
+                    driver.attachment_id,
+                    crate::brain::store::BrainRunStatus::Running,
+                )
+                .unwrap();
+            let program = store
+                .push_for_run(
+                    "shared",
+                    "provider",
+                    run.run_id,
+                    BrainEventKind::Program {
+                        language: ProgramLanguage::Lisp,
+                        source: format!("(say \"out {turn}\")"),
+                    },
+                )
+                .unwrap();
+            push_named_brain_run_result(
+                &store,
+                "shared",
+                run.run_id,
+                program.seq,
+                Ok(format!("out {turn}")),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+            store
+                .transition_run(
+                    "shared",
+                    "daemon",
+                    run.run_id,
+                    crate::brain::store::BrainRunStatus::Completed,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+
+        // The first run fails the way a conflicting stored identity fails.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let runner = tokio::spawn(async move {
+            let mut index = 0;
+            while let Some(request) = rx.recv().await {
+                let crate::server::RunnerRequest::ProjectMemory(request) = request else {
+                    panic!("expected replayed memory projection")
+                };
+                recorded.lock().unwrap().push(request.rendered.clone());
+                let reply = if index == 0 {
+                    Err(
+                        "named-Brain memory identity was reused with conflicting content"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(1)
+                };
+                request.response_tx.send(reply).unwrap();
+                index += 1;
+            }
+        });
+
+        let projected = replay_committed_named_brain_memory(
+            store.clone(),
+            runners.clone(),
+            "shared".into(),
+            lease.lease_id,
+        )
+        .await
+        .unwrap();
+        drop(runners);
+        runner.await.unwrap();
+
+        // Both runs were attempted; the survivor was projected. With `?` the
+        // recorded list stops at one entry and `replay_...` returns `Err`.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["out 0".to_string(), "out 1".to_string()],
+            "a conflicting run must not stop replay from reaching later runs"
+        );
+        assert_eq!(
+            projected, 1,
+            "only the run that actually projected may be counted"
+        );
     }
 
     #[tokio::test]

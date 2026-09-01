@@ -5326,7 +5326,7 @@ Rules:\n\
             let mut inserted = 0;
             for (role, content) in [
                 ("user", request.prompt.as_str()),
-                ("assistant", request.source.as_str()),
+                ("assistant", request.rendered.as_str()),
             ] {
                 if !content.trim().is_empty()
                     && memory

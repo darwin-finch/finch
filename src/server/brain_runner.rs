@@ -24,7 +24,10 @@ pub struct RunnerMemoryProjectionRequest {
     pub run_id: RunId,
     pub request_seq: u64,
     pub prompt: String,
-    pub source: String,
+    /// The rendered output the user saw. Named `rendered`, not `source`:
+    /// carrying output under a field called `source` is the exact confusion
+    /// #254 was about.
+    pub rendered: String,
     pub response_tx: oneshot::Sender<Result<usize, String>>,
 }
 
@@ -1082,7 +1085,7 @@ impl BrainRunnerBroker {
         run_id: RunId,
         request_seq: u64,
         prompt: String,
-        source: String,
+        rendered: String,
     ) -> Result<usize> {
         let registration = self
             .registrations
@@ -1104,7 +1107,7 @@ impl BrainRunnerBroker {
                     run_id,
                     request_seq,
                     prompt,
-                    source,
+                    rendered,
                     response_tx,
                 },
             ))
@@ -1304,7 +1307,7 @@ mod tests {
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.request_seq, 9);
             assert_eq!(request.prompt, "remember this");
-            assert_eq!(request.source, "(say \"remembered\")");
+            assert_eq!(request.rendered, "(say \"remembered\")");
             request.response_tx.send(Ok(2)).unwrap();
         });
 
