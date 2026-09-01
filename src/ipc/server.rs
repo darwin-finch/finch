@@ -5595,8 +5595,199 @@ mod tests {
         assert!(error.to_string().contains("quarantined"));
     }
 
+    #[test]
+    fn test_lost_eject_and_failed_promotion_reject_same_live_child_after_server_restart() {
+        const CHILD_SOCKET: &str = "FINCH_TEST_RUNNER_LEDGER_CHILD_SOCKET";
+        const CHILD_LEASE: &str = "FINCH_TEST_RUNNER_LEDGER_CHILD_LEASE";
+        if let (Ok(socket), Ok(lease)) = (std::env::var(CHILD_SOCKET), std::env::var(CHILD_LEASE)) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async move {
+                let first_stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let first =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(first_stream)
+                        .await
+                        .unwrap();
+                let runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(SuccessfulCancelRunner);
+                let lease_id =
+                    crate::brain::store::RunnerLeaseId(uuid::Uuid::parse_str(&lease).unwrap());
+                first
+                    .register_test_brain_runner_client("shared", lease_id, runner)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if first.ping().await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("child did not observe first daemon transport loss");
+                drop(first);
+
+                let second_stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let second =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(second_stream)
+                        .await
+                        .unwrap();
+                let runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(SuccessfulCancelRunner);
+                let error = second
+                    .register_test_brain_runner_client("shared", lease_id, runner)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE),
+                    "restart admitted an unresolved same-process runner: {error}"
+                );
+            }));
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let temp = tempfile::Builder::new()
+                .prefix("f138-ledger-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket = temp.path().join("runner-ledger.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let brain_root = temp.path().join("brains");
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local",
+                Some(brain_root.clone()),
+            );
+            let lease = store
+                .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+                .unwrap();
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([86; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("--exact")
+                .arg("ipc::server::tests::test_lost_eject_and_failed_promotion_reject_same_live_child_after_server_restart")
+                .arg("--nocapture")
+                .env(CHILD_SOCKET, &socket)
+                .env(CHILD_LEASE, lease.lease_id.0.to_string());
+            let mut child = child.spawn().unwrap();
+
+            let (first_stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("child did not connect to first server")
+            .unwrap();
+            let first_connection = uuid::Uuid::new_v4();
+            server
+                .brain_runners()
+                .claim_connection_lease(first_connection, "shared", lease.lease_id)
+                .unwrap();
+            let first_server = std::sync::Arc::clone(&server);
+            let first_handler = tokio::task::spawn_local(async move {
+                super::handle_connection_with_id(first_stream, first_server, first_connection).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !server
+                    .brain_runners()
+                    .has_registration("shared", lease.lease_id)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("child registration was not acknowledged");
+            server
+                .brain_runners()
+                .fail_next_quarantine_promotion_for_test();
+            let ejection = server
+                .brain_runners()
+                .eject_connection(first_connection)
+                .unwrap();
+            assert!(ejection.try_enter().is_none());
+            // Drop the daemon-side RPC task without publishing ejectProcess:
+            // only the fsynced runner-bearing ledger may protect restart.
+            first_handler.abort();
+            let _ = first_handler.await;
+            drop(server);
+
+            let quarantine_path = temp.path().join("runner-process-quarantine-v1.json");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(&quarantine_path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            let restarted = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    crate::brain::store::BrainStore::with_root(
+                        "box.local",
+                        Some(brain_root),
+                    ),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([86; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let (second_stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("same live child did not reconnect to restarted server")
+            .unwrap();
+            let second_connection = uuid::Uuid::new_v4();
+            restarted
+                .brain_runners()
+                .claim_connection_lease(second_connection, "shared", lease.lease_id)
+                .unwrap();
+            let second_server = std::sync::Arc::clone(&restarted);
+            let second_handler = tokio::task::spawn_local(async move {
+                super::handle_connection_with_id(second_stream, second_server, second_connection)
+                    .await
+            });
+            let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+                .await
+                .expect("same-process restart child did not exit")
+                .unwrap();
+            assert!(status.success());
+            tokio::time::timeout(std::time::Duration::from_secs(2), second_handler)
+                .await
+                .expect("rejected child connection did not retire")
+                .unwrap()
+                .unwrap();
+        }));
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn test_event_loop_terminal_quarantine_does_not_schedule_runner_retry() {
+    async fn test_explicit_local_ejection_makes_event_loop_reconnect_terminal_without_lease_churn()
+    {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let temp = tempfile::tempdir().unwrap();
@@ -5623,34 +5814,6 @@ mod tests {
                     )
                     .unwrap(),
                 );
-                let old_connection = uuid::Uuid::new_v4();
-                server
-                    .brain_runners()
-                    .claim_connection_lease(old_connection, "shared", lease.lease_id)
-                    .unwrap();
-                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-                server
-                    .brain_runners()
-                    .register_bounded_for_connection(
-                        old_connection,
-                        crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
-                        "shared",
-                        lease.lease_id,
-                        tx,
-                    )
-                    .unwrap();
-                let ejection = server
-                    .brain_runners()
-                    .eject_connection(old_connection)
-                    .unwrap();
-                ejection.publish_ejection();
-                ejection.mark_transport_closed();
-                server
-                    .brain_runners()
-                    .begin_connection_teardown(old_connection)
-                    .finish()
-                    .unwrap();
-
                 let reconnect = uuid::Uuid::new_v4();
                 server
                     .brain_runners()
@@ -5660,6 +5823,14 @@ mod tests {
                     FinchDaemonImpl::new(std::sync::Arc::clone(&server), reconnect),
                 );
                 let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                // Exercise the actual reverse-capability control method. The
+                // reconnect below models the restore attempt after transport
+                // EOF; it must observe the typed process-local poison before
+                // sending another registration RPC.
+                ipc.explicitly_eject_runner_process_for_test()
+                    .await
+                    .unwrap();
+                assert!(ipc.test_runner_process_poisoned());
                 let generator: std::sync::Arc<dyn crate::generators::Generator> =
                     std::sync::Arc::new(ProviderSubmitProgramGenerator {
                         input: serde_json::Value::Null,
@@ -5679,7 +5850,7 @@ mod tests {
                     executor,
                     std::sync::Arc::new(crate::runtime::ProgramRuntime::new()),
                 );
-                event_loop.set_ipc_client_for_test(ipc);
+                event_loop.set_ipc_client_for_test(ipc.clone());
                 event_loop
                     .handle_named_brain_event_for_test(
                         crate::cli::repl_event::ReplEvent::RunnerLeaseStatus {
@@ -5693,6 +5864,21 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(event_loop.next_queued_event_for_test().await.is_none());
+                assert_eq!(ipc.test_active_runner_registrations(), 0);
+                assert!(!server
+                    .brain_runners()
+                    .has_registration("shared", lease.lease_id));
+                assert_eq!(
+                    server
+                        .brain_store()
+                        .snapshot("shared")
+                        .unwrap()
+                        .runner_lease
+                        .unwrap()
+                        .lease_id,
+                    lease.lease_id,
+                    "terminal reconnect detection must not churn the durable lease"
+                );
             })
             .await;
     }
@@ -6195,6 +6381,7 @@ mod tests {
         uuid::Uuid,
         crate::brain::store::RunnerLeaseId,
         anyhow::Result<()>,
+        Option<tokio::sync::oneshot::Sender<()>>,
     ) {
         use tokio::io::AsyncWriteExt;
 
@@ -6306,6 +6493,7 @@ mod tests {
                 .fail_next_effect_audit_batch_for_test("shared")
                 .unwrap();
         }
+        let retry_pause = fail_audit_batch.then(|| runners.pause_next_teardown_retry());
 
         let (server_stream, mut peer_stream) = tokio::net::UnixStream::pair().unwrap();
         let handler_server = std::sync::Arc::clone(&server);
@@ -6328,14 +6516,31 @@ mod tests {
             .await
             .expect("partial-frame connection teardown exceeded two seconds")
             .unwrap();
-        (temp, store, server, connection_id, lease.lease_id, result)
+        let retry_release = if let Some((reached, release)) = retry_pause {
+            tokio::time::timeout(std::time::Duration::from_secs(1), reached)
+                .await
+                .expect("teardown retry owner did not reach deterministic pause")
+                .expect("teardown retry owner dropped its deterministic pause");
+            Some(release)
+        } else {
+            None
+        };
+        (
+            temp,
+            store,
+            server,
+            connection_id,
+            lease.lease_id,
+            result,
+            retry_release,
+        )
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn effect_audit_partial_frame_connection_teardown_reconciles_before_and_after_begin() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (_temp, store, server, _connection_id, lease_id, _result) =
+                let (_temp, store, server, _connection_id, lease_id, _result, _retry_release) =
                     partial_frame_connection_teardown_fixture(false).await;
                 assert!(!server.brain_runners().has_registration("shared", lease_id));
                 let states = store
@@ -6367,10 +6572,67 @@ mod tests {
     async fn effect_audit_teardown_transaction_failure_keeps_authority_fenced_until_retry() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (_temp, store, server, connection_id, lease_id, result) =
+                let (_temp, store, server, connection_id, lease_id, result, retry_release) =
                     partial_frame_connection_teardown_fixture(true).await;
-                result.expect("transient audit failure must be retried by the teardown owner");
+                result.expect(
+                    "transport teardown may return while durable audit retry owns authority",
+                );
                 let replacement = uuid::Uuid::new_v4();
+                assert!(server
+                    .brain_runners()
+                    .claim_connection_identity(replacement, "runner@box.local/partial")
+                    .is_err());
+                assert!(server
+                    .brain_runners()
+                    .claim_connection_lease(replacement, "shared", lease_id)
+                    .is_err());
+                assert!(server
+                    .brain_runners()
+                    .connection_dispatch_admission(connection_id)
+                    .unwrap()
+                    .try_enter()
+                    .is_none());
+                assert!(!server
+                    .brain_runners()
+                    .test_connection_resources_retired(connection_id));
+
+                // Fail the first owned retry too, then pause the next attempt.
+                // This proves the task neither abandons authority after a
+                // bounded attempt nor spins through retries without backoff.
+                store
+                    .fail_next_effect_audit_batch_for_test("shared")
+                    .unwrap();
+                let (second_reached, second_release) =
+                    server.brain_runners().pause_next_teardown_retry();
+                let failed_retry_released = tokio::time::Instant::now();
+                retry_release.unwrap().send(()).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), second_reached)
+                    .await
+                    .expect("second bounded teardown retry did not run")
+                    .expect("teardown retry owner exited after a failed attempt");
+                assert!(
+                    failed_retry_released.elapsed() >= std::time::Duration::from_millis(15),
+                    "permanent audit failure retried without bounded backoff"
+                );
+                assert!(server
+                    .brain_runners()
+                    .claim_connection_lease(replacement, "shared", lease_id)
+                    .is_err());
+                assert!(!server
+                    .brain_runners()
+                    .test_connection_resources_retired(connection_id));
+                second_release.send(()).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !server
+                        .brain_runners()
+                        .test_connection_resources_retired(connection_id)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("successful audit retry did not release exact authority");
+
                 server
                     .brain_runners()
                     .claim_connection_identity(replacement, "runner@box.local/partial")
@@ -6379,21 +6641,17 @@ mod tests {
                     .brain_runners()
                     .claim_connection_lease(replacement, "shared", lease_id)
                     .unwrap();
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                server
+                    .brain_runners()
+                    .register_for_connection(replacement, "shared", lease_id, tx)
+                    .unwrap();
                 assert_eq!(
                     store
                         .reconcile_effect_audits_for_disconnected_leases("shared", &[lease_id])
                         .unwrap(),
                     0
                 );
-                server
-                    .brain_runners()
-                    .begin_connection_teardown(connection_id)
-                    .finish()
-                    .unwrap();
-                server
-                    .brain_runners()
-                    .claim_connection_identity(replacement, "runner@box.local/partial")
-                    .unwrap();
             })
             .await;
     }
@@ -8063,57 +8321,90 @@ async fn handle_connection_with_shutdown_for_peer(
             .or_default()
             .push(*lease_id);
     }
-    for (brain, lease_ids) in leases_by_brain {
-        if let Err(error) = server
-            .brain_store()
-            .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
-        {
-            tracing::error!(brain = %brain, %error,
-                "disconnected runner audit reconciliation remains pending");
-            let retry_store = server.brain_store().clone();
-            tokio::spawn(async move {
-                let mut delay = std::time::Duration::from_millis(10);
-                for attempt in 1..=8 {
-                    tokio::time::sleep(delay).await;
-                    match retry_store
-                        .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
-                    {
-                        Ok(_) => break,
-                        Err(error) => {
-                            tracing::error!(brain = %brain, %error, attempt, retry_ms = delay.as_millis(),
-                                "disconnected runner audit reconciliation retry remains pending");
-                            if attempt == 8 {
-                                // The durable audit rows remain the restart
-                                // recovery owner. Bound this connection-local
-                                // retry so forced ejection cannot leak one
-                                // forever-live task per hostile frontend.
-                                break;
-                            }
-                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
-                        }
-                    }
-                }
-            });
-        }
+    if let Err(error) = reconcile_disconnected_runner_audits(&server, &leases_by_brain) {
+        tracing::error!(%error,
+            "disconnected runner audit reconciliation remains pending; retaining exact connection authority");
+        tokio::spawn(retry_connection_teardown(
+            Arc::clone(&server),
+            teardown,
+            leases_by_brain,
+        ));
+        return result;
     }
-    let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+    if let Err(error) = finish_reconciled_connection_teardown(&server, &teardown) {
+        tracing::error!(%error,
+            "reconciled runner connection release remains pending; retaining exact connection authority");
+        tokio::spawn(retry_connection_teardown(
+            Arc::clone(&server),
+            teardown,
+            leases_by_brain,
+        ));
+        return result;
+    }
+    result
+}
+
+fn reconcile_disconnected_runner_audits(
+    server: &AgentServer,
+    leases_by_brain: &std::collections::BTreeMap<String, Vec<crate::brain::store::RunnerLeaseId>>,
+) -> Result<()> {
+    for (brain, lease_ids) in leases_by_brain {
+        server
+            .brain_store()
+            .reconcile_effect_audits_for_disconnected_leases(brain, lease_ids)?;
+    }
+    Ok(())
+}
+
+fn finish_reconciled_connection_teardown(
+    server: &AgentServer,
+    teardown: &crate::server::RunnerConnectionTeardown,
+) -> Result<()> {
+    let lifecycle = crate::server::BrainLifecycleService::from_server(server);
     for (brain, attachment_id, attachment_connection_id) in &teardown.attachments {
         if let Err(error) = lifecycle.detach(brain, *attachment_id, *attachment_connection_id) {
-            // Audit durability is the authority-critical teardown phase. Once
-            // it succeeds, an attachment may already have been retired by an
-            // explicit detach or cancellation path. Cleanup is idempotent in
-            // effect and must not strand the lease/identity fence forever.
+            // Attachment cleanup is idempotent and subordinate to the durable
+            // audit boundary. Do not let an already-retired attachment strand
+            // reconciled runner authority.
             tracing::warn!(
                 brain,
                 attachment_id = %attachment_id.0,
                 connection_id = %attachment_connection_id.0,
                 %error,
-                "could not detach disconnected Brain attachment; releasing reconciled connection claims"
+                "could not detach disconnected Brain attachment before releasing reconciled connection claims"
             );
         }
     }
-    teardown.finish()?;
-    result
+    teardown.finish()
+}
+
+async fn retry_connection_teardown(
+    server: Arc<AgentServer>,
+    teardown: crate::server::RunnerConnectionTeardown,
+    leases_by_brain: std::collections::BTreeMap<String, Vec<crate::brain::store::RunnerLeaseId>>,
+) {
+    let mut attempt = 0_u64;
+    let mut delay = std::time::Duration::from_millis(10);
+    loop {
+        tokio::time::sleep(delay).await;
+        #[cfg(test)]
+        teardown.wait_retry_pause_for_test().await;
+        attempt = attempt.saturating_add(1);
+        let retry = reconcile_disconnected_runner_audits(&server, &leases_by_brain)
+            .and_then(|()| finish_reconciled_connection_teardown(&server, &teardown));
+        match retry {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(%error, attempt, retry_ms = delay.as_millis(),
+                    "disconnected runner teardown retry remains pending with exact authority fenced");
+                // One owner performs one synchronous durable attempt at a
+                // time. The cap bounds retry frequency, not ownership: a
+                // permanent storage failure remains fail-closed without a
+                // hot loop or admitting a replacement generation.
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 struct TransportClosedProof(Arc<crate::server::ConnectionDispatchAdmission>);

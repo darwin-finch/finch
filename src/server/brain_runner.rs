@@ -91,40 +91,80 @@ fn process_start_token(_pid: u32) -> Result<Option<u64>> {
     anyhow::bail!("runner process identity is unsupported on this Unix platform")
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+struct RunnerProcessLedger {
+    /// Confirmed forced-ejection identities. These remain terminal until the
+    /// kernel proves that exact PID/start pair no longer exists.
+    quarantined: HashSet<RunnerProcessIdentity>,
+    /// Successfully registered callback processes whose graceful release has
+    /// not yet been fsynced. On restart these are uncertain, not confirmed
+    /// quarantines, but both states must reject a still-live identity.
+    runner_bearing: HashSet<RunnerProcessIdentity>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RunnerProcessLedgerFile {
+    Current(RunnerProcessLedger),
+    Legacy(Vec<RunnerProcessIdentity>),
+}
+
 #[derive(Clone, Default)]
 struct RunnerQuarantineStore {
     path: Option<Arc<PathBuf>>,
+    ledger: Arc<Mutex<RunnerProcessLedger>>,
+    #[cfg(test)]
+    fail_quarantine_promotions: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RunnerQuarantineStore {
-    fn at(path: PathBuf) -> Result<(Self, HashSet<RunnerProcessIdentity>)> {
+    fn at(
+        path: PathBuf,
+    ) -> Result<(
+        Self,
+        HashSet<RunnerProcessIdentity>,
+        HashSet<RunnerProcessIdentity>,
+    )> {
+        let mut ledger = Self::load(&path)?;
+        let before = (ledger.quarantined.len(), ledger.runner_bearing.len());
+        ledger
+            .quarantined
+            .retain(|identity| identity.still_exists().unwrap_or(true));
+        ledger
+            .runner_bearing
+            .retain(|identity| identity.still_exists().unwrap_or(true));
         let store = Self {
             path: Some(Arc::new(path)),
+            ledger: Arc::new(Mutex::new(ledger.clone())),
+            #[cfg(test)]
+            fail_quarantine_promotions: Arc::default(),
         };
-        let mut quarantined = store.load()?;
-        let before = quarantined.len();
-        quarantined.retain(|identity| identity.still_exists().unwrap_or(true));
-        if quarantined.len() != before {
-            store.persist(&quarantined)?;
+        if before != (ledger.quarantined.len(), ledger.runner_bearing.len()) {
+            store.persist(&ledger)?;
         }
-        Ok((store, quarantined))
+        Ok((store, ledger.quarantined, ledger.runner_bearing))
     }
 
-    fn load(&self) -> Result<HashSet<RunnerProcessIdentity>> {
-        let Some(path) = self.path.as_deref() else {
-            return Ok(HashSet::new());
-        };
+    fn load(path: &std::path::Path) -> Result<RunnerProcessLedger> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RunnerProcessLedger::default());
+            }
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
-        serde_json::from_slice::<Vec<RunnerProcessIdentity>>(&bytes)
-            .context("parse runner process quarantine")
-            .map(|entries| entries.into_iter().collect())
+        match serde_json::from_slice::<RunnerProcessLedgerFile>(&bytes)
+            .context("parse runner process quarantine ledger")?
+        {
+            RunnerProcessLedgerFile::Current(ledger) => Ok(ledger),
+            RunnerProcessLedgerFile::Legacy(entries) => Ok(RunnerProcessLedger {
+                quarantined: entries.into_iter().collect(),
+                runner_bearing: HashSet::new(),
+            }),
+        }
     }
 
-    fn persist(&self, quarantined: &HashSet<RunnerProcessIdentity>) -> Result<()> {
+    fn persist(&self, ledger: &RunnerProcessLedger) -> Result<()> {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
@@ -132,9 +172,7 @@ impl RunnerQuarantineStore {
             .parent()
             .context("runner quarantine path has no parent")?;
         std::fs::create_dir_all(parent)?;
-        let mut entries = quarantined.iter().copied().collect::<Vec<_>>();
-        entries.sort_unstable();
-        let bytes = serde_json::to_vec(&entries)?;
+        let bytes = serde_json::to_vec(ledger)?;
         let temporary = parent.join(format!(
             ".runner-process-quarantine-{}.tmp",
             uuid::Uuid::new_v4().simple()
@@ -158,6 +196,84 @@ impl RunnerQuarantineStore {
             let _ = std::fs::remove_file(&temporary);
         }
         result.with_context(|| format!("persist runner process quarantine at {}", path.display()))
+    }
+
+    /// Persist the fail-closed runner-bearing marker before registration can
+    /// be acknowledged to the frontend.
+    fn mark_runner_bearing(&self, identity: RunnerProcessIdentity) -> Result<()> {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .expect("runner process ledger lock poisoned");
+        if !ledger.runner_bearing.insert(identity) {
+            return Ok(());
+        }
+        if let Err(error) = self.persist(&ledger) {
+            ledger.runner_bearing.remove(&identity);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Promote an already durable runner-bearing identity to a confirmed
+    /// quarantine. If this write fails, the prior fsynced runner-bearing
+    /// marker remains authoritative across restart.
+    fn quarantine(&self, identity: RunnerProcessIdentity) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_quarantine_promotions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            anyhow::bail!("injected runner quarantine promotion persistence failure");
+        }
+        let mut ledger = self
+            .ledger
+            .lock()
+            .expect("runner process ledger lock poisoned");
+        if !ledger.quarantined.insert(identity) {
+            return Ok(());
+        }
+        if let Err(error) = self.persist(&ledger) {
+            ledger.quarantined.remove(&identity);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_quarantine_promotion(&self) {
+        self.fail_quarantine_promotions.store(1, Ordering::SeqCst);
+    }
+
+    /// Release uncertainty only after callback quiescence and durable effect
+    /// reconciliation. A failed fsync leaves both live and restarted brokers
+    /// fail-closed for this exact OS identity.
+    fn release_runner_bearing(
+        &self,
+        identity: RunnerProcessIdentity,
+        confirmed_quarantine: bool,
+    ) -> Result<()> {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .expect("runner process ledger lock poisoned");
+        let previous = ledger.clone();
+        if confirmed_quarantine {
+            ledger.quarantined.insert(identity);
+        }
+        if !ledger.runner_bearing.remove(&identity)
+            && (!confirmed_quarantine || previous.quarantined.contains(&identity))
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.persist(&ledger) {
+            *ledger = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -824,6 +940,7 @@ struct ConnectionAuthority {
     runner_process_owners: HashMap<RunnerProcessIdentity, uuid::Uuid>,
     connection_runner_processes: HashMap<uuid::Uuid, RunnerProcessIdentity>,
     quarantined_runner_processes: HashSet<RunnerProcessIdentity>,
+    uncertain_runner_processes: HashSet<RunnerProcessIdentity>,
 }
 
 #[derive(Default)]
@@ -941,6 +1058,15 @@ pub struct BrainRunnerBroker {
     #[cfg(test)]
     fence_install_pause:
         Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
+    #[cfg(test)]
+    teardown_retry_pause: Arc<
+        Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    >,
 }
 
 impl Default for BrainRunnerBroker {
@@ -965,7 +1091,21 @@ impl RunnerConnectionTeardown {
         self.dispatch.wait_quiesced().await;
     }
 
-    pub(crate) fn finish(self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) async fn wait_retry_pause_for_test(&self) {
+        let pause = self
+            .broker
+            .teardown_retry_pause
+            .lock()
+            .expect("teardown-retry test hook poisoned")
+            .take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
+    pub(crate) fn finish(&self) -> Result<()> {
         anyhow::ensure!(
             self.dispatch
                 .state
@@ -980,6 +1120,18 @@ impl RunnerConnectionTeardown {
             .connection_authority
             .lock()
             .expect("runner connection-authority lock poisoned");
+        let process_identity = authority
+            .connection_runner_processes
+            .get(&self.connection_id)
+            .copied();
+        if let Some(process_identity) = process_identity {
+            self.broker.quarantine_store.release_runner_bearing(
+                process_identity,
+                authority
+                    .quarantined_runner_processes
+                    .contains(&process_identity),
+            )?;
+        }
         authority
             .identities
             .retain(|_, owner| *owner != self.connection_id);
@@ -989,12 +1141,12 @@ impl RunnerConnectionTeardown {
         authority
             .attachments
             .retain(|_, owner| *owner != self.connection_id);
-        if let Some(process_epoch) = authority
+        if let Some(process_identity) = authority
             .connection_runner_processes
             .remove(&self.connection_id)
         {
-            if authority.runner_process_owners.get(&process_epoch) == Some(&self.connection_id) {
-                authority.runner_process_owners.remove(&process_epoch);
+            if authority.runner_process_owners.get(&process_identity) == Some(&self.connection_id) {
+                authority.runner_process_owners.remove(&process_identity);
             }
         }
         authority.dispatch.remove(&self.connection_id);
@@ -1162,12 +1314,18 @@ impl BrainRunnerBroker {
         deadlines: RunnerDeadlines,
         quarantine_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let (quarantine_store, quarantined_runner_processes) = match quarantine_path {
-            Some(path) => RunnerQuarantineStore::at(path)?,
-            None => (RunnerQuarantineStore::default(), HashSet::new()),
-        };
+        let (quarantine_store, quarantined_runner_processes, uncertain_runner_processes) =
+            match quarantine_path {
+                Some(path) => RunnerQuarantineStore::at(path)?,
+                None => (
+                    RunnerQuarantineStore::default(),
+                    HashSet::new(),
+                    HashSet::new(),
+                ),
+            };
         let connection_authority = ConnectionAuthority {
             quarantined_runner_processes,
+            uncertain_runner_processes,
             ..ConnectionAuthority::default()
         };
         Ok(Self {
@@ -1189,6 +1347,8 @@ impl BrainRunnerBroker {
             dispatch_send_pause: Arc::default(),
             #[cfg(test)]
             fence_install_pause: Arc::default(),
+            #[cfg(test)]
+            teardown_retry_pause: Arc::default(),
         })
     }
 
@@ -1922,6 +2082,13 @@ impl BrainRunnerBroker {
             crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE
         );
         anyhow::ensure!(
+            !authority
+                .uncertain_runner_processes
+                .contains(&process_identity),
+            "{}: runner process identity has an unresolved durable runner-bearing marker from a prior daemon instance",
+            crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE
+        );
+        anyhow::ensure!(
             authority
                 .runner_process_owners
                 .get(&process_identity)
@@ -1947,6 +2114,12 @@ impl BrainRunnerBroker {
                 .closed,
             "IPC connection is tearing down"
         );
+        // This fsync is the registration commit point. If the daemon exits or
+        // a later forced-quarantine promotion cannot be persisted, restart
+        // treats the still-live identity as uncertain and rejects it.
+        self.quarantine_store
+            .mark_runner_bearing(process_identity)
+            .context("persist runner-bearing process identity before registration")?;
         let id = RunnerRegistrationId(uuid::Uuid::new_v4());
         let (active, _) = watch::channel(true);
         let registration = Registration {
@@ -2119,11 +2292,33 @@ impl BrainRunnerBroker {
         (reached_rx, release_tx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_next_teardown_retry(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .teardown_retry_pause
+            .lock()
+            .expect("teardown-retry test hook poisoned") = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_quarantine_promotion_for_test(&self) {
+        self.quarantine_store.fail_next_quarantine_promotion();
+    }
+
     /// Permanently quarantine this kernel-derived runner process identity,
     /// synchronously close dispatch and invalidate its exact generations,
-    /// then publish transport ejection. Persisting and invalidation precede
-    /// the signal so neither a spoofed correlation UUID nor a second callback
-    /// can race the quarantine boundary.
+    /// then publish transport ejection. A confirmed quarantine or its earlier
+    /// fsynced runner-bearing fallback and invalidation precede the signal, so
+    /// neither a spoofed correlation UUID nor a second callback can race the
+    /// fail-closed boundary.
     pub(crate) fn eject_connection(
         &self,
         connection_id: uuid::Uuid,
@@ -2139,10 +2334,7 @@ impl BrainRunnerBroker {
         authority
             .quarantined_runner_processes
             .insert(process_identity);
-        let quarantine_persistence_error = self
-            .quarantine_store
-            .persist(&authority.quarantined_runner_processes)
-            .err();
+        let quarantine_persistence_error = self.quarantine_store.quarantine(process_identity).err();
         let dispatch = authority
             .dispatch
             .get(&connection_id)
@@ -2166,13 +2358,13 @@ impl BrainRunnerBroker {
         drop(registrations);
         drop(authority);
         if let Some(error) = quarantine_persistence_error {
-            // Do not let a storage failure skip transport revocation and then
-            // release the callback lane while hostile remote work remains
-            // physically live. The in-memory quarantine stays fail-closed for
-            // this daemon lifetime; startup continues to reject malformed or
-            // unreadable durable quarantine state.
+            // Registration was acknowledged only after its runner-bearing
+            // marker was fsynced. Promotion failure therefore cannot reopen
+            // admission after restart: the older durable uncertainty remains
+            // authoritative while this daemon retains a confirmed in-memory
+            // quarantine.
             tracing::error!(%error, %connection_id,
-                "could not persist forced runner-process quarantine before ejection");
+                "could not promote durable runner-bearing marker to confirmed quarantine before ejection");
         }
         self.registration_changes.notify_waiters();
         Ok(dispatch)
@@ -4481,10 +4673,16 @@ mod tests {
     }
 
     #[test]
-    fn test_graceful_connection_teardown_allows_same_process_epoch_reconnect() {
-        let broker = BrainRunnerBroker::default();
+    fn test_graceful_connection_teardown_fsync_allows_same_process_identity_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine_path = temp.path().join("runner-process-quarantine-v1.json");
+        let broker = BrainRunnerBroker::with_deadlines_and_quarantine_path(
+            RunnerDeadlines::default(),
+            Some(quarantine_path.clone()),
+        )
+        .unwrap();
         let lease_id = lease();
-        let process_epoch = process_identity(21);
+        let process_epoch = RunnerProcessIdentity::for_pid(std::process::id()).unwrap();
         let old_connection = uuid::Uuid::new_v4();
         broker
             .claim_connection_lease(old_connection, "brain", lease_id)
@@ -4503,6 +4701,13 @@ mod tests {
             .begin_connection_teardown(old_connection)
             .finish()
             .unwrap();
+        drop(broker);
+
+        let broker = BrainRunnerBroker::with_deadlines_and_quarantine_path(
+            RunnerDeadlines::default(),
+            Some(quarantine_path),
+        )
+        .unwrap();
 
         let reconnect = uuid::Uuid::new_v4();
         broker
@@ -4588,39 +4793,60 @@ mod tests {
     }
 
     #[test]
-    fn test_quarantine_storage_failure_still_revokes_connection_dispatch() {
+    fn test_quarantine_promotion_failure_uses_durable_runner_bearing_fallback_after_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let blocker = temp.path().join("not-a-directory");
-        std::fs::write(&blocker, b"block quarantine persistence").unwrap();
-        let mut broker = BrainRunnerBroker::default();
-        broker.quarantine_store = RunnerQuarantineStore {
-            path: Some(Arc::new(blocker.join("quarantine.json"))),
-        };
+        let quarantine_path = temp.path().join("runner-process-quarantine-v1.json");
+        let broker = BrainRunnerBroker::with_deadlines_and_quarantine_path(
+            RunnerDeadlines::default(),
+            Some(quarantine_path.clone()),
+        )
+        .unwrap();
         let lease_id = lease();
         let connection = uuid::Uuid::new_v4();
+        let identity = RunnerProcessIdentity::for_pid(std::process::id()).unwrap();
         broker
             .claim_connection_lease(connection, "brain", lease_id)
             .unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         broker
-            .register_bounded_for_connection(
-                connection,
-                process_identity(29),
-                "brain",
-                lease_id,
-                tx,
-            )
+            .register_bounded_for_connection(connection, identity, "brain", lease_id, tx)
             .unwrap();
 
+        broker.fail_next_quarantine_promotion_for_test();
         let admission = broker.eject_connection(connection).unwrap();
         assert!(admission.try_enter().is_none());
-        admission.publish_ejection();
-        admission.mark_transport_closed();
-        broker
-            .begin_connection_teardown(connection)
-            .finish()
+        // Model a lost best-effort eject notification followed by daemon
+        // process loss: neither in-memory quarantine nor teardown survives.
+        drop(broker);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&quarantine_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let restarted = BrainRunnerBroker::with_deadlines_and_quarantine_path(
+            RunnerDeadlines::default(),
+            Some(quarantine_path),
+        )
+        .unwrap();
+        let reconnect = uuid::Uuid::new_v4();
+        restarted
+            .claim_connection_lease(reconnect, "brain", lease_id)
             .unwrap();
-        assert!(broker.test_connection_resources_retired(connection));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = restarted
+            .register_bounded_for_connection(reconnect, identity, "brain", lease_id, tx)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unresolved durable runner-bearing"));
     }
 
     #[test]

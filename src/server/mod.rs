@@ -12,8 +12,9 @@ pub mod openai_types; // Public for client access
 
 pub use brain_approval::BrainApprovalBroker;
 pub(crate) use brain_runner::{
-    BoundedRunnerRequest, ConnectionDispatchAdmission, RunnerEffectAuditControlRequest,
-    RunnerEffectAuditReservationRequest, RunnerHostEffectFinishRequest, RunnerProcessIdentity,
+    BoundedRunnerRequest, ConnectionDispatchAdmission, RunnerConnectionTeardown,
+    RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
+    RunnerHostEffectFinishRequest, RunnerProcessIdentity,
 };
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerDeadlines,

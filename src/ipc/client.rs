@@ -137,6 +137,22 @@ impl IpcClient {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn explicitly_eject_runner_process_for_test(&self) -> Result<()> {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+            event_tx,
+            memory_callbacks: Default::default(),
+            process: std::sync::Arc::clone(&self._rpc_handle.state.process),
+        });
+        let mut request = runner.eject_process_request();
+        request
+            .get()
+            .set_reason("deterministic explicit-ejection test boundary");
+        request.send().promise.await?;
+        Ok(())
+    }
+
     /// Connect to the daemon's Unix socket.
     pub async fn connect() -> Result<Self> {
         Self::connect_path(sock_path()).await
@@ -784,15 +800,15 @@ impl IpcClient {
         lease_id: crate::brain::store::RunnerLeaseId,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
-        anyhow::ensure!(
-            !self
-                ._rpc_handle
-                .state
-                .process
-                .poisoned
-                .load(std::sync::atomic::Ordering::Acquire),
-            "runner process epoch was quarantined after forced callback ejection; restart the frontend process"
-        );
+        if self
+            ._rpc_handle
+            .state
+            .process
+            .poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(anyhow::Error::new(RunnerProcessQuarantined));
+        }
         let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
             event_tx,
             memory_callbacks: Default::default(),
@@ -2571,6 +2587,19 @@ mod tests {
             let mut ejection = runner.eject_process_request();
             ejection.get().set_reason("causal test ejection");
             ejection.send().promise.await.unwrap();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let error = match poisoned_client
+                .register_brain_runner(
+                    "shared",
+                    crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
+                    event_tx,
+                )
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("process-local quarantine allowed runner registration"),
+            };
+            assert!(is_runner_process_quarantined(&error));
             drop(poisoned_client);
             assert!(poisoned_process
                 .poisoned
