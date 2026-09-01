@@ -5,13 +5,15 @@
 // into a structured buffer AND writes it to stdout immediately with ANSI colors.
 // This enables terminal scrollback while maintaining TUI compatibility.
 
+use std::any::{Any, TypeId};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
-    BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef, OperationMessage,
-    StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
+    ActivityMessage, BrainParticipantMessage, LiveToolMessage, Message, MessageId, MessageRef,
+    OperationMessage, ProgramOutputMessage, ProgramSourceMessage, StaticMessage,
+    StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
 use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
@@ -25,8 +27,8 @@ const MAX_BUFFER_SIZE: usize = 1000;
 #[derive(Clone)]
 pub struct VmOutputProjection {
     output: Arc<OutputManager>,
-    default_response: Arc<WorkUnit>,
-    handles: Arc<Mutex<HashMap<String, Arc<WorkUnit>>>>,
+    default_response: VmDefaultResponse,
+    handles: Arc<Mutex<HashMap<String, Arc<ProgramOutputMessage>>>>,
     /// The portable effect protocol is at-least-once at the application
     /// boundary: a reconnecting host may replay a journal suffix.  Keep the
     /// per-run cursor with this client-local projection so a duplicate cannot
@@ -43,6 +45,48 @@ pub struct VmOutputProjection {
     /// later Brain event log, but a live client must not lose output merely
     /// because its local delivery was reordered.
     pending_effects: Arc<Mutex<HashMap<uuid::Uuid, BTreeMap<u64, VmEffectEnvelope>>>>,
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum VmDefaultResponse {
+    Program(Arc<ProgramOutputMessage>),
+    LegacyWorkUnit(Arc<WorkUnit>),
+    ToolActivity { unit: Arc<WorkUnit>, row_idx: usize },
+}
+
+/// Compatibility adapter accepted by [`VmOutputProjection::new`].
+pub trait IntoVmDefaultResponse {
+    #[doc(hidden)]
+    fn into_vm_default_response(self) -> VmDefaultResponse;
+}
+
+impl IntoVmDefaultResponse for Arc<ProgramOutputMessage> {
+    fn into_vm_default_response(self) -> VmDefaultResponse {
+        VmDefaultResponse::Program(self)
+    }
+}
+
+impl IntoVmDefaultResponse for Arc<WorkUnit> {
+    fn into_vm_default_response(self) -> VmDefaultResponse {
+        VmDefaultResponse::LegacyWorkUnit(self)
+    }
+}
+
+impl VmDefaultResponse {
+    fn append(&self, text: &str) {
+        match self {
+            Self::Program(message) => {
+                message.append_output(text);
+            }
+            Self::LegacyWorkUnit(unit) => {
+                unit.append_response(text);
+            }
+            Self::ToolActivity { unit, row_idx } => {
+                unit.append_row_body_line(*row_idx, text.to_string());
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for VmOutputProjection {
@@ -65,10 +109,37 @@ impl std::fmt::Debug for VmOutputProjection {
 }
 
 impl VmOutputProjection {
-    pub fn new(output: Arc<OutputManager>, default_response: Arc<WorkUnit>) -> Self {
+    pub fn new<T: IntoVmDefaultResponse>(output: Arc<OutputManager>, default_response: T) -> Self {
+        let default_response = match default_response.into_vm_default_response() {
+            VmDefaultResponse::LegacyWorkUnit(unit)
+                if unit.status() != crate::cli::messages::MessageStatus::InProgress =>
+            {
+                VmDefaultResponse::Program(output.start_program_output())
+            }
+            default_response => default_response,
+        };
         Self {
             output,
             default_response,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+            next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
+            pending_effects: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Bind VM effects to a genuine tool activity without creating a second
+    /// top-level program-output artifact for the tool's internal execution.
+    pub fn for_tool_activity(
+        output: Arc<OutputManager>,
+        activity: Arc<WorkUnit>,
+        row_idx: usize,
+    ) -> Self {
+        Self {
+            output,
+            default_response: VmDefaultResponse::ToolActivity {
+                unit: activity,
+                row_idx,
+            },
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
             pending_effects: Arc::new(Mutex::new(HashMap::new())),
@@ -129,7 +200,9 @@ impl VmOutputProjection {
 
     fn project_for_execution(&self, execution_id: Option<uuid::Uuid>, effect: &VmSideEffect) {
         match &effect.event {
-            HostSideEffect::Emit { text } => self.default_response.append_response(text),
+            HostSideEffect::Emit { text } => {
+                self.default_response.append(text);
+            }
             HostSideEffect::Request { .. } => {}
             HostSideEffect::Ui {
                 operation,
@@ -151,7 +224,7 @@ impl VmOutputProjection {
     /// from `project`: the portable VM event remains unchanged and another
     /// embedder may choose a different presentation for it.
     pub fn append_default(&self, text: &str) {
-        self.default_response.append_response(text);
+        self.default_response.append(text);
     }
 
     fn project_ui(
@@ -172,12 +245,10 @@ impl VmOutputProjection {
                         &execution_id,
                         format!("output-handle:{handle}").as_bytes(),
                     );
-                    self.output.start_work_unit_with_id(
-                        MessageId::from_uuid(stable),
-                        text.unwrap_or("Working"),
-                    )
+                    self.output
+                        .start_program_output_with_id(MessageId::from_uuid(stable))
                 } else {
-                    self.output.start_work_unit(text.unwrap_or("Working"))
+                    self.output.start_program_output()
                 };
                 // A handle is a VM-owned reactive artifact, not a second
                 // assistant reply.  Give it the same plain output chrome as
@@ -191,12 +262,12 @@ impl VmOutputProjection {
             }
             UiOperation::Append => {
                 if let (Some(unit), Some(text)) = (self.unit(handle), text) {
-                    unit.append_response(text);
+                    unit.append_output(text);
                 }
             }
             UiOperation::Replace => {
                 if let (Some(unit), Some(text)) = (self.unit(handle), text) {
-                    unit.set_response(text);
+                    unit.replace_output(text);
                 }
             }
             UiOperation::Status => {
@@ -219,7 +290,7 @@ impl VmOutputProjection {
                 if let Some(unit) = self.remove_unit(handle) {
                     unit.set_transient_status(None);
                     if let Some(text) = text {
-                        unit.set_response(text);
+                        unit.replace_output(text);
                     }
                     unit.set_failed();
                 }
@@ -227,7 +298,7 @@ impl VmOutputProjection {
         }
     }
 
-    fn unit(&self, handle: &str) -> Option<Arc<WorkUnit>> {
+    fn unit(&self, handle: &str) -> Option<Arc<ProgramOutputMessage>> {
         self.handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -235,7 +306,7 @@ impl VmOutputProjection {
             .cloned()
     }
 
-    fn remove_unit(&self, handle: &str) -> Option<Arc<WorkUnit>> {
+    fn remove_unit(&self, handle: &str) -> Option<Arc<ProgramOutputMessage>> {
         self.handles
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -262,8 +333,25 @@ pub struct OutputManager {
     pending_flush: Arc<RwLock<Vec<String>>>,
     /// Trait-based message storage (reactive updates)
     messages: Arc<RwLock<Vec<MessageRef>>>,
+    /// Concrete root handles created by stable-ID factories. This registry
+    /// lets duplicate reconstruction reuse the manager-owned Arc instead of
+    /// returning a detached object after MessageId dedupe.
+    typed_roots: Arc<Mutex<HashMap<(TypeId, MessageId), std::sync::Weak<dyn Any + Send + Sync>>>>,
+    /// Roots whose canonical bytes reached native history. Only these roots
+    /// are eligible for bounded retention eviction.
+    committed_ids: Arc<RwLock<std::collections::HashSet<MessageId>>>,
+    /// Bounded tombstones for roots evicted after native commit. This closes
+    /// the retention/re-registration race without growing exact-once state
+    /// for the lifetime of the process.
+    retired_ids: Arc<Mutex<RetiredMessageIds>>,
     /// Color scheme for message formatting
     colors: crate::config::ColorScheme,
+}
+
+#[derive(Default)]
+struct RetiredMessageIds {
+    order: std::collections::VecDeque<MessageId>,
+    ids: std::collections::HashSet<MessageId>,
 }
 
 impl OutputManager {
@@ -274,6 +362,9 @@ impl OutputManager {
             buffering_mode: Arc::new(RwLock::new(false)), // Default: immediate write
             pending_flush: Arc::new(RwLock::new(Vec::new())),
             messages: Arc::new(RwLock::new(Vec::new())),
+            typed_roots: Arc::new(Mutex::new(HashMap::new())),
+            committed_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            retired_ids: Arc::new(Mutex::new(RetiredMessageIds::default())),
             colors,
         }
     }
@@ -317,18 +408,71 @@ impl OutputManager {
 
     /// Add a trait-based message to the buffer
     pub fn add_trait_message(&self, message: MessageRef) {
-        // Write to terminal if not a status message
-        self.write_trait_to_terminal(&message);
-
-        // Add to messages vector
         let mut messages = self.messages.write().unwrap();
+        if messages
+            .iter()
+            .any(|existing| existing.id() == message.id())
+            || self
+                .retired_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .ids
+                .contains(&message.id())
+        {
+            return;
+        }
+        messages.push(Arc::clone(&message));
+        drop(messages);
+        // Immediate/buffered output happens only after registration wins the
+        // object-level MessageId dedupe race.
+        self.write_trait_to_terminal(&message);
+        self.prune_committed_roots();
+    }
 
-        // Simple circular buffer (no complex ring buffer needed here)
-        if messages.len() >= MAX_BUFFER_SIZE {
-            messages.remove(0); // Remove oldest
+    fn register_typed<T>(&self, message: Arc<T>) -> Arc<T>
+    where
+        T: Message + Any + Send + Sync + 'static,
+    {
+        let id = message.id();
+        let key = (TypeId::of::<T>(), id);
+        let mut messages = self.messages.write().unwrap();
+        let mut typed = self
+            .typed_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = typed.get(&key).and_then(std::sync::Weak::upgrade) {
+            return existing
+                .downcast::<T>()
+                .expect("typed root registry must preserve its concrete type");
+        }
+        if messages.iter().any(|existing| existing.id() == id) {
+            panic!("MessageId {id} is already registered with a different root type");
+        }
+        if self
+            .retired_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ids
+            .contains(&id)
+        {
+            panic!("MessageId {id} was retired and cannot be reconstructed yet");
         }
 
-        messages.push(message);
+        let erased: Arc<dyn Any + Send + Sync> = message.clone();
+        typed.insert(key, Arc::downgrade(&erased));
+        messages.push(message.clone() as MessageRef);
+        drop(typed);
+        drop(messages);
+        self.write_trait_to_terminal(&(message.clone() as MessageRef));
+        self.prune_committed_roots();
+        message
+    }
+
+    fn forget_typed_id(&self, id: MessageId) {
+        self.typed_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(_, registered_id), _| *registered_id != id);
     }
 
     // get_trait_messages(), trait_message_count(), clear_trait_messages() removed
@@ -435,8 +579,47 @@ impl OutputManager {
     /// canonical event envelope rather than frontend construction time.
     pub fn start_work_unit_with_id(&self, id: MessageId, verb: impl Into<String>) -> Arc<WorkUnit> {
         let wu = Arc::new(WorkUnit::with_id(id, verb));
-        self.add_trait_message(Arc::clone(&wu) as MessageRef);
-        wu
+        self.register_typed(wu)
+    }
+
+    /// Register stable run activity which cannot later be retyped as source or output.
+    pub fn start_activity_with_id(
+        &self,
+        id: MessageId,
+        title: impl Into<String>,
+    ) -> Arc<ActivityMessage> {
+        let message = Arc::new(ActivityMessage::with_id(id, title));
+        self.register_typed(message)
+    }
+
+    /// Register a source artifact with a fresh local identity.
+    pub fn start_program_source(&self, language: impl Into<String>) -> Arc<ProgramSourceMessage> {
+        let message = Arc::new(ProgramSourceMessage::new(language));
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
+    /// Register a source artifact with a canonical stable identity.
+    pub fn start_program_source_with_id(
+        &self,
+        id: MessageId,
+        language: impl Into<String>,
+    ) -> Arc<ProgramSourceMessage> {
+        let message = Arc::new(ProgramSourceMessage::with_id(id, language));
+        self.register_typed(message)
+    }
+
+    /// Register a program-output artifact with a fresh local identity.
+    pub fn start_program_output(&self) -> Arc<ProgramOutputMessage> {
+        let message = Arc::new(ProgramOutputMessage::new());
+        self.add_trait_message(Arc::clone(&message) as MessageRef);
+        message
+    }
+
+    /// Register a program-output artifact with a canonical stable identity.
+    pub fn start_program_output_with_id(&self, id: MessageId) -> Arc<ProgramOutputMessage> {
+        let message = Arc::new(ProgramOutputMessage::with_id(id));
+        self.register_typed(message)
     }
 
     /// Write status information (deprecated - use write_progress or write_info)
@@ -477,16 +660,81 @@ impl OutputManager {
 
     /// Clear all messages
     pub fn clear(&self) {
-        self.messages.write().unwrap().clear();
+        let removed = std::mem::take(&mut *self.messages.write().unwrap());
+        let removed_ids: Vec<_> = removed.into_iter().map(|message| message.id()).collect();
+        self.retire_committed_ids(removed_ids.iter().copied());
+        for id in removed_ids {
+            self.forget_typed_id(id);
+        }
     }
 
     /// Remove one transient projection after its contents have been adopted
     /// by a durable grouped work unit.
     pub fn remove_message(&self, id: crate::cli::messages::MessageId) {
-        self.messages
-            .write()
-            .unwrap()
-            .retain(|message| message.id() != id);
+        let removed = {
+            let mut messages = self.messages.write().unwrap();
+            let before = messages.len();
+            messages.retain(|message| message.id() != id);
+            messages.len() != before
+        };
+        if removed {
+            self.retire_committed_ids([id]);
+            self.forget_typed_id(id);
+        }
+    }
+
+    /// Record an exact native-history commit and prune only old committed
+    /// roots. Live and completed-but-uncommitted roots are never evicted.
+    pub fn mark_committed(&self, ids: impl IntoIterator<Item = MessageId>) {
+        self.committed_ids.write().unwrap().extend(ids);
+        self.prune_committed_roots();
+    }
+
+    fn retire_committed_ids(&self, ids: impl IntoIterator<Item = MessageId>) {
+        let mut committed = self.committed_ids.write().unwrap();
+        let mut retired = self
+            .retired_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in ids {
+            if !committed.remove(&id) || !retired.ids.insert(id) {
+                continue;
+            }
+            retired.order.push_back(id);
+        }
+        while retired.order.len() > MAX_BUFFER_SIZE {
+            if let Some(expired) = retired.order.pop_front() {
+                retired.ids.remove(&expired);
+            }
+        }
+    }
+
+    fn prune_committed_roots(&self) {
+        let committed = self.committed_ids.read().unwrap().clone();
+        let mut messages = self.messages.write().unwrap();
+        while messages.len() > MAX_BUFFER_SIZE {
+            let Some(index) = messages
+                .iter()
+                .position(|message| committed.contains(&message.id()))
+            else {
+                break;
+            };
+            let removed = messages.remove(index).id();
+            self.committed_ids.write().unwrap().remove(&removed);
+            let mut retired = self
+                .retired_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if retired.ids.insert(removed) {
+                retired.order.push_back(removed);
+            }
+            while retired.order.len() > MAX_BUFFER_SIZE {
+                if let Some(expired) = retired.order.pop_front() {
+                    retired.ids.remove(&expired);
+                }
+            }
+            self.forget_typed_id(removed);
+        }
     }
 
     /// Get the number of messages in the buffer
@@ -513,6 +761,9 @@ impl Clone for OutputManager {
             buffering_mode: Arc::clone(&self.buffering_mode),
             pending_flush: Arc::clone(&self.pending_flush),
             messages: Arc::clone(&self.messages),
+            typed_roots: Arc::clone(&self.typed_roots),
+            committed_ids: Arc::clone(&self.committed_ids),
+            retired_ids: Arc::clone(&self.retired_ids),
             colors: self.colors.clone(),
         }
     }
@@ -521,7 +772,7 @@ impl Clone for OutputManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::Message;
+    use crate::cli::messages::{Message, MessageKind};
 
     fn silent_manager() -> OutputManager {
         let m = OutputManager::new(crate::config::ColorScheme::default());
@@ -539,6 +790,123 @@ mod tests {
 
         assert_eq!(manager.len(), 3);
         assert_eq!(manager.get_messages().len(), 3);
+    }
+
+    #[test]
+    fn duplicate_root_message_id_registers_once() {
+        let manager = silent_manager();
+        let id = MessageId::new();
+        let first: MessageRef = Arc::new(WorkUnit::with_id(id, "first"));
+        let duplicate: MessageRef = Arc::new(WorkUnit::with_id(id, "duplicate"));
+        manager.add_trait_message(first);
+        manager.add_trait_message(duplicate);
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn stable_root_factories_reuse_the_canonical_arc() {
+        let manager = silent_manager();
+        let id = MessageId::new();
+        let first = manager.start_work_unit_with_id(id, "first");
+        let duplicate = manager.start_work_unit_with_id(id, "duplicate");
+
+        assert!(Arc::ptr_eq(&first, &duplicate));
+        duplicate.append_response("canonical");
+        assert_eq!(first.content(), "canonical");
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn retention_never_evicts_live_or_uncommitted_roots() {
+        let manager = silent_manager();
+        let live = manager.start_work_unit("live");
+        let terminal_uncommitted = manager.start_work_unit("terminal-uncommitted");
+        terminal_uncommitted.set_complete();
+        for index in 0..=MAX_BUFFER_SIZE {
+            let message = Arc::new(WorkUnit::new(format!("complete-{index}")));
+            message.set_complete();
+            let id = message.id();
+            manager.add_trait_message(message);
+            manager.mark_committed([id]);
+        }
+        assert!(manager
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == live.id()));
+        assert!(manager
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == terminal_uncommitted.id()));
+        assert!(manager.len() <= MAX_BUFFER_SIZE + 2);
+    }
+
+    #[test]
+    fn evicted_committed_root_id_cannot_be_registered_again() {
+        let manager = silent_manager();
+        let first = Arc::new(WorkUnit::new("first"));
+        first.set_complete();
+        let retired_id = first.id();
+        manager.add_trait_message(first);
+        manager.mark_committed([retired_id]);
+        for index in 0..MAX_BUFFER_SIZE {
+            let message = Arc::new(WorkUnit::new(format!("retained-{index}")));
+            message.set_complete();
+            let id = message.id();
+            manager.add_trait_message(message);
+            manager.mark_committed([id]);
+        }
+        assert!(!manager
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == retired_id));
+
+        let duplicate: MessageRef = Arc::new(WorkUnit::with_id(retired_id, "duplicate"));
+        manager.add_trait_message(duplicate);
+        assert_eq!(manager.len(), MAX_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn vm_output_projection_legacy_work_unit_preserves_live_and_terminal_output() {
+        let manager = Arc::new(silent_manager());
+        let legacy = manager.start_work_unit("legacy output");
+        let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&legacy));
+        projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "live".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+        assert_eq!(legacy.content(), "live");
+        assert!(legacy.children().is_empty());
+
+        legacy.set_complete();
+        let terminal_projection =
+            VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&legacy));
+        terminal_projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 1,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "late".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+        assert_eq!(legacy.content(), "live");
+        assert!(manager
+            .get_messages()
+            .iter()
+            .any(|message| message.kind() == MessageKind::Output && message.content() == "late"));
     }
 
     fn output_effect(
@@ -572,7 +940,7 @@ mod tests {
     #[test]
     fn vm_output_projection_keeps_explicit_handles_independent() {
         let manager = Arc::new(silent_manager());
-        let response = manager.start_work_unit("Response");
+        let response = manager.start_program_output();
         let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
 
         projection.project(&VmSideEffect {
@@ -651,9 +1019,52 @@ mod tests {
     }
 
     #[test]
+    fn vm_tool_projection_retains_activity_semantics_without_extra_output_message() {
+        use crate::cli::messages::MessageKind;
+
+        let manager = Arc::new(silent_manager());
+        let activity = manager.start_activity_with_id(MessageId::new(), "Brain activity");
+        let row_idx = activity.add_tool("submit_program");
+        let projection = VmOutputProjection::for_tool_activity(
+            Arc::clone(&manager),
+            activity.work_unit(),
+            row_idx,
+        );
+        projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "tool output".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+
+        let messages = manager.get_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind(), MessageKind::Activity);
+        let activity_children = messages[0].children();
+        assert_eq!(activity_children[0].kind(), MessageKind::ToolCall);
+        let tool_children = activity_children[0].children();
+        assert_eq!(tool_children.len(), 2);
+        assert_eq!(tool_children[1].kind(), MessageKind::ToolOutput);
+        assert_eq!(
+            tool_children[1]
+                .disclosure(&crate::config::ColorScheme::default())
+                .unwrap()
+                .body,
+            vec!["tool output"]
+        );
+    }
+
+    #[test]
     fn vm_output_projection_applies_envelopes_once_and_in_order() {
         let manager = Arc::new(silent_manager());
-        let response = manager.start_work_unit("Response");
+        let response = manager.start_program_output();
         let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
         let execution_id = uuid::Uuid::new_v4();
         let emit = |sequence, text: &str| VmEffectEnvelope {
@@ -708,7 +1119,7 @@ mod tests {
         };
         let project_once = || {
             let manager = Arc::new(silent_manager());
-            let response = manager.start_work_unit("Response");
+            let response = manager.start_program_output();
             let projection = VmOutputProjection::new(Arc::clone(&manager), response);
             assert_eq!(projection.project_envelope(envelope.clone()).len(), 1);
             manager.get_messages()[1].id()
@@ -727,7 +1138,35 @@ mod tests {
 
         manager.clear();
         assert!(manager.is_empty());
+        assert!(manager.committed_ids.read().unwrap().is_empty());
         assert_eq!(manager.len(), 0);
+    }
+
+    #[test]
+    fn clear_and_remove_bound_commit_and_retirement_metadata() {
+        let manager = silent_manager();
+        for index in 0..(MAX_BUFFER_SIZE + 25) {
+            let message = manager.start_work_unit(format!("root-{index}"));
+            message.set_complete();
+            manager.mark_committed([message.id()]);
+            manager.remove_message(message.id());
+        }
+        assert!(manager.committed_ids.read().unwrap().is_empty());
+        let retired = manager
+            .retired_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(retired.order.len(), MAX_BUFFER_SIZE);
+        assert_eq!(retired.ids.len(), MAX_BUFFER_SIZE);
+        drop(retired);
+        assert!(manager.typed_roots.lock().unwrap().is_empty());
+
+        let message = manager.start_work_unit("clear");
+        message.set_complete();
+        manager.mark_committed([message.id()]);
+        manager.clear();
+        assert!(manager.committed_ids.read().unwrap().is_empty());
+        assert!(manager.typed_roots.lock().unwrap().is_empty());
     }
 
     #[test]
