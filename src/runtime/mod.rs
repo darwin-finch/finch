@@ -7409,8 +7409,16 @@ fn summarize_csv(
 /// caller can reach for a panic one could. `src/coforth/interpreter.rs` records
 /// the same constraint for the same reason.
 ///
-/// The residual hazard is an out-of-tree caller reaching `ProgramRuntime`'s
-/// public submit API from a worker; that is tracked separately.
+/// The residual hazard is in-tree, not out of it: a future third drive site
+/// that constructs a `TypedHostHandler` without the hop.
+/// `typed_mem_store_completes_on_a_single_worker_runtime` in this module fails
+/// if that happens on either existing site.
+///
+/// An out-of-tree caller cannot reach this. `block_on_host` and
+/// `TypedHostHandler` are private, and the public submit API performs the hop
+/// itself — a caller on a worker is the case the test exercises and passes.
+/// `AgentVmBinding::block_on` has the identical shape without the requirement
+/// written down; that is #289.
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
