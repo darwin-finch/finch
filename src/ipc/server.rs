@@ -2213,7 +2213,7 @@ async fn forward_runner_request(
                 payload.set_run_id(&request.run_id.0.to_string());
                 payload.set_request_seq(request.request_seq);
                 payload.set_prompt(&request.prompt);
-                payload.set_source(&request.source);
+                payload.set_rendered(&request.rendered);
             }
             let result = match call.send().promise.await {
                 Ok(reply) => match reply.get() {
@@ -2229,9 +2229,26 @@ async fn forward_runner_request(
                             Err(error.to_string())
                         }
                     }
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => Err(format!(
+                        "{}{error}",
+                        crate::server::RUNNER_UNAVAILABLE_PREFIX
+                    )),
                 },
-                Err(error) => Err(error.to_string()),
+                // The call did not complete at all. That covers the transport
+                // — a disconnect, a shutdown, an unimplemented capability — and
+                // also every `Promise::err` the frontend raises in
+                // `ipc/client.rs`: a params decode failure, a stopped event
+                // loop, a dropped response. All of those repeat identically for
+                // every later run, so classifying the whole arm as systemic is
+                // right today. The one per-request error in that set, a
+                // malformed brain/run id, cannot occur — `project_memory` is
+                // handed typed `BrainId`/`RunId` values that always render as
+                // valid UUIDs. If a per-request failure mode is ever added
+                // here, classify it rather than letting it abort a whole pass.
+                Err(error) => Err(format!(
+                    "{}{error}",
+                    crate::server::RUNNER_UNAVAILABLE_PREFIX
+                )),
             };
             let _ = request.response_tx.send(result);
         }
@@ -3073,6 +3090,110 @@ mod tests {
         ) -> capnp::capability::Promise<(), capnp::Error> {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
+    }
+
+    /// A runner that is reachable but whose connection breaks mid-call, which
+    /// is what `Promise::err` from the capability models.
+    struct BrokenConnectionRunner;
+
+    impl super::finch_ipc_capnp::brain_runner::Server for BrokenConnectionRunner {
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::disconnected("connection lost".into()))
+        }
+
+        fn run_program(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::disconnected("connection lost".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::disconnected("connection lost".into()))
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::disconnected("connection lost".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_runner_connection_declares_itself_unavailable_to_memory_replay() {
+        // #254. A replay pass walks every completed run in a Brain. A broken
+        // connection fails identically for all of them, so it has to be
+        // distinguishable from "this one turn was declined" — otherwise the
+        // pass pays a full IPC round trip and a log line per completed run,
+        // under the Brain's execution lock, with nothing to gain.
+        //
+        // The `Result<usize, String>` wire has no room for a variant, so the
+        // daemon marks a systemic failure with `RUNNER_UNAVAILABLE_PREFIX`.
+        // This drives the real forwarding path against a real capability, so
+        // dropping the prefix from `forward_runner_request` fails here rather
+        // than passing on a literal a test supplied itself.
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().join("brains")),
+        );
+        store
+            .attach(
+                "shared",
+                "alice",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let server = std::sync::Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store.clone(),
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([46; 32]),
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap(),
+        );
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = crate::server::RunnerMemoryProjectionRequest {
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            brain: "shared".into(),
+            run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
+            request_seq: 1,
+            prompt: "remember this".into(),
+            rendered: "remembered".into(),
+            response_tx,
+        };
+        let runner: super::finch_ipc_capnp::brain_runner::Client =
+            capnp_rpc::new_client(BrokenConnectionRunner);
+        super::forward_test_runner_request(
+            runner,
+            std::sync::Arc::clone(&server),
+            crate::server::RunnerRequest::ProjectMemory(request),
+        )
+        .await;
+
+        let error = response_rx
+            .await
+            .unwrap()
+            .expect_err("a broken connection cannot project memory");
+        assert!(
+            error.starts_with(crate::server::RUNNER_UNAVAILABLE_PREFIX),
+            "a transport failure must declare itself systemic so replay aborts \
+             instead of retrying every run; got {error:?}"
+        );
     }
 
     async fn raw_effect_eof_states(

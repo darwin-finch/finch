@@ -298,6 +298,56 @@ struct WireExecution {
     output_unit: Arc<crate::cli::messages::WorkUnit>,
 }
 
+/// What a turn produced, as distinct from the wire program that produced it.
+///
+/// In its own module so the tuple field is unreachable from this one: the
+/// defect being prevented is passing the wrong string, memory having indexed
+/// `source_for_history` for long enough to put 9,288 nodes of raw `(say ...)`
+/// into the dogfood store from 19 distinct programs (#254). Both are `String`,
+/// so nothing but a type distinguishes them, and no test can observe the swap
+/// without driving the whole `process_query_with_tools` path.
+///
+/// A private field in this module would have been a speed bump rather than a
+/// guarantee — `RenderedTurn(source_for_history.clone())` would still compile
+/// at both call sites.
+///
+/// Constructing one from anything other than a `WireExecution`'s rendered half
+/// is not merely discouraged, it does not compile outside this module: the
+/// tuple field is private to `rendered`, and the sole production constructor —
+/// `WireExecution::rendered` — lives inside it. Tests get a `#[cfg(test)]`
+/// `for_test`, which does not exist in a release build.
+mod rendered {
+    use super::WireExecution;
+
+    /// The rendered result of a turn.
+    pub(super) struct RenderedTurn(String);
+
+    impl RenderedTurn {
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
+        }
+
+        /// Tests need to drive `persist_completed_turn_memory` directly with a
+        /// literal. `#[cfg(test)]` so the door does not exist in a release
+        /// build.
+        #[cfg(test)]
+        pub(super) fn for_test(rendered: &str) -> Self {
+            Self(rendered.to_string())
+        }
+    }
+
+    impl WireExecution {
+        /// The rendered result, for memory. The only way to obtain a
+        /// `RenderedTurn`; a descendant module may read its parent's private
+        /// fields, so this needs no constructor taking a bare `&str`.
+        pub(super) fn rendered(&self) -> RenderedTurn {
+            RenderedTurn(self.response.clone())
+        }
+    }
+}
+
+use rendered::RenderedTurn;
+
 pub(super) fn runner_effect_records(
     outcome: &crate::runtime::outcome::ExecutionOutcome,
 ) -> Vec<crate::server::RunnerEffectRecord> {
@@ -664,13 +714,24 @@ pub(super) async fn refresh_context_strip(
     }
 }
 
+/// Store a completed turn in memory and refresh its Brain-local summary.
+///
+/// `assistant_rendered` must be what the turn produced, not the wire program
+/// that produced it. Indexing emitted source put 9,288 nodes of raw `(say ...)`
+/// into the dogfood store from only 19 distinct programs, lexically
+/// near-identical to every other program because they all share `(`, `say` and
+/// quoting tokens, which is corrosive to a similarity-driven index (#254).
+///
+/// The source is not hidden from the user — it renders as a `Program source`
+/// row, expanded by default at three lines or fewer, which is exactly the
+/// `(say ...)` case. It is simply the wrong thing to index.
 async fn persist_completed_turn_memory(
     memory_system: &crate::memory::MemorySystem,
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
     query_states: &QueryStateManager,
     query: &str,
-    assistant_source: &str,
+    assistant_rendered: &RenderedTurn,
     model: &str,
     session_label: &str,
     cwd: &str,
@@ -711,11 +772,11 @@ async fn persist_completed_turn_memory(
             .insert_conversation("user", &user_text, Some(model), Some(session_label))
             .await;
     }
-    if !assistant_source.trim().is_empty() {
+    if !assistant_rendered.as_str().trim().is_empty() {
         let _ = memory_system
             .insert_conversation(
                 "assistant",
-                assistant_source,
+                assistant_rendered.as_str(),
                 Some(model),
                 Some(session_label),
             )
@@ -1374,20 +1435,21 @@ pub(crate) async fn process_query_with_tools(
                         )
                         .await;
                 }
+                let wire_execution_rendered = wire_execution.rendered();
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
-                let history_content =
-                    match history_content_with_source(&blocks, source_for_history.clone()) {
-                        Ok(content) => content,
-                        Err(error) => {
-                            work_unit.set_failed();
-                            let _ = event_tx.send(ReplEvent::QueryFailed {
-                                query_id,
-                                error: error.to_string(),
-                            });
-                            return;
-                        }
-                    };
+                let history_content = match history_content_with_source(&blocks, source_for_history)
+                {
+                    Ok(content) => content,
+                    Err(error) => {
+                        work_unit.set_failed();
+                        let _ = event_tx.send(ReplEvent::QueryFailed {
+                            query_id,
+                            error: error.to_string(),
+                        });
+                        return;
+                    }
+                };
                 let effect_journal = wire_execution.effect_journal;
                 let published = query_states
                     .try_publish_completion_content(
@@ -1407,13 +1469,22 @@ pub(crate) async fn process_query_with_tools(
                 });
                 if published {
                     if let Some(ref mem) = memory_system {
+                        // `wire_execution_rendered`, not `source_for_history`:
+                        // memory indexes what the turn produced, not the
+                        // program that produced it. 55% of the dogfood store
+                        // was raw `(say ...)` source, which shares `(`, `say`
+                        // and quoting tokens with every other program, making
+                        // all programs near-identical under a lexical
+                        // embedding (#254). The source is not hidden from the
+                        // user — it renders as a `Program source` row — it is
+                        // simply the wrong thing to index.
                         persist_completed_turn_memory(
                             mem,
                             &conversation,
                             query_id,
                             query_states.as_ref(),
                             &query,
-                            &source_for_history,
+                            &wire_execution_rendered,
                             &actual_model,
                             &session_label,
                             &cwd,
@@ -1612,23 +1683,22 @@ pub(crate) async fn process_query_with_tools(
                     )
                     .await;
             }
+            let wire_execution_rendered = wire_execution.rendered();
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
             let source_for_history = wire_execution.source_for_history;
-            let history_content = match history_content_with_source(
-                &response.content_blocks,
-                source_for_history.clone(),
-            ) {
-                Ok(content) => content,
-                Err(error) => {
-                    work_unit.set_failed();
-                    let _ = event_tx.send(ReplEvent::QueryFailed {
-                        query_id,
-                        error: error.to_string(),
-                    });
-                    return;
-                }
-            };
+            let history_content =
+                match history_content_with_source(&response.content_blocks, source_for_history) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        work_unit.set_failed();
+                        let _ = event_tx.send(ReplEvent::QueryFailed {
+                            query_id,
+                            error: error.to_string(),
+                        });
+                        return;
+                    }
+                };
             let published = query_states
                 .try_publish_completion_content(
                     query_id,
@@ -1651,13 +1721,14 @@ pub(crate) async fn process_query_with_tools(
             if published {
                 if let Some(ref mem) = memory_system {
                     let model_name = response.metadata.model.clone();
+                    // As above: the rendered result, not the source.
                     persist_completed_turn_memory(
                         mem,
                         &conversation,
                         query_id,
                         query_states.as_ref(),
                         &query,
-                        &source_for_history,
+                        &wire_execution_rendered,
                         &model_name,
                         &session_label,
                         &cwd,
@@ -2002,7 +2073,7 @@ mod tests {
             query_id,
             &query_states,
             "",
-            "(say \"test\")",
+            &RenderedTurn::for_test("Hello from the test program"),
             "test-model",
             "test-brain",
             "/workspace",
@@ -2013,6 +2084,25 @@ mod tests {
         .await;
 
         assert_eq!(memory.stats().await.unwrap().conversation_count, 2);
+
+        // What this asserts: `persist_completed_turn_memory` indexes the string
+        // it is handed, and that string survives `MemoryClassifier::is_noise`'s
+        // 20-character floor. It does NOT assert the #254 fix, which is about
+        // which string the two call sites in `process_query_with_tools` pass —
+        // no test reaches those. A previous version added a
+        // `!contains("(say")` assertion here and presented it as proof; no
+        // input in this test could ever have satisfied it.
+        let recalled = memory
+            .query("Hello from the test program", Some(5))
+            .await
+            .unwrap();
+        assert!(
+            recalled
+                .iter()
+                .any(|text| text.contains("Hello from the test")),
+            "the rendered result must be recallable; got {recalled:?}"
+        );
+
         let lines = status.get_lines();
         assert!(lines.iter().any(|line| {
             line.line_type == crate::cli::status_bar::StatusLineType::MemoryContext
@@ -2074,7 +2164,7 @@ mod tests {
                 query_id,
                 &query_states,
                 "",
-                "(say \"done\")",
+                &RenderedTurn::for_test("(say \"done\")"),
                 "test-model",
                 "test-brain",
                 "/workspace",

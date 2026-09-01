@@ -24,7 +24,10 @@ pub struct RunnerMemoryProjectionRequest {
     pub run_id: RunId,
     pub request_seq: u64,
     pub prompt: String,
-    pub source: String,
+    /// The rendered output the user saw. Named `rendered`, not `source`:
+    /// carrying output under a field called `source` is the exact confusion
+    /// #254 was about.
+    pub rendered: String,
     pub response_tx: oneshot::Sender<Result<usize, String>>,
 }
 
@@ -1082,17 +1085,50 @@ impl BrainRunnerBroker {
         run_id: RunId,
         request_seq: u64,
         prompt: String,
-        source: String,
+        rendered: String,
     ) -> Result<usize> {
+        self.try_project_memory(
+            brain,
+            lease_id,
+            brain_id,
+            run_id,
+            request_seq,
+            prompt,
+            rendered,
+        )
+        .await
+        .map_err(RunnerProjectionError::into_error)
+    }
+
+    /// `project_memory`, distinguishing a failure that will repeat for every
+    /// later run from one that is specific to this turn.
+    ///
+    /// A replay loop needs that distinction. Continuing past an unreachable or
+    /// stale runner costs one full IPC round trip and one log line per
+    /// completed run in the Brain, all under the Brain's execution lock, and
+    /// none of them can succeed.
+    pub async fn try_project_memory(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        brain_id: crate::brain::store::BrainId,
+        run_id: RunId,
+        request_seq: u64,
+        prompt: String,
+        rendered: String,
+    ) -> std::result::Result<usize, RunnerProjectionError> {
         let registration = self
             .registrations
             .read()
             .expect("runner broker lock poisoned")
             .get(brain)
             .cloned()
-            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))
+            .map_err(RunnerProjectionError::Unavailable)?;
         if registration.lease_id != lease_id {
-            anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
+            return Err(RunnerProjectionError::Unavailable(anyhow::anyhow!(
+                "named Brain '{brain}' runner callback belongs to a stale lease"
+            )));
         }
         let (response_tx, response_rx) = oneshot::channel();
         registration
@@ -1104,15 +1140,82 @@ impl BrainRunnerBroker {
                     run_id,
                     request_seq,
                     prompt,
-                    source,
+                    rendered,
                     response_tx,
                 },
             ))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+            .map_err(|_| {
+                RunnerProjectionError::Unavailable(anyhow::anyhow!(
+                    "named Brain '{brain}' runner callback disconnected"
+                ))
+            })?;
         response_rx
             .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped memory response"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(|_| {
+                RunnerProjectionError::Unavailable(anyhow::anyhow!(
+                    "named Brain '{brain}' runner dropped memory response"
+                ))
+            })?
+            .map_err(
+                |message| match message.strip_prefix(RUNNER_UNAVAILABLE_PREFIX) {
+                    Some(reason) => RunnerProjectionError::Unavailable(anyhow::Error::msg(
+                        format!("named Brain '{brain}' runner cannot project memory: {reason}"),
+                    )),
+                    None => RunnerProjectionError::Rejected(message),
+                },
+            )
+    }
+}
+
+/// Marks a runner reply as a condition that will repeat for every later run.
+///
+/// The runner answers over a `Result<usize, String>` wire, so a reply that is
+/// systemic rather than about one turn — memory disabled on the runner, the
+/// lease not held, the transport broken — has to say so in the only channel
+/// available. Both sides reference this one constant; it is a two-party
+/// protocol, not a heuristic match on prose.
+pub const RUNNER_UNAVAILABLE_PREFIX: &str = "runner-unavailable: ";
+
+/// Why one memory projection did not happen.
+///
+/// `Unavailable` is either constructed by the broker from its own view of the
+/// registration and the channel, or declared by the runner with
+/// `RUNNER_UNAVAILABLE_PREFIX`.
+///
+/// `Rejected` is everything else. That is *usually* a decision about one turn —
+/// the content-conflict rejection a re-projected identity produces — but not
+/// always: a store-level failure inside `insert_brain_conversation` (disk full,
+/// database locked, embedding failure) is systemic and still arrives here
+/// unprefixed, so a replay pass will walk every run paying a round trip each.
+/// Narrowing that means classifying `MemorySystem`'s errors, which is separate
+/// work; do not read this variant as a guarantee that the failure is per-turn.
+#[derive(Debug)]
+pub enum RunnerProjectionError {
+    /// The runner is absent, stale, or gone. Every later projection in the
+    /// same pass fails identically.
+    Unavailable(anyhow::Error),
+    /// The runner was reached and replied with an error of its own. Usually
+    /// about this one turn — see the caveat on the enum above for when it is
+    /// not.
+    Rejected(String),
+}
+
+impl RunnerProjectionError {
+    /// Flatten back to the untyped error the ordinary callers expect.
+    pub fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Unavailable(error) => error,
+            Self::Rejected(message) => anyhow::Error::msg(message),
+        }
+    }
+}
+
+impl std::fmt::Display for RunnerProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) => write!(f, "{error}"),
+            Self::Rejected(message) => write!(f, "{message}"),
+        }
     }
 }
 
@@ -1304,7 +1407,7 @@ mod tests {
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.request_seq, 9);
             assert_eq!(request.prompt, "remember this");
-            assert_eq!(request.source, "(say \"remembered\")");
+            assert_eq!(request.rendered, "remembered");
             request.response_tx.send(Ok(2)).unwrap();
         });
 
@@ -1317,7 +1420,7 @@ mod tests {
                     run_id,
                     9,
                     "remember this".into(),
-                    "(say \"remembered\")".into(),
+                    "remembered".into(),
                 )
                 .await
                 .unwrap(),

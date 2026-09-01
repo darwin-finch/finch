@@ -16,8 +16,9 @@ pub use brain_runner::{
     RunnerEffectAuditReservation, RunnerEffectRecord, RunnerHostEffectOutcome,
     RunnerHostEffectPermit, RunnerMemoryProjectionRequest, RunnerProgramControlRequest,
     RunnerProgramError, RunnerProgramInteraction, RunnerProgramRequest, RunnerProgramResult,
-    RunnerRegistrationId, RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice,
-    RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
+    RunnerProjectionError, RunnerRegistrationId, RunnerRequest, RunnerTurnCommitAck,
+    RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
+    RUNNER_UNAVAILABLE_PREFIX,
 };
 pub(crate) use brain_runner::{
     RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
