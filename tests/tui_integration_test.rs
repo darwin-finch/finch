@@ -407,6 +407,17 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         marker(b"FINCH_SIGNAL_DESCRIPTOR_FREE")?;
         return Ok(());
     }
+    if mode == "repeated-signal-owners" {
+        // Cross u16 wrap to prove the stable trampoline/monitor has no finite
+        // per-session handler-slot pool to exhaust.
+        for _ in 0..70_000 {
+            let owner = finch::cli::tui::BinaryTerminalSession::install()?
+                .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+            drop(owner);
+        }
+        marker(b"FINCH_SIGNAL_OWNERS_REUSED")?;
+        return Ok(());
+    }
 
     let preserves_host_signal = matches!(mode.as_str(), "binary-owner-drop" | "owner-windows");
     if preserves_host_signal {
@@ -429,9 +440,11 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             | "signal-stop-full"
             | "handler-reuse"
             | "handler-replacement-signal"
+            | "pending-before-drop"
             | "signal-paused-cleanup"
             | "signal-transition-recovery"
             | "signal-disarm-recovery"
+            | "signal-disarm-pending-recovery"
     );
     let mut signals = if needs_binary_owner {
         finch::cli::tui::BinaryTerminalSession::install()?
@@ -476,6 +489,14 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         "signal" => {
             anyhow::ensure!(signals.is_some(), "binary signal owner missing");
             marker(b"FINCH_SIGNAL_READY")?;
+            loop {
+                std::thread::park();
+            }
+        }
+        "signal-disarm-pending-recovery" => {
+            anyhow::ensure!(signals.is_some(), "binary signal owner missing");
+            finch::cli::tui::supervised_fail_next_signal_disarm()?;
+            marker(b"FINCH_SIGNAL_DISARM_PENDING_READY")?;
             loop {
                 std::thread::park();
             }
@@ -695,9 +716,9 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             }
         }
         "handler-reuse" | "handler-replacement-signal" => {
-            // This pause is the production handler's first operation, before
-            // dispatch capture. The old single-handler action could be
-            // disarmed/rearmed here and load zero or the replacement token.
+            // This pause is before the production trampoline's first sticky
+            // atomic. The old generation-attributing handler could be
+            // disarmed/rearmed here and load zero or a replacement token.
             finch::cli::tui::supervised_set_terminal_signal_handler_pause(true)?;
             let observed_errno = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
             let observed_errno_clone = std::sync::Arc::clone(&observed_errno);
@@ -714,16 +735,16 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 anyhow::ensure!(Instant::now() < deadline, "signal handler did not pause");
                 std::thread::yield_now();
             }
-            anyhow::ensure!(
-                renderer.shutdown().is_err(),
-                "cleanup falsely completed while an entered handler was paused"
-            );
+            renderer.shutdown()?;
             drop(renderer);
             drop(signals.take());
-            anyhow::ensure!(
-                finch::cli::tui::BinaryTerminalSession::install().is_err(),
-                "signal owner became reusable before entered handler completed"
-            );
+            let replacement_signals = finch::cli::tui::BinaryTerminalSession::install()?
+                .ok_or_else(|| anyhow::anyhow!("replacement signal owner missing"))?;
+            let _replacement_renderer = new_renderer()?;
+            // Keep the process-lifetime monitor parked while the entered old
+            // trampoline publishes after host restoration/re-arm, so errno can
+            // be checked deterministically before conventional termination.
+            replacement_signals.supervised_pause_signal_listener()?;
             finch::cli::tui::supervised_set_terminal_signal_handler_pause(false)?;
             handler_thread
                 .join()
@@ -732,6 +753,26 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 observed_errno.load(Ordering::Acquire) == nix::libc::EDOM,
                 "terminal signal handler changed the interrupted thread's errno"
             );
+            replacement_signals.supervised_resume_signal_listener()?;
+            loop {
+                std::thread::park();
+            }
+        }
+        "pending-before-drop" => {
+            let signals = signals
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
+            signals.supervised_pause_signal_listener()?;
+            unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_signal_is_pending()? {
+                anyhow::ensure!(Instant::now() < deadline, "signal did not become sticky");
+                std::thread::yield_now();
+            }
+            renderer.shutdown()?;
+            // Drop resumes the permanent monitor. The sticky delivery must not
+            // be lost in the owner-release window and terminates conventionally.
+            drop(signals);
             loop {
                 std::thread::park();
             }
@@ -746,7 +787,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 anyhow::ensure!(Instant::now() < deadline, "terminal writer did not pause");
                 std::thread::yield_now();
             }
-            finch::cli::tui::emergency_restore_terminal();
+            finch::cli::tui::emergency_restore_terminal_result()?;
             finch::cli::tui::supervised_set_terminal_writer_pause(false)?;
             anyhow::ensure!(
                 writer
@@ -756,6 +797,12 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 "admitted writer published after terminal reset"
             );
             marker(b"FINCH_WRITER_REVOKED")?;
+            Ok(())
+        }
+        "stale-gate-cas" => {
+            finch::cli::tui::supervised_verify_stale_terminal_gate_cas()?;
+            renderer.shutdown()?;
+            marker(b"FINCH_STALE_GATE_CAS_SAFE")?;
             Ok(())
         }
         "writer-gate-timeout" => {
@@ -774,7 +821,19 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             // The first bounded cleanup cannot own the publication gate. It
             // must fail closed: no restoration record, replacement admission,
             // or reset bytes may be published yet.
-            finch::cli::tui::emergency_restore_terminal();
+            let started = Instant::now();
+            anyhow::ensure!(
+                finch::cli::tui::emergency_restore_terminal_result().is_err(),
+                "permanently stalled application gate falsely restored"
+            );
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_millis(250),
+                "application gate stall exceeded the library cleanup bound"
+            );
+            anyhow::ensure!(
+                new_renderer().is_err(),
+                "failed cleanup admitted a replacement renderer"
+            );
             finch::cli::tui::supervised_set_terminal_writer_gate_pause(false)?;
             anyhow::ensure!(
                 writer
@@ -785,7 +844,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             );
             // Once the nonblocking writer releases the gate, a later bounded
             // cleanup takes over the abandoned owner and repairs exactly once.
-            finch::cli::tui::emergency_restore_terminal();
+            finch::cli::tui::emergency_restore_terminal_result()?;
             marker(b"FINCH_WRITER_TIMEOUT_REPAIRED")?;
             Ok(())
         }
@@ -812,7 +871,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             Ok(())
         }
         "global-lock-backpressure" => {
-            finch::cli::global_output::set_global_tui_renderer(renderer);
+            finch::cli::global_output::set_global_tui_renderer(renderer)?;
             let (locked_tx, locked_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _guard = finch::cli::global_output::get_global_tui_renderer()
@@ -1110,7 +1169,7 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    for gate_held in [false, true] {
+    for gate_mode in ["none", "other-thread", "same-thread", "cleanup-owner"] {
         let (mut master, slave) = open_owned_pty();
         let original = terminal_modes(&slave);
         let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
@@ -1124,8 +1183,12 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
-        if gate_held {
+        if gate_mode == "other-thread" {
             command.env("FINCH_TEST_TUI_MAIN_PANIC_GATE_HELD", "1");
+        } else if gate_mode == "same-thread" {
+            command.env("FINCH_TEST_TUI_MAIN_PANIC_SAME_THREAD_GATE", "1");
+        } else if gate_mode == "cleanup-owner" {
+            command.env("FINCH_TEST_TUI_MAIN_PANIC_CLEANUP_OWNER", "1");
         }
         let mut child = command.spawn().expect("spawn Finch main panic-hook probe");
         let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
@@ -1143,9 +1206,51 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
         assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
         assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
         assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
-        assert!(String::from_utf8_lossy(&transcript)
-            .contains("supervised panic after Finch terminal activation"));
+        let expected_panic = match gate_mode {
+            "same-thread" => "supervised same-thread panic while holding Finch terminal gate",
+            "cleanup-owner" => "supervised same-thread panic while owning Finch terminal cleanup",
+            _ => "supervised panic after Finch terminal activation",
+        };
+        assert!(String::from_utf8_lossy(&transcript).contains(expected_panic));
     }
+}
+
+/// The IPC quit watcher and this supervised main path share the exact binary
+/// exit helper. Fail-before: a same-thread gate owner deadlocked restoration or
+/// let `process::exit` bypass reset.
+#[cfg(unix)]
+#[test]
+fn test_finch_binary_quit_helper_revokes_same_thread_gate_before_exit() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let original = terminal_modes(&slave);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-terminal-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_MAIN_QUIT_SAME_THREAD_GATE", "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("spawn Finch same-thread quit probe");
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(23));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
 }
 
 #[cfg(unix)]
@@ -1186,10 +1291,12 @@ fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
     for mode in [
         "cloexec",
         "signal-descriptor-free",
+        "repeated-signal-owners",
         "signal-create-failure",
         "sequential",
         "repeated",
         "overlapping-cleanup",
+        "stale-gate-cas",
         "signal-transition-recovery",
         "signal-disarm-recovery",
     ] {
@@ -1284,14 +1391,15 @@ fn test_atomic_signal_owner_drop_is_bounded() {
 
 #[cfg(unix)]
 #[test]
-fn test_entered_handler_retains_identity_until_signal_cleanup_exits() {
+fn test_stable_signal_trampoline_preserves_late_delivery_across_rearm() {
     let _serial = terminal_pty_test_lock();
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    // At the reviewed tip a handler paused before its global dispatch load
-    // could observe zero or a replacement generation. The entry-stable slot
-    // keeps ownership fail-closed until this exact SIGTERM is restored/exited.
+    // Fail-before: a handler selected under the old Finch action but paused
+    // before identity capture could load zero or the replacement generation.
+    // The stable trampoline instead publishes generation-free sticky delivery
+    // after host restoration and replacement re-arm.
     let (mut child, mut master, slave, original) =
         spawn_terminal_child("handler-replacement-signal");
     let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(3));
@@ -1303,8 +1411,64 @@ fn test_entered_handler_retains_identity_until_signal_cleanup_exits() {
     );
     assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
     assert_eq!(terminal_modes(&slave), original);
-    // The replacement cleanup flushes A's queued output before publishing its
-    // own reset, so the transcript contains exactly B's signal-reset sequence.
+    // Replacement cleanup flushes the first generation's queued PTY output
+    // before publishing its own exact reset sequence.
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sticky_signal_pending_before_owner_drop_is_not_lost() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut child, mut master, slave, original) = spawn_terminal_child("pending-before-drop");
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(3));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_pending_signal_retries_one_transient_disposition_restore_failure() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut child, mut master, slave, original) =
+        spawn_terminal_child("signal-disarm-pending-recovery");
+    let mut transcript = Vec::new();
+    assert!(read_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(5),
+        b"FINCH_SIGNAL_DISARM_PENDING_READY",
+    ));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(3));
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
+    assert_eq!(terminal_modes(&slave), original);
     assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
     assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
     assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);

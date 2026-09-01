@@ -1058,7 +1058,10 @@ impl Repl {
                 Ok(renderer) => {
                     // Set global TUI renderer for Menu dialogs (Phase 5)
                     use crate::cli::global_output::set_global_tui_renderer;
-                    set_global_tui_renderer(renderer);
+                    if let Err(error) = set_global_tui_renderer(renderer) {
+                        output_status!("⚠️  Failed to publish TUI renderer: {}", error);
+                        output_status!("   Terminal remains fail-closed until cleanup retry");
+                    }
                 }
                 Err(e) => {
                     output_status!("⚠️  Failed to initialize TUI: {}", e);

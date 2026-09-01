@@ -21,9 +21,11 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   modes, closed its descriptor, and returned to `INACTIVE`; stale generation cleanup is a no-op.
 - Public `TuiRenderer` construction never changes process signal handlers. The Finch binary creates
   `BinaryTerminalSession` before renderer activation; SIGINT/SIGTERM/SIGHUP are armed and restored
-  with each active terminal generation. Alternating installed trampolines increment a slot-specific
-  in-flight epoch before capturing their immutable owner+generation token, so entered old handlers
-  cannot observe zero or a replacement identity. Pending delivery remains descriptor-free.
+  with each active terminal generation. One generation-independent process-lifetime trampoline
+  publishes sticky per-signal bits to one process-lifetime monitor. A trampoline selected by the
+  kernel before host-disposition restoration may enter after Drop or replacement re-arm without
+  loading zero or misattributing a generation; pending delivery remains descriptor-free and is
+  drained before signal ownership can be released.
 - Emergency cleanup uses the generation's nonblocking, close-on-exec tty descriptor and never waits
   for the renderer/global mutex or ordinary stdout.
 - Activation protocol writes and renderer output use the same per-generation admission gate, have
@@ -31,16 +33,24 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   `ACTIVE -> CLEANING` revokes parked writers before
   reset; a writer-gate timeout leaves the generation fail-closed for bounded takeover and never
   records restoration prematurely.
-- The 100 ms writer-quiescence bound assumes normal scheduler progress for a thread executing the
-  short `O_NONBLOCK` write section. If a thread is artificially suspended while holding that gate,
-  cleanup returns a timeout without resetting, admitting a replacement, re-enabling ordinary
-  stdout, or recording restoration; after the writer resumes and observes revocation, a later
-  bounded cleanup owner repairs the same generation.
+- Application waits and nonblocking write loops use absolute deadlines. Their bound assumes that a
+  runnable thread executing Finch's short gate section is scheduled, and that supported tty/console
+  kernel calls return. It is not a mathematical wall-clock claim against a frozen process, stopped
+  thread, wedged device driver, or unsupported console implementation. When injected application
+  progress is withheld, library cleanup returns `TimedOut` without resetting, admitting a
+  replacement, re-enabling ordinary stdout, recording restoration, or retry-spinning. The same
+  generation remains `CLEANING`; a later bounded attempt repairs it after an observable progress
+  epoch. Binary signal/IPC/panic termination completes within its larger absolute deadline under
+  this supported-progress precondition and never treats a failed restoration as successful.
 - The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
-  exclusive lease, exact output generation, protocol activation, cleanup, and Drop. Failed or
-  backpressured cleanup relinquishes only its attempt owner, leaves the generation `CLEANING`, and
-  rejects stale writers and replacements until retry repairs it. Windows CI constructs and tests
-  this exact actor together with the portable protocol source.
+  exclusive lease, exact output generation, raw/protocol activation, bounded staged output, cleanup,
+  and Drop. Synchronous console operations run only on its bounded-capacity worker; caller deadlines
+  revoke admission while actor ordering ensures prior output cannot overtake reset. Activation and
+  rollback failures are aggregated. Failed, unknown, or backpressured cleanup relinquishes only its
+  attempt owner, leaves the generation `CLEANING`, and rejects stale writers and replacements until
+  retry repairs it. Windows CI compiles and exercises this exact production actor and actual
+  callbacks when a console/ConPTY is present; redirected hosted runners emit an explicit gated
+  acceptance marker and are not claimed as real-console conformance.
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).

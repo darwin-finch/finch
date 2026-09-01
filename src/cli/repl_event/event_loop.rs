@@ -1924,7 +1924,7 @@ impl EventLoop {
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
 
         // Spawn quit watcher — a dedicated task that receives Cap'n Proto binary
-        // ControlMessage { quit } and exits the process immediately.
+        // ControlMessage { quit } and exits after bounded terminal restoration.
         // This runs independently of the event loop so /quit always works even
         // when the loop is blocked mid-streaming or mid-tool execution.
         let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -1948,8 +1948,11 @@ impl EventLoop {
                 .unwrap_or(false);
 
                 if ok {
-                    crate::cli::tui::restore_terminal_before_termination();
-                    std::process::exit(0);
+                    // A timeout leaves the generation fail-closed. Do not
+                    // translate that into a successful quit with a dirty
+                    // terminal; a later control message may retry after the
+                    // application owner has made progress.
+                    let _ = crate::cli::tui::exit_process_after_terminal_restore(0);
                 }
             }
         });
@@ -5541,7 +5544,8 @@ Rules:\n\
                     restart.binary_path.display()
                 )
             })?;
-            crate::cli::tui::restore_terminal_before_termination();
+            crate::cli::tui::restore_terminal_before_termination()
+                .context("restore terminal before frontend replacement exit")?;
             std::process::exit(0);
         }
     }

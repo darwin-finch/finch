@@ -1135,9 +1135,23 @@ async fn main() -> Result<()> {
         brain_name,
     )
     .await;
+    #[cfg(unix)]
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_QUIT_SAME_THREAD_GATE").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        finch::cli::tui::supervised_exit_while_holding_terminal_gate(23)?;
+    }
     if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE").is_some()
         && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
     {
+        #[cfg(unix)]
+        if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_CLEANUP_OWNER").is_some() {
+            finch::cli::tui::supervised_panic_while_owning_terminal_cleanup();
+        }
+        #[cfg(unix)]
+        if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_SAME_THREAD_GATE").is_some() {
+            finch::cli::tui::supervised_panic_while_holding_terminal_gate();
+        }
         if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_GATE_HELD").is_some() {
             finch::cli::tui::supervised_set_terminal_writer_gate_pause(true)?;
             std::thread::spawn(|| {
@@ -1223,7 +1237,15 @@ async fn main() -> Result<()> {
 fn install_panic_handler() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        finch::cli::tui::restore_terminal_before_termination();
+        if finch::cli::tui::restore_terminal_before_termination().is_err() {
+            // Never resume unwinding across a fail-closed terminal generation.
+            // This branch is outside the supported scheduler/console progress
+            // contract; parking does not falsely report restoration or retry
+            // an application-owned gate forever.
+            loop {
+                std::thread::park();
+            }
+        }
 
         // Call the default panic handler
         default_panic(info);

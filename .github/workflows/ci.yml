@@ -48,8 +48,8 @@ jobs:
     - name: Verify clean-checkout formatting
       run: cargo fmt --all -- --check
 
-    - name: Test exact portable terminal lifecycle source
-      run: cargo test --manifest-path .github/issue-264-windows-probe/Cargo.toml
+    - name: Test exact portable terminal actor (real console when available)
+      run: cargo test --manifest-path .github/issue-264-windows-probe/Cargo.toml -- --nocapture
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})

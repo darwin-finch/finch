@@ -51,7 +51,7 @@ pub fn global_status() -> Arc<StatusBar> {
 }
 
 /// Set the global TUI renderer (called when TUI mode is enabled)
-pub fn set_global_tui_renderer(renderer: TuiRenderer) {
+pub fn set_global_tui_renderer(renderer: TuiRenderer) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + Duration::from_millis(100);
@@ -60,11 +60,11 @@ pub fn set_global_tui_renderer(renderer: TuiRenderer) {
         match GLOBAL_TUI_RENDERER.try_lock() {
             Ok(mut slot) => {
                 *slot = renderer.take();
-                return;
+                return Ok(());
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 *poisoned.into_inner() = renderer.take();
-                return;
+                return Ok(());
             }
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::yield_now();
@@ -73,8 +73,8 @@ pub fn set_global_tui_renderer(renderer: TuiRenderer) {
                 // Dropping the renderer rolls back its terminal session. Never
                 // wait forever merely to publish the global convenience handle.
                 drop(renderer.take());
-                super::tui::emergency_restore_terminal();
-                return;
+                super::tui::emergency_restore_terminal_result()?;
+                return Ok(());
             }
         }
     }
