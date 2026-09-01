@@ -126,7 +126,14 @@ fn source_metadata_for_node(
                 c.brain_id, c.run_id, c.request_seq
          FROM memory_sources ms
          JOIN conversations c ON c.id = ms.conversation_id
-         WHERE ms.node_id = ?1",
+         WHERE ms.node_id = ?1
+         -- Without an explicit order the row returned depends on the query
+         -- plan, so the same memory could report a different origin after a
+         -- VACUUM or an index change. `conversation_id` is the primary key,
+         -- so this is a total order. Report the earliest occurrence: the
+         -- conversation that first established the memory.
+         ORDER BY ms.indexed_at ASC, ms.conversation_id ASC
+         LIMIT 1",
     )?;
     let mut rows = stmt.query([node_id as i64])?;
     let Some(row) = rows.next()? else {
@@ -604,10 +611,25 @@ impl MemorySystem {
                 .iter()
                 .flat_map(|f| f.to_le_bytes())
                 .collect();
+            // Upsert, never REPLACE. `INSERT OR REPLACE` deletes the existing
+            // row before reinserting it, and `memory_sources.node_id` is
+            // declared `ON DELETE CASCADE` — so a plain REPLACE here silently
+            // cascades away the provenance of every node it rewrites. Since
+            // this function rewrites the whole tree on every insert, that
+            // destroyed every source row except the one written later in the
+            // same transaction: the dogfood store held 9 rows against 896
+            // conversations.
             tx.execute(
-                "INSERT OR REPLACE INTO tree_nodes
+                "INSERT INTO tree_nodes
                  (node_id, parent_id, text, embedding, level, created_at, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                     parent_id = excluded.parent_id,
+                     text = excluded.text,
+                     embedding = excluded.embedding,
+                     level = excluded.level,
+                     created_at = excluded.created_at,
+                     importance = excluded.importance",
                 params![
                     node.id as i64,
                     node.parent.map(|p| p as i64),
@@ -971,6 +993,47 @@ pub struct MemoryStats {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_saving_the_tree_preserves_earlier_provenance() -> Result<()> {
+        // `save_all_nodes_to_db` rewrites every node on every insert. With
+        // `INSERT OR REPLACE` each rewrite deleted the row first, and
+        // `memory_sources.node_id` is `ON DELETE CASCADE`, so each insert
+        // cascaded away the provenance of every prior one. The dogfood store
+        // showed the result: 9 source rows against 896 conversations.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        for i in 0..5 {
+            memory
+                .insert_conversation(
+                    "system",
+                    &format!(
+                        "Deployment note {i}: the signing key for environment {i} \
+                         is stored in the Employee vault, not in the repository."
+                    ),
+                    None,
+                    None,
+                )
+                .await?;
+        }
+
+        let sources: i64 = {
+            let conn = memory.db.lock().await;
+            conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?
+        };
+        assert_eq!(
+            sources, 5,
+            "every indexed conversation must keep its source row; saving the \
+             tree must not cascade earlier rows away"
+        );
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_memory_system_creation() -> Result<()> {
