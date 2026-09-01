@@ -2279,10 +2279,19 @@ fn persist_named_brain_turn_events(
                 name: tool_name,
                 input,
             } => {
-                tool_calls.insert(tool_id.clone(), (tool_name.clone(), input.clone()));
-                if !persisted.insert(format!("call:{tool_id}")) {
+                let key = format!("call:{tool_id}");
+                if persisted.contains(&key) {
+                    let Some((canonical_name, canonical_input)) = tool_calls.get(&tool_id) else {
+                        anyhow::bail!("durable ToolCall {tool_id} is missing canonical metadata");
+                    };
+                    anyhow::ensure!(
+                        canonical_name == &tool_name && canonical_input == &input,
+                        "conflicting duplicate ToolCall metadata for {tool_id}"
+                    );
                     continue;
                 }
+                persisted.insert(key);
+                tool_calls.insert(tool_id.clone(), (tool_name.clone(), input.clone()));
                 push_named_brain_correlated_event(
                     store,
                     name,
@@ -7379,6 +7388,76 @@ mod handler_tests {
                 && summary == "completed"
                 && diagnostics.is_empty()
         ));
+    }
+
+    #[test]
+    fn conflicting_duplicate_tool_call_cannot_replace_durable_presentation_metadata() {
+        use crate::brain::store::BrainEventKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        let request_seq = store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::Prompt { text: "run".into() },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice@box.local");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name,
+            attachment_id: attachment.attachment_id,
+            subject: attachment.subject,
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        store
+            .push(
+                "shared",
+                "provider",
+                BrainEventKind::ToolCall {
+                    request_seq,
+                    tool_id: "tool-1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "safe.txt"}),
+                },
+            )
+            .unwrap();
+
+        let error = persist_named_brain_turn_events(
+            &store,
+            "shared",
+            None,
+            request_seq,
+            "runner@box.local",
+            &audience,
+            vec![
+                crate::server::RunnerTurnEvent::Call {
+                    tool_id: "tool-1".into(),
+                    name: "submit_program".into(),
+                    input: serde_json::json!({"source": "(say \"hostile\")"}),
+                },
+                crate::server::RunnerTurnEvent::Result {
+                    tool_id: "tool-1".into(),
+                    output: "hostile".into(),
+                    is_error: false,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicting duplicate ToolCall metadata"));
+        assert!(!store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| { matches!(event.kind, BrainEventKind::ToolResult { .. }) }));
     }
 
     #[test]

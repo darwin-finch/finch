@@ -484,6 +484,12 @@ pub struct EventLoop {
     >,
 }
 
+#[derive(Clone, Copy)]
+enum InitialSnapshotAttachment {
+    Home,
+    Remote,
+}
+
 /// View mode for the REPL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -1514,6 +1520,7 @@ enum LocalProjectionMatch {
     None,
     Suppress,
     SuppressAndComplete,
+    Conflict,
 }
 
 impl LocalBrainProjection {
@@ -1556,6 +1563,8 @@ impl LocalBrainProjection {
             crate::brain::store::BrainEventKind::Result { error: Some(_), .. } if self.failed => {
                 LocalProjectionMatch::SuppressAndComplete
             }
+            crate::brain::store::BrainEventKind::Program { .. }
+            | crate::brain::store::BrainEventKind::Result { .. } => LocalProjectionMatch::Conflict,
             _ => LocalProjectionMatch::None,
         }
     }
@@ -1575,21 +1584,41 @@ pub(crate) fn project_remote_brain_live_run_event(
     if event.run_id.is_none() {
         return false;
     }
-    let (projection_match, local_source, local_output) = if selected_brain_is_home {
-        local_projections.front_mut().map_or(
-            (LocalProjectionMatch::None, None, None),
-            |projection| {
-                (
-                    projection.observe(event),
-                    projection.source_message.clone(),
-                    projection.transient_output_unit.clone(),
-                )
-            },
+    let local_index = selected_brain_is_home
+        .then(|| {
+            local_projections
+                .iter()
+                .position(|projection| Some(projection.run_id) == event.run_id)
+        })
+        .flatten();
+    let (projection_match, local_source, local_output) = if let Some(index) = local_index {
+        let projection = &mut local_projections[index];
+        (
+            projection.observe(event),
+            projection.source_message.clone(),
+            projection.transient_output_unit.clone(),
         )
     } else {
         (LocalProjectionMatch::None, None, None)
     };
-    if projection_match != LocalProjectionMatch::None {
+    if projection_match == LocalProjectionMatch::Conflict {
+        if let Some(index) = local_index {
+            if let Some(local) = local_projections.remove(index) {
+                if let Some(source) = local.source_message {
+                    output_manager
+                        .remove_message(crate::cli::messages::Message::id(source.as_ref()));
+                }
+                if let Some(output) = local.transient_output_unit {
+                    output_manager
+                        .remove_message(crate::cli::messages::Message::id(output.as_ref()));
+                }
+            }
+        }
+    }
+    if matches!(
+        projection_match,
+        LocalProjectionMatch::Suppress | LocalProjectionMatch::SuppressAndComplete
+    ) {
         if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
             match &event.kind {
                 crate::brain::store::BrainEventKind::ToolCall { tool_id, .. }
@@ -1616,9 +1645,6 @@ pub(crate) fn project_remote_brain_live_run_event(
                     if projection_match == LocalProjectionMatch::SuppressAndComplete =>
                 {
                     if let Some(output) = local_output {
-                        projection
-                            .activity
-                            .add_artifact(Arc::clone(&output) as crate::cli::messages::MessageRef);
                         output_manager
                             .remove_message(crate::cli::messages::Message::id(output.as_ref()));
                         projection.output = Some(output);
@@ -1630,7 +1656,7 @@ pub(crate) fn project_remote_brain_live_run_event(
     }
     let projected = project_remote_brain_run_event(output_manager, projections, event);
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
-        if let Some(local) = local_projections.pop_front() {
+        if let Some(local) = local_index.and_then(|index| local_projections.remove(index)) {
             if matches!(
                 &event.kind,
                 crate::brain::store::BrainEventKind::Result { error: Some(_), .. }
@@ -6193,10 +6219,8 @@ Rules:\n\
         self.todo_journal_target
             .set(self.active_remote_brain.clone());
         self.update_remote_brain_status(runner_online);
-        self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
-            brain: snapshot,
-        })
-        .await?;
+        self.render_initial_snapshot_then_ack(snapshot, InitialSnapshotAttachment::Remote)
+            .await?;
 
         let event_tx = self.event_tx.clone();
         tokio::task::spawn_local(async move {
@@ -6293,13 +6317,8 @@ Rules:\n\
         self.todo_journal_target.set(self.home_brain.clone());
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
-            self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
-                brain: snapshot.clone(),
-            })
-            .await?;
-            if let Some(home) = self.home_brain.as_mut() {
-                home.acknowledge(snapshot.revision).await?;
-            }
+            self.render_initial_snapshot_then_ack(snapshot, InitialSnapshotAttachment::Home)
+                .await?;
         } else {
             self.status_bar.update_line(
                 crate::cli::status_bar::StatusLineType::SessionLabel,
@@ -6492,6 +6511,28 @@ Rules:\n\
         }
         self.try_present_remote_brain_approval().await?;
         self.render_tui().await
+    }
+
+    /// Project the durable initial snapshot before advancing the attachment's
+    /// acknowledgement watermark. Keeping both operations in one production
+    /// boundary prevents a restart between acknowledgement and projection
+    /// from losing uncorrelated prompt/participant events.
+    async fn render_initial_snapshot_then_ack(
+        &mut self,
+        snapshot: crate::brain::store::BrainSnapshot,
+        attachment: InitialSnapshotAttachment,
+    ) -> Result<()> {
+        let revision = snapshot.revision;
+        self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
+            brain: snapshot,
+        })
+        .await?;
+        let client = match attachment {
+            InitialSnapshotAttachment::Home => self.home_brain.as_mut(),
+            InitialSnapshotAttachment::Remote => self.active_remote_brain.as_mut(),
+        }
+        .context("initial Brain attachment disappeared before acknowledgement")?;
+        client.acknowledge(revision).await
     }
 
     fn observe_remote_brain_approval(&mut self, event: &crate::brain::store::BrainEvent) {
@@ -9787,7 +9828,7 @@ mod tests {
             &mut projections,
             &mut locals,
             false,
-            &[a_start, a_program, b_start],
+            &[b_start, a_program, a_start],
         );
         let roots = output.get_messages();
         assert_eq!(roots.len(), 2);
@@ -10316,15 +10357,15 @@ mod tests {
             "lisp",
         ));
         source_message.replace_source("(say \"cache checked\")");
-        source_message.set_complete();
         let transient_output_unit = Arc::new(crate::cli::messages::ProgramOutputMessage::with_id(
             super::brain_run_message_id(run_id, "program-output"),
         ));
         transient_output_unit.replace_output("cache checked");
         transient_output_unit.set_complete();
-        activity.add_artifact(Arc::clone(&source_message) as crate::cli::messages::MessageRef);
-        activity
+        source_message
             .add_artifact(Arc::clone(&transient_output_unit) as crate::cli::messages::MessageRef);
+        source_message.set_complete();
+        activity.add_artifact(Arc::clone(&source_message) as crate::cli::messages::MessageRef);
         let before_canonical = output
             .get_messages()
             .iter()
@@ -10409,7 +10450,14 @@ mod tests {
         assert!(root_children
             .iter()
             .any(|child| child.id() == projection.program.as_ref().unwrap().id()));
-        assert!(root_children
+        assert!(!root_children
+            .iter()
+            .any(|child| child.id() == projection.output.as_ref().unwrap().id()));
+        assert!(projection
+            .program
+            .as_ref()
+            .unwrap()
+            .children()
             .iter()
             .any(|child| child.id() == projection.output.as_ref().unwrap().id()));
         let activity_row = projection
@@ -10436,12 +10484,13 @@ mod tests {
             .children
             .iter()
             .any(|row| row.kind == TranscriptRowKind::Program));
-        assert!(activity_row
+        assert!(!activity_row
             .children
             .iter()
             .any(|row| row.kind == TranscriptRowKind::Output));
         assert_eq!(program_row.kind, TranscriptRowKind::Program);
-        assert!(program_row.children.is_empty());
+        assert_eq!(program_row.children.len(), 1);
+        assert_eq!(program_row.children[0].kind, TranscriptRowKind::Output);
         assert_eq!(output_row.kind, TranscriptRowKind::Output);
         assert!(output_row.children.is_empty());
         assert_eq!(output_row.body, vec!["cache checked"]);
@@ -10458,12 +10507,12 @@ mod tests {
         );
         let replayed_messages = output.get_messages();
         assert_eq!(replayed_messages.len(), 1);
+        fn count_outputs(message: &crate::cli::messages::MessageRef) -> usize {
+            usize::from(message.kind() == TranscriptRowKind::Output)
+                + message.children().iter().map(count_outputs).sum::<usize>()
+        }
         assert_eq!(
-            replayed_messages
-                .iter()
-                .flat_map(|message| message.children())
-                .filter(|message| message.kind() == TranscriptRowKind::Output)
-                .count(),
+            replayed_messages.iter().map(count_outputs).sum::<usize>(),
             1
         );
 
@@ -10832,7 +10881,99 @@ mod tests {
             },
         );
         result.run_id = Some(projection.run_id);
-        assert_eq!(projection.observe(&result), LocalProjectionMatch::None);
+        assert_eq!(projection.observe(&result), LocalProjectionMatch::Conflict);
+    }
+
+    #[test]
+    fn conflicting_local_run_is_retired_without_poisoning_later_run() {
+        let output = crate::cli::OutputManager::new(crate::config::ColorScheme::default());
+        output.disable_stdout();
+        let run_a = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        let run_b = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        let stranded = output.start_program_output();
+        let stranded_id = stranded.id();
+        let mut locals = std::collections::VecDeque::from([
+            LocalBrainProjection {
+                run_id: run_a,
+                source: "(say \"a\")".into(),
+                output: "a".into(),
+                tool_ids: std::collections::HashSet::new(),
+                approval_ids: std::collections::HashSet::new(),
+                program_seq: Some(1),
+                source_message: None,
+                transient_output_unit: Some(stranded),
+                failed: false,
+            },
+            LocalBrainProjection {
+                run_id: run_b,
+                source: "(say \"b\")".into(),
+                output: "b".into(),
+                tool_ids: std::collections::HashSet::new(),
+                approval_ids: std::collections::HashSet::new(),
+                program_seq: None,
+                source_message: None,
+                transient_output_unit: None,
+                failed: false,
+            },
+        ]);
+        let mut projections = std::collections::HashMap::new();
+        let mut conflicting = brain_event(
+            2,
+            "daemon",
+            crate::brain::store::BrainEventKind::Result {
+                request_seq: 1,
+                output: "canonical-a".into(),
+                error: None,
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        );
+        conflicting.run_id = Some(run_a);
+        assert!(super::project_remote_brain_live_run_event(
+            &output,
+            &mut projections,
+            &mut locals,
+            true,
+            &conflicting,
+        ));
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0].run_id, run_b);
+        assert!(!output
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == stranded_id));
+
+        let mut program = brain_event(
+            3,
+            "provider",
+            crate::brain::store::BrainEventKind::Program {
+                language: crate::brain::store::ProgramLanguage::Lisp,
+                source: "(say \"b\")".into(),
+            },
+        );
+        program.run_id = Some(run_b);
+        let mut result = brain_event(
+            4,
+            "daemon",
+            crate::brain::store::BrainEventKind::Result {
+                request_seq: 3,
+                output: "b".into(),
+                error: None,
+                continuation_messages: Vec::new(),
+                invocation_metadata: None,
+            },
+        );
+        result.run_id = Some(run_b);
+        for event in [&program, &result] {
+            assert!(super::project_remote_brain_live_run_event(
+                &output,
+                &mut projections,
+                &mut locals,
+                true,
+                event,
+            ));
+        }
+        assert!(locals.is_empty());
     }
 
     #[test]
