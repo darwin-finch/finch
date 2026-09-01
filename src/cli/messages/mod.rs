@@ -61,11 +61,20 @@ pub struct MessageDisclosure {
 #[deprecated(note = "use Message::render and Message::children")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRow {
+    pub id: TranscriptRowId,
     pub kind: MessageKind,
     pub label: String,
     pub body: Vec<String>,
     pub children: Vec<TranscriptRow>,
     pub default_expanded: bool,
+}
+
+/// Stable identity retained for source compatibility with the former row API.
+#[deprecated(note = "use MessageId and Message::children")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TranscriptRowId {
+    pub message_id: MessageId,
+    pub path: Vec<u32>,
 }
 
 #[deprecated(note = "use MessageKind")]
@@ -154,15 +163,34 @@ pub trait Message: Send + Sync {
     /// Build the legacy transcript snapshot from canonical render semantics.
     #[deprecated(note = "use Message::render and Message::children")]
     fn transcript_row(&self, colors: &crate::config::ColorScheme) -> Option<TranscriptRow> {
+        self.transcript_row_with_path(colors, Vec::new())
+    }
+
+    #[doc(hidden)]
+    #[allow(deprecated)]
+    fn transcript_row_with_path(
+        &self,
+        colors: &crate::config::ColorScheme,
+        path: Vec<u32>,
+    ) -> Option<TranscriptRow> {
         let disclosure = self.disclosure(colors)?;
         Some(TranscriptRow {
+            id: TranscriptRowId {
+                message_id: self.id(),
+                path: path.clone(),
+            },
             kind: self.kind(),
             label: disclosure.label,
             body: disclosure.body,
             children: self
                 .children()
                 .into_iter()
-                .filter_map(|child| child.transcript_row(colors))
+                .enumerate()
+                .filter_map(|(index, child)| {
+                    let mut child_path = path.clone();
+                    child_path.push(index as u32);
+                    child.transcript_row_with_path(colors, child_path)
+                })
                 .collect(),
             default_expanded: disclosure.default_expanded,
         })
@@ -175,10 +203,14 @@ pub trait Message: Send + Sync {
         if let Some(disclosure) = self.disclosure(context.colors) {
             return render::render_message_tree(self.id(), &disclosure, self.children(), context);
         }
+        let text = if context.capabilities.frontend == FrontendKind::PlainText {
+            self.content()
+        } else {
+            self.format(context.colors)
+        };
         RenderedMessage {
             message_id: self.id(),
-            lines: self
-                .format(context.colors)
+            lines: render::normalize_legacy_text(&text, context.capabilities)
                 .split('\n')
                 .map(RenderedLine::plain)
                 .collect(),
@@ -215,3 +247,22 @@ pub trait Message: Send + Sync {
 
 /// Type alias for a shared message reference
 pub type MessageRef = Arc<dyn Message>;
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn transcript_row_id_facade_preserves_root_and_child_paths() {
+        let activity = ActivityMessage::new("run");
+        activity.add_activity("status");
+        let row: TranscriptRow = activity
+            .transcript_row(&crate::config::ColorScheme::default())
+            .unwrap();
+        let root_id: TranscriptRowId = row.id.clone();
+        assert_eq!(root_id.message_id, activity.id());
+        assert!(root_id.path.is_empty());
+        assert_eq!(row.children[0].id.path, vec![0]);
+    }
+}

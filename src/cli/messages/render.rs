@@ -84,6 +84,46 @@ impl RenderCapabilities {
     }
 }
 
+pub(crate) fn normalize_legacy_text(text: &str, capabilities: RenderCapabilities) -> String {
+    let text = if capabilities.color_depth == ColorDepth::Monochrome {
+        strip_ansi(text)
+    } else {
+        text.to_string()
+    };
+    if capabilities.unicode {
+        return text;
+    }
+    text.chars()
+        .map(|character| match character {
+            '❯' => '>',
+            '⏺' | '•' => '*',
+            '→' => '>',
+            '─' => '-',
+            '│' => '|',
+            character if character.is_ascii() => character,
+            _ => '?',
+        })
+        .collect()
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' || chars.peek() != Some(&'[') {
+            plain.push(character);
+            continue;
+        }
+        chars.next();
+        for next in chars.by_ref() {
+            if ('@'..='~').contains(&next) {
+                break;
+            }
+        }
+    }
+    plain
+}
+
 /// Frontend-local disclosure and focus state.
 ///
 /// The lookup is deliberately read-only and semantic: messages never receive
@@ -300,6 +340,24 @@ mod tests {
         assert!(plain.lines[0].text.contains("[expanded]"));
         assert!(!visual.lines[0].text.contains("[expanded]"));
         assert!(!visual.lines[0].text.contains("[collapsed]"));
+    }
+
+    #[test]
+    fn legacy_plain_render_honors_monochrome_ascii_capabilities() {
+        let message = crate::cli::messages::UserQueryMessage::new("hello 世界");
+        let colors = ColorScheme::default();
+        let visual = message.render(&RenderContext::new(
+            &colors,
+            RenderCapabilities::terminal(80),
+        ));
+        let plain = message.render(&RenderContext::new(
+            &colors,
+            RenderCapabilities::plain_text(80),
+        ));
+        assert!(visual.lines[0].text.contains('\u{1b}'));
+        assert!(!plain.lines[0].text.contains('\u{1b}'));
+        assert!(plain.lines[0].text.is_ascii());
+        assert_eq!(plain.lines[0].text, "hello ??");
     }
 
     struct SyntheticDisclosure {

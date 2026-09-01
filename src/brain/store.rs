@@ -15,7 +15,10 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 16;
+// ToolResult presentation is additive and defaultable in JSON and Cap'n Proto,
+// so it remains schema-v15 compatible and does not impose a one-way rollback
+// barrier on older Finch readers.
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
 /// Completed audit histories retained per named Brain. Together with the
 /// bounded intent/outcome encodings this caps the audit projection and its
 /// share of `events.jsonl`; unresolved write-ahead entries are never pruned.

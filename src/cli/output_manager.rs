@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
-    ActivityMessage, BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef,
+    ActivityMessage, BrainParticipantMessage, LiveToolMessage, Message, MessageId, MessageRef,
     OperationMessage, ProgramOutputMessage, ProgramSourceMessage, StaticMessage,
     StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
@@ -50,6 +50,7 @@ pub struct VmOutputProjection {
 #[doc(hidden)]
 pub enum VmDefaultResponse {
     Program(Arc<ProgramOutputMessage>),
+    LegacyWorkUnit(Arc<WorkUnit>),
     ToolActivity { unit: Arc<WorkUnit>, row_idx: usize },
 }
 
@@ -67,11 +68,7 @@ impl IntoVmDefaultResponse for Arc<ProgramOutputMessage> {
 
 impl IntoVmDefaultResponse for Arc<WorkUnit> {
     fn into_vm_default_response(self) -> VmDefaultResponse {
-        let row_idx = self.add_activity_row("program output");
-        VmDefaultResponse::ToolActivity {
-            unit: self,
-            row_idx,
-        }
+        VmDefaultResponse::LegacyWorkUnit(self)
     }
 }
 
@@ -80,6 +77,9 @@ impl VmDefaultResponse {
         match self {
             Self::Program(message) => {
                 message.append_output(text);
+            }
+            Self::LegacyWorkUnit(unit) => {
+                unit.append_response(text);
             }
             Self::ToolActivity { unit, row_idx } => {
                 unit.append_row_body_line(*row_idx, text.to_string());
@@ -109,9 +109,17 @@ impl std::fmt::Debug for VmOutputProjection {
 
 impl VmOutputProjection {
     pub fn new<T: IntoVmDefaultResponse>(output: Arc<OutputManager>, default_response: T) -> Self {
+        let default_response = match default_response.into_vm_default_response() {
+            VmDefaultResponse::LegacyWorkUnit(unit)
+                if unit.status() != crate::cli::messages::MessageStatus::InProgress =>
+            {
+                VmDefaultResponse::Program(output.start_program_output())
+            }
+            default_response => default_response,
+        };
         Self {
             output,
-            default_response: default_response.into_vm_default_response(),
+            default_response,
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
             pending_effects: Arc::new(Mutex::new(HashMap::new())),
@@ -604,16 +612,22 @@ impl OutputManager {
 
     /// Clear all messages
     pub fn clear(&self) {
-        self.messages.write().unwrap().clear();
+        let removed = std::mem::take(&mut *self.messages.write().unwrap());
+        self.retire_committed_ids(removed.into_iter().map(|message| message.id()));
     }
 
     /// Remove one transient projection after its contents have been adopted
     /// by a durable grouped work unit.
     pub fn remove_message(&self, id: crate::cli::messages::MessageId) {
-        self.messages
-            .write()
-            .unwrap()
-            .retain(|message| message.id() != id);
+        let removed = {
+            let mut messages = self.messages.write().unwrap();
+            let before = messages.len();
+            messages.retain(|message| message.id() != id);
+            messages.len() != before
+        };
+        if removed {
+            self.retire_committed_ids([id]);
+        }
     }
 
     /// Record an exact native-history commit and prune only old committed
@@ -621,6 +635,25 @@ impl OutputManager {
     pub fn mark_committed(&self, ids: impl IntoIterator<Item = MessageId>) {
         self.committed_ids.write().unwrap().extend(ids);
         self.prune_committed_roots();
+    }
+
+    fn retire_committed_ids(&self, ids: impl IntoIterator<Item = MessageId>) {
+        let mut committed = self.committed_ids.write().unwrap();
+        let mut retired = self
+            .retired_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for id in ids {
+            if !committed.remove(&id) || !retired.ids.insert(id) {
+                continue;
+            }
+            retired.order.push_back(id);
+        }
+        while retired.order.len() > MAX_BUFFER_SIZE {
+            if let Some(expired) = retired.order.pop_front() {
+                retired.ids.remove(&expired);
+            }
+        }
     }
 
     fn prune_committed_roots(&self) {
@@ -684,7 +717,7 @@ impl Clone for OutputManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::messages::Message;
+    use crate::cli::messages::{Message, MessageKind};
 
     fn silent_manager() -> OutputManager {
         let m = OutputManager::new(crate::config::ColorScheme::default());
@@ -719,6 +752,8 @@ mod tests {
     fn retention_never_evicts_live_or_uncommitted_roots() {
         let manager = silent_manager();
         let live = manager.start_work_unit("live");
+        let terminal_uncommitted = manager.start_work_unit("terminal-uncommitted");
+        terminal_uncommitted.set_complete();
         for index in 0..=MAX_BUFFER_SIZE {
             let message = Arc::new(WorkUnit::new(format!("complete-{index}")));
             message.set_complete();
@@ -730,7 +765,11 @@ mod tests {
             .get_messages()
             .iter()
             .any(|message| message.id() == live.id()));
-        assert!(manager.len() <= MAX_BUFFER_SIZE);
+        assert!(manager
+            .get_messages()
+            .iter()
+            .any(|message| message.id() == terminal_uncommitted.id()));
+        assert!(manager.len() <= MAX_BUFFER_SIZE + 2);
     }
 
     #[test]
@@ -759,10 +798,47 @@ mod tests {
     }
 
     #[test]
-    fn vm_output_projection_new_accepts_legacy_work_unit() {
+    fn vm_output_projection_legacy_work_unit_preserves_live_and_terminal_output() {
         let manager = Arc::new(silent_manager());
-        let legacy = Arc::new(WorkUnit::new("legacy output"));
-        let _projection = VmOutputProjection::new(manager, legacy);
+        let legacy = manager.start_work_unit("legacy output");
+        let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&legacy));
+        projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "live".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+        assert_eq!(legacy.content(), "live");
+        assert!(legacy.children().is_empty());
+
+        legacy.set_complete();
+        let terminal_projection =
+            VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&legacy));
+        terminal_projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 1,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "late".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+        assert_eq!(legacy.content(), "live");
+        assert!(manager
+            .get_messages()
+            .iter()
+            .any(|message| message.kind() == MessageKind::Output && message.content() == "late"));
     }
 
     fn output_effect(
@@ -994,6 +1070,7 @@ mod tests {
 
         manager.clear();
         assert!(manager.is_empty());
+        assert!(manager.committed_ids.read().unwrap().is_empty());
         assert_eq!(manager.len(), 0);
     }
 

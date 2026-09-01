@@ -303,6 +303,10 @@ impl WorkUnit {
     /// Attach one stable semantic child while this unit is live. Insertion
     /// and the terminal-state check are atomic with respect to sealing.
     pub fn add_artifact(&self, artifact: MessageRef) -> bool {
+        self.add_artifact_guarded(artifact, || {})
+    }
+
+    fn add_artifact_guarded(&self, artifact: MessageRef, after_check: impl FnOnce()) -> bool {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if inner.status != MessageStatus::InProgress
             || inner
@@ -312,6 +316,7 @@ impl WorkUnit {
         {
             return false;
         }
+        after_check();
         inner.artifacts.push(artifact);
         true
     }
@@ -600,6 +605,9 @@ impl WorkUnit {
             return;
         }
         if let Some(row) = inner.rows.get_mut(idx) {
+            if !matches!(row.status, WorkRowStatus::Running) {
+                return;
+            }
             row.body_lines
                 .push(crate::cli::diff::sanitize_terminal(&line));
         }
@@ -1975,6 +1983,61 @@ mod tests {
         let wu = WorkUnit::new("X");
         wu.complete_row(99, "summary"); // should not panic
         wu.fail_row(99, "error"); // should not panic
+    }
+
+    #[test]
+    fn terminal_tool_row_rejects_late_stream_output_while_root_is_live() {
+        let unit = WorkUnit::new("tool");
+        let row = unit.add_row("bash");
+        unit.append_row_body_line(row, "before".into());
+        unit.fail_row(row, "cancelled");
+        unit.append_row_body_line(row, "late detached stdout".into());
+
+        let children = unit.children();
+        let output = children[0].children()[1].content();
+        assert!(output.contains("before"));
+        assert!(!output.contains("late detached stdout"));
+    }
+
+    #[test]
+    fn artifact_attach_and_terminal_seal_are_indivisible_at_the_lifecycle_lock() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let unit = Arc::new(WorkUnit::new("activity"));
+        let artifact = Arc::new(WorkUnit::new("artifact"));
+        artifact.set_complete();
+        let artifact: MessageRef = artifact;
+        let mutation_has_lock = Arc::new(Barrier::new(2));
+        let release_mutation = Arc::new(Barrier::new(2));
+
+        let mutation = {
+            let unit = Arc::clone(&unit);
+            let mutation_has_lock = Arc::clone(&mutation_has_lock);
+            let release_mutation = Arc::clone(&release_mutation);
+            thread::spawn(move || {
+                unit.add_artifact_guarded(artifact, || {
+                    mutation_has_lock.wait();
+                    release_mutation.wait();
+                })
+            })
+        };
+        mutation_has_lock.wait();
+
+        let sealing = {
+            let unit = Arc::clone(&unit);
+            thread::spawn(move || unit.set_complete())
+        };
+        release_mutation.wait();
+
+        assert!(mutation.join().unwrap());
+        sealing.join().unwrap();
+        assert_eq!(unit.status(), MessageStatus::Complete);
+        assert_eq!(unit.children().len(), 1);
+
+        let rejected: MessageRef = Arc::new(WorkUnit::new("late"));
+        assert!(!unit.add_artifact(rejected));
+        assert_eq!(unit.children().len(), 1);
     }
 
     // ── format() — InProgress ────────────────────────────────────────────────
