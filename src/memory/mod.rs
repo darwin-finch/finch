@@ -392,16 +392,22 @@ impl MemorySystem {
         // `next_id` is advanced past the highest stored id BEFORE any batch
         // lands. Otherwise a turn stored during hydration could be given an id
         // that a later batch then overwrites.
+        //
+        // These two propagate rather than `unwrap_or(0)`. A failed `COUNT`
+        // silently skipped hydration entirely and reported `Ready { nodes: 0 }`
+        // against a full store, with no log line at all; a failed `MAX` left
+        // `next_id` at 1, so the first write upserted over persisted node 1.
+        // Refusing to open the store is the honest outcome.
         let node_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
-            .unwrap_or(0);
+            .context("Failed to count stored MemTree nodes")?;
         let max_node_id: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(node_id), 0) FROM tree_nodes",
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .context("Failed to read the highest stored MemTree node id")?;
         tree.set_next_id(max_node_id as u64 + 1);
 
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
