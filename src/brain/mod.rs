@@ -429,7 +429,11 @@ fn process_descends_from(ancestor: u32) -> anyhow::Result<bool> {
         Ok(information.pbi_ppid)
     }
 
-    let mut pid = std::process::id();
+    let current_pid = std::process::id();
+    if ancestor == current_pid {
+        return Ok(false);
+    }
+    let mut pid = current_pid;
     // The proof issuer must be an actual ancestor. Accepting the current
     // process would let a test manufacture a self-signed environment and FD.
     pid = parent(pid)?;
@@ -1343,6 +1347,14 @@ mod isolation_tests {
         reaped: bool,
     }
 
+    enum HostileModeOutcome {
+        Completed(std::process::Output),
+        TimedOut {
+            diagnostic: String,
+            cleanup_elapsed: std::time::Duration,
+        },
+    }
+
     impl Drop for HostileModeGroup {
         fn drop(&mut self) {
             if self.reaped {
@@ -1484,10 +1496,11 @@ mod isolation_tests {
     fn run_hostile_proof_mode_with_deadline(
         mode: &str,
         mode_deadline: std::time::Duration,
-    ) -> Result<std::process::Output, String> {
+    ) -> Result<HostileModeOutcome, String> {
         use std::os::unix::process::CommandExt as _;
 
-        let proof = isolated_test_proof().map_err(|error| error.to_string())?;
+        let proof = isolated_test_proof()
+            .map_err(|error| format!("mode={mode} phase=proof-validation: {error:#}"))?;
         let mut command = supervised_test_subprocess_command();
         command
             .args([
@@ -1506,7 +1519,9 @@ mod isolation_tests {
                 Ok(())
             });
         }
-        let child = command.spawn().map_err(|error| error.to_string())?;
+        let child = command
+            .spawn()
+            .map_err(|error| format!("mode={mode} phase=process-spawn: {error}"))?;
         let group_id = child.id() as nix::libc::pid_t;
         let mut group = HostileModeGroup {
             child,
@@ -1528,14 +1543,25 @@ mod isolation_tests {
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let deadline = std::time::Instant::now() + mode_deadline;
-        let (status, timed_out) = loop {
+        let (status, timed_out, cleanup_elapsed) = loop {
             drain_bounded(&mut stdout, &mut stdout_bytes);
             drain_bounded(&mut stderr, &mut stderr_bytes);
-            if mode_leader_exited(&group.child)? {
-                break (finish_mode_group(&mut group.child, group_id)?, false);
+            if mode_leader_exited(&group.child)
+                .map_err(|error| format!("mode={mode} phase=leader-poll: {error}"))?
+            {
+                break (
+                    finish_mode_group(&mut group.child, group_id).map_err(|error| {
+                        format!("mode={mode} phase=natural-exit-cleanup: {error}")
+                    })?,
+                    false,
+                    None,
+                );
             }
             if std::time::Instant::now() >= deadline {
-                break (finish_mode_group(&mut group.child, group_id)?, true);
+                let cleanup_started = std::time::Instant::now();
+                let status = finish_mode_group(&mut group.child, group_id)
+                    .map_err(|error| format!("mode={mode} phase=timeout-cleanup: {error}"))?;
+                break (status, true, Some(cleanup_started.elapsed()));
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
@@ -1543,6 +1569,8 @@ mod isolation_tests {
         drain_bounded(&mut stdout, &mut stdout_bytes);
         drain_bounded(&mut stderr, &mut stderr_bytes);
         if timed_out {
+            let cleanup_elapsed = cleanup_elapsed
+                .expect("timed-out hostile proof mode did not record cleanup duration");
             let redact = |bytes: &[u8]| {
                 String::from_utf8_lossy(bytes)
                     .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
@@ -1553,11 +1581,16 @@ mod isolation_tests {
                     .replace(&proof.brain_addr, "<brain-address>")
                     .replace(&proof.daemon_addr, "<daemon-address>")
             };
-            return Err(format!(
-                "timed out after {mode_deadline:?} (terminated with {status}); stdout={} stderr={}",
-                redact(&stdout_bytes),
-                redact(&stderr_bytes)
-            ));
+            return Ok(HostileModeOutcome::TimedOut {
+                diagnostic: format!(
+                    "mode={mode} phase=timeout-cleanup deadline={mode_deadline:?} \
+                 cleanup_elapsed={cleanup_elapsed:?} status={status} \
+                 descendants_after_cleanup=false stdout={} stderr={}",
+                    redact(&stdout_bytes),
+                    redact(&stderr_bytes)
+                ),
+                cleanup_elapsed,
+            });
         }
         let redact = |bytes: Vec<u8>| {
             String::from_utf8_lossy(&bytes)
@@ -1570,15 +1603,18 @@ mod isolation_tests {
                 .replace(&proof.daemon_addr, "<daemon-address>")
                 .into_bytes()
         };
-        Ok(std::process::Output {
+        Ok(HostileModeOutcome::Completed(std::process::Output {
             status,
             stdout: redact(stdout_bytes),
             stderr: redact(stderr_bytes),
-        })
+        }))
     }
 
     fn run_hostile_proof_mode(mode: &str) -> Result<std::process::Output, String> {
-        run_hostile_proof_mode_with_deadline(mode, HOSTILE_MODE_DEADLINE)
+        match run_hostile_proof_mode_with_deadline(mode, HOSTILE_MODE_DEADLINE)? {
+            HostileModeOutcome::Completed(output) => Ok(output),
+            HostileModeOutcome::TimedOut { diagnostic, .. } => Err(diagnostic),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1652,13 +1688,18 @@ mod isolation_tests {
                 let duplicate = unsafe { nix::libc::fcntl(109, nix::libc::F_DUPFD_CLOEXEC, 200) };
                 assert!(duplicate >= 0);
                 let socket = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(duplicate) };
-                socket
-                    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-                    .unwrap();
                 let mut request = [0_u8; 64];
-                match socket.recv(&mut request) {
-                    Ok(count) => {
-                        assert_eq!(&request[..count], b"finch-proof-key-v1");
+                let mut key_served = false;
+                loop {
+                    let count = socket
+                        .recv(&mut request)
+                        .expect("attacker proof-key responder receive failed");
+                    if &request[..count] == b"finch-proof-key-v1" {
+                        assert!(
+                            !key_served,
+                            "attacker proof key was requested more than once"
+                        );
+                        key_served = true;
                         let key = hex::decode(std::env::var(RESPONDER_KEY_ENV).unwrap()).unwrap();
                         assert_eq!(socket.send(&key).unwrap(), 32);
                         std::fs::write(
@@ -1666,15 +1707,16 @@ mod isolation_tests {
                             b"consulted",
                         )
                         .unwrap();
+                        continue;
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(error) => panic!("attacker proof-key responder failed: {error}"),
+                    if &request[..count] == b"finch-proof-key-stop-v1" {
+                        return;
+                    }
+                    panic!(
+                        "attacker proof-key responder received an unknown request: {:?}",
+                        &request[..count]
+                    );
                 }
-                return;
             }
             let valid = isolated_test_proof().unwrap();
             if mode == "deadline-probe" {
@@ -1728,6 +1770,31 @@ mod isolation_tests {
                     });
                 }
                 (validator, command.spawn().unwrap())
+            };
+            let stop_attacker_responder = |validator: &std::os::unix::net::UnixDatagram,
+                                           responder: &mut std::process::Child,
+                                           marker: &std::path::Path,
+                                           mode: &str| {
+                let stop = b"finch-proof-key-stop-v1";
+                eprintln!("hostile-proof-mode={mode} phase=release-responder");
+                assert_eq!(
+                    validator.send(stop).unwrap(),
+                    stop.len(),
+                    "could not release the attacker-key responder after {mode} proof \
+                         validation; responder_pid={} marker_exists={}",
+                    responder.id(),
+                    marker.exists()
+                );
+                eprintln!("hostile-proof-mode={mode} phase=wait-responder");
+                let status = responder.wait().unwrap();
+                eprintln!("hostile-proof-mode={mode} phase=responder-reaped status={status}");
+                assert!(
+                    status.success(),
+                    "attacker-key responder failed after explicit release: mode={mode} \
+                         responder_pid={} status={status} marker_exists={}",
+                    responder.id(),
+                    marker.exists()
+                );
             };
             if mode == "missing-proof-backup" {
                 assert_eq!(unsafe { nix::libc::close(108) }, 0);
@@ -1867,7 +1934,7 @@ mod isolation_tests {
                         .contains("proof authentication peer is not the ancestor test supervisor"),
                     "genuine key replay reached the wrong rejection boundary: {error:#}"
                 );
-                assert!(responder.wait().unwrap().success());
+                stop_attacker_responder(&validator, &mut responder, &marker, &mode);
                 assert!(
                     !marker.exists(),
                     "validator consumed a replayed key before authenticating its peer"
@@ -1883,6 +1950,7 @@ mod isolation_tests {
                 .open(&path)
                 .unwrap();
             if mode == "self" {
+                eprintln!("hostile-proof-mode=self phase=forge-proof");
                 let token = "self-issued";
                 let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
                 let executable_metadata = std::fs::metadata(&executable).unwrap();
@@ -1929,11 +1997,12 @@ mod isolation_tests {
                     executable_metadata.ino()
                 )
                 .unwrap();
-                writeln!(forged, "{}", {
-                    use sha2::Digest as _;
-                    hex::encode(sha2::Sha256::digest(std::fs::read(&executable).unwrap()))
-                })
-                .unwrap();
+                // The proof must be rejected while authenticating the peer,
+                // before any field in this attacker-signed body is trusted.
+                // Hashing the Rust test executable here read hundreds of MB
+                // only to populate an unreachable field and could consume the
+                // hostile-mode deadline on a cold CI runner.
+                writeln!(forged, "{}", "0".repeat(64)).unwrap();
                 let signature = attacker_key.sign(&forged);
                 writeln!(forged, "{}", hex::encode(signature.to_bytes())).unwrap();
                 writer.write_all(&forged).unwrap();
@@ -1951,21 +2020,27 @@ mod isolation_tests {
                 let marker = valid.home.join("self-issued-auth-key-consulted");
                 let (validator, mut responder) =
                     start_attacker_responder(attacker_key.verifying_key().to_bytes(), &marker);
+                eprintln!(
+                    "hostile-proof-mode=self phase=responder-started responder_pid={}",
+                    responder.id()
+                );
                 assert_eq!(unsafe { nix::libc::dup2(validator.as_raw_fd(), 109) }, 109);
+                eprintln!("hostile-proof-mode=self phase=validate-forged-proof");
                 let error = isolated_test_proof()
                     .err()
                     .expect("signed self-issued proof was accepted");
+                eprintln!("hostile-proof-mode=self phase=proof-rejected diagnostic={error:#}");
                 assert!(
                     error
                         .to_string()
                         .contains("proof authentication peer is not the ancestor test supervisor"),
                     "signed self-issued proof reached the wrong rejection boundary: {error:#}"
                 );
-                assert!(responder.wait().unwrap().success());
                 assert!(
                     !marker.exists(),
                     "validator consumed an attacker key before authenticating its peer"
                 );
+                stop_attacker_responder(&validator, &mut responder, &marker, &mode);
                 return;
             } else {
                 std::fs::remove_file(&path).unwrap();
@@ -1976,25 +2051,33 @@ mod isolation_tests {
             return;
         }
 
-        let timeout_started = std::time::Instant::now();
-        let timeout_error = run_hostile_proof_mode_with_deadline(
+        let timeout_outcome = run_hostile_proof_mode_with_deadline(
             "deadline-probe",
             std::time::Duration::from_millis(100),
         )
-        .expect_err("hostile proof-mode deadline probe escaped its wall-clock bound");
+        .expect("hostile proof-mode deadline probe failed before reaching its timeout boundary");
+        let HostileModeOutcome::TimedOut {
+            diagnostic,
+            cleanup_elapsed,
+        } = timeout_outcome
+        else {
+            panic!("deadline-probe completed instead of exercising bounded timeout cleanup");
+        };
         assert!(
-            timeout_error.contains("timed out after"),
-            "hostile deadline returned the wrong bounded-cleanup error: {timeout_error}"
-        );
-        assert!(
-            timeout_started.elapsed() < std::time::Duration::from_secs(3),
-            "hostile proof-mode timeout and reap exceeded its bounded grace"
+            cleanup_elapsed < std::time::Duration::from_secs(3),
+            "hostile proof-mode timeout cleanup exceeded its bounded grace; {diagnostic}"
         );
 
         let proof = isolated_test_proof().unwrap();
         let output = run_hostile_proof_mode("normal-exit-descendant")
             .expect("normal-exit descendant mode must be reclaimed");
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "normal-exit descendant cleanup failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let descendant_pid: nix::libc::pid_t =
             std::fs::read_to_string(proof.home.join("normal-exit-descendant.pid"))
                 .unwrap()
@@ -2029,7 +2112,8 @@ mod isolation_tests {
                 .unwrap_or_else(|error| panic!("{mode} proof rejection subprocess: {error}"));
             assert!(
                 output.status.success(),
-                "{mode} proof rejection subprocess failed: stdout={} stderr={}",
+                "{mode} proof rejection subprocess failed: status={} stdout={} stderr={}",
+                output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
