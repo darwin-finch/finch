@@ -2032,8 +2032,13 @@ mod tests {
             "the no-runtime arm loads synchronously; got {expected:?}"
         );
 
-        // Reset to the state the background arm starts from, then run the loop
-        // with no edges at all.
+        // Reset to the state the background arm starts from — except
+        // `next_id`, which `new_with_dim` returns to 1. Nothing in
+        // `hydrate_batches` or `link_loaded_children` reads it, and this test
+        // asserts only node count, status, and linkage; a future edit that
+        // consulted `next_id` would need the real value here.
+        //
+        // Then run the loop with no edges at all.
         {
             let mut tree = memory.tree.lock().await;
             *tree = MemTree::new_with_dim(memory.embedding_engine.dimension());
