@@ -901,29 +901,37 @@ impl MemorySystem {
     ) {
         let mut cursor: Option<u64> = None;
         loop {
+            // The database guard is scoped to the read and nothing else. The
+            // failure handling below needs the tree lock, and taking it while
+            // still holding the database guard would establish a db -> tree
+            // ordering on this path; every other path in this module takes them
+            // in that order or not at all, and keeping it that way is what
+            // stops a future tree -> db holder from deadlocking here.
             let batch = {
                 let conn = db.lock().await;
-                match Self::load_batch(&conn, cursor, HYDRATION_BATCH) {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            loaded = state.loaded.load(Ordering::SeqCst),
-                            "MemTree hydration failed; the index is incomplete for \
-                             the rest of this session"
-                        );
-                        // Link what did load before releasing writes.
-                        //
-                        // `fail` completes, and completing opens the write gate.
-                        // Returning here left every loaded node with an empty
-                        // `children`, so `MemTree::insert` saw a childless root,
-                        // attached every later memory directly under it, and
-                        // `save_all_nodes_to_db` persisted that flattening — the
-                        // exact durable miscplacement the gate exists to prevent.
-                        Self::link_loaded_children(&tree).await;
-                        state.fail(error.to_string());
-                        return;
-                    }
+                Self::load_batch(&conn, cursor, HYDRATION_BATCH)
+            };
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        loaded = state.loaded.load(Ordering::SeqCst),
+                        "MemTree hydration failed; the index is incomplete for \
+                         the rest of this session"
+                    );
+                    // Link what did load, THEN fail.
+                    //
+                    // `fail` completes, and completing opens the write gate, so
+                    // the order of these two lines is the fix. Failing first
+                    // left every loaded node with an empty `children`, so
+                    // `MemTree::insert` saw a childless root, attached every
+                    // later memory directly under it, and
+                    // `save_all_nodes_to_db` persisted that flattening — the
+                    // exact durable misplacement the gate exists to prevent.
+                    Self::link_loaded_children(&tree).await;
+                    state.fail(error.to_string());
+                    return;
                 }
             };
             if batch.is_empty() {
@@ -972,14 +980,21 @@ impl MemorySystem {
         }
     }
 
-    /// One page of persisted nodes, without their child links.
-    /// One page of stored nodes, keyed on the last id already read.
+    /// One page of stored nodes, keyed on the last id already read, without
+    /// their child links.
     ///
-    /// Keyset, not `LIMIT`/`OFFSET`. The lock is released between batches, so
-    /// another connection — the daemon and the CLI both open the same
-    /// `memory.db` — can insert a row into the window an offset refers to and
-    /// shift every later row past it, silently skipping nodes for the rest of
-    /// the session. A cursor on `node_id` cannot skip.
+    /// Keyset, not `LIMIT`/`OFFSET`. The database lock is released between
+    /// batches, so the row set can change underneath an offset: a row deleted
+    /// below the window shifts every later row back by one and the loader skips
+    /// the boundary row for the rest of the session. A cursor on `node_id`
+    /// cannot skip, and it is an O(1) primary-key seek rather than an
+    /// O(offset) scan.
+    ///
+    /// The narrower claim, since an earlier version of this comment overstated
+    /// it: Finch's own writers hand out ids monotonically from
+    /// `set_next_id(MAX + 1)` and never `DELETE FROM tree_nodes`, so the
+    /// skipping case is not reachable through Finch today. This removes the
+    /// class rather than a demonstrated failure.
     fn load_batch(conn: &Connection, after: Option<u64>, limit: usize) -> Result<Vec<TreeNode>> {
         let mut stmt = conn.prepare(
             "SELECT node_id, parent_id, text, embedding, level, created_at, importance
@@ -1800,11 +1815,10 @@ mod tests {
         // cursor advance, the per-batch lock release, and the case a parent
         // arrives in a later batch than its child were all unexercised, on a
         // change whose entire point is a 16,782-node store (#242).
+        // Four non-empty pages plus the empty one that ends the loop. Written
+        // in terms of HYDRATION_BATCH so it stays above the batch size if the
+        // constant changes; asserting that would be a tautology.
         const NODES: u64 = 3 * HYDRATION_BATCH as u64 + 7;
-        assert!(
-            NODES > HYDRATION_BATCH as u64,
-            "this test is only meaningful above the batch size"
-        );
         // Node 5 is in the first batch; its parent is in the third. Linking
         // therefore cannot be done as the batches land.
         let late_parent = 2 * HYDRATION_BATCH as u64 + 3;
@@ -1886,6 +1900,12 @@ mod tests {
             other => panic!("a broken row must surface as Failed; got {other:?}"),
         }
 
+        // The assertion below pins linking; it pins the *ordering* only because
+        // `ensure_hydrated` returned above, and it can only return after
+        // `fail()`. Moving `fail()` ahead of `link_loaded_children` would make
+        // this a race with the hydration task for the tree lock rather than a
+        // clean failure, so the ordering is stated here as well as relied on.
+
         let tree = memory.tree.lock().await;
         let loaded = tree.all_nodes().len();
         assert!(
@@ -1902,6 +1922,103 @@ mod tests {
             "every loaded child must be linked to the root before writes are \
              released; an empty `children` makes the next memory flatten the \
              tree and persists it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_loading_cannot_skip_a_row_when_the_store_changes() -> Result<()> {
+        // Keyset, not `LIMIT`/`OFFSET`: the database lock is released between
+        // batches, so the row set can change underneath an offset. Deleting a
+        // row below the window shifts every later row back by one, and an
+        // offset loader skips the boundary row — permanently, for the rest of
+        // the session. Reverting `load_batch` to `LIMIT ?2 OFFSET ?1` (keeping
+        // this signature, with the offset derived from the cursor) makes this
+        // fail: page two starts at 5 instead of 4.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config)?);
+        seed_tree_nodes(temp.path(), 10, &[])?;
+
+        let conn = Connection::open(temp.path())?;
+        let first: Vec<u64> = MemorySystem::load_batch(&conn, None, 4)?
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(
+            first,
+            vec![0, 1, 2, 3],
+            "the first page must start at the root"
+        );
+
+        // A row the loader has already read disappears between batches.
+        conn.execute("DELETE FROM tree_nodes WHERE node_id = 1", [])?;
+
+        let cursor = first.last().copied();
+        let second: Vec<u64> = MemorySystem::load_batch(&conn, cursor, 4)?
+            .into_iter()
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(
+            second,
+            vec![4, 5, 6, 7],
+            "no stored node may be skipped when the row set shifts between \
+             batches; an offset loader loses the boundary row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_unreadable_node_census_refuses_to_open_the_store() -> Result<()> {
+        // `unwrap_or(0)` on the two census queries turned a database error into
+        // silent lies: a failed `COUNT` skipped hydration entirely and reported
+        // `Ready { nodes: 0 }` against a full store with no log line, and a
+        // failed `MAX` left `next_id` at 1 so the first write upserted over
+        // persisted node 1. This drives the `MAX` half, which is the one that
+        // destroys data; the `COUNT` above it is the same expression shape and
+        // the assertion accepts either message. Restoring `unwrap_or(0)` on the
+        // `MAX` query makes this fail.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+
+        // Same table name and columns, so every migration and
+        // `CREATE ... IF NOT EXISTS` in `new` is a no-op — but `node_id` holds
+        // text, so `MAX(node_id)` cannot be read as an `i64`.
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute_batch(
+                "DROP TABLE memory_sources;
+                 DROP TABLE tree_nodes;
+                 CREATE TABLE tree_nodes (
+                     node_id TEXT PRIMARY KEY,
+                     parent_id INTEGER,
+                     text TEXT NOT NULL,
+                     embedding BLOB NOT NULL,
+                     level INTEGER NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     importance INTEGER NOT NULL DEFAULT 1
+                 );
+                 INSERT INTO tree_nodes
+                 VALUES ('not-an-integer', NULL, 'x', x'00000000', 0, 0, 1);",
+            )?;
+        }
+
+        let error = MemorySystem::new(config)
+            .err()
+            .expect("a store whose node census cannot be read must not open");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("count stored MemTree nodes")
+                || chain.contains("highest stored MemTree node id"),
+            "the error must say which census query failed, so the operator can \
+             tell it from an ordinary empty store; got {chain}"
         );
         Ok(())
     }
