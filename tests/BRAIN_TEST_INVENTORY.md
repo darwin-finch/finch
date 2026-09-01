@@ -35,6 +35,14 @@ unrelated same-name process survives the TUI smoke.
 - `tests/daemon_integration_test.rs` fails closed without authenticated
   supervisor proof. Its daemon receives the sealed HOME, password, IPC socket,
   and inherited kernel-assigned listener.
+- `tests/daemon_stdio_binding.rs` is non-Brain: it binds this test process's
+  own stdout and stderr to a `tempfile` log and restores them on drop. It
+  spawns nothing, so no process leaves the supervisor's group. It is a single
+  test because libtest would otherwise run its cases in parallel threads over
+  process-global descriptors.
+- `tests/daemon_log_rotation.rs` is non-Brain: it drives the daemon log
+  retention writer over a `tempfile` directory. It constructs no Brain, spawns
+  no daemon, binds no endpoint, and never touches the user's Finch state.
 - `tests/daemon_upgrade_preflight_test.rs` is non-Brain: it supplies an explicit
   `tempfile` stage and empty Brain root to a production preflight boundary.
 - `tests/worker_integration_test.rs` is non-Brain: it drives stateless Axum

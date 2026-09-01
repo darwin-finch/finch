@@ -71,9 +71,15 @@ A finding is **new** in a round when no earlier round record of this review alre
 
 **Converged** means a round record contains no new CONFIRMED findings. Convergence takes at least two rounds; one round is a smoke test. If the first round produces no CONFIRMED findings, and so no fixes, run the second round at the same tip with freshly instantiated reviewers, so that it is an independent sample rather than a replay.
 
-**Run at most three rounds.** If the third round still contains a new CONFIRMED finding, the review has not converged. Stop there: do not start a fourth round, and do not report the review as converged.
+**Continue only while the review is improving.** After each round from the second onward, compare its record with the previous one. The round must be **strictly better on both counts**: fewer new CONFIRMED findings, and a less severe worst finding. A run that goes 8 findings to 4, with the worst dropping from a security regression to a recovery-path edge case, is converging and has earned another round. A run that goes 8 to 9, or that trades four small findings for one that corrupts data, is not converging and no number of further rounds will fix it — the change itself is wrong, too large, or the implementer keeps reaching for the same wrong shape.
 
-Escalate instead. Post the round records per section 5 with the verdict DO NOT MERGE, and hand the coordinator, named one by one, every CONFIRMED finding still unresolved with its failure scenario, the round that raised it, and what was attempted for it. The coordinator decides what happens next — split the change, narrow its scope, or accept a named risk explicitly. Continuing to loop, dropping the findings, or declaring success anyway are each a failure of this protocol.
+Stop as soon as a round fails that comparison, even if it is only the second. Waiting for a fixed round count lets a pathological run burn two more rounds before anyone looks at it.
+
+**Six rounds is the backstop, not the test.** It exists so a run that improves by a hair each time still terminates. Reaching it means the same thing as failing the comparison.
+
+Each round's fixes are new code and can introduce new defects — in practice they often do, at the exact lines the previous round's fix touched. That is normal once or twice and is why rounds continue at all; it is also why "keep going until it is clean" is not a safe rule on its own.
+
+Escalate instead. Post the round records per section 5 with the verdict DO NOT MERGE, and hand the coordinator, named one by one, every CONFIRMED finding still unresolved with its failure scenario, the round that raised it, and what was attempted for it. Include the per-round counts and worst severity, so the coordinator can see the trend that triggered the stop rather than only the final state. The coordinator decides what happens next — split the change, narrow its scope, or accept a named risk explicitly. Continuing to loop, dropping the findings, or declaring success anyway are each a failure of this protocol.
 
 ## 5. Record the outcome where it can be checked
 

@@ -33,9 +33,19 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
 -- Stable provenance for semantic leaves. A NULL node_id records that the
 -- quality classifier deliberately excluded this conversation from semantic
 -- retrieval, making projection retries idempotent as well.
+-- `node_id` is deliberately NOT UNIQUE. The same sentence said in several
+-- conversations deduplicates to one memory node with several sources, and a
+-- promoted node's provenance rows follow the moved leaf that still holds the
+-- text. A UNIQUE constraint here made storing repeated content fail outright
+-- with `UNIQUE constraint failed: memory_sources.node_id`.
+--
+-- There is no migration for databases created with the old constraint. Finch
+-- has no users yet, so this file is authoritative and a pre-existing
+-- `~/.finch/memory.db` should be removed rather than upgraded. Once that stops
+-- being true, changing this table needs a migration.
 CREATE TABLE IF NOT EXISTS memory_sources (
     conversation_id TEXT PRIMARY KEY,
-    node_id INTEGER UNIQUE,
+    node_id INTEGER,
     indexed_at INTEGER NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
     FOREIGN KEY (node_id) REFERENCES tree_nodes(node_id) ON DELETE CASCADE

@@ -75,8 +75,18 @@ impl TestDaemon {
                     .replace(&daemon_address, "<daemon-address>")
                     .replace(&brain_password, "<brain-password>")
                     .replace(api_key, "<api-key>");
+                let daemon_log = redact_daemon_diagnostic(
+                    bounded_path_diagnostic(&finch_dir.join("daemon.log")),
+                    &home,
+                    &socket_root,
+                    &brain_address,
+                    &daemon_address,
+                    &brain_password,
+                    api_key,
+                );
                 anyhow::bail!(
-                    "isolated daemon exited before binding: {status}; bounded stderr={stderr:?}"
+                    "isolated daemon exited before binding: {status}; \
+                     bounded stderr={stderr:?}; bounded daemon log={daemon_log:?}"
                 );
             }
             if Instant::now() >= deadline {
@@ -111,6 +121,27 @@ impl TestDaemon {
                 "{error}; bounded daemon stderr={stderr:?}; bounded daemon log={daemon_log:?}"
             );
         }
+        // #249 regression: `run_daemon` binds its own stdout/stderr only when the
+        // detached marker is set. This harness does not set it, so this daemon
+        // is in the documented foreground shape — `finch daemon` in a terminal,
+        // `finch worker`, and the shipped systemd unit. Its startup line must
+        // still reach the inherited stderr. Binding unconditionally sent this
+        // into daemon.log and left operators with a blank journal.
+        let foreground_stderr = redact_daemon_diagnostic(
+            bounded_child_stderr(&stderr_file),
+            &home,
+            &socket_root,
+            &brain_address,
+            &daemon_address,
+            &brain_password,
+            api_key,
+        );
+        anyhow::ensure!(
+            foreground_stderr.contains("Daemon logs:"),
+            "a non-detached daemon must keep writing to its inherited stderr; \
+             got {foreground_stderr:?}"
+        );
+
         write_config(&home, &address, api_key, &brain_password)?;
 
         Ok(Self {
