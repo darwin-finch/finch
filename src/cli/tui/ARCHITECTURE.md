@@ -22,8 +22,11 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   lifecycle: suspend releases all three, resume reacquires all three, and
   clean/error/panic/SIGTERM/SIGHUP paths attempt every reset independently.
   SIGTERM/SIGHUP ownership is installed before terminal activation; a dedicated
-  listener thread restores modes without waiting for startup or an event-loop
-  branch, then notifies the ordinary async shutdown path.
+  listener thread serializes against admitted terminal writers, restores saved
+  termios through a dedicated nonblocking descriptor, and exits conventionally
+  without waiting for startup, setup/editor handoff, or an event-loop branch.
+  Live-frame height changes always re-anchor at an absolute bottom-row origin;
+  relative cursor movement is used only inside that bounded frame.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Finch does not
   enable terminal mouse reporting by default, so selection, copying, and
