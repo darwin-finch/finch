@@ -1339,7 +1339,9 @@ mod isolation_tests {
     }
 
     const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    const HOSTILE_MODE_STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
     const HOSTILE_MODE_OUTPUT_LIMIT: usize = 64 * 1024;
+    const HOSTILE_MODE_READY_ENV: &str = "FINCH_TEST_HOSTILE_MODE_READY";
 
     struct HostileModeGroup {
         child: std::process::Child,
@@ -1363,7 +1365,24 @@ mod isolation_tests {
             let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGTERM) };
             std::thread::sleep(std::time::Duration::from_millis(100));
             let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGKILL) };
-            let _ = self.child.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut quiescent = false;
+            while std::time::Instant::now() < deadline {
+                if mode_leader_exited(&self.child).unwrap_or(false)
+                    && mode_group_has_descendants(self.group).is_ok_and(|present| !present)
+                {
+                    quiescent = true;
+                    break;
+                }
+                let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Keep the unreaped leader alive to pin the PGID against reuse if
+            // the bounded fallback cannot prove quiescence. The outer test
+            // supervisor then reports and preserves the failed isolation.
+            if quiescent {
+                let _ = self.child.wait();
+            }
         }
     }
 
@@ -1509,6 +1528,10 @@ mod isolation_tests {
                 "--nocapture",
             ])
             .env("FINCH_TEST_FORGED_PROOF_MODE", mode)
+            .env(
+                HOSTILE_MODE_READY_ENV,
+                proof.home.join(format!("hostile-mode-{mode}.ready")),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         unsafe {
@@ -1542,6 +1565,89 @@ mod isolation_tests {
         set_nonblocking(&stderr);
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
+        let ready = proof.home.join(format!("hostile-mode-{mode}.ready"));
+        let redact = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
+                .replace(
+                    proof.socket_root.to_string_lossy().as_ref(),
+                    "<socket-root>",
+                )
+                .replace(&proof.brain_addr, "<brain-address>")
+                .replace(&proof.daemon_addr, "<daemon-address>")
+        };
+        let startup_started = std::time::Instant::now();
+        let startup_deadline = startup_started + HOSTILE_MODE_STARTUP_DEADLINE;
+        let marker_label = format!("<isolated-home>/hostile-mode-{mode}.ready");
+        let startup_failure = loop {
+            drain_bounded(&mut stdout, &mut stdout_bytes);
+            drain_bounded(&mut stderr, &mut stderr_bytes);
+            match std::fs::read(&ready) {
+                Ok(contents) if contents == mode.as_bytes() => {
+                    if let Err(error) = std::fs::remove_file(&ready) {
+                        break Some(format!(
+                            "phase=process-startup-ready-cleanup marker={marker_label} error={error}"
+                        ));
+                    }
+                    break None;
+                }
+                Ok(_) | Err(_) if std::time::Instant::now() < startup_deadline => {}
+                Ok(contents) => {
+                    break Some(format!(
+                        "phase=process-startup deadline={:?} elapsed={:?} marker={marker_label} \
+                         unexpected_contents={contents:?}",
+                        HOSTILE_MODE_STARTUP_DEADLINE,
+                        startup_started.elapsed()
+                    ));
+                }
+                Err(error) => {
+                    break Some(format!(
+                        "phase=process-startup deadline={:?} elapsed={:?} marker={marker_label} \
+                         error={error}",
+                        HOSTILE_MODE_STARTUP_DEADLINE,
+                        startup_started.elapsed()
+                    ));
+                }
+            }
+            match mode_leader_exited(&group.child) {
+                Ok(true) => {
+                    break Some("phase=process-startup leader_exited=true".to_owned());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    break Some(format!("phase=process-startup-poll error={error}"));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if let Some(startup_failure) = startup_failure {
+            let cleanup_started = std::time::Instant::now();
+            let cleanup = finish_mode_group(&mut group.child, group_id);
+            let cleanup_elapsed = cleanup_started.elapsed();
+            drain_bounded(&mut stdout, &mut stdout_bytes);
+            drain_bounded(&mut stderr, &mut stderr_bytes);
+            match cleanup {
+                Ok(status) => {
+                    group.reaped = true;
+                    return Err(format!(
+                        "mode={mode} {startup_failure} cleanup_elapsed={cleanup_elapsed:?} \
+                         cleanup_status={status} descendants_after_cleanup=false stdout={} \
+                         stderr={}",
+                        redact(&stdout_bytes),
+                        redact(&stderr_bytes)
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "mode={mode} {startup_failure} phase=process-startup-cleanup \
+                         cleanup_elapsed={cleanup_elapsed:?} cleanup_error={error} stdout={} \
+                         stderr={}",
+                        redact(&stdout_bytes),
+                        redact(&stderr_bytes)
+                    ));
+                }
+            }
+        }
         let deadline = std::time::Instant::now() + mode_deadline;
         let (status, timed_out, cleanup_elapsed) = loop {
             drain_bounded(&mut stdout, &mut stdout_bytes);
@@ -1571,16 +1677,6 @@ mod isolation_tests {
         if timed_out {
             let cleanup_elapsed = cleanup_elapsed
                 .expect("timed-out hostile proof mode did not record cleanup duration");
-            let redact = |bytes: &[u8]| {
-                String::from_utf8_lossy(bytes)
-                    .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
-                    .replace(
-                        proof.socket_root.to_string_lossy().as_ref(),
-                        "<socket-root>",
-                    )
-                    .replace(&proof.brain_addr, "<brain-address>")
-                    .replace(&proof.daemon_addr, "<daemon-address>")
-            };
             return Ok(HostileModeOutcome::TimedOut {
                 diagnostic: format!(
                     "mode={mode} phase=timeout-cleanup deadline={mode_deadline:?} \
@@ -1592,21 +1688,10 @@ mod isolation_tests {
                 cleanup_elapsed,
             });
         }
-        let redact = |bytes: Vec<u8>| {
-            String::from_utf8_lossy(&bytes)
-                .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
-                .replace(
-                    proof.socket_root.to_string_lossy().as_ref(),
-                    "<socket-root>",
-                )
-                .replace(&proof.brain_addr, "<brain-address>")
-                .replace(&proof.daemon_addr, "<daemon-address>")
-                .into_bytes()
-        };
         Ok(HostileModeOutcome::Completed(std::process::Output {
             status,
-            stdout: redact(stdout_bytes),
-            stderr: redact(stderr_bytes),
+            stdout: redact(&stdout_bytes).into_bytes(),
+            stderr: redact(&stderr_bytes).into_bytes(),
         }))
     }
 
@@ -1670,14 +1755,21 @@ mod isolation_tests {
         const MODE_ENV: &str = "FINCH_TEST_FORGED_PROOF_MODE";
         const RESPONDER_KEY_ENV: &str = "FINCH_TEST_ATTACKER_RESPONDER_KEY";
         const RESPONDER_MARKER_ENV: &str = "FINCH_TEST_ATTACKER_RESPONDER_MARKER";
+        const DESCENDANT_READY_ENV: &str = "FINCH_TEST_DESCENDANT_READY";
         if !supervisor_contract_present() {
             return;
         }
         if let Ok(mode) = std::env::var(MODE_ENV) {
             if mode == "normal-exit-descendant-child" {
-                unsafe {
-                    nix::libc::signal(nix::libc::SIGTERM, nix::libc::SIG_IGN);
-                }
+                let previous = unsafe { nix::libc::signal(nix::libc::SIGTERM, nix::libc::SIG_IGN) };
+                assert_ne!(
+                    previous,
+                    nix::libc::SIG_ERR,
+                    "normal-exit descendant could not install its SIGTERM-ignore handler"
+                );
+                let ready = std::env::var_os(DESCENDANT_READY_ENV)
+                    .expect("normal-exit descendant readiness path was not supplied");
+                std::fs::write(ready, b"sigterm-ignored").unwrap();
                 loop {
                     std::thread::park();
                 }
@@ -1719,28 +1811,80 @@ mod isolation_tests {
                 }
             }
             let valid = isolated_test_proof().unwrap();
+            let signal_hostile_mode_ready = || {
+                if let Some(ready) = std::env::var_os(HOSTILE_MODE_READY_ENV) {
+                    std::fs::write(ready, mode.as_bytes()).unwrap();
+                }
+            };
             if mode == "deadline-probe" {
+                signal_hostile_mode_ready();
                 loop {
                     std::thread::park();
                 }
             }
             if mode == "normal-exit-descendant" {
-                let descendant = supervised_test_subprocess_command()
+                let ready = valid.home.join("normal-exit-descendant.ready");
+                let mut descendant = supervised_test_subprocess_command()
                     .args([
                         "--exact",
                         "brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
                         "--nocapture",
                     ])
                     .env(MODE_ENV, "normal-exit-descendant-child")
+                    .env(DESCENDANT_READY_ENV, &ready)
+                    .env_remove(HOSTILE_MODE_READY_ENV)
                     .spawn()
                     .unwrap();
+                let readiness_started = std::time::Instant::now();
+                let readiness_deadline = readiness_started + std::time::Duration::from_secs(5);
+                loop {
+                    match std::fs::read(&ready) {
+                        Ok(contents) if contents == b"sigterm-ignored" => break,
+                        Ok(_) | Err(_) if std::time::Instant::now() < readiness_deadline => {}
+                        Ok(contents) => panic!(
+                            "normal-exit descendant readiness marker was incomplete after {:?}: \
+                             descendant_pid={} marker={} contents={contents:?}",
+                            readiness_started.elapsed(),
+                            descendant.id(),
+                            ready.display()
+                        ),
+                        Err(error) => panic!(
+                            "normal-exit descendant did not install its SIGTERM-ignore handler \
+                             within {:?}: descendant_pid={} marker={} error={error}",
+                            readiness_started.elapsed(),
+                            descendant.id(),
+                            ready.display()
+                        ),
+                    }
+                    if let Some(status) = descendant.try_wait().unwrap() {
+                        panic!(
+                            "normal-exit descendant exited before signaling readiness: \
+                             descendant_pid={} status={status} marker={}",
+                            descendant.id(),
+                            ready.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 std::fs::write(
                     valid.home.join("normal-exit-descendant.pid"),
                     descendant.id().to_string(),
                 )
                 .unwrap();
-                return;
+                // Do not start the outer behavior deadline until the nested
+                // descendant has completed its own cold process startup and
+                // installed SIGTERM immunity. On CI that startup can exceed
+                // the behavior budget even though cleanup itself is prompt.
+                signal_hostile_mode_ready();
+                // This fixture exercises cleanup after the process-group
+                // leader exits while a descendant remains. Returning from the
+                // test function leaves the exact exit timing to libtest, which
+                // can remain alive long enough to consume the hostile-mode
+                // deadline on a loaded CI runner. Exit the fixture process
+                // directly so the lifecycle boundary under test is explicit.
+                unsafe { nix::libc::_exit(0) };
             }
+            signal_hostile_mode_ready();
             let start_attacker_responder = |key: [u8; 32],
                                             marker: &std::path::Path|
              -> (
@@ -1757,7 +1901,8 @@ mod isolation_tests {
                         ])
                         .env(MODE_ENV, "attacker-key-responder")
                         .env(RESPONDER_KEY_ENV, hex::encode(key))
-                        .env(RESPONDER_MARKER_ENV, marker);
+                        .env(RESPONDER_MARKER_ENV, marker)
+                        .env_remove(HOSTILE_MODE_READY_ENV);
                 unsafe {
                     command.pre_exec(move || {
                         if nix::libc::dup2(responder.as_raw_fd(), 109) != 109 {
