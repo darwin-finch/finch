@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Upgraded Calamine to 0.36.1, moving quick-xml to the fixed 0.41 line and
+  clearing RUSTSEC-2026-0194 (quadratic time on duplicate attribute names) and
+  RUSTSEC-2026-0195 (unbounded namespace-declaration allocation). Both were
+  reachable on user-supplied spreadsheets through `xlsx@`, `xlsx@/`,
+  `xlsx-sheets`, `xlsx!`, file loading and the TUI preview. (#185)
+
+### Fixed
+
+- **`xlsx@` read the wrong cell on any sheet whose data does not start at A1.**
+  Cell addresses are absolute, but the lookup used a range-relative position, so
+  a sheet with a blank first row or column returned a neighbouring cell's value
+  or an empty string. `xlsx@ B3` on a sheet whose first value is in B3 returned
+  nothing. (#185)
+- **`xlsx!` silently discarded the edit and collapsed the sheet toward A1**, on
+  the same class of sheet and for the same reason. The word reported success,
+  the requested cell was never written, and every surviving cell was rewritten
+  at its range-relative position. (#185)
+
+### Changed
+
+- Declared `rust-version = "1.98"`, matching the pinned toolchain. Calamine
+  0.36.1 requires 1.88; the floor is now explicit rather than transitive. (#185)
+
 ## [0.7.23] - 2026-02-28
 
 ### Added

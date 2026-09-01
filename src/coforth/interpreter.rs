@@ -10822,17 +10822,42 @@ fn xlsx_write_cell(path: &str, addr: &str, value: &str) -> Result<()> {
     let ws = workbook.add_worksheet();
     ws.set_name(&sheet_name)?;
 
+    // `range.rows()` yields rows relative to the used range's start, but
+    // `target_row`/`target_col` come from an absolute cell address, and
+    // `write_string` takes an absolute position. Treating the relative index as
+    // absolute did two things on any sheet whose used range does not begin at
+    // A1 — which is any sheet with a blank first row or column: the requested
+    // patch was compared against the wrong coordinates and silently discarded,
+    // so `xlsx!` reported success and changed nothing, and every surviving cell
+    // was rewritten at its relative index, collapsing the sheet toward the
+    // origin.
+    //
+    // This is the same relative-versus-absolute confusion as the `get` call in
+    // `xlsx_read_cell`, eleven lines up. Fixing only the read half made the
+    // pair worse than leaving both wrong: they agreed on the wrong cell before,
+    // and would have disagreed after.
+    let (start_row, start_col) = range.start().unwrap_or((0, 0));
+    let mut patched = false;
     for (r, row) in range.rows().enumerate() {
         for (c, cell) in row.iter().enumerate() {
-            let text = if r as u32 == target_row && c as u32 == target_col {
+            let row_index = start_row + r as u32;
+            let col_index = start_col + c as u32;
+            let text = if row_index == target_row && col_index == target_col {
+                patched = true;
                 value.to_string()
             } else {
                 data_to_string(cell)
             };
             if !text.is_empty() {
-                ws.write_string(r as u32, c as u16, &text)?;
+                ws.write_string(row_index, u16::try_from(col_index)?, &text)?;
             }
         }
+    }
+    // A cell outside the used range is still a legitimate target; the loop
+    // never reaches it, so write it directly. An empty value writes nothing,
+    // which is how an empty cell is represented.
+    if !patched && !value.is_empty() {
+        ws.write_string(target_row, u16::try_from(target_col)?, value)?;
     }
     workbook.save(path)?;
     Ok(())
@@ -12477,6 +12502,85 @@ mod tests {
         (dir, path)
     }
 
+    /// Hand-write a minimal XLSX whose single string cell carries no
+    /// `xml:space="preserve"`.
+    ///
+    /// `rust_xlsxwriter` adds that attribute to every string that starts or
+    /// ends with whitespace, so a fixture it produces can never reach the
+    /// trimming branch. Excel on some paths, LibreOffice, ODS producers and
+    /// hand-written XML all omit it — that is the population the behaviour
+    /// change actually affects, and it is unreachable through the writer.
+    fn xlsx_with_unpreserved_whitespace(dir: &std::path::Path, text: &str) -> String {
+        use std::io::Write as _;
+        let path = dir.join("unpreserved.xlsx");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        let entries: [(&str, String); 4] = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_string(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#.to_string(),
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#.to_string(),
+            ),
+        ];
+        for (name, body) in entries {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        // An inline string with no `xml:space` attribute at all.
+        zip.start_file("xl/worksheets/sheet1.xml", options).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData></worksheet>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// The one behaviour the upgrade actually changes, pinned.
+    ///
+    /// quick-xml 0.41 trims ASCII whitespace from a text node unless the cell
+    /// declares `xml:space="preserve"`; 0.31 did not trim at all. Every other
+    /// test in this file passes identically on calamine 0.26 and 0.36, because
+    /// `rust_xlsxwriter` always emits the attribute — so without this one,
+    /// nothing here would fail if the dependency bump were reverted, which is
+    /// the single thing these tests exist to prevent.
+    ///
+    /// This asserts the new behaviour rather than the old. It is a real,
+    /// user-visible change on files Finch did not write, and pinning it is how
+    /// it stops being silent.
+    #[test]
+    fn test_unpreserved_whitespace_is_trimmed_as_quick_xml_0_41_specifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = xlsx_with_unpreserved_whitespace(dir.path(), "  padded  ");
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A1").unwrap(),
+            "padded",
+            "quick-xml 0.41 trims a text node with no xml:space=preserve; 0.31 \
+             returned it verbatim. Reverting the Calamine bump fails here."
+        );
+
+        // Interior whitespace is untouched — only the ends are trimmed.
+        let path = xlsx_with_unpreserved_whitespace(dir.path(), " a  b ");
+        assert_eq!(xlsx_read_cell(&path, None, "A1").unwrap(), "a  b");
+    }
+
     /// #185. Calamine 0.26 -> 0.36 moves quick-xml to the 0.41 line, clearing
     /// RUSTSEC-2026-0194 and -0195. The API Finch uses is unchanged, so a clean
     /// compile proves nothing; the risk is behavioural. The release notes name
@@ -12485,20 +12589,21 @@ mod tests {
     /// read through `xlsx@`.
     #[test]
     fn test_xlsx_read_preserves_whitespace_newlines_and_unicode() {
+        // Built from escapes rather than literal newlines: `cargo fmt` expands
+        // a `\n` escape inside a string literal into a real line break, and an
+        // earlier version of this fixture wrote the same value in A2 and A3
+        // that way — the CR vanished, the two cells deduplicated in the shared
+        // string table, and the CRLF case #185 asks for was a dead cell.
+        let lf = ["line one", "line two"].join("\u{000a}");
+        let crlf = ["line one", "line two"].join("\u{000d}\u{000a}");
+        assert!(
+            crlf.contains('\u{000d}'),
+            "the CRLF fixture must contain a CR"
+        );
         let cells = [
             (0, 0, "  padded  "),
-            (
-                1,
-                0,
-                "line one
-line two",
-            ),
-            (
-                2,
-                0,
-                "line one
-line two",
-            ),
+            (1, 0, lf.as_str()),
+            (2, 0, crlf.as_str()),
             (3, 0, "naïve café — 日本語 🕊"),
             (4, 0, ""),
             (5, 0, "0042"),
@@ -12517,6 +12622,17 @@ line two",
             "line one\nline two",
             "an embedded newline must survive"
         );
+        // CRLF survives verbatim. XML normalises a *literal* CR in a text node
+        // to LF on parse, which is the EOL behaviour #185 names — but
+        // `rust_xlsxwriter` escapes it as a character reference, so it
+        // round-trips intact. Measured, not assumed: the first version of this
+        // assertion expected LF and got CRLF back.
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A3").unwrap(),
+            crlf,
+            "a CRLF written through the escape path must come back unchanged"
+        );
+        assert_ne!(lf, crlf, "the two EOL fixtures must actually differ");
         assert_eq!(
             xlsx_read_cell(&path, None, "A4").unwrap(),
             "naïve café — 日本語 🕊",
@@ -12592,11 +12708,70 @@ line two",
         );
     }
 
+    /// Cell addresses are absolute; `Range::rows()` is relative to the used
+    /// range's start. On any sheet whose data does not begin at A1 — a blank
+    /// first row or column is enough — treating one as the other silently
+    /// discarded the requested patch AND collapsed every surviving cell toward
+    /// the origin, while `xlsx!` reported success.
+    ///
+    /// The A1-origin fixture below cannot catch this, because there relative
+    /// and absolute coincide. That is exactly the fixture the first version of
+    /// this PR shipped, eleven lines from the read-side fix it made, so this
+    /// one starts at B3.
+    #[test]
+    fn test_xlsx_write_uses_absolute_addresses_on_a_sheet_that_does_not_start_at_a1() {
+        let (_dir, path) = spreadsheet_fixture(
+            "Data",
+            &[
+                (2, 1, "B3 original"),
+                (2, 2, "C3 neighbour"),
+                (3, 1, "B4 below"),
+            ],
+        );
+
+        xlsx_write_cell(&path, "B3", "B3 patched").unwrap();
+
+        assert_eq!(
+            xlsx_read_cell(&path, None, "B3").unwrap(),
+            "B3 patched",
+            "the requested cell must actually be patched; the relative-index \
+             comparison never matched, so the write was silently dropped"
+        );
+        assert_eq!(
+            xlsx_read_cell(&path, None, "C3").unwrap(),
+            "C3 neighbour",
+            "neighbours must stay where they are; writing at the relative index \
+             moved the whole sheet toward A1"
+        );
+        assert_eq!(xlsx_read_cell(&path, None, "B4").unwrap(), "B4 below");
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A1").unwrap(),
+            "",
+            "nothing may appear at the origin"
+        );
+    }
+
+    /// A cell outside the used range is a legitimate target: the row loop never
+    /// reaches it, so it has to be written directly or the patch is lost.
+    #[test]
+    fn test_xlsx_write_reaches_a_cell_outside_the_used_range() {
+        let (_dir, path) = spreadsheet_fixture("Data", &[(0, 0, "A1")]);
+        xlsx_write_cell(&path, "D5", "far away").unwrap();
+        assert_eq!(xlsx_read_cell(&path, None, "D5").unwrap(), "far away");
+        assert_eq!(xlsx_read_cell(&path, None, "A1").unwrap(), "A1");
+    }
+
     /// The write path reads the whole sheet with calamine, patches one cell and
     /// rewrites the workbook, so an upgrade that changed read behaviour would
     /// corrupt every untouched cell on the next write.
+    ///
+    /// "the rest" means the other cells of the first sheet. It is not the whole
+    /// workbook: this path rebuilds a single-sheet workbook from
+    /// `sheet_names().first()`, so any other worksheet, and all formulas,
+    /// number formats and styling, are lost. That predates this change and is
+    /// recorded rather than fixed here.
     #[test]
-    fn test_xlsx_write_patches_one_cell_and_leaves_the_rest_intact() {
+    fn test_xlsx_write_patches_one_cell_and_keeps_the_other_cells_of_that_sheet() {
         let (_dir, path) = spreadsheet_fixture(
             "Data",
             &[

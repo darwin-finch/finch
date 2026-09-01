@@ -32,6 +32,18 @@ if [[ "$declared_toolchain" != "$expected_toolchain" ]]; then
   exit 1
 fi
 
+# `Cargo.toml`'s `rust-version` is a second source of truth for the supported
+# floor, added with the Calamine upgrade (#185) so a transitive MSRV bump could
+# not arrive silently. Two sources that can drift is what this contract exists
+# to prevent, so pin them together: the declared floor must be the channel's
+# major.minor.
+expected_rust_version="${expected_toolchain%.*}"
+declared_rust_version=$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml)
+if [[ "$declared_rust_version" != "$expected_rust_version" ]]; then
+  echo "Cargo.toml must declare rust-version \"$expected_rust_version\" to match the pinned toolchain $expected_toolchain; found '${declared_rust_version:-missing}'" >&2
+  exit 1
+fi
+
 if ! grep -Fxq 'components = ["clippy", "rustfmt"]' "$toolchain_file"; then
   echo "rust-toolchain.toml must install exactly the required clippy and rustfmt components" >&2
   exit 1

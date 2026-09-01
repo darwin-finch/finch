@@ -1,0 +1,84 @@
+name: Spreadsheet parser advisories
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spreadsheet-advisories-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  spreadsheet-advisory-audit:
+    name: Spreadsheet advisory audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact source tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run full audit and retain independent batch findings
+        id: full-audit
+        shell: bash
+        run: |
+          set +e
+          cargo audit --json > audit.json
+          audit_status=$?
+          set -e
+          if (( audit_status != 0 && audit_status != 1 )); then
+            echo "cargo-audit exited unexpectedly with status ${audit_status}" >&2
+            exit 1
+          fi
+          test -s audit.json
+          audit_bytes=$(wc -c < audit.json)
+          if (( audit_bytes > 10485760 )); then
+            echo "cargo-audit JSON exceeded the 10 MiB inspection bound: ${audit_bytes}" >&2
+            exit 1
+          fi
+          jq -e 'type == "object" and (.vulnerabilities.list | type == "array")' audit.json >/dev/null
+          echo "exit_code=${audit_status}" >> "$GITHUB_OUTPUT"
+      - name: Prove the two issue 185 advisories are absent without ignores
+        shell: bash
+        run: |
+          jq -r '.vulnerabilities.list[]? | [.advisory.id, .package.name, .package.version] | @tsv' audit.json
+          jq -e '
+            [.vulnerabilities.list[]?]
+            | all(
+                .advisory.id != "RUSTSEC-2026-0194"
+                and .advisory.id != "RUSTSEC-2026-0195"
+              )
+          ' audit.json
+      - name: Prove no vulnerable quick-xml remains on any path
+        shell: bash
+        run: |
+          # Cargo.lock is gitignored, so the resolved graph is not pinned in the
+          # repository and this job is what actually holds the floor. Assert on
+          # the resolved tree rather than trusting the manifest constraint.
+          cargo tree --invert quick-xml --edges normal,build,dev --prefix none --format '{p}' \
+            | sort -u | tee quick-xml-tree.txt
+          if grep -qE '^quick-xml v0\.(3[0-9]|[0-2]?[0-9])\.' quick-xml-tree.txt; then
+            echo 'a quick-xml below 0.41 is still reachable' >&2
+            exit 1
+          fi
+          grep -qE '^quick-xml v0\.4[1-9]\.|^quick-xml v[1-9]' quick-xml-tree.txt
+      - name: Report full-audit outcome
+        shell: bash
+        run: |
+          echo "Full cargo-audit exit code: ${{ steps.full-audit.outputs.exit_code }}"
+          echo 'Inherited advisories remain owned by independent issue 150 batches.'
