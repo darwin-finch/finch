@@ -20,7 +20,9 @@ pub use quality::{MemoryClassifier, MemoryImportance};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 
 /// Configuration for memory system
@@ -57,6 +59,81 @@ impl Default for MemoryConfig {
 }
 
 /// Memory system with MemTree and SQLite storage
+/// Progress of the background MemTree hydration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HydrationStatus {
+    /// Every persisted node is in memory.
+    Ready { nodes: usize },
+    /// Still loading. Retrieval sees `loaded` of `total` nodes.
+    Loading { loaded: usize, total: usize },
+    /// Hydration failed; the tree holds whatever loaded before the error.
+    Failed { reason: String },
+}
+
+/// Shared progress record for the background load.
+#[derive(Debug)]
+struct HydrationState {
+    loaded: AtomicUsize,
+    total: AtomicUsize,
+    /// Completion as retained state rather than an edge.
+    ///
+    /// This was an `AtomicBool` plus a `Notify`, which has a lost wakeup:
+    /// `Notified` captures the epoch when the future is *created*, and
+    /// `notify_waiters` stores no permit, so a waiter that checks the flag,
+    /// loses the race to `complete()`, and only then builds its future parks
+    /// forever. `complete()` fires exactly once, so the turn wedges with no
+    /// timeout and no error. Production runs a multi-threaded runtime, so that
+    /// interleaving is reachable. A `watch` channel retains the value, which
+    /// removes the window rather than narrowing it.
+    done: watch::Sender<bool>,
+    failure: std::sync::Mutex<Option<String>>,
+}
+
+impl HydrationState {
+    fn new(total: usize) -> Self {
+        Self {
+            loaded: AtomicUsize::new(0),
+            total: AtomicUsize::new(total),
+            done: watch::channel(total == 0).0,
+            failure: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn complete(&self) {
+        let _ = self.done.send(true);
+    }
+
+    fn fail(&self, reason: String) {
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = Some(reason);
+        }
+        self.complete();
+    }
+
+    fn status(&self) -> HydrationStatus {
+        if let Ok(slot) = self.failure.lock() {
+            if let Some(reason) = slot.as_ref() {
+                return HydrationStatus::Failed {
+                    reason: reason.clone(),
+                };
+            }
+        }
+        let loaded = self.loaded.load(Ordering::SeqCst);
+        if *self.done.borrow() {
+            HydrationStatus::Ready { nodes: loaded }
+        } else {
+            HydrationStatus::Loading {
+                loaded,
+                total: self.total.load(Ordering::SeqCst),
+            }
+        }
+    }
+}
+
+/// Nodes hydrated per batch. Small enough that the tree and database locks are
+/// released frequently, so an interactive turn never waits on one long hold.
+const HYDRATION_BATCH: usize = 512;
+
 pub struct MemorySystem {
     db: Arc<Mutex<Connection>>,
     tree: Arc<Mutex<MemTree>>,
@@ -66,6 +143,7 @@ pub struct MemorySystem {
     insert_lock: Arc<Mutex<()>>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
+    hydration: Arc<HydrationState>,
 }
 
 /// Canonical source identity for a conversation pair projected from one
@@ -293,25 +371,67 @@ impl MemorySystem {
         let dim = embedding_engine.dimension();
         let mut tree = MemTree::new_with_dim(dim);
 
-        // Load MemTree from persisted tree_nodes table.
-        // Falls back gracefully to empty tree if table is empty or data is missing.
-        {
-            let node_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
-                .unwrap_or(0);
-            if node_count > 0 {
-                if let Err(e) = Self::load_tree_from_db_conn(&conn, &mut tree) {
-                    tracing::warn!("Failed to load MemTree from DB (will start fresh): {}", e);
-                    tree = MemTree::new_with_dim(dim);
-                } else {
-                    tracing::debug!("Loaded MemTree with {} nodes from disk", tree.size());
+        // Hydrate the MemTree from `tree_nodes`.
+        //
+        // Doing this synchronously blocked startup behind decoding every stored
+        // embedding: on the dogfood host 16,782 nodes at 2048 f32 is 131 MiB,
+        // and the frontend took 3.25 s to first prompt with about 308 MiB
+        // resident (#242). When a Tokio runtime is available the load runs in
+        // the background in bounded batches, so the prompt paints immediately
+        // and memory fills in behind it.
+        //
+        // `next_id` is advanced past the highest stored id BEFORE any batch
+        // lands. Otherwise a turn stored during hydration could be given an id
+        // that a later batch then overwrites.
+        let node_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
+            .unwrap_or(0);
+        let max_node_id: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(node_id), 0) FROM tree_nodes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        tree.set_next_id(max_node_id as u64 + 1);
+
+        let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
+        let db = Arc::new(Mutex::new(conn));
+        let tree = Arc::new(Mutex::new(tree));
+
+        if node_count > 0 {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let db = Arc::clone(&db);
+                    let tree = Arc::clone(&tree);
+                    let state = Arc::clone(&hydration);
+                    handle.spawn(async move {
+                        Self::hydrate_in_background(db, tree, state).await;
+                    });
+                }
+                Err(_) => {
+                    // No runtime: tests and synchronous callers keep the
+                    // original blocking behaviour rather than silently
+                    // starting with an empty index.
+                    let mut guard = tree.blocking_lock();
+                    let conn = db.blocking_lock();
+                    if let Err(error) = Self::load_tree_from_db_conn(&conn, &mut guard) {
+                        tracing::warn!(%error, "Failed to load MemTree (starting fresh)");
+                        hydration.fail(error.to_string());
+                    } else {
+                        hydration
+                            .loaded
+                            .store(guard.size(), std::sync::atomic::Ordering::SeqCst);
+                        hydration.complete();
+                    }
                 }
             }
         }
 
         Ok(Self {
-            db: Arc::new(Mutex::new(conn)),
-            tree: Arc::new(Mutex::new(tree)),
+            db,
+            tree,
+            hydration,
             insert_lock: Arc::new(Mutex::new(())),
             embedding_engine,
             config,
@@ -368,6 +488,9 @@ impl MemorySystem {
         session_id: Option<&str>,
         provenance: Option<&BrainConversationProvenance>,
     ) -> Result<bool> {
+        // A memory placed against a half-loaded tree lands in the wrong part of
+        // the structure, and that placement is persisted.
+        self.ensure_hydrated().await;
         let _insert_guard = self.insert_lock.lock().await;
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
@@ -746,6 +869,127 @@ impl MemorySystem {
     }
 
     /// Reconstruct MemTree from the tree_nodes table at startup.
+    /// Load persisted nodes in bounded batches, releasing both locks between
+    /// each one so an interactive turn is never blocked for long.
+    ///
+    /// Batches are ordered by `node_id`, so a parent may arrive after its
+    /// child. Children are linked in a final pass once every node is present;
+    /// until then the partially hydrated tree is flat, which retrieval handles
+    /// because it scans nodes rather than traversing.
+    async fn hydrate_in_background(
+        db: Arc<Mutex<Connection>>,
+        tree: Arc<Mutex<MemTree>>,
+        state: Arc<HydrationState>,
+    ) {
+        let mut offset = 0usize;
+        loop {
+            let batch = {
+                let conn = db.lock().await;
+                match Self::load_batch(&conn, offset, HYDRATION_BATCH) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        tracing::warn!(%error, "MemTree hydration failed");
+                        state.fail(error.to_string());
+                        return;
+                    }
+                }
+            };
+            if batch.is_empty() {
+                break;
+            }
+
+            let count = batch.len();
+            {
+                let mut guard = tree.lock().await;
+                let nodes = guard.all_nodes_mut();
+                for node in batch {
+                    nodes.insert(node.id, node);
+                }
+            }
+            state.loaded.fetch_add(count, Ordering::SeqCst);
+            offset += count;
+
+            // Yield so a turn submitted mid-hydration is served promptly.
+            tokio::task::yield_now().await;
+        }
+
+        // Link children once every node is present.
+        {
+            let mut guard = tree.lock().await;
+            let parents: Vec<(u64, u64)> = guard
+                .all_nodes()
+                .values()
+                .filter_map(|node| node.parent.map(|parent| (parent, node.id)))
+                .collect();
+            let nodes = guard.all_nodes_mut();
+            for (parent_id, child_id) in parents {
+                if let Some(parent) = nodes.get_mut(&parent_id) {
+                    if !parent.children.contains(&child_id) {
+                        parent.children.push(child_id);
+                    }
+                }
+            }
+            for node in nodes.values_mut() {
+                node.children.sort_unstable();
+            }
+        }
+
+        state.complete();
+    }
+
+    /// One page of persisted nodes, without their child links.
+    fn load_batch(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<TreeNode>> {
+        let mut stmt = conn.prepare(
+            "SELECT node_id, parent_id, text, embedding, level, created_at, importance
+             FROM tree_nodes ORDER BY node_id ASC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+            let embedding: Vec<u8> = row.get(3)?;
+            Ok(TreeNode {
+                id: row.get::<_, i64>(0)? as u64,
+                parent: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
+                children: Vec::new(),
+                text: row.get(2)?,
+                embedding: embedding
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect(),
+                level: row.get::<_, i64>(4)? as usize,
+                created_at: row.get(5)?,
+                importance: row.get::<_, i64>(6).unwrap_or(1).clamp(0, 3) as u8,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Progress of the background hydration, for status surfaces.
+    pub fn hydration_status(&self) -> HydrationStatus {
+        self.hydration.status()
+    }
+
+    /// Wait until every persisted node is in memory.
+    ///
+    /// Writes await this: placing a memory against a partially loaded tree
+    /// would put it in the wrong part of the structure, and that placement is
+    /// durable. Reads deliberately do not — serving the memories loaded so far
+    /// is better than blocking a turn, and `hydration_status` reports when the
+    /// view is partial.
+    pub async fn ensure_hydrated(&self) {
+        let mut rx = self.hydration.done.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            // The value is retained, so a completion between the check above
+            // and this await is observed on the next iteration rather than
+            // lost. An `Err` means the sender is gone, which cannot happen
+            // while `self` holds the state, but returning is the safe read.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     fn load_tree_from_db_conn(conn: &Connection, tree: &mut MemTree) -> Result<()> {
         struct Row {
             node_id: u64,
@@ -1286,6 +1530,233 @@ mod tests {
         assert!(
             MemorySystem::new(fresh_config).is_ok(),
             "a store created by this build must reopen without tripping the guard"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_startup_does_not_block_on_hydration() -> Result<()> {
+        // #242: `MemorySystem::new` decoded every stored embedding before
+        // returning — 131 MiB on the dogfood store, 3.25 s to first prompt.
+        // Construction must return before the index is loaded.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // Populate a store worth hydrating.
+        {
+            let memory = MemorySystem::new(config.clone())?;
+            memory.ensure_hydrated().await;
+            for i in 0..40 {
+                memory
+                    .insert_conversation(
+                        "system",
+                        &format!(
+                            "Deployment note {i}: the signing key for environment \
+                             {i} lives in the Employee vault, not the repository."
+                        ),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+        }
+
+        // Reopen. Construction happens inside a Tokio runtime, so hydration is
+        // backgrounded and the status is observable.
+        let reopened = MemorySystem::new(config)?;
+        let status = reopened.hydration_status();
+        assert!(
+            matches!(status, HydrationStatus::Loading { loaded: 0, .. }),
+            "construction must return BEFORE the index is loaded; got {status:?}"
+        );
+        // `Loading` and not merely "Loading or Ready": accepting `Ready` here
+        // would accept the blocking behaviour this test exists to prevent, and
+        // the test could not fail if the change were reverted.
+        //
+        // Deterministic rather than racy: `#[tokio::test]` runs a
+        // current-thread runtime, so the task spawned inside `new` cannot make
+        // progress until this test awaits, which it has not yet done.
+
+        // And it must complete, with every node present.
+        reopened.ensure_hydrated().await;
+        match reopened.hydration_status() {
+            HydrationStatus::Ready { nodes } => {
+                assert!(nodes >= 40, "every persisted node must load; got {nodes}");
+            }
+            other => panic!("hydration did not complete: {other:?}"),
+        }
+
+        // The rebuilt structure must match what a blocking load produces:
+        // children linked, not a flat list.
+        let linked = {
+            let tree = reopened.tree.lock().await;
+            tree.all_nodes()
+                .values()
+                .filter(|node| !node.children.is_empty())
+                .count()
+        };
+        assert!(
+            linked > 0,
+            "the final pass must link children; a flat tree means the parent \
+             links were dropped"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hydration_does_not_lose_or_overwrite_stored_memories() -> Result<()> {
+        // `next_id` is advanced past `MAX(node_id)` before any batch lands.
+        // Without it a write takes id 1 and `nodes.insert(1, ..)` overwrites
+        // the node already there.
+        //
+        // An earlier version of this test asserted only that the NEW memory was
+        // retrievable afterwards — which passes with `set_next_id` deleted,
+        // because the query finds the new node and the destroyed victim is
+        // never asserted on. Count the nodes instead, and check a specific
+        // earlier memory survives.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let before = {
+            let memory = MemorySystem::new(config.clone())?;
+            memory.ensure_hydrated().await;
+            for i in 0..30 {
+                memory
+                    .insert_conversation(
+                        "system",
+                        &format!(
+                            "Runbook step {i}: restart the daemon and confirm the \
+                             health endpoint answers before proceeding."
+                        ),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+            memory.stats().await?.tree_node_count
+        };
+
+        let reopened = MemorySystem::new(config)?;
+        reopened
+            .insert_conversation(
+                "system",
+                "A memory stored while the index was still loading from disk.",
+                None,
+                None,
+            )
+            .await?;
+        reopened.ensure_hydrated().await;
+
+        assert_eq!(
+            reopened.stats().await?.tree_node_count,
+            before + 1,
+            "the new memory must be added, not written over an existing node"
+        );
+
+        let survivor = reopened
+            .query("Runbook step 7 restart the daemon", Some(5))
+            .await?;
+        assert!(
+            survivor.iter().any(|text| text.contains("Runbook step")),
+            "memories stored before the restart must survive it; got {survivor:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_background_hydration_reproduces_the_blocking_load_exactly() -> Result<()> {
+        // The highest-value property: whatever the background loader builds
+        // must be node-for-node what the blocking loader builds. Batching by
+        // `node_id` means a parent can arrive after its child, so the child
+        // links are rebuilt in a final pass; this is what proves that pass
+        // reconstructs the same structure rather than merely a non-empty one.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        {
+            let memory = MemorySystem::new(config.clone())?;
+            memory.ensure_hydrated().await;
+            for i in 0..40 {
+                memory
+                    .insert_conversation(
+                        "system",
+                        &format!(
+                            "Incident {i}: the provider returned a malformed \
+                             program and the runner recovered without a restart."
+                        ),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+        }
+
+        // Background path.
+        let background = MemorySystem::new(config.clone())?;
+        background.ensure_hydrated().await;
+        let background_nodes = {
+            let tree = background.tree.lock().await;
+            let mut nodes: Vec<(u64, Option<u64>, usize, Vec<u64>, String)> = tree
+                .all_nodes()
+                .values()
+                .map(|node| {
+                    let mut children = node.children.clone();
+                    children.sort_unstable();
+                    (
+                        node.id,
+                        node.parent,
+                        node.level,
+                        children,
+                        node.text.clone(),
+                    )
+                })
+                .collect();
+            nodes.sort_by_key(|entry| entry.0);
+            nodes
+        };
+
+        // Blocking path, built directly from the same database.
+        let blocking_nodes = {
+            let conn = Connection::open(temp.path())?;
+            let mut tree = MemTree::new_with_dim(background.embedding_engine.dimension());
+            MemorySystem::load_tree_from_db_conn(&conn, &mut tree)?;
+            let mut nodes: Vec<(u64, Option<u64>, usize, Vec<u64>, String)> = tree
+                .all_nodes()
+                .values()
+                .map(|node| {
+                    let mut children = node.children.clone();
+                    children.sort_unstable();
+                    (
+                        node.id,
+                        node.parent,
+                        node.level,
+                        children,
+                        node.text.clone(),
+                    )
+                })
+                .collect();
+            nodes.sort_by_key(|entry| entry.0);
+            nodes
+        };
+
+        assert_eq!(
+            background_nodes, blocking_nodes,
+            "background hydration must reproduce the blocking load exactly"
+        );
+        assert!(
+            background_nodes.len() > 1,
+            "the comparison is only meaningful on a populated store"
         );
 
         Ok(())
