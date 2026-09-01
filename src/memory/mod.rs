@@ -482,8 +482,11 @@ impl MemorySystem {
                     // would leave a structurally corrupt store looking like a
                     // transient I/O problem.
                     if let Err(reload_error) = self.reload_tree_from_db().await {
+                        // `?`, not `%`: `Display` on an `anyhow::Error` prints
+                        // only the outermost message and drops the source chain,
+                        // which is where a restore failure's actual cause lives.
                         tracing::error!(
-                            %reload_error,
+                            ?reload_error,
                             "could not restore the MemTree after a failed insert; \
                              the in-memory index is inconsistent until restart"
                         );
@@ -504,7 +507,18 @@ impl MemorySystem {
                 // mutated the in-memory tree. Rebuild it from the durable
                 // snapshot before returning so a retry cannot add a duplicate
                 // semantic leaf for the same canonical turn.
-                self.reload_tree_from_db().await?;
+                //
+                // The reload's own failure is logged rather than returned, for
+                // the same reason as the branch above: replacing the error the
+                // caller actually needs with a second, coincidental one hides
+                // what went wrong.
+                if let Err(reload_error) = self.reload_tree_from_db().await {
+                    tracing::error!(
+                        ?reload_error,
+                        "could not restore the MemTree after a failed save; the \
+                         in-memory index is inconsistent until restart"
+                    );
+                }
                 return Err(error);
             }
         } else {
