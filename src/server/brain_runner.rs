@@ -1194,7 +1194,9 @@ pub enum RunnerProjectionError {
     /// The runner is absent, stale, or gone. Every later projection in the
     /// same pass fails identically.
     Unavailable(anyhow::Error),
-    /// The runner was reached and declined this specific turn.
+    /// The runner was reached and replied with an error of its own. Usually
+    /// about this one turn — see the caveat on the enum above for when it is
+    /// not.
     Rejected(String),
 }
 

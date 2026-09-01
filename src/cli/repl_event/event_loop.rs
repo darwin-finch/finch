@@ -8806,12 +8806,23 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    /// Every systemic condition the runner can report must reach the broker as
-    /// `Unavailable`, not as a per-turn rejection.
+    /// Every systemic condition this runner can report must declare itself with
+    /// `RUNNER_UNAVAILABLE_PREFIX`, so a replay pass aborts instead of paying a
+    /// round trip per completed run. #254.
     ///
-    /// The round trip, not a literal: the errors come from the production guard
-    /// and are classified by the production `try_project_memory` path, so
-    /// dropping the prefix from either half fails here. #254.
+    /// Be exact about what this reaches. It calls the production guard and
+    /// asserts on the string that guard produces, so dropping the prefix from
+    /// the guard fails it. It does **not** reach the broker: nothing here calls
+    /// `try_project_memory`, and deleting the consumer-side `strip_prefix`
+    /// would leave this green. The consumer is pinned separately by
+    /// `replay_aborts_when_the_runner_declares_a_systemic_condition`, and the
+    /// other producer by
+    /// `broken_runner_connection_declares_itself_unavailable_to_memory_replay`,
+    /// which does traverse the real forwarding path.
+    ///
+    /// A full round trip would need an `EventLoop`, and nothing in the
+    /// repository constructs one outside production — which is why the guard
+    /// was extracted at all.
     #[test]
     fn runner_declines_to_project_memory_with_the_systemic_prefix() {
         use crate::server::RUNNER_UNAVAILABLE_PREFIX;

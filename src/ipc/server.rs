@@ -2234,15 +2234,17 @@ async fn forward_runner_request(
                         crate::server::RUNNER_UNAVAILABLE_PREFIX
                     )),
                 },
-                // The call did not complete at all. Almost always the
-                // connection: a disconnect, a shutdown, an unimplemented
-                // capability — all of which repeat identically for every later
-                // run. It also catches errors the frontend raises for this one
-                // request, which today is only a malformed brain/run id; those
-                // cannot occur, because `project_memory` is handed typed
-                // `BrainId`/`RunId` values that always render as valid UUIDs.
-                // If a per-request failure mode is ever added here, classify it
-                // rather than letting it abort a whole replay pass.
+                // The call did not complete at all. That covers the transport
+                // — a disconnect, a shutdown, an unimplemented capability — and
+                // also every `Promise::err` the frontend raises in
+                // `ipc/client.rs`: a params decode failure, a stopped event
+                // loop, a dropped response. All of those repeat identically for
+                // every later run, so classifying the whole arm as systemic is
+                // right today. The one per-request error in that set, a
+                // malformed brain/run id, cannot occur — `project_memory` is
+                // handed typed `BrainId`/`RunId` values that always render as
+                // valid UUIDs. If a per-request failure mode is ever added
+                // here, classify it rather than letting it abort a whole pass.
                 Err(error) => Err(format!(
                     "{}{error}",
                     crate::server::RUNNER_UNAVAILABLE_PREFIX
