@@ -4,7 +4,7 @@ version = "0.7.30"
 edition = "2021"
 default-run = "finch"
 authors = ["Darwin Finch Contributors"]
-description = "AI that evolves with your code - distributed assistant with hierarchical memory"
+description = "Experimental terminal coding assistant with provider-backed chat, typed programs, and named Brains"
 license = "LicenseRef-PolyForm-Noncommercial-1.0"
 repository = "https://github.com/darwin-finch/finch"
 

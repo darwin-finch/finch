@@ -42,6 +42,14 @@ STALE_CLAIMS = {
         "stale installer path"
     ),
     r"gpt-5\.6": "unverified model claim",
+    r"hierarchical memory": (
+        "memory capability claim unsupported by #250: retrieval does not use "
+        "the tree and parents hold a provisional label, not a summary"
+    ),
+    r"MemTree ANN": (
+        "MemTree::retrieve is a linear scan over every node, not an "
+        "approximate-nearest-neighbour index"
+    ),
     r"model\s*=\s*\"(?:gpt|claude|grok|gemini|mistral|qwen|llama|phi|deepseek)[^\"]*\"": (
         "fixed provider model string"
     ),
@@ -127,6 +135,17 @@ def main() -> int:
         combined += f"\n{text}"
         errors.extend(check_links(document, text))
         errors.extend(check_shell_fences(document, text))
+
+    # The package description is published to package indexes and mirrored far
+    # more widely than any document here, so it is held to the same standard.
+    manifest = ROOT / "Cargo.toml"
+    if manifest.is_file():
+        for line in manifest.read_text().splitlines():
+            if line.startswith("description"):
+                combined += f"\n{line}"
+                break
+    else:
+        errors.append("missing Cargo.toml")
 
     for pattern, description in STALE_CLAIMS.items():
         if re.search(pattern, combined, flags=re.IGNORECASE):
