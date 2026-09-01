@@ -89,6 +89,33 @@ struct HydrationState {
     failure: std::sync::Mutex<Option<String>>,
 }
 
+/// Opens the write gate if the loader ends without finishing.
+///
+/// Moved into the spawned future, so it is dropped however that future ends: a
+/// panic unwinding through it, an `abort()`, or a runtime shutting down before
+/// the task is ever polled. Without it those three cases left `done` false
+/// forever — and because the `watch::Sender` lives inside the
+/// `Arc<HydrationState>` that `MemorySystem` holds, it is never dropped either,
+/// so `changed()` does not even return `Err`. Every subsequent write waited on
+/// a completion that could not arrive, with no timeout and no error.
+///
+/// A guard rather than awaiting the `JoinHandle` in a supervisor task, because
+/// a supervisor is one more thing that can itself be dropped. This cannot be
+/// forgotten: it is owned by the future whose ending it reports.
+struct HydrationGuard(Arc<HydrationState>);
+
+impl Drop for HydrationGuard {
+    fn drop(&mut self) {
+        if !*self.0.done.borrow() {
+            self.0.fail(
+                "the MemTree loader ended without finishing: it panicked, was \
+                 aborted, or its runtime shut down before it could run"
+                    .to_string(),
+            );
+        }
+    }
+}
+
 impl HydrationState {
     fn new(total: usize) -> Self {
         Self {
@@ -139,6 +166,18 @@ impl HydrationState {
     }
 }
 
+/// How long a write waits for the index before refusing.
+///
+/// Waiting at all is right: placing a memory against a partial tree puts it in
+/// the wrong part of the structure and that placement is durable. Waiting
+/// forever is not — it is indistinguishable from a hung process, and #242's
+/// gate had no bound.
+///
+/// The dogfood store's 16,782 nodes load in about 3.25 s, so this is roughly an
+/// order of magnitude of headroom. Its expiry means something is wrong, not
+/// that the store is large.
+const HYDRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Nodes hydrated per batch. Small enough that the tree and database locks are
 /// released frequently, so an interactive turn never waits on one long hold.
 const HYDRATION_BATCH: usize = 512;
@@ -154,6 +193,20 @@ pub struct MemorySystem {
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
     hydration: Arc<HydrationState>,
+    /// Owned so the loader does not outlive the store it is loading.
+    ///
+    /// A discarded handle left the task decoding the whole database into a tree
+    /// nobody would read, holding its connection and contending for the mutex
+    /// with whatever opened the store next.
+    hydration_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MemorySystem {
+    fn drop(&mut self) {
+        if let Some(task) = self.hydration_task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Canonical source identity for a conversation pair projected from one
@@ -414,6 +467,7 @@ impl MemorySystem {
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
         let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
+        let mut hydration_task = None;
 
         if node_count > 0 {
             match tokio::runtime::Handle::try_current() {
@@ -421,9 +475,19 @@ impl MemorySystem {
                     let db = Arc::clone(&db);
                     let tree = Arc::clone(&tree);
                     let state = Arc::clone(&hydration);
-                    handle.spawn(async move {
+                    // Constructed HERE, outside the async block, and moved in.
+                    //
+                    // Building it inside the block means it does not exist
+                    // until the future is first polled — so a task aborted or
+                    // dropped before it ever runs never creates the guard and
+                    // never drops it, which is precisely the "never scheduled"
+                    // case this is for. Capturing it makes it part of the
+                    // future from the moment the future exists.
+                    let guard = HydrationGuard(Arc::clone(&state));
+                    hydration_task = Some(handle.spawn(async move {
+                        let _guard = guard;
                         Self::hydrate_in_background(db, tree, state).await;
-                    });
+                    }));
                 }
                 Err(_) => {
                     // No runtime: tests and synchronous callers keep the
@@ -451,6 +515,7 @@ impl MemorySystem {
             db,
             tree,
             hydration,
+            hydration_task,
             insert_lock: Arc::new(Mutex::new(())),
             embedding_engine,
             config,
@@ -509,7 +574,7 @@ impl MemorySystem {
     ) -> Result<bool> {
         // A memory placed against a half-loaded tree lands in the wrong part of
         // the structure, and that placement is persisted.
-        self.ensure_hydrated().await;
+        self.ensure_hydrated().await?;
         let _insert_guard = self.insert_lock.lock().await;
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
@@ -1188,20 +1253,61 @@ impl MemorySystem {
     /// durable. Reads deliberately do not — serving the memories loaded so far
     /// is better than blocking a turn, and `hydration_status` reports when the
     /// view is partial.
-    pub async fn ensure_hydrated(&self) {
-        let mut rx = self.hydration.done.subscribe();
-        loop {
-            if *rx.borrow_and_update() {
-                return;
+    pub async fn ensure_hydrated(&self) -> Result<()> {
+        let wait = async {
+            let mut rx = self.hydration.done.subscribe();
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                // The value is retained, so a completion between the check
+                // above and this await is observed on the next iteration
+                // rather than lost. An `Err` means the sender is gone, which
+                // cannot happen while `self` holds the state, but returning is
+                // the safe read.
+                if rx.changed().await.is_err() {
+                    return;
+                }
             }
-            // The value is retained, so a completion between the check above
-            // and this await is observed on the next iteration rather than
-            // lost. An `Err` means the sender is gone, which cannot happen
-            // while `self` holds the state, but returning is the safe read.
-            if rx.changed().await.is_err() {
-                return;
+        };
+
+        if tokio::time::timeout(HYDRATION_WAIT, wait).await.is_ok() {
+            // Opening the gate is not the same as the index being usable.
+            // `fail` completes, so a hydration that ended badly releases every
+            // waiter — and until now they went on to write into whatever had
+            // loaded, which is the durable misplacement the gate exists to
+            // prevent, reached by a different route.
+            //
+            // #242 accepted that deliberately, because the only alternative
+            // then was waiting forever. Refusing is expressible now, so a write
+            // against a failed index is refused with the recorded reason. Reads
+            // stay ungated and still serve what loaded, which is why the
+            // failure path keeps linking children first.
+            if let HydrationStatus::Failed { reason } = self.hydration.status() {
+                anyhow::bail!("MemTree hydration failed, so this write cannot be placed: {reason}");
             }
+            return Ok(());
         }
+
+        // Bounded, because an unbounded wait here is indistinguishable from a
+        // hung process. The `HydrationGuard` covers a loader that ends without
+        // finishing; this covers one that never gets to run at all — most
+        // reachably on a current-thread runtime, where `block_on_host` blocks
+        // the only scheduler thread the loader could be polled on, so the task
+        // exists and can never make progress.
+        //
+        // Failing the state rather than only returning an error: the condition
+        // is permanent for this process, so every later write should get the
+        // same diagnosis immediately instead of paying the timeout again.
+        let reason = format!(
+            "MemTree hydration did not finish within {}s. The loader was spawned \
+             but did not complete; on a current-thread runtime it cannot be \
+             polled while a blocking call holds the scheduler thread.",
+            HYDRATION_WAIT.as_secs()
+        );
+        tracing::error!(%reason, "refusing a write rather than waiting indefinitely");
+        self.hydration.fail(reason.clone());
+        anyhow::bail!(reason)
     }
 
     fn load_tree_from_db_conn(conn: &Connection, tree: &mut MemTree) -> Result<()> {
@@ -1763,7 +1869,7 @@ mod tests {
         // Populate a store worth hydrating.
         {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..40 {
                 memory
                     .insert_conversation(
@@ -1796,7 +1902,7 @@ mod tests {
         // progress until this test awaits, which it has not yet done.
 
         // And it must complete, with every node present.
-        reopened.ensure_hydrated().await;
+        reopened.ensure_hydrated().await?;
         match reopened.hydration_status() {
             HydrationStatus::Ready { nodes } => {
                 assert!(nodes >= 40, "every persisted node must load; got {nodes}");
@@ -1876,7 +1982,7 @@ mod tests {
     async fn write_after_hydration_completes(config: MemoryConfig) -> Result<()> {
         {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..40 {
                 memory
                     .insert_conversation(
@@ -1987,7 +2093,7 @@ mod tests {
         seed_tree_nodes(temp.path(), NODES, &[(5, late_parent)])?;
 
         let memory = MemorySystem::new(config)?;
-        memory.ensure_hydrated().await;
+        memory.ensure_hydrated().await?;
 
         match memory.hydration_status() {
             HydrationStatus::Ready { nodes } => assert_eq!(
@@ -2166,6 +2272,142 @@ mod tests {
         Ok(())
     }
 
+    /// #276. A loader that ends without finishing must open the write gate
+    /// with a diagnosis, not leave it shut forever.
+    ///
+    /// The `watch::Sender` lives inside the `Arc<HydrationState>` that
+    /// `MemorySystem` holds, so it is never dropped and `changed()` never
+    /// returns `Err`. Nothing else would ever have woken a waiter.
+    #[test]
+    fn test_a_loader_that_ends_without_finishing_opens_the_gate_as_failed() {
+        let state = Arc::new(HydrationState::new(100));
+        assert!(
+            matches!(state.status(), HydrationStatus::Loading { .. }),
+            "precondition: the gate starts shut"
+        );
+
+        // However the loader's future ends — panic, abort, runtime shutdown —
+        // the guard it owns is dropped.
+        drop(HydrationGuard(Arc::clone(&state)));
+
+        match state.status() {
+            HydrationStatus::Failed { reason } => assert!(
+                reason.contains("ended without finishing"),
+                "the diagnosis must say the loader stopped early; got {reason:?}"
+            ),
+            other => panic!("the gate must open as failed; got {other:?}"),
+        }
+        assert!(
+            *state.done.borrow(),
+            "a waiter must be released, not left parked on a completion that \
+             cannot arrive"
+        );
+    }
+
+    /// A loader that finished is not overwritten by its own guard dropping.
+    #[test]
+    fn test_the_guard_does_not_disturb_a_loader_that_finished() {
+        let state = Arc::new(HydrationState::new(1));
+        state.loaded.store(1, Ordering::SeqCst);
+        state.complete();
+        drop(HydrationGuard(Arc::clone(&state)));
+        assert!(
+            matches!(state.status(), HydrationStatus::Ready { .. }),
+            "got {:?}",
+            state.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_aborted_loader_releases_a_waiting_write() -> Result<()> {
+        // Aborts the handle `MemorySystem::new` actually spawned, not a task
+        // the test built for itself. An earlier version did the latter, and
+        // removing the guard from the production spawn site then failed
+        // nothing — the test proved the guard type worked while leaving the
+        // one place it has to be installed uncovered.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        // Enough rows that the loader is still working when it is aborted.
+        seed_tree_nodes(temp.path(), 4 * HYDRATION_BATCH as u64, &[])?;
+
+        let memory = MemorySystem::new(config)?;
+        memory
+            .hydration_task
+            .as_ref()
+            .expect("a store with rows must spawn a loader")
+            .abort();
+        // Let the runtime process the cancellation and drop the future.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if !matches!(memory.hydration_status(), HydrationStatus::Loading { .. }) {
+                break;
+            }
+        }
+
+        let error = memory
+            .ensure_hydrated()
+            .await
+            .expect_err("an aborted loader must fail the write, not hang it");
+        assert!(
+            error.to_string().contains("ended without finishing"),
+            "the write must be refused for the reason the guard recorded, not \
+             by the timeout; got {error}"
+        );
+        Ok(())
+    }
+
+    /// The loader exists but can never be polled — a current-thread runtime
+    /// with a blocking call holding the only scheduler thread, which is how
+    /// `block_on_host` reaches `mem-store`. The guard cannot help: the future
+    /// is alive, just never scheduled. The wait must be bounded.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_loader_that_never_runs_refuses_the_write_instead_of_hanging() {
+        let temp = NamedTempFile::new().unwrap();
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config).unwrap();
+        // Shut the gate and leave it shut, with nothing that will ever open it.
+        memory.hydration.done.send_replace(false);
+        memory.hydration.total.store(1_000, Ordering::SeqCst);
+
+        let started = tokio::time::Instant::now();
+        let error = memory
+            .ensure_hydrated()
+            .await
+            .expect_err("a gate that can never open must refuse, not wait");
+        assert!(
+            error.to_string().contains("did not finish within"),
+            "got {error}"
+        );
+        assert!(
+            started.elapsed() >= HYDRATION_WAIT,
+            "it must actually wait the bound before giving up"
+        );
+
+        // The condition is permanent, so the diagnosis is retained rather than
+        // re-timed for every later write.
+        assert!(matches!(
+            memory.hydration_status(),
+            HydrationStatus::Failed { .. }
+        ));
+        let second = tokio::time::Instant::now();
+        memory
+            .ensure_hydrated()
+            .await
+            .expect_err("the second write must be refused too");
+        assert!(
+            second.elapsed() < HYDRATION_WAIT,
+            "a later write must get the recorded diagnosis immediately, not pay \
+             the timeout again"
+        );
+    }
+
     #[tokio::test]
     async fn test_a_read_during_hydration_returns_no_internal_aggregate_nodes() -> Result<()> {
         // Reads are deliberately not gated on hydration — serving what has
@@ -2267,7 +2509,18 @@ mod tests {
         }
 
         let memory = MemorySystem::new(config)?;
-        memory.ensure_hydrated().await;
+        // Returns an error, not `Ok`: a hydration that failed cannot place a
+        // write, so #276 refuses one rather than letting it land in whatever
+        // loaded. What matters for *this* test is that it returns at all — the
+        // gate opened — which is the ordering pinned below.
+        let refused = memory
+            .ensure_hydrated()
+            .await
+            .expect_err("a failed hydration must refuse writes, not accept them");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "got {refused}"
+        );
 
         match memory.hydration_status() {
             HydrationStatus::Failed { .. } => {}
@@ -2439,7 +2692,7 @@ mod tests {
 
         let before = {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..30 {
                 memory
                     .insert_conversation(
@@ -2465,7 +2718,7 @@ mod tests {
                 None,
             )
             .await?;
-        reopened.ensure_hydrated().await;
+        reopened.ensure_hydrated().await?;
 
         assert_eq!(
             reopened.stats().await?.tree_node_count,
@@ -2514,7 +2767,7 @@ mod tests {
         };
         {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..40 {
                 memory
                     .insert_conversation(
@@ -2532,7 +2785,7 @@ mod tests {
 
         // Background path.
         let background = MemorySystem::new(config.clone())?;
-        background.ensure_hydrated().await;
+        background.ensure_hydrated().await?;
         let background_nodes = {
             let tree = background.tree.lock().await;
             let mut nodes: Vec<(u64, Option<u64>, usize, Vec<u64>, String)> = tree
