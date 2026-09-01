@@ -1068,6 +1068,15 @@ pub struct BrainRunnerBroker {
         >,
     >,
     #[cfg(test)]
+    runner_control_finish_response_pause: Arc<
+        Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    >,
+    #[cfg(test)]
     runner_lifecycle_test_counts: Arc<RunnerLifecycleTestCounts>,
 }
 
@@ -1361,6 +1370,8 @@ impl BrainRunnerBroker {
             fence_install_pause: Arc::default(),
             #[cfg(test)]
             teardown_retry_pause: Arc::default(),
+            #[cfg(test)]
+            runner_control_finish_response_pause: Arc::default(),
             #[cfg(test)]
             runner_lifecycle_test_counts: Arc::default(),
         })
@@ -2436,6 +2447,36 @@ impl BrainRunnerBroker {
             .lock()
             .expect("teardown-retry test hook poisoned") = Some((reached_tx, release_rx));
         (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_runner_control_finish_response_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .runner_control_finish_response_pause
+            .lock()
+            .expect("runner-control Finish response test hook poisoned") =
+            Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_runner_control_finish_response_pause_for_test(
+        &self,
+    ) -> Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )> {
+        self.runner_control_finish_response_pause
+            .lock()
+            .expect("runner-control Finish response test hook poisoned")
+            .take()
     }
 
     #[cfg(test)]

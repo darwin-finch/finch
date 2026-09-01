@@ -382,6 +382,20 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
             .transition_subagent_run(&self.brain, run_id, status, detail)
         {
             Ok(run) => {
+                #[cfg(test)]
+                if let Some((committed, release)) = self
+                    .runners
+                    .take_runner_control_finish_response_pause_for_test()
+                {
+                    return Promise::from_future(async move {
+                        let _dispatch = _dispatch;
+                        let _ = committed.send(());
+                        let _ = release.await;
+                        Err(capnp::Error::disconnected(
+                            "test dropped committed subagent Finish response".into(),
+                        ))
+                    });
+                }
                 encode_run(results.get().init_run(), &run);
                 Promise::ok(())
             }
@@ -8286,6 +8300,7 @@ mod tests {
         connection_id: uuid::Uuid,
         shutdown: tokio_util::sync::CancellationToken,
         handler: tokio::task::JoinHandle<anyhow::Result<()>>,
+        lease_id: crate::brain::store::RunnerLeaseId,
         parent_run_id: crate::brain::store::RunId,
         child_run_id: Option<crate::brain::store::RunId>,
     }
@@ -8393,6 +8408,7 @@ mod tests {
                 connection_id,
                 shutdown,
                 handler,
+                lease_id: lease.lease_id,
                 parent_run_id: parent.run_id,
                 child_run_id,
             }
@@ -8412,6 +8428,144 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_registered_subagent_finish_retry_survives_lost_capnp_response() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = RegisteredSubagentControlFixture::new(true).await;
+                let RegisteredSubagentControlFixture {
+                    _temp,
+                    store,
+                    server,
+                    client,
+                    bootstrap,
+                    connection_id: _,
+                    shutdown,
+                    handler,
+                    lease_id,
+                    parent_run_id,
+                    child_run_id,
+                } = fixture;
+                let child_run_id = child_run_id.unwrap();
+                let (committed, response_release) = server
+                    .brain_runners()
+                    .pause_next_runner_control_finish_response_for_test();
+                let control = bootstrap.raw_subagent_control.clone();
+                let mut finish = control.finish_subagent_request();
+                finish.get().set_run_id(&child_run_id.0.to_string());
+                finish
+                    .get()
+                    .set_status(crate::ipc::brain_codec::run_status_to_capnp(
+                        crate::brain::store::BrainRunStatus::Completed,
+                    ));
+                finish.get().set_detail("commit before response loss");
+                let first_finish =
+                    tokio::task::spawn_local(
+                        async move { finish.send().promise.await.map(|_| ()) },
+                    );
+                committed
+                    .await
+                    .expect("Finish did not commit before its response pause");
+                let completed = store.inspect_run("shared", child_run_id).unwrap();
+                assert_eq!(
+                    completed.status,
+                    crate::brain::store::BrainRunStatus::Completed
+                );
+
+                // Drop the real Cap'n Proto response only after observing the
+                // durable commit. The caller therefore cannot distinguish
+                // this success from a request that never committed.
+                response_release.send(()).unwrap();
+                let first_result =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), first_finish)
+                        .await
+                        .expect("lost Finish response did not settle")
+                        .unwrap();
+                assert!(
+                    first_result.is_err(),
+                    "the deliberately lost response arrived"
+                );
+                shutdown.cancel();
+                drop(bootstrap);
+                drop(client);
+                tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+                    .await
+                    .expect("lost-response connection did not tear down")
+                    .unwrap()
+                    .unwrap();
+
+                store
+                    .transition_run(
+                        "shared",
+                        "runner",
+                        parent_run_id,
+                        crate::brain::store::BrainRunStatus::Completed,
+                        None,
+                    )
+                    .unwrap();
+                let replacement_connection = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(replacement_connection, "shared", lease_id)
+                    .unwrap();
+                let replacement_shutdown = tokio_util::sync::CancellationToken::new();
+                let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+                let replacement_server = std::sync::Arc::clone(&server);
+                let handler_shutdown = replacement_shutdown.clone();
+                let replacement_handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_shutdown_for_peer(
+                        server_stream,
+                        replacement_server,
+                        replacement_connection,
+                        handler_shutdown,
+                        crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                    )
+                    .await
+                });
+                let replacement =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                        .await
+                        .unwrap();
+                let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+                let replacement_bootstrap = replacement
+                    .register_brain_runner("shared", lease_id, event_tx)
+                    .await
+                    .unwrap();
+                let before_retry = serde_json::to_vec(&store.snapshot("shared").unwrap()).unwrap();
+                let mut retry = replacement_bootstrap
+                    .raw_subagent_control
+                    .finish_subagent_request();
+                retry.get().set_run_id(&child_run_id.0.to_string());
+                retry
+                    .get()
+                    .set_status(crate::ipc::brain_codec::run_status_to_capnp(
+                        crate::brain::store::BrainRunStatus::Completed,
+                    ));
+                retry.get().set_detail("exact retry after response loss");
+                let reply = retry.send().promise.await.unwrap();
+                let returned =
+                    crate::ipc::brain_codec::decode_run(reply.get().unwrap().get_run().unwrap())
+                        .unwrap();
+                assert_eq!(returned, completed);
+                assert_eq!(
+                    serde_json::to_vec(&store.snapshot("shared").unwrap()).unwrap(),
+                    before_retry,
+                    "the fresh-control Finish retry appended an event or changed the run graph"
+                );
+
+                replacement_shutdown.cancel();
+                drop(replacement_bootstrap);
+                drop(replacement);
+                tokio::time::timeout(std::time::Duration::from_secs(1), replacement_handler)
+                    .await
+                    .expect("replacement control connection did not tear down")
+                    .unwrap()
+                    .unwrap();
+                drop(_temp);
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

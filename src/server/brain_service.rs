@@ -2367,12 +2367,38 @@ mod tests {
             terminal_snapshot,
             "a post-parent-terminal start changed the event log or run graph"
         );
+        let durable_before_reload = {
+            let snapshot = service.snapshot("shared").unwrap();
+            serde_json::to_vec(&(snapshot.events, snapshot.runs)).unwrap()
+        };
 
         drop(service);
         let restarted = make_service();
         assert_eq!(
             restarted.inspect_run("shared", child.run_id).unwrap(),
             completed
+        );
+        let reloaded_snapshot = serde_json::to_vec(&restarted.snapshot("shared").unwrap()).unwrap();
+        let durable_after_reload = {
+            let snapshot = restarted.snapshot("shared").unwrap();
+            serde_json::to_vec(&(snapshot.events, snapshot.runs)).unwrap()
+        };
+        assert_eq!(durable_after_reload, durable_before_reload);
+        assert_eq!(
+            restarted
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("exact retry after store reload".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&restarted.snapshot("shared").unwrap()).unwrap(),
+            reloaded_snapshot,
+            "the reloaded exact Finish retry appended an event"
         );
         assert!(restarted
             .transition_subagent_run(
@@ -2382,6 +2408,11 @@ mod tests {
                 Some("conflicting terminal status".into()),
             )
             .is_err());
+        assert_eq!(
+            serde_json::to_vec(&restarted.snapshot("shared").unwrap()).unwrap(),
+            reloaded_snapshot,
+            "a conflicting reloaded Finish changed the event log or run graph"
+        );
     }
 
     #[tokio::test]
