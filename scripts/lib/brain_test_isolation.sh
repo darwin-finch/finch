@@ -158,14 +158,13 @@ brain_test_isolation_is_active() {
   esac
   [[ -x "$expected_supervisor" ]] || brain_isolation_proof_rejected supervisor-not-executable
   [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || brain_isolation_proof_rejected supervisor-executable-binding
-  # Same reasoning as `verify_supervisor_image` in src/brain/mod.rs: the inode
-  # pair is the fast path, but a legitimate relink allocates a new inode, so a
-  # mismatch falls back to the recorded image digest. Same bytes is the same
-  # program; different bytes is a substitution (#259).
-  if [[ "$(brain_isolation_file_identity "$supervisor_executable")" != "$supervisor_identity" ]]; then
-    actual_supervisor_digest="$(shasum -a 256 "$supervisor_executable" | awk '{print $1}')" || brain_isolation_proof_rejected supervisor-digest-tool
-    [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || brain_isolation_proof_rejected supervisor-executable-substituted
-  fi
+  # Same rule as `verify_supervisor_image` in src/brain/mod.rs: the image digest
+  # is checked always, not only when the inode differs, because an in-place
+  # overwrite keeps the inode. A byte-identical relink is accepted; anything
+  # else is refused (#259).
+  actual_supervisor_digest="$(set -o pipefail; shasum -a 256 "$supervisor_executable" | awk '{print $1}')" || brain_isolation_proof_rejected supervisor-digest-tool
+  [[ "$actual_supervisor_digest" =~ ^[0-9a-f]{64}$ ]] || brain_isolation_proof_rejected supervisor-digest-tool
+  [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || brain_isolation_proof_rejected supervisor-executable-substituted
   if [[ "$(uname -s)" == Darwin ]]; then
     links="$(stat -f '%l' /dev/fd/108)" || return 1
     proof_uid="$(stat -f '%u' /dev/fd/108)" || return 1

@@ -14,28 +14,39 @@ cd "$repo_root"
 # Pin the supervisor image before running anything under it.
 #
 # `finch-test-supervisor` is a workspace binary target, so the supervised
-# `cargo test` can relink it. Cargo replaces a binary by writing a new file and
+# `cargo test` relinks it. Cargo replaces a binary by writing a new file and
 # renaming it into place, which allocates a new inode — and the wrapper proof
-# records the supervisor's inode, so the check fires against the supervisor's
-# own rebuild and reports `supervisor executable identity changed`. That is the
-# same message a genuine substitution produces (#259).
+# records the supervisor's inode, so the check fired against the supervisor's
+# own rebuild and reported `supervisor executable identity changed` (#259).
 #
-# `finch-test-supervisor-pinned` is not a Cargo target name, so nothing ever
-# writes to it. Both `expected_supervisor_executable` in src/brain/mod.rs and
-# the fallback below already preferred it; nothing created it.
+# CI has pinned since the isolation workflow was written
+# (.github/workflows/issue-56-brain-isolation.yml installs both the debug and
+# release copies at 0555). Local runs never did, which is why #259 reproduced
+# only locally. This closes that divergence, using `install -m 0555` so the
+# image the authority check trusts is not left owner-writable, and so a local
+# copy is byte-for-byte the same artifact CI produces.
+#
+# `finch-test-supervisor-pinned` is not a Cargo target name, so nothing writes
+# to it behind the running supervisor.
 built_supervisor="$repo_root/target/debug/finch-test-supervisor"
 pinned_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
 if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
-  cargo build --quiet --bin finch-test-supervisor
-  # Refresh only when the built image actually differs, so repeated runs keep
-  # the same inode and the fast path in `verify_supervisor_image` stays exact.
-  if ! cmp -s "$built_supervisor" "$pinned_supervisor" 2>/dev/null; then
-    # Write beside the target and rename, so a concurrent run never observes a
-    # half-copied supervisor.
+  # Build only when there is nothing usable to pin. Building unconditionally
+  # made every supervised launcher — including ones that run no cargo at all —
+  # fail whenever the workspace did not compile, which is exactly when the
+  # isolation harness is most wanted.
+  if [[ ! -x "$built_supervisor" && ! -x "$pinned_supervisor" ]]; then
+    cargo build --quiet --bin finch-test-supervisor
+  fi
+  if [[ -x "$built_supervisor" ]] && ! cmp -s "$built_supervisor" "$pinned_supervisor" 2>/dev/null; then
+    # Stage beside the target and rename, so a concurrent run never observes a
+    # half-copied supervisor. Refresh only when the bytes differ, so repeated
+    # runs keep the same inode.
     staging="$pinned_supervisor.$$"
-    cp "$built_supervisor" "$staging"
-    chmod +x "$staging"
+    trap 'rm -f "$staging"' EXIT
+    install -m 0555 "$built_supervisor" "$staging"
     mv -f "$staging" "$pinned_supervisor"
+    trap - EXIT
   fi
 fi
 

