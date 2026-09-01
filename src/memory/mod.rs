@@ -58,7 +58,6 @@ impl Default for MemoryConfig {
     }
 }
 
-/// Memory system with MemTree and SQLite storage
 /// Progress of the background MemTree hydration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HydrationStatus {
@@ -100,7 +99,16 @@ impl HydrationState {
     }
 
     fn complete(&self) {
-        let _ = self.done.send(true);
+        // `send_replace`, not `send`. `watch::Sender::send` returns `Err`
+        // WITHOUT storing the value when the receiver count is zero, and the
+        // count is zero here: `watch::channel` returns a `Receiver` that is
+        // dropped immediately, and `ensure_hydrated` only subscribes on demand.
+        // With `send` and a discarded error, completion silently never latched
+        // unless a waiter happened to be parked already — so the first write
+        // after hydration finished hung forever, which is the default sequence
+        // rather than a race. `send_replace` stores the value regardless of
+        // receivers.
+        self.done.send_replace(true);
     }
 
     fn fail(&self, reason: String) {
@@ -134,6 +142,7 @@ impl HydrationState {
 /// released frequently, so an interactive turn never waits on one long hold.
 const HYDRATION_BATCH: usize = 512;
 
+/// Memory system with MemTree and SQLite storage
 pub struct MemorySystem {
     db: Arc<Mutex<Connection>>,
     tree: Arc<Mutex<MemTree>>,
@@ -419,9 +428,12 @@ impl MemorySystem {
                         tracing::warn!(%error, "Failed to load MemTree (starting fresh)");
                         hydration.fail(error.to_string());
                     } else {
+                        // `size()` excludes the root; the background arm
+                        // counts rows, which include it. Count rows on both so
+                        // `Ready { nodes }` means one thing.
                         hydration
                             .loaded
-                            .store(guard.size(), std::sync::atomic::Ordering::SeqCst);
+                            .store(guard.all_nodes().len(), std::sync::atomic::Ordering::SeqCst);
                         hydration.complete();
                     }
                 }
@@ -1608,6 +1620,133 @@ mod tests {
         Ok(())
     }
 
+    /// Wait for background hydration to finish WITHOUT parking a waiter on the
+    /// completion channel.
+    ///
+    /// Every other hydration test here calls `ensure_hydrated`, which
+    /// subscribes — and a live subscriber is exactly what
+    /// `watch::Sender::send` needs in order to store its value. That made the
+    /// whole module blind to a completion that never latched. Polling the
+    /// progress counters instead reproduces the production sequence: hydration
+    /// finishes with nobody listening, and the first later waiter has to
+    /// observe the retained value.
+    async fn await_hydration_without_subscribing(memory: &MemorySystem) {
+        // Phase 1: every stored node counted.
+        //
+        // This alone does NOT mean the loader is done. `loaded` reaches
+        // `total` on the last batch, and the loader then runs the child-linking
+        // pass before calling `complete()`. Returning here would subscribe
+        // *before* completion fired, which is precisely the sequence that hides
+        // the bug — an earlier draft of this test did exactly that and passed
+        // against the broken code.
+        for i in 0..2_500 {
+            match memory.hydration_status() {
+                HydrationStatus::Ready { .. } => break,
+                HydrationStatus::Loading { loaded, total } if total > 0 && loaded >= total => break,
+                HydrationStatus::Loading { .. } => {}
+                HydrationStatus::Failed { reason } => panic!("hydration failed: {reason}"),
+            }
+            assert!(i < 2_499, "hydration never counted every node");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        // Phase 2: the child-linking pass has run. `complete()` is the next
+        // statement after it with no await in between, so observing linked
+        // children means the loader has either already completed or is a few
+        // instructions away. The trailing sleep covers the second case on a
+        // multi-threaded runtime.
+        for i in 0..2_500 {
+            let linked = {
+                let tree = memory.tree.lock().await;
+                tree.all_nodes()
+                    .values()
+                    .any(|node| !node.children.is_empty())
+            };
+            if linked {
+                break;
+            }
+            assert!(i < 2_499, "the loader never linked children");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    async fn write_after_hydration_completes(config: MemoryConfig) -> Result<()> {
+        {
+            let memory = MemorySystem::new(config.clone())?;
+            memory.ensure_hydrated().await;
+            for i in 0..40 {
+                memory
+                    .insert_conversation(
+                        "system",
+                        &format!(
+                            "Rollout note {i}: drain the queue before restarting \
+                             the worker or in-flight jobs are lost."
+                        ),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+        }
+
+        let reopened = MemorySystem::new(config)?;
+        await_hydration_without_subscribing(&reopened).await;
+
+        // The write goes through `ensure_hydrated`. With `send` and a
+        // discarded error the completion above stored nothing, so this awaits
+        // a `changed()` that can never fire.
+        let wrote = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reopened.insert_conversation(
+                "system",
+                "Written after hydration finished with nobody waiting on it.",
+                None,
+                None,
+            ),
+        )
+        .await;
+
+        assert!(
+            wrote.is_ok(),
+            "the first write after hydration completed hung: completion did \
+             not latch, so every later turn waits forever"
+        );
+        wrote.expect("timeout checked above")?;
+
+        assert!(
+            matches!(reopened.hydration_status(), HydrationStatus::Ready { .. }),
+            "completion must be retained for a waiter that arrives after it; \
+             got {:?}",
+            reopened.hydration_status()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_after_hydration_completes_does_not_hang() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        write_after_hydration_completes(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_write_after_hydration_completes_does_not_hang_multi_thread() -> Result<()> {
+        // The current-thread sibling above pins the deterministic case; this
+        // one runs the scheduler production actually uses, where the loader
+        // task and the writing turn are genuinely concurrent.
+        let temp = NamedTempFile::new()?;
+        write_after_hydration_completes(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })
+        .await
+    }
+
     #[tokio::test]
     async fn test_hydration_does_not_lose_or_overwrite_stored_memories() -> Result<()> {
         // `next_id` is advanced past `MAX(node_id)` before any batch lands.
@@ -1661,13 +1800,29 @@ mod tests {
             "the new memory must be added, not written over an existing node"
         );
 
-        let survivor = reopened
-            .query("Runbook step 7 restart the daemon", Some(5))
-            .await?;
-        assert!(
-            survivor.iter().any(|text| text.contains("Runbook step")),
-            "memories stored before the restart must survive it; got {survivor:?}"
-        );
+        // Every seeded memory, not "a memory matching `Runbook step`". An
+        // earlier version searched for the shared prefix, which 29 survivors
+        // still match after `set_next_id` is deleted and one node is
+        // overwritten — so it could not fail. Ranking cannot carry this
+        // assertion either: `TfIdfEmbedding` drops tokens under two characters,
+        // so the single-digit index that distinguishes these memories is not in
+        // the embedding at all and `query` orders them arbitrarily. Scan the
+        // hydrated node set instead.
+        let texts: Vec<String> = {
+            let tree = reopened.tree.lock().await;
+            tree.all_nodes()
+                .values()
+                .map(|node| node.text.clone())
+                .collect()
+        };
+        for i in 0..30 {
+            let needle = format!("Runbook step {i}:");
+            assert!(
+                texts.iter().any(|text| text.contains(&needle)),
+                "every memory stored before the restart must survive it; \
+                 {needle:?} was overwritten"
+            );
+        }
 
         Ok(())
     }
