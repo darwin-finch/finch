@@ -11,18 +11,21 @@ mod openai_handlers;
 pub mod openai_types; // Public for client access
 
 pub use brain_approval::BrainApprovalBroker;
-pub use brain_runner::{
-    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectAuditControl,
-    RunnerEffectAuditReservation, RunnerEffectRecord, RunnerHostEffectOutcome,
-    RunnerHostEffectPermit, RunnerMemoryProjectionRequest, RunnerProgramControlRequest,
-    RunnerProgramError, RunnerProgramInteraction, RunnerProgramRequest, RunnerProgramResult,
-    RunnerProjectionError, RunnerRegistrationId, RunnerRequest, RunnerTurnCommitAck,
-    RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
-    RUNNER_UNAVAILABLE_PREFIX,
-};
 pub(crate) use brain_runner::{
-    RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
-    RunnerHostEffectFinishRequest,
+    BoundedRunnerRequest, ConnectionDispatchAdmission, ConnectionDispatchGuard,
+    RunnerConnectionTeardown, RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
+    RunnerHostEffectFinishRequest, RunnerProcessIdentity,
+};
+pub use brain_runner::{
+    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerDeadlines,
+    RunnerDispatchError, RunnerDispatchFailure, RunnerEffectAuditControl,
+    RunnerEffectAuditReservation, RunnerEffectRecord, RunnerHostEffectOutcome,
+    RunnerHostEffectPermit, RunnerMemoryProjectionRequest, RunnerOperation,
+    RunnerProgramControlRequest, RunnerProgramError, RunnerProgramInteraction,
+    RunnerProgramRequest, RunnerProgramResult, RunnerProjectionError, RunnerRegistrationId,
+    RunnerRequest,
+    RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
+    RunnerTurnRequest, RunnerTurnResult, RUNNER_UNAVAILABLE_PREFIX,
 };
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
@@ -260,7 +263,10 @@ impl AgentServer {
                 machine,
                 Some(state_root.join("brains")),
             ),
-            brain_runners: BrainRunnerBroker::default(),
+            brain_runners: BrainRunnerBroker::with_deadlines_and_quarantine_path(
+                RunnerDeadlines::default(),
+                Some(state_root.join("runner-process-quarantine-v1.json")),
+            )?,
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials,
             mcp_servers: std::collections::HashMap::new(),
@@ -294,6 +300,23 @@ impl AgentServer {
         password: String,
         state_root: &std::path::Path,
     ) -> Result<Self> {
+        Self::for_brain_protocol_test_with_runner_deadlines(
+            store,
+            credentials,
+            password,
+            state_root,
+            RunnerDeadlines::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_brain_protocol_test_with_runner_deadlines(
+        store: crate::brain::store::BrainStore,
+        credentials: crate::brain::credential::BrainCredentialAuthority,
+        password: String,
+        state_root: &std::path::Path,
+        runner_deadlines: RunnerDeadlines,
+    ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
         let bootstrap_loader = Arc::new(BootstrapLoader::new(generator_state.clone(), None));
         Ok(Self {
@@ -312,7 +335,10 @@ impl AgentServer {
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
             brain_store: store,
-            brain_runners: BrainRunnerBroker::default(),
+            brain_runners: BrainRunnerBroker::with_deadlines_and_quarantine_path(
+                runner_deadlines,
+                Some(state_root.join("runner-process-quarantine-v1.json")),
+            )?,
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials: credentials,
             mcp_servers: std::collections::HashMap::new(),
@@ -383,7 +409,10 @@ impl AgentServer {
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::new()?),
             brain_store: crate::brain::store::BrainStore::new(machine),
-            brain_runners: BrainRunnerBroker::default(),
+            brain_runners: BrainRunnerBroker::with_deadlines_and_quarantine_path(
+                RunnerDeadlines::default(),
+                Some(credential_state.join("runner-process-quarantine-v1.json")),
+            )?,
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials,
             mcp_servers,

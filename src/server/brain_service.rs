@@ -194,7 +194,7 @@ impl BrainLifecycleService {
         detail: Option<String>,
     ) -> Result<BrainRun> {
         let parent = self.store.inspect_run(brain, parent_run_id)?;
-        let run = self.store.start_run_with_parent_id(
+        let run = self.store.start_run_with_active_parent_id(
             brain,
             &parent.initiated_by,
             RunId(task_id),
@@ -202,7 +202,7 @@ impl BrainLifecycleService {
             parent.request_seq,
             parent.initiating_attachment_id,
             BrainRunStatus::Running,
-            Some(parent_run_id),
+            parent_run_id,
             detail,
         )?;
         Ok(run)
@@ -224,11 +224,8 @@ impl BrainLifecycleService {
             ),
             "runner may only publish a terminal subagent status"
         );
-        if run.status == status {
-            return Ok(run);
-        }
         self.store
-            .transition_run(brain, "runner", run_id, status, detail)
+            .transition_subagent_run_if_parent_active(brain, "runner", run_id, status, detail)
     }
 
     pub fn inspect_schedule(
@@ -566,7 +563,7 @@ impl BrainLifecycleService {
         for run_id in ordinary {
             let run = self.store.inspect_run(brain, run_id)?;
             let detail = "initiating Brain connection disconnected".to_string();
-            match self.store.terminalize_run_with_result_if_active(
+            let terminalized = match self.store.terminalize_run_with_result_if_active(
                 brain,
                 "daemon",
                 run_id,
@@ -574,18 +571,19 @@ impl BrainLifecycleService {
                 BrainRunStatus::Failed,
                 detail.clone(),
             ) {
-                Ok(Some(_)) => {}
-                Ok(None) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => {
-                    continue;
+                Ok(Some(_)) => true,
+                Ok(None) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => true,
+                Ok(None) => {
+                    self.store.schedule_disconnect_terminalization_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run_id,
+                        run.request_seq,
+                        BrainRunStatus::Failed,
+                        detail,
+                    );
+                    false
                 }
-                Ok(None) => self.store.schedule_disconnect_terminalization_retry(
-                    brain.to_string(),
-                    "daemon".into(),
-                    run_id,
-                    run.request_seq,
-                    BrainRunStatus::Failed,
-                    detail,
-                ),
                 Err(error) => {
                     tracing::error!(brain = %brain, run_id = %run_id.0, %error,
                         "disconnect terminalization deferred to durable retry owner");
@@ -597,8 +595,9 @@ impl BrainLifecycleService {
                         BrainRunStatus::Failed,
                         detail,
                     );
+                    false
                 }
-            }
+            };
             if let Some(lease_id) = runner_lease {
                 if let Err(error) = self
                     .runners
@@ -609,6 +608,15 @@ impl BrainLifecycleService {
                 }
             }
             self.runners.abort_run(brain, run_id);
+            if terminalized {
+                self.runners.retire_run_cancellation(brain, run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    brain.to_string(),
+                    run_id,
+                );
+            }
         }
         // A cancellation reservation is durable authority, not authority
         // owned by the WebSocket command future. Once that exact initiating
@@ -616,16 +624,29 @@ impl BrainLifecycleService {
         // release only waits for that run, even if the runner never replies.
         for run_id in reserved {
             self.runners.abort_run(brain, run_id);
-            match self
+            let terminalized = match self
                 .store
                 .complete_reserved_run_cancellation_on_disconnect(brain, "daemon", run_id)
             {
-                Ok(true) => {}
-                Ok(false) | Err(_) => self.store.schedule_reserved_cancellation_retry(
+                Ok(true) => true,
+                Ok(false) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => true,
+                Ok(false) | Err(_) => {
+                    self.store.schedule_reserved_cancellation_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run_id,
+                    );
+                    false
+                }
+            };
+            if terminalized {
+                self.runners.retire_run_cancellation(brain, run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
                     brain.to_string(),
-                    "daemon".into(),
                     run_id,
-                ),
+                );
             }
         }
         self.store.remove_if_unused(brain)?;
@@ -685,7 +706,7 @@ impl BrainLifecycleService {
         {
             self.runners.fence_run_cancellation(brain, run.run_id);
             let detail = "initiating Brain connection disconnected".to_string();
-            match self.store.terminalize_run_with_result_if_active(
+            let terminalized = match self.store.terminalize_run_with_result_if_active(
                 brain,
                 "daemon",
                 run.run_id,
@@ -693,22 +714,37 @@ impl BrainLifecycleService {
                 BrainRunStatus::Failed,
                 detail.clone(),
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => true,
                 Ok(None)
                     if self
                         .store
                         .inspect_run(brain, run.run_id)
-                        .is_ok_and(|current| current.status.is_terminal()) => {}
-                Ok(None) | Err(_) => self.store.schedule_disconnect_terminalization_retry(
-                    brain.to_string(),
-                    "daemon".into(),
-                    run.run_id,
-                    run.request_seq,
-                    BrainRunStatus::Failed,
-                    detail,
-                ),
-            }
+                        .is_ok_and(|current| current.status.is_terminal()) =>
+                {
+                    true
+                }
+                Ok(None) | Err(_) => {
+                    self.store.schedule_disconnect_terminalization_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run.run_id,
+                        run.request_seq,
+                        BrainRunStatus::Failed,
+                        detail,
+                    );
+                    false
+                }
+            };
             self.runners.abort_run(brain, run.run_id);
+            if terminalized {
+                self.runners.retire_run_cancellation(brain, run.run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    brain.to_string(),
+                    run.run_id,
+                );
+            }
             return Err(BrainSubmissionError::State(error));
         }
         let snapshot = self.snapshot(brain).map_err(BrainSubmissionError::State)?;
@@ -907,43 +943,36 @@ impl BrainLifecycleService {
                 mutation_id,
             )?;
         }
+        self.runners.fence_run_cancellation(&brain, run.run_id);
+        self.store
+            .reserve_run_publication_cancellation(&brain, run.run_id)
+            .await?;
         if matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
         ) || needs_runner_reconciliation
         {
-            self.store
-                .reserve_run_publication_cancellation(&brain, run.run_id)
-                .await?;
+            // Fence dispatch before yielding for the publication gate. If a
+            // queued-run resume already won admission, the exact callback is
+            // cancelled below; if cancellation wins, no provider request can
+            // cross the broker boundary after the durable intent.
             let snapshot = self.snapshot(&brain)?;
-            let lease = match snapshot
+            let lease = snapshot
                 .runner_lease
-                .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis())
-            {
-                Some(lease) => lease,
-                None => {
-                    self.store
-                        .clear_run_cancellation(&brain, run.run_id)
-                        .await?;
-                    anyhow::bail!("named Brain '{brain}' has no live runner");
-                }
-            };
+                .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis());
             // Cancellation at the runner is idempotent by RunId: `false`
             // means the run is already absent there, which reconciles the
-            // durable cancellation intent just as safely as `true`.
-            if let Err(error) = self
-                .runners
-                .cancel_run(&brain, lease.lease_id, run.run_id)
-                .await
-            {
-                let current = self.inspect_run(&brain, run.run_id)?;
-                if current.status == BrainRunStatus::Cancelled {
-                    return Ok(current);
+            // durable cancellation intent just as safely as `true`. A dead,
+            // wedged, or absent runner is not allowed to veto terminal state.
+            if let Some(lease) = lease {
+                if let Err(error) = self
+                    .runners
+                    .cancel_run(&brain, lease.lease_id, run.run_id)
+                    .await
+                {
+                    tracing::warn!(brain = %brain, run_id = %run.run_id.0, %error,
+                        "runner cancellation did not acknowledge before durable terminalization");
                 }
-                self.store
-                    .clear_run_cancellation(&brain, run.run_id)
-                    .await?;
-                return Err(error);
             }
         }
         if let Some(mutation_id) = mutation_id {
@@ -954,41 +983,49 @@ impl BrainLifecycleService {
                 mutation_id,
             )?;
         }
-        let publication = self
+        let detail = "cancelled by initiating driver".to_string();
+        let terminalized = self
             .store
-            .acquire_run_publication(&brain, run.run_id)
-            .await?;
-        let transition = match reserved {
-            Some(_) => self
-                .store
-                .complete_reserved_run_cancellation(&brain, &sender, run.run_id),
-            None => self.store.transition_run(
+            .terminalize_run_with_result_if_active_wait(
                 &brain,
                 &sender,
                 run.run_id,
+                run.request_seq,
                 BrainRunStatus::Cancelled,
-                Some("cancelled by initiating driver".into()),
-            ),
-        };
-        let transitioned = match transition {
-            Ok(run) => Ok(run),
+                detail.clone(),
+            )
+            .await;
+        let transitioned = match terminalized {
+            Ok(_) => self.inspect_run(&brain, run.run_id)?,
             Err(error) => {
-                let current = self.inspect_run(&brain, run.run_id)?;
-                if current.status == BrainRunStatus::Cancelled {
-                    Ok(current)
-                } else {
-                    Err(error)
-                }
+                self.store.schedule_disconnect_terminalization_retry(
+                    brain.clone(),
+                    sender.clone(),
+                    run.run_id,
+                    run.request_seq,
+                    BrainRunStatus::Cancelled,
+                    detail,
+                );
+                // The durable retry owns terminal publication now, but the
+                // admitted callback must still be stopped before this lane
+                // can be reused. Keep the fence until that retry is visibly
+                // terminal and every admitted dispatch has quiesced.
+                self.runners.abort_run(&brain, run.run_id);
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    brain.clone(),
+                    run.run_id,
+                );
+                return Err(error);
             }
         };
-        drop(publication);
-        let transitioned = transitioned?;
         // The runner has acknowledged cancellation and the terminal state is
         // now durable. Release only the daemon-side dispatch wait for this
         // run. `abort_run` does not revoke the runner lease or the detached
         // owner of an already-begun host effect, so that owner can still
         // publish its single authoritative late audit outcome.
         self.runners.abort_run(&brain, run.run_id);
+        self.runners.retire_run_cancellation(&brain, run.run_id);
         if !matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
@@ -1010,6 +1047,11 @@ impl BrainLifecycleService {
             environment == self.store.environment(),
             "runner environment does not match the daemon Brain environment"
         );
+        let previous_lease = self
+            .store
+            .snapshot(brain)?
+            .runner_lease
+            .map(|lease| lease.lease_id);
         let lease = self.store.acquire_runner_lease(
             brain,
             subject,
@@ -1017,12 +1059,15 @@ impl BrainLifecycleService {
             lease_id,
             ttl_ms,
         )?;
+        if let Some(previous_lease) = previous_lease.filter(|id| *id != lease.lease_id) {
+            self.runners.invalidate_lease(brain, previous_lease);
+        }
         self.expire_runner_lease(brain.to_owned(), lease.lease_id, lease.expires_ms);
         Ok(lease)
     }
 
     fn expire_runner_lease(&self, brain: String, lease_id: RunnerLeaseId, expires_ms: u64) {
-        let store = self.store.clone();
+        let service = self.clone();
         tokio::spawn(async move {
             loop {
                 let delay_ms = expires_ms.saturating_sub(crate::brain::store::unix_millis());
@@ -1031,17 +1076,31 @@ impl BrainLifecycleService {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-            if store
-                .expire_runner_lease(&brain, lease_id, crate::brain::store::unix_millis())
-                .is_ok_and(|expired| expired)
-            {
-                let _ = store.remove_if_unused(&brain);
-            }
+            let _ = service.expire_runner_lease_if_due(
+                &brain,
+                lease_id,
+                crate::brain::store::unix_millis(),
+            );
         });
+    }
+
+    pub(crate) fn expire_runner_lease_if_due(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        now_ms: u64,
+    ) -> Result<bool> {
+        if !self.store.expire_runner_lease(brain, lease_id, now_ms)? {
+            return Ok(false);
+        }
+        self.runners.invalidate_lease(brain, lease_id);
+        self.store.remove_if_unused(brain)?;
+        Ok(true)
     }
 
     pub fn release_runner(&self, brain: &str, lease_id: RunnerLeaseId) -> Result<()> {
         self.store.release_runner_lease(brain, lease_id)?;
+        self.runners.invalidate_lease(brain, lease_id);
         self.store.remove_if_unused(brain)?;
         Ok(())
     }
@@ -1121,6 +1180,11 @@ impl BrainLifecycleService {
             environment == self.store.environment(),
             "runner handoff environment does not match the daemon Brain environment"
         );
+        let previous_lease = self
+            .store
+            .snapshot(brain)?
+            .runner_lease
+            .map(|lease| lease.lease_id);
         let lease = self.store.accept_runner_handoff(
             brain,
             target_subject,
@@ -1128,6 +1192,9 @@ impl BrainLifecycleService {
             environment.generation,
             ttl_ms,
         )?;
+        if let Some(previous_lease) = previous_lease.filter(|id| *id != lease.lease_id) {
+            self.runners.invalidate_lease(brain, previous_lease);
+        }
         self.expire_runner_lease(brain.to_owned(), lease.lease_id, lease.expires_ms);
         Ok(lease)
     }
@@ -1758,11 +1825,111 @@ mod tests {
             event.run_id == Some(run_id)
                 && matches!(
                     event.kind,
-                    BrainEventKind::EffectRecorded { .. }
-                        | BrainEventKind::RuntimeCommitted { .. }
-                        | BrainEventKind::Result { .. }
+                    BrainEventKind::EffectRecorded { .. } | BrainEventKind::RuntimeCommitted { .. }
                 )
         }));
+        let results = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.run_id == Some(run_id) && matches!(event.kind, BrainEventKind::Result { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.len(),
+            1,
+            "cancellation must publish one fail-closed Result"
+        );
+        assert!(matches!(
+            &results[0].kind,
+            BrainEventKind::Result {
+                output,
+                error: Some(_),
+                ..
+            } if output.is_empty()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_deadline_terminalizes_even_when_runner_withholds_reply() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+        let runners = BrainRunnerBroker::with_deadlines(crate::server::RunnerDeadlines {
+            program: std::time::Duration::from_secs(60),
+            turn: std::time::Duration::from_secs(60),
+            cancel: std::time::Duration::from_millis(10),
+            project_memory: std::time::Duration::from_secs(60),
+            callback_cleanup: std::time::Duration::from_millis(10),
+        });
+        let service = BrainLifecycleService::new(store, runners, BrainApprovalBroker::default());
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let prompt = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "cancel".into(),
+                },
+            )
+            .unwrap();
+        let run = service
+            .store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                driver.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        let lease = service
+            .acquire_runner(
+                "shared",
+                "runner",
+                service.store.environment(),
+                None,
+                300_000,
+            )
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+        let cancelling = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .cancel_run("shared", driver.attachment_id, connection_id, run.run_id)
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Cancel(cancel) = rx.recv().await.unwrap() else {
+            panic!("expected cancellation callback")
+        };
+
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
+        drop(cancel.response_tx);
+        let cancelled = cancelling.await.unwrap().unwrap();
+        assert_eq!(cancelled.status, BrainRunStatus::Cancelled);
+        let snapshot = service.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == Some(run.run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. })
+                })
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2068,7 +2235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_runs_are_idempotent_and_survive_store_restart() {
+    async fn test_subagent_runs_are_idempotent_and_reject_post_terminal_parent_after_restart() {
         let root = tempfile::tempdir().unwrap().keep();
         let make_service = || {
             BrainLifecycleService::new(
@@ -2153,6 +2320,7 @@ mod tests {
                 .unwrap(),
             completed
         );
+        let terminal_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
         assert_eq!(
             service
                 .transition_subagent_run(
@@ -2164,12 +2332,73 @@ mod tests {
                 .unwrap(),
             completed
         );
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "an exact post-parent-terminal Finish retry appended an event"
+        );
+
+        let error = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Failed,
+                Some("conflicting terminal publication".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inactive Brain run"));
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "a conflicting post-parent-terminal Finish changed the event log or run graph"
+        );
+
+        let error = service
+            .start_subagent_for_run(
+                "shared",
+                parent.run_id,
+                uuid::Uuid::new_v4(),
+                Some("late new child".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inactive Brain run"));
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "a post-parent-terminal start changed the event log or run graph"
+        );
+        let durable_before_reload = {
+            let snapshot = service.snapshot("shared").unwrap();
+            serde_json::to_vec(&(snapshot.events, snapshot.runs)).unwrap()
+        };
 
         drop(service);
         let restarted = make_service();
         assert_eq!(
             restarted.inspect_run("shared", child.run_id).unwrap(),
             completed
+        );
+        let reloaded_snapshot = serde_json::to_vec(&restarted.snapshot("shared").unwrap()).unwrap();
+        let durable_after_reload = {
+            let snapshot = restarted.snapshot("shared").unwrap();
+            serde_json::to_vec(&(snapshot.events, snapshot.runs)).unwrap()
+        };
+        assert_eq!(durable_after_reload, durable_before_reload);
+        assert_eq!(
+            restarted
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("exact retry after store reload".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&restarted.snapshot("shared").unwrap()).unwrap(),
+            reloaded_snapshot,
+            "the reloaded exact Finish retry appended an event"
         );
         assert!(restarted
             .transition_subagent_run(
@@ -2179,6 +2408,125 @@ mod tests {
                 Some("conflicting terminal status".into()),
             )
             .is_err());
+        assert_eq!(
+            serde_json::to_vec(&restarted.snapshot("shared").unwrap()).unwrap(),
+            reloaded_snapshot,
+            "a conflicting reloaded Finish changed the event log or run graph"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subagent_finish_is_idempotent_while_parent_awaits_approval() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let request = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "delegate while approval is pending".into(),
+                },
+            )
+            .unwrap();
+        let parent = service
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                request.seq,
+                driver.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let child = service
+            .start_subagent_for_run(
+                "shared",
+                parent.run_id,
+                uuid::Uuid::new_v4(),
+                Some("approval-independent child".into()),
+            )
+            .unwrap();
+        service
+            .store
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::AwaitingApproval,
+                None,
+            )
+            .unwrap();
+
+        let completed = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Completed,
+                Some("done while approval waits".into()),
+            )
+            .unwrap();
+        let completed_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
+        assert_eq!(
+            service
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("lost-reply retry".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            completed_snapshot,
+            "an exact AwaitingApproval Finish retry appended an event"
+        );
+
+        service
+            .store
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::Failed,
+                None,
+            )
+            .unwrap();
+        let terminal_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
+        assert_eq!(
+            service
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("retry after parent terminal".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot
+        );
+        let error = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Cancelled,
+                Some("conflicting late finish".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inactive Brain run"));
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "a conflicting post-terminal Finish changed the event log or run graph"
+        );
     }
 
     #[tokio::test]
@@ -2514,6 +2862,104 @@ mod tests {
             service.snapshot("shared").unwrap().runner_lease,
             Some(replacement)
         );
+    }
+
+    #[tokio::test]
+    async fn test_lease_expiry_cancels_the_exact_callback_and_allows_a_fresh_generation() {
+        let service = service();
+        let _driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let expired = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", expired.lease_id, tx);
+        let dispatch_runners = service.runners.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_runners
+                .dispatch_program(
+                    "shared",
+                    expired.lease_id,
+                    run_id,
+                    1,
+                    ProgramLanguage::Lisp,
+                    "stuck".into(),
+                    crate::server::RunnerProgramInteraction::Interactive,
+                    None,
+                )
+                .await
+        });
+        let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+            panic!("expected running callback")
+        };
+
+        assert!(service
+            .expire_runner_lease_if_due("shared", expired.lease_id, expired.expires_ms)
+            .unwrap());
+        tokio::task::yield_now().await;
+        assert!(
+            !dispatch.is_finished(),
+            "lease invalidation must retain the lane until the stale callback settles"
+        );
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let late = request
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: "late".into(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: Vec::new(),
+            }));
+        assert!(
+            late.is_err(),
+            "lease invalidation must observably close the compatible response receiver"
+        );
+        let error = dispatch.await.unwrap().unwrap_err();
+        let error = error
+            .downcast_ref::<crate::server::RunnerDispatchError>()
+            .expect("lease expiry must preserve typed runner failure");
+        assert_eq!(
+            error.failure,
+            crate::server::RunnerDispatchFailure::GenerationInvalidated
+        );
+        let replacement = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        assert_ne!(replacement.lease_id, expired.lease_id);
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::unbounded_channel();
+        let replacement_id =
+            service
+                .runners
+                .register("shared", replacement.lease_id, replacement_tx);
+        assert!(
+            !service
+                .runners
+                .has_registration("shared", replacement.lease_id),
+            "replacement must remain pending while the compatible callback channel is live"
+        );
+        drop(rx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service
+                .runners
+                .wait_registration_active("shared", replacement_id),
+        )
+        .await
+        .expect("replacement did not activate after physical compatible-channel settlement")
+        .unwrap();
+        assert!(!service.runners.invalidate_lease("shared", expired.lease_id));
+        assert!(service
+            .runners
+            .has_registration("shared", replacement.lease_id));
     }
 
     #[tokio::test]

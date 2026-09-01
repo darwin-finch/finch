@@ -65,6 +65,10 @@ pub struct QueryMetadata {
     /// Cancellation token for this query
     pub cancellation_token: CancellationToken,
 
+    /// Provider futures which must be dropped before a cancelled Brain lane
+    /// can be reused by a replacement query.
+    cancellation_work: Arc<QueryCancellationWork>,
+
     /// Completed provider identity/accounting retained until a named-Brain
     /// turn crosses its durable daemon commit boundary.
     pub invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
@@ -80,6 +84,51 @@ pub struct QueryMetadata {
     /// publishes the correlated Result, EventLoop folds this into the run
     /// group and removes the transient unit without losing live updates.
     pub brain_output_work_unit: Option<Arc<WorkUnit>>,
+}
+
+#[derive(Debug)]
+struct QueryCancellationWork {
+    active: tokio::sync::watch::Sender<usize>,
+}
+
+impl Default for QueryCancellationWork {
+    fn default() -> Self {
+        let (active, _) = tokio::sync::watch::channel(0);
+        Self { active }
+    }
+}
+
+/// RAII proof that one provider future still owns query-scoped work.
+#[derive(Debug)]
+pub struct QueryWorkGuard {
+    work: Arc<QueryCancellationWork>,
+}
+
+/// Stable cancellation fence captured before query metadata can be cleaned up.
+#[derive(Debug, Clone)]
+pub struct QueryWorkBarrier {
+    active: tokio::sync::watch::Receiver<usize>,
+}
+
+impl QueryWorkBarrier {
+    /// Wait until every registered provider future for this query is gone.
+    pub async fn wait(mut self) {
+        while *self.active.borrow_and_update() != 0 {
+            if self.active.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for QueryWorkGuard {
+    fn drop(&mut self) {
+        self.work.active.send_modify(|active| {
+            *active = active
+                .checked_sub(1)
+                .expect("query work guard count underflow");
+        });
+    }
 }
 
 /// Manages state for all in-flight queries
@@ -105,6 +154,7 @@ impl QueryStateManager {
             brain_turn_provenance: None,
             effect_audit: None,
             cancellation_token: CancellationToken::new(),
+            cancellation_work: Arc::new(QueryCancellationWork::default()),
             invocation_metadata: None,
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
@@ -113,6 +163,41 @@ impl QueryStateManager {
 
         self.states.write().await.insert(id, metadata);
         id
+    }
+
+    /// Register one provider future unless cancellation already won. The
+    /// post-increment recheck closes the race between registration and cancel.
+    pub async fn begin_cancellation_sensitive_work(
+        &self,
+        query_id: Uuid,
+    ) -> Option<QueryWorkGuard> {
+        let metadata = self.states.read().await.get(&query_id).cloned()?;
+        if metadata.cancellation_token.is_cancelled() {
+            return None;
+        }
+        metadata
+            .cancellation_work
+            .active
+            .send_modify(|active| *active += 1);
+        let guard = QueryWorkGuard {
+            work: Arc::clone(&metadata.cancellation_work),
+        };
+        if metadata.cancellation_token.is_cancelled() {
+            drop(guard);
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Capture the exact query's provider-work fence before cancellation.
+    pub async fn cancellation_barrier(&self, query_id: Uuid) -> Option<QueryWorkBarrier> {
+        self.states
+            .read()
+            .await
+            .get(&query_id)
+            .map(|metadata| QueryWorkBarrier {
+                active: metadata.cancellation_work.active.subscribe(),
+            })
     }
 
     /// Bind the query to its durable Brain/run before provider dispatch.
@@ -523,6 +608,42 @@ mod tests {
             token.is_cancelled(),
             "token should be cancelled after cancel_query()"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_barrier_waits_for_exact_provider_work() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let work = manager
+            .begin_cancellation_sensitive_work(id)
+            .await
+            .expect("active query accepts provider work");
+        let barrier = manager
+            .cancellation_barrier(id)
+            .await
+            .expect("query has a cancellation barrier");
+
+        assert!(manager.cancel_query(id).await);
+        assert!(
+            manager
+                .begin_cancellation_sensitive_work(id)
+                .await
+                .is_none(),
+            "cancelled query must reject replacement provider work"
+        );
+
+        let waiter = tokio::spawn(barrier.wait());
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "lane fence must remain closed while provider work is alive"
+        );
+
+        drop(work);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("barrier must open when provider work is dropped")
+            .expect("barrier task must not panic");
     }
 
     #[tokio::test]

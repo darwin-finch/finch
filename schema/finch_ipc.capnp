@@ -954,6 +954,12 @@ interface BrainRunner {
   # aborts the pass on it instead of walking the remaining runs. Any other
   # message is per-turn. See RUNNER_UNAVAILABLE_PREFIX in src/server/brain_runner.rs.
   projectMemory @3 (request :BrainMemoryProjectionRequest) -> (inserted :UInt32, error :Text);
+  # Cancels and waits for one memory projection's frontend insertion future.
+  # The reply is the physical-quiescence acknowledgement for that exact run.
+  cancelMemory @4 (brain :Text, runId :Text) -> ();
+  # Explicit fail-closed notification issued before the daemon ejects a
+  # non-quiescent runner transport. Generic EOF is not an ejection signal.
+  ejectProcess @5 (reason :Text) -> ();
 }
 
 # Long-lived reverse capability bound to the exact registered runner lease.
@@ -1601,7 +1607,8 @@ interface FinchDaemon {
   # Register the callback belonging to the frontend's current runner lease.
   # The durable reducible VM state is returned so a restarted frontend can
   # hydrate before accepting work. Host authority is deliberately absent.
-  registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
+  registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner,
+                          processEpoch :Text)
       -> (runtimeRevision :UInt64, checkpoint :TypedRuntimeCheckpoint,
           control :BrainRunnerControl);
 
@@ -1609,4 +1616,9 @@ interface FinchDaemon {
   # capability allows later protocol evolution without adding every Brain
   # operation directly to FinchDaemon.
   brainService @5 () -> (service :BrainService);
+
+  # Return a runner-only lifecycle capability bound to the kernel-derived
+  # PID/start identity of this Unix peer. Creation and each runner operation
+  # fail closed while that identity is quarantined or durably uncertain.
+  runnerBrainService @6 () -> (service :BrainService);
 }

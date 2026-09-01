@@ -5886,6 +5886,7 @@ mod tests {
             else {
                 panic!("target callback received the wrong frontend event")
             };
+            let request = request.request;
             assert_eq!(request.brain, brain);
             assert_eq!(request.source, "(say \"handoff-live\")");
             request

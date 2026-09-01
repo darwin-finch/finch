@@ -30,6 +30,8 @@ pub struct BrainRunnerBootstrap {
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
     pub subagent_control:
         mpsc::UnboundedSender<crate::runtime::scheduler::AgentBrainControlRequest>,
+    #[cfg(test)]
+    pub(crate) raw_subagent_control: brain_runner_control::Client,
 }
 
 pub struct BrainSubmissionResult {
@@ -53,23 +55,125 @@ pub struct IpcClient {
     _rpc_handle: std::rc::Rc<RpcTask>,
 }
 
-struct RpcTask(tokio::task::JoinHandle<()>);
+pub(crate) struct RunnerProcessIdentity {
+    pub(crate) epoch: uuid::Uuid,
+    pub(crate) poisoned: std::sync::atomic::AtomicBool,
+    /// Linearizes explicit process ejection with every runner-scoped
+    /// Cap'n Proto send. The guard is held only through the non-awaiting
+    /// `send()` call, never while its promise is awaited.
+    runner_rpc_admission: std::sync::Mutex<()>,
+    #[cfg(test)]
+    runner_rpc_admission_pause: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+fn new_runner_process_identity(epoch: uuid::Uuid) -> std::sync::Arc<RunnerProcessIdentity> {
+    std::sync::Arc::new(RunnerProcessIdentity {
+        epoch,
+        poisoned: std::sync::atomic::AtomicBool::new(false),
+        runner_rpc_admission: std::sync::Mutex::new(()),
+        #[cfg(test)]
+        runner_rpc_admission_pause: std::sync::Mutex::new(None),
+    })
+}
+
+impl RunnerProcessIdentity {
+    fn with_rpc_admission<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
+        let Ok(_admission) = self.runner_rpc_admission.lock() else {
+            // A panic while this process was admitting a runner RPC leaves
+            // its send ordering unknowable. Make that uncertainty monotonic
+            // and fail closed instead of panicking through the reconnect
+            // supervisor or permitting another lease mutation.
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(anyhow::Error::new(RunnerProcessQuarantined));
+        };
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow::Error::new(RunnerProcessQuarantined));
+        }
+        Ok(send())
+    }
+
+    /// Publish a terminal server rejection in the same total order as every
+    /// runner send. A send already holding admission completes before this
+    /// store; every later sender observes poison and fails locally.
+    fn publish_remote_poison(&self) {
+        self.publish_remote_poison_after_admission(|| {});
+    }
+
+    fn publish_remote_poison_after_admission(&self, admitted: impl FnOnce()) {
+        let _admission = self
+            .runner_rpc_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admitted();
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_rpc_admission_pause_for_test(&self) {
+        let pause = self
+            .runner_rpc_admission_pause
+            .lock()
+            .expect("runner RPC admission pause lock poisoned")
+            .take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+}
+
+fn runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
+    static IDENTITY: std::sync::OnceLock<std::sync::Arc<RunnerProcessIdentity>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(
+        IDENTITY.get_or_init(|| new_runner_process_identity(uuid::Uuid::new_v4())),
+    )
+}
+
+#[cfg(test)]
+fn fresh_runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
+    new_runner_process_identity(uuid::Uuid::new_v4())
+}
+
+struct RpcConnectionState {
+    process: std::sync::Arc<RunnerProcessIdentity>,
+    active_runner_registrations: std::sync::atomic::AtomicUsize,
+}
+
+struct RpcTask {
+    handle: tokio::task::JoinHandle<()>,
+    state: std::sync::Arc<RpcConnectionState>,
+}
 
 impl Drop for RpcTask {
     fn drop(&mut self) {
         // Dropping JoinHandle detaches rather than cancels. Abort when the
         // final IpcClient clone disappears so the daemon observes connection
         // loss and releases connection-scoped identities/callbacks promptly.
-        self.0.abort();
+        self.handle.abort();
     }
 }
 
 impl IpcClient {
     #[cfg(test)]
     pub(crate) fn from_test_client(client: finch_daemon::Client) -> Self {
+        let state = std::sync::Arc::new(RpcConnectionState {
+            process: new_runner_process_identity(uuid::Uuid::new_v4()),
+            active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
+        });
         Self {
             client,
-            _rpc_handle: std::rc::Rc::new(RpcTask(tokio::task::spawn_local(async {}))),
+            _rpc_handle: std::rc::Rc::new(RpcTask {
+                handle: tokio::task::spawn_local(async {}),
+                state,
+            }),
         }
     }
 
@@ -84,13 +188,96 @@ impl IpcClient {
         request.get().set_brain(brain);
         request.get().set_lease_id(&lease_id.0.to_string());
         request.get().set_runner(runner);
+        request
+            .get()
+            .set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
+        self._rpc_handle
+            .state
+            .active_runner_registrations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn explicitly_eject_runner_process_for_test(&self) -> Result<()> {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+            event_tx,
+            memory_callbacks: Default::default(),
+            process: std::sync::Arc::clone(&self._rpc_handle.state.process),
+        });
+        let mut request = runner.eject_process_request();
+        request
+            .get()
+            .set_reason("deterministic explicit-ejection test boundary");
         request.send().promise.await?;
         Ok(())
+    }
+
+    /// Fail locally before a runner restore performs even a health-check or
+    /// reconnect RPC. Every later runner-scoped send repeats this check under
+    /// the process admission gate to close the check/send race.
+    pub(crate) fn ensure_runner_process_available(&self) -> Result<()> {
+        self._rpc_handle.state.process.with_rpc_admission(|| ())
+    }
+
+    fn send_runner_rpc<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
+        // Cap'n Proto request construction only populates a local builder.
+        // The closure contains the irrevocable `send()` and returns its
+        // promise without polling it, so admission is never held across an
+        // await or re-entered by a response callback.
+        self._rpc_handle.state.process.with_rpc_admission(send)
+    }
+
+    fn observe_runner_rpc_error(&self, error: capnp::Error) -> anyhow::Error {
+        observe_runner_rpc_error_for_process(&self._rpc_handle.state.process, error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_runner_rpc_admission_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            ._rpc_handle
+            .state
+            .process
+            .runner_rpc_admission_pause
+            .lock()
+            .expect("runner RPC admission pause lock poisoned") = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn wait_runner_rpc_admission_pause_for_test(&self) {
+        self._rpc_handle
+            .state
+            .process
+            .wait_rpc_admission_pause_for_test()
+            .await;
     }
 
     /// Connect to the daemon's Unix socket.
     pub async fn connect() -> Result<Self> {
         Self::connect_path(sock_path()).await
+    }
+
+    pub(crate) async fn connect_for_runner() -> Result<Self> {
+        let process = runner_process_identity();
+        process.with_rpc_admission(|| ())?;
+        let path = sock_path();
+        let stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("IPC connect failed: {}", path.display()))?;
+        Self::from_stream_with_runner_process(stream, process).await
     }
 
     /// Connect to an explicitly isolated daemon socket. This is used by the
@@ -104,6 +291,28 @@ impl IpcClient {
     }
 
     pub(crate) async fn from_stream(stream: tokio::net::UnixStream) -> Result<Self> {
+        Self::from_stream_with_process(stream, runner_process_identity()).await
+    }
+
+    async fn from_stream_with_process(
+        stream: tokio::net::UnixStream,
+        process: std::sync::Arc<RunnerProcessIdentity>,
+    ) -> Result<Self> {
+        Self::from_stream_with_process_scope(stream, process, false).await
+    }
+
+    async fn from_stream_with_runner_process(
+        stream: tokio::net::UnixStream,
+        process: std::sync::Arc<RunnerProcessIdentity>,
+    ) -> Result<Self> {
+        Self::from_stream_with_process_scope(stream, process, true).await
+    }
+
+    async fn from_stream_with_process_scope(
+        stream: tokio::net::UnixStream,
+        process: std::sync::Arc<RunnerProcessIdentity>,
+        runner_scoped_verification: bool,
+    ) -> Result<Self> {
         let (reader, writer) = stream.into_split();
         let network = twoparty::VatNetwork::new(
             reader.compat(),
@@ -115,16 +324,71 @@ impl IpcClient {
         let mut rpc_system = RpcSystem::new(Box::new(network), None);
         let client: finch_daemon::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
+        let state = std::sync::Arc::new(RpcConnectionState {
+            process,
+            active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task_state = std::sync::Arc::clone(&state);
         let handle = tokio::task::spawn_local(async move {
             let _ = rpc_system.await;
+            // EOF, including an ordinary daemon restart, is not proof of
+            // forced ejection. Only the explicit callback or a typed durable
+            // registration rejection may poison this process identity.
+            let _ = task_state;
         });
 
         let client = Self {
             client,
-            _rpc_handle: std::rc::Rc::new(RpcTask(handle)),
+            _rpc_handle: std::rc::Rc::new(RpcTask { handle, state }),
         };
-        client.verify_protocol_compatibility().await?;
+        if runner_scoped_verification {
+            client.verify_runner_protocol_compatibility().await?;
+        } else {
+            client.verify_protocol_compatibility().await?;
+        }
         Ok(client)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn from_stream_with_fresh_test_process(
+        stream: tokio::net::UnixStream,
+    ) -> Result<Self> {
+        Self::from_stream_with_process(stream, new_runner_process_identity(uuid::Uuid::new_v4()))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reconnect_test_process(
+        &self,
+        stream: tokio::net::UnixStream,
+    ) -> Result<Self> {
+        Self::from_stream_with_process(
+            stream,
+            std::sync::Arc::clone(&self._rpc_handle.state.process),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_runner_process_poisoned(&self) -> bool {
+        self._rpc_handle
+            .state
+            .process
+            .poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_runner_process_identity(&self) -> std::sync::Arc<RunnerProcessIdentity> {
+        std::sync::Arc::clone(&self._rpc_handle.state.process)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_active_runner_registrations(&self) -> usize {
+        self._rpc_handle
+            .state
+            .active_runner_registrations
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     // -----------------------------------------------------------------------
@@ -212,11 +476,36 @@ impl IpcClient {
         Ok(reply.get()?.get_service()?)
     }
 
+    async fn runner_brain_service(&self) -> Result<brain_service::Client> {
+        #[cfg(test)]
+        self.wait_runner_rpc_admission_pause_for_test().await;
+        let request = self.client.runner_brain_service_request();
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
+        Ok(reply.get()?.get_service()?)
+    }
+
     pub async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::store::BrainSnapshot> {
         let service = self.brain_service().await?;
         let mut request = service.snapshot_request();
         request.get().set_brain(brain);
         let reply = request.send().promise.await?;
+        decode_snapshot(reply.get()?.get_snapshot()?)
+    }
+
+    pub(crate) async fn brain_runner_snapshot(
+        &self,
+        brain: &str,
+    ) -> Result<crate::brain::store::BrainSnapshot> {
+        let service = self.runner_brain_service().await?;
+        let mut request = service.snapshot_request();
+        request.get().set_brain(brain);
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_snapshot(reply.get()?.get_snapshot()?)
     }
 
@@ -532,7 +821,7 @@ impl IpcClient {
         lease_id: Option<crate::brain::store::RunnerLeaseId>,
         ttl_ms: u64,
     ) -> Result<crate::brain::store::BrainRunnerLease> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.acquire_runner_request();
         {
             let mut params = request.get();
@@ -545,15 +834,21 @@ impl IpcClient {
             }
             params.set_ttl_ms(ttl_ms);
         }
-        let reply = request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
     pub async fn brain_claim_runner_identity(&self, subject: &str) -> Result<()> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.claim_runner_identity_request();
         request.get().set_subject(subject);
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         Ok(())
     }
 
@@ -562,14 +857,26 @@ impl IpcClient {
         brain: &str,
         lease_id: crate::brain::store::RunnerLeaseId,
     ) -> Result<()> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.release_runner_request();
         {
             let mut params = request.get();
             params.set_brain(brain);
             params.set_lease_id(&lease_id.0.to_string());
         }
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
+        let _ = self
+            ._rpc_handle
+            .state
+            .active_runner_registrations
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active != 0).then_some(active - 1),
+            );
         Ok(())
     }
 
@@ -582,7 +889,7 @@ impl IpcClient {
         environment: &crate::brain::store::BrainEnvironment,
         ttl_ms: u64,
     ) -> Result<crate::brain::store::BrainRunnerHandoff> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.request_runner_handoff_request();
         {
             let mut params = request.get();
@@ -593,7 +900,10 @@ impl IpcClient {
             encode_environment(params.reborrow().init_environment(), environment);
             params.set_ttl_ms(ttl_ms);
         }
-        let reply = request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_runner_handoff(reply.get()?.get_handoff()?)
     }
 
@@ -605,7 +915,7 @@ impl IpcClient {
         environment: &crate::brain::store::BrainEnvironment,
         ttl_ms: u64,
     ) -> Result<crate::brain::store::BrainRunnerLease> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.accept_runner_handoff_request();
         {
             let mut params = request.get();
@@ -615,7 +925,10 @@ impl IpcClient {
             encode_environment(params.reborrow().init_environment(), environment);
             params.set_ttl_ms(ttl_ms);
         }
-        let reply = request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
@@ -625,7 +938,7 @@ impl IpcClient {
         handoff_id: crate::brain::store::RunnerHandoffId,
         sender: &str,
     ) -> Result<()> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.cancel_runner_handoff_request();
         {
             let mut params = request.get();
@@ -633,7 +946,10 @@ impl IpcClient {
             params.set_handoff_id(&handoff_id.0.to_string());
             params.set_sender(sender);
         }
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         Ok(())
     }
 
@@ -648,10 +964,25 @@ impl IpcClient {
         Ok(response.get_version()?.to_str()?.to_string())
     }
 
+    pub(crate) async fn runner_ping(&self) -> Result<String> {
+        #[cfg(test)]
+        self.wait_runner_rpc_admission_pause_for_test().await;
+        let request = self.client.ping_request();
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await?;
+        let response = reply.get()?;
+        ensure_compatible_protocol(response.get_protocol_version())?;
+        Ok(response.get_version()?.to_str()?.to_string())
+    }
+
     async fn verify_protocol_compatibility(&self) -> Result<()> {
         let req = self.client.ping_request();
         let reply = req.send().promise.await?;
         ensure_compatible_protocol(reply.get()?.get_protocol_version())
+    }
+
+    async fn verify_runner_protocol_compatibility(&self) -> Result<()> {
+        self.runner_ping().await.map(|_| ())
     }
 
     /// Register this frontend as the callback for its current named-Brain
@@ -662,21 +993,35 @@ impl IpcClient {
         lease_id: crate::brain::store::RunnerLeaseId,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
-        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
+        self.ensure_runner_process_available()?;
+        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+            event_tx,
+            memory_callbacks: Default::default(),
+            process: std::sync::Arc::clone(&self._rpc_handle.state.process),
+        });
         let mut request = self.client.register_brain_runner_request();
         {
             let mut params = request.get();
             params.set_brain(brain);
             params.set_lease_id(&lease_id.0.to_string());
             params.set_runner(runner);
+            params.set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
         }
-        let reply = request
-            .send()
-            .promise
+        #[cfg(test)]
+        self.wait_runner_rpc_admission_pause_for_test().await;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
             .await
-            .map_err(map_runner_registration_error)?;
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
+        self._rpc_handle
+            .state
+            .active_runner_registrations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let response = reply.get()?;
         let control: brain_runner_control::Client = response.get_control()?;
+        #[cfg(test)]
+        let raw_subagent_control = control.clone();
+        let control_process = std::sync::Arc::clone(&self._rpc_handle.state.process);
         let (subagent_control, mut subagent_rx) =
             mpsc::unbounded_channel::<crate::runtime::scheduler::AgentBrainControlRequest>();
         tokio::task::spawn_local(async move {
@@ -696,9 +1041,14 @@ impl IpcClient {
                                 params.set_task_id(&task_id.to_string());
                                 params.set_detail(&detail);
                             }
-                            let reply = call.send().promise.await?;
+                            #[cfg(test)]
+                            control_process.wait_rpc_admission_pause_for_test().await;
+                            let promise =
+                                control_process.with_rpc_admission(|| call.send().promise)?;
+                            let reply = promise.await.map_err(|error| {
+                                observe_runner_rpc_error_for_process(&control_process, error)
+                            })?;
                             decode_run(reply.get()?.get_run()?)
-                                .map_err(|error| capnp::Error::failed(error.to_string()))
                         }
                         .await
                         .map_err(|error| error.to_string());
@@ -720,9 +1070,14 @@ impl IpcClient {
                                 ));
                                 params.set_detail(&detail);
                             }
-                            let reply = call.send().promise.await?;
+                            #[cfg(test)]
+                            control_process.wait_rpc_admission_pause_for_test().await;
+                            let promise =
+                                control_process.with_rpc_admission(|| call.send().promise)?;
+                            let reply = promise.await.map_err(|error| {
+                                observe_runner_rpc_error_for_process(&control_process, error)
+                            })?;
                             decode_run(reply.get()?.get_run()?)
-                                .map_err(|error| capnp::Error::failed(error.to_string()))
                         }
                         .await
                         .map_err(|error| error.to_string());
@@ -736,18 +1091,48 @@ impl IpcClient {
             checkpoint: decode_checkpoint(response.get_checkpoint()?)
                 .context("daemon returned an invalid named-Brain checkpoint")?,
             subagent_control,
+            #[cfg(test)]
+            raw_subagent_control,
         })
     }
 }
 
-fn map_runner_registration_error(error: capnp::Error) -> anyhow::Error {
+fn observe_runner_rpc_error_for_process(
+    process: &RunnerProcessIdentity,
+    error: capnp::Error,
+) -> anyhow::Error {
+    let error = map_runner_rpc_error(error);
+    if is_runner_process_quarantined(&error) {
+        process.publish_remote_poison();
+    }
+    error
+}
+
+fn map_runner_rpc_error(error: capnp::Error) -> anyhow::Error {
     if error.kind == capnp::ErrorKind::Unimplemented {
         anyhow::anyhow!(
             "the running Finch daemon uses an older IPC schema; restart the daemon and reconnect"
         )
+    } else if error
+        .to_string()
+        .contains(crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE)
+    {
+        anyhow::Error::new(RunnerProcessQuarantined)
     } else {
         anyhow::Error::new(error)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "runner process was quarantined after forced callback ejection; restart the frontend process"
+)]
+pub(crate) struct RunnerProcessQuarantined;
+
+pub(crate) fn is_runner_process_quarantined(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RunnerProcessQuarantined>().is_some())
 }
 
 fn ensure_compatible_protocol(protocol_version: u32) -> Result<()> {
@@ -764,6 +1149,70 @@ fn ensure_protocol_generation(protocol_version: u32, required_version: u32) -> R
 
 struct BrainRunnerImpl {
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+    memory_callbacks: std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::HashMap<
+                (String, crate::brain::store::RunId),
+                MemoryProjectionLifecycle,
+            >,
+        >,
+    >,
+    process: std::sync::Arc<RunnerProcessIdentity>,
+}
+
+#[derive(Clone)]
+struct MemoryProjectionLifecycle {
+    generation: uuid::Uuid,
+    cancel: tokio_util::sync::CancellationToken,
+    finished: tokio::sync::watch::Receiver<bool>,
+}
+
+struct MemoryProjectionCompletion {
+    memory_callbacks: std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::HashMap<
+                (String, crate::brain::store::RunId),
+                MemoryProjectionLifecycle,
+            >,
+        >,
+    >,
+    lifecycle_key: (String, crate::brain::store::RunId),
+    generation: uuid::Uuid,
+    finished_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for MemoryProjectionCompletion {
+    fn drop(&mut self) {
+        self.finished_tx.send_replace(true);
+        let remove = self
+            .memory_callbacks
+            .borrow()
+            .get(&self.lifecycle_key)
+            .is_some_and(|lifecycle| lifecycle.generation == self.generation);
+        if remove {
+            self.memory_callbacks
+                .borrow_mut()
+                .remove(&self.lifecycle_key);
+        }
+    }
+}
+
+fn required_runner_text(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+    field: &str,
+) -> capnp::Result<String> {
+    let value = value?;
+    let value = value.to_str().map_err(|error| {
+        capnp::Error::failed(format!(
+            "runner request text field '{field}' is not valid UTF-8: {error}"
+        ))
+    })?;
+    if value.is_empty() {
+        return Err(capnp::Error::failed(format!(
+            "runner request is missing required text field '{field}'"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 fn effect_audit_reservation_proxy(
@@ -910,6 +1359,32 @@ struct BrainTurnCommitAckImpl {
     tx: tokio::sync::mpsc::UnboundedSender<crate::server::RunnerTurnCommitNotice>,
 }
 
+struct RunnerCallbackCancellation {
+    cancel: tokio_util::sync::CancellationToken,
+    armed: bool,
+}
+
+impl RunnerCallbackCancellation {
+    fn new(cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            cancel,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunnerCallbackCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel.cancel();
+        }
+    }
+}
+
 impl finch_ipc_capnp::brain_turn_commit_ack::Server for BrainTurnCommitAckImpl {
     fn committed(
         &mut self,
@@ -953,18 +1428,14 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(request) => request,
             Err(error) => return Promise::err(error),
         };
-        let brain = request
-            .get_brain()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let source = request
-            .get_source()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let brain = match required_runner_text(request.get_brain(), "brain") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
+        let rendered = match required_runner_text(request.get_rendered(), "rendered") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
         let run_id = match request
             .get_run_id()
             .map_err(anyhow::Error::new)
@@ -1096,42 +1567,48 @@ impl brain_runner::Server for BrainRunnerImpl {
             }
         });
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
         if self
             .event_tx
             .send(
                 crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(
-                    crate::server::RunnerProgramRequest {
-                        brain,
-                        run_id,
-                        request_seq: request.get_request_seq(),
-                        language,
-                        source,
-                        interaction: match request.get_interaction() {
-                            Ok(finch_ipc_capnp::BrainProgramInteraction::Interactive) => {
-                                crate::server::RunnerProgramInteraction::Interactive
-                            }
-                            Ok(finch_ipc_capnp::BrainProgramInteraction::Noninteractive) => {
-                                crate::server::RunnerProgramInteraction::Noninteractive
-                            }
-                            Err(error) => return Promise::err(error.into()),
-                        },
-                        grant_ceiling: if request.get_has_grant_ceiling() {
-                            match request
-                                .get_grant_ceiling()
-                                .map_err(anyhow::Error::new)
-                                .and_then(crate::ipc::checkpoint_codec::decode_effects)
-                            {
-                                Ok(grants) => Some(grants),
-                                Err(error) => {
-                                    return Promise::err(capnp::Error::failed(error.to_string()))
+                    crate::cli::repl_event::events::BoundedRunnerRequest {
+                        request: crate::server::RunnerProgramRequest {
+                            brain,
+                            run_id,
+                            request_seq: request.get_request_seq(),
+                            language,
+                            source,
+                            interaction: match request.get_interaction() {
+                                Ok(finch_ipc_capnp::BrainProgramInteraction::Interactive) => {
+                                    crate::server::RunnerProgramInteraction::Interactive
                                 }
-                            }
-                        } else {
-                            None
+                                Ok(finch_ipc_capnp::BrainProgramInteraction::Noninteractive) => {
+                                    crate::server::RunnerProgramInteraction::Noninteractive
+                                }
+                                Err(error) => return Promise::err(error.into()),
+                            },
+                            grant_ceiling: if request.get_has_grant_ceiling() {
+                                match request
+                                    .get_grant_ceiling()
+                                    .map_err(anyhow::Error::new)
+                                    .and_then(crate::ipc::checkpoint_codec::decode_effects)
+                                {
+                                    Ok(grants) => Some(grants),
+                                    Err(error) => {
+                                        return Promise::err(capnp::Error::failed(
+                                            error.to_string(),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                None
+                            },
+                            control_tx: Some(control_tx),
+                            effect_audit: Some(effect_audit),
+                            response_tx,
                         },
-                        control_tx: Some(control_tx),
-                        effect_audit: Some(effect_audit),
-                        response_tx,
+                        cancel: cancel.clone(),
                     },
                 ),
             )
@@ -1139,10 +1616,13 @@ impl brain_runner::Server for BrainRunnerImpl {
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
         }
+        let callback = RunnerCallbackCancellation::new(cancel);
         Promise::from_future(async move {
+            let mut callback = callback;
             let response = response_rx
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            callback.disarm();
             let mut result = results.get().init_result();
             let effect_journal = match &response {
                 Ok(response) => &response.effect_journal,
@@ -1177,18 +1657,14 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(request) => request,
             Err(error) => return Promise::err(error),
         };
-        let brain = request
-            .get_brain()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let prompt = request
-            .get_prompt()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let brain = match required_runner_text(request.get_brain(), "brain") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
+        let prompt = match required_runner_text(request.get_prompt(), "prompt") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
         let run_id = match request
             .get_run_id()
             .map_err(anyhow::Error::new)
@@ -1236,30 +1712,37 @@ impl brain_runner::Server for BrainRunnerImpl {
             }
         });
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
         if self
             .event_tx
             .send(crate::cli::repl_event::ReplEvent::NamedBrainTurnRequested(
-                crate::server::RunnerTurnRequest {
-                    brain,
-                    run_id,
-                    request_seq: request.get_request_seq(),
-                    prompt,
-                    context,
-                    approval_audience,
-                    approval_connection_id: None,
-                    approval_tx: Some(approval_tx),
-                    effect_audit: Some(effect_audit),
-                    response_tx,
+                crate::cli::repl_event::events::BoundedRunnerRequest {
+                    request: crate::server::RunnerTurnRequest {
+                        brain,
+                        run_id,
+                        request_seq: request.get_request_seq(),
+                        prompt,
+                        context,
+                        approval_audience,
+                        approval_connection_id: None,
+                        approval_tx: Some(approval_tx),
+                        effect_audit: Some(effect_audit),
+                        response_tx,
+                    },
+                    cancel: cancel.clone(),
                 },
             ))
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
         }
+        let callback = RunnerCallbackCancellation::new(cancel);
         Promise::from_future(async move {
+            let mut callback = callback;
             let response = response_rx
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            callback.disarm();
             let mut result = results.get().init_result();
             let turn_events = match &response {
                 Ok(response) => &response.turn_events,
@@ -1352,10 +1835,14 @@ impl brain_runner::Server for BrainRunnerImpl {
             .event_tx
             .send(
                 crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
-                    crate::server::RunnerCancelRequest {
-                        brain,
-                        run_id,
-                        response_tx,
+                    crate::cli::repl_event::events::BoundedRunnerCancelRequest {
+                        request: crate::server::RunnerCancelRequest {
+                            brain,
+                            run_id,
+                            response_tx,
+                        },
+                        cancel: tokio_util::sync::CancellationToken::new(),
+                        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(10),
                     },
                 ),
             )
@@ -1413,37 +1900,74 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(value) => crate::brain::store::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let text = |value: capnp::Result<capnp::text::Reader<'_>>| {
-            value
-                .ok()
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_string()
+        let brain = match required_runner_text(request.get_brain(), "brain") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
+        let prompt = match required_runner_text(request.get_prompt(), "prompt") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
+        let source = match required_runner_text(request.get_source(), "source") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (finished_tx, finished_rx) = tokio::sync::watch::channel(false);
+        let lifecycle_key = (brain.clone(), run_id);
+        let generation = uuid::Uuid::new_v4();
+        if self.memory_callbacks.borrow().contains_key(&lifecycle_key) {
+            return Promise::err(capnp::Error::failed(
+                "memory projection callback is already active for this run".into(),
+            ));
+        }
+        self.memory_callbacks.borrow_mut().insert(
+            lifecycle_key.clone(),
+            MemoryProjectionLifecycle {
+                generation,
+                cancel: cancel.clone(),
+                finished: finished_rx,
+            },
+        );
         if self
             .event_tx
             .send(
                 crate::cli::repl_event::ReplEvent::NamedBrainMemoryProjectionRequested(
-                    crate::server::RunnerMemoryProjectionRequest {
-                        brain_id,
-                        brain: text(request.get_brain()),
-                        run_id,
-                        request_seq: request.get_request_seq(),
-                        prompt: text(request.get_prompt()),
-                        rendered: text(request.get_rendered()),
-                        response_tx,
+                    crate::cli::repl_event::events::BoundedRunnerRequest {
+                        request: crate::server::RunnerMemoryProjectionRequest {
+                            brain_id,
+                            brain,
+                            run_id,
+                            request_seq: request.get_request_seq(),
+                            prompt,
+                            rendered,
+                            response_tx,
+                        },
+                        cancel: cancel.clone(),
                     },
                 ),
             )
             .is_err()
         {
+            finished_tx.send_replace(true);
+            self.memory_callbacks.borrow_mut().remove(&lifecycle_key);
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
         }
+        let callback = RunnerCallbackCancellation::new(cancel);
+        let completion = MemoryProjectionCompletion {
+            memory_callbacks: std::rc::Rc::clone(&self.memory_callbacks),
+            lifecycle_key,
+            generation,
+            finished_tx,
+        };
         Promise::from_future(async move {
+            let _completion = completion;
+            let mut callback = callback;
             let response = response_rx
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped memory response".into()))?;
+            callback.disarm();
             let mut result = results.get();
             match response {
                 Ok(inserted) => {
@@ -1454,6 +1978,82 @@ impl brain_runner::Server for BrainRunnerImpl {
             }
             Ok(())
         })
+    }
+
+    fn cancel_memory(
+        &mut self,
+        params: brain_runner::CancelMemoryParams,
+        _results: brain_runner::CancelMemoryResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let brain = match required_runner_text(params.get_brain(), "brain") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(error),
+        };
+        let run_id = match params
+            .get_run_id()
+            .map_err(anyhow::Error::new)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::new))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
+        {
+            Ok(value) => crate::brain::store::RunId(value),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let Some(lifecycle) = self
+            .memory_callbacks
+            .borrow()
+            .get(&(brain, run_id))
+            .cloned()
+        else {
+            return Promise::ok(());
+        };
+        lifecycle.cancel.cancel();
+        Promise::from_future(async move {
+            let mut finished = lifecycle.finished;
+            let already_finished = *finished.borrow();
+            if !already_finished {
+                finished.changed().await.map_err(|_| {
+                    capnp::Error::failed(
+                        "frontend memory projection ended without a settlement acknowledgement"
+                            .into(),
+                    )
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn eject_process(
+        &mut self,
+        params: brain_runner::EjectProcessParams,
+        _results: brain_runner::EjectProcessResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        if let Err(error) = required_runner_text(params.get_reason(), "ejection reason") {
+            return Promise::err(error);
+        }
+        // Linearize poison with every runner-scoped non-awaiting RPC send.
+        // The monotonic store happens before acknowledging the daemon, so a
+        // concurrent final-client Drop cannot turn an observed ejection into
+        // an ordinary EOF and no later runner mutation can be admitted.
+        // Recovering a poisoned mutex is safe only because this path
+        // immediately makes the process identity terminal. No runner RPC can
+        // be admitted again through `with_rpc_admission`.
+        let _admission = self
+            .process
+            .runner_rpc_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.process
+            .poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        Promise::ok(())
     }
 }
 
@@ -1946,7 +2546,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 8);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 13);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1955,29 +2555,29 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 7,
+                protocol_version: 12,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 7"));
-            assert!(error.contains("requires 8"));
+            assert!(error.contains("protocol 12"));
+            assert!(error.contains("requires 13"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 8,
+                protocol_version: 13,
                 query_calls: std::rc::Rc::clone(&new_daemon_calls),
             });
             let request = daemon.ping_request();
             let reply = request.send().promise.await.unwrap();
             let protocol_version = reply.get().unwrap().get_protocol_version();
-            let error = ensure_protocol_generation(protocol_version, 7)
+            let error = ensure_protocol_generation(protocol_version, 12)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 8"));
-            assert!(error.contains("requires 7"));
+            assert!(error.contains("protocol 13"));
+            assert!(error.contains("requires 12"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);
         }));
@@ -2068,6 +2668,311 @@ mod tests {
         ));
     }
 
+    struct UnusedProgramControl;
+
+    impl finch_ipc_capnp::brain_program_control::Server for UnusedProgramControl {
+        fn create_schedule(
+            &mut self,
+            _params: finch_ipc_capnp::brain_program_control::CreateScheduleParams,
+            _results: finch_ipc_capnp::brain_program_control::CreateScheduleResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("unused".into()))
+        }
+
+        fn inspect_schedule(
+            &mut self,
+            _params: finch_ipc_capnp::brain_program_control::InspectScheduleParams,
+            _results: finch_ipc_capnp::brain_program_control::InspectScheduleResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("unused".into()))
+        }
+
+        fn cancel_schedule(
+            &mut self,
+            _params: finch_ipc_capnp::brain_program_control::CancelScheduleParams,
+            _results: finch_ipc_capnp::brain_program_control::CancelScheduleResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("unused".into()))
+        }
+
+        fn reserve_effect(
+            &mut self,
+            _params: finch_ipc_capnp::brain_program_control::ReserveEffectParams,
+            _results: finch_ipc_capnp::brain_program_control::ReserveEffectResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented("unused".into()))
+        }
+    }
+
+    #[test]
+    fn test_dropped_program_rpc_cancels_the_exact_enqueued_frontend_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+                event_tx,
+                memory_callbacks: Default::default(),
+                process: fresh_runner_process_identity(),
+            });
+            let control: finch_ipc_capnp::brain_program_control::Client =
+                capnp_rpc::new_client(UnusedProgramControl);
+            let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+            let mut call = runner.run_program_request();
+            {
+                let mut request = call.get().init_request();
+                request.set_brain("shared");
+                request.set_run_id(&run_id.0.to_string());
+                request.set_request_seq(1);
+                request.set_language(finch_ipc_capnp::ProgramLanguage::Lisp);
+                request.set_source("stuck");
+                request.set_interaction(finch_ipc_capnp::BrainProgramInteraction::Interactive);
+                request.set_has_grant_ceiling(false);
+                request.set_control(control);
+            }
+            let mut rpc = Box::pin(call.send().promise);
+            let request = tokio::select! {
+                event = event_rx.recv() => match event.unwrap() {
+                    crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) => request,
+                    other => panic!("expected program callback, got {other:?}"),
+                },
+                _ = &mut rpc => panic!("program callback ended before enqueue"),
+            };
+            assert_eq!(request.request.run_id, run_id);
+            assert!(!request.cancel.is_cancelled());
+            drop(rpc);
+            tokio::task::yield_now().await;
+            assert!(request.cancel.is_cancelled());
+        }));
+    }
+
+    #[test]
+    fn test_explicit_ejection_poison_survives_final_client_drop_but_ordinary_drop_does_not_poison()
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let ordinary_process = fresh_runner_process_identity();
+            let ordinary_state = std::sync::Arc::new(RpcConnectionState {
+                process: std::sync::Arc::clone(&ordinary_process),
+                active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let ordinary_client = IpcClient {
+                client: capnp_rpc::new_client(ProtocolFixtureDaemon {
+                    protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+                    query_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+                _rpc_handle: std::rc::Rc::new(RpcTask {
+                    handle: tokio::task::spawn_local(async {}),
+                    state: ordinary_state,
+                }),
+            };
+            drop(ordinary_client);
+            assert!(!ordinary_process
+                .poisoned
+                .load(std::sync::atomic::Ordering::Acquire));
+
+            let poisoned_process = fresh_runner_process_identity();
+            let poisoned_state = std::sync::Arc::new(RpcConnectionState {
+                process: std::sync::Arc::clone(&poisoned_process),
+                active_runner_registrations: std::sync::atomic::AtomicUsize::new(1),
+            });
+            let poisoned_client = IpcClient {
+                client: capnp_rpc::new_client(ProtocolFixtureDaemon {
+                    protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+                    query_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+                _rpc_handle: std::rc::Rc::new(RpcTask {
+                    handle: tokio::task::spawn_local(async {}),
+                    state: poisoned_state,
+                }),
+            };
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+                event_tx,
+                memory_callbacks: Default::default(),
+                process: std::sync::Arc::clone(&poisoned_process),
+            });
+            let mut ejection = runner.eject_process_request();
+            ejection.get().set_reason("causal test ejection");
+            ejection.send().promise.await.unwrap();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let error = match poisoned_client
+                .register_brain_runner(
+                    "shared",
+                    crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
+                    event_tx,
+                )
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("process-local quarantine allowed runner registration"),
+            };
+            assert!(is_runner_process_quarantined(&error));
+            drop(poisoned_client);
+            assert!(poisoned_process
+                .poisoned
+                .load(std::sync::atomic::Ordering::Acquire));
+        }));
+    }
+
+    #[test]
+    fn test_remote_quarantine_publication_is_totally_ordered_with_runner_sends() {
+        let process = fresh_runner_process_identity();
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sender_process = std::sync::Arc::clone(&process);
+        let sender_sends = std::sync::Arc::clone(&sends);
+        let sender = std::thread::spawn(move || {
+            sender_process
+                .with_rpc_admission(|| {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    sender_sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .unwrap();
+        });
+        admitted_rx.recv().unwrap();
+
+        let publisher_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publisher_thread_started = std::sync::Arc::clone(&publisher_started);
+        let (publication_admitted_tx, publication_admitted_rx) = std::sync::mpsc::channel();
+        let (publication_release_tx, publication_release_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let poison_process = std::sync::Arc::clone(&process);
+        let publisher = std::thread::spawn(move || {
+            publisher_thread_started.wait();
+            poison_process.publish_remote_poison_after_admission(|| {
+                publication_admitted_tx.send(()).unwrap();
+                publication_release_rx.recv().unwrap();
+            });
+            published_tx.send(()).unwrap();
+        });
+        publisher_started.wait();
+        assert!(!process.poisoned.load(std::sync::atomic::Ordering::Acquire));
+
+        release_tx.send(()).unwrap();
+        sender.join().unwrap();
+        publication_admitted_rx.recv().unwrap();
+        assert!(!process.poisoned.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        publication_release_tx.send(()).unwrap();
+        published_rx.recv().unwrap();
+        publisher.join().unwrap();
+        assert!(process.poisoned.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let later = process.with_rpc_admission(|| {
+            sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(is_runner_process_quarantined(&later.unwrap_err()));
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a runner send occurred after terminal poison publication"
+        );
+    }
+
+    #[test]
+    fn test_runner_request_text_fails_closed_at_callback_boundary() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+                event_tx,
+                memory_callbacks: Default::default(),
+                process: fresh_runner_process_identity(),
+            });
+
+            let mut missing_program = runner.run_program_request();
+            missing_program.get().init_request().set_source("valid");
+            let error = match missing_program.send().promise.await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("missing program brain was accepted"),
+            };
+            assert!(error.contains("brain"), "unexpected error: {error}");
+
+            let mut invalid_program = runner.run_program_request();
+            {
+                let mut request = invalid_program.get().init_request();
+                request.set_brain("shared");
+                request.set_source(capnp::text::Reader(&[0xff, 0xfe]));
+            }
+            let error = match invalid_program.send().promise.await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("invalid program source was accepted"),
+            };
+            assert!(error.contains("UTF-8"), "unexpected error: {error}");
+
+            let mut missing_turn = runner.run_turn_request();
+            missing_turn.get().init_request().set_brain("shared");
+            let error = match missing_turn.send().promise.await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("missing turn prompt was accepted"),
+            };
+            assert!(error.contains("prompt"), "unexpected error: {error}");
+
+            let mut invalid_turn = runner.run_turn_request();
+            invalid_turn
+                .get()
+                .init_request()
+                .set_brain(capnp::text::Reader(&[0xff, 0xfe]));
+            let error = match invalid_turn.send().promise.await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("invalid turn brain was accepted"),
+            };
+            assert!(error.contains("UTF-8"), "unexpected error: {error}");
+
+            let brain_id = uuid::Uuid::new_v4().to_string();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let mut missing_memory = runner.project_memory_request();
+            {
+                let mut request = missing_memory.get().init_request();
+                request.set_brain_id(&brain_id);
+                request.set_brain("shared");
+                request.set_run_id(&run_id);
+                request.set_source("valid");
+            }
+            let error = match missing_memory.send().promise.await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("missing memory prompt was accepted"),
+            };
+            assert!(error.contains("prompt"), "unexpected error: {error}");
+
+            let mut invalid_memory = runner.project_memory_request();
+            {
+                let mut request = invalid_memory.get().init_request();
+                request.set_brain_id(&brain_id);
+                request.set_brain("shared");
+                request.set_run_id(&run_id);
+                request.set_prompt("valid");
+                request.set_source(capnp::text::Reader(&[0xff, 0xfe]));
+            }
+            let error = match invalid_memory.send().promise.await {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("invalid memory source was accepted"),
+            };
+            assert!(error.contains("UTF-8"), "unexpected error: {error}");
+
+            assert!(matches!(
+                event_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }));
+    }
+
     struct BlockingBrainRunner {
         started:
             std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
@@ -2149,9 +3054,8 @@ mod tests {
 
     #[test]
     fn runner_registration_explains_an_older_daemon_schema() {
-        let error = map_runner_registration_error(capnp::Error::unimplemented(
-            "remote method missing".into(),
-        ));
+        let error =
+            map_runner_rpc_error(capnp::Error::unimplemented("remote method missing".into()));
         let message = error.to_string();
         assert!(message.contains("older IPC schema"));
         assert!(message.contains("restart the daemon"));
@@ -2463,6 +3367,9 @@ mod tests {
                 .get()
                 .set_lease_id(&lease.lease_id.0.to_string());
             registration.get().set_runner(runner);
+            registration
+                .get()
+                .set_process_epoch(&client._rpc_handle.state.process.epoch.to_string());
             registration.send().promise.await.unwrap();
 
             let submit_client = client.clone();

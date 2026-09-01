@@ -87,6 +87,24 @@ fn lease_id_after_registration(
     }
 }
 
+/// Reconcile the frontend VM to the daemon's canonical checkpoint. Recovery
+/// must be able to roll back a locally advanced revision left behind by a
+/// callback that crossed its cancellation boundary; ordinary idle renewal
+/// avoids replacing an already-identical lineage.
+async fn reconcile_runner_checkpoint(
+    runtime: &crate::runtime::ProgramRuntime,
+    checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    revision: u64,
+    force_exact: bool,
+) -> Result<()> {
+    if !force_exact && runtime.revision() == revision {
+        return Ok(());
+    }
+    runtime
+        .replace_reducible_state(checkpoint, revision)
+        .await
+}
+
 struct HomeRunnerRegistration {
     target: RunnerReconnectTarget,
     registration: std::result::Result<crate::brain::store::RunnerLeaseId, String>,
@@ -132,6 +150,26 @@ fn verify_local_frontend_environment(
 }
 
 impl EventLoop {
+    /// Install the daemon's canonical runner bootstrap before the callback is
+    /// considered recovered. Reconnect deliberately permits rollback from a
+    /// locally advanced, cancelled generation.
+    pub(crate) async fn install_runner_bootstrap(
+        &self,
+        bootstrap: crate::ipc::client::BrainRunnerBootstrap,
+    ) -> Result<()> {
+        reconcile_runner_checkpoint(
+            &self.program_runtime,
+            bootstrap.checkpoint,
+            bootstrap.runtime_revision,
+            true,
+        )
+        .await?;
+        self.agent_scheduler
+            .bind_brain_control(bootstrap.subagent_control)
+            .await;
+        Ok(())
+    }
+
     /// Update the vocabulary panel from partially typed input. This is local
     /// presentation only and never starts provider or workspace work.
     async fn handle_typing_started(&self, partial: String) {
@@ -161,12 +199,13 @@ impl EventLoop {
         let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
+        ipc.ensure_runner_process_available()?;
         ipc.brain_claim_runner_identity(&self.runner_subject)
             .await
             .context("claim this frontend's runner identity")?;
-        let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        let snapshot = ipc.brain_runner_snapshot(&self.session_label).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
-        let initial = ipc
+        let initial = match ipc
             .brain_acquire_runner(
                 &self.session_label,
                 &self.runner_subject,
@@ -174,26 +213,20 @@ impl EventLoop {
                 None,
                 30_000,
             )
-            .await;
+            .await
+        {
+            Err(error) if crate::ipc::is_runner_process_quarantined(&error) => {
+                return Err(error);
+            }
+            result => result,
+        };
         let initial_registration = match (&initial, self.ipc_client.as_ref()) {
             (Ok(lease), Some(ipc)) => match ipc
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
                 .await
             {
-                Ok(bootstrap) => match self
-                    .program_runtime
-                    .hydrate_reducible_state_if_newer(
-                        bootstrap.checkpoint,
-                        bootstrap.runtime_revision,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        self.agent_scheduler
-                            .bind_brain_control(bootstrap.subagent_control)
-                            .await;
-                        Ok(lease.lease_id)
-                    }
+                Ok(bootstrap) => match self.install_runner_bootstrap(bootstrap).await {
+                    Ok(_) => Ok(lease.lease_id),
                     Err(error) => {
                         let _ = ipc
                             .brain_release_runner(&self.session_label, lease.lease_id)
@@ -202,6 +235,13 @@ impl EventLoop {
                         Err(error.to_string())
                     }
                 },
+                Err(error) if crate::ipc::is_runner_process_quarantined(&error) => {
+                    // The server's durable PID/start ledger is authoritative.
+                    // Preserve this typed terminal result and the durable
+                    // lease; starting renewal here would recreate the exact
+                    // post-quarantine claim/snapshot/acquire churn.
+                    return Err(error);
+                }
                 Err(error) => Err(error.to_string()),
             },
             (Ok(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),
@@ -284,7 +324,7 @@ impl EventLoop {
                         // could reclaim the Brain after the target exits.
                         let inspected_handoff = match lease_id {
                             Some(previous) => ipc
-                                .brain_snapshot(&brain)
+                                .brain_runner_snapshot(&brain)
                                 .await
                                 .ok()
                                 .map(|brain| brain.runner_lease_was_handed_off(previous)),
@@ -497,8 +537,14 @@ impl EventLoop {
             .as_ref()
             .context("Cap'n Proto daemon connection unavailable")?
             .clone();
-        if ipc.ping().await.is_err() {
-            ipc = crate::ipc::IpcClient::connect()
+        // This local-only check must precede health checks, socket reconnect,
+        // snapshots, and every lease mutation. Each client send repeats it
+        // under the shared process admission gate so an ejection racing this
+        // check still wins before the first irrevocable RPC send.
+        ipc.ensure_runner_process_available()?;
+        if ipc.runner_ping().await.is_err() {
+            ipc.ensure_runner_process_available()?;
+            ipc = crate::ipc::IpcClient::connect_for_runner()
                 .await
                 .context("reconnect local daemon IPC for runner")?;
             self.ipc_client = Some(ipc.clone());
@@ -506,7 +552,7 @@ impl EventLoop {
         ipc.brain_claim_runner_identity(&self.runner_subject)
             .await
             .context("reclaim this frontend's runner identity")?;
-        let snapshot = ipc.brain_snapshot(&target.brain).await?;
+        let snapshot = ipc.brain_runner_snapshot(&target.brain).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
         anyhow::ensure!(
             snapshot.environment == target.environment,
@@ -542,14 +588,7 @@ impl EventLoop {
                 )));
             }
         };
-        if let Err(error) = self
-            .program_runtime
-            .hydrate_reducible_state_if_newer(
-                bootstrap.checkpoint,
-                bootstrap.runtime_revision,
-            )
-            .await
-        {
+        if let Err(error) = self.install_runner_bootstrap(bootstrap).await {
             let _ = ipc
                 .brain_release_runner(&target.brain, lease.lease_id)
                 .await;
@@ -559,9 +598,6 @@ impl EventLoop {
                 target.brain
             )));
         }
-        self.agent_scheduler
-            .bind_brain_control(bootstrap.subagent_control)
-            .await;
         self.home_runner_lease_id = Some(lease.lease_id);
         self.home_runner_lease_active = true;
         self.runner_brain = Some(target.brain.clone());
@@ -1092,6 +1128,7 @@ impl EventLoop {
         let Some((brain, environment)) = previous else {
             return Ok(());
         };
+        ipc.ensure_runner_process_available()?;
         let lease = ipc
             .brain_acquire_runner(&brain, &self.runner_subject, &environment, None, 30_000)
             .await
@@ -1106,13 +1143,13 @@ impl EventLoop {
                 return Err(error.context(format!("restore runner callback for {brain}")));
             }
         };
-        if let Err(error) = self
-            .program_runtime
-            .hydrate_reducible_state_if_newer(
-                bootstrap.checkpoint,
-                bootstrap.runtime_revision,
-            )
-            .await
+        if let Err(error) = reconcile_runner_checkpoint(
+            &self.program_runtime,
+            bootstrap.checkpoint,
+            bootstrap.runtime_revision,
+            true,
+        )
+        .await
         {
             let _ = ipc.brain_release_runner(&brain, lease.lease_id).await;
             return Err(error.context(format!("restore runtime checkpoint for {brain}")));
@@ -1187,6 +1224,7 @@ impl EventLoop {
             .as_ref()
             .context("Cap'n Proto daemon connection unavailable")?
             .clone();
+        ipc.ensure_runner_process_available()?;
 
         anyhow::ensure!(
             self.runner_brain.as_deref() != Some(snapshot.name.as_str()),
@@ -1197,7 +1235,7 @@ impl EventLoop {
         let previous_runner = match (self.runner_brain.as_ref(), self.home_runner_lease_id) {
             (Some(brain), Some(_)) => Some((
                 brain.clone(),
-                ipc.brain_snapshot(brain)
+                ipc.brain_runner_snapshot(brain)
                     .await
                     .with_context(|| format!("inspect current runner Brain {brain}"))?
                     .environment,
@@ -1251,11 +1289,7 @@ impl EventLoop {
                     .await);
             }
         };
-        if let Err(error) = self
-            .program_runtime
-            .replace_reducible_state(bootstrap.checkpoint, bootstrap.runtime_revision)
-            .await
-        {
+        if let Err(error) = self.install_runner_bootstrap(bootstrap).await {
             let _ = ipc
                 .brain_release_runner(&snapshot.name, lease.lease_id)
                 .await;

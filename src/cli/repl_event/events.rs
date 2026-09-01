@@ -25,6 +25,27 @@ pub struct RunnerReconnectTarget {
     pub lease_id: Option<crate::brain::store::RunnerLeaseId>,
 }
 
+/// Process-local lifecycle paired with a source-compatible public runner
+/// request after it crosses the Cap'n Proto callback boundary.
+#[derive(Debug)]
+pub struct BoundedRunnerRequest<T> {
+    /// Source-compatible public request payload.
+    pub request: T,
+    /// Process-local cancellation authority for this callback generation.
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Process-local deadline for one runner cancellation callback.
+#[derive(Debug)]
+pub struct BoundedRunnerCancelRequest {
+    /// Source-compatible public cancellation payload.
+    pub request: crate::server::RunnerCancelRequest,
+    /// Cancels the callback wait when the originating RPC is abandoned.
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Absolute bound for physical callback settlement.
+    pub deadline: tokio::time::Instant,
+}
+
 /// Result of a tool execution confirmation prompt
 #[derive(Debug, Clone)]
 pub enum ConfirmationResult {
@@ -230,16 +251,37 @@ pub enum ReplEvent {
 
     /// A daemon request routed through the callback registered for this
     /// frontend's current named-Brain runner lease.
-    NamedBrainProgramRequested(crate::server::RunnerProgramRequest),
+    NamedBrainProgramRequested(BoundedRunnerRequest<crate::server::RunnerProgramRequest>),
     /// A complete provider/tool/VM turn routed to the frontend holding the
     /// named Brain's environment-runner lease.
-    NamedBrainTurnRequested(crate::server::RunnerTurnRequest),
+    NamedBrainTurnRequested(BoundedRunnerRequest<crate::server::RunnerTurnRequest>),
     /// Project a daemon-committed successful turn into runner-owned memory.
-    NamedBrainMemoryProjectionRequested(crate::server::RunnerMemoryProjectionRequest),
+    NamedBrainMemoryProjectionRequested(
+        BoundedRunnerRequest<crate::server::RunnerMemoryProjectionRequest>,
+    ),
     /// Cancel one exact ProgramRun currently owned by this frontend.
-    NamedBrainRunCancelRequested(crate::server::RunnerCancelRequest),
-    /// Release frontend-local cancellation state after a delegated program ends.
-    NamedBrainProgramFinished(crate::brain::store::RunId),
+    NamedBrainRunCancelRequested(BoundedRunnerCancelRequest),
+    /// The daemon stopped awaiting one exact turn callback. This is scoped to
+    /// the callback request, not to the frontend's current runner generation.
+    NamedBrainTurnCallbackCancelled {
+        query_id: uuid::Uuid,
+        run_id: crate::brain::store::RunId,
+    },
+    /// Release frontend-local cancellation state after a delegated program
+    /// ends. The program callback must not reply to the daemon until the event
+    /// loop acknowledges canonical checkpoint reconciliation.
+    NamedBrainProgramFinished {
+        run_id: crate::brain::store::RunId,
+        preserve_local_checkpoint: bool,
+        reconciliation_tx: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Complete an explicit cancellation reply only after the exact program's
+    /// physical callback has settled and its finished event has been handled.
+    NamedBrainProgramCancellationSettled {
+        run_id: crate::brain::store::RunId,
+        response_tx: oneshot::Sender<std::result::Result<bool, String>>,
+        result: std::result::Result<bool, String>,
+    },
 
     /// The daemon has durably committed the exact named-Brain turn that
     /// requested this frontend replacement. It is now safe to leave the
