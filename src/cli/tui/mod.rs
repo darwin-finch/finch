@@ -20,17 +20,14 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent},
+    event::{self, Event, KeyCode, KeyEvent, MouseEvent},
     execute,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{
-        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
-        EndSynchronizedUpdate,
-    },
+    terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate},
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use tui_textarea::TextArea;
 
@@ -58,6 +55,459 @@ pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::visible_length;
 
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+#[cfg(unix)]
+use std::os::fd::RawFd;
+
+#[cfg(unix)]
+const MODE_RAW: u8 = 1 << 0;
+#[cfg(unix)]
+const MODE_PASTE: u8 = 1 << 1;
+#[cfg(unix)]
+const MODE_MOUSE: u8 = 1 << 2;
+#[cfg(unix)]
+const MODE_KEYBOARD: u8 = 1 << 3;
+
+#[cfg(unix)]
+const ENABLE_PASTE: &[u8] = b"\x1b[?2004h";
+#[cfg(unix)]
+const ENABLE_MOUSE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+#[cfg(unix)]
+const PUSH_KEYBOARD: &[u8] = b"\x1b[>1u";
+
+#[cfg(unix)]
+struct TerminalSessionState {
+    fd: std::sync::atomic::AtomicI32,
+    original: nix::libc::termios,
+    modes: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(unix)]
+impl TerminalSessionState {
+    fn activate() -> io::Result<Arc<Self>> {
+        use std::sync::atomic::Ordering;
+
+        let fd = open_current_stdout_tty()?;
+        let mut original = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+        if unsafe { nix::libc::tcgetattr(fd, original.as_mut_ptr()) } < 0 {
+            let error = io::Error::last_os_error();
+            unsafe { nix::libc::close(fd) };
+            return Err(error);
+        }
+        let original = unsafe { original.assume_init() };
+        let state = Arc::new(Self {
+            fd: std::sync::atomic::AtomicI32::new(fd),
+            original,
+            modes: std::sync::atomic::AtomicU8::new(0),
+        });
+        register_active_terminal(&state)?;
+
+        let mut raw = original;
+        unsafe { nix::libc::cfmakeraw(&mut raw) };
+        if unsafe { nix::libc::tcsetattr(fd, nix::libc::TCSANOW, &raw) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        state.modes.fetch_or(MODE_RAW, Ordering::Release);
+        if supervised_activation_failure_requested("raw") {
+            return Err(io::Error::other("injected failure after raw mode"));
+        }
+        state.acquire_protocol(ENABLE_PASTE, MODE_PASTE)?;
+        if supervised_activation_failure_requested("paste") {
+            return Err(io::Error::other("injected failure after bracketed paste"));
+        }
+        state.acquire_protocol(ENABLE_MOUSE, MODE_MOUSE)?;
+        state.acquire_protocol(PUSH_KEYBOARD, MODE_KEYBOARD)?;
+        write_nonblocking(fd, b"\x1b[?25h")?;
+        Ok(state)
+    }
+
+    fn acquire_protocol(&self, bytes: &[u8], mode: u8) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let fd = self.fd.load(Ordering::Acquire);
+        let written = write_nonblocking_count(fd, bytes)?;
+        if written > 0 {
+            self.modes.fetch_or(mode, Ordering::Release);
+        }
+        if written != bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "terminal protocol activation was incomplete",
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_active(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.fd.load(Ordering::Acquire) >= 0
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let fd = self.fd.swap(-1, Ordering::AcqRel);
+        if fd < 0 {
+            return Ok(());
+        }
+        let modes = self.modes.swap(0, Ordering::AcqRel);
+        let mut first_error = None;
+        if unsafe { nix::libc::tcsetattr(fd, nix::libc::TCSANOW, &self.original) } < 0 {
+            first_error = Some(io::Error::last_os_error());
+        }
+        unsafe { nix::libc::tcflush(fd, nix::libc::TCOFLUSH) };
+
+        let mut reset = Vec::with_capacity(64);
+        if modes & MODE_KEYBOARD != 0 {
+            reset.extend_from_slice(b"\x1b[<1u");
+        }
+        if modes & MODE_MOUSE != 0 {
+            reset.extend_from_slice(b"\x1b[?1000l\x1b[?1006l");
+        }
+        if modes & MODE_PASTE != 0 {
+            reset.extend_from_slice(b"\x1b[?2004l");
+        }
+        reset.extend_from_slice(b"\x1b[?25h\x1b[0m\r\n");
+        if let Err(error) = write_nonblocking(fd, &reset) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        unsafe { nix::libc::close(fd) };
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalSessionState {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(unix)]
+fn open_current_stdout_tty() -> io::Result<RawFd> {
+    let mut path = [0_i8; 1024];
+    let status =
+        unsafe { nix::libc::ttyname_r(nix::libc::STDOUT_FILENO, path.as_mut_ptr(), path.len()) };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    let fd = unsafe {
+        nix::libc::open(
+            path.as_ptr(),
+            nix::libc::O_WRONLY
+                | nix::libc::O_NOCTTY
+                | nix::libc::O_NONBLOCK
+                | nix::libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn write_nonblocking_count(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let written =
+            unsafe { nix::libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+        if written > 0 {
+            offset += written as usize;
+            continue;
+        }
+        if written == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if offset > 0 && error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(offset);
+        }
+        return Err(error);
+    }
+    Ok(offset)
+}
+
+#[cfg(unix)]
+fn write_nonblocking(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
+    if write_nonblocking_count(fd, bytes)? == bytes.len() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "terminal output queue is full",
+    ))
+}
+
+#[cfg(unix)]
+fn active_terminal_slot() -> &'static Mutex<Weak<TerminalSessionState>> {
+    static ACTIVE: OnceLock<Mutex<Weak<TerminalSessionState>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+#[cfg(unix)]
+fn register_active_terminal(state: &Arc<TerminalSessionState>) -> io::Result<()> {
+    let mut active = active_terminal_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if active.upgrade().is_some_and(|current| current.is_active()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "another terminal session is active",
+        ));
+    }
+    *active = Arc::downgrade(state);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cleanup_active_terminal() {
+    let active = active_terminal_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .upgrade();
+    if let Some(active) = active {
+        let _ = active.cleanup();
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_active_terminal() {
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+fn supervised_activation_failure_requested(stage: &str) -> bool {
+    std::env::var("FINCH_TEST_TUI_FAIL_AFTER").ok().as_deref() == Some(stage)
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+}
+
+/// Return the active restore descriptor to an isolated regression child.
+/// This is proof-gated because the descriptor is otherwise an implementation
+/// detail and callers must never write through or close it.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_terminal_restore_fd() -> io::Result<RawFd> {
+    if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "terminal descriptor probe requires isolated test authority",
+        ));
+    }
+    let active = active_terminal_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .upgrade()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active terminal session"))?;
+    let fd = active.fd.load(std::sync::atomic::Ordering::Acquire);
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "terminal session is inactive",
+        ));
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+static SIGNAL_PIPE_WRITER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static SIGNAL_HANDLER_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(unix)]
+static BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn terminal_signal_handler(signal: nix::libc::c_int) {
+    use std::sync::atomic::Ordering;
+    SIGNAL_HANDLER_COUNT.fetch_add(1, Ordering::AcqRel);
+    let fd = SIGNAL_PIPE_WRITER.load(Ordering::Acquire);
+    if fd >= 0 {
+        let byte = signal as u8;
+        unsafe { nix::libc::write(fd, (&byte as *const u8).cast(), 1) };
+    }
+    SIGNAL_HANDLER_COUNT.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Scoped signal ownership for the Finch binary's active terminal session.
+/// Public [`TuiRenderer`] construction never installs signal handlers.
+pub struct BinaryTerminalSession {
+    #[cfg(unix)]
+    read_fd: RawFd,
+    #[cfg(unix)]
+    write_fd: RawFd,
+    #[cfg(unix)]
+    previous: Vec<(nix::libc::c_int, nix::libc::sigaction)>,
+    #[cfg(unix)]
+    listener: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BinaryTerminalSession {
+    /// Claim SIGINT, SIGTERM, and SIGHUP while the binary owns a live TUI.
+    #[cfg(unix)]
+    pub fn install() -> io::Result<Option<Self>> {
+        use std::sync::atomic::Ordering;
+
+        let has_active = active_terminal_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
+            .is_some_and(|session| session.is_active());
+        if !has_active {
+            return Ok(None);
+        }
+        if BINARY_SIGNAL_OWNER.swap(true, Ordering::AcqRel) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "binary terminal signal owner already installed",
+            ));
+        }
+
+        let mut pipe = [-1; 2];
+        if unsafe { nix::libc::pipe(pipe.as_mut_ptr()) } < 0 {
+            BINARY_SIGNAL_OWNER.store(false, Ordering::Release);
+            return Err(io::Error::last_os_error());
+        }
+        for fd in pipe {
+            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) };
+        }
+        let flags = unsafe { nix::libc::fcntl(pipe[1], nix::libc::F_GETFL) };
+        if flags < 0
+            || unsafe {
+                nix::libc::fcntl(pipe[1], nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK)
+            } < 0
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                nix::libc::close(pipe[0]);
+                nix::libc::close(pipe[1]);
+            }
+            BINARY_SIGNAL_OWNER.store(false, Ordering::Release);
+            return Err(error);
+        }
+
+        let read_fd = pipe[0];
+        let listener = match std::thread::Builder::new()
+            .name("finch-terminal-signals".into())
+            .spawn(move || {
+                let mut signal = 0_u8;
+                loop {
+                    let read =
+                        unsafe { nix::libc::read(read_fd, (&mut signal as *mut u8).cast(), 1) };
+                    if read == 1 {
+                        if signal == 0 {
+                            return;
+                        }
+                        if !BINARY_SIGNAL_OWNER.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        // Signal termination owns the process from here. Close
+                        // the ordinary blocking writer before restoration so
+                        // a stuck or admitted frame cannot write after reset.
+                        unsafe { nix::libc::close(nix::libc::STDOUT_FILENO) };
+                        cleanup_active_terminal();
+                        unsafe { nix::libc::_exit(128 + i32::from(signal)) };
+                    }
+                    if read == 0 {
+                        return;
+                    }
+                    if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                        return;
+                    }
+                }
+            }) {
+            Ok(listener) => listener,
+            Err(error) => {
+                unsafe {
+                    nix::libc::close(pipe[0]);
+                    nix::libc::close(pipe[1]);
+                }
+                BINARY_SIGNAL_OWNER.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+
+        SIGNAL_PIPE_WRITER.store(pipe[1], Ordering::Release);
+        let mut previous = Vec::new();
+        let signals = if supervised_signal_omission_requested() {
+            vec![nix::libc::SIGTERM, nix::libc::SIGHUP]
+        } else {
+            vec![nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP]
+        };
+        for signal in signals {
+            let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+            action.sa_sigaction = terminal_signal_handler as *const () as usize;
+            unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
+            let mut old = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+            if unsafe { nix::libc::sigaction(signal, &action, &mut old) } < 0 {
+                let error = io::Error::last_os_error();
+                for (installed, prior) in previous.iter().rev() {
+                    unsafe { nix::libc::sigaction(*installed, prior, std::ptr::null_mut()) };
+                }
+                SIGNAL_PIPE_WRITER.store(-1, Ordering::Release);
+                unsafe { nix::libc::close(pipe[1]) };
+                let _ = listener.join();
+                unsafe { nix::libc::close(pipe[0]) };
+                BINARY_SIGNAL_OWNER.store(false, Ordering::Release);
+                return Err(error);
+            }
+            previous.push((signal, old));
+        }
+        Ok(Some(Self {
+            read_fd: pipe[0],
+            write_fd: pipe[1],
+            previous,
+            listener: Some(listener),
+        }))
+    }
+
+    #[cfg(not(unix))]
+    pub fn install() -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn supervised_signal_omission_requested() -> bool {
+    std::env::var_os("FINCH_TEST_TUI_MUTATE_OMIT_SIGINT").is_some()
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+}
+
+#[cfg(unix)]
+impl Drop for BinaryTerminalSession {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        BINARY_SIGNAL_OWNER.store(false, Ordering::Release);
+        for (signal, previous) in self.previous.iter().rev() {
+            unsafe { nix::libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+        }
+        SIGNAL_PIPE_WRITER.store(-1, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while SIGNAL_HANDLER_COUNT.load(Ordering::Acquire) != 0
+            && std::time::Instant::now() < deadline
+        {
+            std::hint::spin_loop();
+        }
+        let stop = 0_u8;
+        unsafe { nix::libc::write(self.write_fd, (&stop as *const u8).cast(), 1) };
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+        unsafe { nix::libc::close(self.write_fd) };
+        unsafe { nix::libc::close(self.read_fd) };
+    }
+}
+
 /// Best-effort terminal restoration for an exit path that cannot acquire the
 /// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
 /// `/quit` and the IPC quit watcher may call `process::exit`, which skips Drop,
@@ -65,19 +515,7 @@ pub use shadow_buffer::visible_length;
 /// alone is insufficient — bracketed paste and kitty keyboard enhancement
 /// remain enabled and their escape sequences leak into the user's shell.
 pub fn emergency_restore_terminal() {
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
-        crossterm::event::PopKeyboardEnhancementFlags,
-        crossterm::event::DisableBracketedPaste,
-        cursor::Show,
-        ResetColor,
-        Print("\r\n"),
-    );
-    let _ = stdout.lock().flush();
-    let _ = disable_raw_mode();
+    cleanup_active_terminal();
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
@@ -1004,6 +1442,8 @@ pub enum PosetPanelMode {
 
 #[allow(dead_code)]
 pub struct TuiRenderer {
+    #[cfg(unix)]
+    terminal_session: Mutex<Option<Arc<TerminalSessionState>>>,
     output_manager: Arc<OutputManager>,
     status_bar: Arc<StatusBar>,
     colors: ColorScheme,
@@ -1118,6 +1558,8 @@ impl TuiRenderer {
     ) -> Self {
         output_manager.disable_stdout();
         Self {
+            #[cfg(unix)]
+            terminal_session: Mutex::new(None),
             output_manager,
             status_bar,
             colors,
@@ -1166,54 +1608,11 @@ impl TuiRenderer {
         status_bar: Arc<StatusBar>,
         colors: ColorScheme,
     ) -> Result<Self> {
-        enable_raw_mode().context("Failed to enable raw mode")?;
-
-        // Enable bracketed paste so the terminal wraps pasted content in
-        // \x1b[200~ ... \x1b[201~ markers.  Crossterm surfaces this as
-        // Event::Paste(String) which we handle without any Enter-confusion.
-        // Unlike kitty keyboard enhancement flags, bracketed paste cannot
-        // corrupt the terminal on unclean exit — it simply falls back to
-        // normal (unbounded) paste mode, which is safe.
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::EnableMouseCapture
-        );
-
-        // Enable DISAMBIGUATE_ESCAPE_CODES so terminals that support the kitty
-        // keyboard protocol send distinct sequences for Shift+Enter (vs bare Enter).
-        // Without this, macOS Terminal.app and iTerm2 both send bare \r for
-        // Shift+Enter — the SHIFT modifier is never set — so the newline-insertion
-        // path in async_input.rs can never trigger.
-        //
-        // Terminals that don't support the protocol silently ignore the push
-        // (crossterm returns an error we discard with `let _ =`), so there is no
-        // regression for unsupported terminals.
-        //
-        // Cleanup: the Drop impl and the panic hook registered below both call
-        // PopKeyboardEnhancementFlags, so normal exit, panics, and most signals
-        // are covered.  SIGKILL terminates the session entirely so corruption
-        // doesn't persist.  This is the same risk level we already accept for
-        // enable_raw_mode().
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            )
-        );
-
-        // Panic hook: restore terminal state so the shell is usable after a crash.
-        std::panic::set_hook(Box::new(|info| {
-            let _ = execute!(
-                io::stdout(),
-                crossterm::event::DisableMouseCapture,
-                crossterm::event::PopKeyboardEnhancementFlags
-            );
-            let _ = crossterm::terminal::disable_raw_mode();
-            eprintln!("{info}");
-        }));
-
-        execute!(io::stdout(), cursor::Show)?;
+        #[cfg(unix)]
+        let terminal_session =
+            TerminalSessionState::activate().context("Failed to activate terminal session")?;
+        #[cfg(not(unix))]
+        crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
 
         // Suppress OutputManager's own stdout writes — we own the terminal.
         output_manager.disable_stdout();
@@ -1221,6 +1620,8 @@ impl TuiRenderer {
         let command_history = Self::load_history();
 
         Ok(TuiRenderer {
+            #[cfg(unix)]
+            terminal_session: Mutex::new(Some(terminal_session)),
             output_manager,
             status_bar,
             colors,
@@ -2289,26 +2690,25 @@ impl TuiRenderer {
             return Ok(());
         }
         self.is_active = false;
-        let _ = self.erase_live_area();
-        // Reset terminal state: show cursor, reset colours, move to a clean line.
-        // The `\r\n` ensures the shell prompt lands on its own fresh line rather
-        // than overwriting content from the erased live area.
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::PopKeyboardEnhancementFlags,
-            crossterm::event::DisableMouseCapture,
-            crossterm::event::DisableBracketedPaste,
-            cursor::Show,
-            ResetColor,
-        );
-        print!("\r\n");
-        // Flush pending output BEFORE leaving raw mode — otherwise some terminals
-        // silently discard buffered bytes after the mode switch.
-        let _ = io::stdout().flush();
-        let _ = disable_raw_mode();
+        #[cfg(unix)]
+        let cleanup_result = if let Some(session) = self
+            .terminal_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            session.cleanup()
+        } else {
+            Ok(())
+        };
+        #[cfg(not(unix))]
+        let cleanup_result = {
+            emergency_restore_terminal();
+            Ok::<(), io::Error>(())
+        };
         Self::save_history(&self.command_history);
         self.output_manager.enable_stdout();
-        Ok(())
+        cleanup_result.map_err(Into::into)
     }
 
     pub fn is_active(&self) -> bool {
@@ -2318,16 +2718,32 @@ impl TuiRenderer {
     /// Temporarily release the terminal so another full-screen TUI (e.g. the
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
-        let _ = io::stdout().flush();
-        let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
-        disable_raw_mode()?;
+        #[cfg(unix)]
+        if let Some(session) = self
+            .terminal_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            session.cleanup()?;
+        }
+        #[cfg(not(unix))]
+        emergency_restore_terminal();
         Ok(())
     }
 
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
-        enable_raw_mode()?;
-        let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
+        #[cfg(unix)]
+        {
+            *self
+                .terminal_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(TerminalSessionState::activate()?);
+        }
+        #[cfg(not(unix))]
+        crossterm::terminal::enable_raw_mode()?;
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -2340,16 +2756,16 @@ impl TuiRenderer {
     /// deliberately stronger than [`Self::resume`]: emergency restoration
     /// also pops keyboard enhancements and disables bracketed paste.
     pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
-        enable_raw_mode()?;
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::EnableMouseCapture,
-            crossterm::event::EnableBracketedPaste,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
-            ),
-            cursor::Show,
-        );
+        #[cfg(unix)]
+        {
+            *self
+                .terminal_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(TerminalSessionState::activate()?);
+        }
+        #[cfg(not(unix))]
+        crossterm::terminal::enable_raw_mode()?;
         self.output_manager.disable_stdout();
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -2365,7 +2781,18 @@ impl Drop for TuiRenderer {
         // shutdown() sets is_active = false before doing anything, so this is
         // idempotent — if shutdown() already ran, this is a no-op.
         if self.is_active {
+            #[cfg(unix)]
+            if let Some(session) = self
+                .terminal_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = session.cleanup();
+            }
+            #[cfg(not(unix))]
             emergency_restore_terminal();
+            self.output_manager.enable_stdout();
         }
     }
 }

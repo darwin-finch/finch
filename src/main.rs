@@ -1129,6 +1129,8 @@ async fn main() -> Result<()> {
         brain_name,
     )
     .await;
+    let _terminal_session = finch::cli::tui::BinaryTerminalSession::install()
+        .context("Failed to install terminal signal ownership")?;
 
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
@@ -1195,14 +1197,7 @@ async fn main() -> Result<()> {
 fn install_panic_handler() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Emergency terminal cleanup
-        use crossterm::{cursor, execute, terminal};
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            cursor::Show,
-            terminal::Clear(terminal::ClearType::FromCursorDown)
-        );
+        finch::cli::tui::emergency_restore_terminal();
 
         // Call the default panic handler
         default_panic(info);
