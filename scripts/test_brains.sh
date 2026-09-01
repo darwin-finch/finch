@@ -31,23 +31,27 @@ cd "$repo_root"
 built_supervisor="$repo_root/target/debug/finch-test-supervisor"
 pinned_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
 if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
-  # Build only when there is nothing usable to pin. Building unconditionally
-  # made every supervised launcher — including ones that run no cargo at all —
-  # fail whenever the workspace did not compile, which is exactly when the
-  # isolation harness is most wanted.
-  if [[ ! -x "$built_supervisor" && ! -x "$pinned_supervisor" ]]; then
-    cargo build --quiet --bin finch-test-supervisor
-  fi
-  if [[ -x "$built_supervisor" ]] && ! cmp -s "$built_supervisor" "$pinned_supervisor" 2>/dev/null; then
-    # Stage beside the target and rename, so a concurrent run never observes a
-    # half-copied supervisor. Refresh only when the bytes differ, so repeated
-    # runs keep the same inode.
-    staging="$pinned_supervisor.$$"
-    trap 'rm -f "$staging"' EXIT
-    install -m 0555 "$built_supervisor" "$staging"
+  # Cargo's fingerprint is the maintained source/build freshness contract.
+  # Merely finding an executable here is not enough: after switching
+  # revisions, both the plain and pinned paths can still contain the previous
+  # checkout's supervisor. In particular, that stale image can predate proof
+  # fields or other authority fixes. Never fall back to it when the current
+  # supervisor does not build; fail before granting test authority instead.
+  cargo build --quiet --target-dir "$repo_root/target" --bin finch-test-supervisor
+
+  # Stage beside the target and rename, so a concurrent run never observes a
+  # half-copied supervisor. Compare the completed staging image, rather than
+  # checking before copying: if another launcher publishes the same current
+  # image while this copy is in progress, retain its inode and remove ours.
+  staging="$pinned_supervisor.$$"
+  trap 'rm -f "$staging"' EXIT
+  install -m 0555 "$built_supervisor" "$staging"
+  if cmp -s "$staging" "$pinned_supervisor" 2>/dev/null; then
+    rm -f "$staging"
+  else
     mv -f "$staging" "$pinned_supervisor"
-    trap - EXIT
   fi
+  trap - EXIT
 fi
 
 default_supervisor="$pinned_supervisor"

@@ -17,9 +17,32 @@ signaler_pid=''
 substitution_pid=''
 supervisor_backup=''
 substitution_restored=''
+launcher_cache_active=''
+launcher_built_backup=''
+launcher_pinned_backup=''
+launcher_source_timestamp_backup=''
+restore_launcher_cache() {
+  [[ -n "$launcher_cache_active" ]] || return 0
+  rm -f -- "$repo_root/target/debug/finch-test-supervisor" \
+    "$repo_root/target/debug/finch-test-supervisor-pinned"
+  if [[ -n "$launcher_built_backup" && -e "$launcher_built_backup" ]]; then
+    mv -f -- "$launcher_built_backup" "$repo_root/target/debug/finch-test-supervisor"
+  fi
+  if [[ -n "$launcher_pinned_backup" && -e "$launcher_pinned_backup" ]]; then
+    mv -f -- "$launcher_pinned_backup" "$repo_root/target/debug/finch-test-supervisor-pinned"
+  fi
+  if [[ -n "$launcher_source_timestamp_backup" && -e "$launcher_source_timestamp_backup" ]]; then
+    touch -r "$launcher_source_timestamp_backup" "$repo_root/src/bin/finch-test-supervisor.rs"
+  fi
+  launcher_cache_active=''
+  launcher_built_backup=''
+  launcher_pinned_backup=''
+  launcher_source_timestamp_backup=''
+}
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
+  restore_launcher_cache
   if [[ -n "$supervisor_backup" && -e "$supervisor_backup" ]]; then
     mv -f -- "$supervisor_backup" "$supervisor"
   fi
@@ -158,6 +181,71 @@ phase=launcher-canonicalizes-default-temp-parent
 env -u FINCH_TEST_TMP_PARENT FINCH_TEST_REAL_HOME="$fake_home" TMPDIR="$temp_parent/" \
   "$repo_root/scripts/test_brains.sh" true
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+# A cached supervisor from a previous checkout is not test authority for the
+# current source. Seed both maintained default paths with an executable that
+# records if it is ever launched, then make the checked-out supervisor source
+# newer than Cargo's cached revision. Before #259's freshness repair, existence
+# alone selected the stale pinned image and this phase exited 88. The maintained
+# launcher must now ask Cargo to reproduce the checked-out target, atomically
+# pin it, and run the requested command without executing the cached program.
+phase=launcher-rebuilds-stale-cached-supervisor
+launcher_built="$repo_root/target/debug/finch-test-supervisor"
+launcher_pinned="$repo_root/target/debug/finch-test-supervisor-pinned"
+launcher_built_backup="$launcher_built.freshness-backup.$$"
+launcher_pinned_backup="$launcher_pinned.freshness-backup.$$"
+stale_supervisor_ran="$scratch/stale-supervisor-ran"
+stale_launcher_diagnostic="$scratch/stale-launcher-diagnostic"
+launcher_source_timestamp_backup="$scratch/supervisor-source-timestamp"
+cp -p "$repo_root/src/bin/finch-test-supervisor.rs" "$launcher_source_timestamp_backup"
+if [[ -e "$launcher_built" ]]; then
+  mv -- "$launcher_built" "$launcher_built_backup"
+else
+  launcher_built_backup=''
+fi
+if [[ -e "$launcher_pinned" ]]; then
+  mv -- "$launcher_pinned" "$launcher_pinned_backup"
+else
+  launcher_pinned_backup=''
+fi
+launcher_cache_active=1
+printf '%s\n' '#!/bin/sh' \
+  'printf "stale cached supervisor executed\n" >"$FINCH_STALE_SUPERVISOR_RAN"' \
+  'exit 88' >"$launcher_pinned"
+chmod 0555 "$launcher_pinned"
+install -m 0555 "$launcher_pinned" "$launcher_built"
+# Coarse-mtime filesystems need a full tick to model a later checkout revision
+# deterministically; otherwise Cargo may legitimately consider equal-second
+# source and fingerprint timestamps unchanged.
+sleep 1
+touch "$repo_root/src/bin/finch-test-supervisor.rs"
+stale_launcher_status=0
+env -u FINCH_TEST_SUPERVISOR_BIN \
+  FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_STALE_SUPERVISOR_RAN="$stale_supervisor_ran" \
+  "$repo_root/scripts/test_brains.sh" true 2>"$stale_launcher_diagnostic" || \
+  stale_launcher_status=$?
+if [[ "$stale_launcher_status" -ne 0 ]]; then
+  echo "maintained launcher returned $stale_launcher_status instead of rebuilding its stale cached supervisor" >&2
+  sed 's/^/launcher diagnostic: /' "$stale_launcher_diagnostic" >&2
+  exit 1
+fi
+if [[ -e "$stale_supervisor_ran" ]]; then
+  echo "maintained launcher executed stale cached supervisor; marker: $(cat "$stale_supervisor_ran")" >&2
+  exit 1
+fi
+if [[ ! -x "$launcher_built" || ! -x "$launcher_pinned" ]] || \
+  ! cmp -s "$launcher_built" "$launcher_pinned"; then
+  echo "maintained launcher did not leave byte-identical executable plain and pinned supervisor images" >&2
+  ls -l "$launcher_built" "$launcher_pinned" >&2 || true
+  exit 1
+fi
+restore_launcher_cache
+if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
+  echo "stale-cache launcher regression left an isolated test HOME under $temp_parent" >&2
+  find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
+  exit 1
+fi
 
 hostile_home="$scratch/hostile-home"
 hostile_target="$scratch/effective-production-finch"
@@ -608,6 +696,7 @@ stubborn_ready_file="$scratch/stubborn.ready"
 stubborn_term_file="$scratch/stubborn.term"
 stubborn_target_file="$scratch/stubborn.target"
 stubborn_home_file="$scratch/stubborn.home"
+stubborn_later_pause_file="$scratch/stubborn.later-paused"
 late_signal_file="$scratch/late-signal.observed"
 phase=signal-during-teardown
 (
@@ -625,7 +714,8 @@ phase=signal-during-teardown
 signal_status=0
 FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" FINCH_STUBBORN_READY_FILE="$stubborn_ready_file" \
 FINCH_STUBBORN_TERM_FILE="$stubborn_term_file" FINCH_STUBBORN_TARGET_FILE="$stubborn_target_file" \
-FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
+FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" \
+FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE="$stubborn_later_pause_file" run_isolated bash -c '
   leader_pid=$BASHPID
   "$FINCH_TEST_SUPERVISOR_BIN" --child-stubborn-probe &
   while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
@@ -637,13 +727,46 @@ FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
 signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
 signaler_pid=''
-test "$signaler_status" -eq 0
-test "$signal_status" -eq 143
-test -s "$late_signal_file" && test -s "$stubborn_term_file"
+if [[ "$signaler_status" -ne 0 ]]; then
+  echo "late teardown signaler returned $signaler_status before observing the first stubborn-child TERM marker" >&2
+  ls -l "$stubborn_target_file" "$stubborn_term_file" "$late_signal_file" >&2 || true
+  exit 1
+fi
+if [[ "$signal_status" -ne 143 ]]; then
+  echo "real supervisor returned $signal_status, expected conventional externally observed SIGTERM status 143" >&2
+  ls -l "$stubborn_term_file" "$stubborn_later_pause_file" >&2 || true
+  exit 1
+fi
+if [[ ! -s "$late_signal_file" ]]; then
+  echo "late signaler did not record the retained-zombie leader it signaled" >&2
+  exit 1
+fi
+if [[ ! -s "$stubborn_later_pause_file" ]]; then
+  echo "stubborn child never paused a later TERM publication before the supervisor's SIGKILL bound" >&2
+  ls -l "$stubborn_term_file" "$stubborn_later_pause_file" >&2 || true
+  exit 1
+fi
+if [[ ! -s "$stubborn_term_file" ]]; then
+  echo "repeated TERM plus SIGKILL erased the first stubborn-child termination marker" >&2
+  ls -l "$stubborn_term_file" "$stubborn_later_pause_file" >&2 || true
+  exit 1
+fi
 stubborn_group="$(cat "$stubborn_pid_file")"
-! kill -0 -- "-$stubborn_group" 2>/dev/null
-test ! -e "$(cat "$stubborn_home_file")"
-test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+if kill -0 -- "-$stubborn_group" 2>/dev/null; then
+  echo "real supervisor returned before stubborn process group $stubborn_group became quiescent" >&2
+  /bin/ps -o pid=,ppid=,pgid=,stat=,command= -g "$stubborn_group" >&2 || true
+  exit 1
+fi
+stubborn_home="$(cat "$stubborn_home_file")"
+if [[ -e "$stubborn_home" ]]; then
+  echo "real supervisor returned before removing stubborn-child isolated HOME $stubborn_home" >&2
+  exit 1
+fi
+if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
+  echo "real supervisor left isolated teardown state under $temp_parent" >&2
+  find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
+  exit 1
+fi
 
 launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tool_passthrough.sh test_tui_debug.sh)
 phase=launcher-probe-closure
