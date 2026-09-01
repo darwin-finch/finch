@@ -718,10 +718,13 @@ pub(super) async fn refresh_context_strip(
 ///
 /// `assistant_rendered` must be what the turn produced, not the wire program
 /// that produced it. Indexing emitted source put 9,288 nodes of raw `(say ...)`
-/// into the dogfood store from only 19 distinct programs — content the user
-/// never saw, and lexically near-identical to every other program because they
-/// all share `(`, `say` and quoting tokens, which is corrosive to a
-/// similarity-driven index (#254).
+/// into the dogfood store from only 19 distinct programs, lexically
+/// near-identical to every other program because they all share `(`, `say` and
+/// quoting tokens, which is corrosive to a similarity-driven index (#254).
+///
+/// The source is not hidden from the user — it renders as a `Program source`
+/// row, expanded by default at three lines or fewer, which is exactly the
+/// `(say ...)` case. It is simply the wrong thing to index.
 async fn persist_completed_turn_memory(
     memory_system: &crate::memory::MemorySystem,
     conversation: &Arc<RwLock<ConversationHistory>>,

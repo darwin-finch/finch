@@ -2229,9 +2229,17 @@ async fn forward_runner_request(
                             Err(error.to_string())
                         }
                     }
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => Err(format!(
+                        "{}{error}",
+                        crate::server::RUNNER_UNAVAILABLE_PREFIX
+                    )),
                 },
-                Err(error) => Err(error.to_string()),
+                // The call itself did not complete: the runner's connection is
+                // broken, which repeats identically for every later run.
+                Err(error) => Err(format!(
+                    "{}{error}",
+                    crate::server::RUNNER_UNAVAILABLE_PREFIX
+                )),
             };
             let _ = request.response_tx.send(result);
         }

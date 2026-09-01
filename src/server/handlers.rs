@@ -1599,7 +1599,6 @@ pub(crate) async fn replay_committed_named_brain_memory(
         return Ok(0);
     }
     let mut projected = 0;
-    let mut rejected = 0usize;
     for run in snapshot
         .runs
         .iter()
@@ -1637,13 +1636,9 @@ pub(crate) async fn replay_committed_named_brain_memory(
             )
             .await
         {
-            Ok(_) => {
-                projected += 1;
-                rejected = 0;
-            }
+            Ok(_) => projected += 1,
             Err(crate::server::RunnerProjectionError::Unavailable(error)) => return Err(error),
             Err(crate::server::RunnerProjectionError::Rejected(message)) => {
-                rejected += 1;
                 tracing::warn!(
                     brain = %name,
                     run_id = %run.run_id.0,
@@ -1651,33 +1646,11 @@ pub(crate) async fn replay_committed_named_brain_memory(
                     "skipping memory replay for one Brain run; the rest of the \
                      replay continues"
                 );
-                // A runner that declines this many in a row is declining for a
-                // reason that is not about any one turn — memory disabled on
-                // the runner, or a whole Brain's worth of rows written by an
-                // older build. Each further attempt is a wasted round trip
-                // under the execution lock.
-                if rejected >= MAX_CONSECUTIVE_PROJECTION_REJECTIONS {
-                    tracing::warn!(
-                        brain = %name,
-                        rejected = MAX_CONSECUTIVE_PROJECTION_REJECTIONS,
-                        "stopping memory replay: the runner declined every recent \
-                         run, so the remaining runs are not worth attempting"
-                    );
-                    return Ok(projected);
-                }
             }
         }
     }
     Ok(projected)
 }
-
-/// How many consecutive per-run rejections end a replay pass.
-///
-/// Small enough that a Brain whose rows were all written by an older build
-/// costs a bounded number of round trips, large enough that a handful of
-/// genuinely per-turn rejections does not stop the pass from reaching the runs
-/// behind them.
-const MAX_CONSECUTIVE_PROJECTION_REJECTIONS: usize = 8;
 
 /// Drain durable work that arrived while the environment runner was absent.
 /// The exact lease that registered the callback must still be current before
@@ -9146,14 +9119,16 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn replay_stops_after_repeated_rejections() {
-        // A whole Brain's worth of rows written by an older build, or memory
-        // disabled on the runner, declines every run for a reason that is not
-        // about any one turn. The pass must stop rather than pay a round trip
-        // per completed run.
+    async fn replay_aborts_when_the_runner_declares_a_systemic_condition() {
+        // The runner answers over a `Result<usize, String>` wire, so a reply
+        // that is systemic rather than about one turn — memory disabled on the
+        // runner, the lease not held, the transport broken — has to say so with
+        // `RUNNER_UNAVAILABLE_PREFIX`. Without that, every such reply looked
+        // per-turn and the pass paid a full IPC round trip and a log line for
+        // every completed run in the Brain, under the execution lock, with
+        // nothing to gain.
         let store = crate::brain::store::BrainStore::with_root("box.local", None);
-        let total = MAX_CONSECUTIVE_PROJECTION_REJECTIONS + 5;
-        let lease = seed_completed_brain_runs(&store, total);
+        let lease = seed_completed_brain_runs(&store, 6);
         let runners = crate::server::BrainRunnerBroker::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
@@ -9168,30 +9143,34 @@ mod handler_tests {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 request
                     .response_tx
-                    .send(Err(
-                        "memory is disabled on the environment runner".to_string()
-                    ))
+                    .send(Err(format!(
+                        "{}memory is disabled on the environment runner",
+                        crate::server::RUNNER_UNAVAILABLE_PREFIX
+                    )))
                     .unwrap();
             }
         });
 
-        let projected = replay_committed_named_brain_memory(
+        let error = replay_committed_named_brain_memory(
             store.clone(),
             runners.clone(),
             "shared".into(),
             lease.lease_id,
         )
         .await
-        .expect("declined runs are not a failure of the pass");
+        .expect_err("a systemic decline must fail the pass, not be skipped");
         drop(runners);
         runner.await.unwrap();
 
-        assert_eq!(projected, 0, "nothing was projected");
+        assert!(
+            error.to_string().contains("memory is disabled"),
+            "the error must carry the runner's reason; got {error}"
+        );
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
-            MAX_CONSECUTIVE_PROJECTION_REJECTIONS,
-            "the pass must stop after {MAX_CONSECUTIVE_PROJECTION_REJECTIONS} \
-             consecutive rejections, not attempt all {total} runs"
+            1,
+            "a systemic decline must stop the pass at the first run, not cost \
+             one round trip per completed run"
         );
     }
 

@@ -5309,15 +5309,20 @@ Rules:\n\
             if self.runner_brain.as_deref() != Some(request.brain.as_str())
                 || !self.home_runner_lease_active
             {
+                // Systemic, not about this turn: every later run in the same
+                // replay fails identically, so say so with the shared prefix.
                 anyhow::bail!(
-                    "frontend does not hold the runner lease for named Brain '{}'",
+                    "{}frontend does not hold the runner lease for named Brain '{}'",
+                    crate::server::RUNNER_UNAVAILABLE_PREFIX,
                     request.brain
                 );
             }
-            let memory = self
-                .memory_system
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("memory is disabled on the environment runner"))?;
+            let memory = self.memory_system.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{}memory is disabled on the environment runner",
+                    crate::server::RUNNER_UNAVAILABLE_PREFIX
+                )
+            })?;
             let provenance = crate::memory::BrainConversationProvenance {
                 brain_id: request.brain_id.0.to_string(),
                 run_id: request.run_id.0.to_string(),

@@ -1156,15 +1156,31 @@ impl BrainRunnerBroker {
                     "named Brain '{brain}' runner dropped memory response"
                 ))
             })?
-            .map_err(RunnerProjectionError::Rejected)
+            .map_err(
+                |message| match message.strip_prefix(RUNNER_UNAVAILABLE_PREFIX) {
+                    Some(reason) => RunnerProjectionError::Unavailable(anyhow::Error::msg(
+                        format!("named Brain '{brain}' runner cannot project memory: {reason}"),
+                    )),
+                    None => RunnerProjectionError::Rejected(message),
+                },
+            )
     }
 }
 
+/// Marks a runner reply as a condition that will repeat for every later run.
+///
+/// The runner answers over a `Result<usize, String>` wire, so a reply that is
+/// systemic rather than about one turn — memory disabled on the runner, the
+/// lease not held, the transport broken — has to say so in the only channel
+/// available. Both sides reference this one constant; it is a two-party
+/// protocol, not a heuristic match on prose.
+pub const RUNNER_UNAVAILABLE_PREFIX: &str = "runner-unavailable: ";
+
 /// Why one memory projection did not happen.
 ///
-/// The split is structural, not a string match: `Unavailable` is constructed
-/// here, from the broker's own view of the registration and the channel;
-/// `Rejected` is whatever the runner itself replied.
+/// `Unavailable` is either constructed by the broker from its own view of the
+/// registration and the channel, or declared by the runner with
+/// `RUNNER_UNAVAILABLE_PREFIX`. `Rejected` is a reply about this turn alone.
 #[derive(Debug)]
 pub enum RunnerProjectionError {
     /// The runner is absent, stale, or gone. Every later projection in the
