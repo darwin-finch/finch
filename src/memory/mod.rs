@@ -19,6 +19,7 @@ pub use quality::{MemoryClassifier, MemoryImportance};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -891,22 +892,52 @@ impl MemorySystem {
     /// each one so an interactive turn is never blocked for long.
     ///
     /// Batches are ordered by `node_id`, so a parent may arrive after its
-    /// child. Children are linked in a final pass once every node is present;
-    /// until then the partially hydrated tree is flat, which retrieval handles
-    /// because it scans nodes rather than traversing.
+    /// child, and the full child lists are only correct once every node is
+    /// present — hence the final linking pass.
+    ///
+    /// But a node cannot be allowed to *look* like a leaf until then. Reads are
+    /// deliberately not gated on hydration, and `MemTree::retrieve` identifies
+    /// leaves as `children.is_empty()`; an unlinked tree therefore makes every
+    /// internal node answer queries, surfacing provisional labels duplicated
+    /// from a child and mean-of-subtree embeddings as if they were memories.
+    /// That is the window this change creates, on the first turn, which is
+    /// exactly when it would be seen.
+    ///
+    /// So the edge list is read first, in one query. It is two integers per
+    /// row — 268 KiB against 131 MiB of embeddings on the dogfood store — so it
+    /// does not reintroduce the startup cost this change exists to remove, and
+    /// every node is linked as its batch lands. The final pass stays, both as a
+    /// safety net and to cover rows written after the edge query.
     async fn hydrate_in_background(
         db: Arc<Mutex<Connection>>,
         tree: Arc<Mutex<MemTree>>,
         state: Arc<HydrationState>,
     ) {
+        // Every parent's child list, before any node lands. See the doc
+        // comment: an unlinked node is indistinguishable from a leaf, and reads
+        // are not gated on hydration.
+        let edges = {
+            let conn = db.lock().await;
+            Self::load_child_edges(&conn)
+        };
+        let edges = match edges {
+            Ok(edges) => edges,
+            Err(error) => {
+                tracing::error!(%error, "MemTree hydration could not read child links");
+                state.fail(error.to_string());
+                return;
+            }
+        };
+
         let mut cursor: Option<u64> = None;
         loop {
-            // The database guard is scoped to the read and nothing else. The
-            // failure handling below needs the tree lock, and taking it while
-            // still holding the database guard would establish a db -> tree
-            // ordering on this path; every other path in this module takes them
-            // in that order or not at all, and keeping it that way is what
-            // stops a future tree -> db holder from deadlocking here.
+            // The database guard is scoped to the read and nothing else, so
+            // it is not held across `link_loaded_children().await` on the
+            // failure path below. (An earlier version of this comment claimed a
+            // db -> tree lock ordering that the module does not actually have:
+            // `stats` nests exactly that way, and nothing nests tree -> db, so
+            // there was no deadlock either before or after. Not holding a tokio
+            // guard across an await is the whole of the reason.)
             let batch = {
                 let conn = db.lock().await;
                 Self::load_batch(&conn, cursor, HYDRATION_BATCH)
@@ -943,7 +974,10 @@ impl MemorySystem {
             {
                 let mut guard = tree.lock().await;
                 let nodes = guard.all_nodes_mut();
-                for node in batch {
+                for mut node in batch {
+                    if let Some(children) = edges.get(&node.id) {
+                        node.children = children.clone();
+                    }
                     nodes.insert(node.id, node);
                 }
             }
@@ -957,9 +991,17 @@ impl MemorySystem {
         state.complete();
     }
 
-    /// Rebuild `children` from the `parent` links of every node currently in
-    /// the tree. A parent can arrive in a later batch than its child, so this
-    /// cannot be done as the batches land.
+    /// Rebuild every `children` list from the `parent` links of the nodes
+    /// actually in the tree, discarding what was there.
+    ///
+    /// Rebuild rather than merge, because the batch loader seeds each node with
+    /// its full stored child list — including children that have not loaded yet
+    /// — so that an unlinked node is never mistaken for a leaf by a read taken
+    /// mid-hydration. Those ids are dangling until their nodes arrive, and
+    /// `MemTree::insert` rejects a dangling child id outright. Writes are gated
+    /// on hydration finishing, so the only way one can reach a write is a
+    /// hydration that *failed* partway: this pass runs there too, and the
+    /// rebuild is what prunes them.
     async fn link_loaded_children(tree: &Arc<Mutex<MemTree>>) {
         let mut guard = tree.lock().await;
         let parents: Vec<(u64, u64)> = guard
@@ -968,16 +1010,37 @@ impl MemorySystem {
             .filter_map(|node| node.parent.map(|parent| (parent, node.id)))
             .collect();
         let nodes = guard.all_nodes_mut();
+        for node in nodes.values_mut() {
+            node.children.clear();
+        }
         for (parent_id, child_id) in parents {
             if let Some(parent) = nodes.get_mut(&parent_id) {
-                if !parent.children.contains(&child_id) {
-                    parent.children.push(child_id);
-                }
+                parent.children.push(child_id);
             }
         }
         for node in nodes.values_mut() {
             node.children.sort_unstable();
         }
+    }
+
+    /// Every parent's child list, as one compact query.
+    ///
+    /// Two integers per row and no embeddings, so this is cheap enough to run
+    /// before the first batch. `idx_tree_nodes_parent` covers the scan.
+    fn load_child_edges(conn: &Connection) -> Result<HashMap<u64, Vec<u64>>> {
+        let mut stmt = conn.prepare(
+            "SELECT parent_id, node_id FROM tree_nodes
+             WHERE parent_id IS NOT NULL ORDER BY node_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+        })?;
+        let mut edges: HashMap<u64, Vec<u64>> = HashMap::new();
+        for row in rows {
+            let (parent, child) = row?;
+            edges.entry(parent).or_default().push(child);
+        }
+        Ok(edges)
     }
 
     /// One page of stored nodes, keyed on the last id already read, without
@@ -1861,6 +1924,79 @@ mod tests {
                 .children,
             vec![5],
             "a child in an earlier batch must be linked to its later parent"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_read_during_hydration_returns_no_internal_aggregate_nodes() -> Result<()> {
+        // Reads are deliberately not gated on hydration — serving what has
+        // loaded beats blocking a turn — so the first turn of a session queries
+        // a partially hydrated tree. `MemTree::retrieve` identifies leaves as
+        // `children.is_empty()`, and linking children only in a final pass made
+        // every internal node answer that predicate for the whole window: one
+        // memory occupying several result slots, and mean-of-subtree embeddings
+        // surfaced as if they were memories, on exactly the turn a user is most
+        // likely to be typing during. Loading the edge list before the first
+        // batch is what fixes it.
+        const NODES: u64 = 4 * HYDRATION_BATCH as u64;
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        // Node 2's parent becomes node 1, so node 1 is a genuine internal node
+        // and both are in the first batch.
+        seed_tree_nodes(temp.path(), NODES, &[(2, 1)])?;
+
+        let memory = MemorySystem::new(config)?;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if !matches!(
+                memory.hydration_status(),
+                HydrationStatus::Loading { loaded: 0, .. }
+            ) {
+                break;
+            }
+        }
+
+        // Holding the tree lock freezes hydration, so the two assertions below
+        // see the same state.
+        {
+            let tree = memory.tree.lock().await;
+            assert!(
+                tree.all_nodes().len() < NODES as usize,
+                "this test is only meaningful mid-hydration; the whole store \
+                 loaded before the read"
+            );
+            assert!(
+                tree.all_nodes().contains_key(&2),
+                "the first batch must have landed"
+            );
+            assert!(
+                !tree
+                    .all_nodes()
+                    .get(&1)
+                    .expect("node 1 is in the first batch")
+                    .children
+                    .is_empty(),
+                "an internal node must not look like a leaf before its children \
+                 are linked; retrieval would return it"
+            );
+        }
+
+        // And the production boundary: the query itself must not return it.
+        let results = memory.query("seeded node", Some(NODES as usize)).await?;
+        assert!(
+            !results.is_empty(),
+            "the read must return the memories that have loaded"
+        );
+        assert!(
+            !results.iter().any(|text| text == "seeded node 1"),
+            "node 1 is an internal aggregate: its text is a label duplicated \
+             from a child and its embedding is a mean, so it must never be a \
+             query result"
         );
         Ok(())
     }
