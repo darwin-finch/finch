@@ -89,6 +89,33 @@ struct HydrationState {
     failure: std::sync::Mutex<Option<String>>,
 }
 
+/// Opens the write gate if the loader ends without finishing.
+///
+/// Moved into the spawned future, so it is dropped however that future ends: a
+/// panic unwinding through it, an `abort()`, or a runtime shutting down before
+/// the task is ever polled. Without it those three cases left `done` false
+/// forever — and because the `watch::Sender` lives inside the
+/// `Arc<HydrationState>` that `MemorySystem` holds, it is never dropped either,
+/// so `changed()` does not even return `Err`. Every subsequent write waited on
+/// a completion that could not arrive, with no timeout and no error.
+///
+/// A guard rather than awaiting the `JoinHandle` in a supervisor task, because
+/// a supervisor is one more thing that can itself be dropped. This cannot be
+/// forgotten: it is owned by the future whose ending it reports.
+struct HydrationGuard(Arc<HydrationState>);
+
+impl Drop for HydrationGuard {
+    fn drop(&mut self) {
+        if !*self.0.done.borrow() {
+            self.0.fail(
+                "the MemTree loader ended without finishing: it panicked, was \
+                 aborted, or its runtime shut down before it could run"
+                    .to_string(),
+            );
+        }
+    }
+}
+
 impl HydrationState {
     fn new(total: usize) -> Self {
         Self {
@@ -154,6 +181,20 @@ pub struct MemorySystem {
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
     hydration: Arc<HydrationState>,
+    /// Owned so the loader does not outlive the store it is loading.
+    ///
+    /// A discarded handle left the task decoding the whole database into a tree
+    /// nobody would read, holding its connection and contending for the mutex
+    /// with whatever opened the store next.
+    hydration_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MemorySystem {
+    fn drop(&mut self) {
+        if let Some(task) = self.hydration_task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Canonical source identity for a conversation pair projected from one
@@ -414,26 +455,78 @@ impl MemorySystem {
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
         let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
+        let mut hydration_task = None;
 
         if node_count > 0 {
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
+            // Spawn ONLY on a multi-threaded runtime.
+            //
+            // `Handle::try_current()` succeeds on a current-thread runtime too,
+            // and spawning there is what made `mem-store` deadlock:
+            // `block_on_host` blocks the single scheduler thread waiting for a
+            // write, the write waits for the loader, and the loader cannot be
+            // polled because the thread it needs is the one blocking. Bounding
+            // that wait does not help either — the blocked `Runtime::block_on`
+            // owns the time driver, so a `tokio::time::timeout` around it never
+            // fires. An earlier version of this change claimed the bound
+            // covered this case; it does not, and the hang reproduces in over
+            // 200 seconds.
+            //
+            // A current-thread runtime therefore loads synchronously, exactly
+            // as a caller with no runtime does. There is no task to starve.
+            // `try_lock` rather than `blocking_lock`, which panics inside an
+            // async context: nothing else holds these `Arc`s yet, so it cannot
+            // contend.
+            let flavor = tokio::runtime::Handle::try_current()
+                .map(|handle| handle.runtime_flavor())
+                .ok();
+            match flavor {
+                Some(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                    let handle = tokio::runtime::Handle::current();
                     let db = Arc::clone(&db);
                     let tree = Arc::clone(&tree);
                     let state = Arc::clone(&hydration);
-                    handle.spawn(async move {
+                    // Constructed HERE, outside the async block, and moved in.
+                    //
+                    // Building it inside the block means it does not exist
+                    // until the future is first polled — so a task aborted or
+                    // dropped before it ever runs never creates the guard and
+                    // never drops it, which is precisely the "never scheduled"
+                    // case this is for. Capturing it makes it part of the
+                    // future from the moment the future exists.
+                    let guard = HydrationGuard(Arc::clone(&state));
+                    hydration_task = Some(handle.spawn(async move {
+                        let _guard = guard;
                         Self::hydrate_in_background(db, tree, state).await;
-                    });
+                    }));
                 }
-                Err(_) => {
-                    // No runtime: tests and synchronous callers keep the
-                    // original blocking behaviour rather than silently
-                    // starting with an empty index.
-                    let mut guard = tree.blocking_lock();
-                    let conn = db.blocking_lock();
+                _ => {
+                    // A current-thread runtime, or no runtime at all.
+                    let mut guard = tree
+                        .try_lock()
+                        .expect("a newly constructed MemTree cannot be contended");
+                    let conn = db
+                        .try_lock()
+                        .expect("a newly opened connection cannot be contended");
                     if let Err(error) = Self::load_tree_from_db_conn(&conn, &mut guard) {
-                        tracing::warn!(%error, "Failed to load MemTree (starting fresh)");
-                        hydration.fail(error.to_string());
+                        // Start fresh, and mean it. This used to `fail()` the
+                        // state, which since writes now refuse a failed index
+                        // would have turned "starting fresh" into "this store
+                        // accepts no writes for the rest of the process" — a
+                        // log line saying the opposite of what the code did.
+                        // An unreadable tree is a fresh tree; `next_id` is
+                        // already past the highest stored id, so a write cannot
+                        // collide with a row that did not load.
+                        tracing::warn!(
+                            %error,
+                            "Failed to load MemTree; starting with an empty index"
+                        );
+                        hydration
+                            .loaded
+                            .store(0, std::sync::atomic::Ordering::SeqCst);
+                        hydration
+                            .total
+                            .store(0, std::sync::atomic::Ordering::SeqCst);
+                        hydration.complete();
                     } else {
                         // `size()` excludes the root; the background arm
                         // counts rows, which include it. Count rows on both so
@@ -451,6 +544,7 @@ impl MemorySystem {
             db,
             tree,
             hydration,
+            hydration_task,
             insert_lock: Arc::new(Mutex::new(())),
             embedding_engine,
             config,
@@ -507,9 +601,6 @@ impl MemorySystem {
         session_id: Option<&str>,
         provenance: Option<&BrainConversationProvenance>,
     ) -> Result<bool> {
-        // A memory placed against a half-loaded tree lands in the wrong part of
-        // the structure, and that placement is persisted.
-        self.ensure_hydrated().await;
         let _insert_guard = self.insert_lock.lock().await;
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
@@ -593,6 +684,21 @@ impl MemorySystem {
         if already_classified {
             return Ok(inserted);
         }
+
+        // The gate guards semantic placement, and only that.
+        //
+        // A memory placed against a half-loaded tree lands in the wrong part of
+        // the structure, and that placement is persisted — so the tree insert
+        // below has to wait. But it used to sit at the top of this function,
+        // ahead of the `INSERT INTO conversations` above, so a refused write
+        // dropped the raw turn as well as its index entry. That is worse than
+        // the misplacement it was preventing: raw history is the thing a user
+        // cannot reconstruct.
+        //
+        // Refusing here leaves the conversation row written and no
+        // `memory_sources` row, which is exactly the state a later
+        // re-projection repairs.
+        self.ensure_hydrated().await?;
 
         // Quality filter: classify and extract key content before indexing.
         // Low-signal content (acks, greetings) is skipped in MemTree but still
@@ -1188,20 +1294,42 @@ impl MemorySystem {
     /// durable. Reads deliberately do not — serving the memories loaded so far
     /// is better than blocking a turn, and `hydration_status` reports when the
     /// view is partial.
-    pub async fn ensure_hydrated(&self) {
+    pub async fn ensure_hydrated(&self) -> Result<()> {
         let mut rx = self.hydration.done.subscribe();
         loop {
             if *rx.borrow_and_update() {
-                return;
+                break;
             }
             // The value is retained, so a completion between the check above
             // and this await is observed on the next iteration rather than
             // lost. An `Err` means the sender is gone, which cannot happen
             // while `self` holds the state, but returning is the safe read.
             if rx.changed().await.is_err() {
-                return;
+                break;
             }
         }
+
+        // No timeout here, deliberately.
+        //
+        // An earlier version of this change wrapped the wait in
+        // `tokio::time::timeout`, which was wrong twice. It could not fire in
+        // the case it was written for — a current-thread runtime blocked in
+        // `block_on_host` owns the time driver, so the `Sleep` never
+        // advances — and where it *could* fire, it turned a latency signal
+        // into a permanent verdict: a store that hydrated in 75 seconds
+        // tripped the bound at 60, and because nothing clears `failure`, every
+        // write for the rest of the process was refused, blaming a loader that
+        // had in fact succeeded.
+        //
+        // The current-thread case is now structurally impossible: that flavor
+        // loads synchronously in `new`, so there is no task to starve. What
+        // remains is a multi-threaded loader that ends without finishing, and
+        // `HydrationGuard` covers that by construction rather than by waiting
+        // a guessed interval.
+        if let HydrationStatus::Failed { reason } = self.hydration.status() {
+            anyhow::bail!("MemTree hydration failed, so this write cannot be placed: {reason}");
+        }
+        Ok(())
     }
 
     fn load_tree_from_db_conn(conn: &Connection, tree: &mut MemTree) -> Result<()> {
@@ -1749,89 +1877,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_startup_does_not_block_on_hydration() -> Result<()> {
-        // #242: `MemorySystem::new` decoded every stored embedding before
-        // returning — 131 MiB on the dogfood store, 3.25 s to first prompt.
-        // Construction must return before the index is loaded.
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        // Populate a store worth hydrating.
-        {
-            let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
-            for i in 0..40 {
-                memory
-                    .insert_conversation(
-                        "system",
-                        &format!(
-                            "Deployment note {i}: the signing key for environment \
-                             {i} lives in the Employee vault, not the repository."
-                        ),
-                        None,
-                        None,
-                    )
-                    .await?;
-            }
-        }
-
-        // Reopen. Construction happens inside a Tokio runtime, so hydration is
-        // backgrounded and the status is observable.
-        let reopened = MemorySystem::new(config)?;
-        let status = reopened.hydration_status();
-        assert!(
-            matches!(status, HydrationStatus::Loading { loaded: 0, .. }),
-            "construction must return BEFORE the index is loaded; got {status:?}"
-        );
-        // `Loading` and not merely "Loading or Ready": accepting `Ready` here
-        // would accept the blocking behaviour this test exists to prevent, and
-        // the test could not fail if the change were reverted.
-        //
-        // Deterministic rather than racy: `#[tokio::test]` runs a
-        // current-thread runtime, so the task spawned inside `new` cannot make
-        // progress until this test awaits, which it has not yet done.
-
-        // And it must complete, with every node present.
-        reopened.ensure_hydrated().await;
-        match reopened.hydration_status() {
-            HydrationStatus::Ready { nodes } => {
-                assert!(nodes >= 40, "every persisted node must load; got {nodes}");
-            }
-            other => panic!("hydration did not complete: {other:?}"),
-        }
-
-        // The rebuilt structure must match what a blocking load produces:
-        // children linked, not a flat list.
-        let linked = {
-            let tree = reopened.tree.lock().await;
-            tree.all_nodes()
-                .values()
-                .filter(|node| !node.children.is_empty())
-                .count()
-        };
-        assert!(
-            linked > 0,
-            "the final pass must link children; a flat tree means the parent \
-             links were dropped"
-        );
-
-        Ok(())
-    }
-
-    /// Wait for background hydration to finish WITHOUT parking a waiter on the
-    /// completion channel.
-    ///
-    /// Every other hydration test here calls `ensure_hydrated`, which
-    /// subscribes — and a live subscriber is exactly what
-    /// `watch::Sender::send` needs in order to store its value. That made the
-    /// whole module blind to a completion that never latched. Polling the
-    /// progress counters instead reproduces the production sequence: hydration
-    /// finishes with nobody listening, and the first later waiter has to
-    /// observe the retained value.
     async fn await_hydration_without_subscribing(memory: &MemorySystem) {
         // Phase 1: every stored node counted.
         //
@@ -1873,10 +1918,40 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    fn seed_tree_nodes(path: &std::path::Path, count: u64, overrides: &[(u64, u64)]) -> Result<()> {
+        let conn = Connection::open(path)?;
+        let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
+        let tx = conn.unchecked_transaction()?;
+        for id in 0..count {
+            let parent = if id == 0 { None } else { Some(0i64) };
+            tx.execute(
+                "INSERT OR REPLACE INTO tree_nodes
+                 (node_id, parent_id, text, embedding, level, created_at, importance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    id as i64,
+                    parent,
+                    format!("seeded node {id}"),
+                    embedding,
+                    if id == 0 { 0i64 } else { 1i64 },
+                    id as i64,
+                ],
+            )?;
+        }
+        for (child, parent) in overrides {
+            tx.execute(
+                "UPDATE tree_nodes SET parent_id = ?1 WHERE node_id = ?2",
+                params![*parent as i64, *child as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     async fn write_after_hydration_completes(config: MemoryConfig) -> Result<()> {
         {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..40 {
                 memory
                     .insert_conversation(
@@ -1926,44 +2001,91 @@ mod tests {
         Ok(())
     }
 
-    /// Write `count` nodes straight into `tree_nodes`, cheaply.
-    ///
-    /// Going through `insert_conversation` would embed and re-persist the whole
-    /// tree per memory, which is quadratic and far too slow to reach the batch
-    /// size. `overrides` re-points a child at a parent by id, applied after
-    /// every row exists so the self-referential foreign key is satisfied even
-    /// when the parent has the higher id.
-    fn seed_tree_nodes(path: &std::path::Path, count: u64, overrides: &[(u64, u64)]) -> Result<()> {
-        let conn = Connection::open(path)?;
-        let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
-        let tx = conn.unchecked_transaction()?;
-        for id in 0..count {
-            let parent = if id == 0 { None } else { Some(0i64) };
-            tx.execute(
-                "INSERT OR REPLACE INTO tree_nodes
-                 (node_id, parent_id, text, embedding, level, created_at, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-                params![
-                    id as i64,
-                    parent,
-                    format!("seeded node {id}"),
-                    embedding,
-                    if id == 0 { 0i64 } else { 1i64 },
-                    id as i64,
-                ],
-            )?;
+    // Multi-thread: the only flavor that backgrounds the load. A
+    // current-thread runtime now loads synchronously, so there is nothing here
+    // to observe — and production runs multi-thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_startup_does_not_block_on_hydration() -> Result<()> {
+        // #242: `MemorySystem::new` decoded every stored embedding before
+        // returning — 131 MiB on the dogfood store, 3.25 s to first prompt.
+        // Construction must return before the index is loaded.
+        //
+        // Asserted by comparison rather than against a fixed threshold, and
+        // rather than against an immediate `Loading` status. The old assertion
+        // relied on a current-thread runtime being unable to poll the loader
+        // until the test awaited; under the flavor production actually runs,
+        // the loader may well have started, so that assertion was pinned to a
+        // configuration nothing ships. Timing the same store loaded both ways
+        // measures the property directly and cannot be satisfied by a blocking
+        // load.
+        const NODES: u64 = 4 * HYDRATION_BATCH as u64;
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), NODES, &[])?;
+
+        // The blocking load, on a thread with no runtime.
+        let blocking_config = config.clone();
+        let blocking = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let memory = MemorySystem::new(blocking_config).expect("blocking construction");
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(memory.hydration_status(), HydrationStatus::Ready { .. }),
+                "the no-runtime arm must finish loading before it returns"
+            );
+            elapsed
+        })
+        .join()
+        .expect("blocking construction thread");
+
+        // The backgrounded one.
+        let started = std::time::Instant::now();
+        let reopened = MemorySystem::new(config)?;
+        let backgrounded = started.elapsed();
+
+        assert!(
+            backgrounded * 4 < blocking,
+            "construction must return before the index is loaded: backgrounded \
+             {backgrounded:?} against a blocking load of {blocking:?} for the \
+             same {NODES}-node store"
+        );
+
+        // And it must still complete, with every node present.
+        reopened.ensure_hydrated().await?;
+        match reopened.hydration_status() {
+            HydrationStatus::Ready { nodes } => assert_eq!(
+                nodes as u64, NODES,
+                "every persisted node must load; got {nodes}"
+            ),
+            other => panic!("hydration did not complete: {other:?}"),
         }
-        for (child, parent) in overrides {
-            tx.execute(
-                "UPDATE tree_nodes SET parent_id = ?1 WHERE node_id = ?2",
-                params![*parent as i64, *child as i64],
-            )?;
-        }
-        tx.commit()?;
+
+        // The rebuilt structure must match what a blocking load produces:
+        // children linked, not a flat list.
+        let linked = {
+            let tree = reopened.tree.lock().await;
+            tree.all_nodes()
+                .values()
+                .filter(|node| !node.children.is_empty())
+                .count()
+        };
+        assert!(
+            linked > 0,
+            "the final pass must link children; a flat tree means the parent \
+             links were dropped"
+        );
+
         Ok(())
     }
 
-    #[tokio::test]
+    // Multi-thread: the only flavor that spawns the background loader.
+    // It exists for the paging loop, which a current-thread runtime never
+    // enters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_hydration_pages_across_batches_and_links_late_parents() -> Result<()> {
         // Every other hydration test seeds 30-40 conversations, so the paging
         // loop this PR introduces runs its body exactly once and stops. The
@@ -1987,7 +2109,7 @@ mod tests {
         seed_tree_nodes(temp.path(), NODES, &[(5, late_parent)])?;
 
         let memory = MemorySystem::new(config)?;
-        memory.ensure_hydrated().await;
+        memory.ensure_hydrated().await?;
 
         match memory.hydration_status() {
             HydrationStatus::Ready { nodes } => assert_eq!(
@@ -2166,7 +2288,216 @@ mod tests {
         Ok(())
     }
 
+    /// #276. A loader that ends without finishing must open the write gate
+    /// with a diagnosis, not leave it shut forever.
+    ///
+    /// The `watch::Sender` lives inside the `Arc<HydrationState>` that
+    /// `MemorySystem` holds, so it is never dropped and `changed()` never
+    /// returns `Err`. Nothing else would ever have woken a waiter.
+    #[test]
+    fn test_a_loader_that_ends_without_finishing_opens_the_gate_as_failed() {
+        let state = Arc::new(HydrationState::new(100));
+        assert!(
+            matches!(state.status(), HydrationStatus::Loading { .. }),
+            "precondition: the gate starts shut"
+        );
+
+        // However the loader's future ends — panic, abort, runtime shutdown —
+        // the guard it owns is dropped.
+        drop(HydrationGuard(Arc::clone(&state)));
+
+        match state.status() {
+            HydrationStatus::Failed { reason } => assert!(
+                reason.contains("ended without finishing"),
+                "the diagnosis must say the loader stopped early; got {reason:?}"
+            ),
+            other => panic!("the gate must open as failed; got {other:?}"),
+        }
+        assert!(
+            *state.done.borrow(),
+            "a waiter must be released, not left parked on a completion that \
+             cannot arrive"
+        );
+    }
+
+    /// A loader that finished is not overwritten by its own guard dropping.
+    #[test]
+    fn test_the_guard_does_not_disturb_a_loader_that_finished() {
+        let state = Arc::new(HydrationState::new(1));
+        state.loaded.store(1, Ordering::SeqCst);
+        state.complete();
+        drop(HydrationGuard(Arc::clone(&state)));
+        assert!(
+            matches!(state.status(), HydrationStatus::Ready { .. }),
+            "got {:?}",
+            state.status()
+        );
+    }
+
+    // Multi-thread, because that is the only flavor that spawns the
+    // background loader now — a current-thread runtime loads
+    // synchronously, so there is no task for this to observe. It is
+    // also the flavor production runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_an_aborted_loader_releases_a_waiting_write() -> Result<()> {
+        // Aborts the handle `MemorySystem::new` actually spawned, not a task
+        // the test built for itself. An earlier version did the latter, and
+        // removing the guard from the production spawn site then failed
+        // nothing — the test proved the guard type worked while leaving the
+        // one place it has to be installed uncovered.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        // Enough rows that the loader is still working when it is aborted.
+        seed_tree_nodes(temp.path(), 4 * HYDRATION_BATCH as u64, &[])?;
+
+        let memory = MemorySystem::new(config)?;
+        memory
+            .hydration_task
+            .as_ref()
+            .expect("a store with rows must spawn a loader")
+            .abort();
+        // Let the runtime process the cancellation and drop the future.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if !matches!(memory.hydration_status(), HydrationStatus::Loading { .. }) {
+                break;
+            }
+        }
+
+        let error = memory
+            .ensure_hydrated()
+            .await
+            .expect_err("an aborted loader must fail the write, not hang it");
+        assert!(
+            error.to_string().contains("ended without finishing"),
+            "the write must be refused for the reason the guard recorded, not \
+             by the timeout; got {error}"
+        );
+        Ok(())
+    }
+
+    /// A refused index write must still keep the raw turn.
+    ///
+    /// The gate used to sit at the top of `insert_conversation_record`, ahead
+    /// of the `INSERT INTO conversations`, so refusing dropped the raw turn as
+    /// well as its index entry — worse than the misplacement it was
+    /// preventing, because raw history is the thing a user cannot
+    /// reconstruct. It also leaves no `memory_sources` row, which is the state
+    /// a later re-projection repairs.
     #[tokio::test]
+    async fn test_a_refused_index_write_still_keeps_the_raw_conversation() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        // Fail hydration the way a loader that ended without finishing does.
+        memory
+            .hydration
+            .fail("loader ended without finishing".to_string());
+
+        let error = memory
+            .insert_conversation(
+                "user",
+                "A turn written while the index was unusable. It is long enough \
+                 for the quality classifier to want to index it.",
+                None,
+                Some("session-1"),
+            )
+            .await
+            .expect_err("a failed index must refuse the placement");
+        assert!(
+            error.to_string().contains("cannot be placed"),
+            "got {error}"
+        );
+
+        let conn = memory.db.lock().await;
+        let rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+        assert_eq!(
+            rows, 1,
+            "the raw turn must survive: refusing to place a memory is not a \
+             reason to lose the conversation"
+        );
+        let sources: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?;
+        assert_eq!(
+            sources, 0,
+            "and it must be left unindexed, so a re-projection can repair it"
+        );
+        Ok(())
+    }
+
+    /// A current-thread runtime does not spawn a loader at all, so there is
+    /// nothing to starve and nothing to wait on.
+    ///
+    /// Spawning there was a real hazard: `Handle::try_current()` succeeds on a
+    /// current-thread runtime, and a loader spawned onto it cannot be polled
+    /// while any synchronous caller blocks the single scheduler thread. A
+    /// timeout could not have rescued it either — that blocked thread owns the
+    /// time driver, so the `Sleep` never fires, which is why an earlier
+    /// attempt at bounding the wait hung for over 200 seconds while claiming
+    /// to be bounded.
+    ///
+    /// The multi-threaded counterpart is `typed_mem_store_completes_on_a_single_worker_runtime`
+    /// in `src/runtime`, which drives the real submit API.
+    #[tokio::test]
+    async fn test_a_current_thread_runtime_loads_without_spawning_a_loader() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        const NODES: u64 = 2 * HYDRATION_BATCH as u64;
+        const LATE_PARENT: u64 = HYDRATION_BATCH as u64 + 8;
+        seed_tree_nodes(temp.path(), NODES, &[(5, LATE_PARENT)])?;
+
+        let memory = MemorySystem::new(config)?;
+        assert!(
+            memory.hydration_task.is_none(),
+            "a current-thread runtime must not spawn a loader it cannot poll"
+        );
+        match memory.hydration_status() {
+            HydrationStatus::Ready { nodes } => assert_eq!(nodes as u64, NODES),
+            other => panic!("construction must finish the load here; got {other:?}"),
+        }
+
+        // The write that used to deadlock. It completes because the gate is
+        // already open, not because anything timed out.
+        memory
+            .insert_conversation(
+                "system",
+                "A memory written from a current-thread runtime, which is how \
+                 mem-store reaches this through block_on_host.",
+                None,
+                None,
+            )
+            .await?;
+
+        // And the structure is the one the batched loader would have built.
+        let tree = memory.tree.lock().await;
+        assert_eq!(
+            tree.all_nodes()
+                .get(&LATE_PARENT)
+                .expect("the late parent must load")
+                .children,
+            vec![5],
+            "the synchronous load must link children just as the batched one does"
+        );
+        Ok(())
+    }
+
+    // Multi-thread, because that is the only flavor that spawns the
+    // background loader now — a current-thread runtime loads
+    // synchronously, so there is no task for this to observe. It is
+    // also the flavor production runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_a_read_during_hydration_returns_no_internal_aggregate_nodes() -> Result<()> {
         // Reads are deliberately not gated on hydration — serving what has
         // loaded beats blocking a turn — so the first turn of a session queries
@@ -2189,29 +2520,42 @@ mod tests {
         seed_tree_nodes(temp.path(), NODES, &[(2, 1)])?;
 
         let memory = MemorySystem::new(config)?;
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            if !matches!(
-                memory.hydration_status(),
-                HydrationStatus::Loading { loaded: 0, .. }
-            ) {
-                break;
-            }
-        }
 
-        // Holding the tree lock freezes hydration, so the two assertions below
-        // see the same state.
+        // Poll for the state this test needs — at least one batch landed, not
+        // all of them — rather than for a status the loader passes through.
+        // The old loop broke as soon as `loaded` left zero and then took the
+        // tree lock separately, which under the multi-threaded flavor is a
+        // different instant.
+        let mut window = None;
+        for _ in 0..5_000 {
+            {
+                let tree = memory.tree.lock().await;
+                let loaded = tree.all_nodes().len();
+                if tree.all_nodes().contains_key(&2) && loaded < NODES as usize {
+                    window = Some(loaded);
+                    break;
+                }
+                if loaded >= NODES as usize {
+                    panic!(
+                        "the whole store loaded before the read; this test is \
+                         only meaningful mid-hydration"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+        }
+        let loaded_when_observed =
+            window.expect("the loader never reached a partially loaded state");
+
+        // Re-taken and held across every assertion below, so they all see one
+        // state rather than three.
         {
             let tree = memory.tree.lock().await;
             assert!(
-                tree.all_nodes().len() < NODES as usize,
-                "this test is only meaningful mid-hydration; the whole store \
-                 loaded before the read"
+                tree.all_nodes().len() >= loaded_when_observed,
+                "hydration must only ever add nodes"
             );
-            assert!(
-                tree.all_nodes().contains_key(&2),
-                "the first batch must have landed"
-            );
+
             assert!(
                 !tree
                     .all_nodes()
@@ -2239,7 +2583,11 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    // Multi-thread, because that is the only flavor that spawns the
+    // background loader now — a current-thread runtime loads
+    // synchronously, so there is no task for this to observe. It is
+    // also the flavor production runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_failed_hydration_links_what_loaded_before_releasing_writes() -> Result<()> {
         // `fail()` completes, and completing opens the write gate. It used to
         // return before the child-linking pass, so every loaded node kept an
@@ -2267,7 +2615,18 @@ mod tests {
         }
 
         let memory = MemorySystem::new(config)?;
-        memory.ensure_hydrated().await;
+        // Returns an error, not `Ok`: a hydration that failed cannot place a
+        // write, so #276 refuses one rather than letting it land in whatever
+        // loaded. What matters for *this* test is that it returns at all — the
+        // gate opened — which is the ordering pinned below.
+        let refused = memory
+            .ensure_hydrated()
+            .await
+            .expect_err("a failed hydration must refuse writes, not accept them");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "got {refused}"
+        );
 
         match memory.hydration_status() {
             HydrationStatus::Failed { .. } => {}
@@ -2420,7 +2779,10 @@ mod tests {
         .await
     }
 
-    #[tokio::test]
+    // Multi-thread: the only flavor that spawns the background loader.
+    // Its "stored while the index was still loading" premise needs a loader
+    // that is actually running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_hydration_does_not_lose_or_overwrite_stored_memories() -> Result<()> {
         // `next_id` is advanced past `MAX(node_id)` before any batch lands.
         // Without it a write takes id 1 and `nodes.insert(1, ..)` overwrites
@@ -2439,7 +2801,7 @@ mod tests {
 
         let before = {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..30 {
                 memory
                     .insert_conversation(
@@ -2465,7 +2827,7 @@ mod tests {
                 None,
             )
             .await?;
-        reopened.ensure_hydrated().await;
+        reopened.ensure_hydrated().await?;
 
         assert_eq!(
             reopened.stats().await?.tree_node_count,
@@ -2500,7 +2862,11 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    // Multi-thread: the only flavor that spawns the background loader.
+    // Its whole point is that the batched loader reproduces the blocking one.
+    // On a current-thread runtime it compared `load_tree_from_db_conn` against
+    // itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_background_hydration_reproduces_the_blocking_load_exactly() -> Result<()> {
         // The highest-value property: whatever the background loader builds
         // must be node-for-node what the blocking loader builds. Batching by
@@ -2514,7 +2880,7 @@ mod tests {
         };
         {
             let memory = MemorySystem::new(config.clone())?;
-            memory.ensure_hydrated().await;
+            memory.ensure_hydrated().await?;
             for i in 0..40 {
                 memory
                     .insert_conversation(
@@ -2532,7 +2898,7 @@ mod tests {
 
         // Background path.
         let background = MemorySystem::new(config.clone())?;
-        background.ensure_hydrated().await;
+        background.ensure_hydrated().await?;
         let background_nodes = {
             let tree = background.tree.lock().await;
             let mut nodes: Vec<(u64, Option<u64>, usize, Vec<u64>, String)> = tree

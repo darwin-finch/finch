@@ -767,20 +767,37 @@ async fn persist_completed_turn_memory(
     } else {
         explicit_query.to_string()
     };
+    // Logged rather than discarded.
+    //
+    // These were `let _ =`, which was survivable while the only failures were
+    // transient. It is not survivable now that a failed MemTree hydration
+    // refuses writes for the rest of the process (#276): memory capture would
+    // stop for the whole session with no signal anywhere, while the status line
+    // below went on reporting recalls from the index that had loaded.
+    //
+    // Not propagated: the turn itself succeeded and the user has their answer,
+    // so failing it here would be worse. A warning per turn is the honest
+    // middle, until #275 gives memory a status surface of its own.
     if !user_text.is_empty() {
-        let _ = memory_system
+        if let Err(error) = memory_system
             .insert_conversation("user", &user_text, Some(model), Some(session_label))
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "could not store the user turn in memory");
+        }
     }
     if !assistant_rendered.as_str().trim().is_empty() {
-        let _ = memory_system
+        if let Err(error) = memory_system
             .insert_conversation(
                 "assistant",
                 assistant_rendered.as_str(),
                 Some(model),
                 Some(session_label),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "could not store the assistant turn in memory");
+        }
     }
     status_bar.update_line(
         crate::cli::status_bar::StatusLineType::MemoryContext,
