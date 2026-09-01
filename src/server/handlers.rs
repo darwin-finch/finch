@@ -4963,12 +4963,26 @@ mod handler_tests {
         );
         forwarding.await;
 
-        // Dropping the daemon RPC retires that callback generation. A safe
-        // frontend reconnect explicitly registers a fresh generation before
-        // the recovered durable lane is reused.
+        // A Compatible callback channel is the conservative physical owner for
+        // every request dequeued from that frontend loop. Install the successor
+        // first so it remains pending, then close the entire old loop before
+        // waiting for exact promotion.
         let (replacement_runner_tx, mut replacement_runner_rx) =
             tokio::sync::mpsc::unbounded_channel();
-        lifecycle.register_test_runner("shared", lease.lease_id, replacement_runner_tx);
+        let replacement_registration =
+            server
+                .brain_runners()
+                .register("shared", lease.lease_id, replacement_runner_tx);
+        drop(runner_rx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server
+                .brain_runners()
+                .wait_registration_active("shared", replacement_registration),
+        )
+        .await
+        .expect("fresh Compatible runner did not activate after the disconnected callback loop physically closed")
+        .expect("fresh Compatible runner registration was retired instead of promoted");
 
         let replacement = lifecycle
             .attach(
@@ -5101,8 +5115,14 @@ mod handler_tests {
                 .count()
         );
         assert!(
-            runner_rx.try_recv().is_err(),
-            "terminal disconnect sent runner cancellation"
+            server.brain_runners().has_exact_registration(
+                "shared",
+                lease.lease_id,
+                replacement_registration,
+            ),
+            "disconnecting an already-terminal attachment invalidated the exact promoted runner generation: lease={:?}, registration={:?}",
+            lease.lease_id,
+            replacement_registration,
         );
         assert_eq!(
             lifecycle.snapshot("shared").unwrap().runner_lease,
@@ -8067,15 +8087,34 @@ mod handler_tests {
         tokio::task::yield_now().await;
         assert!(!resume.is_finished());
         assert!(rx.try_recv().is_err());
-        // The frontend bridge retains this sender until exact cancelRun
-        // acknowledgement and original-RPC settlement. Its closure is the
-        // broker's proof that the lane may be reused.
+        // Public Compatible requests cannot carry a new mandatory lifetime
+        // field. Install a fresh callback loop while the old one is still the
+        // exact physical owner, then close the old loop to prove quiescence.
+        let (next_tx, mut next_rx) = tokio::sync::mpsc::unbounded_channel();
+        let next_registration = runners.register("shared", lease.lease_id, next_tx);
+        assert!(
+            !runners.has_exact_registration("shared", lease.lease_id, next_registration),
+            "successor Compatible callback activated before the timed-out callback loop closed"
+        );
         drop(stuck.response_tx);
+        drop(rx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runners.wait_registration_active("shared", next_registration),
+        )
+        .await
+        .expect("successor Compatible callback did not activate after the timed-out callback loop closed")
+        .expect("successor Compatible callback was retired instead of promoted");
 
-        let crate::server::RunnerRequest::Program(next) = rx.recv().await.unwrap() else {
+        let crate::server::RunnerRequest::Program(next) = next_rx.recv().await.expect(
+            "successor Compatible callback channel closed before the queued program resumed",
+        ) else {
             panic!("expected later queued program after callback cleanup")
         };
-        assert_eq!(next.run_id, runs[1].run_id);
+        assert_eq!(
+            next.run_id, runs[1].run_id,
+            "successor callback resumed the wrong FIFO run after old-loop quiescence; queued runs: {runs:#?}"
+        );
         let runtime = crate::runtime::ProgramRuntime::new();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
@@ -8106,7 +8145,11 @@ mod handler_tests {
                 effect_journal: Vec::new(),
             }))
             .unwrap();
-        assert_eq!(resume.await.unwrap().unwrap(), 2);
+        assert_eq!(
+            resume.await.unwrap().unwrap(),
+            2,
+            "callback cleanup must resume and terminalize both durable FIFO runs exactly once"
+        );
 
         let snapshot = store.snapshot("shared").unwrap();
         let first = snapshot

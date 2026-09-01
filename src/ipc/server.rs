@@ -2373,6 +2373,11 @@ async fn eject_nonquiescent_runner_connection(
     };
     match server.brain_runners().eject_connection(connection_id.0) {
         Ok(admission) => {
+            #[cfg(test)]
+            server
+                .brain_runners()
+                .wait_nonquiescent_ejection_pause_for_test()
+                .await;
             let mut notification = runner.eject_process_request();
             notification.get().set_reason(
                 "runner callback did not physically settle before its cleanup deadline",
@@ -4488,15 +4493,14 @@ mod tests {
     struct NonQuiescentExpiredProgramRunner {
         started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
         cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
-        release: std::sync::Arc<tokio::sync::Notify>,
-        late_effect_rejected: Option<tokio::sync::oneshot::Sender<bool>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for NonQuiescentExpiredProgramRunner {
         fn run_program(
             &mut self,
             params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
-            mut results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
         ) -> capnp::capability::Promise<(), capnp::Error> {
             let request = match params.get().and_then(|params| params.get_request()) {
                 Ok(request) => request,
@@ -4513,51 +4517,15 @@ mod tests {
                 Ok(run_id) => run_id,
                 Err(error) => return capnp::capability::Promise::err(error),
             };
-            let control = match request.get_control() {
-                Ok(control) => control,
-                Err(error) => return capnp::capability::Promise::err(error),
-            };
             let started = self
                 .started
                 .take()
                 .expect("expired callback received more than one program");
-            let late_effect_rejected = self
-                .late_effect_rejected
-                .take()
-                .expect("expired callback attempted more than one late effect");
-            let release = std::sync::Arc::clone(&self.release);
+            let proof = CallbackDropProof(self.dropped.take());
             capnp::capability::Promise::from_future(async move {
+                let _proof = proof;
                 let _ = started.send(run_id);
-                release.notified().await;
-
-                let mut reserve = control.reserve_effect_request();
-                reserve
-                    .get()
-                    .set_execution_id(&uuid::Uuid::new_v4().to_string());
-                crate::ipc::checkpoint_codec::encode_vm_side_effect(
-                    reserve.get().init_effect(),
-                    &crate::vm::VmSideEffect {
-                        protocol_version: 1,
-                        sequence: 0,
-                        requirement: crate::vm::CapabilityRequirement {
-                            capability: crate::vm::CapabilityKind::SessionEmit,
-                            selector: crate::vm::ResourceSelector::None,
-                        },
-                        output: Vec::new(),
-                        event: crate::vm::HostSideEffect::Emit {
-                            text: "stale generation effect".into(),
-                        },
-                        origin: crate::vm::SourceOrigin::generated("expired-runner-late-effect"),
-                    },
-                )
-                .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                let rejected = reserve.send().promise.await.is_err();
-                let _ = late_effect_rejected.send(rejected);
-                results
-                    .get()
-                    .init_result()
-                    .set_error("late stale generation result");
-                Ok(())
+                std::future::pending::<Result<(), capnp::Error>>().await
             })
         }
 
@@ -6825,39 +6793,43 @@ mod tests {
                 let expired_lease_id = expired.lease_id;
                 let expired_expires_ms = expired.expires_ms;
 
-                let release_old = std::sync::Arc::new(tokio::sync::Notify::new());
+                let old_connection_id = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(old_connection_id, "shared", expired_lease_id)
+                    .unwrap();
+                let old_dispatch = server
+                    .brain_runners()
+                    .open_connection_dispatch(old_connection_id);
+                let (old_server_stream, old_client_stream) =
+                    tokio::net::UnixStream::pair().unwrap();
+                let old_server = std::sync::Arc::clone(&server);
+                let old_handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_id(
+                        old_server_stream,
+                        old_server,
+                        old_connection_id,
+                    )
+                    .await
+                });
+                let old_client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(old_client_stream)
+                        .await
+                        .unwrap();
                 let (old_started_tx, old_started_rx) = tokio::sync::oneshot::channel();
                 let (old_cancelled_tx, mut old_cancelled_rx) =
                     tokio::sync::mpsc::unbounded_channel();
-                let (late_effect_tx, late_effect_rx) = tokio::sync::oneshot::channel();
+                let (old_dropped_tx, mut old_dropped_rx) = tokio::sync::oneshot::channel();
                 let old_runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(NonQuiescentExpiredProgramRunner {
                         started: Some(old_started_tx),
                         cancelled: old_cancelled_tx,
-                        release: std::sync::Arc::clone(&release_old),
-                        late_effect_rejected: Some(late_effect_tx),
+                        dropped: Some(old_dropped_tx),
                     });
-                let (old_tx, mut old_rx) = tokio::sync::mpsc::unbounded_channel();
-                let old_registration = server.brain_runners().register_bounded(
-                    "shared",
-                    expired_lease_id,
-                    old_tx,
-                );
-                let old_server = std::sync::Arc::clone(&server);
-                let old_bridge = tokio::task::spawn_local(async move {
-                    while let Some(request) = old_rx.recv().await {
-                        super::forward_runner_request(
-                            old_runner.clone(),
-                            std::sync::Arc::clone(&old_server),
-                            request,
-                            expired_lease_id,
-                            None,
-                            Some(old_registration),
-                            None,
-                        )
-                        .await;
-                    }
-                });
+                old_client
+                    .register_test_brain_runner_client("shared", expired_lease_id, old_runner)
+                    .await
+                    .unwrap();
 
                 let old_lifecycle = lifecycle.clone();
                 let mut old_submission = tokio::task::spawn_local(async move {
@@ -6887,6 +6859,9 @@ mod tests {
                 .await
                 .expect("old IPC callback did not start");
 
+                let (ejection_reached, release_ejection) = server
+                    .brain_runners()
+                    .pause_next_nonquiescent_ejection_for_test();
                 assert!(lifecycle
                     .expire_runner_lease_if_due("shared", expired_lease_id, expired_expires_ms)
                     .unwrap());
@@ -6899,6 +6874,12 @@ mod tests {
                     .expect("expired IPC callback did not receive physical cancellation"),
                     Some(old_run_id)
                 );
+                tokio::time::timeout(std::time::Duration::from_secs(2), ejection_reached)
+                    .await
+                    .expect("expired IPC callback never reached forced-ejection publication")
+                    .expect(
+                        "forced-ejection pause was dropped before replacement admission could race it",
+                    );
 
                 let replacement = lifecycle
                     .acquire_runner(
@@ -6924,39 +6905,52 @@ mod tests {
                         started: Some(replacement_started_tx),
                         checkpoint,
                     });
-                let (replacement_tx, mut replacement_rx) =
-                    tokio::sync::mpsc::unbounded_channel();
-                let replacement_registration = server.brain_runners().register_bounded(
-                    "shared",
-                    replacement_lease_id,
-                    replacement_tx,
-                );
+                let replacement_connection_id = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(
+                        replacement_connection_id,
+                        "shared",
+                        replacement_lease_id,
+                    )
+                    .unwrap();
+                let (replacement_server_stream, replacement_client_stream) =
+                    tokio::net::UnixStream::pair().unwrap();
                 let replacement_server = std::sync::Arc::clone(&server);
-                let replacement_bridge = tokio::task::spawn_local(async move {
-                    while let Some(request) = replacement_rx.recv().await {
-                        super::forward_runner_request(
-                            replacement_runner.clone(),
-                            std::sync::Arc::clone(&replacement_server),
-                            request,
-                            replacement_lease_id,
-                            None,
-                            Some(replacement_registration),
-                            None,
-                        )
-                        .await;
-                    }
+                let actual_identity =
+                    crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap();
+                let replacement_identity = crate::server::RunnerProcessIdentity {
+                    pid: actual_identity.pid,
+                    start_token: actual_identity.start_token.wrapping_add(1),
+                };
+                let replacement_handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_id_and_peer_process(
+                        replacement_server_stream,
+                        replacement_server,
+                        replacement_connection_id,
+                        replacement_identity,
+                    )
+                    .await
                 });
+                let replacement_client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(
+                        replacement_client_stream,
+                    )
+                    .await
+                    .unwrap();
+                replacement_client
+                    .register_test_brain_runner_client(
+                        "shared",
+                        replacement_lease_id,
+                        replacement_runner,
+                    )
+                    .await
+                    .unwrap();
                 let replacement_lifecycle = lifecycle.clone();
-                let replacement_activation_server = std::sync::Arc::clone(&server);
                 let (replacement_attempted_tx, replacement_attempted_rx) =
                     tokio::sync::oneshot::channel();
                 let replacement_submission = tokio::task::spawn_local(async move {
                     let _ = replacement_attempted_tx.send(());
-                    replacement_activation_server
-                        .brain_runners()
-                        .wait_registration_active("shared", replacement_registration)
-                        .await
-                        .expect("replacement registration was retired before activation");
                     replacement_lifecycle
                         .submit(
                             "shared",
@@ -6973,6 +6967,36 @@ mod tests {
                 replacement_attempted_rx
                     .await
                     .expect("replacement submission task did not reach admission");
+                assert!(
+                    old_dropped_rx.try_recv().is_err(),
+                    "hostile callback dropped before the deterministic forced-ejection release; replacement was not queued against a live callback"
+                );
+                assert!(
+                    replacement_started_rx.try_recv().is_err(),
+                    "replacement callback started while the expired callback and transport still owned the physical lane"
+                );
+                release_ejection.send(()).expect(
+                    "forced-ejection owner disappeared before the test released transport closure",
+                );
+
+                tokio::select! {
+                    dropped = &mut old_dropped_rx => {
+                        dropped.expect("old callback drop witness was lost before transport ejection");
+                    }
+                    started = &mut replacement_started_rx => {
+                        panic!(
+                            "replacement callback {started:?} started before transport ejection dropped the expired callback"
+                        );
+                    }
+                }
+                tokio::select! {
+                    _ = old_dispatch.wait_transport_closed() => {}
+                    started = &mut replacement_started_rx => {
+                        panic!(
+                            "replacement callback {started:?} started before the expired runner transport published physical closure"
+                        );
+                    }
+                }
                 let old_outcome = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     &mut old_submission,
@@ -6981,23 +7005,10 @@ mod tests {
                 .expect("expired callback did not return its bounded user-facing timeout")
                 .unwrap()
                 .unwrap();
-                assert_eq!(old_outcome.run.unwrap().run_id, old_run_id);
-                assert!(
-                    !replacement_submission.is_finished()
-                        && replacement_started_rx.try_recv().is_err(),
-                    "replacement callback overlapped the physically nonquiescent generation"
-                );
-
-                release_old.notify_one();
-                assert!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        late_effect_rx,
-                    )
-                    .await
-                    .expect("stale callback did not reach its late effect boundary")
-                    .unwrap(),
-                    "expired callback admitted a new effect after cancellation"
+                assert_eq!(
+                    old_outcome.run.unwrap().run_id,
+                    old_run_id,
+                    "expired submission returned a different durable run after transport ejection"
                 );
                 let replacement_run_id = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -7016,7 +7027,8 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     replacement_outcome.run.unwrap().run_id,
-                    replacement_run_id
+                    replacement_run_id,
+                    "replacement submission completed a different run than the fresh callback observed"
                 );
 
                 let snapshot = store.snapshot("shared").unwrap();
@@ -7030,10 +7042,15 @@ mod tests {
                     .iter()
                     .find(|run| run.run_id == replacement_run_id)
                     .unwrap();
-                assert_eq!(old_run.status, crate::brain::store::BrainRunStatus::Failed);
+                assert_eq!(
+                    old_run.status,
+                    crate::brain::store::BrainRunStatus::Failed,
+                    "expired callback run did not terminalize Failed after bounded ejection: {old_run:#?}"
+                );
                 assert_eq!(
                     replacement_run.status,
-                    crate::brain::store::BrainRunStatus::Completed
+                    crate::brain::store::BrainRunStatus::Completed,
+                    "fresh-process replacement run did not complete after old physical quiescence: {replacement_run:#?}"
                 );
                 assert_eq!(
                     snapshot
@@ -7048,15 +7065,15 @@ mod tests {
                             } if run_id == old_run_id && status.is_terminal()
                         ))
                         .count(),
-                    1
+                    1,
+                    "expired IPC callback must append exactly one terminal transition after ejection; events: {:#?}",
+                    snapshot.events
                 );
-                assert!(snapshot.effect_audits.is_empty());
-                assert!(!snapshot.events.iter().any(|event| matches!(
-                    &event.kind,
-                    crate::brain::store::BrainEventKind::Result { output, error, .. }
-                        if output.contains("late stale generation")
-                            || error.as_deref().is_some_and(|error| error.contains("late stale generation"))
-                )));
+                assert!(
+                    snapshot.effect_audits.is_empty(),
+                    "transport-ejected expired callback left effect-audit authority behind: {:#?}",
+                    snapshot.effect_audits
+                );
 
                 let reopened = crate::brain::store::BrainStore::with_root(
                     "box.local",
@@ -7080,18 +7097,24 @@ mod tests {
                         "reopen must preserve exactly one canonical result per terminal run"
                     );
                 }
-                assert!(!reopened_snapshot.events.iter().any(|event| matches!(
-                    &event.kind,
-                    crate::brain::store::BrainEventKind::Result { output, error, .. }
-                        if output.contains("late stale generation")
-                            || error.as_deref().is_some_and(|error| error.contains("late stale generation"))
-                )));
-
-                server
-                    .brain_runners()
-                    .invalidate_lease("shared", replacement_lease_id);
-                old_bridge.await.unwrap();
-                replacement_bridge.await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), old_handler)
+                    .await
+                    .expect("expired runner connection handler did not retire after ejection")
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    server
+                        .brain_runners()
+                        .test_connection_resources_retired(old_connection_id),
+                    "expired runner connection resources remained live after its handler completed teardown"
+                );
+                drop(old_client);
+                drop(replacement_client);
+                tokio::time::timeout(std::time::Duration::from_secs(2), replacement_handler)
+                    .await
+                    .expect("replacement runner connection handler did not retire after client drop")
+                    .unwrap()
+                    .unwrap();
             })
             .await;
     }
