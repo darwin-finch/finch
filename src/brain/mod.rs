@@ -600,6 +600,17 @@ fn duplicate_validated_proof(fd: std::os::fd::RawFd) -> anyhow::Result<std::fs::
 /// `cargo build --bin`'s for this very target. The pinned copy is what makes
 /// the relink case not arise in the first place.
 #[cfg(unix)]
+fn content_addressed_supervisor_digest(executable: &std::path::Path) -> Option<&str> {
+    let name = executable.file_name()?.to_str()?;
+    let digest = name.strip_prefix("finch-test-supervisor-pinned-sha256-")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(digest)
+}
+
+#[cfg(unix)]
 fn verify_supervisor_image(
     recorded_identity: &str,
     recorded_digest: &str,
@@ -627,6 +638,14 @@ fn verify_supervisor_image(
     let mut image = Vec::new();
     file.read_to_end(&mut image)?;
     let digest = hex::encode(Sha256::digest(&image));
+
+    if let Some(path_digest) = content_addressed_supervisor_digest(executable) {
+        anyhow::ensure!(
+            path_digest == digest,
+            "content-addressed supervisor executable {} does not contain the image named by its path",
+            executable.display()
+        );
+    }
 
     if digest == recorded_digest {
         if identity != recorded_identity {
@@ -659,7 +678,7 @@ fn verify_supervisor_image(
 
 /// Is this the supervisor binary belonging to the current build directory?
 ///
-/// Either name is accepted, not the pinned one in preference.
+/// Either legacy name and a checked content-addressed pin are accepted.
 ///
 /// Preferring the pinned copy meant that the moment it existed, any launcher
 /// that pointed `FINCH_TEST_SUPERVISOR_BIN` at the plain path — `test_server.sh`
@@ -669,9 +688,10 @@ fn verify_supervisor_image(
 /// binary rather than `cargo test`, so nothing relinked the supervisor
 /// underneath them; creating the pinned copy would have broken them.
 ///
-/// `scripts/lib/brain_test_isolation.sh` already accepted all four names
-/// (debug and release, pinned and plain). This mirrors it rather than
-/// inventing a narrower rule on the Rust side.
+/// Maintained launchers use an immutable `pinned-sha256-<digest>` sibling. Its
+/// digest-to-name binding is checked from the same descriptor that verifies
+/// the proof, so allowing the name pattern does not turn arbitrary target
+/// files into supervisor authority.
 fn is_expected_supervisor_executable(candidate: &std::path::Path) -> anyhow::Result<bool> {
     let test_executable = std::env::current_exe()?.canonicalize()?;
     let mut directory = test_executable
@@ -696,7 +716,9 @@ fn is_expected_supervisor_executable(candidate: &std::path::Path) -> anyhow::Res
             return Ok(true);
         }
     }
-    Ok(false)
+    Ok(candidate.parent() == Some(directory)
+        && candidate.is_file()
+        && content_addressed_supervisor_digest(candidate).is_some())
 }
 
 #[cfg(target_os = "linux")]

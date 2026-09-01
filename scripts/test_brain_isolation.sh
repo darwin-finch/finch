@@ -17,32 +17,9 @@ signaler_pid=''
 substitution_pid=''
 supervisor_backup=''
 substitution_restored=''
-launcher_cache_active=''
-launcher_built_backup=''
-launcher_pinned_backup=''
-launcher_source_timestamp_backup=''
-restore_launcher_cache() {
-  [[ -n "$launcher_cache_active" ]] || return 0
-  rm -f -- "$repo_root/target/debug/finch-test-supervisor" \
-    "$repo_root/target/debug/finch-test-supervisor-pinned"
-  if [[ -n "$launcher_built_backup" && -e "$launcher_built_backup" ]]; then
-    mv -f -- "$launcher_built_backup" "$repo_root/target/debug/finch-test-supervisor"
-  fi
-  if [[ -n "$launcher_pinned_backup" && -e "$launcher_pinned_backup" ]]; then
-    mv -f -- "$launcher_pinned_backup" "$repo_root/target/debug/finch-test-supervisor-pinned"
-  fi
-  if [[ -n "$launcher_source_timestamp_backup" && -e "$launcher_source_timestamp_backup" ]]; then
-    touch -r "$launcher_source_timestamp_backup" "$repo_root/src/bin/finch-test-supervisor.rs"
-  fi
-  launcher_cache_active=''
-  launcher_built_backup=''
-  launcher_pinned_backup=''
-  launcher_source_timestamp_backup=''
-}
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
-  restore_launcher_cache
   if [[ -n "$supervisor_backup" && -e "$supervisor_backup" ]]; then
     mv -f -- "$supervisor_backup" "$supervisor"
   fi
@@ -121,7 +98,9 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 # original inode must leave the chosen artifact unchanged for later tests.
 case "$supervisor" in
   "$repo_root"/target/debug/finch-test-supervisor-pinned|\
-  "$repo_root"/target/release/finch-test-supervisor-pinned)
+  "$repo_root"/target/release/finch-test-supervisor-pinned|\
+  "$repo_root"/target/debug/finch-test-supervisor-pinned-sha256-*|\
+  "$repo_root"/target/release/finch-test-supervisor-pinned-sha256-*)
     phase=supervisor-substitution-rejected
     substitution_ready="$scratch/substitution.ready"
     substitution_continue="$scratch/substitution.continue"
@@ -183,47 +162,34 @@ env -u FINCH_TEST_TMP_PARENT FINCH_TEST_REAL_HOME="$fake_home" TMPDIR="$temp_par
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 # A cached supervisor from a previous checkout is not test authority for the
-# current source. Seed both maintained default paths with an executable that
-# records if it is ever launched, then make the checked-out supervisor source
-# newer than Cargo's cached revision. Before #259's freshness repair, existence
-# alone selected the stale pinned image and this phase exited 88. The maintained
-# launcher must now ask Cargo to reproduce the checked-out target, atomically
-# pin it, and run the requested command without executing the cached program.
+# current source. Seed both maintained default names in an isolated target with
+# an executable that records if it is ever launched, then cross the public
+# launcher boundary. Before #259's freshness repair, existence alone selected
+# the stale pinned image. The maintained launcher must ask Cargo to reproduce
+# the checked-out target and execute its immutable content-addressed pin. This
+# target is wholly private: the regression never moves workspace artifacts or
+# rewrites source mtimes/Cargo fingerprints, even if interrupted.
 phase=launcher-rebuilds-stale-cached-supervisor
-launcher_built="$repo_root/target/debug/finch-test-supervisor"
-launcher_pinned="$repo_root/target/debug/finch-test-supervisor-pinned"
-launcher_built_backup="$launcher_built.freshness-backup.$$"
-launcher_pinned_backup="$launcher_pinned.freshness-backup.$$"
+launcher_target="$scratch/stale-supervisor-target"
+launcher_built="$launcher_target/debug/finch-test-supervisor"
+launcher_pinned="$launcher_target/debug/finch-test-supervisor-pinned"
 stale_supervisor_ran="$scratch/stale-supervisor-ran"
 stale_launcher_diagnostic="$scratch/stale-launcher-diagnostic"
-launcher_source_timestamp_backup="$scratch/supervisor-source-timestamp"
-cp -p "$repo_root/src/bin/finch-test-supervisor.rs" "$launcher_source_timestamp_backup"
-if [[ -e "$launcher_built" ]]; then
-  mv -- "$launcher_built" "$launcher_built_backup"
-else
-  launcher_built_backup=''
-fi
-if [[ -e "$launcher_pinned" ]]; then
-  mv -- "$launcher_pinned" "$launcher_pinned_backup"
-else
-  launcher_pinned_backup=''
-fi
-launcher_cache_active=1
+observed_stale_launcher="$scratch/stale-launcher-observed"
+mkdir -p "$launcher_target/debug"
 printf '%s\n' '#!/bin/sh' \
   'printf "stale cached supervisor executed\n" >"$FINCH_STALE_SUPERVISOR_RAN"' \
   'exit 88' >"$launcher_pinned"
 chmod 0555 "$launcher_pinned"
 install -m 0555 "$launcher_pinned" "$launcher_built"
-# Coarse-mtime filesystems need a full tick to model a later checkout revision
-# deterministically; otherwise Cargo may legitimately consider equal-second
-# source and fingerprint timestamps unchanged.
-sleep 1
-touch "$repo_root/src/bin/finch-test-supervisor.rs"
 stale_launcher_status=0
 env -u FINCH_TEST_SUPERVISOR_BIN \
+  FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
-  FINCH_STALE_SUPERVISOR_RAN="$stale_supervisor_ran" \
-  "$repo_root/scripts/test_brains.sh" true 2>"$stale_launcher_diagnostic" || \
+  FINCH_STALE_SUPERVISOR_RAN="$stale_supervisor_ran" FINCH_LAUNCHER_OBSERVED="$observed_stale_launcher" \
+  "$repo_root/scripts/test_brains.sh" bash -c \
+  'printf "%s\n" "$FINCH_TEST_SUPERVISOR_BIN" >"$FINCH_LAUNCHER_OBSERVED"' \
+  2>"$stale_launcher_diagnostic" || \
   stale_launcher_status=$?
 if [[ "$stale_launcher_status" -ne 0 ]]; then
   echo "maintained launcher returned $stale_launcher_status instead of rebuilding its stale cached supervisor" >&2
@@ -234,16 +200,84 @@ if [[ -e "$stale_supervisor_ran" ]]; then
   echo "maintained launcher executed stale cached supervisor; marker: $(cat "$stale_supervisor_ran")" >&2
   exit 1
 fi
-if [[ ! -x "$launcher_built" || ! -x "$launcher_pinned" ]] || \
-  ! cmp -s "$launcher_built" "$launcher_pinned"; then
-  echo "maintained launcher did not leave byte-identical executable plain and pinned supervisor images" >&2
-  ls -l "$launcher_built" "$launcher_pinned" >&2 || true
+observed_supervisor="$(cat "$observed_stale_launcher" 2>/dev/null || true)"
+case "$observed_supervisor" in
+  "$launcher_target/debug/finch-test-supervisor-pinned-sha256-"*) ;;
+  *)
+    echo "maintained launcher did not execute an isolated content-addressed supervisor; observed ${observed_supervisor:-<none>}" >&2
+    exit 1
+    ;;
+esac
+if [[ ! -x "$launcher_built" || ! -x "$observed_supervisor" ]] || \
+  ! cmp -s "$launcher_built" "$observed_supervisor"; then
+  echo "maintained launcher did not leave byte-identical executable built and content-addressed supervisor images" >&2
+  ls -l "$launcher_built" "$observed_supervisor" >&2 || true
   exit 1
 fi
-restore_launcher_cache
 if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
   echo "stale-cache launcher regression left an isolated test HOME under $temp_parent" >&2
   find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
+  exit 1
+fi
+
+# Two launchers that publish the same freshly built image concurrently must
+# converge on one immutable inode. The maintained hook pauses both after their
+# complete private staging copy exists and before atomic publication; the old
+# compare/rename design let both decide to replace the fixed path, so the later
+# rename unlinked the executable already running in the first supervisor.
+phase=concurrent-launchers-share-immutable-supervisor-image
+rm -f -- "$observed_supervisor"
+pin_ready_dir="$scratch/pin-publication-ready"
+pin_continue_file="$scratch/pin-publication-continue"
+pin_result_one="$scratch/pin-result-one"
+pin_result_two="$scratch/pin-result-two"
+pin_diagnostic_one="$scratch/pin-diagnostic-one"
+pin_diagnostic_two="$scratch/pin-diagnostic-two"
+mkdir "$pin_ready_dir"
+run_concurrent_launcher() {
+  local result_file="$1" diagnostic_file="$2"
+  env -u FINCH_TEST_SUPERVISOR_BIN \
+    FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
+    FINCH_TEST_SUPERVISOR_PIN_READY_DIR="$pin_ready_dir" \
+    FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE="$pin_continue_file" \
+    FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+    FINCH_PIN_RESULT="$result_file" "$repo_root/scripts/test_brains.sh" bash -c '
+      case "$(uname -s)" in
+        Darwin) identity="$(stat -f "%d:%i" "$FINCH_TEST_SUPERVISOR_BIN")" ;;
+        Linux) identity="$(stat -c "%d:%i" "$FINCH_TEST_SUPERVISOR_BIN")" ;;
+        *) exit 64 ;;
+      esac
+      printf "%s|%s\n" "$FINCH_TEST_SUPERVISOR_BIN" "$identity" >"$FINCH_PIN_RESULT"
+    ' 2>"$diagnostic_file"
+}
+run_concurrent_launcher "$pin_result_one" "$pin_diagnostic_one" & pin_pid_one=$!
+run_concurrent_launcher "$pin_result_two" "$pin_diagnostic_two" & pin_pid_two=$!
+for _ in {1..1000}; do
+  ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
+  [[ "$ready_count" -eq 2 ]] && break
+  sleep 0.01
+done
+if [[ "${ready_count:-0}" -ne 2 ]]; then
+  echo "concurrent maintained launchers did not both reach immutable publication; ready=${ready_count:-0}" >&2
+  sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
+  sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
+  exit 1
+fi
+: >"$pin_continue_file"
+pin_status_one=0
+pin_status_two=0
+wait "$pin_pid_one" || pin_status_one=$?
+wait "$pin_pid_two" || pin_status_two=$?
+if [[ "$pin_status_one" -ne 0 || "$pin_status_two" -ne 0 ]]; then
+  echo "concurrent maintained launchers failed after publication: one=$pin_status_one two=$pin_status_two" >&2
+  sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
+  sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
+  exit 1
+fi
+pin_observation_one="$(cat "$pin_result_one")"
+pin_observation_two="$(cat "$pin_result_two")"
+if [[ "$pin_observation_one" != "$pin_observation_two" ]]; then
+  echo "concurrent maintained launchers executed different supervisor path/inodes: one=$pin_observation_one two=$pin_observation_two" >&2
   exit 1
 fi
 

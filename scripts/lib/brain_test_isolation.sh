@@ -51,7 +51,7 @@ brain_test_isolation_is_active() {
   local supervisor_pid supervisor_executable supervisor_identity supervisor_digest signature
   local actual_supervisor_digest
   local links proof_uid proof_mode proof_type actual_password_digest ancestor actual_supervisor_executable
-  local library_root expected_supervisor
+  local library_root expected_supervisor supervisor_path_digest supervisor_name
   [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || brain_isolation_proof_rejected isolated-marker
   [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || brain_isolation_proof_rejected proof-target-fd
   [[ "${FINCH_BRAIN_TEST_PROOF_BACKUP_FD:-}" == 108 ]] || brain_isolation_proof_rejected proof-backup-fd
@@ -148,12 +148,20 @@ brain_test_isolation_is_active() {
     *) brain_isolation_proof_rejected unsupported-platform ;;
   esac
   library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || return 1
+  supervisor_path_digest=''
   case "$supervisor_executable" in
     "$library_root/target/debug/finch-test-supervisor"|\
     "$library_root/target/debug/finch-test-supervisor-pinned"|\
     "$library_root/target/release/finch-test-supervisor"|\
     "$library_root/target/release/finch-test-supervisor-pinned")
       expected_supervisor="$supervisor_executable" ;;
+    "$library_root/target/debug/finch-test-supervisor-pinned-sha256-"*|\
+    "$library_root/target/release/finch-test-supervisor-pinned-sha256-"*)
+      expected_supervisor="$supervisor_executable"
+      supervisor_name="$(basename "$supervisor_executable")"
+      supervisor_path_digest="${supervisor_name#finch-test-supervisor-pinned-sha256-}"
+      [[ "$supervisor_path_digest" =~ ^[0-9a-f]{64}$ ]] || brain_isolation_proof_rejected supervisor-content-path-shape
+      ;;
     *) brain_isolation_proof_rejected supervisor-profile ;;
   esac
   [[ -x "$expected_supervisor" ]] || brain_isolation_proof_rejected supervisor-not-executable
@@ -164,6 +172,7 @@ brain_test_isolation_is_active() {
   # else is refused (#259).
   actual_supervisor_digest="$(set -o pipefail; shasum -a 256 "$supervisor_executable" | awk '{print $1}')" || brain_isolation_proof_rejected supervisor-digest-tool
   [[ "$actual_supervisor_digest" =~ ^[0-9a-f]{64}$ ]] || brain_isolation_proof_rejected supervisor-digest-tool
+  [[ -z "$supervisor_path_digest" || "$actual_supervisor_digest" == "$supervisor_path_digest" ]] || brain_isolation_proof_rejected supervisor-content-path-binding
   [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || brain_isolation_proof_rejected supervisor-executable-substituted
   if [[ "$(uname -s)" == Darwin ]]; then
     links="$(stat -f '%l' /dev/fd/108)" || return 1
