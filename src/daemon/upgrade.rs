@@ -323,9 +323,12 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         lost.result.as_ref().is_some_and(|event| matches!(
             &event.kind,
             crate::brain::store::BrainEventKind::Result { error: Some(error), .. }
-                if error.contains("disconnected") || error.contains("stopped")
+                if error.contains("disconnected")
+                    || error.contains("stopped")
+                    || error.contains("dropped its response")
         )),
-        "closed runner callback did not become an observable failure"
+        "closed runner callback did not become an observable failure: {:?}",
+        lost.result
     );
 
     let (restored_tx, mut restored_rx) = tokio::sync::mpsc::unbounded_channel();
