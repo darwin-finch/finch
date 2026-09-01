@@ -1474,23 +1474,45 @@ mod tests {
                 .status,
             BrainRunStatus::Cancelled
         );
-        assert!(!snapshot.events.iter().any(|event| {
+        let run_events = snapshot
+            .events
+            .iter()
+            .filter(|event| event.run_id == Some(run_id))
+            .collect::<Vec<_>>();
+        assert!(!run_events.iter().any(|event| {
             event.run_id == Some(run_id)
                 && matches!(
                     event.kind,
                     BrainEventKind::ToolCall { .. }
                         | BrainEventKind::Program { .. }
                         | BrainEventKind::RuntimeCommitted { .. }
-                        | BrainEventKind::Result { .. }
                 )
-        }));
+        }), "late runner publication crossed the durable cancellation boundary; run events: {run_events:#?}");
+        let cancellation_results = run_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::Result {
+                        output,
+                        error: Some(error),
+                        ..
+                    } if output.is_empty() && error == "cancelled by initiating driver"
+                )
+            })
+            .count();
+        assert_eq!(
+            cancellation_results, 1,
+            "reserved disconnect cancellation must publish exactly one canonical error Result; run events: {run_events:#?}"
+        );
         assert_eq!(
             snapshot
                 .events
                 .iter()
                 .filter(|event| { event.mutation.as_ref() == Some(&receipt) })
                 .count(),
-            1
+            1,
+            "disconnect cancellation receipt must be applied exactly once; receipt: {receipt:#?}, run events: {run_events:#?}"
         );
         assert_eq!(
             snapshot
@@ -1502,7 +1524,8 @@ mod tests {
                         if event_run_id == run_id && status.is_terminal()
                 ))
                 .count(),
-            1
+            1,
+            "disconnect cancellation must append exactly one terminal transition; run events: {run_events:#?}"
         );
     }
 
@@ -1603,17 +1626,38 @@ mod tests {
                 .iter()
                 .filter(|event| { event.mutation.as_ref() == Some(&receipt) })
                 .count(),
-            1
+            1,
+            "reserved cancellation receipt must survive disconnect exactly once; receipt: {receipt:#?}, events: {:#?}",
+            snapshot.events
         );
-        assert!(!snapshot.events.iter().any(|event| {
-            event.run_id == Some(run.run_id)
-                && matches!(
-                    event.kind,
-                    BrainEventKind::Program { .. }
-                        | BrainEventKind::EffectRecorded { .. }
-                        | BrainEventKind::Result { .. }
+        let run_events = snapshot
+            .events
+            .iter()
+            .filter(|event| event.run_id == Some(run.run_id))
+            .collect::<Vec<_>>();
+        assert!(!run_events.iter().any(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::Program { .. } | BrainEventKind::EffectRecorded { .. }
+            )
+        }), "late program/effect publication crossed the reserved disconnect cancellation boundary; run events: {run_events:#?}");
+        let cancellation_results = run_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::Result {
+                        output,
+                        error: Some(error),
+                        ..
+                    } if output.is_empty() && error == "cancelled by initiating driver"
                 )
-        }));
+            })
+            .count();
+        assert_eq!(
+            cancellation_results, 1,
+            "disconnect recovery must publish exactly one canonical cancellation Result after the reservation owner is detached; run events: {run_events:#?}"
+        );
         assert_eq!(
             snapshot
                 .events
@@ -1624,7 +1668,8 @@ mod tests {
                         if run_id == run.run_id && status.is_terminal()
                 ))
                 .count(),
-            1
+            1,
+            "reserved disconnect cancellation must append exactly one terminal transition; run events: {run_events:#?}"
         );
     }
 

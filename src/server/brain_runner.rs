@@ -888,6 +888,10 @@ enum RunnerCallbackSender {
 }
 
 impl RunnerCallbackSender {
+    fn has_irrevocable_local_enqueue(&self) -> bool {
+        matches!(self, Self::Compatible(_))
+    }
+
     fn compatible_lifetime(&self) -> Option<mpsc::UnboundedSender<RunnerRequest>> {
         match self {
             Self::Compatible(tx) => Some(tx.clone()),
@@ -1060,6 +1064,15 @@ pub struct BrainRunnerBroker {
         Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
     #[cfg(test)]
     teardown_retry_pause: Arc<
+        Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    >,
+    #[cfg(test)]
+    nonquiescent_ejection_pause: Arc<
         Mutex<
             Option<(
                 tokio::sync::oneshot::Sender<()>,
@@ -1402,6 +1415,8 @@ impl BrainRunnerBroker {
             #[cfg(test)]
             teardown_retry_pause: Arc::default(),
             #[cfg(test)]
+            nonquiescent_ejection_pause: Arc::default(),
+            #[cfg(test)]
             runner_control_finish_response_pause: Arc::default(),
             #[cfg(test)]
             runner_lifecycle_test_counts: Arc::default(),
@@ -1562,8 +1577,15 @@ impl BrainRunnerBroker {
             let operation = RunnerOperation::Cancel;
             let (registration, registration_request) =
                 self.registration(brain, lease_id, operation)?;
+            // A Compatible send below is the final in-process enqueue, so a
+            // durable disconnect owner may later close only its reply wait
+            // without retracting the cancellation request. A Bounded send is
+            // merely queued for the IPC bridge; it must remain non-abortable
+            // until that bridge commits the Cap'n Proto send or ejects the
+            // connection.
+            let abort_after_enqueue = registration.tx.has_irrevocable_local_enqueue();
             let (abort_rx, inflight, run_dispatch_gate) =
-                self.track_inflight(brain, run_id, false, false)?;
+                self.track_inflight(brain, run_id, false, abort_after_enqueue)?;
             let (response_tx, response_rx) = oneshot::channel();
             let cancel = CancellationToken::new();
             let deadline = tokio::time::Instant::now() + self.deadlines.cancel;
@@ -2481,6 +2503,41 @@ impl BrainRunnerBroker {
     }
 
     #[cfg(test)]
+    pub(crate) fn pause_next_nonquiescent_ejection_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut pause = self
+            .nonquiescent_ejection_pause
+            .lock()
+            .expect("nonquiescent-ejection test hook lock poisoned");
+        assert!(
+            pause.is_none(),
+            "nonquiescent-ejection test hook already armed; a prior ejection did not consume it"
+        );
+        *pause = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_nonquiescent_ejection_pause_for_test(&self) {
+        let pause = self
+            .nonquiescent_ejection_pause
+            .lock()
+            .expect("nonquiescent-ejection test hook lock poisoned")
+            .take();
+        let Some((reached, release)) = pause else {
+            return;
+        };
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_next_runner_control_finish_response_for_test(
         &self,
         connection_id: uuid::Uuid,
@@ -3304,8 +3361,13 @@ impl BrainRunnerBroker {
         // Cancel is control-plane traffic for this exact run. It must retain
         // registration/generation admission while bypassing only the run's
         // own data-plane cancellation fence.
+        // Preserve the same split as detached teardown cancellation: public
+        // Compatible delivery is irrevocable once `send` returns, while an IPC
+        // envelope is not committed until the connection bridge performs its
+        // generation-gated Cap'n Proto send.
+        let abort_after_enqueue = registration.tx.has_irrevocable_local_enqueue();
         let (abort_rx, inflight, run_dispatch_gate) =
-            self.track_inflight(brain, run_id, false, false)?;
+            self.track_inflight(brain, run_id, false, abort_after_enqueue)?;
         let cancel = CancellationToken::new();
         registration
             .tx
@@ -4271,6 +4333,84 @@ mod tests {
             RunnerDispatchFailure::TimedOut,
         );
         assert!(!broker.has_registration("brain", lease_id));
+    }
+
+    #[tokio::test]
+    async fn test_compatible_cancel_abort_closes_reply_without_releasing_physical_owner() {
+        let broker = deadline_broker();
+        let lease_id = lease();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, old_tx);
+
+        let cancelling_broker = broker.clone();
+        let cancelling = tokio::spawn(async move {
+            cancelling_broker
+                .cancel_run("brain", lease_id, run_id)
+                .await
+        });
+        let RunnerRequest::Cancel(cancel) = old_rx
+            .recv()
+            .await
+            .expect("Compatible runner channel closed before receiving the exact Cancel request")
+        else {
+            panic!(
+                "Compatible runner received a non-Cancel request for the cancellation regression"
+            )
+        };
+        assert_eq!(
+            cancel.run_id, run_id,
+            "Compatible runner received Cancel for the wrong durable run: expected {run_id:?}, got {:?}",
+            cancel.run_id
+        );
+
+        let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+        let replacement = broker.register("brain", lease_id, replacement_tx);
+        assert!(
+            !broker.has_exact_registration("brain", lease_id, replacement),
+            "replacement Compatible registration activated while the old Cancel callback still owned its channel"
+        );
+
+        broker.abort_run("brain", run_id);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancel.response_tx.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "durable abort did not close the already-enqueued Compatible Cancel reply receiver",
+        );
+        assert!(
+            cancel.response_tx.send(Ok(true)).is_err(),
+            "Compatible Cancel accepted a reply after its durable owner aborted the response wait"
+        );
+        assert!(
+            !broker.has_exact_registration("brain", lease_id, replacement),
+            "closing the Compatible Cancel reply prematurely released the old physical callback owner"
+        );
+
+        drop(old_rx);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.wait_registration_active("brain", replacement),
+        )
+        .await
+        .expect("replacement Compatible registration did not activate after the old callback channel closed")
+        .expect("replacement Compatible registration was retired instead of promoted");
+        assert!(
+            broker.has_exact_registration("brain", lease_id, replacement),
+            "replacement Compatible registration was not the exact active generation after physical closure"
+        );
+        let error = cancelling
+            .await
+            .expect("Compatible Cancel owner task panicked")
+            .expect_err("aborted Compatible Cancel unexpectedly reported an acknowledgement");
+        assert_dispatch_failure(
+            &error,
+            RunnerOperation::Cancel,
+            RunnerDispatchFailure::RunAborted,
+        );
     }
 
     #[tokio::test(start_paused = true)]
