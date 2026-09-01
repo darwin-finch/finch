@@ -903,11 +903,12 @@ impl MemorySystem {
     /// That is the window this change creates, on the first turn, which is
     /// exactly when it would be seen.
     ///
-    /// So the edge list is read first, in one query. It is two integers per
-    /// row — 268 KiB against 131 MiB of embeddings on the dogfood store — so it
-    /// does not reintroduce the startup cost this change exists to remove, and
-    /// every node is linked as its batch lands. The final pass stays, both as a
-    /// safety net and to cover rows written after the edge query.
+    /// So the edge list is read first, in one query: two integers per row, a
+    /// couple of megabytes resident against 131 MiB of embeddings on the
+    /// dogfood store, so it does not reintroduce the startup cost this change
+    /// exists to remove. Every node is linked as its batch lands. The final
+    /// pass stays, both as a safety net and to cover rows written after the
+    /// edge query.
     async fn hydrate_in_background(
         db: Arc<Mutex<Connection>>,
         tree: Arc<Mutex<MemTree>>,
@@ -920,23 +921,45 @@ impl MemorySystem {
             let conn = db.lock().await;
             Self::load_child_edges(&conn)
         };
-        // Degrade, do not abandon hydration. This query only buys read purity
-        // during the window; failing it used to call `fail()`, which opens the
-        // write gate against a tree holding nothing but a fresh root — so the
-        // next write would attach under that root and `save_all_nodes_to_db`
-        // would persist it, which is the durable misplacement the gate exists
-        // to prevent. Falling back to an empty map reproduces exactly the
-        // pre-#242 behaviour: flat until the final pass, then a complete and
-        // correctly linked tree.
-        let edges = edges.unwrap_or_else(|error| {
+        Self::hydrate_batches(db, tree, state, Self::edges_or_degraded(edges)).await;
+    }
+
+    /// Degrade, do not abandon hydration.
+    ///
+    /// The edge query only buys read purity during the window. Failing it used
+    /// to call `fail()`, which opens the write gate — against a tree holding
+    /// nothing but a fresh root, because this runs before the first batch. The
+    /// next write would attach under that root and `save_all_nodes_to_db` would
+    /// persist it: the durable misplacement the gate exists to prevent.
+    ///
+    /// This takes no `HydrationState`, so it *cannot* fail the hydration. An
+    /// empty map reproduces exactly the pre-#242 behaviour — flat until the
+    /// final pass, then a complete and correctly linked tree.
+    fn edges_or_degraded(edges: Result<HashMap<u64, Vec<u64>>>) -> HashMap<u64, Vec<u64>> {
+        edges.unwrap_or_else(|error| {
             tracing::warn!(
                 %error,
                 "MemTree hydration could not read child links; reads during \
                  hydration may return internal nodes until the final pass"
             );
             HashMap::new()
-        });
+        })
+    }
 
+    /// The batch loop, taking the edge map rather than reading it.
+    ///
+    /// Split out so the degraded path is reachable from a test. Both queries
+    /// read `tree_nodes`, so there is no way to fail the edge query and not the
+    /// batch query against a real database — without this seam, "hydration
+    /// still completes correctly when the edge list could not be read" would
+    /// have no coverage at all, and re-adding the `fail()` that used to be
+    /// there would be caught by nothing.
+    async fn hydrate_batches(
+        db: Arc<Mutex<Connection>>,
+        tree: Arc<Mutex<MemTree>>,
+        state: Arc<HydrationState>,
+        edges: HashMap<u64, Vec<u64>>,
+    ) {
         let mut cursor: Option<u64> = None;
         loop {
             // The database guard is scoped to the read and nothing else, so
@@ -1950,6 +1973,100 @@ mod tests {
                 .children,
             vec![5],
             "a child in an earlier batch must be linked to its later parent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_an_unreadable_edge_list_degrades_instead_of_failing_hydration() {
+        // The decision itself, separately from its consequence. `fail()` opens
+        // the write gate, and this runs before the first batch, so failing here
+        // released writes against a tree holding nothing but a fresh root.
+        // `edges_or_degraded` takes no `HydrationState`, so it cannot fail the
+        // hydration however it is edited — the type is the guarantee, and this
+        // pins the empty-map result that goes with it.
+        let degraded = MemorySystem::edges_or_degraded(Err(anyhow::anyhow!("database is locked")));
+        assert!(
+            degraded.is_empty(),
+            "an unreadable edge list must degrade to no links, not propagate"
+        );
+
+        let mut edges = HashMap::new();
+        edges.insert(0u64, vec![1u64, 2]);
+        assert_eq!(
+            MemorySystem::edges_or_degraded(Ok(edges.clone())),
+            edges,
+            "a readable edge list must pass through untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hydration_completes_correctly_when_the_edge_list_is_unavailable() -> Result<()> {
+        // The edge query only buys read purity during the window. Failing it
+        // used to call `fail()`, which opens the write gate against a tree
+        // holding nothing but a fresh root — so the next write would attach
+        // under that root and `save_all_nodes_to_db` would persist it, which is
+        // the durable misplacement the gate exists to prevent. Degrading must
+        // still reach a complete, correctly linked tree, and must not open the
+        // gate early.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        // 552 nodes: two batches, with node 5 (first batch) reparented under
+        // node 520 (second batch), so the final linking pass has real work.
+        const NODES: u64 = HYDRATION_BATCH as u64 + 40;
+        const LATE_PARENT: u64 = HYDRATION_BATCH as u64 + 8;
+        seed_tree_nodes(temp.path(), NODES, &[(5, LATE_PARENT)])?;
+
+        // Construct without a runtime so nothing is spawned, then drive the
+        // batch loop by hand with the map the fallback would produce.
+        let memory = std::thread::spawn(move || MemorySystem::new(config))
+            .join()
+            .expect("constructor thread")?;
+        let expected = memory.hydration_status();
+        assert!(
+            matches!(expected, HydrationStatus::Ready { .. }),
+            "the no-runtime arm loads synchronously; got {expected:?}"
+        );
+
+        // Reset to the state the background arm starts from, then run the loop
+        // with no edges at all.
+        {
+            let mut tree = memory.tree.lock().await;
+            *tree = MemTree::new_with_dim(memory.embedding_engine.dimension());
+        }
+        let state = Arc::new(HydrationState::new(NODES as usize));
+        MemorySystem::hydrate_batches(
+            Arc::clone(&memory.db),
+            Arc::clone(&memory.tree),
+            Arc::clone(&state),
+            HashMap::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(state.status(), HydrationStatus::Ready { .. }),
+            "a degraded run must still complete; got {:?}",
+            state.status()
+        );
+        let tree = memory.tree.lock().await;
+        assert_eq!(
+            tree.all_nodes().len(),
+            NODES as usize,
+            "every node must load without the edge list"
+        );
+        assert_eq!(
+            tree.all_nodes()
+                .get(&LATE_PARENT)
+                .expect("the late parent must load")
+                .children,
+            vec![5],
+            "the final pass must still link a child to a parent in a later \
+             batch; degrading loses read purity during the window, not the \
+             structure it ends with"
         );
         Ok(())
     }
