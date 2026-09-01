@@ -2221,6 +2221,14 @@ impl EventLoop {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_memory_system_for_test(
+        &mut self,
+        memory_system: std::sync::Arc<crate::memory::MemorySystem>,
+    ) {
+        self.memory_system = Some(memory_system);
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_named_brain_program_active_for_test(
         &mut self,
         run_id: crate::brain::store::RunId,
