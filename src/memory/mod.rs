@@ -893,14 +893,28 @@ impl MemorySystem {
         tree: Arc<Mutex<MemTree>>,
         state: Arc<HydrationState>,
     ) {
-        let mut offset = 0usize;
+        let mut cursor: Option<u64> = None;
         loop {
             let batch = {
                 let conn = db.lock().await;
-                match Self::load_batch(&conn, offset, HYDRATION_BATCH) {
+                match Self::load_batch(&conn, cursor, HYDRATION_BATCH) {
                     Ok(batch) => batch,
                     Err(error) => {
-                        tracing::warn!(%error, "MemTree hydration failed");
+                        tracing::error!(
+                            %error,
+                            loaded = state.loaded.load(Ordering::SeqCst),
+                            "MemTree hydration failed; the index is incomplete for \
+                             the rest of this session"
+                        );
+                        // Link what did load before releasing writes.
+                        //
+                        // `fail` completes, and completing opens the write gate.
+                        // Returning here left every loaded node with an empty
+                        // `children`, so `MemTree::insert` saw a childless root,
+                        // attached every later memory directly under it, and
+                        // `save_all_nodes_to_db` persisted that flattening — the
+                        // exact durable miscplacement the gate exists to prevent.
+                        Self::link_loaded_children(&tree).await;
                         state.fail(error.to_string());
                         return;
                     }
@@ -911,6 +925,7 @@ impl MemorySystem {
             }
 
             let count = batch.len();
+            cursor = batch.last().map(|node| node.id);
             {
                 let mut guard = tree.lock().await;
                 let nodes = guard.all_nodes_mut();
@@ -919,43 +934,54 @@ impl MemorySystem {
                 }
             }
             state.loaded.fetch_add(count, Ordering::SeqCst);
-            offset += count;
 
             // Yield so a turn submitted mid-hydration is served promptly.
             tokio::task::yield_now().await;
         }
 
-        // Link children once every node is present.
-        {
-            let mut guard = tree.lock().await;
-            let parents: Vec<(u64, u64)> = guard
-                .all_nodes()
-                .values()
-                .filter_map(|node| node.parent.map(|parent| (parent, node.id)))
-                .collect();
-            let nodes = guard.all_nodes_mut();
-            for (parent_id, child_id) in parents {
-                if let Some(parent) = nodes.get_mut(&parent_id) {
-                    if !parent.children.contains(&child_id) {
-                        parent.children.push(child_id);
-                    }
-                }
-            }
-            for node in nodes.values_mut() {
-                node.children.sort_unstable();
-            }
-        }
-
+        Self::link_loaded_children(&tree).await;
         state.complete();
     }
 
+    /// Rebuild `children` from the `parent` links of every node currently in
+    /// the tree. A parent can arrive in a later batch than its child, so this
+    /// cannot be done as the batches land.
+    async fn link_loaded_children(tree: &Arc<Mutex<MemTree>>) {
+        let mut guard = tree.lock().await;
+        let parents: Vec<(u64, u64)> = guard
+            .all_nodes()
+            .values()
+            .filter_map(|node| node.parent.map(|parent| (parent, node.id)))
+            .collect();
+        let nodes = guard.all_nodes_mut();
+        for (parent_id, child_id) in parents {
+            if let Some(parent) = nodes.get_mut(&parent_id) {
+                if !parent.children.contains(&child_id) {
+                    parent.children.push(child_id);
+                }
+            }
+        }
+        for node in nodes.values_mut() {
+            node.children.sort_unstable();
+        }
+    }
+
     /// One page of persisted nodes, without their child links.
-    fn load_batch(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<TreeNode>> {
+    /// One page of stored nodes, keyed on the last id already read.
+    ///
+    /// Keyset, not `LIMIT`/`OFFSET`. The lock is released between batches, so
+    /// another connection — the daemon and the CLI both open the same
+    /// `memory.db` — can insert a row into the window an offset refers to and
+    /// shift every later row past it, silently skipping nodes for the rest of
+    /// the session. A cursor on `node_id` cannot skip.
+    fn load_batch(conn: &Connection, after: Option<u64>, limit: usize) -> Result<Vec<TreeNode>> {
         let mut stmt = conn.prepare(
             "SELECT node_id, parent_id, text, embedding, level, created_at, importance
-             FROM tree_nodes ORDER BY node_id ASC LIMIT ?1 OFFSET ?2",
+             FROM tree_nodes WHERE node_id > ?1 ORDER BY node_id ASC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64, offset as i64], |row| {
+        // `-1` rather than `0`: node 0 is the root and must be included.
+        let after = after.map_or(-1, |id| id as i64);
+        let rows = stmt.query_map(params![after, limit as i64], |row| {
             let embedding: Vec<u8> = row.get(3)?;
             Ok(TreeNode {
                 id: row.get::<_, i64>(0)? as u64,
@@ -1721,6 +1747,156 @@ mod tests {
             reopened.hydration_status()
         );
 
+        Ok(())
+    }
+
+    /// Write `count` nodes straight into `tree_nodes`, cheaply.
+    ///
+    /// Going through `insert_conversation` would embed and re-persist the whole
+    /// tree per memory, which is quadratic and far too slow to reach the batch
+    /// size. `overrides` re-points a child at a parent by id, applied after
+    /// every row exists so the self-referential foreign key is satisfied even
+    /// when the parent has the higher id.
+    fn seed_tree_nodes(path: &std::path::Path, count: u64, overrides: &[(u64, u64)]) -> Result<()> {
+        let conn = Connection::open(path)?;
+        let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
+        let tx = conn.unchecked_transaction()?;
+        for id in 0..count {
+            let parent = if id == 0 { None } else { Some(0i64) };
+            tx.execute(
+                "INSERT OR REPLACE INTO tree_nodes
+                 (node_id, parent_id, text, embedding, level, created_at, importance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    id as i64,
+                    parent,
+                    format!("seeded node {id}"),
+                    embedding,
+                    if id == 0 { 0i64 } else { 1i64 },
+                    id as i64,
+                ],
+            )?;
+        }
+        for (child, parent) in overrides {
+            tx.execute(
+                "UPDATE tree_nodes SET parent_id = ?1 WHERE node_id = ?2",
+                params![*parent as i64, *child as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hydration_pages_across_batches_and_links_late_parents() -> Result<()> {
+        // Every other hydration test seeds 30-40 conversations, so the paging
+        // loop this PR introduces runs its body exactly once and stops. The
+        // cursor advance, the per-batch lock release, and the case a parent
+        // arrives in a later batch than its child were all unexercised, on a
+        // change whose entire point is a 16,782-node store (#242).
+        const NODES: u64 = 3 * HYDRATION_BATCH as u64 + 7;
+        assert!(
+            NODES > HYDRATION_BATCH as u64,
+            "this test is only meaningful above the batch size"
+        );
+        // Node 5 is in the first batch; its parent is in the third. Linking
+        // therefore cannot be done as the batches land.
+        let late_parent = 2 * HYDRATION_BATCH as u64 + 3;
+
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?); // create the schema
+        seed_tree_nodes(temp.path(), NODES, &[(5, late_parent)])?;
+
+        let memory = MemorySystem::new(config)?;
+        memory.ensure_hydrated().await;
+
+        match memory.hydration_status() {
+            HydrationStatus::Ready { nodes } => assert_eq!(
+                nodes as u64, NODES,
+                "every node across every batch must load"
+            ),
+            other => panic!("hydration did not complete: {other:?}"),
+        }
+
+        let tree = memory.tree.lock().await;
+        assert_eq!(
+            tree.all_nodes().len() as u64,
+            NODES,
+            "a skipped or duplicated page loses nodes"
+        );
+        for id in 0..NODES {
+            assert!(
+                tree.all_nodes().contains_key(&id),
+                "node {id} was skipped by the batch loader"
+            );
+        }
+        assert_eq!(
+            tree.all_nodes()
+                .get(&late_parent)
+                .expect("late parent must load")
+                .children,
+            vec![5],
+            "a child in an earlier batch must be linked to its later parent"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_hydration_links_what_loaded_before_releasing_writes() -> Result<()> {
+        // `fail()` completes, and completing opens the write gate. It used to
+        // return before the child-linking pass, so every loaded node kept an
+        // empty `children`: `MemTree::insert` saw a childless root, hung the
+        // next memory directly off it, and `save_all_nodes_to_db` persisted
+        // that flattening. A partial index is recoverable; a durably flattened
+        // one is not.
+        const NODES: u64 = 2 * HYDRATION_BATCH as u64;
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), NODES, &[])?;
+
+        // Break one row in the SECOND batch: `text` becomes a BLOB, so
+        // `row.get::<_, String>` fails. The first batch still loads.
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
+                params![vec![0xffu8, 0xfe], HYDRATION_BATCH as i64 + 4],
+            )?;
+        }
+
+        let memory = MemorySystem::new(config)?;
+        memory.ensure_hydrated().await;
+
+        match memory.hydration_status() {
+            HydrationStatus::Failed { .. } => {}
+            other => panic!("a broken row must surface as Failed; got {other:?}"),
+        }
+
+        let tree = memory.tree.lock().await;
+        let loaded = tree.all_nodes().len();
+        assert!(
+            loaded >= HYDRATION_BATCH,
+            "the batches that did load must be kept; got {loaded}"
+        );
+        assert_eq!(
+            tree.all_nodes()
+                .get(&0)
+                .expect("root must load")
+                .children
+                .len(),
+            loaded - 1,
+            "every loaded child must be linked to the root before writes are \
+             released; an empty `children` makes the next memory flatten the \
+             tree and persists it"
+        );
         Ok(())
     }
 
