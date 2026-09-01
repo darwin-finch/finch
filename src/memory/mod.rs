@@ -127,11 +127,12 @@ fn source_metadata_for_node(
          FROM memory_sources ms
          JOIN conversations c ON c.id = ms.conversation_id
          WHERE ms.node_id = ?1
-         -- Without an explicit order the row returned depends on the query
-         -- plan, so the same memory could report a different origin after a
-         -- VACUUM or an index change. `conversation_id` is the primary key,
-         -- so this is a total order. Report the earliest occurrence: the
-         -- conversation that first established the memory.
+         -- `node_id` is no longer unique: several conversations may share one
+         -- deduplicated memory. Without an explicit order the row returned
+         -- depends on the query plan, so the same memory could report a
+         -- different origin after a VACUUM or an index change. Report the
+         -- earliest occurrence, which is the conversation that first
+         -- established the memory.
          ORDER BY ms.indexed_at ASC, ms.conversation_id ASC
          LIMIT 1",
     )?;
@@ -170,6 +171,38 @@ impl MemorySystem {
 
         // Enable WAL mode for concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+        // Refuse a database created before `memory_sources.node_id UNIQUE` was
+        // dropped. There is deliberately no migration — Finch has no users and
+        // `schema.sql` is authoritative — but `CREATE TABLE IF NOT EXISTS`
+        // silently leaves an old table in place, and the first repeated memory
+        // then fails with `UNIQUE constraint failed: memory_sources.node_id`
+        // from deep inside an insert. Fail at open, naming the remedy.
+        {
+            let stale: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='memory_sources'
+                       AND sql LIKE '%UNIQUE%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            anyhow::ensure!(
+                stale == 0,
+                "{} predates the current memory schema and cannot be upgraded \
+                 in place. Storing the same content twice would fail with a \
+                 UNIQUE constraint error.\n\n\
+                 Move it aside and Finch will create a fresh store, keeping \
+                 the old one readable with any SQLite client:\n\
+                 \x20\x20mv {} {}.pre-schema-change\n\n\
+                 Do not delete it unless you are certain the history is not \
+                 wanted — there is no export path yet.",
+                config.db_path.display(),
+                config.db_path.display(),
+                config.db_path.display()
+            );
+        }
 
         // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
         // not 'node_id').  The old table always had 0 rows because inserts failed with
@@ -425,16 +458,17 @@ impl MemorySystem {
         let classifier = MemoryClassifier::new();
         if let Some((key_content, importance)) = classifier.process(role, content) {
             let embedding = self.embedding_engine.embed(&key_content)?;
-            let node_id = {
+            let effect = {
                 let mut tree = self.tree.lock().await;
-                tree.insert(key_content, embedding, importance.as_u8())?
+                tree.insert_with_effect(key_content, embedding, importance.as_u8())?
             };
+            let node_id = effect.node;
             // Persist all nodes (root + ancestors + new leaf) so the DB stays
             // consistent across process restarts and FK constraints are satisfied.
             // The source mapping commits in the same SQLite transaction, so a
             // retry cannot create a second semantic leaf for the same turn.
             if let Err(error) = self
-                .save_all_nodes_to_db(Some((node_id, &id, timestamp)))
+                .save_all_nodes_to_db(Some((node_id, &id, timestamp)), effect.promotion)
                 .await
             {
                 // The SQLite transaction rolled back, but insertion already
@@ -456,6 +490,30 @@ impl MemorySystem {
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
 
         Ok(true)
+    }
+
+    /// Structural summary of the semantic index: (leaf count, max depth,
+    /// widest fan-out below the root).
+    ///
+    /// Deliberately scalars rather than a tree snapshot. Cloning the index
+    /// copies every embedding while holding the lock — around 137 MB at the
+    /// scale measured on the dogfood store, blocking every concurrent insert
+    /// and query — and the callers only ever needed these three numbers.
+    pub async fn index_shape(&self) -> (usize, usize, usize) {
+        let tree = self.tree.lock().await;
+        let leaves = tree
+            .all_nodes()
+            .values()
+            .filter(|node| node.id != 0 && node.children.is_empty())
+            .count();
+        let widest = tree
+            .all_nodes()
+            .values()
+            .filter(|node| node.id != 0)
+            .map(|node| node.children.len())
+            .max()
+            .unwrap_or(0);
+        (leaves, tree.max_depth(), widest)
     }
 
     /// Query memory for relevant context
@@ -592,7 +650,11 @@ impl MemorySystem {
     ///      libsqlite3-sys bundles SQLite compiled with SQLITE_DEFAULT_FOREIGN_KEYS=1.
     ///   2. Parent embeddings updated by `update_parent_aggregation` were never
     ///      persisted, so embeddings went stale across process restarts.
-    async fn save_all_nodes_to_db(&self, source: Option<(NodeId, &str, i64)>) -> Result<()> {
+    async fn save_all_nodes_to_db(
+        &self,
+        source: Option<(NodeId, &str, i64)>,
+        promotion: Option<(NodeId, NodeId)>,
+    ) -> Result<()> {
         let mut nodes: Vec<TreeNode> = {
             let tree = self.tree.lock().await;
             tree.all_nodes().values().cloned().collect()
@@ -617,8 +679,14 @@ impl MemorySystem {
             // cascades away the provenance of every node it rewrites. Since
             // this function rewrites the whole tree on every insert, that
             // destroyed every source row except the one written later in the
-            // same transaction: the dogfood store held 9 rows against 896
-            // conversations.
+            // same transaction.
+            //
+            // The dogfood store held 9 rows against 896 conversations. The
+            // cascade alone accounts for all but one of those; the likely
+            // explanation for the survivors is the `node_id IS NULL` rows
+            // written for classifier-excluded turns, which a cascade through
+            // `tree_nodes` cannot reach. That is a hypothesis, not a measured
+            // fact.
             tx.execute(
                 "INSERT INTO tree_nodes
                  (node_id, parent_id, text, embedding, level, created_at, importance)
@@ -641,9 +709,24 @@ impl MemorySystem {
                 ],
             )?;
         }
-        if let Some((node_id, conversation_id, indexed_at)) = source {
+        // A promotion moved the promoted node's content into a new leaf. Any
+        // conversation attributed to that node was attributed to those words,
+        // so its provenance follows them; leaving it behind would point the row
+        // at an aggregate whose embedding is the mean of two memories, and the
+        // leaf that actually holds the text would have no source at all.
+        if let Some((promoted, moved)) = promotion {
             tx.execute(
-                "INSERT INTO memory_sources (conversation_id, node_id, indexed_at)
+                "UPDATE memory_sources SET node_id = ?1 WHERE node_id = ?2",
+                params![moved as i64, promoted as i64],
+            )?;
+        }
+
+        if let Some((node_id, conversation_id, indexed_at)) = source {
+            // `node_id` is not unique: deduplicated content is one node with
+            // several source conversations. `conversation_id` is the primary
+            // key, so a retry of the same turn is still idempotent.
+            tx.execute(
+                "INSERT OR REPLACE INTO memory_sources (conversation_id, node_id, indexed_at)
                  VALUES (?1, ?2, ?3)",
                 params![conversation_id, node_id as i64, indexed_at],
             )?;
@@ -994,13 +1077,26 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// Content long enough to survive the quality classifier's noise filter.
+    fn substantive(tag: &str) -> String {
+        format!(
+            "The deploy key for the {tag} environment lives in the Employee \
+             vault under the Finch signing item, not in the repository."
+        )
+    }
+
     #[tokio::test]
-    async fn test_saving_the_tree_preserves_earlier_provenance() -> Result<()> {
-        // `save_all_nodes_to_db` rewrites every node on every insert. With
-        // `INSERT OR REPLACE` each rewrite deleted the row first, and
-        // `memory_sources.node_id` is `ON DELETE CASCADE`, so each insert
-        // cascaded away the provenance of every prior one. The dogfood store
-        // showed the result: 9 source rows against 896 conversations.
+    async fn test_storing_identical_content_twice_succeeds() -> Result<()> {
+        // Deduplication resolves repeated content to an existing node, which
+        // the original `INSERT` into a UNIQUE `node_id` rejected outright.
+        //
+        // What this test now pins is the deduplication itself: on the base
+        // revision three inserts of one text mint three nodes, so `matching`
+        // is 3. The schema change is pinned separately by
+        // `test_repeated_content_records_every_source_conversation` — with the
+        // `INSERT OR REPLACE` used today, restoring the UNIQUE constraint
+        // would not raise an error at all, it would silently delete the
+        // earlier source row.
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -1008,17 +1104,52 @@ mod tests {
         };
         let memory = MemorySystem::new(config)?;
 
-        for i in 0..5 {
+        let text = substantive("production");
+        memory
+            .insert_conversation("system", &text, None, None)
+            .await?;
+
+        // The same fact again, in a different conversation.
+        memory
+            .insert_conversation("system", &text, None, None)
+            .await
+            .expect("storing identical content a second time must not fail");
+
+        // And a third time, to catch a fix that only handles the first repeat.
+        memory
+            .insert_conversation("system", &text, None, None)
+            .await?;
+
+        let stats = memory.stats().await?;
+        assert_eq!(
+            stats.conversation_count, 3,
+            "every turn is still recorded in raw history"
+        );
+
+        let results = memory.query_with_sources(&text, Some(5)).await?;
+        let matching = results.iter().filter(|r| r.text == text).count();
+        assert_eq!(
+            matching, 1,
+            "the repeated fact is one memory, not three; got {results:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_repeated_content_records_every_source_conversation() -> Result<()> {
+        // Many conversations map to one node, so all three sources are durable.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        let text = substantive("staging");
+        for _ in 0..3 {
             memory
-                .insert_conversation(
-                    "system",
-                    &format!(
-                        "Deployment note {i}: the signing key for environment {i} \
-                         is stored in the Employee vault, not in the repository."
-                    ),
-                    None,
-                    None,
-                )
+                .insert_conversation("system", &text, None, None)
                 .await?;
         }
 
@@ -1027,9 +1158,134 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?
         };
         assert_eq!(
-            sources, 5,
-            "every indexed conversation must keep its source row; saving the \
-             tree must not cascade earlier rows away"
+            sources, 3,
+            "each conversation that produced the memory keeps its own source row"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_promotion_moves_provenance_to_the_leaf_holding_the_text() -> Result<()> {
+        // When a matched leaf becomes an aggregate, the conversation attributed
+        // to it was attributed to those words, so its row must follow them to
+        // the moved child. Otherwise it points at an embedding that is the mean
+        // of two different memories, and the leaf holding the text has no
+        // source at all.
+        //
+        // The fixture pair must sit BELOW `NEAR_IDENTICAL_SIMILARITY`, or the
+        // variant rule fires, promotion never happens, and this test silently
+        // covers nothing. A previous version used "alpha" and "alpha two",
+        // which measured 0.99275 and did exactly that. Swapping a single word
+        // measures 0.9499 — below the cutoff, but by 0.040, not the 0.12
+        // an earlier version of this comment implied.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        memory
+            .insert_conversation("system", &substantive("production"), None, None)
+            .await?;
+        memory
+            .insert_conversation("system", &substantive("staging"), None, None)
+            .await?;
+
+        // Guard: if no promotion occurred there is nothing to follow, and the
+        // assertions below would pass vacuously.
+        let (_, depth, _) = memory.index_shape().await;
+        assert!(
+            depth > 1,
+            "the fixture must actually promote, or this test covers nothing"
+        );
+
+        let conn = memory.db.lock().await;
+
+        // Every source row points at a leaf, never at an aggregate.
+        let orphaned: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_sources s
+             WHERE EXISTS (SELECT 1 FROM tree_nodes c WHERE c.parent_id = s.node_id)",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            orphaned, 0,
+            "no conversation may be attributed to an internal aggregate node"
+        );
+
+        // And the row points at the leaf that actually holds its words.
+        let mismatched: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_sources s
+             JOIN conversations c ON c.id = s.conversation_id
+             JOIN tree_nodes n ON n.node_id = s.node_id
+             WHERE instr(c.content, n.text) = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            mismatched, 0,
+            "each source row must point at a node whose text came from that \
+             conversation"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_schema_is_refused_and_a_fresh_one_reopens() -> Result<()> {
+        use rusqlite::Connection;
+
+        // A database carrying the historical `memory_sources.node_id UNIQUE`
+        // must be refused at open, naming the file. `CREATE TABLE IF NOT
+        // EXISTS` would otherwise leave it in place and the first repeated
+        // memory would fail with an opaque constraint error from inside an
+        // insert.
+        let temp = NamedTempFile::new()?;
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute_batch(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY);
+                 CREATE TABLE tree_nodes (node_id INTEGER PRIMARY KEY);
+                 CREATE TABLE memory_sources (
+                     conversation_id TEXT PRIMARY KEY,
+                     node_id INTEGER UNIQUE,
+                     indexed_at INTEGER NOT NULL
+                 );",
+            )?;
+        }
+
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        // `expect_err` would require `MemorySystem: Debug`, which it is not.
+        let error = match MemorySystem::new(config.clone()) {
+            Ok(_) => panic!("a database predating the schema change must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("predates the current memory schema"),
+            "the refusal must say why: {message}"
+        );
+        assert!(
+            message.contains("mv "),
+            "and must advise moving the file aside rather than deleting it: {message}"
+        );
+
+        // The guard must not fire on a database this build created. Opening a
+        // fresh store twice is the case a bare substring probe would break.
+        let fresh = NamedTempFile::new()?;
+        let fresh_config = MemoryConfig {
+            db_path: fresh.path().to_path_buf(),
+            ..Default::default()
+        };
+        MemorySystem::new(fresh_config.clone())?;
+        assert!(
+            MemorySystem::new(fresh_config).is_ok(),
+            "a store created by this build must reopen without tripping the guard"
         );
 
         Ok(())
