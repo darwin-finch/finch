@@ -184,6 +184,15 @@ impl MemTree {
     }
 
     /// Insert, reporting what happened so durable provenance can be kept correct.
+    ///
+    /// **A returned `Err` leaves the tree mutated.** `attach_child` and
+    /// `promote_leaf` insert the new node and push it into its parent's
+    /// `children` before aggregating, and neither unwinds when aggregation
+    /// fails. A caller that keeps using the tree afterwards will find the
+    /// half-inserted node — and `find_leaf_by_text` will deduplicate to it, so
+    /// an identical retry returns `Ok` off the wreckage of the failed attempt.
+    /// The one production caller restores from the durable snapshot; a new one
+    /// must do the same or restore some other way.
     pub fn insert_with_effect(
         &mut self,
         text: String,
@@ -460,12 +469,12 @@ impl MemTree {
                      is corrupt"
                 );
             }
-            anyhow::ensure!(
-                self.nodes.contains_key(&current),
-                "memtree: node {current} not found during aggregation"
-            );
+            let node = self.nodes.get(&current).ok_or_else(|| {
+                anyhow::anyhow!("memtree: node {current} not found during aggregation")
+            })?;
+            let parent = node.parent;
             chain.push(current);
-            let Some(parent_id) = self.nodes[&current].parent else {
+            let Some(parent_id) = parent else {
                 break;
             };
             previous = current;
@@ -476,7 +485,10 @@ impl MemTree {
             // A childless node keeps its own embedding, but its ancestors are
             // still walked: the caller may have just moved a child away from
             // one of them.
-            let child_embeddings: Vec<_> = self.nodes[&id]
+            let node = self.nodes.get(&id).ok_or_else(|| {
+                anyhow::anyhow!("memtree: node {id} disappeared between validation and update")
+            })?;
+            let child_embeddings: Vec<_> = node
                 .children
                 .iter()
                 .filter_map(|child_id| self.nodes.get(child_id))
@@ -486,9 +498,10 @@ impl MemTree {
                 continue;
             }
             let aggregated = average_embeddings(&child_embeddings);
-            if let Some(node) = self.nodes.get_mut(&id) {
-                node.embedding = aggregated;
-            }
+            let node = self.nodes.get_mut(&id).ok_or_else(|| {
+                anyhow::anyhow!("memtree: node {id} disappeared before its embedding update")
+            })?;
+            node.embedding = aggregated;
         }
 
         Ok(())

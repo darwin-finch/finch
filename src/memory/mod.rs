@@ -475,7 +475,19 @@ impl MemorySystem {
                     // aggregation, so the guard is never reached — and then
                     // persists. A caller cannot act on an error that behaves
                     // that way.
-                    self.reload_tree_from_db().await?;
+                    //
+                    // The reload's own failure is logged, not returned: `error`
+                    // is the cycle diagnostic this whole change exists to
+                    // produce, and replacing it with a generic SQLite error
+                    // would leave a structurally corrupt store looking like a
+                    // transient I/O problem.
+                    if let Err(reload_error) = self.reload_tree_from_db().await {
+                        tracing::error!(
+                            %reload_error,
+                            "could not restore the MemTree after a failed insert; \
+                             the in-memory index is inconsistent until restart"
+                        );
+                    }
                     return Err(error);
                 }
             };
@@ -1822,10 +1834,12 @@ mod tests {
                 None,
             )
             .await;
+        let retry_error =
+            retry.expect_err("an identical retry of a write that hard-failed must fail too");
         assert!(
-            retry.is_err(),
-            "an identical retry of a write that hard-failed must fail the same \
-             way, not succeed off the wreckage of the first attempt"
+            retry_error.to_string().contains("cycles:"),
+            "the retry must fail the SAME way, not on a foreign-key violation or \
+             a masked reload error; got {retry_error}"
         );
         Ok(())
     }
