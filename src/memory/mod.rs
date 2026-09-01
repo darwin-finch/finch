@@ -602,7 +602,39 @@ impl MemorySystem {
             let embedding = self.embedding_engine.embed(&key_content)?;
             let effect = {
                 let mut tree = self.tree.lock().await;
-                tree.insert_with_effect(key_content, embedding, importance.as_u8())?
+                tree.insert_with_effect(key_content, embedding, importance.as_u8())
+            };
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(error) => {
+                    // Same reason as the `save_all_nodes_to_db` failure below.
+                    // `attach_child` and `promote_leaf` insert the new node and
+                    // push it into its parent's `children` BEFORE aggregating,
+                    // so an aggregation error leaves the tree mutated. Without
+                    // this, an identical retry of the write that just hard
+                    // failed succeeds — `find_leaf_by_text` dedups to the node
+                    // the failed insert left behind and returns before
+                    // aggregation, so the guard is never reached — and then
+                    // persists. A caller cannot act on an error that behaves
+                    // that way.
+                    //
+                    // The reload's own failure is logged, not returned: `error`
+                    // is the cycle diagnostic this whole change exists to
+                    // produce, and replacing it with a generic SQLite error
+                    // would leave a structurally corrupt store looking like a
+                    // transient I/O problem.
+                    if let Err(reload_error) = self.reload_tree_from_db().await {
+                        // `?`, not `%`: `Display` on an `anyhow::Error` prints
+                        // only the outermost message and drops the source chain,
+                        // which is where a restore failure's actual cause lives.
+                        tracing::error!(
+                            ?reload_error,
+                            "could not restore the MemTree after a failed insert; \
+                             the in-memory index is inconsistent until restart"
+                        );
+                    }
+                    return Err(error);
+                }
             };
             let node_id = effect.node;
             // Persist all nodes (root + ancestors + new leaf) so the DB stays
@@ -617,7 +649,18 @@ impl MemorySystem {
                 // mutated the in-memory tree. Rebuild it from the durable
                 // snapshot before returning so a retry cannot add a duplicate
                 // semantic leaf for the same canonical turn.
-                self.reload_tree_from_db().await?;
+                //
+                // The reload's own failure is logged rather than returned, for
+                // the same reason as the branch above: replacing the error the
+                // caller actually needs with a second, coincidental one hides
+                // what went wrong.
+                if let Err(reload_error) = self.reload_tree_from_db().await {
+                    tracing::error!(
+                        ?reload_error,
+                        "could not restore the MemTree after a failed save; the \
+                         in-memory index is inconsistent until restart"
+                    );
+                }
                 return Err(error);
             }
         } else {
@@ -2979,6 +3022,95 @@ mod tests {
             "node should be in MemTree after migration"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_corrupt_parent_chain_on_disk_errors_instead_of_aborting() -> Result<()> {
+        // #274 at the persistence boundary. `parent` links are rebuilt from
+        // `tree_nodes`, so a corrupt chain reaches `update_parent_aggregation`
+        // through a real store open followed by a real write. Before the fix
+        // that recursed until the thread overflowed its stack, which is SIGABRT
+        // — the process dies and no `Result` is ever returned, so a caller
+        // cannot log it, retry, or fall back.
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // A real store with real nodes.
+        {
+            let memory = MemorySystem::new(config.clone())?;
+            for i in 0..5 {
+                memory
+                    .insert_conversation(
+                        "system",
+                        &format!(
+                            "Deployment note {i}: the signing key lives in the \
+                             Employee vault, never in the repository."
+                        ),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+        }
+
+        // Corrupt it: the root's parent points at one of its own descendants.
+        // The foreign key holds because the target row already exists.
+        {
+            let conn = Connection::open(temp.path())?;
+            let descendant: i64 = conn.query_row(
+                "SELECT node_id FROM tree_nodes WHERE node_id != 0 ORDER BY node_id ASC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE tree_nodes SET parent_id = ?1 WHERE node_id = 0",
+                params![descendant],
+            )?;
+        }
+
+        let memory = MemorySystem::new(config)?;
+        let result = memory
+            .insert_conversation(
+                "system",
+                "A memory written against a store whose parent chain is corrupt.",
+                None,
+                None,
+            )
+            .await;
+
+        let error = result.expect_err("a corrupt parent chain must surface as an error");
+        assert!(
+            error.to_string().contains("cycles:"),
+            "the error must name the cycle so the corruption is diagnosable; \
+             got {error}"
+        );
+
+        // The same write, again. `attach_child` and `promote_leaf` insert the
+        // new node and push it into its parent's `children` BEFORE aggregating,
+        // so an aggregation error leaves the tree mutated. Without restoring it
+        // the retry hits `find_leaf_by_text`, dedups to the node the failed
+        // insert left behind, returns before aggregation — and SUCCEEDS,
+        // persisting a write that had just hard-failed. An error a caller
+        // cannot retry deterministically is worse than no error.
+        let retry = memory
+            .insert_conversation(
+                "system",
+                "A memory written against a store whose parent chain is corrupt.",
+                None,
+                None,
+            )
+            .await;
+        let retry_error =
+            retry.expect_err("an identical retry of a write that hard-failed must fail too");
+        assert!(
+            retry_error.to_string().contains("cycles:"),
+            "the retry must fail the SAME way, not on a foreign-key violation or \
+             a masked reload error; got {retry_error}"
+        );
         Ok(())
     }
 }
