@@ -36,7 +36,8 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   Activation failures aggregate their stage and rollback errors, retain explicit `CLEANING` repair
   ownership on incomplete rollback, and never report a false restored state.
   The production REPL constructor owns one larger bounded repair attempt after an activation error;
-  it enables ordinary stdout only after exact repair, otherwise construction aborts fail-closed.
+  it enables ordinary stdout only after exact repair. A repeated repair failure retains an explicit
+  takeover-safe `CLEANING` owner and aborts construction without fallback stdout.
 - Application waits and nonblocking write loops use absolute deadlines. Their bound assumes that a
   runnable thread executing Finch's short gate section is scheduled, and that supported tty/console
   kernel calls return. It is not a mathematical wall-clock claim against a frozen process, stopped
@@ -52,11 +53,14 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   bounded, latched restoration attempt and always returns to Rust's unwind policy rather than
   parking forever. These binary paths complete within their larger absolute deadline under this
   supported-progress precondition and never treat a failed restoration as successful.
-- On supported Unix targets, `pthread_atfork` prepare blocks terminal signals only on the forking
-  thread. The child callback restores the host dispositions captured before Finch ownership, clears
-  inherited sticky/monitor ownership (the monitor thread does not survive `fork`), and then restores
-  the caller's mask. The supported child contract is immediate exec/exit; starting another TUI in
-  the un-execed child is outside scope.
+- On supported Unix targets, `pthread_atfork` prepare atomically serializes fork with signal
+  arm/disarm and blocks terminal signals only on the forking thread. Its saved mask is one global
+  record protected by that atomic transition; callbacks use no Rust TLS, locks, allocation, or
+  Tokio. The child restores only slots whose current disposition is Finch's trampoline, using the
+  exact per-slot host action displaced by the completed arm. Terminal phase is never a proxy for
+  signal ownership. It then clears inherited sticky/monitor ownership (the monitor thread does not
+  survive `fork`) and restores the caller's mask. The supported child contract is immediate
+  exec/exit; starting another TUI in the un-execed child is outside scope.
 - The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
   exclusive lease, exact output generation, raw/protocol activation, bounded staged output, cleanup,
   and Drop. Every staged Write/Flush carries shared
@@ -65,9 +69,11 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   receive. Failed, unknown, or backpressured cleanup remains `CLEANING` and rejects stale writers and
   replacements until retry repairs it. Windows console stdout currently has no proven cancellable or
   nonblocking Write/Flush contract, so the production renderer rejects it before raw/protocol
-  activation. CI exercises the exact actor with supervised bounded effects and asserts the actual
-  Windows production rejection. ConPTY behavior remains explicitly acceptance-gated; this is not a
-  Windows TUI conformance claim.
+  activation. The actor bypass exists only under `cfg(test)` and injects stalls before an effect;
+  once a blocking console syscall reaches `EffectStarted`, the architecture cannot cancel it and
+  explicitly treats that path as nonconformant. CI exercises the exact actor with supervised bounded
+  pre-effect stalls and asserts the actual Windows production rejection. ConPTY behavior remains
+  explicitly acceptance-gated; this is not a Windows TUI conformance claim.
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).

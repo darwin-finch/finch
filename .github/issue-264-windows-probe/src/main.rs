@@ -24,6 +24,7 @@ fn cleanup_protocols() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_probe() {
     let mut activation = Vec::new();
     terminal_protocol::write_activation(&mut activation).unwrap();
@@ -195,8 +196,23 @@ fn run_probe() {
     }
 }
 
+#[cfg(test)]
 fn main() {
     run_probe();
+}
+
+#[cfg(not(test))]
+fn main() {
+    #[cfg(windows)]
+    {
+        // Keep the ordinary probe binary wired to the production path. It is
+        // expected to reject uncancellable Windows stdout before activation.
+        assert!(terminal_lifecycle::PortableRendererSession::activate(
+            terminal_protocol::activate,
+            terminal_protocol::cleanup,
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]

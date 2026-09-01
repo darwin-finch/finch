@@ -495,11 +495,11 @@ fn wait_effect_reply_until(
                     }
                 }
                 Err(OPERATION_EFFECT_STARTED) | Err(OPERATION_COMPLETE) => {
-                    // Production activation rejects non-Unix stdout because it
-                    // cannot prove a cancellable/nonblocking console effect.
-                    // Supervised exact-source operations must finish inside
-                    // this final absolute grace; never convert the actor claim
-                    // into an unbounded recv.
+                    // Production activation rejects non-Unix stdout because an
+                    // EffectStarted console syscall cannot be cancelled and
+                    // may outlive this final absolute grace. The cfg(test)
+                    // actor bypass injects stalls only before this edge; it is
+                    // not a conformance claim for a blocking console effect.
                     return wait_reply_until(receiver, operation.effect_deadline);
                 }
                 Err(_) => continue,
@@ -748,10 +748,10 @@ impl PortableRendererSession {
         })
     }
 
-    /// Exercise the exact actor/lifecycle implementation with bounded
-    /// supervised effects even when the host console is acceptance-gated.
-    #[doc(hidden)]
-    #[allow(dead_code)]
+    /// Exercise the exact actor/lifecycle implementation in unit tests. This
+    /// bypass is absent from ordinary crate builds, so production code cannot
+    /// evade [`ensure_bounded_portable_stdout`].
+    #[cfg(test)]
     pub(crate) fn activate_supervised(
         activate_protocols: ProtocolOperation,
         cleanup_protocols: ProtocolOperation,

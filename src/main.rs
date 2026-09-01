@@ -1126,7 +1126,7 @@ async fn main() -> Result<()> {
     // session becomes replaceable.
     let _terminal_session = finch::cli::tui::BinaryTerminalSession::install()
         .context("Failed to install terminal signal ownership")?;
-    let mut repl = Repl::new(
+    let repl_result = Repl::new(
         config,
         claude_client,
         router,
@@ -1134,7 +1134,18 @@ async fn main() -> Result<()> {
         daemon_client,
         brain_name,
     )
-    .await?;
+    .await;
+    #[cfg(unix)]
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_ASSERT_DIRTY_CONSTRUCTION").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        anyhow::ensure!(
+            repl_result.is_err()
+                && finch::cli::tui::supervised_terminal_cleanup_owner_is_retained()?,
+            "dirty Repl construction did not retain fail-closed terminal repair ownership"
+        );
+    }
+    let mut repl = repl_result?;
     if std::env::var_os("FINCH_TEST_TUI_MAIN_RETURN_AFTER_CONSTRUCTION").is_some()
         && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
     {

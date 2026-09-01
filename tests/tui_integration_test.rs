@@ -34,6 +34,44 @@ extern "C" fn embedding_signal_handler(_: nix::libc::c_int) {
 }
 
 #[cfg(unix)]
+fn install_embedding_sigterm() -> anyhow::Result<()> {
+    let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+    action.sa_sigaction = embedding_signal_handler as *const () as usize;
+    unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
+    anyhow::ensure!(
+        unsafe { nix::libc::sigaction(nix::libc::SIGTERM, &action, std::ptr::null_mut()) } == 0,
+        "install embedding SIGTERM handler"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fork_child_must_observe_embedding_sigterm() -> anyhow::Result<()> {
+    EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
+    let forked = unsafe { nix::libc::fork() };
+    anyhow::ensure!(forked >= 0, "fork embedding-signal child");
+    if forked == 0 {
+        unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+        let status = if EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire) {
+            0
+        } else {
+            77
+        };
+        unsafe { nix::libc::_exit(status) };
+    }
+    let mut status = 0;
+    anyhow::ensure!(
+        unsafe { nix::libc::waitpid(forked, &mut status, 0) } == forked,
+        "reap fork embedding-signal child"
+    );
+    anyhow::ensure!(
+        nix::libc::WIFEXITED(status) && nix::libc::WEXITSTATUS(status) == 0,
+        "fork child did not receive the current embedding disposition: {status}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 struct TerminalModes {
     input: nix::libc::tcflag_t,
@@ -446,19 +484,62 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         marker(b"FINCH_SIGNAL_OWNERS_REUSED")?;
         return Ok(());
     }
+    if mode == "fork-public-renderer-after-host-change" {
+        // Fail-before: atfork treated ACTIVE terminal phase as signal
+        // ownership and restored the stale install-time snapshot, even though
+        // this public embedding renderer never armed Finch's trampoline.
+        let owner = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+        drop(owner);
+        install_embedding_sigterm()?;
+        let mut renderer = new_renderer()?;
+        fork_child_must_observe_embedding_sigterm()?;
+        renderer.shutdown()?;
+        marker(b"FINCH_FORK_PUBLIC_RENDERER_HOST_SIGNAL_PRESERVED")?;
+        return Ok(());
+    }
+    if mode == "fork-host-change-between-install-arm" {
+        // Binary install only registers stable infrastructure. The handler
+        // installed after it, immediately before terminal arm, is the exact
+        // disposition that Finch displaces and the fork child must restore.
+        let owner = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+        install_embedding_sigterm()?;
+        let mut renderer = new_renderer()?;
+        fork_child_must_observe_embedding_sigterm()?;
+        renderer.shutdown()?;
+        drop(owner);
+        marker(b"FINCH_FORK_DISPLACED_HOST_SIGNAL_RESTORED")?;
+        return Ok(());
+    }
+    if mode == "fork-host-replaces-armed-signal" {
+        // The installed bit records Finch's arm, but an embedding host can
+        // replace one slot afterward. The child and parent cleanup must both
+        // preserve that newer disposition instead of blindly replaying the
+        // action Finch originally displaced.
+        let owner = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+        let mut renderer = new_renderer()?;
+        install_embedding_sigterm()?;
+        fork_child_must_observe_embedding_sigterm()?;
+        renderer.shutdown()?;
+        drop(owner);
+        EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
+        unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+        anyhow::ensure!(
+            EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire),
+            "parent cleanup overwrote the embedding host's replacement signal action"
+        );
+        marker(b"FINCH_FORK_REPLACEMENT_HOST_SIGNAL_PRESERVED")?;
+        return Ok(());
+    }
 
     let preserves_host_signal = matches!(
         mode.as_str(),
         "binary-owner-drop" | "owner-windows" | "fork-preexec-host-signal"
     );
     if preserves_host_signal {
-        let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
-        action.sa_sigaction = embedding_signal_handler as *const () as usize;
-        unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
-        anyhow::ensure!(
-            unsafe { nix::libc::sigaction(nix::libc::SIGTERM, &action, std::ptr::null_mut()) } == 0,
-            "install host handler before binary ownership"
-        );
+        install_embedding_sigterm()?;
     }
     let needs_binary_owner = matches!(
         mode.as_str(),
@@ -666,27 +747,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             Ok(())
         }
         "fork-preexec-host-signal" => {
-            EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
-            let forked = unsafe { nix::libc::fork() };
-            anyhow::ensure!(forked >= 0, "fork embedding-signal child");
-            if forked == 0 {
-                unsafe { nix::libc::raise(nix::libc::SIGTERM) };
-                let status = if EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire) {
-                    0
-                } else {
-                    77
-                };
-                unsafe { nix::libc::_exit(status) };
-            }
-            let mut status = 0;
-            anyhow::ensure!(
-                unsafe { nix::libc::waitpid(forked, &mut status, 0) } == forked,
-                "reap fork embedding-signal child"
-            );
-            anyhow::ensure!(
-                nix::libc::WIFEXITED(status) && nix::libc::WEXITSTATUS(status) == 0,
-                "fork child did not receive restored embedding disposition: {status}"
-            );
+            fork_child_must_observe_embedding_sigterm()?;
             renderer.shutdown()?;
             marker(b"FINCH_FORK_PREEXEC_HOST_SIGNAL_RESTORED")?;
             Ok(())
@@ -1427,6 +1488,65 @@ fn test_real_repl_constructor_repairs_before_standard_output_fallback() {
     }
 }
 
+/// A constructor whose activation and every rollback attempt fail must abort
+/// without admitting standard stdout. Fail-before: the production Err branch
+/// enabled fallback unconditionally while the generation was still raw and
+/// retained in CLEANING.
+#[cfg(unix)]
+#[test]
+fn test_real_repl_constructor_persistent_dirty_failure_aborts_without_stdout_fallback() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let original = terminal_modes(&slave);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-terminal-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_FAIL_AFTER", "keyboard")
+        .env("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK", "1")
+        .env("FINCH_TEST_TUI_MAIN_ASSERT_DIRTY_CONSTRUCTION", "1")
+        .env("FINCH_TEST_TUI_MAIN_RETURN_AFTER_CONSTRUCTION", "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("spawn persistently dirty Repl constructor probe");
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(10));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "dirty constructor did not abort cleanly"
+    );
+    assert!(
+        !transcript
+            .windows(b"Falling back to standard output mode".len())
+            .any(|bytes| bytes == b"Falling back to standard output mode"),
+        "dirty constructor published fallback stdout: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    assert!(
+        String::from_utf8_lossy(&transcript).contains("automatic terminal recovery failed"),
+        "dirty constructor did not report recovery failure: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    assert_ne!(
+        terminal_modes(&slave),
+        original,
+        "persistent rollback failure falsely restored/published INACTIVE"
+    );
+}
+
 /// The IPC quit watcher and this supervised main path share the exact binary
 /// exit helper. Fail-before: a same-thread gate owner deadlocked restoration or
 /// let `process::exit` bypass reset.
@@ -1600,6 +1720,26 @@ fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn assert_fork_signal_mode(mode: &str, marker: &[u8]) {
+    let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert!(status.success(), "fork/pre-exec probe failed: {status}");
+    assert!(transcript
+        .windows(marker.len())
+        .any(|bytes| bytes == marker));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn test_fork_child_restores_host_signal_before_preexec_delivery() {
     let _serial = terminal_pty_test_lock();
@@ -1616,23 +1756,47 @@ fn test_fork_child_restores_host_signal_before_preexec_delivery() {
             b"FINCH_FORK_PREEXEC_HOST_SIGNAL_RESTORED".as_slice(),
         ),
     ] {
-        let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
-        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
-        let mut transcript = Vec::new();
-        drain_pty(
-            &mut master,
-            &mut transcript,
-            Instant::now() + Duration::from_millis(100),
-        );
-        assert!(status.success(), "fork/pre-exec probe failed: {status}");
-        assert!(transcript
-            .windows(marker.len())
-            .any(|bytes| bytes == marker));
-        assert_eq!(terminal_modes(&slave), original);
-        assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
-        assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
-        assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+        assert_fork_signal_mode(mode, marker);
     }
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_fork_active_public_renderer_preserves_post_install_host_signal() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    assert_fork_signal_mode(
+        "fork-public-renderer-after-host-change",
+        b"FINCH_FORK_PUBLIC_RENDERER_HOST_SIGNAL_PRESERVED",
+    );
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_fork_restores_handler_displaced_after_binary_install() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    assert_fork_signal_mode(
+        "fork-host-change-between-install-arm",
+        b"FINCH_FORK_DISPLACED_HOST_SIGNAL_RESTORED",
+    );
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_fork_and_cleanup_preserve_host_replacement_of_armed_signal() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    assert_fork_signal_mode(
+        "fork-host-replaces-armed-signal",
+        b"FINCH_FORK_REPLACEMENT_HOST_SIGNAL_PRESERVED",
+    );
 }
 
 #[cfg(unix)]

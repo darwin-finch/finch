@@ -1613,10 +1613,14 @@ unsafe impl Sync for PreviousSignalActions {}
 static PREVIOUS_SIGNAL_ACTIONS: PreviousSignalActions =
     PreviousSignalActions(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-static FORK_CHILD_SIGNAL_ACTIONS: PreviousSignalActions =
-    PreviousSignalActions(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
+struct AtForkSignalMask(std::cell::UnsafeCell<nix::libc::sigset_t>);
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-static FORK_CHILD_SIGNAL_ACTIONS_READY: std::sync::atomic::AtomicBool =
+unsafe impl Sync for AtForkSignalMask {}
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static ATFORK_SIGNAL_MASK: AtForkSignalMask =
+    AtForkSignalMask(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static ATFORK_SIGNAL_MASK_VALID: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 static SIGNAL_ATFORK_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -1686,69 +1690,70 @@ static SUPERVISED_CLEANUP_PAUSE_OWNER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-struct AtForkSignalMask {
-    mask: std::cell::UnsafeCell<nix::libc::sigset_t>,
-    valid: std::cell::Cell<bool>,
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-std::thread_local! {
-    // Const native TLS avoids locks or allocation in pthread_atfork callbacks.
-    static ATFORK_SIGNAL_MASK: AtForkSignalMask = const { AtForkSignalMask {
-        mask: std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }),
-        valid: std::cell::Cell::new(false),
-    }};
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_prepare() {
+    use std::sync::atomic::Ordering;
+    // Serialize fork with signal arm/disarm and with every other fork callback
+    // using the same process-global atomic transition. This makes the one
+    // process-global saved mask record exclusive without TLS, a mutex, or
+    // allocation. The supported progress contract requires the runnable
+    // signal-transition owner to finish its bounded application-side section.
+    while SIGNAL_TRANSITION
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        std::hint::spin_loop();
+    }
     let mut blocked = unsafe { std::mem::zeroed::<nix::libc::sigset_t>() };
     unsafe { nix::libc::sigemptyset(&mut blocked) };
     for signal in TERMINAL_SIGNALS {
         unsafe { nix::libc::sigaddset(&mut blocked, signal) };
     }
-    ATFORK_SIGNAL_MASK.with(|saved| {
-        let ok = unsafe {
-            nix::libc::pthread_sigmask(nix::libc::SIG_BLOCK, &blocked, saved.mask.get()) == 0
-        };
-        saved.valid.set(ok);
-    });
+    let ok = unsafe {
+        nix::libc::pthread_sigmask(nix::libc::SIG_BLOCK, &blocked, ATFORK_SIGNAL_MASK.0.get()) == 0
+    };
+    ATFORK_SIGNAL_MASK_VALID.store(ok, Ordering::Release);
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe fn restore_atfork_signal_mask() {
-    ATFORK_SIGNAL_MASK.with(|saved| {
-        if saved.valid.replace(false) {
-            unsafe {
-                nix::libc::pthread_sigmask(
-                    nix::libc::SIG_SETMASK,
-                    saved.mask.get(),
-                    std::ptr::null_mut(),
-                );
-            }
+    if ATFORK_SIGNAL_MASK_VALID.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        unsafe {
+            nix::libc::pthread_sigmask(
+                nix::libc::SIG_SETMASK,
+                ATFORK_SIGNAL_MASK.0.get(),
+                std::ptr::null_mut(),
+            );
         }
-    });
+    }
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_parent() {
     unsafe { restore_atfork_signal_mask() };
+    SIGNAL_TRANSITION.store(false, std::sync::atomic::Ordering::Release);
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_child() {
     use std::sync::atomic::Ordering;
     // The caller's terminal signals remain blocked from prepare until the
-    // inherited Finch actions and sticky state have been withdrawn. The child
-    // is then safe to receive a signal before its immediate exec/exit.
-    if (SIGNAL_INSTALLED_MASK.load(Ordering::Acquire) != 0
-        || TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) != SESSION_INACTIVE)
-        && FORK_CHILD_SIGNAL_ACTIONS_READY.load(Ordering::Acquire)
-    {
-        let actions = unsafe { (*FORK_CHILD_SIGNAL_ACTIONS.0.get()).as_ptr() };
-        for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
+    // inherited Finch actions and sticky state have been withdrawn. Restore
+    // only a slot whose exact current action is Finch's trampoline, using the
+    // disposition displaced by that same arm operation. Terminal phase is not
+    // signal ownership: a public embedding renderer can be ACTIVE with no
+    // binary handlers at all.
+    let installed_mask = SIGNAL_INSTALLED_MASK.load(Ordering::Acquire);
+    let previous = unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr() };
+    for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
+        if installed_mask & (1 << index) == 0 {
+            continue;
+        }
+        let mut current = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+        if unsafe { nix::libc::sigaction(signal, std::ptr::null(), &mut current) } == 0
+            && current.sa_sigaction == terminal_signal_handler as *const () as usize
+        {
             unsafe {
-                nix::libc::sigaction(signal, actions.add(index), std::ptr::null_mut());
+                nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut());
             }
         }
     }
@@ -1763,6 +1768,7 @@ unsafe extern "C" fn terminal_atfork_child() {
         .termination_requested
         .store(false, Ordering::Release);
     unsafe { restore_atfork_signal_mask() };
+    SIGNAL_TRANSITION.store(false, Ordering::Release);
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -1826,26 +1832,6 @@ fn ensure_terminal_signal_atfork() -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "binary terminal signal ownership requires a verified pthread_atfork protocol",
     ))
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn capture_fork_child_signal_actions() -> io::Result<()> {
-    use std::sync::atomic::Ordering;
-    FORK_CHILD_SIGNAL_ACTIONS_READY.store(false, Ordering::Release);
-    let actions = unsafe { (*FORK_CHILD_SIGNAL_ACTIONS.0.get()).as_mut_ptr() };
-    for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
-        let status = unsafe { nix::libc::sigaction(signal, std::ptr::null(), actions.add(index)) };
-        if status < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    FORK_CHILD_SIGNAL_ACTIONS_READY.store(true, Ordering::Release);
-    Ok(())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn capture_fork_child_signal_actions() -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
@@ -2003,9 +1989,7 @@ impl BinaryTerminalSession {
                 "injected atomic signal transport setup failure",
             ));
         }
-        if let Err(error) =
-            ensure_terminal_signal_atfork().and_then(|()| capture_fork_child_signal_actions())
-        {
+        if let Err(error) = ensure_terminal_signal_atfork() {
             BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
             return Err(error);
         }
@@ -2327,16 +2311,25 @@ fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
         }
         unsafe { previous.add(index).write(old) };
         installed_mask |= 1 << index;
+        // Publish only after the displaced disposition is initialized. Fork
+        // prepare shares SIGNAL_TRANSITION, so a child observes either the
+        // complete prior mask or this exact completed per-slot arm state.
+        SIGNAL_INSTALLED_MASK.store(installed_mask, Ordering::Release);
     }
     if let Some(error) = first_error {
         let mut remaining_mask = 0_u8;
         for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate().rev() {
             if installed_mask & (1 << index) != 0 {
-                if unsafe {
-                    nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut())
-                } < 0
-                {
-                    remaining_mask |= 1 << index;
+                match terminal_signal_slot_is_owned(signal) {
+                    Ok(true)
+                        if unsafe {
+                            nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut())
+                        } < 0 =>
+                    {
+                        remaining_mask |= 1 << index;
+                    }
+                    Ok(true) | Ok(false) => {}
+                    Err(_) => remaining_mask |= 1 << index,
                 }
             }
         }
@@ -2347,6 +2340,15 @@ fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
     SIGNAL_INSTALLED_MASK.store(installed_mask, Ordering::Release);
     release_signal_transition();
     Ok(())
+}
+
+#[cfg(unix)]
+fn terminal_signal_slot_is_owned(signal: nix::libc::c_int) -> io::Result<bool> {
+    let mut current = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+    if unsafe { nix::libc::sigaction(signal, std::ptr::null(), &mut current) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(current.sa_sigaction == terminal_signal_handler as *const () as usize)
 }
 
 #[cfg(unix)]
@@ -2369,17 +2371,31 @@ fn disarm_binary_terminal_signals_until(deadline: std::time::Instant) -> io::Res
             continue;
         }
         let injected = index == 1 && SUPERVISED_SIGNAL_DISARM_FAILURE.swap(false, Ordering::AcqRel);
-        if injected
-            || unsafe { nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut()) }
-                < 0
-        {
-            remaining_mask |= 1 << index;
-            if first_error.is_none() {
-                first_error = Some(if injected {
-                    io::Error::other("injected signal disposition restore failure")
-                } else {
-                    io::Error::last_os_error()
-                });
+        match terminal_signal_slot_is_owned(signal) {
+            Ok(false) => {
+                // An embedding host replaced Finch's action. Finch no longer
+                // owns this slot and must not overwrite the newer contract.
+            }
+            Ok(true)
+                if !injected
+                    && unsafe {
+                        nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut())
+                    } == 0 => {}
+            Ok(true) => {
+                remaining_mask |= 1 << index;
+                if first_error.is_none() {
+                    first_error = Some(if injected {
+                        io::Error::other("injected signal disposition restore failure")
+                    } else {
+                        io::Error::last_os_error()
+                    });
+                }
+            }
+            Err(error) => {
+                remaining_mask |= 1 << index;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
     }
@@ -2476,8 +2492,37 @@ pub fn emergency_restore_terminal_result() -> io::Result<()> {
 /// ordinary stdout. A dirty `CLEANING` generation remains fail-closed and the
 /// caller must abort construction instead of publishing standard-output bytes.
 pub(crate) fn recover_terminal_after_failed_activation() -> io::Result<()> {
-    cleanup_active_terminal_until(std::time::Instant::now() + Duration::from_millis(500))
+    let result =
+        cleanup_active_terminal_until(std::time::Instant::now() + Duration::from_millis(500));
+    if result.is_err() {
+        retain_explicit_terminal_repair_owner();
+    }
+    result
 }
+
+#[cfg(unix)]
+fn retain_explicit_terminal_repair_owner() {
+    use std::sync::atomic::Ordering;
+    if TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) != SESSION_CLEANING
+        || TERMINAL_COORDINATOR.cleanup_owner.load(Ordering::Acquire) != 0
+    {
+        return;
+    }
+    let owner = NEXT_TERMINAL_CLEANUP_OWNER
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+        .max(1);
+    if TERMINAL_COORDINATOR
+        .cleanup_owner
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        publish_terminal_progress();
+    }
+}
+
+#[cfg(not(unix))]
+fn retain_explicit_terminal_repair_owner() {}
 
 /// Monotonic application progress observed by latched binary termination
 /// paths. It is deliberately only a wakeup hint; cleanup always revalidates
