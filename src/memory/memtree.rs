@@ -29,7 +29,8 @@ const NEAR_IDENTICAL_SIMILARITY: f32 = 0.99;
 /// Floor for the depth-adaptive threshold.
 const MIN_SIMILARITY_THRESHOLD: f32 = 0.05;
 
-/// Unused base threshold retained for the paper reference in the docs below.
+/// Base threshold at the root: `theta_0` in the paper's notation, and the
+/// starting point of the depth-adaptive curve in `threshold_at_depth`.
 const BASE_SIMILARITY_THRESHOLD: f32 = 0.4;
 
 /// Rate at which the threshold rises with depth, `lambda` in the paper.
@@ -246,12 +247,18 @@ impl MemTree {
                 // belongs beside its siblings rather than beneath them.
                 //
                 // But only once a cluster exists to hold them. At the root
-                // there is no cluster yet, and attaching there would make 40
-                // variants into 40 direct children of the root — trading the
-                // chain defect for the wide-node defect from the same issue.
-                // So the first variant promotes, creating the cluster, and
-                // every later one lands inside it: root fan-out 1 and depth 2,
-                // however many variants arrive.
+                // there is no cluster yet, so the first variant promotes to
+                // create one and every later variant lands inside it: root
+                // fan-out 1 and depth 2, however many arrive.
+                //
+                // Be precise about what this does and does not fix. The
+                // cluster head's own fan-out is unbounded — 13,650 repeats of
+                // one status line give one node with 13,650 children, the same
+                // shape #250 measured, one level below where it used to sit.
+                // That is intended: those are variants of a single message and
+                // belong together, retrieval scans linearly either way, and
+                // insert cost is unchanged. What this rule fixes is the depth,
+                // not the width.
                 if best_similarity >= NEAR_IDENTICAL_SIMILARITY && current != self.root {
                     let node =
                         self.attach_child(current, text, embedding, importance, created_at)?;
@@ -671,6 +678,50 @@ mod tests {
     }
 
     #[test]
+    fn test_ceiling_stays_above_the_variant_cutoff() {
+        // Load-bearing ordering. When the ceiling sat below the variant cutoff,
+        // pairs in the band between them cleared the saturated threshold at
+        // every depth yet were never recognised as variants, so they promoted
+        // without bound. Nothing else in the suite lands in that band, so
+        // without this assertion the whole suite passes with the ceiling
+        // lowered — and a family at pairwise 0.985 then builds a 500-deep
+        // chain instead of stopping at 25.
+        assert!(
+            MAX_SIMILARITY_THRESHOLD > NEAR_IDENTICAL_SIMILARITY,
+            "the depth-adaptive ceiling ({MAX_SIMILARITY_THRESHOLD}) must stay \
+             above the variant cutoff ({NEAR_IDENTICAL_SIMILARITY}), or the \
+             band between them promotes without bound"
+        );
+    }
+
+    #[test]
+    fn test_content_in_the_ceiling_band_does_not_chain() {
+        // A fixture inside the reopened band: similarity above the ceiling but
+        // below the variant cutoff. Depth is bounded by the point at which the
+        // depth-adaptive threshold reaches the ceiling.
+        let mut tree = MemTree::new_with_dim(64);
+        let mut base = vec![0.02_f32; 64];
+        base[0] = 1.0;
+        for i in 0..120 {
+            let mut v = base.clone();
+            v[1 + (i % 60)] += 0.16;
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            tree.insert(
+                format!("banded item {i}"),
+                v.iter().map(|x| x / norm).collect(),
+                1,
+            )
+            .unwrap();
+        }
+        assert!(
+            tree.max_depth() <= 26,
+            "depth must be bounded by the ceiling, not by the input count; \
+             got {} for 120 inserts",
+            tree.max_depth()
+        );
+    }
+
+    #[test]
     fn test_threshold_rises_with_depth() {
         let root = MemTree::threshold_at_depth(0);
         let deep = MemTree::threshold_at_depth(13);
@@ -716,6 +767,25 @@ mod tests {
             root_children <= 2,
             "variants must form a cluster, not spread across the root; got \
              {root_children} root children for 40 variants"
+        );
+
+        // And pin where the width actually goes, so the shape is asserted
+        // rather than merely implied: one cluster head holding them all. This
+        // is the fan-out the rule deliberately does not bound, and stating it
+        // here means a change that re-spreads them cannot pass quietly.
+        let widest_nonroot = tree
+            .all_nodes()
+            .values()
+            .filter(|node| node.id != 0)
+            .map(|node| node.children.len())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            widest_nonroot, 40,
+            "the 40 variants must sit under one cluster head. The second insert \
+             promotes the first, which puts TWO children under the head — the \
+             moved original and the new variant — and the remaining 38 join \
+             them"
         );
 
         let leaves = tree

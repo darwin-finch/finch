@@ -172,35 +172,6 @@ impl MemorySystem {
         // Enable WAL mode for concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
-        // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
-        // not 'node_id').  The old table always had 0 rows because inserts failed with
-        // FK violations, so dropping it is safe.  We detect by checking whether the
-        // 'node_id' column is absent from an existing table.
-        {
-            let table_exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tree_nodes'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if table_exists > 0 {
-                let has_node_id: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('tree_nodes') WHERE name='node_id'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                if has_node_id == 0 {
-                    tracing::info!(
-                        "Dropping stale tree_nodes table (old schema used 'id', not 'node_id')"
-                    );
-                    conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
-                }
-            }
-        }
-
         // Refuse a database created before `memory_sources.node_id UNIQUE` was
         // dropped. There is deliberately no migration — Finch has no users and
         // `schema.sql` is authoritative — but `CREATE TABLE IF NOT EXISTS`
@@ -231,6 +202,35 @@ impl MemorySystem {
                 config.db_path.display(),
                 config.db_path.display()
             );
+        }
+
+        // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
+        // not 'node_id').  The old table always had 0 rows because inserts failed with
+        // FK violations, so dropping it is safe.  We detect by checking whether the
+        // 'node_id' column is absent from an existing table.
+        {
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tree_nodes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if table_exists > 0 {
+                let has_node_id: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('tree_nodes') WHERE name='node_id'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if has_node_id == 0 {
+                    tracing::info!(
+                        "Dropping stale tree_nodes table (old schema used 'id', not 'node_id')"
+                    );
+                    conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
+                }
+            }
         }
 
         // Load schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
@@ -1080,13 +1080,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_storing_identical_content_twice_succeeds() -> Result<()> {
-        // Deduplication resolves repeated content to an existing node. With
-        // `memory_sources.node_id` declared UNIQUE, the second conversation's
-        // row collided and the whole transaction failed with
-        // `UNIQUE constraint failed: memory_sources.node_id`, surfacing to the
-        // model through the memory_store tool and silently dropping the turn in
-        // the REPL paths. Every test for the tree itself passed regardless,
-        // because none of them crossed the persistence boundary.
+        // Deduplication resolves repeated content to an existing node, which
+        // the original `INSERT` into a UNIQUE `node_id` rejected outright.
+        //
+        // What this test now pins is the deduplication itself: on the base
+        // revision three inserts of one text mint three nodes, so `matching`
+        // is 3. The schema change is pinned separately by
+        // `test_repeated_content_records_every_source_conversation` — with the
+        // `INSERT OR REPLACE` used today, restoring the UNIQUE constraint
+        // would not raise an error at all, it would silently delete the
+        // earlier source row.
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -1217,6 +1220,64 @@ mod tests {
             mismatched, 0,
             "each source row must point at a node whose text came from that \
              conversation"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stale_schema_is_refused_and_a_fresh_one_reopens() -> Result<()> {
+        use rusqlite::Connection;
+
+        // A database carrying the historical `memory_sources.node_id UNIQUE`
+        // must be refused at open, naming the file. `CREATE TABLE IF NOT
+        // EXISTS` would otherwise leave it in place and the first repeated
+        // memory would fail with an opaque constraint error from inside an
+        // insert.
+        let temp = NamedTempFile::new()?;
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute_batch(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY);
+                 CREATE TABLE tree_nodes (node_id INTEGER PRIMARY KEY);
+                 CREATE TABLE memory_sources (
+                     conversation_id TEXT PRIMARY KEY,
+                     node_id INTEGER UNIQUE,
+                     indexed_at INTEGER NOT NULL
+                 );",
+            )?;
+        }
+
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        // `expect_err` would require `MemorySystem: Debug`, which it is not.
+        let error = match MemorySystem::new(config.clone()) {
+            Ok(_) => panic!("a database predating the schema change must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("predates the current memory schema"),
+            "the refusal must say why: {message}"
+        );
+        assert!(
+            message.contains("mv "),
+            "and must advise moving the file aside rather than deleting it: {message}"
+        );
+
+        // The guard must not fire on a database this build created. Opening a
+        // fresh store twice is the case a bare substring probe would break.
+        let fresh = NamedTempFile::new()?;
+        let fresh_config = MemoryConfig {
+            db_path: fresh.path().to_path_buf(),
+            ..Default::default()
+        };
+        MemorySystem::new(fresh_config.clone())?;
+        assert!(
+            MemorySystem::new(fresh_config).is_ok(),
+            "a store created by this build must reopen without tripping the guard"
         );
 
         Ok(())
