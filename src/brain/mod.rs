@@ -1255,6 +1255,22 @@ mod isolation_tests {
         verify_supervisor_image(&identity, &digest, &relinked)
             .expect("a relink of the same image must be accepted, not read as an attack");
 
+        // Content-addressed names bind the filename to the bytes. Trusted
+        // supervisor bytes under a false digest name must not gain authority.
+        let wrong_digest_name = temp.path().join(format!(
+            "finch-test-supervisor-pinned-sha256-{}",
+            "0".repeat(64)
+        ));
+        std::fs::write(&wrong_digest_name, image).unwrap();
+        let error = verify_supervisor_image(&identity, &digest, &wrong_digest_name)
+            .expect_err("a false content-addressed supervisor name must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain the image named by its path"),
+            "wrong digest-name rejection must identify the violated path binding; got {error}"
+        );
+
         // A different inode holding a different image. A real Cargo relink does
         // this — `cargo test` unifies features with dev-dependencies, so its
         // uplifted binary differs from `cargo build --bin`'s — and so does a

@@ -16,12 +16,13 @@ sentinel_pid=''
 signaler_pid=''
 substitution_pid=''
 supervisor_backup=''
+supervisor_backup_target=''
 substitution_restored=''
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
-  if [[ -n "$supervisor_backup" && -e "$supervisor_backup" ]]; then
-    mv -f -- "$supervisor_backup" "$supervisor"
+  if [[ -n "$supervisor_backup" && -e "$supervisor_backup" && -n "$supervisor_backup_target" ]]; then
+    mv -f -- "$supervisor_backup" "$supervisor_backup_target"
   fi
   if [[ -n "$substitution_restored" ]]; then : >"$substitution_restored"; fi
   if [[ -n "$substitution_pid" ]]; then
@@ -50,6 +51,63 @@ expect_supervisor_70() {
   else
     test "$?" -eq 70
   fi
+}
+
+exercise_supervisor_substitution() {
+  local candidate="$1" label="$2" candidate_identity
+  local substitution_ready="$scratch/substitution-$label.ready"
+  local substitution_continue="$scratch/substitution-$label.continue"
+  local substitution_rejected="$scratch/substitution-$label.rejected"
+
+  phase="supervisor-substitution-rejected-$label"
+  substitution_restored="$scratch/substitution-$label.restored"
+  supervisor_backup="$scratch/supervisor-$label.original"
+  supervisor_backup_target="$candidate"
+  candidate_identity="$(brain_isolation_file_identity "$candidate")"
+  FINCH_SUBSTITUTION_READY="$substitution_ready" \
+  FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
+  FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
+  FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
+    FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$candidate" bash -c '
+      : >"$FINCH_SUBSTITUTION_READY"
+      for _ in {1..400}; do
+        [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
+        sleep 0.01
+      done
+      [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
+      if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
+        exit 1
+      fi
+      : >"$FINCH_SUBSTITUTION_REJECTED"
+      for _ in {1..400}; do
+        [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
+        sleep 0.01
+      done
+      exit 1
+    ' & substitution_pid=$!
+  for _ in {1..400}; do
+    [[ -e "$substitution_ready" ]] && break
+    sleep 0.01
+  done
+  test -e "$substitution_ready"
+  mv -- "$candidate" "$supervisor_backup"
+  install -m 0555 "$supervisor_backup" "$candidate"
+  test "$(brain_isolation_file_identity "$candidate")" != "$candidate_identity"
+  : >"$substitution_continue"
+  for _ in {1..400}; do
+    [[ -e "$substitution_rejected" ]] && break
+    sleep 0.01
+  done
+  test -e "$substitution_rejected"
+  mv -f -- "$supervisor_backup" "$candidate"
+  supervisor_backup=''
+  supervisor_backup_target=''
+  test "$(brain_isolation_file_identity "$candidate")" = "$candidate_identity"
+  : >"$substitution_restored"
+  wait "$substitution_pid"
+  substitution_pid=''
+  substitution_restored=''
+  test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 }
 
 # Canonical path validation fails before a child is launched or a disposable
@@ -101,56 +159,7 @@ case "$supervisor" in
   "$repo_root"/target/release/finch-test-supervisor-pinned|\
   "$repo_root"/target/debug/finch-test-supervisor-pinned-sha256-*|\
   "$repo_root"/target/release/finch-test-supervisor-pinned-sha256-*)
-    phase=supervisor-substitution-rejected
-    substitution_ready="$scratch/substitution.ready"
-    substitution_continue="$scratch/substitution.continue"
-    substitution_rejected="$scratch/substitution.rejected"
-    substitution_restored="$scratch/substitution.restored"
-    supervisor_backup="$scratch/supervisor.original"
-    supervisor_identity="$(brain_isolation_file_identity "$supervisor")"
-    FINCH_SUBSTITUTION_READY="$substitution_ready" \
-    FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
-    FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
-    FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
-      run_isolated bash -c '
-        : >"$FINCH_SUBSTITUTION_READY"
-        for _ in {1..400}; do
-          [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
-          sleep 0.01
-        done
-        [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
-        if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
-          exit 1
-        fi
-        : >"$FINCH_SUBSTITUTION_REJECTED"
-        for _ in {1..400}; do
-          [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
-          sleep 0.01
-        done
-        exit 1
-      ' & substitution_pid=$!
-    for _ in {1..400}; do
-      [[ -e "$substitution_ready" ]] && break
-      sleep 0.01
-    done
-    test -e "$substitution_ready"
-    mv -- "$supervisor" "$supervisor_backup"
-    install -m 0555 "$supervisor_backup" "$supervisor"
-    test "$(brain_isolation_file_identity "$supervisor")" != "$supervisor_identity"
-    : >"$substitution_continue"
-    for _ in {1..400}; do
-      [[ -e "$substitution_rejected" ]] && break
-      sleep 0.01
-    done
-    test -e "$substitution_rejected"
-    mv -f -- "$supervisor_backup" "$supervisor"
-    supervisor_backup=''
-    test "$(brain_isolation_file_identity "$supervisor")" = "$supervisor_identity"
-    : >"$substitution_restored"
-    wait "$substitution_pid"
-    substitution_pid=''
-    substitution_restored=''
-    test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+    exercise_supervisor_substitution "$supervisor" selected
     ;;
 esac
 
@@ -214,6 +223,33 @@ if [[ ! -x "$launcher_built" || ! -x "$observed_supervisor" ]] || \
   ls -l "$launcher_built" "$observed_supervisor" >&2 || true
   exit 1
 fi
+
+# The digest in a content-addressed supervisor name is authority, not a label.
+# Run trusted supervisor bytes from a deliberately false digest path and prove
+# that both independent validators reject the inherited proof.
+wrong_digest_supervisor="$launcher_target/debug/finch-test-supervisor-pinned-sha256-$(printf '0%.0s' {1..64})"
+install -m 0555 "$observed_supervisor" "$wrong_digest_supervisor"
+phase=rust-rejects-wrong-content-addressed-supervisor-name
+if FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  "$wrong_digest_supervisor" "$wrong_digest_supervisor" --verify-inherited-proof >/dev/null 2>&1; then
+  echo "Rust proof validation accepted supervisor bytes under a false digest name" >&2
+  exit 1
+fi
+phase=shell-rejects-wrong-content-addressed-supervisor-name
+if FINCH_SHELL_PROOF_LIBRARY="$repo_root/scripts/lib/brain_test_isolation.sh" \
+  FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  "$wrong_digest_supervisor" bash -c \
+  'source "$FINCH_SHELL_PROOF_LIBRARY"; brain_test_isolation_is_active' >/dev/null 2>&1; then
+  echo "shell proof validation accepted supervisor bytes under a false digest name" >&2
+  exit 1
+fi
+rm -f -- "$wrong_digest_supervisor"
+
+# Exercise the same live-inode substitution boundary against the exact
+# content-addressed image produced above, even when CI selected a legacy pin
+# for the outer isolation run.
+exercise_supervisor_substitution "$observed_supervisor" content-addressed
+
 if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
   echo "stale-cache launcher regression left an isolated test HOME under $temp_parent" >&2
   find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
