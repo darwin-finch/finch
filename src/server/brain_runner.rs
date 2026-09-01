@@ -1087,15 +1087,48 @@ impl BrainRunnerBroker {
         prompt: String,
         rendered: String,
     ) -> Result<usize> {
+        self.try_project_memory(
+            brain,
+            lease_id,
+            brain_id,
+            run_id,
+            request_seq,
+            prompt,
+            rendered,
+        )
+        .await
+        .map_err(RunnerProjectionError::into_error)
+    }
+
+    /// `project_memory`, distinguishing a failure that will repeat for every
+    /// later run from one that is specific to this turn.
+    ///
+    /// A replay loop needs that distinction. Continuing past an unreachable or
+    /// stale runner costs one full IPC round trip and one log line per
+    /// completed run in the Brain, all under the Brain's execution lock, and
+    /// none of them can succeed.
+    pub async fn try_project_memory(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        brain_id: crate::brain::store::BrainId,
+        run_id: RunId,
+        request_seq: u64,
+        prompt: String,
+        rendered: String,
+    ) -> std::result::Result<usize, RunnerProjectionError> {
         let registration = self
             .registrations
             .read()
             .expect("runner broker lock poisoned")
             .get(brain)
             .cloned()
-            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))
+            .map_err(RunnerProjectionError::Unavailable)?;
         if registration.lease_id != lease_id {
-            anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
+            return Err(RunnerProjectionError::Unavailable(anyhow::anyhow!(
+                "named Brain '{brain}' runner callback belongs to a stale lease"
+            )));
         }
         let (response_tx, response_rx) = oneshot::channel();
         registration
@@ -1111,11 +1144,52 @@ impl BrainRunnerBroker {
                     response_tx,
                 },
             ))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+            .map_err(|_| {
+                RunnerProjectionError::Unavailable(anyhow::anyhow!(
+                    "named Brain '{brain}' runner callback disconnected"
+                ))
+            })?;
         response_rx
             .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped memory response"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(|_| {
+                RunnerProjectionError::Unavailable(anyhow::anyhow!(
+                    "named Brain '{brain}' runner dropped memory response"
+                ))
+            })?
+            .map_err(RunnerProjectionError::Rejected)
+    }
+}
+
+/// Why one memory projection did not happen.
+///
+/// The split is structural, not a string match: `Unavailable` is constructed
+/// here, from the broker's own view of the registration and the channel;
+/// `Rejected` is whatever the runner itself replied.
+#[derive(Debug)]
+pub enum RunnerProjectionError {
+    /// The runner is absent, stale, or gone. Every later projection in the
+    /// same pass fails identically.
+    Unavailable(anyhow::Error),
+    /// The runner was reached and declined this specific turn.
+    Rejected(String),
+}
+
+impl RunnerProjectionError {
+    /// Flatten back to the untyped error the ordinary callers expect.
+    pub fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Unavailable(error) => error,
+            Self::Rejected(message) => anyhow::Error::msg(message),
+        }
+    }
+}
+
+impl std::fmt::Display for RunnerProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) => write!(f, "{error}"),
+            Self::Rejected(message) => write!(f, "{message}"),
+        }
     }
 }
 
@@ -1307,7 +1381,7 @@ mod tests {
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.request_seq, 9);
             assert_eq!(request.prompt, "remember this");
-            assert_eq!(request.rendered, "(say \"remembered\")");
+            assert_eq!(request.rendered, "remembered");
             request.response_tx.send(Ok(2)).unwrap();
         });
 
@@ -1320,7 +1394,7 @@ mod tests {
                     run_id,
                     9,
                     "remember this".into(),
-                    "(say \"remembered\")".into(),
+                    "remembered".into(),
                 )
                 .await
                 .unwrap(),

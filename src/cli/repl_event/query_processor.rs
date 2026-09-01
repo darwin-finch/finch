@@ -1469,10 +1469,12 @@ pub(crate) async fn process_query_with_tools(
                         // `wire_execution_rendered`, not `source_for_history`:
                         // memory indexes what the turn produced, not the
                         // program that produced it. 55% of the dogfood store
-                        // was raw `(say ...)` source, which the user never saw
-                        // and which shares `(`, `say` and quoting tokens with
-                        // every other program, making all programs
-                        // near-identical under a lexical embedding (#254).
+                        // was raw `(say ...)` source, which shares `(`, `say`
+                        // and quoting tokens with every other program, making
+                        // all programs near-identical under a lexical
+                        // embedding (#254). The source is not hidden from the
+                        // user — it renders as a `Program source` row — it is
+                        // simply the wrong thing to index.
                         persist_completed_turn_memory(
                             mem,
                             &conversation,

@@ -1599,6 +1599,7 @@ pub(crate) async fn replay_committed_named_brain_memory(
         return Ok(0);
     }
     let mut projected = 0;
+    let mut rejected = 0usize;
     for run in snapshot
         .runs
         .iter()
@@ -1607,19 +1608,25 @@ pub(crate) async fn replay_committed_named_brain_memory(
         let Ok((prompt, rendered)) = committed_named_brain_memory_pair(&snapshot, run) else {
             continue;
         };
-        // Per-run isolation, not `?`.
+        // Per-run isolation for a per-run failure, `?` for a systemic one.
         //
         // Memory keys a projected Brain turn on `brain:{id}:run:{id}:role:{r}`
         // and rejects the same identity arriving with different content. A
         // Brain that ran under the previous code has an assistant row holding
         // the program source; this build re-projects that identity with the
-        // rendered output, so the store returns that conflict. With `?` the
-        // first such run aborted the entire replay, skipping every later run in
-        // the Brain — permanently, on every reconnect, defeating the recovery
-        // this function exists to provide. One unprojectable run must cost only
-        // that run.
+        // rendered output, so the store returns that conflict. Aborting the
+        // loop on it skipped every later run in the Brain — permanently, on
+        // every reconnect, defeating the recovery this function exists to
+        // provide.
+        //
+        // Continuing past *every* error is the opposite mistake. An absent or
+        // stale runner fails identically for every remaining run, so a plain
+        // warn-and-continue turns one round trip into one per completed run,
+        // all under the execution lock this function holds. `Unavailable` is
+        // therefore fatal to the pass, and only a `Rejected` reply — the runner
+        // was reached and declined this turn — is skipped.
         match runners
-            .project_memory(
+            .try_project_memory(
                 &name,
                 lease_id,
                 snapshot.brain_id,
@@ -1630,20 +1637,47 @@ pub(crate) async fn replay_committed_named_brain_memory(
             )
             .await
         {
-            Ok(_) => projected += 1,
-            Err(error) => {
+            Ok(_) => {
+                projected += 1;
+                rejected = 0;
+            }
+            Err(crate::server::RunnerProjectionError::Unavailable(error)) => return Err(error),
+            Err(crate::server::RunnerProjectionError::Rejected(message)) => {
+                rejected += 1;
                 tracing::warn!(
                     brain = %name,
                     run_id = %run.run_id.0,
-                    %error,
+                    error = %message,
                     "skipping memory replay for one Brain run; the rest of the \
                      replay continues"
                 );
+                // A runner that declines this many in a row is declining for a
+                // reason that is not about any one turn — memory disabled on
+                // the runner, or a whole Brain's worth of rows written by an
+                // older build. Each further attempt is a wasted round trip
+                // under the execution lock.
+                if rejected >= MAX_CONSECUTIVE_PROJECTION_REJECTIONS {
+                    tracing::warn!(
+                        brain = %name,
+                        rejected = MAX_CONSECUTIVE_PROJECTION_REJECTIONS,
+                        "stopping memory replay: the runner declined every recent \
+                         run, so the remaining runs are not worth attempting"
+                    );
+                    return Ok(projected);
+                }
             }
         }
     }
     Ok(projected)
 }
+
+/// How many consecutive per-run rejections end a replay pass.
+///
+/// Small enough that a Brain whose rows were all written by an older build
+/// costs a bounded number of round trips, large enough that a handful of
+/// genuinely per-turn rejections does not stop the pass from reaching the runs
+/// behind them.
+const MAX_CONSECUTIVE_PROJECTION_REJECTIONS: usize = 8;
 
 /// Drain durable work that arrived while the environment runner was absent.
 /// The exact lease that registered the callback must still be current before
@@ -8929,18 +8963,16 @@ mod handler_tests {
         runner.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn replay_skips_one_unprojectable_run_and_continues() {
-        // A Brain that ran under the previous code has an assistant memory row
-        // holding the program source; re-projecting that identity with the
-        // rendered output is rejected as conflicting content. With `?` the
-        // first such run aborted the whole replay, so every later completed run
-        // in that Brain was skipped too — on every reconnect, forever.
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+    /// Seed `count` completed runs whose rendered output is `out {i}` and
+    /// whose program source is `(say "out {i}")`, then take a runner lease.
+    fn seed_completed_brain_runs(
+        store: &crate::brain::store::BrainStore,
+        count: usize,
+    ) -> crate::brain::store::BrainRunnerLease {
         let driver = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
-        for turn in 0..2 {
+        for turn in 0..count {
             let prompt = store
                 .push(
                     "shared",
@@ -8972,7 +9004,7 @@ mod handler_tests {
                 )
                 .unwrap();
             push_named_brain_run_result(
-                &store,
+                store,
                 "shared",
                 run.run_id,
                 program.seq,
@@ -8991,8 +9023,7 @@ mod handler_tests {
                 )
                 .unwrap();
         }
-
-        let lease = store
+        store
             .acquire_runner_lease(
                 "shared",
                 "runner@box.local",
@@ -9000,12 +9031,23 @@ mod handler_tests {
                 None,
                 60_000,
             )
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replay_skips_one_unprojectable_run_and_continues() {
+        // A Brain that ran under the previous code has an assistant memory row
+        // holding the program source; re-projecting that identity with the
+        // rendered output is rejected as conflicting content. Aborting the loop
+        // on that skipped every later completed run in the Brain too — on every
+        // reconnect, forever.
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let lease = seed_completed_brain_runs(&store, 2);
         let runners = crate::server::BrainRunnerBroker::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
 
-        // The first run fails the way a conflicting stored identity fails.
+        // The first run is declined the way a conflicting stored identity is.
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = std::sync::Arc::clone(&seen);
         let runner = tokio::spawn(async move {
@@ -9035,20 +9077,121 @@ mod handler_tests {
             lease.lease_id,
         )
         .await
-        .unwrap();
+        .expect("a declined run is not a failure of the pass");
         drop(runners);
         runner.await.unwrap();
 
-        // Both runs were attempted; the survivor was projected. With `?` the
-        // recorded list stops at one entry and `replay_...` returns `Err`.
+        // Both runs were attempted; the survivor was projected. Aborting the
+        // pass on the first rejection leaves the recorded list at one entry and
+        // returns `Err`.
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["out 0".to_string(), "out 1".to_string()],
-            "a conflicting run must not stop replay from reaching later runs"
+            "a declined run must not stop replay from reaching later runs"
         );
         assert_eq!(
             projected, 1,
             "only the run that actually projected may be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_aborts_when_the_runner_is_unavailable() {
+        // The opposite error. A runner that is gone fails identically for every
+        // remaining run, so continuing costs one full IPC round trip and one log
+        // line per completed run, under the execution lock this function holds,
+        // with nothing to gain. It must abort at the first one.
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let lease = seed_completed_brain_runs(&store, 4);
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+
+        // The registration is live, so the pass begins — but the runner goes
+        // away mid-request and never answers.
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&attempts);
+        let runner = tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                let crate::server::RunnerRequest::ProjectMemory(request) = request else {
+                    panic!("expected replayed memory projection")
+                };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Dropped without a reply.
+                drop(request);
+            }
+        });
+
+        let error = replay_committed_named_brain_memory(
+            store.clone(),
+            runners.clone(),
+            "shared".into(),
+            lease.lease_id,
+        )
+        .await
+        .expect_err("an unreachable runner must fail the pass, not be skipped");
+        drop(runners);
+        runner.await.unwrap();
+
+        assert!(
+            error.to_string().contains("dropped memory response"),
+            "the error must say the runner is gone; got {error}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the pass must stop at the first unreachable runner, not attempt \
+             every remaining run"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_stops_after_repeated_rejections() {
+        // A whole Brain's worth of rows written by an older build, or memory
+        // disabled on the runner, declines every run for a reason that is not
+        // about any one turn. The pass must stop rather than pay a round trip
+        // per completed run.
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let total = MAX_CONSECUTIVE_PROJECTION_REJECTIONS + 5;
+        let lease = seed_completed_brain_runs(&store, total);
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&attempts);
+        let runner = tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                let crate::server::RunnerRequest::ProjectMemory(request) = request else {
+                    panic!("expected replayed memory projection")
+                };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                request
+                    .response_tx
+                    .send(Err(
+                        "memory is disabled on the environment runner".to_string()
+                    ))
+                    .unwrap();
+            }
+        });
+
+        let projected = replay_committed_named_brain_memory(
+            store.clone(),
+            runners.clone(),
+            "shared".into(),
+            lease.lease_id,
+        )
+        .await
+        .expect("declined runs are not a failure of the pass");
+        drop(runners);
+        runner.await.unwrap();
+
+        assert_eq!(projected, 0, "nothing was projected");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_CONSECUTIVE_PROJECTION_REJECTIONS,
+            "the pass must stop after {MAX_CONSECUTIVE_PROJECTION_REJECTIONS} \
+             consecutive rejections, not attempt all {total} runs"
         );
     }
 
