@@ -15,6 +15,8 @@ const OPERATION_PENDING: u8 = 0;
 const OPERATION_EXECUTING: u8 = 1;
 const OPERATION_CANCELLED: u8 = 2;
 const OPERATION_COMPLETE: u8 = 3;
+const OPERATION_EFFECT_STARTED: u8 = 4;
+const EFFECT_COMPLETION_GRACE: Duration = Duration::from_millis(25);
 
 pub(crate) type ProtocolOperation = fn() -> io::Result<()>;
 
@@ -30,6 +32,8 @@ static SUPERVISED_OUTPUT_GATE_PAUSE: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_OUTPUT_GATE_PAUSED: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_ACTOR_PAUSE: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_ACTOR_PAUSED: AtomicBool = AtomicBool::new(false);
+static SUPERVISED_ACTOR_EFFECT_PAUSE: AtomicBool = AtomicBool::new(false);
+static SUPERVISED_ACTOR_EFFECT_PAUSED: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_ACTOR_WRITE_EFFECTS: AtomicU64 = AtomicU64::new(0);
 static SUPERVISED_ACTOR_FLUSH_EFFECTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -141,6 +145,7 @@ enum ActorCommand {
 struct ActorOperation {
     state: AtomicU8,
     expires: Instant,
+    effect_deadline: Instant,
 }
 
 impl ActorOperation {
@@ -148,6 +153,7 @@ impl ActorOperation {
         Self {
             state: AtomicU8::new(OPERATION_PENDING),
             expires,
+            effect_deadline: expires + EFFECT_COMPLETION_GRACE,
         }
     }
 
@@ -177,6 +183,30 @@ impl ActorOperation {
 
     fn complete(&self) {
         self.state.store(OPERATION_COMPLETE, Ordering::Release);
+    }
+
+    fn begin_effect(&self) -> bool {
+        if Instant::now() >= self.expires
+            && self
+                .state
+                .compare_exchange(
+                    OPERATION_EXECUTING,
+                    OPERATION_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                OPERATION_EXECUTING,
+                OPERATION_EFFECT_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -277,6 +307,14 @@ fn terminal_actor(receiver: Receiver<ActorCommand>) {
                     ))));
                     continue;
                 }
+                supervised_pause_before_actor_effect();
+                if !operation.begin_effect() {
+                    let _ = reply.send(ActorReply::Written(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "portable terminal write was cancelled before its effect",
+                    ))));
+                    continue;
+                }
                 let result = match session.as_ref() {
                     Some(active)
                         if active.generation == generation
@@ -305,6 +343,14 @@ fn terminal_actor(receiver: Receiver<ActorCommand>) {
                     ))));
                     continue;
                 }
+                supervised_pause_before_actor_effect();
+                if !operation.begin_effect() {
+                    let _ = reply.send(ActorReply::Unit(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "portable terminal flush was cancelled before its effect",
+                    ))));
+                    continue;
+                }
                 let result = match session.as_ref() {
                     Some(active)
                         if active.generation == generation
@@ -323,6 +369,17 @@ fn terminal_actor(receiver: Receiver<ActorCommand>) {
             }
         }
     }
+}
+
+fn supervised_pause_before_actor_effect() {
+    if !SUPERVISED_ACTOR_EFFECT_PAUSE.load(Ordering::Acquire) {
+        return;
+    }
+    SUPERVISED_ACTOR_EFFECT_PAUSED.store(true, Ordering::Release);
+    while SUPERVISED_ACTOR_EFFECT_PAUSE.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    SUPERVISED_ACTOR_EFFECT_PAUSED.store(false, Ordering::Release);
 }
 
 fn aggregate_activation_rollback(
@@ -420,18 +477,30 @@ fn wait_effect_reply_until(
                         "portable terminal actor operation was cancelled before execution",
                     ));
                 }
-                Err(OPERATION_EXECUTING) | Err(OPERATION_COMPLETE) => {
-                    // The actor won the effect claim, so returning a timeout
-                    // would permit publication after the caller observed a
-                    // terminal result. The staged operation is one bounded
-                    // write/flush and completes under the supported console
-                    // progress precondition; wait for its exact reply.
-                    return receiver.recv().map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "portable terminal actor response channel closed",
+                Err(OPERATION_EXECUTING) => {
+                    if operation
+                        .state
+                        .compare_exchange(
+                            OPERATION_EXECUTING,
+                            OPERATION_CANCELLED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
                         )
-                    });
+                        .is_ok()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "portable terminal actor operation was cancelled before its effect",
+                        ));
+                    }
+                }
+                Err(OPERATION_EFFECT_STARTED) | Err(OPERATION_COMPLETE) => {
+                    // Production activation rejects non-Unix stdout because it
+                    // cannot prove a cancellable/nonblocking console effect.
+                    // Supervised exact-source operations must finish inside
+                    // this final absolute grace; never convert the actor claim
+                    // into an unbounded recv.
+                    return wait_reply_until(receiver, operation.effect_deadline);
                 }
                 Err(_) => continue,
             },
@@ -543,6 +612,17 @@ pub(crate) fn supervised_set_actor_pause(paused: bool) {
     SUPERVISED_ACTOR_PAUSE.store(paused, Ordering::Release);
 }
 
+pub(crate) fn supervised_set_actor_effect_pause(paused: bool) {
+    if !paused {
+        SUPERVISED_ACTOR_EFFECT_PAUSED.store(false, Ordering::Release);
+    }
+    SUPERVISED_ACTOR_EFFECT_PAUSE.store(paused, Ordering::Release);
+}
+
+pub(crate) fn supervised_actor_effect_is_paused() -> bool {
+    SUPERVISED_ACTOR_EFFECT_PAUSED.load(Ordering::Acquire)
+}
+
 pub(crate) fn supervised_actor_is_paused() -> bool {
     SUPERVISED_ACTOR_PAUSED.load(Ordering::Acquire)
 }
@@ -569,6 +649,14 @@ pub(crate) struct ExclusiveTerminalLease {
 
 impl ExclusiveTerminalLease {
     pub(crate) fn activate(
+        activate_protocols: ProtocolOperation,
+        cleanup_protocols: ProtocolOperation,
+    ) -> io::Result<Self> {
+        ensure_bounded_portable_stdout()?;
+        Self::activate_inner(activate_protocols, cleanup_protocols)
+    }
+
+    fn activate_inner(
         activate_protocols: ProtocolOperation,
         cleanup_protocols: ProtocolOperation,
     ) -> io::Result<Self> {
@@ -629,6 +717,22 @@ impl ExclusiveTerminalLease {
     }
 }
 
+fn ensure_bounded_portable_stdout() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // This module is compiled on Unix only by its exact-source tests. Unix
+        // production uses the O_NONBLOCK descriptor path in `tui::mod`.
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "portable TUI stdout has no proven cancellable/nonblocking console write contract",
+        ))
+    }
+}
+
 /// Exact non-Unix lifecycle/output actor owned by `TuiRenderer`.
 pub(crate) struct PortableRendererSession {
     lease: ExclusiveTerminalLease,
@@ -641,6 +745,19 @@ impl PortableRendererSession {
     ) -> io::Result<Self> {
         Ok(Self {
             lease: ExclusiveTerminalLease::activate(activate_protocols, cleanup_protocols)?,
+        })
+    }
+
+    /// Exercise the exact actor/lifecycle implementation with bounded
+    /// supervised effects even when the host console is acceptance-gated.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub(crate) fn activate_supervised(
+        activate_protocols: ProtocolOperation,
+        cleanup_protocols: ProtocolOperation,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            lease: ExclusiveTerminalLease::activate_inner(activate_protocols, cleanup_protocols)?,
         })
     }
 
@@ -802,8 +919,13 @@ mod tests {
         assert_eq!(CLEANUP_OWNER.load(Ordering::Acquire), 0);
 
         let first =
-            PortableRendererSession::activate(activate_protocols, cleanup_protocols).unwrap();
-        assert!(PortableRendererSession::activate(activate_protocols, cleanup_protocols).is_err());
+            PortableRendererSession::activate_supervised(activate_protocols, cleanup_protocols)
+                .unwrap();
+        assert!(PortableRendererSession::activate_supervised(
+            activate_protocols,
+            cleanup_protocols
+        )
+        .is_err());
         assert_eq!(first.write(b"active").unwrap(), 6);
 
         supervised_set_output_gate_pause(true);
@@ -817,13 +939,18 @@ mod tests {
         let cleanup_started = Instant::now();
         assert!(first.cleanup().is_err());
         assert!(cleanup_started.elapsed() < Duration::from_millis(250));
-        assert!(PortableRendererSession::activate(activate_protocols, cleanup_protocols).is_err());
+        assert!(PortableRendererSession::activate_supervised(
+            activate_protocols,
+            cleanup_protocols
+        )
+        .is_err());
         supervised_set_output_gate_pause(false);
         assert!(writer.join().unwrap().is_err());
         first.cleanup().unwrap();
 
         let replacement =
-            PortableRendererSession::activate(activate_protocols, cleanup_protocols).unwrap();
+            PortableRendererSession::activate_supervised(activate_protocols, cleanup_protocols)
+                .unwrap();
         assert!(first.write(b"old-generation").is_err());
         replacement.cleanup().unwrap();
 
@@ -831,7 +958,8 @@ mod tests {
         // production actor bounds the caller and revokes a staged frame before
         // its delayed execution; cleanup stays fail-closed until actor progress.
         let renderer =
-            PortableRendererSession::activate(activate_protocols, cleanup_protocols).unwrap();
+            PortableRendererSession::activate_supervised(activate_protocols, cleanup_protocols)
+                .unwrap();
         let effects_before = supervised_actor_write_effects();
         supervised_set_actor_pause(true);
         let generation = renderer.generation();
@@ -863,9 +991,64 @@ mod tests {
         flush_generation(renderer.generation()).unwrap();
         assert_eq!(supervised_actor_flush_effects(), flush_effects_before + 1);
         renderer.cleanup().unwrap();
-        PortableRendererSession::activate(activate_protocols, cleanup_protocols)
+        PortableRendererSession::activate_supervised(activate_protocols, cleanup_protocols)
             .unwrap()
             .cleanup()
             .unwrap();
+    }
+
+    #[test]
+    fn test_portable_claimed_write_and_flush_cancel_before_effect_and_cleanup_is_bounded() {
+        let _serial = supervised_test_lock();
+
+        let renderer =
+            PortableRendererSession::activate_supervised(activate_protocols, cleanup_protocols)
+                .unwrap();
+        let write_effects = supervised_actor_write_effects();
+        supervised_set_actor_effect_pause(true);
+        let generation = renderer.generation();
+        let started = Instant::now();
+        let writer = std::thread::spawn(move || write_generation(generation, b"claimed-frame"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !supervised_actor_effect_is_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "write did not reach claimed edge"
+            );
+            std::thread::yield_now();
+        }
+        assert!(writer.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let cleanup_started = Instant::now();
+        assert!(renderer.cleanup().is_err());
+        assert!(cleanup_started.elapsed() < Duration::from_millis(250));
+        supervised_set_actor_effect_pause(false);
+        renderer.cleanup().unwrap();
+        assert_eq!(supervised_actor_write_effects(), write_effects);
+
+        let renderer =
+            PortableRendererSession::activate_supervised(activate_protocols, cleanup_protocols)
+                .unwrap();
+        let flush_effects = supervised_actor_flush_effects();
+        supervised_set_actor_effect_pause(true);
+        let generation = renderer.generation();
+        let started = Instant::now();
+        let flush = std::thread::spawn(move || flush_generation(generation));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !supervised_actor_effect_is_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "flush did not reach claimed edge"
+            );
+            std::thread::yield_now();
+        }
+        assert!(flush.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let cleanup_started = Instant::now();
+        assert!(renderer.cleanup().is_err());
+        assert!(cleanup_started.elapsed() < Duration::from_millis(250));
+        supervised_set_actor_effect_pause(false);
+        renderer.cleanup().unwrap();
+        assert_eq!(supervised_actor_flush_effects(), flush_effects);
     }
 }

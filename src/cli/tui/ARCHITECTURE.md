@@ -35,6 +35,8 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   no longer publish or clear its replacement; it never overtakes an executing nonblocking write.
   Activation failures aggregate their stage and rollback errors, retain explicit `CLEANING` repair
   ownership on incomplete rollback, and never report a false restored state.
+  The production REPL constructor owns one larger bounded repair attempt after an activation error;
+  it enables ordinary stdout only after exact repair, otherwise construction aborts fail-closed.
 - Application waits and nonblocking write loops use absolute deadlines. Their bound assumes that a
   runnable thread executing Finch's short gate section is scheduled, and that supported tty/console
   kernel calls return. It is not a mathematical wall-clock claim against a frozen process, stopped
@@ -42,23 +44,30 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   progress is withheld, library cleanup returns `TimedOut` without resetting, admitting a
   replacement, re-enabling ordinary stdout, recording restoration, or retry-spinning. The same
   generation remains `CLEANING`; a later bounded attempt repairs it after an observable progress
-  epoch. Binary signal termination retries at a bounded active cadence; the process-lifetime monitor
-  uses a materially lower idle cadence. IPC Quit latches one decoded `ControlMessage` and retries
+  epoch. Binary signal termination uses short no-progress probes with 25–250 ms exponential parks;
+  new signal/progress epochs reset the backoff, so a persistent failure cannot run expensive cleanup
+  waits at high duty. The process-lifetime monitor uses a materially lower idle cadence. IPC Quit
+  latches one decoded `ControlMessage` and retries
   bounded restoration on progress/recovery ticks without another message. The panic hook makes one
   bounded, latched restoration attempt and always returns to Rust's unwind policy rather than
   parking forever. These binary paths complete within their larger absolute deadline under this
   supported-progress precondition and never treat a failed restoration as successful.
+- On supported Unix targets, `pthread_atfork` prepare blocks terminal signals only on the forking
+  thread. The child callback restores the host dispositions captured before Finch ownership, clears
+  inherited sticky/monitor ownership (the monitor thread does not survive `fork`), and then restores
+  the caller's mask. The supported child contract is immediate exec/exit; starting another TUI in
+  the un-execed child is outside scope.
 - The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
   exclusive lease, exact output generation, raw/protocol activation, bounded staged output, cleanup,
-  and Drop. Every staged Write/Flush carries shared `Pending -> Executing/Cancelled -> Complete`
-  state and an expiry. A caller reports timeout only if its CAS cancels `Pending`; if the actor wins,
-  it waits for that single bounded effect. Thus no queued command can publish after its caller has
-  reported timeout, even when the actor resumes while the session remains `ACTIVE`. Activation and
-  rollback failures are aggregated. Failed, unknown, or backpressured cleanup relinquishes only its
-  attempt owner, leaves the generation `CLEANING`, and rejects stale writers and replacements until
-  retry repairs it. Windows CI compiles and exercises this exact production actor and actual
-  callbacks when a console/ConPTY is present; redirected hosted runners emit an explicit gated
-  acceptance marker and are not claimed as real-console conformance.
+  and Drop. Every staged Write/Flush carries shared
+  `Pending -> Executing -> EffectStarted/Cancelled -> Complete` state and absolute expiry. A caller
+  can still cancel an actor-claimed command before its effect begins; no path changes to an unbounded
+  receive. Failed, unknown, or backpressured cleanup remains `CLEANING` and rejects stale writers and
+  replacements until retry repairs it. Windows console stdout currently has no proven cancellable or
+  nonblocking Write/Flush contract, so the production renderer rejects it before raw/protocol
+  activation. CI exercises the exact actor with supervised bounded effects and asserts the actual
+  Windows production rejection. ConPTY behavior remains explicitly acceptance-gated; this is not a
+  Windows TUI conformance claim.
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).

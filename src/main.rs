@@ -1134,7 +1134,12 @@ async fn main() -> Result<()> {
         daemon_client,
         brain_name,
     )
-    .await;
+    .await?;
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_RETURN_AFTER_CONSTRUCTION").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        return Ok(());
+    }
     #[cfg(unix)]
     if std::env::var_os("FINCH_TEST_TUI_MAIN_QUIT_SAME_THREAD_GATE").is_some()
         && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))

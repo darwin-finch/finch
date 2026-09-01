@@ -447,7 +447,10 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let preserves_host_signal = matches!(mode.as_str(), "binary-owner-drop" | "owner-windows");
+    let preserves_host_signal = matches!(
+        mode.as_str(),
+        "binary-owner-drop" | "owner-windows" | "fork-preexec-host-signal"
+    );
     if preserves_host_signal {
         let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
         action.sa_sigaction = embedding_signal_handler as *const () as usize;
@@ -473,6 +476,9 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             | "signal-transition-recovery"
             | "signal-disarm-recovery"
             | "signal-disarm-pending-recovery"
+            | "signal-persistent-backoff"
+            | "fork-preexec-signal"
+            | "fork-preexec-host-signal"
     );
     let mut signals = if needs_binary_owner {
         finch::cli::tui::BinaryTerminalSession::install()?
@@ -525,6 +531,37 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             anyhow::ensure!(signals.is_some(), "binary signal owner missing");
             finch::cli::tui::supervised_fail_next_signal_disarm()?;
             marker(b"FINCH_SIGNAL_DISARM_PENDING_READY")?;
+            loop {
+                std::thread::park();
+            }
+        }
+        "signal-persistent-backoff" => {
+            anyhow::ensure!(signals.is_some(), "binary signal owner missing");
+            let (attempts_before, parks_before) =
+                finch::cli::tui::supervised_terminal_signal_recovery_counts()?;
+            finch::cli::tui::supervised_set_signal_transition_stall(true)?;
+            unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_signal_transition_stall_is_observed()? {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "signal recovery never reached stall"
+                );
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(900));
+            let (attempts_after, parks_after) =
+                finch::cli::tui::supervised_terminal_signal_recovery_counts()?;
+            finch::cli::tui::supervised_set_signal_transition_stall(false)?;
+            anyhow::ensure!(
+                attempts_after.saturating_sub(attempts_before) <= 6,
+                "persistent restore failure retried at high duty: {} attempts",
+                attempts_after.saturating_sub(attempts_before)
+            );
+            anyhow::ensure!(
+                parks_after.saturating_sub(parks_before) >= 2,
+                "persistent restore failure did not enter bounded park/backoff"
+            );
             loop {
                 std::thread::park();
             }
@@ -605,6 +642,54 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             let status = wait_for_child(&mut exec_child, Instant::now() + Duration::from_secs(2));
             anyhow::ensure!(status.success(), "restore fd inherited by exec child");
             renderer.shutdown()
+        }
+        "fork-preexec-signal" => {
+            let forked = unsafe { nix::libc::fork() };
+            anyhow::ensure!(forked >= 0, "fork terminal-session child");
+            if forked == 0 {
+                unsafe {
+                    nix::libc::raise(nix::libc::SIGTERM);
+                    nix::libc::_exit(77);
+                }
+            }
+            let mut status = 0;
+            anyhow::ensure!(
+                unsafe { nix::libc::waitpid(forked, &mut status, 0) } == forked,
+                "reap fork/pre-exec signal child"
+            );
+            anyhow::ensure!(
+                nix::libc::WIFSIGNALED(status) && nix::libc::WTERMSIG(status) == nix::libc::SIGTERM,
+                "fork child swallowed/misattributed pre-exec SIGTERM: {status}"
+            );
+            renderer.shutdown()?;
+            marker(b"FINCH_FORK_PREEXEC_SIGNAL_RESTORED")?;
+            Ok(())
+        }
+        "fork-preexec-host-signal" => {
+            EMBEDDING_SIGNAL_OBSERVED.store(false, Ordering::Release);
+            let forked = unsafe { nix::libc::fork() };
+            anyhow::ensure!(forked >= 0, "fork embedding-signal child");
+            if forked == 0 {
+                unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+                let status = if EMBEDDING_SIGNAL_OBSERVED.load(Ordering::Acquire) {
+                    0
+                } else {
+                    77
+                };
+                unsafe { nix::libc::_exit(status) };
+            }
+            let mut status = 0;
+            anyhow::ensure!(
+                unsafe { nix::libc::waitpid(forked, &mut status, 0) } == forked,
+                "reap fork embedding-signal child"
+            );
+            anyhow::ensure!(
+                nix::libc::WIFEXITED(status) && nix::libc::WEXITSTATUS(status) == 0,
+                "fork child did not receive restored embedding disposition: {status}"
+            );
+            renderer.shutdown()?;
+            marker(b"FINCH_FORK_PREEXEC_HOST_SIGNAL_RESTORED")?;
+            Ok(())
         }
         "signal-paused-cleanup" => {
             finch::cli::tui::supervised_set_terminal_cleanup_pause(true)?;
@@ -1273,6 +1358,75 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
     }
 }
 
+/// The production REPL constructor may fall back to ordinary stdout only after
+/// it has automatically repaired a failed TUI constructor. Fail-before: an
+/// activation+rollback error returned to this branch while the terminal was
+/// still raw/CLEANING, and fallback bytes were then published into that state.
+#[cfg(unix)]
+#[test]
+fn test_real_repl_constructor_repairs_before_standard_output_fallback() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let original = terminal_modes(&slave);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-terminal-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_FAIL_AFTER", "keyboard")
+        .env("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK_ONCE", "1")
+        .env("FINCH_TEST_TUI_MAIN_RETURN_AFTER_CONSTRUCTION", "1")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("spawn real Repl constructor fallback probe");
+    let mut transcript = Vec::new();
+    assert!(
+        read_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(20),
+            b"Falling back to standard output mode",
+        ),
+        "Repl did not reach repaired stdout fallback: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert!(status.success(), "Repl fallback failed: {status}");
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+    let fallback = transcript
+        .windows(b"Falling back to standard output mode".len())
+        .position(|bytes| bytes == b"Falling back to standard output mode")
+        .expect("fallback marker");
+    for reset in [
+        b"\x1b[?2004l".as_slice(),
+        b"\x1b[?1000l".as_slice(),
+        b"\x1b[<1u".as_slice(),
+    ] {
+        let reset_at = transcript
+            .windows(reset.len())
+            .position(|bytes| bytes == reset)
+            .expect("automatic constructor recovery reset");
+        assert!(
+            reset_at < fallback,
+            "stdout fallback published before automatic terminal recovery"
+        );
+    }
+}
+
 /// The IPC quit watcher and this supervised main path share the exact binary
 /// exit helper. Fail-before: a same-thread gate owner deadlocked restoration or
 /// let `process::exit` bypass reset.
@@ -1443,6 +1597,65 @@ fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
         );
         assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
     }
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_fork_child_restores_host_signal_before_preexec_delivery() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    for (mode, marker) in [
+        (
+            "fork-preexec-signal",
+            b"FINCH_FORK_PREEXEC_SIGNAL_RESTORED".as_slice(),
+        ),
+        (
+            "fork-preexec-host-signal",
+            b"FINCH_FORK_PREEXEC_HOST_SIGNAL_RESTORED".as_slice(),
+        ),
+    ] {
+        let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
+        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
+        let mut transcript = Vec::new();
+        drain_pty(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_millis(100),
+        );
+        assert!(status.success(), "fork/pre-exec probe failed: {status}");
+        assert!(transcript
+            .windows(marker.len())
+            .any(|bytes| bytes == marker));
+        assert_eq!(terminal_modes(&slave), original);
+        assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+        assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+        assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_persistent_signal_restore_failure_uses_bounded_progress_backoff() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut child, mut master, slave, original) =
+        spawn_terminal_child("signal-persistent-backoff");
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
 }
 
 #[cfg(unix)]

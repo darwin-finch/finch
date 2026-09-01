@@ -142,6 +142,9 @@ static SUPERVISED_WRITER_GATE_PAUSE: std::sync::atomic::AtomicBool =
 static SUPERVISED_WRITER_GATE_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
+static SUPERVISED_ROLLBACK_FAILURE_ONCE_CONSUMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
 static NEXT_TERMINAL_GATE_OWNER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(unix)]
@@ -1284,9 +1287,17 @@ fn supervised_activation_failure_requested(stage: &str) -> bool {
         && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
 }
 
+#[cfg(unix)]
 fn supervised_rollback_failure_requested() -> bool {
-    std::env::var_os("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK").is_some()
-        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    use std::sync::atomic::Ordering;
+    if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+        return false;
+    }
+    if std::env::var_os("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK").is_some() {
+        return true;
+    }
+    std::env::var_os("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK_ONCE").is_some()
+        && !SUPERVISED_ROLLBACK_FAILURE_ONCE_CONSUMED.swap(true, Ordering::AcqRel)
 }
 
 fn supervised_activation_write_limit(stage: &str) -> Option<usize> {
@@ -1530,6 +1541,19 @@ pub fn supervised_terminal_signal_is_pending() -> io::Result<bool> {
     Ok(SIGNAL_PENDING_MASK.load(std::sync::atomic::Ordering::Acquire) != 0)
 }
 
+/// Return recovery attempt/park counters for a supervised persistent-failure
+/// duty-cycle regression.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_terminal_signal_recovery_counts() -> io::Result<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok((
+        SUPERVISED_SIGNAL_RECOVERY_ATTEMPTS.load(Ordering::Acquire),
+        SUPERVISED_SIGNAL_RECOVERY_PARKS.load(Ordering::Acquire),
+    ))
+}
+
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn supervised_set_signal_transition_stall(stalled: bool) -> io::Result<()> {
@@ -1588,6 +1612,14 @@ unsafe impl Sync for PreviousSignalActions {}
 #[cfg(unix)]
 static PREVIOUS_SIGNAL_ACTIONS: PreviousSignalActions =
     PreviousSignalActions(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static FORK_CHILD_SIGNAL_ACTIONS: PreviousSignalActions =
+    PreviousSignalActions(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static FORK_CHILD_SIGNAL_ACTIONS_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SIGNAL_ATFORK_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(unix)]
 static NEXT_BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicU16 =
     std::sync::atomic::AtomicU16::new(0);
@@ -1638,6 +1670,12 @@ static SUPERVISED_SIGNAL_MONITOR_PAUSE: std::sync::atomic::AtomicBool =
 static SUPERVISED_SIGNAL_MONITOR_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
+static SUPERVISED_SIGNAL_RECOVERY_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+static SUPERVISED_SIGNAL_RECOVERY_PARKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
 static SUPERVISED_CLEANUP_PAUSE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
@@ -1646,6 +1684,169 @@ static SUPERVISED_CLEANUP_PAUSED: std::sync::atomic::AtomicBool =
 #[cfg(unix)]
 static SUPERVISED_CLEANUP_PAUSE_OWNER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+struct AtForkSignalMask {
+    mask: std::cell::UnsafeCell<nix::libc::sigset_t>,
+    valid: std::cell::Cell<bool>,
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+std::thread_local! {
+    // Const native TLS avoids locks or allocation in pthread_atfork callbacks.
+    static ATFORK_SIGNAL_MASK: AtForkSignalMask = const { AtForkSignalMask {
+        mask: std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }),
+        valid: std::cell::Cell::new(false),
+    }};
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+unsafe extern "C" fn terminal_atfork_prepare() {
+    let mut blocked = unsafe { std::mem::zeroed::<nix::libc::sigset_t>() };
+    unsafe { nix::libc::sigemptyset(&mut blocked) };
+    for signal in TERMINAL_SIGNALS {
+        unsafe { nix::libc::sigaddset(&mut blocked, signal) };
+    }
+    ATFORK_SIGNAL_MASK.with(|saved| {
+        let ok = unsafe {
+            nix::libc::pthread_sigmask(nix::libc::SIG_BLOCK, &blocked, saved.mask.get()) == 0
+        };
+        saved.valid.set(ok);
+    });
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+unsafe fn restore_atfork_signal_mask() {
+    ATFORK_SIGNAL_MASK.with(|saved| {
+        if saved.valid.replace(false) {
+            unsafe {
+                nix::libc::pthread_sigmask(
+                    nix::libc::SIG_SETMASK,
+                    saved.mask.get(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    });
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+unsafe extern "C" fn terminal_atfork_parent() {
+    unsafe { restore_atfork_signal_mask() };
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+unsafe extern "C" fn terminal_atfork_child() {
+    use std::sync::atomic::Ordering;
+    // The caller's terminal signals remain blocked from prepare until the
+    // inherited Finch actions and sticky state have been withdrawn. The child
+    // is then safe to receive a signal before its immediate exec/exit.
+    if (SIGNAL_INSTALLED_MASK.load(Ordering::Acquire) != 0
+        || TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) != SESSION_INACTIVE)
+        && FORK_CHILD_SIGNAL_ACTIONS_READY.load(Ordering::Acquire)
+    {
+        let actions = unsafe { (*FORK_CHILD_SIGNAL_ACTIONS.0.get()).as_ptr() };
+        for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
+            unsafe {
+                nix::libc::sigaction(signal, actions.add(index), std::ptr::null_mut());
+            }
+        }
+    }
+    SIGNAL_INSTALLED_MASK.store(0, Ordering::Release);
+    SIGNAL_PENDING_MASK.store(0, Ordering::Release);
+    SIGNAL_PENDING_EPOCH.store(0, Ordering::Release);
+    SIGNAL_TERMINATION_LATCHED.store(false, Ordering::Release);
+    SIGNAL_TRANSITION.store(false, Ordering::Release);
+    SIGNAL_MONITOR_STARTED.store(false, Ordering::Release);
+    BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
+    TERMINAL_COORDINATOR
+        .termination_requested
+        .store(false, Ordering::Release);
+    unsafe { restore_atfork_signal_mask() };
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn ensure_terminal_signal_atfork() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    const UNREGISTERED: u8 = 0;
+    const REGISTERING: u8 = 1;
+    const REGISTERED: u8 = 2;
+    const FAILED: u8 = 3;
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    loop {
+        match SIGNAL_ATFORK_STATE.load(Ordering::Acquire) {
+            REGISTERED => return Ok(()),
+            FAILED => {
+                return Err(io::Error::other(
+                    "terminal signal pthread_atfork registration previously failed",
+                ));
+            }
+            UNREGISTERED => {
+                if SIGNAL_ATFORK_STATE
+                    .compare_exchange(
+                        UNREGISTERED,
+                        REGISTERING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let status = unsafe {
+                        nix::libc::pthread_atfork(
+                            Some(terminal_atfork_prepare),
+                            Some(terminal_atfork_parent),
+                            Some(terminal_atfork_child),
+                        )
+                    };
+                    SIGNAL_ATFORK_STATE.store(
+                        if status == 0 { REGISTERED } else { FAILED },
+                        Ordering::Release,
+                    );
+                    if status == 0 {
+                        return Ok(());
+                    }
+                    return Err(io::Error::from_raw_os_error(status));
+                }
+            }
+            REGISTERING if std::time::Instant::now() < deadline => std::thread::yield_now(),
+            REGISTERING => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "terminal signal pthread_atfork registration did not finish",
+                ));
+            }
+            _ => unreachable!("known pthread_atfork state"),
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn ensure_terminal_signal_atfork() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "binary terminal signal ownership requires a verified pthread_atfork protocol",
+    ))
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn capture_fork_child_signal_actions() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    FORK_CHILD_SIGNAL_ACTIONS_READY.store(false, Ordering::Release);
+    let actions = unsafe { (*FORK_CHILD_SIGNAL_ACTIONS.0.get()).as_mut_ptr() };
+    for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
+        let status = unsafe { nix::libc::sigaction(signal, std::ptr::null(), actions.add(index)) };
+        if status < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    FORK_CHILD_SIGNAL_ACTIONS_READY.store(true, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn capture_fork_child_signal_actions() -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
 unsafe fn signal_errno() -> nix::libc::c_int {
@@ -1802,6 +2003,12 @@ impl BinaryTerminalSession {
                 "injected atomic signal transport setup failure",
             ));
         }
+        if let Err(error) =
+            ensure_terminal_signal_atfork().and_then(|()| capture_fork_child_signal_actions())
+        {
+            BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
+            return Err(error);
+        }
         if let Err(error) = ensure_terminal_signal_monitor() {
             BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
             return Err(error);
@@ -1869,13 +2076,36 @@ fn ensure_terminal_signal_monitor() -> io::Result<()> {
 }
 
 #[cfg(unix)]
+struct SignalRecoveryRetry {
+    progress_epoch: u64,
+    signal_epoch: usize,
+    retry_at: std::time::Instant,
+    backoff: Duration,
+}
+
+#[cfg(unix)]
+fn park_until_signal_retry(retry_at: std::time::Instant) -> bool {
+    let Some(remaining) = retry_at.checked_duration_since(std::time::Instant::now()) else {
+        return false;
+    };
+    SUPERVISED_SIGNAL_RECOVERY_PARKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    std::thread::park_timeout(remaining);
+    true
+}
+
+#[cfg(unix)]
+fn next_signal_retry_backoff(previous: Duration) -> Duration {
+    previous.saturating_mul(2).min(Duration::from_millis(250))
+}
+
+#[cfg(unix)]
 fn terminal_signal_monitor() {
     use std::sync::atomic::Ordering;
-    const ACTIVE_POLL: Duration = Duration::from_millis(1);
     const IDLE_POLL: Duration = Duration::from_millis(25);
-    const RECOVERY_RETRY: Duration = Duration::from_millis(25);
-    let mut pending_retry: Option<(u64, usize, std::time::Instant)> = None;
-    let mut drop_retry: Option<(u64, std::time::Instant)> = None;
+    const INITIAL_RETRY: Duration = Duration::from_millis(25);
+    const NO_PROGRESS_PROBE: Duration = Duration::from_millis(25);
+    let mut pending_retry: Option<SignalRecoveryRetry> = None;
+    let mut drop_retry: Option<SignalRecoveryRetry> = None;
     loop {
         if SUPERVISED_SIGNAL_MONITOR_PAUSE.load(Ordering::Acquire) {
             SUPERVISED_SIGNAL_MONITOR_PAUSED.store(true, Ordering::Release);
@@ -1889,14 +2119,20 @@ fn terminal_signal_monitor() {
         if observed_pending != 0 {
             let progress_epoch = TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire);
             let signal_epoch = SIGNAL_PENDING_EPOCH.load(Ordering::Acquire);
-            if matches!(
-                pending_retry,
-                Some((failed_progress, failed_signal, retry_at))
-                    if failed_progress == progress_epoch
-                        && failed_signal == signal_epoch
-                        && std::time::Instant::now() < retry_at
-            ) {
-                std::thread::sleep(ACTIVE_POLL);
+            let no_external_progress = matches!(
+                pending_retry.as_ref(),
+                Some(retry)
+                    if retry.progress_epoch == progress_epoch
+                        && retry.signal_epoch == signal_epoch
+            );
+            if no_external_progress
+                && park_until_signal_retry(
+                    pending_retry
+                        .as_ref()
+                        .expect("retry was matched above")
+                        .retry_at,
+                )
+            {
                 continue;
             }
             // Latch before withdrawing the bits so Drop can never observe a
@@ -1907,7 +2143,13 @@ fn terminal_signal_monitor() {
                 TERMINAL_COORDINATOR
                     .termination_requested
                     .store(true, Ordering::Release);
-                let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                SUPERVISED_SIGNAL_RECOVERY_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
+                let attempt_budget = if no_external_progress {
+                    NO_PROGRESS_PROBE
+                } else {
+                    Duration::from_millis(500)
+                };
+                let deadline = std::time::Instant::now() + attempt_budget;
                 if restore_terminal_before_termination_until(deadline).is_ok()
                     && disarm_binary_terminal_signals_until(deadline).is_ok()
                 {
@@ -1919,23 +2161,46 @@ fn terminal_signal_monitor() {
                 // cleanup transition, or newly delivered signal publishes
                 // observable progress.
                 SIGNAL_PENDING_MASK.fetch_or(pending, Ordering::AcqRel);
-                pending_retry = Some((
-                    TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire),
-                    SIGNAL_PENDING_EPOCH.load(Ordering::Acquire),
-                    std::time::Instant::now() + RECOVERY_RETRY,
-                ));
+                let backoff = if no_external_progress {
+                    next_signal_retry_backoff(
+                        pending_retry
+                            .as_ref()
+                            .map(|retry| retry.backoff)
+                            .unwrap_or(INITIAL_RETRY),
+                    )
+                } else {
+                    INITIAL_RETRY
+                };
+                pending_retry = Some(SignalRecoveryRetry {
+                    progress_epoch: TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire),
+                    signal_epoch: SIGNAL_PENDING_EPOCH.load(Ordering::Acquire),
+                    retry_at: std::time::Instant::now() + backoff,
+                    backoff,
+                });
             }
         } else if BINARY_SIGNAL_OWNER.load(Ordering::Acquire) == BINARY_SIGNAL_OWNER_DROPPING {
             let progress_epoch = TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire);
-            if matches!(
-                drop_retry,
-                Some((failed_progress, retry_at))
-                    if failed_progress == progress_epoch && std::time::Instant::now() < retry_at
-            ) {
-                std::thread::sleep(ACTIVE_POLL);
+            let no_external_progress = matches!(
+                drop_retry.as_ref(),
+                Some(retry) if retry.progress_epoch == progress_epoch
+            );
+            if no_external_progress
+                && park_until_signal_retry(
+                    drop_retry
+                        .as_ref()
+                        .expect("retry was matched above")
+                        .retry_at,
+                )
+            {
                 continue;
             }
-            let deadline = std::time::Instant::now() + Duration::from_millis(100);
+            SUPERVISED_SIGNAL_RECOVERY_ATTEMPTS.fetch_add(1, Ordering::AcqRel);
+            let attempt_budget = if no_external_progress {
+                NO_PROGRESS_PROBE
+            } else {
+                Duration::from_millis(100)
+            };
+            let deadline = std::time::Instant::now() + attempt_budget;
             if restore_terminal_before_termination_until(deadline).is_ok()
                 && disarm_binary_terminal_signals_until(deadline).is_ok()
                 && SIGNAL_PENDING_MASK.load(Ordering::Acquire) == 0
@@ -1952,15 +2217,31 @@ fn terminal_signal_monitor() {
                 pending_retry = None;
                 drop_retry = None;
             } else {
-                drop_retry = Some((
-                    TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire),
-                    std::time::Instant::now() + RECOVERY_RETRY,
-                ));
+                let backoff = if no_external_progress {
+                    next_signal_retry_backoff(
+                        drop_retry
+                            .as_ref()
+                            .map(|retry| retry.backoff)
+                            .unwrap_or(INITIAL_RETRY),
+                    )
+                } else {
+                    INITIAL_RETRY
+                };
+                drop_retry = Some(SignalRecoveryRetry {
+                    progress_epoch: TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire),
+                    signal_epoch: SIGNAL_PENDING_EPOCH.load(Ordering::Acquire),
+                    retry_at: std::time::Instant::now() + backoff,
+                    backoff,
+                });
             }
         }
         let active = SIGNAL_PENDING_MASK.load(Ordering::Acquire) != 0
             || BINARY_SIGNAL_OWNER.load(Ordering::Acquire) == BINARY_SIGNAL_OWNER_DROPPING;
-        std::thread::sleep(if active { ACTIVE_POLL } else { IDLE_POLL });
+        if active {
+            std::thread::yield_now();
+        } else {
+            std::thread::park_timeout(IDLE_POLL);
+        }
     }
 }
 
@@ -2189,6 +2470,13 @@ impl Drop for BinaryTerminalSession {
 /// bounded timeout as successful cleanup.
 pub fn emergency_restore_terminal_result() -> io::Result<()> {
     cleanup_active_terminal()
+}
+
+/// Repair a constructor failure before the REPL is allowed to fall back to
+/// ordinary stdout. A dirty `CLEANING` generation remains fail-closed and the
+/// caller must abort construction instead of publishing standard-output bytes.
+pub(crate) fn recover_terminal_after_failed_activation() -> io::Result<()> {
+    cleanup_active_terminal_until(std::time::Instant::now() + Duration::from_millis(500))
 }
 
 /// Monotonic application progress observed by latched binary termination
