@@ -2433,130 +2433,19 @@ mod tests {
         Ok(())
     }
 
-    /// `block_in_place` must be safe on every thread `block_on_host` can run
-    /// on, not only a worker.
-    ///
-    /// It panics outside a multi-threaded runtime, which is why the flavor is
-    /// checked — but `Runtime::block_on`'s own calling thread is inside a
-    /// multi-threaded runtime and is *not* a worker. Review flagged that as the
-    /// one input shape where the new arm's behaviour differs from the worker
-    /// case, so it is asserted rather than assumed.
-    #[test]
-    fn test_block_in_place_is_safe_on_every_thread_block_on_host_reaches() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        // A worker task: the ordinary `mem-store` path.
-        let from_worker = runtime.block_on(async {
-            tokio::spawn(async { tokio::task::block_in_place(|| "worker") })
-                .await
-                .expect("worker task")
-        });
-        assert_eq!(from_worker, "worker");
-
-        // `Runtime::block_on`'s own thread — inside the runtime, but not a
-        // worker. If this panicked, `block_on_host` would panic for every
-        // caller reaching it from there, since it takes the same arm.
-        let from_block_on = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(async { tokio::task::block_in_place(|| "block_on") })
-        }));
-        assert_eq!(
-            from_block_on.ok(),
-            Some("block_on"),
-            "block_in_place must not panic on Runtime::block_on's thread"
-        );
-    }
-
-    /// The production boundary for #276's deadlock: a task on a worker thread
-    /// driving a write through `block_on_host`, on a runtime with **one**
-    /// worker.
-    ///
-    /// This is shipped configuration. `#[tokio::main(flavor = "multi_thread")]`
-    /// sets no `worker_threads`, so tokio uses `available_parallelism()` — one
-    /// on a single-vCPU host. The sole worker blocks in `join()` waiting for
-    /// the write; the write waits for the loader; the loader needs that worker.
-    ///
-    /// An earlier version of this fix only stopped current-thread runtimes from
-    /// spawning, which left exactly this case deadlocked while the comments
-    /// claimed it was closed. `block_in_place` hands the worker's queue to a
-    /// replacement thread, so the loader can be polled.
-    #[test]
-    fn test_mem_store_through_block_on_host_on_a_single_worker_runtime() -> Result<()> {
-        let temp = NamedTempFile::new()?;
-        let config = MemoryConfig {
-            db_path: temp.path().to_path_buf(),
-            ..Default::default()
-        };
-        {
-            let blocking = MemorySystem::new(config.clone())?;
-            drop(blocking);
-        }
-        seed_tree_nodes(temp.path(), 4 * HYDRATION_BATCH as u64, &[])?;
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()?;
-
-        // Bounded, and the runtime is torn down before asserting.
-        //
-        // A regression here wedges a worker. Without the forced shutdown below,
-        // dropping the runtime waits for that worker and the whole test binary
-        // hangs — which in CI is an unattributed job timeout rather than a
-        // named failure. Measured: the negative control ran 71 minutes before
-        // it was killed by hand. `shutdown_timeout` abandons the blocked thread
-        // so the assertion can actually report.
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let handle = runtime.handle().clone();
-        runtime.spawn(async move {
-            let memory = MemorySystem::new(config).expect("construction");
-            // Exactly `block_on_host`'s shape, from a task on the worker.
-            let result = tokio::task::block_in_place(|| {
-                std::thread::scope(|scope| {
-                    scope
-                        .spawn(|| {
-                            handle.block_on(memory.insert_conversation(
-                                "system",
-                                "A memory stored through the typed host from a \
-                                 worker task, which is how mem-store reaches it.",
-                                None,
-                                None,
-                            ))
-                        })
-                        .join()
-                        .expect("host worker")
-                })
-            });
-            let _ = done_tx.send(result.is_ok());
-        });
-
-        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(30));
-        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-
-        let stored = outcome.map_err(|_| {
-            anyhow::anyhow!(
-                "mem-store deadlocked on a single-worker runtime: the write \
-                 waits for the loader, and the loader needs the worker that is \
-                 blocking"
-            )
-        })?;
-        assert!(stored, "the write must succeed, not merely return");
-        Ok(())
-    }
-
     /// A current-thread runtime does not spawn a loader at all, so there is
     /// nothing to starve and nothing to wait on.
     ///
-    /// This is #276's `mem-store` deadlock, closed structurally rather than by
-    /// bounding the wait. `block_on_host` blocks the single scheduler thread
-    /// waiting for a write; the write waits for the loader; the loader needs
-    /// the blocked thread. A timeout cannot rescue that — the blocked
-    /// `Runtime::block_on` owns the time driver, so the `Sleep` never fires,
-    /// which is why the first attempt at this hung for over 200 seconds while
-    /// claiming to be bounded.
+    /// Spawning there was a real hazard: `Handle::try_current()` succeeds on a
+    /// current-thread runtime, and a loader spawned onto it cannot be polled
+    /// while any synchronous caller blocks the single scheduler thread. A
+    /// timeout could not have rescued it either — that blocked thread owns the
+    /// time driver, so the `Sleep` never fires, which is why an earlier
+    /// attempt at bounding the wait hung for over 200 seconds while claiming
+    /// to be bounded.
+    ///
+    /// The multi-threaded counterpart is `typed_mem_store_completes_on_a_single_worker_runtime`
+    /// in `src/runtime`, which drives the real submit API.
     #[tokio::test]
     async fn test_a_current_thread_runtime_loads_without_spawning_a_loader() -> Result<()> {
         let temp = NamedTempFile::new()?;

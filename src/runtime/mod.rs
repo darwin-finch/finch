@@ -3251,6 +3251,11 @@ impl ProgramRuntime {
             program_hash: hash_program_source(&source),
             agent_ancestry: agent_ancestry(caller.as_ref()),
         };
+        // `spawn_blocking` is load-bearing, not just a courtesy to the
+        // scheduler: it moves this off a runtime worker, which is what lets
+        // `block_on_host` block its thread waiting for a future that needs the
+        // runtime. Drive this inline and `mem-store` deadlocks on a
+        // single-worker runtime.
         let (runtime, execution) = tokio::task::spawn_blocking(move || {
             let vocabulary =
                 serde_json::to_string(runtime.vocabulary()).unwrap_or_else(|_| "[]".to_string());
@@ -3351,6 +3356,11 @@ impl ProgramRuntime {
             program_hash: hash_program_source(&pending.source),
             agent_ancestry: agent_ancestry(pending.caller.as_ref()),
         };
+        // `spawn_blocking` is load-bearing, not just a courtesy to the
+        // scheduler: it moves this off a runtime worker, which is what lets
+        // `block_on_host` block its thread waiting for a future that needs the
+        // runtime. Drive this inline and `mem-store` deadlocks on a
+        // single-worker runtime.
         let (runtime, execution) = tokio::task::spawn_blocking(move || {
             let vocabulary =
                 serde_json::to_string(runtime.vocabulary()).unwrap_or_else(|_| "[]".to_string());
@@ -7380,23 +7390,27 @@ fn summarize_csv(
 
 /// Run an async host effect to completion from synchronous typed-program code.
 ///
-/// The `join` below blocks the calling thread, and on a multi-threaded runtime
-/// that thread is a worker. If the future needs the runtime to make progress —
-/// `mem-store` waits for the MemTree loader — the worker it needs is the one
-/// blocking, and on a runtime with a single worker that is a deadlock. Shipped
-/// configuration reaches it: `#[tokio::main(flavor = "multi_thread")]` sets no
-/// `worker_threads`, so tokio uses `available_parallelism()`, which is one on a
-/// one-vCPU host. N concurrent effects reach it on an N-worker runtime.
+/// **Callers must not be on a runtime worker thread.** The `join` below blocks
+/// the calling thread; if that thread is a worker and the future needs the
+/// runtime to make progress — `mem-store` waits for the MemTree loader — the
+/// worker it needs is the one blocking, and on a runtime with a single worker
+/// that is a deadlock.
 ///
-/// `block_in_place` is the fix: it converts this worker into a blocking thread
-/// and hands its queue to a replacement, so the runtime keeps its full
-/// complement and the loader can be polled. A timeout cannot substitute — the
-/// blocked worker also owns the time driver on a one-worker runtime, so the
-/// `Sleep` would never fire either.
+/// Every in-tree caller satisfies this incidentally, through the
+/// `tokio::task::spawn_blocking` hop that wraps both `TypedHostHandler` drive
+/// sites. That hop is load-bearing, not incidental convenience, and is marked
+/// as such at both sites.
 ///
-/// It panics on a current-thread runtime, hence the flavor check. That arm
-/// needs no help: `MemorySystem` loads synchronously there rather than
-/// spawning a loader it could not poll.
+/// A `tokio::task::block_in_place` here would release the worker and make the
+/// requirement unnecessary — but it panics inside a `LocalSet`, and
+/// `Handle::runtime_flavor()` reports `MultiThread` there, so the panic cannot
+/// be guarded against. `src/main.rs` runs the whole interactive REPL inside
+/// `local.run_until(...)`, so that trade would swap a deadlock no in-tree
+/// caller can reach for a panic one could. `src/coforth/interpreter.rs` records
+/// the same constraint for the same reason.
+///
+/// The residual hazard is an out-of-tree caller reaching `ProgramRuntime`'s
+/// public submit API from a worker; that is tracked separately.
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
@@ -7404,19 +7418,12 @@ where
 {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("typed host requires a Tokio runtime"))?;
-    let flavor = handle.runtime_flavor();
-    let run = move || {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || handle.block_on(future))
-                .join()
-                .map_err(|_| anyhow::anyhow!("typed host worker panicked"))?
-        })
-    };
-    match flavor {
-        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(run),
-        _ => run(),
-    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || handle.block_on(future))
+            .join()
+            .map_err(|_| anyhow::anyhow!("typed host worker panicked"))?
+    })
 }
 
 fn authority_state_from_parts(
@@ -10482,6 +10489,107 @@ mod tests {
             .find(|grant| grant.id == grant_id)
             .unwrap()
             .is_active(unix_time_ms()));
+    }
+
+    /// The production path for #276's `mem-store` deadlock, on the runtime
+    /// shape that would expose it: one worker.
+    ///
+    /// `block_on_host` blocks its calling thread, so if that thread were a
+    /// runtime worker the write would wait for the MemTree loader while holding
+    /// the only thread the loader could run on. It is not a worker: both
+    /// `TypedHostHandler` drive sites go through `tokio::task::spawn_blocking`,
+    /// and this pins that the hop stays.
+    ///
+    /// Written against the real submit API rather than a hand-built
+    /// `block_on_host` shape. An earlier version asserted on the hand-built one
+    /// and called it "the production boundary"; review showed production never
+    /// produces it, so the test was defending a shape no caller creates.
+    #[test]
+    fn typed_mem_store_completes_on_a_single_worker_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let path = database.path().to_path_buf();
+
+        // Seed enough rows that hydration actually has work. Without this the
+        // store is empty, no loader is spawned, the write gate is already open,
+        // and the test passes whether or not the deadlock is possible — which
+        // is exactly what the first version of it did.
+        {
+            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path: path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .expect("schema");
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
+            let tx = conn.unchecked_transaction().expect("tx");
+            for id in 0..2048i64 {
+                tx.execute(
+                    "INSERT OR REPLACE INTO tree_nodes
+                     (node_id, parent_id, text, embedding, level, created_at, importance)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    rusqlite::params![
+                        id,
+                        if id == 0 { None } else { Some(0i64) },
+                        format!("seeded node {id}"),
+                        embedding,
+                        if id == 0 { 0i64 } else { 1i64 },
+                        id,
+                    ],
+                )
+                .expect("seed");
+            }
+            tx.commit().expect("commit");
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let memory = Arc::new(
+                crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                    db_path: path,
+                    use_neural_embeddings: false,
+                    ..Default::default()
+                })
+                .expect("memory"),
+            );
+            let program_runtime = ProgramRuntime::new();
+            program_runtime.attach_memory(memory);
+            program_runtime
+                .grant_typed_capability(crate::vm::CapabilityRequirement {
+                    capability: crate::vm::CapabilityKind::MemoryWrite,
+                    selector: crate::vm::ResourceSelector::Memory {
+                        tree: "session".into(),
+                        path: "**".into(),
+                    },
+                })
+                .expect("grant");
+            let outcome = program_runtime
+                .submit(submission(
+                    ProgramLanguage::Lisp,
+                    "(mem-store \"a fact stored from a single-worker runtime\")",
+                    ExecutionEffect::VmWrite,
+                ))
+                .await;
+            let _ = done_tx.send(outcome.map(|outcome| outcome.status));
+        });
+
+        // Bounded, and the runtime is torn down before asserting: a regression
+        // here wedges the worker, and dropping the runtime would then block the
+        // whole test binary — which in CI is an unattributed timeout rather
+        // than a named failure.
+        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+
+        let status = outcome
+            .expect("mem-store deadlocked on a single-worker runtime")
+            .expect("submit");
+        assert_eq!(status, ExecutionStatus::Completed);
     }
 
     #[tokio::test]
