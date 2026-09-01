@@ -6696,6 +6696,9 @@ mod tests {
 
     #[test]
     fn test_headless_renderer_flush_is_noop_without_terminal_session() {
+        #[cfg(not(unix))]
+        let _terminal_lifecycle = terminal_lifecycle::supervised_test_lock();
+
         let colors = ColorScheme::default();
         let output_manager = Arc::new(OutputManager::new(colors.clone()));
         let status_bar = Arc::new(StatusBar::new());
