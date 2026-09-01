@@ -266,14 +266,19 @@ struct BrainRunnerControlImpl {
     lifecycle: crate::server::BrainLifecycleService,
     runners: crate::server::BrainRunnerBroker,
     connection_id: uuid::Uuid,
+    process_identity: crate::server::RunnerProcessIdentity,
     brain: String,
     lease_id: crate::brain::store::RunnerLeaseId,
 }
 
 impl BrainRunnerControlImpl {
-    fn validate_lease(&self) -> anyhow::Result<()> {
-        self.runners
-            .require_connection_lease(self.connection_id, &self.brain, self.lease_id)?;
+    fn admit(&self) -> anyhow::Result<crate::server::ConnectionDispatchGuard> {
+        let dispatch = self.runners.admit_runner_control(
+            self.connection_id,
+            self.process_identity,
+            &self.brain,
+            self.lease_id,
+        )?;
         let snapshot = self.lifecycle.snapshot(&self.brain)?;
         anyhow::ensure!(
             snapshot
@@ -282,7 +287,7 @@ impl BrainRunnerControlImpl {
                 .is_some_and(|lease| lease.lease_id == self.lease_id),
             "runner lifecycle capability no longer matches the active lease"
         );
-        Ok(())
+        Ok(dispatch)
     }
 }
 
@@ -292,9 +297,10 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
         params: finch_ipc_capnp::brain_runner_control::StartSubagentParams,
         mut results: finch_ipc_capnp::brain_runner_control::StartSubagentResults,
     ) -> Promise<(), capnp::Error> {
-        if let Err(error) = self.validate_lease() {
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
+        let _dispatch = match self.admit() {
+            Ok(dispatch) => dispatch,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let params = match params.get() {
             Ok(params) => params,
             Err(error) => return Promise::err(error.into()),
@@ -344,9 +350,10 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
         params: finch_ipc_capnp::brain_runner_control::FinishSubagentParams,
         mut results: finch_ipc_capnp::brain_runner_control::FinishSubagentResults,
     ) -> Promise<(), capnp::Error> {
-        if let Err(error) = self.validate_lease() {
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
+        let _dispatch = match self.admit() {
+            Ok(dispatch) => dispatch,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let params = match params.get() {
             Ok(params) => params,
             Err(error) => return Promise::err(error),
@@ -2108,6 +2115,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
                 runners: self.server.brain_runners().clone(),
                 connection_id: self.connection_id,
+                process_identity: self.peer_process_identity,
                 brain: brain.clone(),
                 lease_id,
             });
@@ -8269,6 +8277,289 @@ mod tests {
         }
     }
 
+    struct RegisteredSubagentControlFixture {
+        _temp: tempfile::TempDir,
+        store: crate::brain::store::BrainStore,
+        server: std::sync::Arc<crate::server::AgentServer>,
+        client: crate::ipc::IpcClient,
+        bootstrap: crate::ipc::client::BrainRunnerBootstrap,
+        connection_id: uuid::Uuid,
+        shutdown: tokio_util::sync::CancellationToken,
+        handler: tokio::task::JoinHandle<anyhow::Result<()>>,
+        parent_run_id: crate::brain::store::RunId,
+        child_run_id: Option<crate::brain::store::RunId>,
+    }
+
+    impl RegisteredSubagentControlFixture {
+        async fn new(with_child: bool) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local",
+                Some(temp.path().join("brains")),
+            );
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([109; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+            lifecycle.create("shared").await.unwrap();
+            let driver = lifecycle
+                .attach(
+                    "shared",
+                    "alice",
+                    crate::brain::store::AttachmentRole::Driver,
+                    None,
+                )
+                .unwrap();
+            let request = store
+                .push(
+                    "shared",
+                    "alice",
+                    crate::brain::store::BrainEventKind::Prompt {
+                        text: "delegate exactly once".into(),
+                    },
+                )
+                .unwrap();
+            let parent = lifecycle
+                .start_run_with_parent(
+                    "shared",
+                    "alice",
+                    crate::brain::store::BrainRunKind::Interactive,
+                    request.seq,
+                    driver.attachment_id,
+                    crate::brain::store::BrainRunStatus::Running,
+                    None,
+                )
+                .unwrap();
+            let child_run_id = with_child.then(|| {
+                lifecycle
+                    .start_subagent_for_run(
+                        "shared",
+                        parent.run_id,
+                        uuid::Uuid::new_v4(),
+                        Some("existing child".into()),
+                    )
+                    .unwrap()
+                    .run_id
+            });
+            let environment = store.environment().clone();
+            let lease = lifecycle
+                .acquire_runner(
+                    "shared",
+                    "runner@box.local/subagent-control",
+                    &environment,
+                    None,
+                    300_000,
+                )
+                .unwrap();
+            let connection_id = uuid::Uuid::new_v4();
+            server
+                .brain_runners()
+                .claim_connection_lease(connection_id, "shared", lease.lease_id)
+                .unwrap();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+            let handler_server = std::sync::Arc::clone(&server);
+            let handler_shutdown = shutdown.clone();
+            let handler = tokio::task::spawn_local(async move {
+                super::handle_connection_with_shutdown_for_peer(
+                    server_stream,
+                    handler_server,
+                    connection_id,
+                    handler_shutdown,
+                    crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                )
+                .await
+            });
+            let client = crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                .await
+                .unwrap();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let bootstrap = client
+                .register_brain_runner("shared", lease.lease_id, event_tx)
+                .await
+                .unwrap();
+            Self {
+                _temp: temp,
+                store,
+                server,
+                client,
+                bootstrap,
+                connection_id,
+                shutdown,
+                handler,
+                parent_run_id: parent.run_id,
+                child_run_id,
+            }
+        }
+
+        fn snapshot_bytes(&self) -> Vec<u8> {
+            serde_json::to_vec(&self.store.snapshot("shared").unwrap()).unwrap()
+        }
+
+        async fn close(self) {
+            self.shutdown.cancel();
+            drop(self.bootstrap);
+            drop(self.client);
+            tokio::time::timeout(std::time::Duration::from_secs(1), self.handler)
+                .await
+                .expect("subagent-control fixture did not tear down")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_queued_subagent_start_is_rejected_after_local_process_ejection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = RegisteredSubagentControlFixture::new(false).await;
+                let before = fixture.snapshot_bytes();
+                let (admission_reached, admission_release) =
+                    fixture.client.pause_next_runner_rpc_admission_for_test();
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                fixture
+                    .bootstrap
+                    .subagent_control
+                    .send(crate::runtime::scheduler::AgentBrainControlRequest::Start {
+                        parent_run_id: fixture.parent_run_id,
+                        task_id: uuid::Uuid::new_v4(),
+                        detail: "must not start after eject".into(),
+                        response_tx,
+                    })
+                    .unwrap();
+                admission_reached
+                    .await
+                    .expect("start did not reach its pre-send admission boundary");
+
+                let ejection = fixture
+                    .server
+                    .brain_runners()
+                    .eject_connection(fixture.connection_id)
+                    .unwrap();
+                fixture
+                    .client
+                    .explicitly_eject_runner_process_for_test()
+                    .await
+                    .unwrap();
+                assert!(fixture.client.test_runner_process_poisoned());
+                admission_release.send(()).unwrap();
+                let error = response_rx.await.unwrap().unwrap_err();
+                assert!(error.contains("runner process was quarantined"), "{error}");
+                assert_eq!(fixture.snapshot_bytes(), before);
+
+                ejection.publish_ejection();
+                fixture.close().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_queued_subagent_finish_observes_remote_quarantine_before_mutation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = RegisteredSubagentControlFixture::new(true).await;
+                let child_run_id = fixture.child_run_id.unwrap();
+                let before = fixture.snapshot_bytes();
+                let (admission_reached, admission_release) =
+                    fixture.client.pause_next_runner_rpc_admission_for_test();
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                fixture
+                    .bootstrap
+                    .subagent_control
+                    .send(
+                        crate::runtime::scheduler::AgentBrainControlRequest::Finish {
+                            run_id: child_run_id,
+                            status: crate::brain::store::BrainRunStatus::Completed,
+                            detail: "must not finish after eject".into(),
+                            response_tx,
+                        },
+                    )
+                    .unwrap();
+                admission_reached
+                    .await
+                    .expect("finish did not reach its pre-send admission boundary");
+
+                let ejection = fixture
+                    .server
+                    .brain_runners()
+                    .eject_connection(fixture.connection_id)
+                    .unwrap();
+                admission_release.send(()).unwrap();
+                let error = response_rx.await.unwrap().unwrap_err();
+                assert!(error.contains("runner process was quarantined"), "{error}");
+                assert!(fixture.client.test_runner_process_poisoned());
+                assert_eq!(fixture.snapshot_bytes(), before);
+
+                ejection.publish_ejection();
+                fixture.close().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_raw_subagent_control_capability_rejects_ejected_connection_without_mutation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let fixture = RegisteredSubagentControlFixture::new(true).await;
+                let before = fixture.snapshot_bytes();
+                let control = fixture.bootstrap.raw_subagent_control.clone();
+                let ejection = fixture
+                    .server
+                    .brain_runners()
+                    .eject_connection(fixture.connection_id)
+                    .unwrap();
+
+                let mut start = control.start_subagent_request();
+                start
+                    .get()
+                    .set_parent_run_id(&fixture.parent_run_id.0.to_string());
+                start.get().set_task_id(&uuid::Uuid::new_v4().to_string());
+                start.get().set_detail("raw late start");
+                let start_error = match start.send().promise.await {
+                    Ok(_) => panic!("raw late start unexpectedly mutated the Brain"),
+                    Err(error) => error,
+                };
+                assert!(
+                    start_error
+                        .to_string()
+                        .contains(crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE),
+                    "{start_error}"
+                );
+
+                let mut finish = control.finish_subagent_request();
+                finish
+                    .get()
+                    .set_run_id(&fixture.child_run_id.unwrap().0.to_string());
+                finish
+                    .get()
+                    .set_status(crate::ipc::brain_codec::run_status_to_capnp(
+                        crate::brain::store::BrainRunStatus::Completed,
+                    ));
+                finish.get().set_detail("raw late finish");
+                let finish_error = match finish.send().promise.await {
+                    Ok(_) => panic!("raw late finish unexpectedly mutated the Brain"),
+                    Err(error) => error,
+                };
+                assert!(
+                    finish_error
+                        .to_string()
+                        .contains(crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE),
+                    "{finish_error}"
+                );
+                assert_eq!(fixture.snapshot_bytes(), before);
+
+                ejection.publish_ejection();
+                fixture.close().await;
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn runner_lifecycle_capability_rejects_a_replaced_lease() {
         let root = tempfile::tempdir().unwrap().keep();
@@ -8293,24 +8584,41 @@ mod tests {
             .acquire_runner("shared", "runner-one", &environment, None, 60_000)
             .unwrap();
         let connection_id = uuid::Uuid::new_v4();
+        let process_identity =
+            crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap();
+        let _dispatch = runners.open_connection_dispatch(connection_id);
         runners
             .claim_connection_lease(connection_id, "shared", first.lease_id)
+            .unwrap();
+        let (runner_tx, _runner_rx) = tokio::sync::mpsc::unbounded_channel();
+        runners
+            .register_bounded_for_connection(
+                connection_id,
+                process_identity,
+                "shared",
+                first.lease_id,
+                runner_tx,
+            )
             .unwrap();
         let control = BrainRunnerControlImpl {
             lifecycle: lifecycle.clone(),
             runners: runners.clone(),
             connection_id,
+            process_identity,
             brain: "shared".into(),
             lease_id: first.lease_id,
         };
-        control.validate_lease().unwrap();
+        drop(control.admit().unwrap());
 
         lifecycle.release_runner("shared", first.lease_id).unwrap();
         let replacement = lifecycle
             .acquire_runner("shared", "runner-two", &environment, None, 60_000)
             .unwrap();
         assert_ne!(replacement.lease_id, first.lease_id);
-        let error = control.validate_lease().unwrap_err();
+        let error = match control.admit() {
+            Ok(_) => panic!("replaced runner control retained admission"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("active lease"));
     }
 

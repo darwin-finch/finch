@@ -2960,6 +2960,64 @@ impl BrainStore {
         parent_run_id: Option<RunId>,
         detail: Option<String>,
     ) -> Result<BrainRun> {
+        self.start_run_with_parent_id_inner(
+            name,
+            sender,
+            run_id,
+            kind,
+            request_seq,
+            initiating_attachment_id,
+            status,
+            parent_run_id,
+            detail,
+            false,
+        )
+    }
+
+    /// Start an idempotent child only while its parent is actively running.
+    /// The parent check and RunStarted append share the Brain write lock, so
+    /// interruption or terminalization cannot race a new child into the log.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_run_with_active_parent_id(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        kind: BrainRunKind,
+        request_seq: u64,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+        parent_run_id: RunId,
+        detail: Option<String>,
+    ) -> Result<BrainRun> {
+        self.start_run_with_parent_id_inner(
+            name,
+            sender,
+            run_id,
+            kind,
+            request_seq,
+            initiating_attachment_id,
+            status,
+            Some(parent_run_id),
+            detail,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_run_with_parent_id_inner(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        kind: BrainRunKind,
+        request_seq: u64,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+        parent_run_id: Option<RunId>,
+        detail: Option<String>,
+        require_active_parent: bool,
+    ) -> Result<BrainRun> {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("run initiator", sender)?;
         self.ensure_loaded(name)?;
@@ -2987,7 +3045,12 @@ impl BrainStore {
                 .runs
                 .get(&parent_run_id)
                 .with_context(|| format!("parent Brain run {} does not exist", parent_run_id.0))?;
-            if parent.status.is_terminal() {
+            if require_active_parent {
+                anyhow::ensure!(
+                    parent.status == BrainRunStatus::Running,
+                    "inactive Brain run cannot start a subagent child"
+                );
+            } else if parent.status.is_terminal() {
                 anyhow::bail!("terminal Brain run cannot start a child");
             }
         }
@@ -3035,6 +3098,33 @@ impl BrainStore {
         status: BrainRunStatus,
         detail: Option<String>,
     ) -> Result<BrainRun> {
+        self.transition_run_inner(name, sender, run_id, status, detail, false)
+    }
+
+    /// Publish a subagent terminal transition only while its parent still
+    /// owns active execution authority. The parent check and status append
+    /// share the Brain write lock, so parent terminalization cannot race a
+    /// late reverse-control publication into the durable log.
+    pub(crate) fn transition_subagent_run_if_parent_active(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        status: BrainRunStatus,
+        detail: Option<String>,
+    ) -> Result<BrainRun> {
+        self.transition_run_inner(name, sender, run_id, status, detail, true)
+    }
+
+    fn transition_run_inner(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        status: BrainRunStatus,
+        detail: Option<String>,
+        require_active_subagent_parent: bool,
+    ) -> Result<BrainRun> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
@@ -3045,6 +3135,26 @@ impl BrainStore {
             .runs
             .get(&run_id)
             .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+        if require_active_subagent_parent {
+            anyhow::ensure!(
+                current.kind == BrainRunKind::Subagent,
+                "run is not a subagent"
+            );
+            let parent_run_id = current
+                .parent_run_id
+                .context("subagent run has no parent")?;
+            let parent = state
+                .runs
+                .get(&parent_run_id)
+                .with_context(|| format!("parent Brain run {} does not exist", parent_run_id.0))?;
+            anyhow::ensure!(
+                parent.status == BrainRunStatus::Running,
+                "inactive Brain run cannot finish a subagent child"
+            );
+            if current.status == status {
+                return Ok(current.clone());
+            }
+        }
         validate_run_transition(current.status, status)?;
         self.push_locked_for_run(
             name,

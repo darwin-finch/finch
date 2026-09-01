@@ -30,6 +30,8 @@ pub struct BrainRunnerBootstrap {
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
     pub subagent_control:
         mpsc::UnboundedSender<crate::runtime::scheduler::AgentBrainControlRequest>,
+    #[cfg(test)]
+    pub(crate) raw_subagent_control: brain_runner_control::Client,
 }
 
 pub struct BrainSubmissionResult {
@@ -111,6 +113,19 @@ impl RunnerProcessIdentity {
         admitted();
         self.poisoned
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_rpc_admission_pause_for_test(&self) {
+        let pause = self
+            .runner_rpc_admission_pause
+            .lock()
+            .expect("runner RPC admission pause lock poisoned")
+            .take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
     }
 }
 
@@ -219,11 +234,7 @@ impl IpcClient {
     }
 
     fn observe_runner_rpc_error(&self, error: capnp::Error) -> anyhow::Error {
-        let error = map_runner_rpc_error(error);
-        if is_runner_process_quarantined(&error) {
-            self._rpc_handle.state.process.publish_remote_poison();
-        }
-        error
+        observe_runner_rpc_error_for_process(&self._rpc_handle.state.process, error)
     }
 
     #[cfg(test)]
@@ -247,18 +258,11 @@ impl IpcClient {
 
     #[cfg(test)]
     async fn wait_runner_rpc_admission_pause_for_test(&self) {
-        let pause = self
-            ._rpc_handle
+        self._rpc_handle
             .state
             .process
-            .runner_rpc_admission_pause
-            .lock()
-            .expect("runner RPC admission pause lock poisoned")
-            .take();
-        if let Some((reached, release)) = pause {
-            let _ = reached.send(());
-            let _ = release.await;
-        }
+            .wait_rpc_admission_pause_for_test()
+            .await;
     }
 
     /// Connect to the daemon's Unix socket.
@@ -1015,6 +1019,9 @@ impl IpcClient {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let response = reply.get()?;
         let control: brain_runner_control::Client = response.get_control()?;
+        #[cfg(test)]
+        let raw_subagent_control = control.clone();
+        let control_process = std::sync::Arc::clone(&self._rpc_handle.state.process);
         let (subagent_control, mut subagent_rx) =
             mpsc::unbounded_channel::<crate::runtime::scheduler::AgentBrainControlRequest>();
         tokio::task::spawn_local(async move {
@@ -1034,9 +1041,14 @@ impl IpcClient {
                                 params.set_task_id(&task_id.to_string());
                                 params.set_detail(&detail);
                             }
-                            let reply = call.send().promise.await?;
+                            #[cfg(test)]
+                            control_process.wait_rpc_admission_pause_for_test().await;
+                            let promise =
+                                control_process.with_rpc_admission(|| call.send().promise)?;
+                            let reply = promise.await.map_err(|error| {
+                                observe_runner_rpc_error_for_process(&control_process, error)
+                            })?;
                             decode_run(reply.get()?.get_run()?)
-                                .map_err(|error| capnp::Error::failed(error.to_string()))
                         }
                         .await
                         .map_err(|error| error.to_string());
@@ -1058,9 +1070,14 @@ impl IpcClient {
                                 ));
                                 params.set_detail(&detail);
                             }
-                            let reply = call.send().promise.await?;
+                            #[cfg(test)]
+                            control_process.wait_rpc_admission_pause_for_test().await;
+                            let promise =
+                                control_process.with_rpc_admission(|| call.send().promise)?;
+                            let reply = promise.await.map_err(|error| {
+                                observe_runner_rpc_error_for_process(&control_process, error)
+                            })?;
                             decode_run(reply.get()?.get_run()?)
-                                .map_err(|error| capnp::Error::failed(error.to_string()))
                         }
                         .await
                         .map_err(|error| error.to_string());
@@ -1074,8 +1091,21 @@ impl IpcClient {
             checkpoint: decode_checkpoint(response.get_checkpoint()?)
                 .context("daemon returned an invalid named-Brain checkpoint")?,
             subagent_control,
+            #[cfg(test)]
+            raw_subagent_control,
         })
     }
+}
+
+fn observe_runner_rpc_error_for_process(
+    process: &RunnerProcessIdentity,
+    error: capnp::Error,
+) -> anyhow::Error {
+    let error = map_runner_rpc_error(error);
+    if is_runner_process_quarantined(&error) {
+        process.publish_remote_poison();
+    }
+    error
 }
 
 fn map_runner_rpc_error(error: capnp::Error) -> anyhow::Error {

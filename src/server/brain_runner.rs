@@ -2042,6 +2042,42 @@ impl BrainRunnerBroker {
         Ok(())
     }
 
+    /// Admit one reverse runner-lifecycle mutation against the exact live
+    /// connection, process, and lease generation. The authority lock is
+    /// always acquired before the dispatch lock, matching ejection and
+    /// teardown; the returned guard keeps the admitted mutation visible to
+    /// physical-quiescence accounting without holding either lock.
+    pub(crate) fn admit_runner_control(
+        &self,
+        connection_id: uuid::Uuid,
+        process_identity: RunnerProcessIdentity,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+    ) -> Result<ConnectionDispatchGuard> {
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        Self::ensure_runner_process_admitted_locked(&authority, process_identity)?;
+        anyhow::ensure!(
+            authority.connection_runner_processes.get(&connection_id) == Some(&process_identity)
+                && authority.runner_process_owners.get(&process_identity) == Some(&connection_id),
+            "runner lifecycle capability no longer matches the registered process"
+        );
+        anyhow::ensure!(
+            authority.leases.get(&(brain.to_string(), lease_id)) == Some(&connection_id),
+            "runner lease is not owned by this IPC connection"
+        );
+        let dispatch = authority
+            .dispatch
+            .get(&connection_id)
+            .cloned()
+            .context("IPC connection has no dispatch authority")?;
+        dispatch
+            .try_enter()
+            .context("IPC connection runner dispatch is closed")
+    }
+
     pub(crate) fn release_connection_lease(
         &self,
         connection_id: uuid::Uuid,

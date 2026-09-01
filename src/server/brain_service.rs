@@ -194,7 +194,7 @@ impl BrainLifecycleService {
         detail: Option<String>,
     ) -> Result<BrainRun> {
         let parent = self.store.inspect_run(brain, parent_run_id)?;
-        let run = self.store.start_run_with_parent_id(
+        let run = self.store.start_run_with_active_parent_id(
             brain,
             &parent.initiated_by,
             RunId(task_id),
@@ -202,7 +202,7 @@ impl BrainLifecycleService {
             parent.request_seq,
             parent.initiating_attachment_id,
             BrainRunStatus::Running,
-            Some(parent_run_id),
+            parent_run_id,
             detail,
         )?;
         Ok(run)
@@ -224,11 +224,8 @@ impl BrainLifecycleService {
             ),
             "runner may only publish a terminal subagent status"
         );
-        if run.status == status {
-            return Ok(run);
-        }
         self.store
-            .transition_run(brain, "runner", run_id, status, detail)
+            .transition_subagent_run_if_parent_active(brain, "runner", run_id, status, detail)
     }
 
     pub fn inspect_schedule(
@@ -2238,7 +2235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_runs_are_idempotent_and_survive_store_restart() {
+    async fn test_subagent_runs_are_idempotent_and_reject_post_terminal_parent_after_restart() {
         let root = tempfile::tempdir().unwrap().keep();
         let make_service = || {
             BrainLifecycleService::new(
@@ -2323,16 +2320,35 @@ mod tests {
                 .unwrap(),
             completed
         );
+        let terminal_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
+        let error = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Completed,
+                Some("duplicate terminal publication".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inactive Brain run"));
         assert_eq!(
-            service
-                .transition_subagent_run(
-                    "shared",
-                    child.run_id,
-                    BrainRunStatus::Completed,
-                    Some("duplicate terminal publication".into()),
-                )
-                .unwrap(),
-            completed
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "a post-parent-terminal finish changed the event log or run graph"
+        );
+
+        let error = service
+            .start_subagent_for_run(
+                "shared",
+                parent.run_id,
+                uuid::Uuid::new_v4(),
+                Some("late new child".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inactive Brain run"));
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "a post-parent-terminal start changed the event log or run graph"
         );
 
         drop(service);
