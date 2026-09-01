@@ -460,7 +460,24 @@ impl MemorySystem {
             let embedding = self.embedding_engine.embed(&key_content)?;
             let effect = {
                 let mut tree = self.tree.lock().await;
-                tree.insert_with_effect(key_content, embedding, importance.as_u8())?
+                tree.insert_with_effect(key_content, embedding, importance.as_u8())
+            };
+            let effect = match effect {
+                Ok(effect) => effect,
+                Err(error) => {
+                    // Same reason as the `save_all_nodes_to_db` failure below.
+                    // `attach_child` and `promote_leaf` insert the new node and
+                    // push it into its parent's `children` BEFORE aggregating,
+                    // so an aggregation error leaves the tree mutated. Without
+                    // this, an identical retry of the write that just hard
+                    // failed succeeds — `find_leaf_by_text` dedups to the node
+                    // the failed insert left behind and returns before
+                    // aggregation, so the guard is never reached — and then
+                    // persists. A caller cannot act on an error that behaves
+                    // that way.
+                    self.reload_tree_from_db().await?;
+                    return Err(error);
+                }
             };
             let node_id = effect.node;
             // Persist all nodes (root + ancestors + new leaf) so the DB stays
@@ -1759,8 +1776,7 @@ mod tests {
         }
 
         // Corrupt it: the root's parent points at one of its own descendants.
-        // Two passes, because the self-referential foreign key is checked per
-        // statement and the parent must already exist.
+        // The foreign key holds because the target row already exists.
         {
             let conn = Connection::open(temp.path())?;
             let descendant: i64 = conn.query_row(
@@ -1786,9 +1802,30 @@ mod tests {
 
         let error = result.expect_err("a corrupt parent chain must surface as an error");
         assert!(
-            error.to_string().contains("cycles at node"),
+            error.to_string().contains("cycles:"),
             "the error must name the cycle so the corruption is diagnosable; \
              got {error}"
+        );
+
+        // The same write, again. `attach_child` and `promote_leaf` insert the
+        // new node and push it into its parent's `children` BEFORE aggregating,
+        // so an aggregation error leaves the tree mutated. Without restoring it
+        // the retry hits `find_leaf_by_text`, dedups to the node the failed
+        // insert left behind, returns before aggregation — and SUCCEEDS,
+        // persisting a write that had just hard-failed. An error a caller
+        // cannot retry deterministically is worse than no error.
+        let retry = memory
+            .insert_conversation(
+                "system",
+                "A memory written against a store whose parent chain is corrupt.",
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            retry.is_err(),
+            "an identical retry of a write that hard-failed must fail the same \
+             way, not succeed off the wreckage of the first attempt"
         );
         Ok(())
     }
