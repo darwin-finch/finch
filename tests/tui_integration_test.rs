@@ -63,6 +63,18 @@ fn install_embedding_sigterm_exit() -> anyhow::Result<()> {
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn install_embedding_sigint_exit() -> anyhow::Result<()> {
+    let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+    action.sa_sigaction = embedding_signal_exit_handler as *const () as usize;
+    unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
+    anyhow::ensure!(
+        unsafe { nix::libc::sigaction(nix::libc::SIGINT, &action, std::ptr::null_mut()) } == 0,
+        "install embedding SIGINT exit handler"
+    );
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn install_default_sigint() -> anyhow::Result<()> {
     let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
     action.sa_sigaction = nix::libc::SIG_DFL;
@@ -632,6 +644,51 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
     if mode == "fork-handler-during-disarm-transition" {
         fork_from_signal_handler_during_transition(true)?;
         marker(b"FINCH_FORK_HANDLER_DISARM_TRANSITION_COMPLETED")?;
+        return Ok(());
+    }
+    if mode == "fork-linux-oldact-copy-window" {
+        // Fail-before Linux model: the new kernel action is visible while
+        // glibc's oldact copy to its caller remains delayed. The previous
+        // implementation pointed that delayed output at the restore slot, so
+        // this concurrent fork restored stale/default state instead of this
+        // exact embedding action.
+        install_embedding_sigint_exit()?;
+        let signals = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+        finch::cli::tui::supervised_prepare_linux_oldact_publication_fork()?;
+        let mut renderer = new_renderer()?;
+        anyhow::ensure!(
+            finch::cli::tui::supervised_take_linux_oldact_publication_fork_result()? == 1,
+            "fork child did not restore the prepublished action during delayed oldact copy"
+        );
+        renderer.shutdown()?;
+        drop(signals);
+        marker(b"FINCH_FORK_PREPUBLISHED_OLDACT_RESTORED")?;
+        return Ok(());
+    }
+    if mode == "signal-host-mutation-during-arm" {
+        let signals = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+        finch::cli::tui::supervised_change_host_signal_during_next_arm()?;
+        let error = match new_renderer() {
+            Ok(_) => anyhow::bail!("concurrent host signal mutation was accepted"),
+            Err(error) => format!("{error:#}"),
+        };
+        anyhow::ensure!(
+            error.contains("embedding signal disposition changed concurrently"),
+            "unexpected concurrent signal mutation error: {error}"
+        );
+        let mut current = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+        anyhow::ensure!(
+            unsafe { nix::libc::sigaction(nix::libc::SIGINT, std::ptr::null(), &mut current) } == 0
+                && current.sa_sigaction == nix::libc::SIG_IGN,
+            "activation mismatch did not restore the actually displaced host action"
+        );
+        install_default_sigint()?;
+        let mut replacement = new_renderer()?;
+        replacement.shutdown()?;
+        drop(signals);
+        marker(b"FINCH_CONCURRENT_SIGNAL_MUTATION_REJECTED")?;
         return Ok(());
     }
 
@@ -1919,6 +1976,32 @@ fn test_signal_handler_fork_does_not_wait_on_interrupted_transition_owner() {
     ] {
         assert_fork_signal_mode(mode, marker);
     }
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_fork_child_uses_prepublished_action_before_linux_oldact_copy() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    assert_fork_signal_mode(
+        "fork-linux-oldact-copy-window",
+        b"FINCH_FORK_PREPUBLISHED_OLDACT_RESTORED",
+    );
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_signal_arm_rejects_and_restores_concurrent_host_mutation() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    assert_fork_signal_mode(
+        "signal-host-mutation-during-arm",
+        b"FINCH_CONCURRENT_SIGNAL_MUTATION_REJECTED",
+    );
 }
 
 #[cfg(unix)]

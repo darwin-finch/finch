@@ -1607,6 +1607,94 @@ pub fn supervised_take_post_cas_signal_handler_fork_result() -> io::Result<i32> 
     Ok(SUPERVISED_POST_CAS_FORK_RESULT.swap(0, Ordering::AcqRel))
 }
 
+/// Model Linux's kernel-visible action / delayed userspace `oldact` copy
+/// ordering while a second thread forks through the real atfork boundary.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[doc(hidden)]
+pub fn supervised_prepare_linux_oldact_publication_fork() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    SUPERVISED_LINUX_OLDACT_FORK_RESULT.store(0, Ordering::Release);
+    SUPERVISED_LINUX_OLDACT_COPY_PAUSED.store(false, Ordering::Release);
+    SUPERVISED_LINUX_OLDACT_COPY_DELAY.store(true, Ordering::Release);
+    match std::thread::Builder::new()
+        .name("finch-oldact-fork-proof".into())
+        .spawn(|| {
+            let pause_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !SUPERVISED_LINUX_OLDACT_COPY_PAUSED.load(Ordering::Acquire) {
+                if std::time::Instant::now() >= pause_deadline {
+                    SUPERVISED_LINUX_OLDACT_FORK_RESULT.store(-2, Ordering::Release);
+                    SUPERVISED_LINUX_OLDACT_COPY_DELAY.store(false, Ordering::Release);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+
+            let forked = unsafe { nix::libc::fork() };
+            if forked == 0 {
+                // Atfork child must have consumed the prepublished exact
+                // record, not the deliberately delayed oldact output.
+                unsafe {
+                    nix::libc::raise(nix::libc::SIGINT);
+                    nix::libc::_exit(79);
+                }
+            }
+            if forked < 0 {
+                SUPERVISED_LINUX_OLDACT_FORK_RESULT.store(-3, Ordering::Release);
+                SUPERVISED_LINUX_OLDACT_COPY_PAUSED.store(false, Ordering::Release);
+                return;
+            }
+
+            let child_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut status = 0;
+            loop {
+                let waited = unsafe { nix::libc::waitpid(forked, &mut status, nix::libc::WNOHANG) };
+                if waited == forked {
+                    let exact = nix::libc::WIFEXITED(status) && nix::libc::WEXITSTATUS(status) == 0;
+                    SUPERVISED_LINUX_OLDACT_FORK_RESULT
+                        .store(if exact { 1 } else { -4 }, Ordering::Release);
+                    break;
+                }
+                if waited < 0 || std::time::Instant::now() >= child_deadline {
+                    unsafe {
+                        nix::libc::kill(forked, nix::libc::SIGKILL);
+                        nix::libc::waitpid(forked, &mut status, 0);
+                    }
+                    SUPERVISED_LINUX_OLDACT_FORK_RESULT.store(-5, Ordering::Release);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            SUPERVISED_LINUX_OLDACT_COPY_PAUSED.store(false, Ordering::Release);
+        }) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            SUPERVISED_LINUX_OLDACT_COPY_DELAY.store(false, Ordering::Release);
+            Err(error)
+        }
+    }
+}
+
+/// Take the result of the supervised concurrent fork / delayed-oldact proof.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[doc(hidden)]
+pub fn supervised_take_linux_oldact_publication_fork_result() -> io::Result<i32> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok(SUPERVISED_LINUX_OLDACT_FORK_RESULT.swap(0, Ordering::AcqRel))
+}
+
+/// Change one host disposition after prepublication but before installation so
+/// the production verification path must restore it and reject activation.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[doc(hidden)]
+pub fn supervised_change_host_signal_during_next_arm() -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    SUPERVISED_HOST_SIGNAL_ARM_MUTATION.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// Report whether a fail-closed generation retains an explicit repair owner.
 #[cfg(unix)]
 #[doc(hidden)]
@@ -1672,6 +1760,8 @@ static SIGNAL_TERMINATION_LATCHED: std::sync::atomic::AtomicBool =
 #[cfg(unix)]
 static SIGNAL_INSTALLED_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(unix)]
+static SIGNAL_RESTORE_READY_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(unix)]
 static SIGNAL_TRANSITION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
 static SUPERVISED_SIGNAL_TRANSITION_STALL: std::sync::atomic::AtomicBool =
@@ -1694,6 +1784,18 @@ static SUPERVISED_POST_CAS_FORK_READY: std::sync::atomic::AtomicBool =
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 static SUPERVISED_POST_CAS_FORK_RESULT: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(0);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_LINUX_OLDACT_COPY_DELAY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_LINUX_OLDACT_COPY_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_LINUX_OLDACT_FORK_RESULT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_HOST_SIGNAL_ARM_MUTATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
 static SUPERVISED_SIGNAL_DISARM_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1741,24 +1843,29 @@ unsafe extern "C" fn terminal_atfork_parent() {
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_child() {
     use std::sync::atomic::Ordering;
-    // Each successful arm asks sigaction to write the displaced action directly
-    // into its permanent per-slot record. Thus observing Finch's trampoline is
-    // itself proof that the matching record was initialized, even when fork
-    // interrupted the arm before its diagnostic installed-mask publication.
-    // No application lock, transition, TLS, allocation, or per-fork mask is
-    // needed here, and terminal phase is never a signal-ownership proxy.
+    // Arm fully initializes and release-publishes each permanent restore slot
+    // before making Finch's trampoline observable. The later install oldact is
+    // verification only; Linux may expose the new kernel action before copying
+    // that output back to userspace. No application lock, transition, TLS,
+    // allocation, or per-fork mask is needed here, and terminal phase is never
+    // a signal-ownership proxy.
+    let ready_mask = SIGNAL_RESTORE_READY_MASK.load(Ordering::Acquire);
     let previous = unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr() };
     for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
         let mut current = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
         if unsafe { nix::libc::sigaction(signal, std::ptr::null(), &mut current) } == 0
             && current.sa_sigaction == terminal_signal_handler as *const () as usize
         {
+            if ready_mask & (1 << index) == 0 {
+                unsafe { nix::libc::_exit(126) };
+            }
             unsafe {
                 nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut());
             }
         }
     }
     SIGNAL_INSTALLED_MASK.store(0, Ordering::Release);
+    SIGNAL_RESTORE_READY_MASK.store(0, Ordering::Release);
     SIGNAL_PENDING_MASK.store(0, Ordering::Release);
     SIGNAL_PENDING_EPOCH.store(0, Ordering::Release);
     SIGNAL_TERMINATION_LATCHED.store(false, Ordering::Release);
@@ -1922,11 +2029,15 @@ extern "C" fn terminal_signal_handler(signal: nix::libc::c_int) {
             // restore this exact slot and requeue the signal for the host
             // action instead of publishing sticky work nobody can drain.
             if let Some(index) = terminal_signal_index(signal) {
-                let previous = unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr().add(index) };
-                if unsafe { nix::libc::sigaction(signal, previous, std::ptr::null_mut()) } == 0 {
-                    unsafe { nix::libc::kill(process_id, signal) };
-                    unsafe { restore_signal_errno(saved_errno) };
-                    return;
+                if SIGNAL_RESTORE_READY_MASK.load(Ordering::Acquire) & (1 << index) != 0 {
+                    let previous =
+                        unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr().add(index) };
+                    if unsafe { nix::libc::sigaction(signal, previous, std::ptr::null_mut()) } == 0
+                    {
+                        unsafe { nix::libc::kill(process_id, signal) };
+                        unsafe { restore_signal_errno(saved_errno) };
+                        return;
+                    }
                 }
             }
             unsafe { nix::libc::_exit(128 + signal) };
@@ -2372,6 +2483,63 @@ fn supervised_pause_after_signal_transition_cas(_: u8) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+unsafe fn signal_actions_equal(
+    left: *const nix::libc::sigaction,
+    right: *const nix::libc::sigaction,
+) -> bool {
+    let length = std::mem::size_of::<nix::libc::sigaction>();
+    let left = unsafe { std::slice::from_raw_parts(left.cast::<u8>(), length) };
+    let right = unsafe { std::slice::from_raw_parts(right.cast::<u8>(), length) };
+    left == right
+}
+
+#[cfg(unix)]
+unsafe fn install_terminal_signal_action(
+    signal: nix::libc::c_int,
+    action: *const nix::libc::sigaction,
+    old_action: *mut nix::libc::sigaction,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if SUPERVISED_HOST_SIGNAL_ARM_MUTATION.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        let mut ignored = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+        ignored.sa_sigaction = nix::libc::SIG_IGN;
+        unsafe { nix::libc::sigemptyset(&mut ignored.sa_mask) };
+        if unsafe { nix::libc::sigaction(signal, &ignored, std::ptr::null_mut()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if SUPERVISED_LINUX_OLDACT_COPY_DELAY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        // Deterministically model Linux rt_sigaction followed by glibc's later
+        // copy from its stack `koact` into caller oldact: publish the kernel
+        // action, let another thread fork, and only then fill old_action.
+        let mut delayed_old = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+        if unsafe { nix::libc::sigaction(signal, std::ptr::null(), &mut delayed_old) } < 0
+            || unsafe { nix::libc::sigaction(signal, action, std::ptr::null_mut()) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        SUPERVISED_LINUX_OLDACT_COPY_PAUSED.store(true, std::sync::atomic::Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while SUPERVISED_LINUX_OLDACT_COPY_PAUSED.load(std::sync::atomic::Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        if SUPERVISED_LINUX_OLDACT_COPY_PAUSED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            SUPERVISED_LINUX_OLDACT_FORK_RESULT.store(-6, std::sync::atomic::Ordering::Release);
+        }
+        unsafe { old_action.write(delayed_old) };
+        return Ok(());
+    }
+
+    if unsafe { nix::libc::sigaction(signal, action, old_action) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     let owner = BINARY_SIGNAL_OWNER.load(Ordering::Acquire);
@@ -2403,28 +2571,62 @@ fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
         let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
         action.sa_sigaction = terminal_signal_handler as *const () as usize;
         unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
-        // The kernel writes the exact displaced action into permanent storage
-        // as part of the same sigaction operation that makes our trampoline
-        // observable. A fork child therefore never needs to wait for a later
-        // Rust publication before this record is safe to consume.
-        if unsafe { nix::libc::sigaction(signal, &action, previous.add(index)) } < 0 {
+        let bit = 1 << index;
+        SIGNAL_RESTORE_READY_MASK.fetch_and(!bit, Ordering::AcqRel);
+        unsafe { previous.add(index).write(std::mem::zeroed()) };
+        if unsafe { nix::libc::sigaction(signal, std::ptr::null(), previous.add(index)) } < 0 {
             first_error = Some(io::Error::last_os_error());
+            break;
+        }
+        // This release publication precedes the syscall that can make Finch's
+        // trampoline visible. Child/PID-gap consumers require the bit before
+        // reading the slot, so Linux's later oldact userspace copy is irrelevant.
+        SIGNAL_RESTORE_READY_MASK.fetch_or(bit, Ordering::Release);
+
+        let mut displaced = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+        if let Err(error) =
+            unsafe { install_terminal_signal_action(signal, &action, &mut displaced) }
+        {
+            SIGNAL_RESTORE_READY_MASK.fetch_and(!bit, Ordering::AcqRel);
+            first_error = Some(error);
+            break;
+        }
+        if !unsafe { signal_actions_equal(previous.add(index), &displaced) } {
+            // Embedding hosts must not mutate these dispositions concurrently
+            // with the explicit Finch arm transition. There is no POSIX CAS for
+            // sigaction. Detect a violation, publish the actually displaced
+            // action fail-closed, restore it immediately, and reject activation.
+            SIGNAL_RESTORE_READY_MASK.fetch_and(!bit, Ordering::AcqRel);
+            unsafe { previous.add(index).write(displaced) };
+            SIGNAL_RESTORE_READY_MASK.fetch_or(bit, Ordering::Release);
+            installed_mask |= bit;
+            let restored =
+                unsafe { nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut()) }
+                    == 0;
+            if restored {
+                installed_mask &= !bit;
+                SIGNAL_RESTORE_READY_MASK.fetch_and(!bit, Ordering::AcqRel);
+            }
+            first_error = Some(io::Error::other(if restored {
+                "embedding signal disposition changed concurrently with terminal activation"
+            } else {
+                "embedding signal disposition changed concurrently and exact rollback failed"
+            }));
             break;
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if index == 0 {
-            // Deliberately before installed-mask publication: the fork child
-            // must derive this exact completed kernel arm from current
-            // sigaction plus the record initialized by that same syscall.
+            // Still before installed-mask publication: atfork depends only on
+            // the earlier restore-record readiness and current kernel action.
             if let Err(error) =
                 supervised_pause_after_signal_transition_cas(SUPERVISED_POST_CAS_ARM)
             {
-                installed_mask |= 1 << index;
+                installed_mask |= bit;
                 first_error = Some(error);
                 break;
             }
         }
-        installed_mask |= 1 << index;
+        installed_mask |= bit;
         // This mask is application cleanup state only. Atfork derives kernel
         // ownership from the current sigaction and does not wait on it.
         SIGNAL_INSTALLED_MASK.store(installed_mask, Ordering::Release);
@@ -2447,6 +2649,7 @@ fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
             }
         }
         SIGNAL_INSTALLED_MASK.store(remaining_mask, Ordering::Release);
+        SIGNAL_RESTORE_READY_MASK.store(remaining_mask, Ordering::Release);
         release_signal_transition();
         return Err(error);
     }
@@ -2521,6 +2724,7 @@ fn disarm_binary_terminal_signals_until(deadline: std::time::Instant) -> io::Res
     // stable trampoline selected before this restoration may still enter
     // later; its process-lifetime sticky publication remains valid.
     SIGNAL_INSTALLED_MASK.store(remaining_mask, Ordering::Release);
+    SIGNAL_RESTORE_READY_MASK.store(remaining_mask, Ordering::Release);
     release_signal_transition();
     match first_error {
         Some(error) => Err(error),

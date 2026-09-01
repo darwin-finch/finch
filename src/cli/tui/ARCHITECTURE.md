@@ -54,14 +54,19 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   parking forever. These binary paths complete within their larger absolute deadline under this
   supported-progress precondition and never treat a failed restoration as successful.
 - On supported Unix targets, `pthread_atfork` prepare/parent never acquire or wait on application
-  state. Each arm has the kernel write the displaced host action directly into a permanent per-slot
-  record in the same `sigaction` operation that publishes Finch's trampoline. The child can therefore
-  query each current disposition and restore exactly the slots Finch still owns without consulting
-  terminal phase, an application transition, TLS, allocation, a lock, or a process-global saved
-  signal mask. A PID guard in the stable trampoline restores and requeues a signal selected in the
-  fork-child gap before the child callback runs, where the process-lifetime monitor no longer exists.
-  The child then clears inherited sticky/monitor ownership. The supported child contract is immediate
-  exec/exit; starting another TUI in the un-execed child is outside scope.
+  state. Before an arm can publish Finch's trampoline, it queries the current host disposition into a
+  permanent per-slot record and release-publishes that record's ready bit. The install call's returned
+  `oldact` only verifies the prepublished record; this does not depend on Linux's later userspace
+  `oldact` copy. Embedding hosts must not concurrently mutate the same dispositions during this
+  explicit arm transition (POSIX provides no `sigaction` compare/exchange); a detected mismatch is
+  restored and activation fails closed. A fork concurrent with such an out-of-contract host mutation
+  can precede parent-side mismatch detection, so exact child restoration is not claimed for that
+  combined race. The child queries each current disposition and restores only ready slots Finch still
+  owns, without terminal phase, an application transition, TLS, allocation, a lock, or a
+  process-global saved signal mask. A PID guard in the stable trampoline applies the same ready check
+  while restoring and requeuing a signal selected before the child callback, where the process-lifetime
+  monitor no longer exists. The child then clears inherited sticky/monitor ownership. The supported
+  child contract is immediate exec/exit; starting another TUI in the un-execed child is outside scope.
 - The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
   exclusive lease, exact output generation, raw/protocol activation, bounded staged output, cleanup,
   and Drop. Every staged Write/Flush carries shared
