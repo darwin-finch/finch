@@ -5672,11 +5672,11 @@ impl BrainStore {
             if let Some(intent) = disconnect_intents.remove(&run_id) {
                 let next_seq = state.revision + 1;
                 let now = unix_millis();
-                let existing_result = state.events.iter().any(|event| {
+                let existing_result = state.events.iter().find(|event| {
                     event.run_id == Some(run_id)
                         && matches!(event.kind, BrainEventKind::Result { .. })
                 });
-                let result = BrainEvent {
+                let result = existing_result.is_none().then(|| BrainEvent {
                     schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                     brain_id: state.brain_id,
                     seq: next_seq,
@@ -5692,11 +5692,30 @@ impl BrainStore {
                         continuation_messages: Vec::new(),
                         invocation_metadata: None,
                     },
+                });
+                // A Result is the durable execution outcome. A later crash
+                // recovery intent may complete its missing terminal marker,
+                // but must never rewrite a previously published success into
+                // a Failed/Cancelled status (or vice versa).
+                let (status, detail) = match existing_result.map(|event| &event.kind) {
+                    Some(BrainEventKind::Result { error: None, .. }) => (
+                        BrainRunStatus::Completed,
+                        "recovered previously published successful result".to_string(),
+                    ),
+                    Some(BrainEventKind::Result {
+                        error: Some(error), ..
+                    }) if intent.status == BrainRunStatus::Completed => {
+                        (BrainRunStatus::Failed, error.clone())
+                    }
+                    Some(BrainEventKind::Result {
+                        error: Some(error), ..
+                    }) => (intent.status, error.clone()),
+                    _ => (intent.status, intent.detail.clone()),
                 };
                 let terminal = BrainEvent {
                     schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                     brain_id: state.brain_id,
-                    seq: next_seq + u64::from(!existing_result),
+                    seq: next_seq + u64::from(result.is_some()),
                     environment_generation: self.environment.generation,
                     sender: intent.sender.clone(),
                     created_ms: now,
@@ -5704,21 +5723,16 @@ impl BrainStore {
                     mutation: None,
                     kind: BrainEventKind::RunStatusChanged {
                         run_id,
-                        status: intent.status,
-                        detail: Some(intent.detail.clone()),
+                        status,
+                        detail: Some(detail),
                     },
                 };
-                let events = if existing_result {
-                    vec![terminal.clone()]
-                } else {
-                    vec![result.clone(), terminal.clone()]
-                };
+                let events = result.into_iter().chain([terminal]).collect::<Vec<_>>();
                 match self.append_event_batch(name, &events) {
                     Ok(()) => {
-                        if !existing_result {
-                            state.apply(result);
+                        for event in events {
+                            state.apply(event);
                         }
-                        state.apply(terminal);
                         self.clear_disconnect_intent(name, run_id)?;
                     }
                     Err(error) => {
@@ -7514,6 +7528,166 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_restart_intent_keeps_existing_success_result_coherent_and_exact_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "recover after restart".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        store
+            .push_for_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainEventKind::Result {
+                    request_seq: prompt.seq,
+                    output: "already durable".into(),
+                    error: None,
+                    continuation_messages: Vec::new(),
+                    invocation_metadata: None,
+                },
+            )
+            .unwrap();
+        store
+            .persist_disconnect_intent(
+                "shared",
+                &DisconnectTerminalizationIntent {
+                    sender: "daemon".into(),
+                    run_id: run.run_id,
+                    request_seq: prompt.seq,
+                    status: BrainRunStatus::Failed,
+                    detail: "runner generation disappeared".into(),
+                },
+            )
+            .unwrap();
+        let failed_prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "recover an error after restart".into(),
+                },
+            )
+            .unwrap();
+        let failed_run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                failed_prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        store
+            .push_for_run(
+                "shared",
+                "runner",
+                failed_run.run_id,
+                BrainEventKind::Result {
+                    request_seq: failed_prompt.seq,
+                    output: String::new(),
+                    error: Some("already failed".into()),
+                    continuation_messages: Vec::new(),
+                    invocation_metadata: None,
+                },
+            )
+            .unwrap();
+        store
+            .persist_disconnect_intent(
+                "shared",
+                &DisconnectTerminalizationIntent {
+                    sender: "daemon".into(),
+                    run_id: failed_run.run_id,
+                    request_seq: failed_prompt.seq,
+                    status: BrainRunStatus::Completed,
+                    detail: "obsolete success intent".into(),
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = BrainStore::with_root("box.local", Some(root));
+        let snapshot = reopened.snapshot("shared").unwrap();
+        assert_eq!(
+            reopened.inspect_run("shared", run.run_id).unwrap().status,
+            BrainRunStatus::Completed
+        );
+        let results = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.run_id == Some(run.run_id)
+                    && matches!(event.kind, BrainEventKind::Result { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0].kind,
+            BrainEventKind::Result { output, error: None, .. } if output == "already durable"
+        ));
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    BrainEventKind::RunStatusChanged {
+                        run_id: event_run_id,
+                        status: BrainRunStatus::Completed,
+                        ..
+                    } if event_run_id == run.run_id
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .inspect_run("shared", failed_run.run_id)
+                .unwrap()
+                .status,
+            BrainRunStatus::Failed
+        );
+        let failed_results = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.run_id == Some(failed_run.run_id)
+                    && matches!(event.kind, BrainEventKind::Result { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failed_results.len(), 1);
+        assert!(matches!(
+            &failed_results[0].kind,
+            BrainEventKind::Result {
+                output,
+                error: Some(error),
+                ..
+            } if output.is_empty() && error == "already failed"
+        ));
     }
 
     #[test]

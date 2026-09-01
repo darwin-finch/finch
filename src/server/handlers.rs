@@ -890,11 +890,14 @@ impl Drop for RunAdmissionTerminalizer {
             .inspect_run(&self.brain, run.run_id)
             .is_ok_and(|current| current.status.is_terminal())
         {
+            self.runners.abort_run(&self.brain, run.run_id);
+            self.runners
+                .retire_run_cancellation(&self.brain, run.run_id);
             return;
         }
         self.runners.fence_run_cancellation(&self.brain, run.run_id);
         let detail = "initiating Brain connection disconnected".to_string();
-        match self.store.terminalize_run_with_result_if_active(
+        let terminalized = match self.store.terminalize_run_with_result_if_active(
             &self.brain,
             "daemon",
             run.run_id,
@@ -902,21 +905,27 @@ impl Drop for RunAdmissionTerminalizer {
             crate::brain::store::BrainRunStatus::Failed,
             detail.clone(),
         ) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => true,
             Ok(None)
                 if self
                     .store
                     .inspect_run(&self.brain, run.run_id)
-                    .is_ok_and(|current| current.status.is_terminal()) => {}
-            Ok(None) | Err(_) => self.store.schedule_disconnect_terminalization_retry(
-                self.brain.clone(),
-                "daemon".into(),
-                run.run_id,
-                run.request_seq,
-                crate::brain::store::BrainRunStatus::Failed,
-                detail,
-            ),
-        }
+                    .is_ok_and(|current| current.status.is_terminal()) =>
+            {
+                true
+            }
+            Ok(None) | Err(_) => {
+                self.store.schedule_disconnect_terminalization_retry(
+                    self.brain.clone(),
+                    "daemon".into(),
+                    run.run_id,
+                    run.request_seq,
+                    crate::brain::store::BrainRunStatus::Failed,
+                    detail,
+                );
+                false
+            }
+        };
         if let Ok(snapshot) = self.store.snapshot(&self.brain) {
             if let Some(lease) = snapshot.runner_lease {
                 let _ =
@@ -925,6 +934,16 @@ impl Drop for RunAdmissionTerminalizer {
             }
         }
         self.runners.abort_run(&self.brain, run.run_id);
+        if terminalized {
+            self.runners
+                .retire_run_cancellation(&self.brain, run.run_id);
+        } else {
+            self.runners.retire_run_cancellation_when_terminal(
+                self.store.clone(),
+                self.brain.clone(),
+                run.run_id,
+            );
+        }
     }
 }
 
@@ -1249,6 +1268,7 @@ async fn dispatch_named_brain_run(
     // fencing any late frontend completion from publication.
     struct DisconnectTerminalizer {
         store: crate::brain::store::BrainStore,
+        runners: crate::server::BrainRunnerBroker,
         brain: String,
         run_id: crate::brain::store::RunId,
         request_seq: u64,
@@ -1259,8 +1279,10 @@ async fn dispatch_named_brain_run(
             if !self.armed {
                 return;
             }
+            self.runners
+                .fence_run_cancellation(&self.brain, self.run_id);
             let detail = "initiating Brain connection disconnected".to_string();
-            match self.store.terminalize_run_with_result_if_active(
+            let terminalized = match self.store.terminalize_run_with_result_if_active(
                 &self.brain,
                 "daemon",
                 self.run_id,
@@ -1268,20 +1290,26 @@ async fn dispatch_named_brain_run(
                 BrainRunStatus::Failed,
                 detail.clone(),
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => true,
                 Ok(None)
                     if self
                         .store
                         .inspect_run(&self.brain, self.run_id)
-                        .is_ok_and(|run| run.status.is_terminal()) => {}
-                Ok(None) => self.store.schedule_disconnect_terminalization_retry(
-                    self.brain.clone(),
-                    "daemon".into(),
-                    self.run_id,
-                    self.request_seq,
-                    BrainRunStatus::Failed,
-                    detail,
-                ),
+                        .is_ok_and(|run| run.status.is_terminal()) =>
+                {
+                    true
+                }
+                Ok(None) => {
+                    self.store.schedule_disconnect_terminalization_retry(
+                        self.brain.clone(),
+                        "daemon".into(),
+                        self.run_id,
+                        self.request_seq,
+                        BrainRunStatus::Failed,
+                        detail,
+                    );
+                    false
+                }
                 Err(error) => {
                     tracing::error!(brain = %self.brain, run_id = %self.run_id.0, %error,
                         "failed to publish disconnect terminalization; scheduling durable retry");
@@ -1293,12 +1321,25 @@ async fn dispatch_named_brain_run(
                         BrainRunStatus::Failed,
                         detail,
                     );
+                    false
                 }
+            };
+            self.runners.abort_run(&self.brain, self.run_id);
+            if terminalized {
+                self.runners
+                    .retire_run_cancellation(&self.brain, self.run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    self.brain.clone(),
+                    self.run_id,
+                );
             }
         }
     }
     let mut terminalizer = DisconnectTerminalizer {
         store: store.clone(),
+        runners: runners.clone(),
         brain: name.to_string(),
         run_id: run.run_id,
         request_seq: run.request_seq,

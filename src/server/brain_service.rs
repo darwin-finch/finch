@@ -566,7 +566,7 @@ impl BrainLifecycleService {
         for run_id in ordinary {
             let run = self.store.inspect_run(brain, run_id)?;
             let detail = "initiating Brain connection disconnected".to_string();
-            match self.store.terminalize_run_with_result_if_active(
+            let terminalized = match self.store.terminalize_run_with_result_if_active(
                 brain,
                 "daemon",
                 run_id,
@@ -574,18 +574,19 @@ impl BrainLifecycleService {
                 BrainRunStatus::Failed,
                 detail.clone(),
             ) {
-                Ok(Some(_)) => {}
-                Ok(None) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => {
-                    continue;
+                Ok(Some(_)) => true,
+                Ok(None) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => true,
+                Ok(None) => {
+                    self.store.schedule_disconnect_terminalization_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run_id,
+                        run.request_seq,
+                        BrainRunStatus::Failed,
+                        detail,
+                    );
+                    false
                 }
-                Ok(None) => self.store.schedule_disconnect_terminalization_retry(
-                    brain.to_string(),
-                    "daemon".into(),
-                    run_id,
-                    run.request_seq,
-                    BrainRunStatus::Failed,
-                    detail,
-                ),
                 Err(error) => {
                     tracing::error!(brain = %brain, run_id = %run_id.0, %error,
                         "disconnect terminalization deferred to durable retry owner");
@@ -597,8 +598,9 @@ impl BrainLifecycleService {
                         BrainRunStatus::Failed,
                         detail,
                     );
+                    false
                 }
-            }
+            };
             if let Some(lease_id) = runner_lease {
                 if let Err(error) = self
                     .runners
@@ -609,6 +611,15 @@ impl BrainLifecycleService {
                 }
             }
             self.runners.abort_run(brain, run_id);
+            if terminalized {
+                self.runners.retire_run_cancellation(brain, run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    brain.to_string(),
+                    run_id,
+                );
+            }
         }
         // A cancellation reservation is durable authority, not authority
         // owned by the WebSocket command future. Once that exact initiating
@@ -616,16 +627,29 @@ impl BrainLifecycleService {
         // release only waits for that run, even if the runner never replies.
         for run_id in reserved {
             self.runners.abort_run(brain, run_id);
-            match self
+            let terminalized = match self
                 .store
                 .complete_reserved_run_cancellation_on_disconnect(brain, "daemon", run_id)
             {
-                Ok(true) => {}
-                Ok(false) | Err(_) => self.store.schedule_reserved_cancellation_retry(
+                Ok(true) => true,
+                Ok(false) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => true,
+                Ok(false) | Err(_) => {
+                    self.store.schedule_reserved_cancellation_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run_id,
+                    );
+                    false
+                }
+            };
+            if terminalized {
+                self.runners.retire_run_cancellation(brain, run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
                     brain.to_string(),
-                    "daemon".into(),
                     run_id,
-                ),
+                );
             }
         }
         self.store.remove_if_unused(brain)?;
@@ -685,7 +709,7 @@ impl BrainLifecycleService {
         {
             self.runners.fence_run_cancellation(brain, run.run_id);
             let detail = "initiating Brain connection disconnected".to_string();
-            match self.store.terminalize_run_with_result_if_active(
+            let terminalized = match self.store.terminalize_run_with_result_if_active(
                 brain,
                 "daemon",
                 run.run_id,
@@ -693,22 +717,37 @@ impl BrainLifecycleService {
                 BrainRunStatus::Failed,
                 detail.clone(),
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => true,
                 Ok(None)
                     if self
                         .store
                         .inspect_run(brain, run.run_id)
-                        .is_ok_and(|current| current.status.is_terminal()) => {}
-                Ok(None) | Err(_) => self.store.schedule_disconnect_terminalization_retry(
-                    brain.to_string(),
-                    "daemon".into(),
-                    run.run_id,
-                    run.request_seq,
-                    BrainRunStatus::Failed,
-                    detail,
-                ),
-            }
+                        .is_ok_and(|current| current.status.is_terminal()) =>
+                {
+                    true
+                }
+                Ok(None) | Err(_) => {
+                    self.store.schedule_disconnect_terminalization_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run.run_id,
+                        run.request_seq,
+                        BrainRunStatus::Failed,
+                        detail,
+                    );
+                    false
+                }
+            };
             self.runners.abort_run(brain, run.run_id);
+            if terminalized {
+                self.runners.retire_run_cancellation(brain, run.run_id);
+            } else {
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    brain.to_string(),
+                    run.run_id,
+                );
+            }
             return Err(BrainSubmissionError::State(error));
         }
         let snapshot = self.snapshot(brain).map_err(BrainSubmissionError::State)?;
@@ -969,6 +1008,16 @@ impl BrainLifecycleService {
                     run.request_seq,
                     BrainRunStatus::Cancelled,
                     detail,
+                );
+                // The durable retry owns terminal publication now, but the
+                // admitted callback must still be stopped before this lane
+                // can be reused. Keep the fence until that retry is visibly
+                // terminal and every admitted dispatch has quiesced.
+                self.runners.abort_run(&brain, run.run_id);
+                self.runners.retire_run_cancellation_when_terminal(
+                    self.store.clone(),
+                    brain.clone(),
+                    run.run_id,
                 );
                 return Err(error);
             }
