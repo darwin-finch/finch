@@ -56,25 +56,58 @@ pub struct IpcClient {
 pub(crate) struct RunnerProcessIdentity {
     pub(crate) epoch: uuid::Uuid,
     pub(crate) poisoned: std::sync::atomic::AtomicBool,
+    /// Linearizes explicit process ejection with every runner-scoped
+    /// Cap'n Proto send. The guard is held only through the non-awaiting
+    /// `send()` call, never while its promise is awaited.
+    runner_rpc_admission: std::sync::Mutex<()>,
+    #[cfg(test)]
+    runner_rpc_admission_pause: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+fn new_runner_process_identity(epoch: uuid::Uuid) -> std::sync::Arc<RunnerProcessIdentity> {
+    std::sync::Arc::new(RunnerProcessIdentity {
+        epoch,
+        poisoned: std::sync::atomic::AtomicBool::new(false),
+        runner_rpc_admission: std::sync::Mutex::new(()),
+        #[cfg(test)]
+        runner_rpc_admission_pause: std::sync::Mutex::new(None),
+    })
+}
+
+impl RunnerProcessIdentity {
+    fn with_rpc_admission<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
+        let Ok(_admission) = self.runner_rpc_admission.lock() else {
+            // A panic while this process was admitting a runner RPC leaves
+            // its send ordering unknowable. Make that uncertainty monotonic
+            // and fail closed instead of panicking through the reconnect
+            // supervisor or permitting another lease mutation.
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(anyhow::Error::new(RunnerProcessQuarantined));
+        };
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow::Error::new(RunnerProcessQuarantined));
+        }
+        Ok(send())
+    }
 }
 
 fn runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
     static IDENTITY: std::sync::OnceLock<std::sync::Arc<RunnerProcessIdentity>> =
         std::sync::OnceLock::new();
-    std::sync::Arc::clone(IDENTITY.get_or_init(|| {
-        std::sync::Arc::new(RunnerProcessIdentity {
-            epoch: uuid::Uuid::new_v4(),
-            poisoned: std::sync::atomic::AtomicBool::new(false),
-        })
-    }))
+    std::sync::Arc::clone(
+        IDENTITY.get_or_init(|| new_runner_process_identity(uuid::Uuid::new_v4())),
+    )
 }
 
 #[cfg(test)]
 fn fresh_runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
-    std::sync::Arc::new(RunnerProcessIdentity {
-        epoch: uuid::Uuid::new_v4(),
-        poisoned: std::sync::atomic::AtomicBool::new(false),
-    })
+    new_runner_process_identity(uuid::Uuid::new_v4())
 }
 
 struct RpcConnectionState {
@@ -100,10 +133,7 @@ impl IpcClient {
     #[cfg(test)]
     pub(crate) fn from_test_client(client: finch_daemon::Client) -> Self {
         let state = std::sync::Arc::new(RpcConnectionState {
-            process: std::sync::Arc::new(RunnerProcessIdentity {
-                epoch: uuid::Uuid::new_v4(),
-                poisoned: std::sync::atomic::AtomicBool::new(false),
-            }),
+            process: new_runner_process_identity(uuid::Uuid::new_v4()),
             active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
         });
         Self {
@@ -129,7 +159,8 @@ impl IpcClient {
         request
             .get()
             .set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise.await?;
         self._rpc_handle
             .state
             .active_runner_registrations
@@ -153,9 +184,69 @@ impl IpcClient {
         Ok(())
     }
 
+    /// Fail locally before a runner restore performs even a health-check or
+    /// reconnect RPC. Every later runner-scoped send repeats this check under
+    /// the process admission gate to close the check/send race.
+    pub(crate) fn ensure_runner_process_available(&self) -> Result<()> {
+        self._rpc_handle.state.process.with_rpc_admission(|| ())
+    }
+
+    fn send_runner_rpc<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
+        // Cap'n Proto request construction only populates a local builder.
+        // The closure contains the irrevocable `send()` and returns its
+        // promise without polling it, so admission is never held across an
+        // await or re-entered by a response callback.
+        self._rpc_handle.state.process.with_rpc_admission(send)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_runner_rpc_admission_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            ._rpc_handle
+            .state
+            .process
+            .runner_rpc_admission_pause
+            .lock()
+            .expect("runner RPC admission pause lock poisoned") = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    async fn wait_runner_rpc_admission_pause_for_test(&self) {
+        let pause = self
+            ._rpc_handle
+            .state
+            .process
+            .runner_rpc_admission_pause
+            .lock()
+            .expect("runner RPC admission pause lock poisoned")
+            .take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
     /// Connect to the daemon's Unix socket.
     pub async fn connect() -> Result<Self> {
         Self::connect_path(sock_path()).await
+    }
+
+    pub(crate) async fn connect_for_runner() -> Result<Self> {
+        let process = runner_process_identity();
+        process.with_rpc_admission(|| ())?;
+        let path = sock_path();
+        let stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("IPC connect failed: {}", path.display()))?;
+        Self::from_stream_with_runner_process(stream, process).await
     }
 
     /// Connect to an explicitly isolated daemon socket. This is used by the
@@ -175,6 +266,21 @@ impl IpcClient {
     async fn from_stream_with_process(
         stream: tokio::net::UnixStream,
         process: std::sync::Arc<RunnerProcessIdentity>,
+    ) -> Result<Self> {
+        Self::from_stream_with_process_scope(stream, process, false).await
+    }
+
+    async fn from_stream_with_runner_process(
+        stream: tokio::net::UnixStream,
+        process: std::sync::Arc<RunnerProcessIdentity>,
+    ) -> Result<Self> {
+        Self::from_stream_with_process_scope(stream, process, true).await
+    }
+
+    async fn from_stream_with_process_scope(
+        stream: tokio::net::UnixStream,
+        process: std::sync::Arc<RunnerProcessIdentity>,
+        runner_scoped_verification: bool,
     ) -> Result<Self> {
         let (reader, writer) = stream.into_split();
         let network = twoparty::VatNetwork::new(
@@ -204,7 +310,11 @@ impl IpcClient {
             client,
             _rpc_handle: std::rc::Rc::new(RpcTask { handle, state }),
         };
-        client.verify_protocol_compatibility().await?;
+        if runner_scoped_verification {
+            client.verify_runner_protocol_compatibility().await?;
+        } else {
+            client.verify_protocol_compatibility().await?;
+        }
         Ok(client)
     }
 
@@ -212,14 +322,8 @@ impl IpcClient {
     pub(crate) async fn from_stream_with_fresh_test_process(
         stream: tokio::net::UnixStream,
     ) -> Result<Self> {
-        Self::from_stream_with_process(
-            stream,
-            std::sync::Arc::new(RunnerProcessIdentity {
-                epoch: uuid::Uuid::new_v4(),
-                poisoned: std::sync::atomic::AtomicBool::new(false),
-            }),
-        )
-        .await
+        Self::from_stream_with_process(stream, new_runner_process_identity(uuid::Uuid::new_v4()))
+            .await
     }
 
     #[cfg(test)]
@@ -341,11 +445,32 @@ impl IpcClient {
         Ok(reply.get()?.get_service()?)
     }
 
+    async fn runner_brain_service(&self) -> Result<brain_service::Client> {
+        #[cfg(test)]
+        self.wait_runner_rpc_admission_pause_for_test().await;
+        let request = self.client.brain_service_request();
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await?;
+        Ok(reply.get()?.get_service()?)
+    }
+
     pub async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::store::BrainSnapshot> {
         let service = self.brain_service().await?;
         let mut request = service.snapshot_request();
         request.get().set_brain(brain);
         let reply = request.send().promise.await?;
+        decode_snapshot(reply.get()?.get_snapshot()?)
+    }
+
+    pub(crate) async fn brain_runner_snapshot(
+        &self,
+        brain: &str,
+    ) -> Result<crate::brain::store::BrainSnapshot> {
+        let service = self.runner_brain_service().await?;
+        let mut request = service.snapshot_request();
+        request.get().set_brain(brain);
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await?;
         decode_snapshot(reply.get()?.get_snapshot()?)
     }
 
@@ -661,7 +786,7 @@ impl IpcClient {
         lease_id: Option<crate::brain::store::RunnerLeaseId>,
         ttl_ms: u64,
     ) -> Result<crate::brain::store::BrainRunnerLease> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.acquire_runner_request();
         {
             let mut params = request.get();
@@ -674,15 +799,17 @@ impl IpcClient {
             }
             params.set_ttl_ms(ttl_ms);
         }
-        let reply = request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await?;
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
     pub async fn brain_claim_runner_identity(&self, subject: &str) -> Result<()> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.claim_runner_identity_request();
         request.get().set_subject(subject);
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise.await?;
         Ok(())
     }
 
@@ -691,14 +818,15 @@ impl IpcClient {
         brain: &str,
         lease_id: crate::brain::store::RunnerLeaseId,
     ) -> Result<()> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.release_runner_request();
         {
             let mut params = request.get();
             params.set_brain(brain);
             params.set_lease_id(&lease_id.0.to_string());
         }
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise.await?;
         let _ = self
             ._rpc_handle
             .state
@@ -743,7 +871,7 @@ impl IpcClient {
         environment: &crate::brain::store::BrainEnvironment,
         ttl_ms: u64,
     ) -> Result<crate::brain::store::BrainRunnerLease> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.accept_runner_handoff_request();
         {
             let mut params = request.get();
@@ -753,7 +881,8 @@ impl IpcClient {
             encode_environment(params.reborrow().init_environment(), environment);
             params.set_ttl_ms(ttl_ms);
         }
-        let reply = request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await?;
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
@@ -786,10 +915,25 @@ impl IpcClient {
         Ok(response.get_version()?.to_str()?.to_string())
     }
 
+    pub(crate) async fn runner_ping(&self) -> Result<String> {
+        #[cfg(test)]
+        self.wait_runner_rpc_admission_pause_for_test().await;
+        let request = self.client.ping_request();
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await?;
+        let response = reply.get()?;
+        ensure_compatible_protocol(response.get_protocol_version())?;
+        Ok(response.get_version()?.to_str()?.to_string())
+    }
+
     async fn verify_protocol_compatibility(&self) -> Result<()> {
         let req = self.client.ping_request();
         let reply = req.send().promise.await?;
         ensure_compatible_protocol(reply.get()?.get_protocol_version())
+    }
+
+    async fn verify_runner_protocol_compatibility(&self) -> Result<()> {
+        self.runner_ping().await.map(|_| ())
     }
 
     /// Register this frontend as the callback for its current named-Brain
@@ -800,15 +944,7 @@ impl IpcClient {
         lease_id: crate::brain::store::RunnerLeaseId,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
-        if self
-            ._rpc_handle
-            .state
-            .process
-            .poisoned
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(anyhow::Error::new(RunnerProcessQuarantined));
-        }
+        self.ensure_runner_process_available()?;
         let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
             event_tx,
             memory_callbacks: Default::default(),
@@ -822,7 +958,10 @@ impl IpcClient {
             params.set_runner(runner);
             params.set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
         }
-        let reply = request.send().promise.await.map_err(|error| {
+        #[cfg(test)]
+        self.wait_runner_rpc_admission_pause_for_test().await;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise.await.map_err(|error| {
             let error = map_runner_registration_error(error);
             if is_runner_process_quarantined(&error) {
                 self._rpc_handle
@@ -1832,9 +1971,18 @@ impl brain_runner::Server for BrainRunnerImpl {
         if let Err(error) = required_runner_text(params.get_reason(), "ejection reason") {
             return Promise::err(error);
         }
-        // This monotonic store happens before acknowledging the daemon. A
+        // Linearize poison with every runner-scoped non-awaiting RPC send.
+        // The monotonic store happens before acknowledging the daemon, so a
         // concurrent final-client Drop cannot turn an observed ejection into
-        // an ordinary EOF, and a later reconnect shares this process state.
+        // an ordinary EOF and no later runner mutation can be admitted.
+        // Recovering a poisoned mutex is safe only because this path
+        // immediately makes the process identity terminal. No runner RPC can
+        // be admitted again through `with_rpc_admission`.
+        let _admission = self
+            .process
+            .runner_rpc_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.process
             .poisoned
             .store(true, std::sync::atomic::Ordering::Release);

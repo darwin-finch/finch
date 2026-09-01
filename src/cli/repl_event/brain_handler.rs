@@ -199,10 +199,11 @@ impl EventLoop {
         let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
+        ipc.ensure_runner_process_available()?;
         ipc.brain_claim_runner_identity(&self.runner_subject)
             .await
             .context("claim this frontend's runner identity")?;
-        let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        let snapshot = ipc.brain_runner_snapshot(&self.session_label).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
         let initial = ipc
             .brain_acquire_runner(
@@ -310,7 +311,7 @@ impl EventLoop {
                         // could reclaim the Brain after the target exits.
                         let inspected_handoff = match lease_id {
                             Some(previous) => ipc
-                                .brain_snapshot(&brain)
+                                .brain_runner_snapshot(&brain)
                                 .await
                                 .ok()
                                 .map(|brain| brain.runner_lease_was_handed_off(previous)),
@@ -523,8 +524,14 @@ impl EventLoop {
             .as_ref()
             .context("Cap'n Proto daemon connection unavailable")?
             .clone();
-        if ipc.ping().await.is_err() {
-            ipc = crate::ipc::IpcClient::connect()
+        // This local-only check must precede health checks, socket reconnect,
+        // snapshots, and every lease mutation. Each client send repeats it
+        // under the shared process admission gate so an ejection racing this
+        // check still wins before the first irrevocable RPC send.
+        ipc.ensure_runner_process_available()?;
+        if ipc.runner_ping().await.is_err() {
+            ipc.ensure_runner_process_available()?;
+            ipc = crate::ipc::IpcClient::connect_for_runner()
                 .await
                 .context("reconnect local daemon IPC for runner")?;
             self.ipc_client = Some(ipc.clone());
@@ -532,7 +539,7 @@ impl EventLoop {
         ipc.brain_claim_runner_identity(&self.runner_subject)
             .await
             .context("reclaim this frontend's runner identity")?;
-        let snapshot = ipc.brain_snapshot(&target.brain).await?;
+        let snapshot = ipc.brain_runner_snapshot(&target.brain).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
         anyhow::ensure!(
             snapshot.environment == target.environment,
@@ -1108,6 +1115,7 @@ impl EventLoop {
         let Some((brain, environment)) = previous else {
             return Ok(());
         };
+        ipc.ensure_runner_process_available()?;
         let lease = ipc
             .brain_acquire_runner(&brain, &self.runner_subject, &environment, None, 30_000)
             .await
@@ -1203,6 +1211,7 @@ impl EventLoop {
             .as_ref()
             .context("Cap'n Proto daemon connection unavailable")?
             .clone();
+        ipc.ensure_runner_process_available()?;
 
         anyhow::ensure!(
             self.runner_brain.as_deref() != Some(snapshot.name.as_str()),
@@ -1213,7 +1222,7 @@ impl EventLoop {
         let previous_runner = match (self.runner_brain.as_ref(), self.home_runner_lease_id) {
             (Some(brain), Some(_)) => Some((
                 brain.clone(),
-                ipc.brain_snapshot(brain)
+                ipc.brain_runner_snapshot(brain)
                     .await
                     .with_context(|| format!("inspect current runner Brain {brain}"))?
                     .environment,

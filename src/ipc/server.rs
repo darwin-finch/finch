@@ -5595,6 +5595,217 @@ mod tests {
         assert!(error.to_string().contains("quarantined"));
     }
 
+    #[derive(Default)]
+    struct RunnerRestoreRpcCounts {
+        ping: std::sync::atomic::AtomicUsize,
+        brain_service: std::sync::atomic::AtomicUsize,
+        claim: std::sync::atomic::AtomicUsize,
+        snapshot: std::sync::atomic::AtomicUsize,
+        acquire_or_renew: std::sync::atomic::AtomicUsize,
+        register: std::sync::atomic::AtomicUsize,
+        release: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RunnerRestoreRpcCounts {
+        fn reset(&self) {
+            for counter in [
+                &self.ping,
+                &self.brain_service,
+                &self.claim,
+                &self.snapshot,
+                &self.acquire_or_renew,
+                &self.register,
+                &self.release,
+            ] {
+                counter.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn assert_zero(&self) {
+            assert_eq!(self.ping.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                self.brain_service.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(self.claim.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(self.snapshot.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                self.acquire_or_renew
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(self.register.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(self.release.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    struct CountingRunnerRestoreBrainService {
+        counts: std::sync::Arc<RunnerRestoreRpcCounts>,
+        store: crate::brain::store::BrainStore,
+    }
+
+    impl super::finch_ipc_capnp::brain_service::Server for CountingRunnerRestoreBrainService {
+        fn claim_runner_identity(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_service::ClaimRunnerIdentityParams,
+            _results: super::finch_ipc_capnp::brain_service::ClaimRunnerIdentityResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .claim
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            capnp::capability::Promise::ok(())
+        }
+
+        fn snapshot(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_service::SnapshotParams,
+            mut results: super::finch_ipc_capnp::brain_service::SnapshotResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .snapshot
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let snapshot = self.store.snapshot("shared").unwrap();
+            match crate::ipc::brain_codec::encode_snapshot(results.get().init_snapshot(), &snapshot)
+            {
+                Ok(()) => capnp::capability::Promise::ok(()),
+                Err(error) => {
+                    capnp::capability::Promise::err(capnp::Error::failed(error.to_string()))
+                }
+            }
+        }
+
+        fn acquire_runner(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_service::AcquireRunnerParams,
+            mut results: super::finch_ipc_capnp::brain_service::AcquireRunnerResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .acquire_or_renew
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let lease = self
+                .store
+                .snapshot("shared")
+                .unwrap()
+                .runner_lease
+                .expect("restore fixture lost its durable runner lease");
+            crate::ipc::brain_codec::encode_runner_lease(results.get().init_lease(), &lease);
+            capnp::capability::Promise::ok(())
+        }
+
+        fn release_runner(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_service::ReleaseRunnerParams,
+            _results: super::finch_ipc_capnp::brain_service::ReleaseRunnerResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .release
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let lease = self
+                .store
+                .snapshot("shared")
+                .unwrap()
+                .runner_lease
+                .expect("restore fixture lost its durable runner lease before cleanup");
+            self.store
+                .release_runner_lease("shared", lease.lease_id)
+                .unwrap();
+            capnp::capability::Promise::ok(())
+        }
+    }
+
+    struct CountingRunnerRestoreDaemon {
+        counts: std::sync::Arc<RunnerRestoreRpcCounts>,
+        store: crate::brain::store::BrainStore,
+    }
+
+    impl super::finch_ipc_capnp::finch_daemon::Server for CountingRunnerRestoreDaemon {
+        fn ping(
+            &mut self,
+            _params: super::finch_ipc_capnp::finch_daemon::PingParams,
+            mut results: super::finch_ipc_capnp::finch_daemon::PingResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .ping
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut response = results.get();
+            response.set_version("runner-restore-counter");
+            response.set_protocol_version(crate::ipc::IPC_PROTOCOL_VERSION);
+            capnp::capability::Promise::ok(())
+        }
+
+        fn brain_service(
+            &mut self,
+            _params: super::finch_ipc_capnp::finch_daemon::BrainServiceParams,
+            mut results: super::finch_ipc_capnp::finch_daemon::BrainServiceResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .brain_service
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let service: super::finch_ipc_capnp::brain_service::Client =
+                capnp_rpc::new_client(CountingRunnerRestoreBrainService {
+                    counts: std::sync::Arc::clone(&self.counts),
+                    store: self.store.clone(),
+                });
+            results.get().set_service(service);
+            capnp::capability::Promise::ok(())
+        }
+
+        fn register_brain_runner(
+            &mut self,
+            _params: super::finch_ipc_capnp::finch_daemon::RegisterBrainRunnerParams,
+            _results: super::finch_ipc_capnp::finch_daemon::RegisterBrainRunnerResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .register
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            capnp::capability::Promise::err(capnp::Error::failed(
+                "restore counter deliberately rejects callback registration".into(),
+            ))
+        }
+    }
+
+    fn spawn_counting_runner_restore_daemon(
+        stream: tokio::net::UnixStream,
+        counts: std::sync::Arc<RunnerRestoreRpcCounts>,
+        store: crate::brain::store::BrainStore,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+        let (reader, writer) = stream.into_split();
+        let network = capnp_rpc::twoparty::VatNetwork::new(
+            reader.compat(),
+            writer.compat_write(),
+            capnp_rpc::rpc_twoparty_capnp::Side::Server,
+            Default::default(),
+        );
+        let daemon: super::finch_ipc_capnp::finch_daemon::Client =
+            capnp_rpc::new_client(CountingRunnerRestoreDaemon { counts, store });
+        tokio::task::spawn_local(async move {
+            let _ = capnp_rpc::RpcSystem::new(Box::new(network), Some(daemon.client)).await;
+        })
+    }
+
+    fn runner_restore_event_loop(temp: &std::path::Path) -> crate::cli::repl_event::EventLoop {
+        let generator: std::sync::Arc<dyn crate::generators::Generator> =
+            std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                input: serde_json::Value::Null,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+        let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::tools::executor::ToolExecutor::new(
+                crate::tools::registry::ToolRegistry::new(),
+                crate::tools::permissions::PermissionManager::new(),
+                temp.join("tool-patterns.json"),
+            )
+            .unwrap(),
+        ));
+        crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+            generator,
+            Vec::new(),
+            executor,
+            std::sync::Arc::new(crate::runtime::ProgramRuntime::new()),
+        )
+    }
+
     #[test]
     fn test_lost_eject_and_failed_promotion_reject_same_live_child_after_server_restart() {
         const CHILD_SOCKET: &str = "FINCH_TEST_RUNNER_LEDGER_CHILD_SOCKET";
@@ -5785,9 +5996,71 @@ mod tests {
         }));
     }
 
+    async fn counting_runner_restore_connections(
+        counts: std::sync::Arc<RunnerRestoreRpcCounts>,
+        store: crate::brain::store::BrainStore,
+    ) -> (
+        crate::ipc::IpcClient,
+        crate::ipc::IpcClient,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (first_client_stream, first_server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let first_server = spawn_counting_runner_restore_daemon(
+            first_server_stream,
+            std::sync::Arc::clone(&counts),
+            store.clone(),
+        );
+        let first = crate::ipc::IpcClient::from_stream_with_fresh_test_process(first_client_stream)
+            .await
+            .unwrap();
+        let (replacement_client_stream, replacement_server_stream) =
+            tokio::net::UnixStream::pair().unwrap();
+        let replacement_server = spawn_counting_runner_restore_daemon(
+            replacement_server_stream,
+            std::sync::Arc::clone(&counts),
+            store,
+        );
+        let replacement = first
+            .reconnect_test_process(replacement_client_stream)
+            .await
+            .unwrap();
+        counts.reset();
+        (first, replacement, first_server, replacement_server)
+    }
+
+    async fn prove_runner_transport_eof(
+        first: &crate::ipc::IpcClient,
+        first_server: tokio::task::JoinHandle<()>,
+    ) {
+        first_server.abort();
+        let _ = first_server.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while first.ping().await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("frontend did not observe the first runner transport EOF");
+    }
+
+    fn runner_reconnect_event(
+        environment: crate::brain::store::BrainEnvironment,
+        lease_id: crate::brain::store::RunnerLeaseId,
+    ) -> crate::cli::repl_event::ReplEvent {
+        crate::cli::repl_event::ReplEvent::ReconnectHomeRunner {
+            epoch: 0,
+            attempt: 0,
+            target: crate::cli::repl_event::events::RunnerReconnectTarget {
+                brain: "shared".into(),
+                environment,
+                lease_id: Some(lease_id),
+            },
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn test_explicit_local_ejection_makes_event_loop_reconnect_terminal_without_lease_churn()
-    {
+    async fn test_explicit_eject_then_eof_reconnect_home_runner_sends_no_rpc_or_lease_cleanup() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let temp = tempfile::tempdir().unwrap();
@@ -5795,90 +6068,105 @@ mod tests {
                     "box.local",
                     Some(temp.path().join("brains")),
                 );
+                let mut event_loop = runner_restore_event_loop(temp.path());
+                let runner_subject = event_loop.runner_subject_for_test().to_string();
+                let lease = store
+                    .acquire_runner_lease("shared", &runner_subject, 1, None, 300_000)
+                    .unwrap();
+                let original_lease = store.snapshot("shared").unwrap().runner_lease;
+                let environment = store.snapshot("shared").unwrap().environment;
+                let counts = std::sync::Arc::new(RunnerRestoreRpcCounts::default());
+                let (first, replacement, first_server, replacement_server) =
+                    counting_runner_restore_connections(
+                        std::sync::Arc::clone(&counts),
+                        store.clone(),
+                    )
+                    .await;
+
+                first
+                    .explicitly_eject_runner_process_for_test()
+                    .await
+                    .unwrap();
+                prove_runner_transport_eof(&first, first_server).await;
+                counts.reset();
+                event_loop.set_ipc_client_for_test(replacement);
+                event_loop
+                    .handle_named_brain_event_for_test(runner_reconnect_event(
+                        environment,
+                        lease.lease_id,
+                    ))
+                    .await
+                    .unwrap();
+
+                counts.assert_zero();
+                assert_eq!(
+                    store.snapshot("shared").unwrap().runner_lease,
+                    original_lease
+                );
+                assert!(event_loop.next_queued_event_for_test().await.is_none());
+                replacement_server.abort();
+                let _ = replacement_server.await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_ejection_racing_first_restore_rpc_is_rejected_by_process_admission_gate() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let mut event_loop = runner_restore_event_loop(temp.path());
+                let runner_subject = event_loop.runner_subject_for_test().to_string();
                 let lease = store
                     .acquire_runner_lease(
                         "shared",
-                        "runner@box.local/terminal-quarantine",
+                        &runner_subject,
                         1,
                         None,
                         300_000,
                     )
                     .unwrap();
+                let original_lease = store.snapshot("shared").unwrap().runner_lease;
                 let environment = store.snapshot("shared").unwrap().environment;
-                let server = std::sync::Arc::new(
-                    crate::server::AgentServer::for_brain_protocol_test(
-                        store,
-                        crate::brain::credential::BrainCredentialAuthority::ephemeral([81; 32]),
-                        "test-password".into(),
-                        temp.path(),
+                let counts = std::sync::Arc::new(RunnerRestoreRpcCounts::default());
+                let (first, replacement, first_server, replacement_server) =
+                    counting_runner_restore_connections(
+                        std::sync::Arc::clone(&counts),
+                        store.clone(),
                     )
-                    .unwrap(),
-                );
-                let reconnect = uuid::Uuid::new_v4();
-                server
-                    .brain_runners()
-                    .claim_connection_lease(reconnect, "shared", lease.lease_id)
-                    .unwrap();
-                let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
-                    FinchDaemonImpl::new(std::sync::Arc::clone(&server), reconnect),
-                );
-                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
-                // Exercise the actual reverse-capability control method. The
-                // reconnect below models the restore attempt after transport
-                // EOF; it must observe the typed process-local poison before
-                // sending another registration RPC.
-                ipc.explicitly_eject_runner_process_for_test()
-                    .await
-                    .unwrap();
-                assert!(ipc.test_runner_process_poisoned());
-                let generator: std::sync::Arc<dyn crate::generators::Generator> =
-                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
-                        input: serde_json::Value::Null,
-                        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                    });
-                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::tools::executor::ToolExecutor::new(
-                        crate::tools::registry::ToolRegistry::new(),
-                        crate::tools::permissions::PermissionManager::new(),
-                        temp.path().join("tool-patterns.json"),
-                    )
-                    .unwrap(),
-                ));
-                let mut event_loop = crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
-                    generator,
-                    Vec::new(),
-                    executor,
-                    std::sync::Arc::new(crate::runtime::ProgramRuntime::new()),
-                );
-                event_loop.set_ipc_client_for_test(ipc.clone());
-                event_loop
-                    .handle_named_brain_event_for_test(
-                        crate::cli::repl_event::ReplEvent::RunnerLeaseStatus {
-                            brain: "shared".into(),
-                            environment,
-                            epoch: 0,
-                            lease_id: Some(lease.lease_id),
-                            detail: "renewed".into(),
-                        },
-                    )
-                    .await
-                    .unwrap();
+                    .await;
+                prove_runner_transport_eof(&first, first_server).await;
+                counts.reset();
+
+                let (admission_reached, admission_release) =
+                    replacement.pause_next_runner_rpc_admission_for_test();
+                event_loop.set_ipc_client_for_test(replacement);
+                {
+                    let restore = event_loop.handle_named_brain_event_for_test(
+                        runner_reconnect_event(environment, lease.lease_id),
+                    );
+                    tokio::pin!(restore);
+                    tokio::select! {
+                        _ = &mut restore => panic!("restore sent its first runner RPC before the admission pause"),
+                        reached = admission_reached => reached.expect("restore dropped the admission race hook"),
+                    }
+                    first
+                        .explicitly_eject_runner_process_for_test()
+                        .await
+                        .unwrap();
+                    admission_release.send(()).unwrap();
+                    restore.await.unwrap();
+                }
+
+                counts.assert_zero();
+                assert_eq!(store.snapshot("shared").unwrap().runner_lease, original_lease);
                 assert!(event_loop.next_queued_event_for_test().await.is_none());
-                assert_eq!(ipc.test_active_runner_registrations(), 0);
-                assert!(!server
-                    .brain_runners()
-                    .has_registration("shared", lease.lease_id));
-                assert_eq!(
-                    server
-                        .brain_store()
-                        .snapshot("shared")
-                        .unwrap()
-                        .runner_lease
-                        .unwrap()
-                        .lease_id,
-                    lease.lease_id,
-                    "terminal reconnect detection must not churn the durable lease"
-                );
+                replacement_server.abort();
+                let _ = replacement_server.await;
             })
             .await;
     }
