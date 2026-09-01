@@ -383,17 +383,63 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
         {
             Ok(run) => {
                 #[cfg(test)]
-                if let Some((committed, release)) = self
+                if let Some((operation_id, committed, abandoned)) = self
                     .runners
-                    .take_runner_control_finish_response_pause_for_test()
+                    .take_runner_control_finish_response_pause_for_test(self.connection_id, run_id)
                 {
-                    return Promise::from_future(async move {
+                    let (activate, activated) = tokio::sync::oneshot::channel();
+                    let (response, response_wait) = tokio::sync::oneshot::channel::<()>();
+                    let owner = tokio::task::spawn_local(async move {
                         let _dispatch = _dispatch;
+                        let _response = response;
+                        let _abandoned = PendingFinishResponseDropWitness(Some(abandoned));
+                        if activated.await.is_err() {
+                            return;
+                        }
                         let _ = committed.send(());
-                        let _ = release.await;
-                        Err(capnp::Error::disconnected(
-                            "test dropped committed subagent Finish response".into(),
-                        ))
+                        std::future::pending::<()>().await;
+                    });
+                    if let Err((error, owner)) =
+                        self.runners.install_runner_control_finish_owner_for_test(
+                            self.connection_id,
+                            run_id,
+                            operation_id,
+                            owner,
+                        )
+                    {
+                        return Promise::from_future(async move {
+                            let _ = owner.abort_and_wait().await;
+                            Err(capnp::Error::failed(error.to_string()))
+                        });
+                    }
+                    if activate.send(()).is_err() {
+                        let owner = self
+                            .runners
+                            .take_runner_control_finish_owner_for_test(self.connection_id);
+                        return Promise::from_future(async move {
+                            match owner {
+                                Ok(Some((_, _, owner))) => {
+                                    let _ = owner.abort_and_wait().await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    return Err(capnp::Error::failed(format!(
+                                        "runner-control Finish owner lookup failed after activation failure: {error}"
+                                    )));
+                                }
+                            }
+                            Err(capnp::Error::failed(
+                                "runner-control Finish owner failed before activation".into(),
+                            ))
+                        });
+                    }
+                    // Only the independently owned test task retains the
+                    // dispatch guard, response sender, and Drop witness. The
+                    // Cap'n Proto method waits without holding authority and
+                    // can resolve only after that owner is retired.
+                    return Promise::from_future(async move {
+                        let _ = response_wait.await;
+                        Ok(())
                     });
                 }
                 encode_run(results.get().init_run(), &run);
@@ -8441,7 +8487,7 @@ mod tests {
                     server,
                     client,
                     bootstrap,
-                    connection_id: _,
+                    connection_id,
                     shutdown,
                     handler,
                     lease_id,
@@ -8449,9 +8495,12 @@ mod tests {
                     child_run_id,
                 } = fixture;
                 let child_run_id = child_run_id.unwrap();
-                let (committed, response_release) = server
+                let (_operation_id, committed, response_abandoned) = server
                     .brain_runners()
-                    .pause_next_runner_control_finish_response_for_test();
+                    .pause_next_runner_control_finish_response_for_test(
+                        connection_id,
+                        child_run_id,
+                    );
                 let control = bootstrap.raw_subagent_control.clone();
                 let mut finish = control.finish_subagent_request();
                 finish.get().set_run_id(&child_run_id.0.to_string());
@@ -8473,21 +8522,43 @@ mod tests {
                     completed.status,
                     crate::brain::store::BrainRunStatus::Completed
                 );
+                assert!(
+                    !first_finish.is_finished(),
+                    "Finish response settled before transport destruction"
+                );
 
-                // Drop the real Cap'n Proto response only after observing the
-                // durable commit. The caller therefore cannot distinguish
-                // this success from a request that never committed.
-                response_release.send(()).unwrap();
+                // Destroy the real server-side RpcSystem while Finish is
+                // still pending after its durable commit. Only after the
+                // handler publishes post-drop transport closure does it abort
+                // and await the independent owner, so retirement cannot
+                // encode a response frame.
+                let dispatch_admission = server
+                    .brain_runners()
+                    .connection_dispatch_admission(connection_id)
+                    .unwrap();
+                shutdown.cancel();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    dispatch_admission.wait_transport_closed(),
+                )
+                .await
+                .expect("connection handler did not publish transport closure");
+                tokio::time::timeout(std::time::Duration::from_secs(1), response_abandoned)
+                    .await
+                    .expect("pending Finish method did not retire after transport destruction")
+                    .expect("pending Finish abandonment witness was dropped");
                 let first_result =
                     tokio::time::timeout(std::time::Duration::from_secs(1), first_finish)
                         .await
                         .expect("lost Finish response did not settle")
                         .unwrap();
-                assert!(
-                    first_result.is_err(),
-                    "the deliberately lost response arrived"
+                let error = first_result.expect_err("the deliberately lost response arrived");
+                assert_eq!(
+                    error.kind,
+                    capnp::ErrorKind::Disconnected,
+                    "the caller observed an application response instead of transport EOF"
                 );
-                shutdown.cancel();
+                drop(control);
                 drop(bootstrap);
                 drop(client);
                 tokio::time::timeout(std::time::Duration::from_secs(1), handler)
@@ -9422,6 +9493,28 @@ async fn handle_connection_with_shutdown_for_peer(
     // connection. Publish that proof before waiting for active bridge guards:
     // a hostile callback bridge may itself be awaiting this exact boundary.
     transport_closed.mark();
+    #[cfg(test)]
+    if let Some((run_id, operation_id, owner)) = server
+        .brain_runners()
+        .take_runner_control_finish_owner_for_test(connection_id)
+        .context("failed to take runner-control Finish owner after transport closure")?
+    {
+        match owner.abort_and_wait().await {
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                anyhow::bail!(
+                    "runner-control Finish owner {operation_id} for run {} panicked after transport closure: {error}",
+                    run_id.0
+                );
+            }
+            Ok(()) => {
+                anyhow::bail!(
+                    "runner-control Finish owner {operation_id} for run {} completed instead of being cancelled",
+                    run_id.0
+                );
+            }
+        }
+    }
     let teardown = server
         .brain_runners()
         .begin_connection_teardown(connection_id);
@@ -9521,6 +9614,18 @@ async fn retry_connection_teardown(
 }
 
 struct TransportClosedProof(Arc<crate::server::ConnectionDispatchAdmission>);
+
+#[cfg(test)]
+struct PendingFinishResponseDropWitness(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(test)]
+impl Drop for PendingFinishResponseDropWitness {
+    fn drop(&mut self) {
+        if let Some(abandoned) = self.0.take() {
+            let _ = abandoned.send(());
+        }
+    }
+}
 
 impl TransportClosedProof {
     fn mark(&self) {

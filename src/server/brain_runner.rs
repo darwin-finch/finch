@@ -1068,14 +1068,7 @@ pub struct BrainRunnerBroker {
         >,
     >,
     #[cfg(test)]
-    runner_control_finish_response_pause: Arc<
-        Mutex<
-            Option<(
-                tokio::sync::oneshot::Sender<()>,
-                tokio::sync::oneshot::Receiver<()>,
-            )>,
-        >,
-    >,
+    runner_control_finish_response_pause: Arc<Mutex<Option<RunnerControlFinishResponseTestHook>>>,
     #[cfg(test)]
     runner_lifecycle_test_counts: Arc<RunnerLifecycleTestCounts>,
 }
@@ -1088,6 +1081,44 @@ struct RunnerLifecycleTestCounts {
     acquire_or_renew: AtomicUsize,
     release: AtomicUsize,
     register: AtomicUsize,
+}
+
+#[cfg(test)]
+struct RunnerControlFinishResponseTestHook {
+    connection_id: uuid::Uuid,
+    run_id: RunId,
+    operation_id: uuid::Uuid,
+    committed: Option<tokio::sync::oneshot::Sender<()>>,
+    abandoned: Option<tokio::sync::oneshot::Sender<()>>,
+    owner: Option<RunnerControlFinishOwnerHandle>,
+}
+
+#[cfg(test)]
+pub(crate) struct RunnerControlFinishOwnerHandle(Option<tokio::task::JoinHandle<()>>);
+
+#[cfg(test)]
+impl RunnerControlFinishOwnerHandle {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    pub(crate) async fn abort_and_wait(mut self) -> Result<(), tokio::task::JoinError> {
+        let handle = self
+            .0
+            .take()
+            .expect("runner-control Finish owner handle missing");
+        handle.abort();
+        handle.await
+    }
+}
+
+#[cfg(test)]
+impl Drop for RunnerControlFinishOwnerHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Default for BrainRunnerBroker {
@@ -2452,31 +2483,115 @@ impl BrainRunnerBroker {
     #[cfg(test)]
     pub(crate) fn pause_next_runner_control_finish_response_for_test(
         &self,
+        connection_id: uuid::Uuid,
+        run_id: RunId,
     ) -> (
+        uuid::Uuid,
         tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
     ) {
+        let operation_id = uuid::Uuid::new_v4();
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *self
+        let (abandoned_tx, abandoned_rx) = tokio::sync::oneshot::channel();
+        let mut slot = self
             .runner_control_finish_response_pause
             .lock()
-            .expect("runner-control Finish response test hook poisoned") =
-            Some((reached_tx, release_rx));
-        (reached_rx, release_tx)
+            .expect("runner-control Finish response test hook poisoned");
+        assert!(
+            slot.is_none(),
+            "runner-control Finish test hook already armed"
+        );
+        *slot = Some(RunnerControlFinishResponseTestHook {
+            connection_id,
+            run_id,
+            operation_id,
+            committed: Some(reached_tx),
+            abandoned: Some(abandoned_tx),
+            owner: None,
+        });
+        (operation_id, reached_rx, abandoned_rx)
     }
 
     #[cfg(test)]
     pub(crate) fn take_runner_control_finish_response_pause_for_test(
         &self,
+        connection_id: uuid::Uuid,
+        run_id: RunId,
     ) -> Option<(
+        uuid::Uuid,
         tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
     )> {
-        self.runner_control_finish_response_pause
+        let mut slot = self
+            .runner_control_finish_response_pause
             .lock()
-            .expect("runner-control Finish response test hook poisoned")
+            .expect("runner-control Finish response test hook poisoned");
+        let hook = slot.as_mut()?;
+        if hook.connection_id != connection_id || hook.run_id != run_id {
+            return None;
+        }
+        let committed = hook.committed.take()?;
+        let abandoned = hook
+            .abandoned
             .take()
+            .expect("runner-control Finish abandonment hook missing");
+        Some((hook.operation_id, committed, abandoned))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_runner_control_finish_owner_for_test(
+        &self,
+        connection_id: uuid::Uuid,
+        run_id: RunId,
+        operation_id: uuid::Uuid,
+        owner: tokio::task::JoinHandle<()>,
+    ) -> std::result::Result<(), (anyhow::Error, RunnerControlFinishOwnerHandle)> {
+        let owner = RunnerControlFinishOwnerHandle::new(owner);
+        let mut slot = self
+            .runner_control_finish_response_pause
+            .lock()
+            .expect("runner-control Finish response test hook poisoned");
+        let Some(hook) = slot.as_mut() else {
+            return Err((
+                anyhow::anyhow!("runner-control Finish hook disappeared"),
+                owner,
+            ));
+        };
+        if hook.connection_id != connection_id
+            || hook.run_id != run_id
+            || hook.operation_id != operation_id
+            || hook.owner.is_some()
+        {
+            return Err((
+                anyhow::anyhow!("runner-control Finish hook identity changed"),
+                owner,
+            ));
+        }
+        hook.owner = Some(owner);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_runner_control_finish_owner_for_test(
+        &self,
+        connection_id: uuid::Uuid,
+    ) -> Result<Option<(RunId, uuid::Uuid, RunnerControlFinishOwnerHandle)>> {
+        let mut slot = self
+            .runner_control_finish_response_pause
+            .lock()
+            .expect("runner-control Finish response test hook poisoned");
+        if !slot
+            .as_ref()
+            .is_some_and(|hook| hook.connection_id == connection_id)
+        {
+            return Ok(None);
+        }
+        let mut hook = slot.take().expect("checked runner-control Finish hook");
+        let owner = hook
+            .owner
+            .take()
+            .context("runner-control Finish hook has no installed owner")?;
+        Ok(Some((hook.run_id, hook.operation_id, owner)))
     }
 
     #[cfg(test)]
