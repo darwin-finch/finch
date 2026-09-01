@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1163,6 +1163,7 @@ fn cleanup_terminal(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
     let raw_result = crossterm::terminal::disable_raw_mode();
+    crate::cli::tui::restore_terminal_attributes();
     let screen_result = crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen,
@@ -1177,6 +1178,8 @@ fn cleanup_terminal(
 
 /// Show first-run setup wizard and return configuration
 pub fn show_setup_wizard() -> Result<SetupResult> {
+    let _terminal_gate = crate::cli::tui::lock_terminal_handoff()
+        .context("terminal shutdown requested before setup wizard activation")?;
     // `None` is reserved for a genuinely absent file. Existing configuration
     // failures must stop setup before it can render or save an empty fallback.
     let existing_config = crate::config::load_persisted_config().context(
@@ -1198,6 +1201,17 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableMouseCapture
     )?;
+
+    if std::env::var_os("FINCH_TEST_SETUP_SIGNAL_PAUSE_AFTER_ACTIVATION").is_some()
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        stdout.write_all(b"FINCH_SETUP_SIGNAL_READY")?;
+        stdout.flush()?;
+        while crate::cli::tui::terminal_shutdown_requested().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        crate::cli::tui::exit_for_pending_terminal_shutdown();
+    }
 
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;

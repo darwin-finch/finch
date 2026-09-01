@@ -124,7 +124,10 @@ fn artifact_suffix(language: &str) -> &'static str {
     }
 }
 
-pub(crate) fn suspend_terminal_for_editor() {
+pub(crate) fn suspend_terminal_for_editor() -> bool {
+    let Ok(_terminal_gate) = crate::cli::tui::lock_terminal_handoff() else {
+        return false;
+    };
     std::io::stdout().flush().ok();
     // Raw mode alone is not the whole TUI protocol. Leaving bracketed paste or
     // kitty keyboard enhancement enabled makes vi receive Finch's input dialect.
@@ -136,25 +139,38 @@ pub(crate) fn suspend_terminal_for_editor() {
         ResetColor,
     )
     .ok();
+    crate::cli::tui::mark_terminal_protocol_suspended();
     terminal::disable_raw_mode().ok();
+    crate::cli::tui::restore_terminal_attributes();
     // Finch renders on the terminal's primary screen so conversation history
     // remains useful shell scrollback. Give full-screen editors a disposable
     // screen even when the selected editor does not enter one itself.
     enter_editor_screen(&mut std::io::stdout()).ok();
     std::io::stdout().flush().ok();
+    true
 }
 
 pub(crate) fn resume_terminal_after_editor() {
+    let Ok(_terminal_gate) = crate::cli::tui::lock_terminal_handoff() else {
+        crate::set_editor_active(false);
+        return;
+    };
     leave_editor_screen(&mut std::io::stdout()).ok();
     terminal::enable_raw_mode().ok();
-    execute!(
+    crate::cli::tui::mark_terminal_protocol_active();
+    if execute!(
         std::io::stdout(),
         event::EnableBracketedPaste,
         event::PushKeyboardEnhancementFlags(
             event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
         ),
     )
-    .ok();
+    .is_err()
+    {
+        crate::cli::tui::emergency_restore_terminal();
+        crate::set_editor_active(false);
+        return;
+    }
     crate::request_tui_rebuild();
     crate::set_editor_active(false);
 }
@@ -184,7 +200,7 @@ fn leave_editor_screen(writer: &mut impl std::io::Write) -> std::io::Result<()> 
 
 trait EditorTerminalControl: Send + Sync + 'static {
     fn set_editor_active(&self, active: bool);
-    fn suspend(&self);
+    fn suspend(&self) -> bool;
     fn restore(&self, terminal_was_suspended: bool);
 }
 
@@ -196,8 +212,8 @@ impl EditorTerminalControl for ProductionTerminalControl {
         crate::set_editor_active(active);
     }
 
-    fn suspend(&self) {
-        suspend_terminal_for_editor();
+    fn suspend(&self) -> bool {
+        suspend_terminal_for_editor()
     }
 
     fn restore(&self, terminal_was_suspended: bool) {
@@ -226,11 +242,11 @@ impl<C: EditorTerminalControl> TerminalRestorer<C> {
         }
     }
 
-    fn suspend(&mut self) {
+    fn suspend(&mut self) -> bool {
         // Arm the full restore before the first terminal mutation. A panic in
         // the terminal writer must still release the editor gate.
-        self.terminal_was_suspended = true;
-        self.control.suspend();
+        self.terminal_was_suspended = self.control.suspend();
+        self.terminal_was_suspended
     }
 }
 
@@ -259,7 +275,9 @@ where
     // this future during the grace period releases the gate and redraws once.
     let mut restore = TerminalRestorer::new(control);
     tokio::time::sleep(grace_period).await;
-    restore.suspend();
+    if !restore.suspend() {
+        anyhow::bail!("terminal shutdown requested before editor activation");
+    }
 
     spawn_blocking(move || {
         let _restore = restore;
@@ -274,8 +292,8 @@ impl<T: EditorTerminalControl> EditorTerminalControl for std::sync::Arc<T> {
         (**self).set_editor_active(active);
     }
 
-    fn suspend(&self) {
-        (**self).suspend();
+    fn suspend(&self) -> bool {
+        (**self).suspend()
     }
 
     fn restore(&self, terminal_was_suspended: bool) {
@@ -566,9 +584,10 @@ mod tests {
             crate::set_editor_active(active);
         }
 
-        fn suspend(&self) {
+        fn suspend(&self) -> bool {
             self.counts.lock().unwrap().suspends += 1;
             enter_editor_screen(&mut *self.output.lock().unwrap()).unwrap();
+            true
         }
 
         fn restore(&self, terminal_was_suspended: bool) {

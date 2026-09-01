@@ -2096,7 +2096,6 @@ impl Repl {
         // Do not fall back to the traditional reader after it has restored the
         // terminal during that early-startup window.
         if crate::cli::tui::terminal_shutdown_requested().is_some() {
-            crate::cli::tui::wait_for_terminal_shutdown().await;
             return Ok(());
         }
 

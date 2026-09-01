@@ -79,6 +79,95 @@ async fn supervised_busy_terminal_branch(input: &str) -> bool {
     true
 }
 
+async fn supervised_dynamic_terminal_branch(
+    input: &str,
+    tui_renderer: &Arc<Mutex<TuiRenderer>>,
+    output_manager: &Arc<OutputManager>,
+) -> Result<bool> {
+    if input != "__finch_test_dynamic_terminal_frames__"
+        || std::env::var_os("FINCH_TEST_TUI_DYNAMIC_FRAMES").is_none()
+        || !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        return Ok(false);
+    }
+
+    output_manager.write_info("FINCH_CANONICAL_BEFORE".to_string());
+    supervised_flush_dynamic_frame(tui_renderer, output_manager).await?;
+
+    {
+        use std::io::Write;
+        let _gate = crate::cli::tui::lock_terminal_handoff()?;
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"FINCH_DYNAMIC_PROBE_BEGIN")?;
+        stdout.flush()?;
+    }
+
+    let unit = output_manager.start_work_unit("FINCH_DYNAMIC_STREAM");
+    unit.append_response("stream-one");
+    for stage in ["draft", "completion"] {
+        {
+            let mut tui = tui_renderer.lock().await;
+            tui.configure_supervised_dynamic_probe(stage)?;
+            tui.mark_dirty();
+        }
+        supervised_flush_dynamic_frame(tui_renderer, output_manager).await?;
+    }
+    {
+        let mut tui = tui_renderer.lock().await;
+        tui.configure_supervised_dynamic_probe("clear")?;
+        unit.append_response("\nstream-two\nstream-three\nstream-four");
+        tui.mark_dirty();
+    }
+    supervised_flush_dynamic_frame(tui_renderer, output_manager).await?;
+    {
+        let mut tui = tui_renderer.lock().await;
+        tui.configure_supervised_dynamic_probe("dialog")?;
+        tui.mark_dirty();
+    }
+    supervised_flush_dynamic_frame(tui_renderer, output_manager).await?;
+    {
+        use std::io::Write;
+        let _gate = crate::cli::tui::lock_terminal_handoff()?;
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"FINCH_DYNAMIC_PROBE_DONE")?;
+        stdout.flush()?;
+    }
+    unit.set_complete();
+    {
+        let mut tui = tui_renderer.lock().await;
+        tui.configure_supervised_dynamic_probe("clear")?;
+        tui.mark_dirty();
+    }
+    supervised_flush_dynamic_frame(tui_renderer, output_manager).await?;
+    output_manager.write_info("FINCH_CANONICAL_AFTER".to_string());
+    supervised_flush_dynamic_frame(tui_renderer, output_manager).await?;
+    Ok(true)
+}
+
+async fn supervised_flush_dynamic_frame(
+    tui_renderer: &Arc<Mutex<TuiRenderer>>,
+    output_manager: &Arc<OutputManager>,
+) -> Result<()> {
+    for _ in 0..20 {
+        let result = {
+            let mut tui = tui_renderer.lock().await;
+            tui.flush_output_safe(output_manager)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    anyhow::bail!("dynamic terminal probe remained backpressured")
+}
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
@@ -2419,20 +2508,6 @@ impl EventLoop {
 
         while !should_exit {
             tokio::select! {
-                signal = crate::cli::tui::wait_for_terminal_shutdown() => {
-                    tracing::info!(signal, "received terminal shutdown signal");
-                    // Restore the user's terminal before durable/session
-                    // cleanup awaits any external resource. The final normal
-                    // shutdown call is idempotent after this succeeds.
-                    let mut tui = self.tui_renderer.lock().await;
-                    if let Err(error) = tui.shutdown() {
-                        tracing::warn!(%error, signal, "terminal shutdown after signal failed");
-                        crate::cli::tui::emergency_restore_terminal();
-                    }
-                    drop(tui);
-                    should_exit = true;
-                }
-
                 // User input event
                 Some(event) = self.input_rx.recv() => {
                     use crate::cli::tui::InputEvent;
@@ -2440,6 +2515,15 @@ impl EventLoop {
                         InputEvent::Submitted(input) => {
                             tracing::debug!("Received input: {}", input);
                             if supervised_busy_terminal_branch(&input).await {
+                                continue;
+                            }
+                            if supervised_dynamic_terminal_branch(
+                                &input,
+                                &self.tui_renderer,
+                                &self.output_manager,
+                            )
+                            .await?
+                            {
                                 continue;
                             }
                             // Clear typing words — restore panel to previous mode.

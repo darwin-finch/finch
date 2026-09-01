@@ -31,8 +31,8 @@ use crossterm::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
-    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering},
+    Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock,
 };
 use std::time::Duration;
 use tui_textarea::TextArea;
@@ -71,19 +71,124 @@ enum TerminalActivation {
 const NO_TERMINAL_SHUTDOWN_SIGNAL: u8 = 0;
 const TERMINAL_SHUTDOWN_SIGTERM: u8 = 1;
 const TERMINAL_SHUTDOWN_SIGHUP: u8 = 2;
+static TERMINAL_WRITE_GATE: StdMutex<()> = StdMutex::new(());
+static TERMINAL_RESTORE_FD: AtomicI32 = AtomicI32::new(-1);
+static TERMINAL_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TERMINAL_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+static ORIGINAL_TERMIOS: StdMutex<Option<nix::libc::termios>> = StdMutex::new(None);
+
+pub(crate) fn mark_terminal_protocol_suspended() {
+    TERMINAL_PROTOCOL_ACTIVE.store(false, Ordering::Release);
+}
+
+pub(crate) fn mark_terminal_protocol_active() {
+    TERMINAL_PROTOCOL_ACTIVE.store(true, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn supervised_editor_handoff_for_signal() -> Result<()> {
+    if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+        anyhow::bail!("supervised editor handoff requires isolated proof");
+    }
+    if crate::tools::implementations::propose::suspend_terminal_for_editor() {
+        Ok(())
+    } else {
+        anyhow::bail!("terminal shutdown requested before editor handoff")
+    }
+}
+
+#[doc(hidden)]
+pub fn supervised_resume_editor_handoff() -> Result<()> {
+    if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+        anyhow::bail!("supervised editor resume requires isolated proof");
+    }
+    crate::tools::implementations::propose::resume_terminal_after_editor();
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn supervised_hold_backpressured_terminal() -> Result<()> {
+    if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+        anyhow::bail!("supervised backpressure probe requires isolated proof");
+    }
+    let _gate = lock_terminal_handoff()?;
+    let bytes = [b'X'; 16 * 1024];
+    while io::stdout().write_all(&bytes).is_ok() {}
+    std::thread::sleep(Duration::from_secs(10));
+    anyhow::bail!("backpressure probe survived signal deadline")
+}
+
+#[cfg(unix)]
+fn terminal_signal_exit_code(signal: u8) -> i32 {
+    match signal {
+        TERMINAL_SHUTDOWN_SIGTERM => 128 + nix::libc::SIGTERM,
+        TERMINAL_SHUTDOWN_SIGHUP => 128 + nix::libc::SIGHUP,
+        _ => 1,
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_signal_exit_code(_signal: u8) -> i32 {
+    1
+}
+std::thread_local! {
+    static TERMINAL_WRITE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct TerminalWriteGuard {
+    _outer: Option<StdMutexGuard<'static, ()>>,
+}
+
+impl Drop for TerminalWriteGuard {
+    fn drop(&mut self) {
+        TERMINAL_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub(crate) fn lock_terminal_handoff() -> io::Result<TerminalWriteGuard> {
+    let nested = TERMINAL_WRITE_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            false
+        } else {
+            depth.set(depth.get() + 1);
+            true
+        }
+    });
+    if nested {
+        if terminal_shutdown_requested().is_some() {
+            TERMINAL_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminal shutdown requested",
+            ));
+        }
+        return Ok(TerminalWriteGuard { _outer: None });
+    }
+    let outer = TERMINAL_WRITE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if terminal_shutdown_requested().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal shutdown requested",
+        ));
+    }
+    TERMINAL_WRITE_DEPTH.with(|depth| depth.set(1));
+    Ok(TerminalWriteGuard {
+        _outer: Some(outer),
+    })
+}
 
 struct TerminalShutdownState {
     signal: AtomicU8,
-    cleanup_complete: AtomicBool,
-    notify: tokio::sync::Notify,
 }
 
 impl TerminalShutdownState {
     fn new() -> Self {
         Self {
             signal: AtomicU8::new(NO_TERMINAL_SHUTDOWN_SIGNAL),
-            cleanup_complete: AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -106,16 +211,158 @@ impl TerminalShutdownState {
             )
             .is_err()
         {
+            // The first accepted signal owns cleanup and the bounded exit.
+            // A repeat must not race that reset by terminating early.
             return;
         }
-        // This runs on the dedicated listener thread, not in an OS signal
-        // handler. It stays responsive while startup or an event-loop branch
-        // is synchronously busy and never needs the renderer mutex.
-        emergency_restore_terminal();
-        self.cleanup_complete.store(true, Ordering::Release);
-        self.notify.notify_one();
+        std::thread::Builder::new()
+            .name("finch-terminal-cleanup".into())
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_millis(250);
+                loop {
+                    match TERMINAL_WRITE_GATE.try_lock() {
+                        Ok(_guard) => {
+                            bounded_cleanup_and_exit(signal);
+                        }
+                        Err(std::sync::TryLockError::Poisoned(error)) => {
+                            let _guard = error.into_inner();
+                            bounded_cleanup_and_exit(signal);
+                        }
+                        Err(std::sync::TryLockError::WouldBlock)
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            // An admitted terminal writer is blocked. Restore
+                            // termios and enqueue only nonblocking reset bytes,
+                            // then terminate so it cannot write after cleanup.
+                            bounded_cleanup_and_exit(signal);
+                        }
+                    }
+                }
+            })
+            .unwrap_or_else(|_| {
+                bounded_cleanup_and_exit(signal);
+            });
     }
 }
+
+fn bounded_cleanup_and_exit(signal: u8) -> ! {
+    if !TERMINAL_EXIT_STARTED.swap(true, Ordering::AcqRel) {
+        bounded_emergency_restore_terminal();
+    }
+    std::process::exit(terminal_signal_exit_code(signal));
+}
+
+pub(crate) fn exit_for_pending_terminal_shutdown() -> ! {
+    let signal = TERMINAL_SHUTDOWN_STATE
+        .get()
+        .and_then(|state| state.as_ref().ok())
+        .map(|state| state.signal.load(Ordering::Acquire))
+        .unwrap_or(TERMINAL_SHUTDOWN_SIGTERM);
+    bounded_cleanup_and_exit(signal);
+}
+
+#[cfg(unix)]
+fn bounded_emergency_restore_terminal() {
+    const ACTIVE_RESET: &[u8] = b"\x1b[?1049l\x1b[?2026h\x1b[?2026l\x1b[<1u\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?25h\x1b[0m\r\n";
+    const SUSPENDED_RESET: &[u8] = b"\x1b[?1049l\x1b[?2026h\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?25h\x1b[0m\r\n";
+    let reset_bytes = if TERMINAL_PROTOCOL_ACTIVE.swap(false, Ordering::AcqRel) {
+        ACTIVE_RESET
+    } else {
+        SUSPENDED_RESET
+    };
+    let stdout_fd = std::io::stdout().as_raw_fd();
+    let restore_fd = TERMINAL_RESTORE_FD.load(Ordering::Acquire);
+    let fd = if restore_fd >= 0 {
+        // Once shutdown owns this path, no admitted or future renderer write
+        // may follow restoration. Existing nonblocking writes either finish
+        // before this close or are discarded by the tcflush below.
+        unsafe {
+            nix::libc::close(stdout_fd);
+        }
+        restore_fd
+    } else {
+        stdout_fd
+    };
+    restore_terminal_attributes_fd(fd);
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK);
+            // Discard transient queued frame bytes on termination so reset
+            // sequences have bounded space even under PTY backpressure.
+            nix::libc::tcflush(fd, nix::libc::TCOFLUSH);
+            let _ = nix::libc::write(fd, reset_bytes.as_ptr().cast(), reset_bytes.len());
+            nix::libc::fcntl(fd, nix::libc::F_SETFL, flags);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn capture_terminal_restore_state() -> io::Result<()> {
+    let fd = std::io::stdout().as_raw_fd();
+    let mut original = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+    if unsafe { nix::libc::tcgetattr(fd, original.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut saved = ORIGINAL_TERMIOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if saved.is_none() {
+        *saved = Some(unsafe { original.assume_init() });
+    }
+    if TERMINAL_RESTORE_FD.load(Ordering::Acquire) < 0 {
+        let restore_fd = unsafe { nix::libc::dup(fd) };
+        if restore_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if TERMINAL_RESTORE_FD
+            .compare_exchange(-1, restore_fd, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            unsafe {
+                nix::libc::close(restore_fd);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn capture_terminal_restore_state() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn restore_terminal_attributes() {
+    restore_terminal_attributes_fd(std::io::stdout().as_raw_fd());
+}
+
+#[cfg(unix)]
+fn restore_terminal_attributes_fd(fd: i32) {
+    let saved = ORIGINAL_TERMIOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(original) = saved.as_ref() {
+        unsafe {
+            // TCSANOW does not wait for a backpressured output queue.
+            nix::libc::tcsetattr(fd, nix::libc::TCSANOW, original);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn restore_terminal_attributes() {}
+
+#[cfg(not(unix))]
+fn bounded_emergency_restore_terminal() {
+    emergency_restore_terminal();
+}
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 static TERMINAL_SHUTDOWN_STATE: OnceLock<Result<Arc<TerminalShutdownState>, String>> =
     OnceLock::new();
@@ -196,29 +443,6 @@ pub(crate) fn terminal_shutdown_requested() -> Option<&'static str> {
         .and_then(|state| state.signal_name())
 }
 
-fn terminal_shutdown_cleanup_complete() -> bool {
-    TERMINAL_SHUTDOWN_STATE
-        .get()
-        .and_then(|state| state.as_ref().ok())
-        .is_some_and(|state| state.cleanup_complete.load(Ordering::Acquire))
-}
-
-pub(crate) async fn wait_for_terminal_shutdown() -> &'static str {
-    let state = install_terminal_shutdown_listener()
-        .expect("terminal shutdown listener was installed before TUI activation");
-    loop {
-        if let Some(signal) = state
-            .cleanup_complete
-            .load(Ordering::Acquire)
-            .then(|| state.signal_name())
-            .flatten()
-        {
-            return signal;
-        }
-        state.notify.notified().await;
-    }
-}
-
 /// Enable the terminal modes owned by Finch's default REPL.
 fn activate_default_terminal_modes<W: Write>(
     mut writer: W,
@@ -226,7 +450,19 @@ fn activate_default_terminal_modes<W: Write>(
 ) -> io::Result<()> {
     match activation {
         TerminalActivation::Startup | TerminalActivation::Resume => {
+            if terminal_shutdown_requested().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal shutdown requested before activation",
+                ));
+            }
             execute!(writer, crossterm::event::EnableBracketedPaste)?;
+            if terminal_shutdown_requested().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal shutdown requested during activation",
+                ));
+            }
             execute!(
                 writer,
                 crossterm::event::PushKeyboardEnhancementFlags(
@@ -235,6 +471,12 @@ fn activate_default_terminal_modes<W: Write>(
             )?;
         }
         TerminalActivation::EmergencyRestore => {
+            if terminal_shutdown_requested().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal shutdown requested before emergency activation",
+                ));
+            }
             execute!(
                 writer,
                 crossterm::event::EnableBracketedPaste,
@@ -285,6 +527,12 @@ fn restore_default_terminal_modes<W: Write>(mut writer: W) -> io::Result<()> {
         "disable_mouse",
         execute!(writer, crossterm::event::DisableMouseCapture)
     );
+    // Crossterm releases its supported tracking and encoding modes. Reset
+    // the legacy UTF-8 and pixel-coordinate encodings explicitly as well.
+    attempt!(
+        "disable_mouse_encodings",
+        execute!(writer, Print("\x1b[?1005l\x1b[?1016l"))
+    );
     attempt!(
         "disable_paste",
         execute!(writer, crossterm::event::DisableBracketedPaste)
@@ -294,6 +542,7 @@ fn restore_default_terminal_modes<W: Write>(mut writer: W) -> io::Result<()> {
     if !ended_sync {
         attempt!("end_sync_retry", execute!(writer, EndSynchronizedUpdate));
     }
+    TERMINAL_PROTOCOL_ACTIVE.store(false, Ordering::Release);
 
     match first_error {
         Some(error) => Err(error),
@@ -335,21 +584,10 @@ impl TerminalInitializationGuard {
 
 impl Drop for TerminalInitializationGuard {
     fn drop(&mut self) {
-        if self.armed && terminal_shutdown_requested().is_none() {
+        if self.armed {
             emergency_restore_terminal();
         }
     }
-}
-
-fn install_tui_panic_hook() {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            emergency_restore_terminal();
-            previous(info);
-        }));
-    });
 }
 
 fn supervised_initialization_failure_requested() -> bool {
@@ -362,6 +600,16 @@ fn supervised_startup_signal_pause_requested() -> bool {
         && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
 }
 
+fn supervised_raw_only_signal_pause_requested() -> bool {
+    std::env::var_os("FINCH_TEST_TUI_PAUSE_AFTER_RAW_MODE").is_some()
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+}
+
+fn supervised_relative_live_anchor_mutation_requested() -> bool {
+    std::env::var_os("FINCH_TEST_TUI_MUTATE_RELATIVE_LIVE_ANCHOR").is_some()
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+}
+
 /// Best-effort terminal restoration for an exit path that cannot acquire the
 /// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
 /// `/quit` and the IPC quit watcher may call `process::exit`, which skips Drop,
@@ -369,12 +617,20 @@ fn supervised_startup_signal_pause_requested() -> bool {
 /// alone is insufficient — bracketed paste and kitty keyboard enhancement
 /// remain enabled and their escape sequences leak into the user's shell.
 pub fn emergency_restore_terminal() {
+    let Ok(_terminal_gate) = lock_terminal_handoff() else {
+        return;
+    };
+    emergency_restore_terminal_inner();
+}
+
+fn emergency_restore_terminal_inner() {
     let mut stdout = io::stdout();
     let _ = execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
     let _ = restore_default_terminal_modes(&mut stdout);
     let _ = execute!(stdout, Print("\r\n"));
     let _ = stdout.lock().flush();
     let _ = disable_raw_mode();
+    restore_terminal_attributes();
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
@@ -1290,6 +1546,7 @@ impl<W: Write> SynchronizedWriter<W> {
         let mut encoded_end = Vec::new();
         crossterm::queue!(&mut encoded_end, EndSynchronizedUpdate)?;
         let mut offset = 0;
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
         while offset < encoded_end.len() {
             match self.inner.write(&encoded_end[offset..]) {
                 Ok(0) => {
@@ -1305,12 +1562,42 @@ impl<W: Write> SynchronizedWriter<W> {
                     // error is ambiguous: retrying could emit a duplicate End.
                     self.end_state = SynchronizedEndState::Accepted;
                 }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 Err(error) => return Err(error.into()),
             }
         }
         self.inner.flush()?;
         Ok(())
     }
+}
+
+fn write_all_nonblocking_bounded(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match writer.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "terminal write stalled",
+                ))
+            }
+            Ok(written) => offset += written,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 impl<W: Write> Write for SynchronizedWriter<W> {
@@ -1338,26 +1625,43 @@ impl<W: Write> Drop for SynchronizedWriter<W> {
 fn write_live_area_erase(
     out: &mut impl Write,
     active_rows: usize,
-    cursor_row_from_top: usize,
+    _cursor_row_from_top: usize,
 ) -> Result<()> {
     let mut out = SynchronizedWriter::begin(out)?;
-    if active_rows == 0 && cursor_row_from_top == 0 {
+    if active_rows == 0 {
         return out.finish();
     }
-    execute!(out, cursor::MoveToColumn(0))?;
-    if cursor_row_from_top > 0 {
-        execute!(out, cursor::MoveUp(cursor_row_from_top as u16))?;
+    let terminal_height = usize::from(crossterm::terminal::size().unwrap_or((80, 24)).1);
+    let top = terminal_height.saturating_sub(active_rows);
+    for row in 0..active_rows.min(terminal_height) {
+        execute!(
+            out,
+            cursor::MoveTo(0, top.saturating_add(row) as u16),
+            Clear(ClearType::CurrentLine)
+        )?;
     }
-    for row in 0..active_rows {
-        execute!(out, Clear(ClearType::CurrentLine))?;
-        if row + 1 < active_rows {
-            execute!(out, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
-        }
+    execute!(out, cursor::MoveTo(0, top as u16))?;
+    out.finish()
+}
+
+fn write_live_frame_at_bottom(
+    out: &mut impl Write,
+    frame: &[u8],
+    rows: usize,
+    terminal_height: usize,
+) -> Result<()> {
+    let mut out = SynchronizedWriter::begin(out)?;
+    if supervised_relative_live_anchor_mutation_requested() {
+        // Causal regression control: reenact the relative re-anchor used by
+        // the rejected implementation through the real production boundary.
+        execute!(out, cursor::MoveUp(rows.min(u16::MAX as usize) as u16))?;
+    } else {
+        execute!(
+            out,
+            cursor::MoveTo(0, terminal_height.saturating_sub(rows) as u16)
+        )?;
     }
-    if active_rows > 1 {
-        execute!(out, cursor::MoveUp((active_rows - 1) as u16))?;
-        execute!(out, cursor::MoveToColumn(0))?;
-    }
+    write_all_nonblocking_bounded(&mut out, frame)?;
     out.finish()
 }
 
@@ -1660,18 +1964,33 @@ impl TuiRenderer {
     ) -> Result<Self> {
         install_terminal_shutdown_listener()
             .context("Failed to install terminal shutdown listener")?;
+        let _terminal_gate =
+            lock_terminal_handoff().context("Failed to acquire terminal activation ownership")?;
         if let Some(signal) = terminal_shutdown_requested() {
             anyhow::bail!("terminal shutdown already requested by {signal}");
         }
+        capture_terminal_restore_state().context("Failed to snapshot terminal state")?;
         enable_raw_mode().context("Failed to enable raw mode")?;
         let mut initialization_guard = TerminalInitializationGuard::new();
-
+        if supervised_raw_only_signal_pause_requested() {
+            let mut stdout = io::stdout();
+            stdout.write_all(b"FINCH_RAW_ONLY_SIGNAL_READY")?;
+            stdout.flush()?;
+            while terminal_shutdown_requested().is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            exit_for_pending_terminal_shutdown();
+        }
         // Enable bracketed paste so the terminal wraps pasted content in
         // \x1b[200~ ... \x1b[201~ markers.  Crossterm surfaces this as
         // Event::Paste(String) which we handle without any Enter-confusion.
         // Unlike kitty keyboard enhancement flags, bracketed paste cannot
         // corrupt the terminal on unclean exit — it simply falls back to
         // normal (unbounded) paste mode, which is safe.
+        // Publish ownership before the first protocol byte. If a signal lands
+        // after any prefix is accepted, the cleanup owner must conservatively
+        // release the complete protocol set.
+        mark_terminal_protocol_active();
         activate_default_terminal_modes(io::stdout(), TerminalActivation::Startup)
             .context("Failed to activate default terminal modes")?;
 
@@ -1680,12 +1999,13 @@ impl TuiRenderer {
         // listener observes a supervised signal. Unverified environments
         // cannot activate this path.
         if supervised_startup_signal_pause_requested() {
-            while !terminal_shutdown_cleanup_complete() {
+            while terminal_shutdown_requested().is_none() {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
         if let Some(signal) = terminal_shutdown_requested() {
-            anyhow::bail!("terminal shutdown requested during initialization by {signal}");
+            let _ = signal;
+            exit_for_pending_terminal_shutdown();
         }
 
         // Environment-owned PTY regression hook: fail only after Finch has
@@ -1705,13 +2025,6 @@ impl TuiRenderer {
         // (crossterm returns an error we discard with `let _ =`), so there is no
         // regression for unsupported terminals.
         //
-        // Cleanup: the Drop impl and the panic hook registered below both call
-        // PopKeyboardEnhancementFlags, so normal exit, panics, and most signals
-        // are covered.  SIGKILL terminates the session entirely so corruption
-        // doesn't persist.  This is the same risk level we already accept for
-        // enable_raw_mode().
-        install_tui_panic_hook();
-
         execute!(io::stdout(), cursor::Show)?;
 
         // Suppress OutputManager's own stdout writes — we own the terminal.
@@ -2018,6 +2331,7 @@ impl TuiRenderer {
     /// (not necessarily at the bottom row), so we must use that field — not
     /// `active_rows - 1` — to reach the top correctly.
     pub fn erase_live_area(&mut self) -> Result<()> {
+        let _terminal_gate = lock_terminal_handoff()?;
         let mut stdout = io::stdout();
         // Erase is its own balanced synchronized update. Keeping the owner
         // local guarantees that an error cannot leave terminal output frozen.
@@ -2037,7 +2351,8 @@ impl TuiRenderer {
 
     /// Draw the live area from scratch and track `active_rows`.
     pub fn draw_live_area(&mut self) -> Result<()> {
-        let mut stdout = SynchronizedWriter::begin(io::stdout())?;
+        let _terminal_gate = lock_terminal_handoff()?;
+        let mut stdout = Vec::new();
         let mut rows: usize = 0;
 
         // ── 1. Active WorkUnit ────────────────────────────────────────────────
@@ -2075,7 +2390,7 @@ impl TuiRenderer {
             self.active_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
             self.accordion.rebuild_hit_regions(&[], 0, term_width);
-            return stdout.finish();
+            return write_live_frame_at_bottom(&mut io::stdout(), &stdout, rows, term_h);
         }
         let todo_lines = self.prepared_todo_rows(term_width);
         let agent_lines = self.prepared_agent_rows(term_width);
@@ -2335,7 +2650,7 @@ impl TuiRenderer {
         self.active_rows = rows;
         self.cursor_row_from_top = cursor_row_from_top;
         self.rebuild_transcript_hit_regions(&visible_live_rendered, rows, term_width, term_h);
-        stdout.finish()
+        write_live_frame_at_bottom(&mut io::stdout(), &stdout, rows, term_h)
     }
 
     /// Return the whole uncommitted transcript suffix in order.
@@ -2608,12 +2923,50 @@ fn continue_full_viewport_paint(
 // ─── flush_output_safe / render ───────────────────────────────────────────────
 
 impl TuiRenderer {
+    pub(crate) fn configure_supervised_dynamic_probe(&mut self, stage: &str) -> Result<()> {
+        if !matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_))) {
+            anyhow::bail!("dynamic terminal probe requires isolated proof");
+        }
+        match stage {
+            "draft" => {
+                self.active_dialog = None;
+                self.autocomplete_state.hide();
+                self.input_textarea = Self::create_clean_textarea_with_text(
+                    "draft-one\ndraft-two grows the physical live frame",
+                );
+            }
+            "completion" => {
+                self.active_dialog = None;
+                self.input_textarea = Self::create_clean_textarea_with_text("/bra");
+                self.autocomplete_state
+                    .show_matches(self.command_registry.match_prefix("/bra"));
+            }
+            "dialog" => {
+                self.autocomplete_state.hide();
+                self.active_dialog = Some(Dialog::select(
+                    "FINCH_DYNAMIC_DIALOG",
+                    vec![
+                        DialogOption::new("first"),
+                        DialogOption::new("second"),
+                        DialogOption::new("third"),
+                    ],
+                ));
+            }
+            "clear" => {
+                self.active_dialog = None;
+                self.autocomplete_state.hide();
+                self.input_textarea = Self::create_clean_textarea();
+            }
+            _ => anyhow::bail!("unknown dynamic terminal probe stage"),
+        }
+        self.live_area_dirty = true;
+        Ok(())
+    }
+
     /// Called from the event loop on every tick.
     /// Commits newly-completed messages to permanent scrollback, then redraws.
     pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
-        if terminal_shutdown_requested().is_some() {
-            return Ok(());
-        }
+        let _terminal_gate = lock_terminal_handoff()?;
         let messages = self.output_manager.get_messages();
 
         let unprinted: Vec<MessageRef> = messages
@@ -2684,9 +3037,7 @@ impl TuiRenderer {
 
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
-        if terminal_shutdown_requested().is_some() {
-            return Ok(());
-        }
+        let _terminal_gate = lock_terminal_handoff()?;
         if self.viewport_invalidated {
             self.redraw_full_viewport()?;
             return self.draw_poset_overlay();
@@ -2705,6 +3056,7 @@ impl TuiRenderer {
     /// effect** on the live area's cursor tracking.  No rows are added to
     /// `active_rows`; the panel never triggers the "Reflecting…" scrollback spam.
     pub fn draw_poset_overlay(&mut self) -> Result<()> {
+        let _terminal_gate = lock_terminal_handoff()?;
         // Show the output of the user-defined `check` word, if any.
         let text = self.corner.lock().ok().and_then(|g| g.clone());
         let Some(text) = text else {
@@ -2719,6 +3071,7 @@ impl TuiRenderer {
 
     /// Kept for API compatibility.  Forces a redraw if flagged.
     pub fn check_and_refresh(&mut self) -> Result<()> {
+        let _terminal_gate = lock_terminal_handoff()?;
         if self.needs_full_refresh {
             self.needs_full_refresh = false;
             self.erase_live_area()?;
@@ -2759,21 +3112,21 @@ impl TuiRenderer {
 
 impl TuiRenderer {
     pub fn shutdown(&mut self) -> Result<()> {
+        let _terminal_gate = lock_terminal_handoff()?;
         if !self.is_active {
             return Ok(());
         }
-        if terminal_shutdown_requested().is_none() {
-            let _ = self.erase_live_area();
-            // Reset terminal state: show cursor, reset colours, move to a clean line.
-            // The `\r\n` ensures the shell prompt lands on its own fresh line rather
-            // than overwriting content from the erased live area.
-            let _ = restore_default_terminal_modes(io::stdout());
-            print!("\r\n");
-            // Flush pending output BEFORE leaving raw mode — otherwise some terminals
-            // silently discard buffered bytes after the mode switch.
-            let _ = io::stdout().flush();
-            let _ = disable_raw_mode();
-        }
+        let _ = self.erase_live_area();
+        // Reset terminal state: show cursor, reset colours, move to a clean line.
+        // The `\r\n` ensures the shell prompt lands on its own fresh line rather
+        // than overwriting content from the erased live area.
+        let _ = restore_default_terminal_modes(io::stdout());
+        print!("\r\n");
+        // Flush pending output BEFORE leaving raw mode — otherwise some terminals
+        // silently discard buffered bytes after the mode switch.
+        let _ = io::stdout().flush();
+        let _ = disable_raw_mode();
+        restore_terminal_attributes();
         Self::save_history(&self.command_history);
         self.output_manager.enable_stdout();
         self.is_active = false;
@@ -2787,12 +3140,11 @@ impl TuiRenderer {
     /// Temporarily release the terminal so another full-screen TUI (e.g. the
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
-        if let Some(signal) = terminal_shutdown_requested() {
-            anyhow::bail!("terminal shutdown requested by {signal}");
-        }
+        let _terminal_gate = lock_terminal_handoff()?;
         let _ = io::stdout().flush();
         let modes = restore_default_terminal_modes(io::stdout());
         let raw_mode = disable_raw_mode();
+        restore_terminal_attributes();
         if let Err(error) = modes {
             return Err(error).context("Failed to release terminal modes");
         }
@@ -2801,10 +3153,9 @@ impl TuiRenderer {
 
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
-        if let Some(signal) = terminal_shutdown_requested() {
-            anyhow::bail!("terminal shutdown requested by {signal}");
-        }
+        let _terminal_gate = lock_terminal_handoff()?;
         enable_raw_mode()?;
+        mark_terminal_protocol_active();
         if let Err(error) =
             activate_default_terminal_modes(io::stdout(), TerminalActivation::Resume)
         {
@@ -2836,10 +3187,9 @@ impl TuiRenderer {
     /// deliberately stronger than [`Self::resume`]: emergency restoration
     /// also pops keyboard enhancements and disables bracketed paste.
     pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
-        if let Some(signal) = terminal_shutdown_requested() {
-            anyhow::bail!("terminal shutdown requested by {signal}");
-        }
+        let _terminal_gate = lock_terminal_handoff()?;
         enable_raw_mode()?;
+        mark_terminal_protocol_active();
         if let Err(error) =
             activate_default_terminal_modes(io::stdout(), TerminalActivation::EmergencyRestore)
         {
@@ -2864,7 +3214,7 @@ impl Drop for TuiRenderer {
         // Safety net: restore terminal if shutdown() was never explicitly called.
         // shutdown() sets is_active = false before doing anything, so this is
         // idempotent — if shutdown() already ran, this is a no-op.
-        if self.is_active && terminal_shutdown_requested().is_none() {
+        if self.is_active {
             emergency_restore_terminal();
         }
     }
@@ -2875,6 +3225,7 @@ impl Drop for TuiRenderer {
 impl TuiRenderer {
     pub fn read_line(&mut self) -> Result<Option<String>> {
         use crossterm::event::{KeyCode, KeyModifiers};
+        let _terminal_gate = lock_terminal_handoff()?;
 
         loop {
             let om = Arc::clone(&self.output_manager);
@@ -3809,6 +4160,7 @@ impl TuiRenderer {
     /// Returns `DialogResult::Cancelled` if Esc is pressed.
     pub fn show_dialog(&mut self, dialog: Dialog) -> Result<DialogResult> {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+        let _terminal_gate = lock_terminal_handoff()?;
 
         // Commit any pending Complete messages to scrollback before drawing the dialog.
         // This ensures messages written before show_dialog() appear above the dialog,
@@ -3878,6 +4230,7 @@ impl TuiRenderer {
 
     /// Show the setup wizard using ratatui in an alternate screen.
     pub fn show_tabbed_dialog(&mut self, mut dialog: TabbedDialog) -> Result<TabbedDialogResult> {
+        let _terminal_gate = lock_terminal_handoff()?;
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
         use ratatui::widgets::Widget;
         use ratatui::{backend::CrosstermBackend, Terminal};
@@ -3915,6 +4268,7 @@ impl TuiRenderer {
     /// All other files are shown as scrollable text.
     /// `q`, `Esc`, or `Ctrl-D` closes the viewer.
     pub fn show_file_viewer(&mut self, path: &str) -> Result<()> {
+        let _terminal_gate = lock_terminal_handoff()?;
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
         use ratatui::backend::CrosstermBackend;
         use ratatui::layout::{Constraint, Direction, Layout};
@@ -4380,6 +4734,18 @@ mod tests {
         bytes
     }
 
+    fn mouse_reporting_enable_sequences() -> [&'static [u8]; 7] {
+        [
+            b"\x1b[?1000h",
+            b"\x1b[?1002h",
+            b"\x1b[?1003h",
+            b"\x1b[?1005h",
+            b"\x1b[?1006h",
+            b"\x1b[?1015h",
+            b"\x1b[?1016h",
+        ]
+    }
+
     #[test]
     fn test_default_terminal_activation_never_captures_native_mouse_input() {
         let enable_mouse = mouse_capture_sequence(true);
@@ -4391,6 +4757,12 @@ mod tests {
             let mut bytes = Vec::new();
             activate_default_terminal_modes(&mut bytes, activation).unwrap();
             assert!(!contains_bytes(&bytes, &enable_mouse));
+            for sequence in mouse_reporting_enable_sequences() {
+                assert!(
+                    !contains_bytes(&bytes, sequence),
+                    "activation emitted standalone mouse-reporting mode {sequence:?}"
+                );
+            }
 
             let mut enable_paste = Vec::new();
             execute!(&mut enable_paste, crossterm::event::EnableBracketedPaste).unwrap();
@@ -5822,6 +6194,23 @@ mod tests {
     }
 
     #[test]
+    fn test_live_frame_height_changes_reanchor_to_absolute_bottom_without_linefeed() {
+        let mut output = Vec::new();
+
+        write_live_frame_at_bottom(&mut output, b"GROW", 8, 24).unwrap();
+        write_live_frame_at_bottom(&mut output, b"SHRINK", 3, 24).unwrap();
+        write_live_frame_at_bottom(&mut output, b"GROW-AGAIN", 11, 24).unwrap();
+
+        let raw = String::from_utf8(output).unwrap();
+        assert!(raw.contains("\x1b[17;1HGROW"));
+        assert!(raw.contains("\x1b[22;1HSHRINK"));
+        assert!(raw.contains("\x1b[14;1HGROW-AGAIN"));
+        assert!(!raw.contains('\n'));
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 3);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 3);
+    }
+
+    #[test]
     fn test_production_live_erase_closes_synchronized_update_after_write_error() {
         struct ClearFailsOnce {
             bytes: Vec<u8>,
@@ -5848,6 +6237,64 @@ mod tests {
             failed: false,
         };
         assert!(write_live_area_erase(&mut output, 2, 1).is_err());
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+    }
+
+    #[test]
+    fn test_synchronized_finish_does_not_duplicate_accepted_end_after_flush_error() {
+        struct FlushFails {
+            bytes: Vec<u8>,
+        }
+
+        impl Write for FlushFails {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected ambiguous flush failure"))
+            }
+        }
+
+        let mut output = FlushFails { bytes: Vec::new() };
+        let synchronized = SynchronizedWriter::begin(&mut output).unwrap();
+        assert!(synchronized.finish().is_err());
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+    }
+
+    #[test]
+    fn test_synchronized_finish_retries_once_when_end_write_accepts_no_bytes() {
+        struct EndWriteFailsOnce {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for EndWriteFailsOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.failed && bytes == b"\x1b[?2026l" {
+                    self.failed = true;
+                    return Err(io::Error::other("injected pre-write failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut output = EndWriteFailsOnce {
+            bytes: Vec::new(),
+            failed: false,
+        };
+        let synchronized = SynchronizedWriter::begin(&mut output).unwrap();
+        assert!(synchronized.finish().is_err());
         let raw = String::from_utf8(output.bytes).unwrap();
         assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
         assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
