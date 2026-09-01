@@ -1597,7 +1597,8 @@ interface FinchDaemon {
   # Register the callback belonging to the frontend's current runner lease.
   # The durable reducible VM state is returned so a restarted frontend can
   # hydrate before accepting work. Host authority is deliberately absent.
-  registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
+  registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner,
+                          processEpoch :Text)
       -> (runtimeRevision :UInt64, checkpoint :TypedRuntimeCheckpoint,
           control :BrainRunnerControl);
 

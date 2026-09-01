@@ -1881,16 +1881,33 @@ impl finch_daemon::Server for FinchDaemonImpl {
         mut results: finch_daemon::RegisterBrainRunnerResults,
     ) -> Promise<(), capnp::Error> {
         let params = pry!(params.get());
-        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
-        let lease_text = pry!(params.get_lease_id())
-            .to_str()
-            .unwrap_or("")
-            .to_string();
+        let brain = match decode_required_text(params.get_brain(), "runner brain") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(capnp::Error::failed(error)),
+        };
+        let lease_text = match decode_required_text(params.get_lease_id(), "runner lease id") {
+            Ok(value) => value,
+            Err(error) => return Promise::err(capnp::Error::failed(error)),
+        };
+        let process_epoch_text =
+            match decode_required_text(params.get_process_epoch(), "runner process epoch") {
+                Ok(value) => value,
+                Err(error) => return Promise::err(capnp::Error::failed(error)),
+            };
         let lease_uuid = match uuid::Uuid::parse_str(&lease_text) {
             Ok(value) => value,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let lease_id = crate::brain::store::RunnerLeaseId(lease_uuid);
+        let process_epoch = match uuid::Uuid::parse_str(&process_epoch_text) {
+            Ok(value) if !value.is_nil() => value,
+            Ok(_) => {
+                return Promise::err(capnp::Error::failed(
+                    "runner process epoch must not be nil".into(),
+                ))
+            }
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let runner = pry!(params.get_runner());
         if let Err(error) = self.server.brain_runners().require_connection_lease(
             self.connection_id,
@@ -1923,6 +1940,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let server = Arc::clone(&self.server);
         let registration_id = match broker.register_bounded_for_connection(
             self.connection_id,
+            process_epoch,
             brain.clone(),
             lease_id,
             tx,
@@ -1964,6 +1982,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 };
                 let runner = runner.clone();
                 let server = Arc::clone(&server);
+                let callback_dispatch_admission = Arc::clone(&dispatch_admission);
                 tokio::task::spawn_local(async move {
                     let _dispatch_guard = dispatch_guard;
                     forward_runner_request(
@@ -1973,6 +1992,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         lease_id,
                         Some(crate::brain::store::ConnectionId(registered_connection_id)),
                         Some(registration_id),
+                        Some(callback_dispatch_admission),
                     )
                     .await;
                 });
@@ -2169,11 +2189,30 @@ async fn cancel_frontend_memory(
     }
 }
 
-async fn settle_cancelled_frontend_rpc<F>(rpc: &mut std::pin::Pin<Box<F>>)
+async fn settle_cancelled_frontend_rpc<F>(
+    rpc: &mut std::pin::Pin<Box<F>>,
+    deadline: tokio::time::Instant,
+) -> bool
 where
     F: std::future::Future,
 {
-    let _ = rpc.await;
+    tokio::time::timeout_at(deadline, rpc).await.is_ok()
+}
+
+async fn eject_nonquiescent_runner_connection(
+    server: &AgentServer,
+    connection_id: Option<crate::brain::store::ConnectionId>,
+    dispatch_admission: Option<&Arc<crate::server::ConnectionDispatchAdmission>>,
+) {
+    let (Some(connection_id), Some(dispatch_admission)) = (connection_id, dispatch_admission)
+    else {
+        return;
+    };
+    match server.brain_runners().eject_connection(connection_id.0) {
+        Ok(_) => dispatch_admission.wait_transport_closed().await,
+        Err(error) => tracing::warn!(connection_id = %connection_id.0, %error,
+            "could not eject non-quiescent runner connection"),
+    }
 }
 
 fn bounded_runner_request_is_dispatchable(
@@ -2231,6 +2270,7 @@ async fn forward_runner_request(
     lease_id: crate::brain::store::RunnerLeaseId,
     connection_id: Option<crate::brain::store::ConnectionId>,
     registration_id: Option<crate::server::RunnerRegistrationId>,
+    dispatch_admission: Option<Arc<crate::server::ConnectionDispatchAdmission>>,
 ) {
     // Recheck immediately before any run authority is minted or remote RPC is
     // constructed. A request can expire, be cancelled, or lose its exact
@@ -2244,6 +2284,7 @@ async fn forward_runner_request(
         generation_cancel,
         deadline,
         cleanup_timeout,
+        dispatch_gate,
     } = request;
     match request {
         crate::server::RunnerRequest::Program(request) => {
@@ -2312,22 +2353,20 @@ async fn forward_runner_request(
                 payload.set_control(control);
             }
             let mut response_tx = request.response_tx;
-            if !runner_envelope_is_dispatchable(
-                &server,
-                &request.brain,
+            let Some(rpc_future) = server.brain_runners().admit_runner_dispatch(
+                &dispatch_gate,
                 &callback_cancel,
                 &generation_cancel,
                 deadline,
-                lease_id,
-                registration_id,
-            ) {
+                || call.send().promise,
+            ) else {
                 audit_active.store(false, std::sync::atomic::Ordering::Release);
                 let _ = server
                     .brain_store()
                     .abandon_unbegun_effect_audits(&reconciliation_grant);
                 return;
-            }
-            let mut rpc = Box::pin(call.send().promise);
+            };
+            let mut rpc = Box::pin(rpc_future);
             let reply = await_runner_rpc(
                 &mut response_tx,
                 &callback_cancel,
@@ -2343,10 +2382,18 @@ async fn forward_runner_request(
                 audit_active.store(false, std::sync::atomic::Ordering::Release);
                 callback_cancel.cancel();
                 let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
-                let (cancel_ack, ()) = tokio::join!(
+                let (cancel_ack, settled) = tokio::join!(
                     cancel_frontend_run(&runner, &request.brain, request.run_id, cleanup_deadline),
-                    settle_cancelled_frontend_rpc(&mut rpc)
+                    settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline)
                 );
+                if !settled {
+                    eject_nonquiescent_runner_connection(
+                        &server,
+                        connection_id,
+                        dispatch_admission.as_ref(),
+                    )
+                    .await;
+                }
                 if !cancel_ack {
                     if let Some(registration_id) = registration_id {
                         server
@@ -2454,19 +2501,18 @@ async fn forward_runner_request(
                     encoded
                 };
                 match encoded {
-                    Ok(())
-                        if runner_envelope_is_dispatchable(
-                            &server,
-                            &request.brain,
+                    Ok(()) => {
+                        let Some(rpc_future) = server.brain_runners().admit_runner_dispatch(
+                            &dispatch_gate,
                             &callback_cancel,
                             &generation_cancel,
                             deadline,
-                            lease_id,
-                            registration_id,
-                        ) =>
-                    {
+                            || call.send().promise,
+                        ) else {
+                            return;
+                        };
                         let mut response_tx = request.response_tx;
-                        let mut rpc = Box::pin(call.send().promise);
+                        let mut rpc = Box::pin(rpc_future);
                         let reply = await_runner_rpc(
                             &mut response_tx,
                             &callback_cancel,
@@ -2480,15 +2526,23 @@ async fn forward_runner_request(
                             audit_active.store(false, std::sync::atomic::Ordering::Release);
                             callback_cancel.cancel();
                             let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
-                            let (cancel_ack, ()) = tokio::join!(
+                            let (cancel_ack, settled) = tokio::join!(
                                 cancel_frontend_run(
                                     &runner,
                                     &request.brain,
                                     request.run_id,
                                     cleanup_deadline
                                 ),
-                                settle_cancelled_frontend_rpc(&mut rpc)
+                                settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline)
                             );
+                            if !settled {
+                                eject_nonquiescent_runner_connection(
+                                    &server,
+                                    connection_id,
+                                    dispatch_admission.as_ref(),
+                                )
+                                .await;
+                            }
                             if !cancel_ack {
                                 if let Some(registration_id) = registration_id {
                                     server
@@ -2499,7 +2553,6 @@ async fn forward_runner_request(
                         }
                         Some((response_tx, reply))
                     }
-                    Ok(()) => None,
                     Err(error) => {
                         tracing::warn!(
                             brain = %request.brain,
@@ -2558,18 +2611,16 @@ async fn forward_runner_request(
                 payload.set_source(&request.source);
             }
             let mut response_tx = request.response_tx;
-            if !runner_envelope_is_dispatchable(
-                &server,
-                &request.brain,
+            let Some(rpc_future) = server.brain_runners().admit_runner_dispatch(
+                &dispatch_gate,
                 &callback_cancel,
                 &generation_cancel,
                 deadline,
-                lease_id,
-                registration_id,
-            ) {
+                || call.send().promise,
+            ) else {
                 return;
-            }
-            let mut rpc = Box::pin(call.send().promise);
+            };
+            let mut rpc = Box::pin(rpc_future);
             let Some(reply) = await_runner_rpc(
                 &mut response_tx,
                 &callback_cancel,
@@ -2580,15 +2631,23 @@ async fn forward_runner_request(
             else {
                 callback_cancel.cancel();
                 let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
-                let (cancel_ack, ()) = tokio::join!(
+                let (cancel_ack, settled) = tokio::join!(
                     cancel_frontend_memory(
                         &runner,
                         &request.brain,
                         request.run_id,
                         cleanup_deadline
                     ),
-                    settle_cancelled_frontend_rpc(&mut rpc)
+                    settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline)
                 );
+                if !settled {
+                    eject_nonquiescent_runner_connection(
+                        &server,
+                        connection_id,
+                        dispatch_admission.as_ref(),
+                    )
+                    .await;
+                }
                 if !cancel_ack {
                     if let Some(registration_id) = registration_id {
                         server
@@ -2638,23 +2697,21 @@ async fn forward_runner_request(
             call.get().set_brain(&request.brain);
             call.get().set_run_id(&request.run_id.0.to_string());
             let response_tx = request.response_tx;
-            if !runner_envelope_is_dispatchable(
-                &server,
-                &request.brain,
+            let Some(rpc) = server.brain_runners().admit_runner_dispatch(
+                &dispatch_gate,
                 &callback_cancel,
                 &generation_cancel,
                 deadline,
-                lease_id,
-                registration_id,
-            ) {
+                || call.send().promise,
+            ) else {
                 return;
-            }
+            };
             let reply = tokio::select! {
                 biased;
                 _ = callback_cancel.cancelled() => None,
                 _ = generation_cancel.cancelled() => None,
                 _ = tokio::time::sleep_until(deadline) => None,
-                reply = call.send().promise => Some(reply),
+                reply = rpc => Some(reply),
             };
             let Some(reply) = reply else {
                 return;
@@ -2705,6 +2762,7 @@ fn bounded_test_runner_request(
         generation_cancel: tokio_util::sync::CancellationToken::new(),
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
         cleanup_timeout: std::time::Duration::from_secs(2),
+        dispatch_gate: std::sync::Arc::default(),
     }
 }
 
@@ -2731,6 +2789,7 @@ pub(crate) async fn forward_test_runner_request(
         server,
         bounded_test_runner_request(request),
         lease_id,
+        None,
         None,
         None,
     )
@@ -4518,6 +4577,7 @@ mod tests {
                                 lease.lease_id,
                                 None,
                                 Some(registration),
+                                None,
                             )
                             .await;
                         });
@@ -4905,6 +4965,7 @@ mod tests {
             generation_cancel: tokio_util::sync::CancellationToken::new(),
             deadline,
             cleanup_timeout: std::time::Duration::from_millis(10),
+            dispatch_gate: std::sync::Arc::default(),
         };
 
         // Pause an actual broker envelope between enqueue and bridge dequeue,
@@ -4947,6 +5008,7 @@ mod tests {
             lease_id,
             None,
             Some(queued_registration),
+            None,
         )
         .await;
         assert!(queued_dispatch.await.unwrap().is_err());
@@ -4961,6 +5023,7 @@ mod tests {
                 tokio::time::Instant::now(),
             ),
             lease_id,
+            None,
             None,
             None,
         )
@@ -4983,10 +5046,285 @@ mod tests {
             lease_id,
             None,
             Some(queued_registration),
+            None,
         )
         .await;
         assert!(stale_rx.await.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    struct HostileNeverSettlingMemoryRunner {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    struct CallbackDropProof(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for CallbackDropProof {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for HostileNeverSettlingMemoryRunner {
+        fn run_program(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let started = self.started.take().expect("memory callback called twice");
+            let proof = CallbackDropProof(self.dropped.take());
+            capnp::capability::Promise::from_future(async move {
+                let _proof = proof;
+                let _ = started.send(());
+                std::future::pending::<Result<(), capnp::Error>>().await
+            })
+        }
+
+        fn cancel_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::from_future(std::future::pending())
+        }
+    }
+
+    struct SuccessfulCancelRunner;
+
+    impl super::finch_ipc_capnp::brain_runner::Server for SuccessfulCancelRunner {
+        fn run_program(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("cancel only".into()))
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("cancel only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            results.get().set_cancelled(true);
+            results.get().set_error("");
+            capnp::capability::Promise::ok(())
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("cancel only".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_never_settling_live_callback_ejects_process_and_fresh_epoch_recovers() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let lease = store
+                    .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+                    .unwrap();
+                let lease_id = lease.lease_id;
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test_with_runner_deadlines(
+                        store.clone(),
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([94; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                        crate::server::RunnerDeadlines {
+                            program: std::time::Duration::from_secs(1),
+                            turn: std::time::Duration::from_secs(1),
+                            cancel: std::time::Duration::from_secs(1),
+                            project_memory: std::time::Duration::from_millis(30),
+                            callback_cleanup: std::time::Duration::from_millis(100),
+                        },
+                    )
+                    .unwrap(),
+                );
+                let old_connection = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(old_connection, "shared", lease_id)
+                    .unwrap();
+                let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+                let old_server = std::sync::Arc::clone(&server);
+                let old_handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_id(server_stream, old_server, old_connection)
+                        .await
+                });
+                let old_client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                        .await
+                        .unwrap();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+                let hostile: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(HostileNeverSettlingMemoryRunner {
+                        started: Some(started_tx),
+                        dropped: Some(dropped_tx),
+                    });
+                old_client
+                    .register_test_brain_runner_client("shared", lease_id, hostile)
+                    .await
+                    .unwrap();
+                let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+                let brain_id = store.snapshot("shared").unwrap().brain_id;
+                let old_broker = server.brain_runners().clone();
+                let memory_dispatch = tokio::task::spawn_local(async move {
+                    old_broker
+                        .project_memory(
+                            "shared",
+                            lease_id,
+                            brain_id,
+                            run_id,
+                            1,
+                            "hostile".into(),
+                            "test".into(),
+                        )
+                        .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+                    .await
+                    .expect("hostile callback did not start")
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), memory_dispatch)
+                        .await
+                        .expect("hostile callback did not recover within the bounded deadline")
+                        .unwrap()
+                        .is_err()
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+                    .await
+                    .expect("transport ejection did not drop the hostile frontend promise")
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), old_handler)
+                    .await
+                    .expect("ejected connection teardown did not finish")
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !old_client.test_runner_process_poisoned() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("ejected frontend process epoch was not poisoned");
+                assert!(server
+                    .brain_runners()
+                    .test_connection_resources_retired(old_connection));
+                assert!(server
+                    .brain_runners()
+                    .test_run_resources_retired("shared", run_id));
+
+                let same_connection = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(same_connection, "shared", lease_id)
+                    .unwrap();
+                let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+                let same_server = std::sync::Arc::clone(&server);
+                let same_handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_id(server_stream, same_server, same_connection)
+                        .await
+                });
+                let same_client = old_client
+                    .reconnect_test_process(client_stream)
+                    .await
+                    .unwrap();
+                let same_runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(SuccessfulCancelRunner);
+                let error = same_client
+                    .register_test_brain_runner_client("shared", lease_id, same_runner)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("quarantined"));
+                drop(same_client);
+                tokio::time::timeout(std::time::Duration::from_secs(1), same_handler)
+                    .await
+                    .expect("same-process rejected connection did not tear down")
+                    .unwrap()
+                    .unwrap();
+
+                let fresh_connection = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(fresh_connection, "shared", lease_id)
+                    .unwrap();
+                let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+                let fresh_server = std::sync::Arc::clone(&server);
+                let fresh_handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_id(server_stream, fresh_server, fresh_connection)
+                        .await
+                });
+                let fresh_client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                        .await
+                        .unwrap();
+                let fresh_runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(SuccessfulCancelRunner);
+                fresh_client
+                    .register_test_brain_runner_client("shared", lease_id, fresh_runner)
+                    .await
+                    .unwrap();
+                assert!(server
+                    .brain_runners()
+                    .cancel_run("shared", lease_id, run_id)
+                    .await
+                    .unwrap());
+                drop(fresh_client);
+                tokio::time::timeout(std::time::Duration::from_secs(1), fresh_handler)
+                    .await
+                    .expect("fresh-process connection did not tear down")
+                    .unwrap()
+                    .unwrap();
+                assert!(server
+                    .brain_runners()
+                    .test_connection_resources_retired(fresh_connection));
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5069,6 +5407,7 @@ mod tests {
                             expired_lease_id,
                             None,
                             Some(old_registration),
+                            None,
                         )
                         .await;
                     }
@@ -5156,6 +5495,7 @@ mod tests {
                             replacement_lease_id,
                             None,
                             Some(replacement_registration),
+                            None,
                         )
                         .await;
                     }
@@ -7194,6 +7534,9 @@ async fn handle_connection_with_shutdown(
     connection_id: uuid::Uuid,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    let dispatch_admission = server
+        .brain_runners()
+        .open_connection_dispatch(connection_id);
     let (reader, writer) = stream.into_split();
 
     let network = twoparty::VatNetwork::new(
@@ -7206,13 +7549,20 @@ async fn handle_connection_with_shutdown(
     let daemon_impl = FinchDaemonImpl::new(Arc::clone(&server), connection_id);
     let daemon_client: finch_daemon::Client = capnp_rpc::new_client(daemon_impl);
 
-    let rpc = RpcSystem::new(Box::new(network), Some(daemon_client.client));
-    tokio::pin!(rpc);
+    let mut rpc = Box::pin(RpcSystem::new(
+        Box::new(network),
+        Some(daemon_client.client),
+    ));
     let result = tokio::select! {
-        result = &mut rpc => result.map_err(anyhow::Error::from),
+        result = rpc.as_mut() => result.map_err(anyhow::Error::from),
         _ = shutdown.cancelled() => Ok(()),
+        _ = dispatch_admission.ejection_requested() => Ok(()),
     };
     drop(rpc);
+    // Dropping the RpcSystem revokes every capability transported by this
+    // connection. Publish that proof before waiting for active bridge guards:
+    // a hostile callback bridge may itself be awaiting this exact boundary.
+    dispatch_admission.mark_transport_closed();
     let teardown = server
         .brain_runners()
         .begin_connection_teardown(connection_id);
