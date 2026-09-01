@@ -117,10 +117,12 @@ async fn test_memory_stats() -> Result<()> {
         stats.tree_node_count >= leaves,
         "internal nodes are expected in addition to leaves"
     );
+    // A constant bound, not `depth < leaves`: the latter permits a 9-deep
+    // chain for 10 memories, which is the regression it is named for.
     assert!(
-        depth < leaves,
-        "ten near-identical turns must not build a chain one level per turn; \
-         got depth {depth} for {leaves} memories"
+        depth <= 4,
+        "ten near-identical turns must cluster, not chain; got depth {depth} \
+         for {leaves} memories"
     );
 
     Ok(())

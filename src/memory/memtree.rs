@@ -52,8 +52,10 @@ const THRESHOLD_DEPTH_SCALE: f32 = 13.0;
 /// This must stay ABOVE `NEAR_IDENTICAL_SIMILARITY`. When it sat below, pairs
 /// in the band between the two cleared the (saturated) threshold at every
 /// depth yet were never recognised as variants, so they promoted without
-/// bound: 200 sentences differing by one word built a 161-deep chain, and
-/// around 88% of real prose pairs land in that band.
+/// bound. Measured with the ceiling at 0.98, content at pairwise 0.985 reaches
+/// depth 60 across the 60 distinct vectors of
+/// `test_content_in_the_ceiling_band_does_not_chain` — one level per distinct
+/// input — against depth 25 with the ordering correct.
 const MAX_SIMILARITY_THRESHOLD: f32 = 0.995;
 
 /// What an insert did, so the caller can keep durable provenance correct.
@@ -252,9 +254,11 @@ impl MemTree {
                 // fan-out 1 and depth 2, however many arrive.
                 //
                 // Be precise about what this does and does not fix. The
-                // cluster head's own fan-out is unbounded — 13,650 repeats of
-                // one status line give one node with 13,650 children, the same
-                // shape #250 measured, one level below where it used to sit.
+                // cluster head's own fan-out is unbounded — 13,650 near-identical
+                // VARIANTS of one status line give one node with 13,650
+                // children, the same shape #250 measured, one level below where
+                // it used to sit. Byte-identical repeats never get here: they
+                // are deduplicated to a single childless leaf.
                 // That is intended: those are variants of a single message and
                 // belong together, retrieval scans linearly either way, and
                 // insert cost is unchanged. What this rule fixes is the depth,
@@ -682,10 +686,15 @@ mod tests {
         // Load-bearing ordering. When the ceiling sat below the variant cutoff,
         // pairs in the band between them cleared the saturated threshold at
         // every depth yet were never recognised as variants, so they promoted
-        // without bound. Nothing else in the suite lands in that band, so
-        // without this assertion the whole suite passes with the ceiling
-        // lowered — and a family at pairwise 0.985 then builds a 500-deep
-        // chain instead of stopping at 25.
+        // without bound — a family at pairwise 0.985 builds a 500-deep chain
+        // instead of stopping at 25.
+        //
+        // This assertion pins the constants; the behaviour is pinned by
+        // `test_content_in_the_ceiling_band_does_not_chain`, whose fixture sits
+        // inside the band at 0.98507 and fails with the ceiling at 0.98. Both
+        // are needed: this one measures nothing, and that one would not catch
+        // the constants being reordered past each other in the other
+        // direction.
         assert!(
             MAX_SIMILARITY_THRESHOLD > NEAR_IDENTICAL_SIMILARITY,
             "the depth-adaptive ceiling ({MAX_SIMILARITY_THRESHOLD}) must stay \
@@ -696,15 +705,25 @@ mod tests {
 
     #[test]
     fn test_content_in_the_ceiling_band_does_not_chain() {
-        // A fixture inside the reopened band: similarity above the ceiling but
-        // below the variant cutoff. Depth is bounded by the point at which the
-        // depth-adaptive threshold reaches the ceiling.
+        // A fixture whose pairwise similarity is 0.98507: above the ceiling
+        // this constant previously held (0.95, and 0.98 in the failure mode
+        // being guarded), and below `NEAR_IDENTICAL_SIMILARITY`.
+        //
+        // That band is the one that discriminates. Content at or above 0.99 is
+        // caught by the variant rule first and gives depth 2 whatever the
+        // ceiling is, so a fixture there proves nothing. An earlier version of
+        // this test sat at 0.97579 and passed unchanged with the ceiling
+        // lowered to 0.98 — the exact defect it names.
+        //
+        // Verified: with the ordering correct this bounds at depth 25; with the
+        // ceiling at 0.98 the same input chains one level per insert.
         let mut tree = MemTree::new_with_dim(64);
-        let mut base = vec![0.02_f32; 64];
-        base[0] = 1.0;
-        for i in 0..120 {
-            let mut v = base.clone();
-            v[1 + (i % 60)] += 0.16;
+        // 60, not 120: with `i % 60` over 0..120 every item had an exact
+        // embedding twin, so half the inserts took the variant branch and
+        // contributed nothing. Depth was identical for 60 and 120.
+        for i in 0..60 {
+            let mut v = vec![0.05_f32; 64];
+            v[1 + i] += 0.05;
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             tree.insert(
                 format!("banded item {i}"),
@@ -716,7 +735,7 @@ mod tests {
         assert!(
             tree.max_depth() <= 26,
             "depth must be bounded by the ceiling, not by the input count; \
-             got {} for 120 inserts",
+             got {} for 60 inserts",
             tree.max_depth()
         );
     }

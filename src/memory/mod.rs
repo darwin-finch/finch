@@ -678,8 +678,15 @@ impl MemorySystem {
             // declared `ON DELETE CASCADE` — so a plain REPLACE here silently
             // cascades away the provenance of every node it rewrites. Since
             // this function rewrites the whole tree on every insert, that
-            // destroyed all but the most recent source row: the dogfood store
-            // held 9 rows against 896 conversations.
+            // destroyed every source row except the one written later in the
+            // same transaction.
+            //
+            // The dogfood store held 9 rows against 896 conversations. The
+            // cascade alone accounts for all but one of those; the likely
+            // explanation for the survivors is the `node_id IS NULL` rows
+            // written for classifier-excluded turns, which a cascade through
+            // `tree_nodes` cannot reach. That is a hypothesis, not a measured
+            // fact.
             tx.execute(
                 "INSERT INTO tree_nodes
                  (node_id, parent_id, text, embedding, level, created_at, importance)
@@ -1170,7 +1177,8 @@ mod tests {
         // variant rule fires, promotion never happens, and this test silently
         // covers nothing. A previous version used "alpha" and "alpha two",
         // which measured 0.99275 and did exactly that. Swapping a single word
-        // measures 0.87.
+        // measures 0.9499 — below the cutoff, but by 0.040, not the 0.12
+        // an earlier version of this comment implied.
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
