@@ -7378,6 +7378,25 @@ fn summarize_csv(
     }))
 }
 
+/// Run an async host effect to completion from synchronous typed-program code.
+///
+/// The `join` below blocks the calling thread, and on a multi-threaded runtime
+/// that thread is a worker. If the future needs the runtime to make progress —
+/// `mem-store` waits for the MemTree loader — the worker it needs is the one
+/// blocking, and on a runtime with a single worker that is a deadlock. Shipped
+/// configuration reaches it: `#[tokio::main(flavor = "multi_thread")]` sets no
+/// `worker_threads`, so tokio uses `available_parallelism()`, which is one on a
+/// one-vCPU host. N concurrent effects reach it on an N-worker runtime.
+///
+/// `block_in_place` is the fix: it converts this worker into a blocking thread
+/// and hands its queue to a replacement, so the runtime keeps its full
+/// complement and the loader can be polled. A timeout cannot substitute — the
+/// blocked worker also owns the time driver on a one-worker runtime, so the
+/// `Sleep` would never fire either.
+///
+/// It panics on a current-thread runtime, hence the flavor check. That arm
+/// needs no help: `MemorySystem` loads synchronously there rather than
+/// spawning a loader it could not poll.
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
@@ -7385,12 +7404,19 @@ where
 {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| anyhow::anyhow!("typed host requires a Tokio runtime"))?;
-    std::thread::scope(|scope| {
-        scope
-            .spawn(move || handle.block_on(future))
-            .join()
-            .map_err(|_| anyhow::anyhow!("typed host worker panicked"))?
-    })
+    let flavor = handle.runtime_flavor();
+    let run = move || {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || handle.block_on(future))
+                .join()
+                .map_err(|_| anyhow::anyhow!("typed host worker panicked"))?
+        })
+    };
+    match flavor {
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(run),
+        _ => run(),
+    }
 }
 
 fn authority_state_from_parts(
