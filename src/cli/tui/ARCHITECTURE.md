@@ -53,13 +53,14 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   bounded, latched restoration attempt and always returns to Rust's unwind policy rather than
   parking forever. These binary paths complete within their larger absolute deadline under this
   supported-progress precondition and never treat a failed restoration as successful.
-- On supported Unix targets, `pthread_atfork` prepare atomically serializes fork with signal
-  arm/disarm and blocks terminal signals only on the forking thread. Its saved mask is one global
-  record protected by that atomic transition; callbacks use no Rust TLS, locks, allocation, or
-  Tokio. The child restores only slots whose current disposition is Finch's trampoline, using the
-  exact per-slot host action displaced by the completed arm. Terminal phase is never a proxy for
-  signal ownership. It then clears inherited sticky/monitor ownership (the monitor thread does not
-  survive `fork`) and restores the caller's mask. The supported child contract is immediate
+- On supported Unix targets, `pthread_atfork` prepare/parent never acquire or wait on application
+  state. Each arm has the kernel write the displaced host action directly into a permanent per-slot
+  record in the same `sigaction` operation that publishes Finch's trampoline. The child can therefore
+  query each current disposition and restore exactly the slots Finch still owns without consulting
+  terminal phase, an application transition, TLS, allocation, a lock, or a process-global saved
+  signal mask. A PID guard in the stable trampoline restores and requeues a signal selected in the
+  fork-child gap before the child callback runs, where the process-lifetime monitor no longer exists.
+  The child then clears inherited sticky/monitor ownership. The supported child contract is immediate
   exec/exit; starting another TUI in the un-execed child is outside scope.
 - The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
   exclusive lease, exact output generation, raw/protocol activation, bounded staged output, cleanup,

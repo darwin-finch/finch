@@ -1578,6 +1578,35 @@ pub fn supervised_signal_transition_stall_is_observed() -> io::Result<bool> {
     Ok(SUPERVISED_SIGNAL_TRANSITION_STALL_OBSERVED.load(Ordering::Acquire))
 }
 
+/// Arrange for the real signal handler to fork after an arm/disarm transition
+/// has acquired its application-side CAS and reached the selected stage.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[doc(hidden)]
+pub fn supervised_prepare_post_cas_signal_handler_fork(disarm: bool) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    SUPERVISED_POST_CAS_FORK_RESULT.store(0, Ordering::Release);
+    SUPERVISED_POST_CAS_FORK_READY.store(false, Ordering::Release);
+    SUPERVISED_POST_CAS_FORK_STAGE.store(
+        if disarm {
+            SUPERVISED_POST_CAS_DISARM
+        } else {
+            SUPERVISED_POST_CAS_ARM
+        },
+        Ordering::Release,
+    );
+    Ok(())
+}
+
+/// Take the child PID returned by the supervised signal-handler fork.
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[doc(hidden)]
+pub fn supervised_take_post_cas_signal_handler_fork_result() -> io::Result<i32> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok(SUPERVISED_POST_CAS_FORK_RESULT.swap(0, Ordering::AcqRel))
+}
+
 /// Report whether a fail-closed generation retains an explicit repair owner.
 #[cfg(unix)]
 #[doc(hidden)]
@@ -1613,17 +1642,9 @@ unsafe impl Sync for PreviousSignalActions {}
 static PREVIOUS_SIGNAL_ACTIONS: PreviousSignalActions =
     PreviousSignalActions(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-struct AtForkSignalMask(std::cell::UnsafeCell<nix::libc::sigset_t>);
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-unsafe impl Sync for AtForkSignalMask {}
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-static ATFORK_SIGNAL_MASK: AtForkSignalMask =
-    AtForkSignalMask(std::cell::UnsafeCell::new(unsafe { std::mem::zeroed() }));
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-static ATFORK_SIGNAL_MASK_VALID: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 static SIGNAL_ATFORK_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SIGNAL_OWNER_PROCESS_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 #[cfg(unix)]
 static NEXT_BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicU16 =
     std::sync::atomic::AtomicU16::new(0);
@@ -1658,6 +1679,21 @@ static SUPERVISED_SIGNAL_TRANSITION_STALL: std::sync::atomic::AtomicBool =
 #[cfg(unix)]
 static SUPERVISED_SIGNAL_TRANSITION_STALL_OBSERVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const SUPERVISED_POST_CAS_NONE: u8 = 0;
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const SUPERVISED_POST_CAS_ARM: u8 = 1;
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const SUPERVISED_POST_CAS_DISARM: u8 = 2;
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_POST_CAS_FORK_STAGE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(SUPERVISED_POST_CAS_NONE);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_POST_CAS_FORK_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+static SUPERVISED_POST_CAS_FORK_RESULT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
 #[cfg(unix)]
 static SUPERVISED_SIGNAL_DISARM_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1691,63 +1727,28 @@ static SUPERVISED_CLEANUP_PAUSE_OWNER: std::sync::atomic::AtomicU64 =
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_prepare() {
-    use std::sync::atomic::Ordering;
-    // Serialize fork with signal arm/disarm and with every other fork callback
-    // using the same process-global atomic transition. This makes the one
-    // process-global saved mask record exclusive without TLS, a mutex, or
-    // allocation. The supported progress contract requires the runnable
-    // signal-transition owner to finish its bounded application-side section.
-    while SIGNAL_TRANSITION
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        std::hint::spin_loop();
-    }
-    let mut blocked = unsafe { std::mem::zeroed::<nix::libc::sigset_t>() };
-    unsafe { nix::libc::sigemptyset(&mut blocked) };
-    for signal in TERMINAL_SIGNALS {
-        unsafe { nix::libc::sigaddset(&mut blocked, signal) };
-    }
-    let ok = unsafe {
-        nix::libc::pthread_sigmask(nix::libc::SIG_BLOCK, &blocked, ATFORK_SIGNAL_MASK.0.get()) == 0
-    };
-    ATFORK_SIGNAL_MASK_VALID.store(ok, Ordering::Release);
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-unsafe fn restore_atfork_signal_mask() {
-    if ATFORK_SIGNAL_MASK_VALID.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        unsafe {
-            nix::libc::pthread_sigmask(
-                nix::libc::SIG_SETMASK,
-                ATFORK_SIGNAL_MASK.0.get(),
-                std::ptr::null_mut(),
-            );
-        }
-    }
+    // Never wait here. A host signal handler can call fork after interrupting
+    // the same thread immediately after it acquired SIGNAL_TRANSITION. Waiting
+    // for that interrupted frame would self-deadlock, and a process-global
+    // saved signal mask cannot represent concurrent or nested forks.
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_parent() {
-    unsafe { restore_atfork_signal_mask() };
-    SIGNAL_TRANSITION.store(false, std::sync::atomic::Ordering::Release);
+    // Prepare acquired no application state, so parent has nothing to release.
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 unsafe extern "C" fn terminal_atfork_child() {
     use std::sync::atomic::Ordering;
-    // The caller's terminal signals remain blocked from prepare until the
-    // inherited Finch actions and sticky state have been withdrawn. Restore
-    // only a slot whose exact current action is Finch's trampoline, using the
-    // disposition displaced by that same arm operation. Terminal phase is not
-    // signal ownership: a public embedding renderer can be ACTIVE with no
-    // binary handlers at all.
-    let installed_mask = SIGNAL_INSTALLED_MASK.load(Ordering::Acquire);
+    // Each successful arm asks sigaction to write the displaced action directly
+    // into its permanent per-slot record. Thus observing Finch's trampoline is
+    // itself proof that the matching record was initialized, even when fork
+    // interrupted the arm before its diagnostic installed-mask publication.
+    // No application lock, transition, TLS, allocation, or per-fork mask is
+    // needed here, and terminal phase is never a signal-ownership proxy.
     let previous = unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr() };
     for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate() {
-        if installed_mask & (1 << index) == 0 {
-            continue;
-        }
         let mut current = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
         if unsafe { nix::libc::sigaction(signal, std::ptr::null(), &mut current) } == 0
             && current.sa_sigaction == terminal_signal_handler as *const () as usize
@@ -1762,13 +1763,15 @@ unsafe extern "C" fn terminal_atfork_child() {
     SIGNAL_PENDING_EPOCH.store(0, Ordering::Release);
     SIGNAL_TERMINATION_LATCHED.store(false, Ordering::Release);
     SIGNAL_TRANSITION.store(false, Ordering::Release);
+    SUPERVISED_POST_CAS_FORK_READY.store(false, Ordering::Release);
+    SUPERVISED_POST_CAS_FORK_STAGE.store(SUPERVISED_POST_CAS_NONE, Ordering::Release);
+    SUPERVISED_POST_CAS_FORK_RESULT.store(0, Ordering::Release);
     SIGNAL_MONITOR_STARTED.store(false, Ordering::Release);
+    SIGNAL_OWNER_PROCESS_ID.store(unsafe { nix::libc::getpid() }, Ordering::Release);
     BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
     TERMINAL_COORDINATOR
         .termination_requested
         .store(false, Ordering::Release);
-    unsafe { restore_atfork_signal_mask() };
-    SIGNAL_TRANSITION.store(false, Ordering::Release);
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -1910,6 +1913,56 @@ unsafe fn restore_signal_errno(_: nix::libc::c_int) {}
 extern "C" fn terminal_signal_handler(signal: nix::libc::c_int) {
     use std::sync::atomic::Ordering;
     let saved_errno = unsafe { signal_errno() };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let process_id = unsafe { nix::libc::getpid() };
+        if SIGNAL_OWNER_PROCESS_ID.load(Ordering::Acquire) != process_id {
+            // A signal can be selected in the fork child before libc reaches
+            // Finch's child callback. The monitor thread is absent there, so
+            // restore this exact slot and requeue the signal for the host
+            // action instead of publishing sticky work nobody can drain.
+            if let Some(index) = terminal_signal_index(signal) {
+                let previous = unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr().add(index) };
+                if unsafe { nix::libc::sigaction(signal, previous, std::ptr::null_mut()) } == 0 {
+                    unsafe { nix::libc::kill(process_id, signal) };
+                    unsafe { restore_signal_errno(saved_errno) };
+                    return;
+                }
+            }
+            unsafe { nix::libc::_exit(128 + signal) };
+        }
+
+        let fork_stage = SUPERVISED_POST_CAS_FORK_STAGE.load(Ordering::Acquire);
+        if fork_stage != SUPERVISED_POST_CAS_NONE
+            && SUPERVISED_POST_CAS_FORK_READY.load(Ordering::Acquire)
+        {
+            // Isolated causal proof only: fork from this real handler while
+            // the interrupted application frame still owns SIGNAL_TRANSITION.
+            let forked = unsafe { nix::libc::fork() };
+            if forked == 0 {
+                let mut interrupt_action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+                let restored = unsafe {
+                    nix::libc::sigaction(nix::libc::SIGINT, std::ptr::null(), &mut interrupt_action)
+                } == 0
+                    && interrupt_action.sa_sigaction == nix::libc::SIG_DFL;
+                if !restored {
+                    unsafe { nix::libc::_exit(78) };
+                }
+                // SIGTERM is distinct from the currently blocked SIGINT. The
+                // embedding handler displaced by Finch must run and return;
+                // a stale trampoline or default disposition cannot reach 0.
+                unsafe {
+                    nix::libc::raise(nix::libc::SIGTERM);
+                    nix::libc::_exit(79);
+                }
+            }
+            SUPERVISED_POST_CAS_FORK_RESULT.store(forked, Ordering::Release);
+            SUPERVISED_POST_CAS_FORK_READY.store(false, Ordering::Release);
+            SUPERVISED_POST_CAS_FORK_STAGE.store(SUPERVISED_POST_CAS_NONE, Ordering::Release);
+            unsafe { restore_signal_errno(saved_errno) };
+            return;
+        }
+    }
     // This stable process-lifetime trampoline has no session or generation
     // identity to tear. Even if the kernel selected it before sigaction
     // restoration and does not enter user code until after Drop or re-arm,
@@ -1926,6 +1979,16 @@ extern "C" fn terminal_signal_handler(signal: nix::libc::c_int) {
         SIGNAL_PENDING_EPOCH.fetch_add(1, Ordering::Release);
     }
     unsafe { restore_signal_errno(saved_errno) };
+}
+
+#[cfg(unix)]
+fn terminal_signal_index(signal: nix::libc::c_int) -> Option<usize> {
+    match signal {
+        nix::libc::SIGINT => Some(0),
+        nix::libc::SIGTERM => Some(1),
+        nix::libc::SIGHUP => Some(2),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -1993,6 +2056,8 @@ impl BinaryTerminalSession {
             BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
             return Err(error);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        SIGNAL_OWNER_PROCESS_ID.store(unsafe { nix::libc::getpid() }, Ordering::Release);
         if let Err(error) = ensure_terminal_signal_monitor() {
             BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
             return Err(error);
@@ -2272,6 +2337,40 @@ fn release_signal_transition() {
     publish_terminal_progress();
 }
 
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn supervised_pause_after_signal_transition_cas(stage: u8) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    if SUPERVISED_POST_CAS_FORK_STAGE.load(Ordering::Acquire) != stage {
+        return Ok(());
+    }
+    // The proof/env gate ran in the public setup method before the application
+    // transition was acquired. This critical section uses only the configured
+    // atomics and a real synchronous signal delivery to its owning thread.
+    SUPERVISED_POST_CAS_FORK_READY.store(true, Ordering::Release);
+    if unsafe { nix::libc::raise(nix::libc::SIGINT) } != 0 {
+        SUPERVISED_POST_CAS_FORK_READY.store(false, Ordering::Release);
+        SUPERVISED_POST_CAS_FORK_STAGE.store(SUPERVISED_POST_CAS_NONE, Ordering::Release);
+        return Err(io::Error::last_os_error());
+    }
+    let forked = SUPERVISED_POST_CAS_FORK_RESULT.load(Ordering::Acquire);
+    if SUPERVISED_POST_CAS_FORK_STAGE.load(Ordering::Acquire) == stage || forked == 0 {
+        SUPERVISED_POST_CAS_FORK_READY.store(false, Ordering::Release);
+        SUPERVISED_POST_CAS_FORK_STAGE.store(SUPERVISED_POST_CAS_NONE, Ordering::Release);
+        return Err(io::Error::other(
+            "supervised signal handler did not fork while transition CAS was held",
+        ));
+    }
+    if forked < 0 {
+        return Err(io::Error::other("supervised signal-handler fork failed"));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn supervised_pause_after_signal_transition_cas(_: u8) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
     use std::sync::atomic::Ordering;
@@ -2304,16 +2403,30 @@ fn arm_binary_terminal_signals(_generation: u64) -> io::Result<()> {
         let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
         action.sa_sigaction = terminal_signal_handler as *const () as usize;
         unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
-        let mut old = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
-        if unsafe { nix::libc::sigaction(signal, &action, &mut old) } < 0 {
+        // The kernel writes the exact displaced action into permanent storage
+        // as part of the same sigaction operation that makes our trampoline
+        // observable. A fork child therefore never needs to wait for a later
+        // Rust publication before this record is safe to consume.
+        if unsafe { nix::libc::sigaction(signal, &action, previous.add(index)) } < 0 {
             first_error = Some(io::Error::last_os_error());
             break;
         }
-        unsafe { previous.add(index).write(old) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if index == 0 {
+            // Deliberately before installed-mask publication: the fork child
+            // must derive this exact completed kernel arm from current
+            // sigaction plus the record initialized by that same syscall.
+            if let Err(error) =
+                supervised_pause_after_signal_transition_cas(SUPERVISED_POST_CAS_ARM)
+            {
+                installed_mask |= 1 << index;
+                first_error = Some(error);
+                break;
+            }
+        }
         installed_mask |= 1 << index;
-        // Publish only after the displaced disposition is initialized. Fork
-        // prepare shares SIGNAL_TRANSITION, so a child observes either the
-        // complete prior mask or this exact completed per-slot arm state.
+        // This mask is application cleanup state only. Atfork derives kernel
+        // ownership from the current sigaction and does not wait on it.
         SIGNAL_INSTALLED_MASK.store(installed_mask, Ordering::Release);
     }
     if let Some(error) = first_error {
@@ -2361,6 +2474,11 @@ fn disarm_binary_terminal_signals_until(deadline: std::time::Instant) -> io::Res
     if SIGNAL_INSTALLED_MASK.load(Ordering::Acquire) == 0 {
         release_signal_transition();
         return Ok(());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Err(error) = supervised_pause_after_signal_transition_cas(SUPERVISED_POST_CAS_DISARM) {
+        release_signal_transition();
+        return Err(error);
     }
     let installed_mask = SIGNAL_INSTALLED_MASK.swap(0, Ordering::AcqRel);
     let previous = unsafe { (*PREVIOUS_SIGNAL_ACTIONS.0.get()).as_ptr() };

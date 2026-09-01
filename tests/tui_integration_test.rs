@@ -33,6 +33,11 @@ extern "C" fn embedding_signal_handler(_: nix::libc::c_int) {
     EMBEDDING_SIGNAL_OBSERVED.store(true, Ordering::Release);
 }
 
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+extern "C" fn embedding_signal_exit_handler(_: nix::libc::c_int) {
+    unsafe { nix::libc::_exit(0) };
+}
+
 #[cfg(unix)]
 fn install_embedding_sigterm() -> anyhow::Result<()> {
     let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
@@ -41,6 +46,41 @@ fn install_embedding_sigterm() -> anyhow::Result<()> {
     anyhow::ensure!(
         unsafe { nix::libc::sigaction(nix::libc::SIGTERM, &action, std::ptr::null_mut()) } == 0,
         "install embedding SIGTERM handler"
+    );
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn install_embedding_sigterm_exit() -> anyhow::Result<()> {
+    let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+    action.sa_sigaction = embedding_signal_exit_handler as *const () as usize;
+    unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
+    anyhow::ensure!(
+        unsafe { nix::libc::sigaction(nix::libc::SIGTERM, &action, std::ptr::null_mut()) } == 0,
+        "install embedding SIGTERM exit handler"
+    );
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn install_default_sigint() -> anyhow::Result<()> {
+    let mut action = unsafe { std::mem::zeroed::<nix::libc::sigaction>() };
+    action.sa_sigaction = nix::libc::SIG_DFL;
+    unsafe { nix::libc::sigemptyset(&mut action.sa_mask) };
+    anyhow::ensure!(
+        unsafe { nix::libc::sigaction(nix::libc::SIGINT, &action, std::ptr::null_mut()) } == 0,
+        "install default SIGINT action"
+    );
+    let mut signals = unsafe { std::mem::zeroed::<nix::libc::sigset_t>() };
+    unsafe {
+        nix::libc::sigemptyset(&mut signals);
+        nix::libc::sigaddset(&mut signals, nix::libc::SIGINT);
+    }
+    anyhow::ensure!(
+        unsafe {
+            nix::libc::pthread_sigmask(nix::libc::SIG_UNBLOCK, &signals, std::ptr::null_mut())
+        } == 0,
+        "unblock SIGINT on transition owner"
     );
     Ok(())
 }
@@ -68,6 +108,57 @@ fn fork_child_must_observe_embedding_sigterm() -> anyhow::Result<()> {
         nix::libc::WIFEXITED(status) && nix::libc::WEXITSTATUS(status) == 0,
         "fork child did not receive the current embedding disposition: {status}"
     );
+    Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn reap_signal_handler_fork_child() -> anyhow::Result<()> {
+    let forked = finch::cli::tui::supervised_take_post_cas_signal_handler_fork_result()?;
+    anyhow::ensure!(forked > 0, "signal-handler fork failed: {forked}");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut status = 0;
+        let waited = unsafe { nix::libc::waitpid(forked, &mut status, nix::libc::WNOHANG) };
+        if waited == forked {
+            anyhow::ensure!(
+                nix::libc::WIFEXITED(status) && nix::libc::WEXITSTATUS(status) == 0,
+                "signal-handler fork child did not observe exact restored dispositions: {status}"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(waited == 0, "wait for signal-handler fork child: {waited}");
+        if Instant::now() >= deadline {
+            unsafe {
+                nix::libc::kill(forked, nix::libc::SIGKILL);
+                nix::libc::waitpid(forked, &mut status, 0);
+            }
+            anyhow::bail!("signal-handler fork child exceeded bounded completion deadline");
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+fn fork_from_signal_handler_during_transition(disarm: bool) -> anyhow::Result<()> {
+    // Fail-before: pthread_atfork prepare spun on SIGNAL_TRANSITION, but this
+    // handler interrupted the thread that owned that CAS. The interrupted arm
+    // or disarm frame could never run to release it.
+    install_default_sigint()?;
+    install_embedding_sigterm_exit()?;
+    let signals = finch::cli::tui::BinaryTerminalSession::install()?
+        .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+
+    if disarm {
+        let mut renderer = new_renderer()?;
+        finch::cli::tui::supervised_prepare_post_cas_signal_handler_fork(true)?;
+        renderer.shutdown()?;
+    } else {
+        finch::cli::tui::supervised_prepare_post_cas_signal_handler_fork(false)?;
+        let mut renderer = new_renderer()?;
+        renderer.shutdown()?;
+    }
+    reap_signal_handler_fork_child()?;
+    drop(signals);
     Ok(())
 }
 
@@ -531,6 +622,16 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             "parent cleanup overwrote the embedding host's replacement signal action"
         );
         marker(b"FINCH_FORK_REPLACEMENT_HOST_SIGNAL_PRESERVED")?;
+        return Ok(());
+    }
+    if mode == "fork-handler-during-arm-transition" {
+        fork_from_signal_handler_during_transition(false)?;
+        marker(b"FINCH_FORK_HANDLER_ARM_TRANSITION_COMPLETED")?;
+        return Ok(());
+    }
+    if mode == "fork-handler-during-disarm-transition" {
+        fork_from_signal_handler_during_transition(true)?;
+        marker(b"FINCH_FORK_HANDLER_DISARM_TRANSITION_COMPLETED")?;
         return Ok(());
     }
 
@@ -1797,6 +1898,27 @@ fn test_fork_and_cleanup_preserve_host_replacement_of_armed_signal() {
         "fork-host-replaces-armed-signal",
         b"FINCH_FORK_REPLACEMENT_HOST_SIGNAL_PRESERVED",
     );
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn test_signal_handler_fork_does_not_wait_on_interrupted_transition_owner() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    for (mode, marker) in [
+        (
+            "fork-handler-during-arm-transition",
+            b"FINCH_FORK_HANDLER_ARM_TRANSITION_COMPLETED".as_slice(),
+        ),
+        (
+            "fork-handler-during-disarm-transition",
+            b"FINCH_FORK_HANDLER_DISARM_TRANSITION_COMPLETED".as_slice(),
+        ),
+    ] {
+        assert_fork_signal_mode(mode, marker);
+    }
 }
 
 #[cfg(unix)]
