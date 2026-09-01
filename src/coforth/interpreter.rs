@@ -10781,7 +10781,13 @@ pub(crate) fn xlsx_read_cell(path: &str, sheet: Option<&str>, addr: &str) -> Res
     let range = wb
         .worksheet_range(&sheet_name)
         .map_err(|e| anyhow::anyhow!("cannot read sheet '{sheet_name}': {e}"))?;
-    let cell = range.get((row as usize, col as usize));
+    // `get_value`, not `get`: `Range::get` takes a position *relative to the
+    // range's own start*, while a cell address like "B3" is absolute. Any sheet
+    // whose used range does not begin at A1 therefore read the wrong cell, or
+    // an empty one — `xlsx@ B3` on a sheet whose first value is in B3 returned
+    // "". Surfaced by the #185 fixtures; the defect predates the Calamine
+    // upgrade.
+    let cell = range.get_value((row, col));
     Ok(cell.map(data_to_string).unwrap_or_default())
 }
 
@@ -12453,6 +12459,166 @@ fn collect_case(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a one-sheet workbook and hand back its path, keeping the temp
+    /// directory alive.
+    fn spreadsheet_fixture(sheet: &str, cells: &[(u32, u16, &str)]) -> (tempfile::TempDir, String) {
+        use rust_xlsxwriter::Workbook;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.xlsx");
+        let mut workbook = Workbook::new();
+        let ws = workbook.add_worksheet();
+        ws.set_name(sheet).unwrap();
+        for (row, col, value) in cells {
+            ws.write_string(*row, *col, *value).unwrap();
+        }
+        workbook.save(&path).unwrap();
+        let path = path.to_string_lossy().to_string();
+        (dir, path)
+    }
+
+    /// #185. Calamine 0.26 -> 0.36 moves quick-xml to the 0.41 line, clearing
+    /// RUSTSEC-2026-0194 and -0195. The API Finch uses is unchanged, so a clean
+    /// compile proves nothing; the risk is behavioural. The release notes name
+    /// EOL normalization and ASCII-whitespace trimming unless
+    /// `xml:space="preserve"`, both of which would silently corrupt cell values
+    /// read through `xlsx@`.
+    #[test]
+    fn test_xlsx_read_preserves_whitespace_newlines_and_unicode() {
+        let cells = [
+            (0, 0, "  padded  "),
+            (
+                1,
+                0,
+                "line one
+line two",
+            ),
+            (
+                2,
+                0,
+                "line one
+line two",
+            ),
+            (3, 0, "naïve café — 日本語 🕊"),
+            (4, 0, ""),
+            (5, 0, "0042"),
+        ];
+        let (_dir, path) = spreadsheet_fixture("Data", &cells);
+
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A1").unwrap(),
+            "  padded  ",
+            "leading and trailing spaces must survive; 0.41 trims ASCII \
+             whitespace unless the cell declares xml:space=preserve, and the \
+             writer is what decides that"
+        );
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A2").unwrap(),
+            "line one\nline two",
+            "an embedded newline must survive"
+        );
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A4").unwrap(),
+            "naïve café — 日本語 🕊",
+            "multi-byte content must round-trip"
+        );
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A5").unwrap(),
+            "",
+            "an empty cell reads as empty, not as an error"
+        );
+        assert_eq!(
+            xlsx_read_cell(&path, None, "A6").unwrap(),
+            "0042",
+            "a leading-zero string must not be coerced to a number"
+        );
+    }
+
+    #[test]
+    fn test_xlsx_reads_a_named_sheet_and_lists_sheet_names() {
+        let (_dir, path) = spreadsheet_fixture("Quarterly Results", &[(2, 1, "B3 value")]);
+        assert_eq!(
+            xlsx_read_cell(&path, Some("Quarterly Results"), "B3").unwrap(),
+            "B3 value"
+        );
+        assert_eq!(
+            xlsx_sheet_names(&path).unwrap(),
+            "Quarterly Results",
+            "a sheet name with a space must survive the upgrade"
+        );
+    }
+
+    /// A cell beyond the used range reads as empty rather than erroring, and a
+    /// cell address that is not an address errors rather than reading garbage.
+    #[test]
+    fn test_xlsx_out_of_range_is_empty_and_a_bad_address_is_an_error() {
+        let (_dir, path) = spreadsheet_fixture("Data", &[(0, 0, "only cell")]);
+        assert_eq!(
+            xlsx_read_cell(&path, None, "Z99").unwrap(),
+            "",
+            "a cell past the used range is empty"
+        );
+        let error = xlsx_read_cell(&path, None, "not-an-address").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid cell address"),
+            "got {error}"
+        );
+    }
+
+    /// Truthful errors rather than empty data: the issue is explicit that a
+    /// malformed archive must surface as an error, not as an empty read.
+    #[test]
+    fn test_xlsx_malformed_and_missing_inputs_error_rather_than_read_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let truncated = dir.path().join("truncated.xlsx");
+        std::fs::write(&truncated, b"PK\x03\x04 not really a workbook").unwrap();
+        let error = xlsx_read_cell(truncated.to_str().unwrap(), None, "A1").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot open"),
+            "a malformed archive must name the failure, not read as empty; got {error}"
+        );
+
+        let missing = dir.path().join("absent.xlsx");
+        let error = xlsx_read_cell(missing.to_str().unwrap(), None, "A1").unwrap_err();
+        assert!(error.to_string().contains("cannot open"), "got {error}");
+
+        let unnamed = dir.path().join("nosuchsheet.xlsx");
+        std::fs::copy(spreadsheet_fixture("Data", &[(0, 0, "x")]).1, &unnamed).unwrap();
+        let error = xlsx_read_cell(unnamed.to_str().unwrap(), Some("Missing"), "A1").unwrap_err();
+        assert!(
+            error.to_string().contains("cannot read sheet"),
+            "naming a sheet that does not exist must error; got {error}"
+        );
+    }
+
+    /// The write path reads the whole sheet with calamine, patches one cell and
+    /// rewrites the workbook, so an upgrade that changed read behaviour would
+    /// corrupt every untouched cell on the next write.
+    #[test]
+    fn test_xlsx_write_patches_one_cell_and_leaves_the_rest_intact() {
+        let (_dir, path) = spreadsheet_fixture(
+            "Data",
+            &[
+                (0, 0, "keep me"),
+                (0, 1, "  spaced  "),
+                (1, 0, "naïve café"),
+                (2, 0, "replace me"),
+            ],
+        );
+
+        xlsx_write_cell(&path, "A3", "replaced").unwrap();
+
+        assert_eq!(xlsx_read_cell(&path, None, "A3").unwrap(), "replaced");
+        assert_eq!(xlsx_read_cell(&path, None, "A1").unwrap(), "keep me");
+        assert_eq!(
+            xlsx_read_cell(&path, None, "B1").unwrap(),
+            "  spaced  ",
+            "an untouched cell's whitespace must survive the read-patch-write \
+             round trip"
+        );
+        assert_eq!(xlsx_read_cell(&path, None, "A2").unwrap(), "naïve café");
+    }
 
     #[test]
     fn test_arithmetic() {
