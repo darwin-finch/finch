@@ -512,6 +512,16 @@ fn create_proof(
         supervisor_metadata.dev(),
         supervisor_metadata.ino()
     )?;
+    // The inode pair alone cannot tell a rebuild from a substitution. Cargo
+    // replaces a binary by writing a new file and renaming it into place, so a
+    // legitimate relink of a workspace target allocates a new inode and looks
+    // exactly like someone swapping the program. Recording what the image
+    // *contains* separates the two (#259).
+    writeln!(
+        contents,
+        "{}",
+        hex::encode(Sha256::digest(fs::read(&supervisor_executable)?))
+    )?;
     let signature = signing_key.sign(contents.as_bytes());
     writeln!(contents, "{}", hex::encode(signature.to_bytes()))?;
 

