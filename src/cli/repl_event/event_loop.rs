@@ -2221,6 +2221,14 @@ impl EventLoop {
     }
 
     #[cfg(test)]
+    pub(crate) async fn next_queued_event_for_test(&mut self) -> Option<ReplEvent> {
+        tokio::time::timeout(std::time::Duration::from_millis(150), self.event_rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_memory_system_for_test(
         &mut self,
         memory_system: std::sync::Arc<crate::memory::MemorySystem>,
@@ -4899,10 +4907,18 @@ Rules:\n\
                             ));
                         }
                         self.last_home_watch_error = Some(detail);
-                        self.schedule_home_brain_reconnect(
-                            self.home_watch_epoch,
-                            attempt.saturating_add(1),
-                        );
+                        if crate::ipc::is_runner_process_quarantined(&error) {
+                            self.home_watch_epoch = self.home_watch_epoch.wrapping_add(1);
+                            self.runner_renewal_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            self.home_runner_lease_id = None;
+                            self.runner_reconnect_target = None;
+                        } else {
+                            self.schedule_home_brain_reconnect(
+                                self.home_watch_epoch,
+                                attempt.saturating_add(1),
+                            );
+                        }
                     }
                 }
             }
@@ -4931,6 +4947,7 @@ Rules:\n\
                         }
                     }
                     Err(error) => {
+                        let terminal_quarantine = crate::ipc::is_runner_process_quarantined(&error);
                         let detail = error.to_string();
                         if self.last_home_runner_error.as_deref() != Some(&detail) {
                             self.output_manager.write_info(format!(
@@ -4939,7 +4956,12 @@ Rules:\n\
                             ));
                         }
                         self.last_home_runner_error = Some(detail);
-                        if self
+                        if terminal_quarantine {
+                            self.runner_renewal_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            self.home_runner_lease_id = None;
+                            self.runner_reconnect_target = None;
+                        } else if self
                             .last_home_runner_error
                             .as_deref()
                             .is_some_and(|detail| detail.contains("handed off"))
@@ -4970,6 +4992,7 @@ Rules:\n\
                 {
                     return Ok(());
                 }
+                let mut terminal_quarantine = false;
                 let registration = match (lease_id, self.ipc_client.as_ref()) {
                     (Some(lease_id), Some(ipc)) => match ipc
                         .register_brain_runner(&brain, lease_id, self.event_tx.clone())
@@ -5009,7 +5032,10 @@ Rules:\n\
                                 }
                             }
                         }
-                        Err(error) => Err(error.to_string()),
+                        Err(error) => {
+                            terminal_quarantine = crate::ipc::is_runner_process_quarantined(&error);
+                            Err(error.to_string())
+                        }
                     },
                     (Some(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),
                     (None, _) => Err(detail.clone()),
@@ -5035,8 +5061,15 @@ Rules:\n\
                     environment,
                     lease_id: self.home_runner_lease_id,
                 };
-                self.runner_reconnect_target = (!handed_off).then(|| reconnect_target.clone());
-                if !active && !handed_off {
+                if terminal_quarantine {
+                    self.runner_renewal_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    self.home_runner_lease_id = None;
+                    self.runner_reconnect_target = None;
+                } else {
+                    self.runner_reconnect_target = (!handed_off).then(|| reconnect_target.clone());
+                }
+                if !active && !handed_off && !terminal_quarantine {
                     self.schedule_home_runner_reconnect(epoch, 0, reconnect_target);
                 }
                 if self.active_remote_brain.is_none() {

@@ -950,6 +950,9 @@ interface BrainRunner {
   # Cancels and waits for one memory projection's frontend insertion future.
   # The reply is the physical-quiescence acknowledgement for that exact run.
   cancelMemory @4 (brain :Text, runId :Text) -> ();
+  # Explicit fail-closed notification issued before the daemon ejects a
+  # non-quiescent runner transport. Generic EOF is not an ejection signal.
+  ejectProcess @5 (reason :Text) -> ();
 }
 
 # Long-lived reverse capability bound to the exact registered runner lease.

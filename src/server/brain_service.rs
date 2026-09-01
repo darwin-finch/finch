@@ -2733,15 +2733,18 @@ mod tests {
             .unwrap()
             .checkpoint
             .unwrap();
-        request
+        let late = request
             .response_tx
             .send(Ok(crate::server::RunnerProgramResult {
                 output: "late".into(),
                 runtime_revision: 0,
                 checkpoint,
                 effect_journal: Vec::new(),
-            }))
-            .unwrap();
+            }));
+        assert!(
+            late.is_err(),
+            "lease invalidation must observably close the compatible response receiver"
+        );
         let error = dispatch.await.unwrap().unwrap_err();
         let error = error
             .downcast_ref::<crate::server::RunnerDispatchError>()
@@ -2755,9 +2758,26 @@ mod tests {
             .unwrap();
         assert_ne!(replacement.lease_id, expired.lease_id);
         let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::unbounded_channel();
-        service
-            .runners
-            .register("shared", replacement.lease_id, replacement_tx);
+        let replacement_id =
+            service
+                .runners
+                .register("shared", replacement.lease_id, replacement_tx);
+        assert!(
+            !service
+                .runners
+                .has_registration("shared", replacement.lease_id),
+            "replacement must remain pending while the compatible callback channel is live"
+        );
+        drop(rx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service
+                .runners
+                .wait_registration_active("shared", replacement_id),
+        )
+        .await
+        .expect("replacement did not activate after physical compatible-channel settlement")
+        .unwrap();
         assert!(!service.runners.invalidate_lease("shared", expired.lease_id));
         assert!(service
             .runners

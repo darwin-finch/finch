@@ -28,13 +28,26 @@ use crate::server::AgentServer;
 struct FinchDaemonImpl {
     server: Arc<AgentServer>,
     connection_id: uuid::Uuid,
+    peer_process_identity: crate::server::RunnerProcessIdentity,
 }
 
 impl FinchDaemonImpl {
     fn new(server: Arc<AgentServer>, connection_id: uuid::Uuid) -> Self {
+        let peer_process_identity =
+            crate::server::RunnerProcessIdentity::for_pid(std::process::id())
+                .expect("current test process must have a stable identity");
+        Self::new_with_peer_process(server, connection_id, peer_process_identity)
+    }
+
+    fn new_with_peer_process(
+        server: Arc<AgentServer>,
+        connection_id: uuid::Uuid,
+        peer_process_identity: crate::server::RunnerProcessIdentity,
+    ) -> Self {
         Self {
             server,
             connection_id,
+            peer_process_identity,
         }
     }
 }
@@ -1899,7 +1912,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let lease_id = crate::brain::store::RunnerLeaseId(lease_uuid);
-        let process_epoch = match uuid::Uuid::parse_str(&process_epoch_text) {
+        let _process_epoch = match uuid::Uuid::parse_str(&process_epoch_text) {
             Ok(value) if !value.is_nil() => value,
             Ok(_) => {
                 return Promise::err(capnp::Error::failed(
@@ -1940,7 +1953,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let server = Arc::clone(&self.server);
         let registration_id = match broker.register_bounded_for_connection(
             self.connection_id,
-            process_epoch,
+            self.peer_process_identity,
             brain.clone(),
             lease_id,
             tx,
@@ -2201,6 +2214,7 @@ where
 
 async fn eject_nonquiescent_runner_connection(
     server: &AgentServer,
+    runner: &finch_ipc_capnp::brain_runner::Client,
     connection_id: Option<crate::brain::store::ConnectionId>,
     dispatch_admission: Option<&Arc<crate::server::ConnectionDispatchAdmission>>,
 ) {
@@ -2209,7 +2223,19 @@ async fn eject_nonquiescent_runner_connection(
         return;
     };
     match server.brain_runners().eject_connection(connection_id.0) {
-        Ok(_) => dispatch_admission.wait_transport_closed().await,
+        Ok(admission) => {
+            let mut notification = runner.eject_process_request();
+            notification.get().set_reason(
+                "runner callback did not physically settle before its cleanup deadline",
+            );
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                notification.send().promise,
+            )
+            .await;
+            admission.publish_ejection();
+            dispatch_admission.wait_transport_closed().await;
+        }
         Err(error) => tracing::warn!(connection_id = %connection_id.0, %error,
             "could not eject non-quiescent runner connection"),
     }
@@ -2285,6 +2311,8 @@ async fn forward_runner_request(
         deadline,
         cleanup_timeout,
         dispatch_gate,
+        run_dispatch_gate,
+        enforce_run_fence,
     } = request;
     match request {
         crate::server::RunnerRequest::Program(request) => {
@@ -2355,6 +2383,8 @@ async fn forward_runner_request(
             let mut response_tx = request.response_tx;
             let Some(rpc_future) = server.brain_runners().admit_runner_dispatch(
                 &dispatch_gate,
+                &run_dispatch_gate,
+                enforce_run_fence,
                 &callback_cancel,
                 &generation_cancel,
                 deadline,
@@ -2389,6 +2419,7 @@ async fn forward_runner_request(
                 if !settled {
                     eject_nonquiescent_runner_connection(
                         &server,
+                        &runner,
                         connection_id,
                         dispatch_admission.as_ref(),
                     )
@@ -2504,6 +2535,8 @@ async fn forward_runner_request(
                     Ok(()) => {
                         let Some(rpc_future) = server.brain_runners().admit_runner_dispatch(
                             &dispatch_gate,
+                            &run_dispatch_gate,
+                            enforce_run_fence,
                             &callback_cancel,
                             &generation_cancel,
                             deadline,
@@ -2538,6 +2571,7 @@ async fn forward_runner_request(
                             if !settled {
                                 eject_nonquiescent_runner_connection(
                                     &server,
+                                    &runner,
                                     connection_id,
                                     dispatch_admission.as_ref(),
                                 )
@@ -2613,6 +2647,8 @@ async fn forward_runner_request(
             let mut response_tx = request.response_tx;
             let Some(rpc_future) = server.brain_runners().admit_runner_dispatch(
                 &dispatch_gate,
+                &run_dispatch_gate,
+                enforce_run_fence,
                 &callback_cancel,
                 &generation_cancel,
                 deadline,
@@ -2643,6 +2679,7 @@ async fn forward_runner_request(
                 if !settled {
                     eject_nonquiescent_runner_connection(
                         &server,
+                        &runner,
                         connection_id,
                         dispatch_admission.as_ref(),
                     )
@@ -2699,6 +2736,8 @@ async fn forward_runner_request(
             let response_tx = request.response_tx;
             let Some(rpc) = server.brain_runners().admit_runner_dispatch(
                 &dispatch_gate,
+                &run_dispatch_gate,
+                enforce_run_fence,
                 &callback_cancel,
                 &generation_cancel,
                 deadline,
@@ -2763,6 +2802,8 @@ fn bounded_test_runner_request(
         deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
         cleanup_timeout: std::time::Duration::from_secs(2),
         dispatch_gate: std::sync::Arc::default(),
+        run_dispatch_gate: std::sync::Arc::default(),
+        enforce_run_fence: true,
     }
 }
 
@@ -4966,6 +5007,8 @@ mod tests {
             deadline,
             cleanup_timeout: std::time::Duration::from_millis(10),
             dispatch_gate: std::sync::Arc::default(),
+            run_dispatch_gate: std::sync::Arc::default(),
+            enforce_run_fence: true,
         };
 
         // Pause an actual broker envelope between enqueue and bridge dequeue,
@@ -5056,6 +5099,7 @@ mod tests {
     struct HostileNeverSettlingMemoryRunner {
         started: Option<tokio::sync::oneshot::Sender<()>>,
         dropped: Option<tokio::sync::oneshot::Sender<()>>,
+        process: std::sync::Arc<crate::ipc::client::RunnerProcessIdentity>,
     }
 
     struct CallbackDropProof(Option<tokio::sync::oneshot::Sender<()>>);
@@ -5113,6 +5157,17 @@ mod tests {
             _results: super::finch_ipc_capnp::brain_runner::CancelMemoryResults,
         ) -> capnp::capability::Promise<(), capnp::Error> {
             capnp::capability::Promise::from_future(std::future::pending())
+        }
+
+        fn eject_process(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::EjectProcessParams,
+            _results: super::finch_ipc_capnp::brain_runner::EjectProcessResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.process
+                .poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            capnp::capability::Promise::ok(())
         }
     }
 
@@ -5204,6 +5259,7 @@ mod tests {
                     capnp_rpc::new_client(HostileNeverSettlingMemoryRunner {
                         started: Some(started_tx),
                         dropped: Some(dropped_tx),
+                        process: old_client.test_runner_process_identity(),
                     });
                 old_client
                     .register_test_brain_runner_client("shared", lease_id, hostile)
@@ -5270,10 +5326,10 @@ mod tests {
                     super::handle_connection_with_id(server_stream, same_server, same_connection)
                         .await
                 });
-                let same_client = old_client
-                    .reconnect_test_process(client_stream)
-                    .await
-                    .unwrap();
+                let same_client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                        .await
+                        .unwrap();
                 let same_runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(SuccessfulCancelRunner);
                 let error = same_client
@@ -5295,9 +5351,20 @@ mod tests {
                     .unwrap();
                 let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
                 let fresh_server = std::sync::Arc::clone(&server);
+                let actual_identity =
+                    crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap();
+                let fresh_process_identity = crate::server::RunnerProcessIdentity {
+                    pid: actual_identity.pid,
+                    start_token: actual_identity.start_token.wrapping_add(1),
+                };
                 let fresh_handler = tokio::task::spawn_local(async move {
-                    super::handle_connection_with_id(server_stream, fresh_server, fresh_connection)
-                        .await
+                    super::handle_connection_with_id_and_peer_process(
+                        server_stream,
+                        fresh_server,
+                        fresh_connection,
+                        fresh_process_identity,
+                    )
+                    .await
                 });
                 let fresh_client =
                     crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
@@ -5323,6 +5390,387 @@ mod tests {
                 assert!(server
                     .brain_runners()
                     .test_connection_resources_retired(fresh_connection));
+            })
+            .await;
+    }
+
+    #[test]
+    fn test_genuinely_new_os_process_identity_recovers_after_parent_quarantine() {
+        const CHILD_SOCKET: &str = "FINCH_TEST_RUNNER_IDENTITY_CHILD_SOCKET";
+        const CHILD_LEASE: &str = "FINCH_TEST_RUNNER_IDENTITY_CHILD_LEASE";
+        if let (Ok(socket), Ok(lease)) = (std::env::var(CHILD_SOCKET), std::env::var(CHILD_LEASE)) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async move {
+                let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+                let client = crate::ipc::IpcClient::from_stream_with_fresh_test_process(stream)
+                    .await
+                    .unwrap();
+                let runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(SuccessfulCancelRunner);
+                client
+                    .register_test_brain_runner_client(
+                        "shared",
+                        crate::brain::store::RunnerLeaseId(uuid::Uuid::parse_str(&lease).unwrap()),
+                        runner,
+                    )
+                    .await
+                    .unwrap();
+            }));
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            // Cap'n Proto's real Unix transport must remain below macOS
+            // `sockaddr_un::sun_path` even when the test supervisor HOME is
+            // intentionally long and isolated.
+            let temp = tempfile::Builder::new()
+                .prefix("f138-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket = temp.path().join("runner-identity.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local",
+                Some(temp.path().join("brains")),
+            );
+            let lease = store
+                .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+                .unwrap();
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([73; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                )
+                .unwrap(),
+            );
+            let parent_connection = uuid::Uuid::new_v4();
+            server
+                .brain_runners()
+                .claim_connection_lease(parent_connection, "shared", lease.lease_id)
+                .unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            server
+                .brain_runners()
+                .register_bounded_for_connection(
+                    parent_connection,
+                    crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                    "shared",
+                    lease.lease_id,
+                    tx,
+                )
+                .unwrap();
+            let parent_ejection = server
+                .brain_runners()
+                .eject_connection(parent_connection)
+                .unwrap();
+            parent_ejection.publish_ejection();
+            parent_ejection.mark_transport_closed();
+            server
+                .brain_runners()
+                .begin_connection_teardown(parent_connection)
+                .finish()
+                .unwrap();
+
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("--exact")
+                .arg("ipc::server::tests::test_genuinely_new_os_process_identity_recovers_after_parent_quarantine")
+                .arg("--nocapture")
+                .env(CHILD_SOCKET, &socket)
+                .env(CHILD_LEASE, lease.lease_id.0.to_string());
+            let mut child = child.spawn().unwrap();
+            let (stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("fresh process did not connect")
+            .unwrap();
+            let child_connection = uuid::Uuid::new_v4();
+            server
+                .brain_runners()
+                .claim_connection_lease(child_connection, "shared", lease.lease_id)
+                .unwrap();
+            let child_server = std::sync::Arc::clone(&server);
+            let handler = tokio::task::spawn_local(async move {
+                super::handle_connection_with_id(stream, child_server, child_connection).await
+            });
+            let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+                .await
+                .expect("fresh process did not exit")
+                .unwrap();
+            assert!(status.success());
+            tokio::time::timeout(std::time::Duration::from_secs(2), handler)
+                .await
+                .expect("fresh process handler did not retire")
+                .unwrap()
+                .unwrap();
+        }));
+    }
+
+    #[test]
+    fn test_runner_process_quarantine_survives_agent_server_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let brain_root = temp.path().join("brains");
+        let lease_id = {
+            let store =
+                crate::brain::store::BrainStore::with_root("box.local", Some(brain_root.clone()));
+            let lease = store
+                .acquire_runner_lease(
+                    "shared",
+                    "runner@box.local/restart-quarantine",
+                    1,
+                    None,
+                    300_000,
+                )
+                .unwrap();
+            let server = crate::server::AgentServer::for_brain_protocol_test(
+                store,
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([82; 32]),
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap();
+            let connection = uuid::Uuid::new_v4();
+            server
+                .brain_runners()
+                .claim_connection_lease(connection, "shared", lease.lease_id)
+                .unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            server
+                .brain_runners()
+                .register_bounded_for_connection(
+                    connection,
+                    crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                    "shared",
+                    lease.lease_id,
+                    tx,
+                )
+                .unwrap();
+            let ejection = server.brain_runners().eject_connection(connection).unwrap();
+            ejection.publish_ejection();
+            ejection.mark_transport_closed();
+            server
+                .brain_runners()
+                .begin_connection_teardown(connection)
+                .finish()
+                .unwrap();
+            lease.lease_id
+        };
+
+        let restarted = crate::server::AgentServer::for_brain_protocol_test(
+            crate::brain::store::BrainStore::with_root("box.local", Some(brain_root)),
+            crate::brain::credential::BrainCredentialAuthority::ephemeral([82; 32]),
+            "test-password".into(),
+            temp.path(),
+        )
+        .unwrap();
+        let reconnect = uuid::Uuid::new_v4();
+        restarted
+            .brain_runners()
+            .claim_connection_lease(reconnect, "shared", lease_id)
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let error = restarted
+            .brain_runners()
+            .register_bounded_for_connection(
+                reconnect,
+                crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                "shared",
+                lease_id,
+                tx,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("quarantined"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_event_loop_terminal_quarantine_does_not_schedule_runner_retry() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let lease = store
+                    .acquire_runner_lease(
+                        "shared",
+                        "runner@box.local/terminal-quarantine",
+                        1,
+                        None,
+                        300_000,
+                    )
+                    .unwrap();
+                let environment = store.snapshot("shared").unwrap().environment;
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store,
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([81; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let old_connection = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(old_connection, "shared", lease.lease_id)
+                    .unwrap();
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                server
+                    .brain_runners()
+                    .register_bounded_for_connection(
+                        old_connection,
+                        crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                        "shared",
+                        lease.lease_id,
+                        tx,
+                    )
+                    .unwrap();
+                let ejection = server
+                    .brain_runners()
+                    .eject_connection(old_connection)
+                    .unwrap();
+                ejection.publish_ejection();
+                ejection.mark_transport_closed();
+                server
+                    .brain_runners()
+                    .begin_connection_teardown(old_connection)
+                    .finish()
+                    .unwrap();
+
+                let reconnect = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(reconnect, "shared", lease.lease_id)
+                    .unwrap();
+                let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                    FinchDaemonImpl::new(std::sync::Arc::clone(&server), reconnect),
+                );
+                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input: serde_json::Value::Null,
+                        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    });
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        crate::tools::registry::ToolRegistry::new(),
+                        crate::tools::permissions::PermissionManager::new(),
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .unwrap(),
+                ));
+                let mut event_loop = crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    std::sync::Arc::new(crate::runtime::ProgramRuntime::new()),
+                );
+                event_loop.set_ipc_client_for_test(ipc);
+                event_loop
+                    .handle_named_brain_event_for_test(
+                        crate::cli::repl_event::ReplEvent::RunnerLeaseStatus {
+                            brain: "shared".into(),
+                            environment,
+                            epoch: 0,
+                            lease_id: Some(lease.lease_id),
+                            detail: "renewed".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(event_loop.next_queued_event_for_test().await.is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_released_runner_daemon_eof_is_not_a_process_ejection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let lease = store
+                    .acquire_runner_lease(
+                        "shared",
+                        "runner@box.local/graceful-eof",
+                        1,
+                        None,
+                        300_000,
+                    )
+                    .unwrap();
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store,
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([84; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let connection = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .claim_connection_lease(connection, "shared", lease.lease_id)
+                    .unwrap();
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
+                let handler_server = std::sync::Arc::clone(&server);
+                let handler_shutdown = shutdown.clone();
+                let handler = tokio::task::spawn_local(async move {
+                    super::handle_connection_with_shutdown_for_peer(
+                        server_stream,
+                        handler_server,
+                        connection,
+                        handler_shutdown,
+                        crate::server::RunnerProcessIdentity::for_pid(std::process::id()).unwrap(),
+                    )
+                    .await
+                });
+                let client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                        .await
+                        .unwrap();
+                let runner: super::finch_ipc_capnp::brain_runner::Client =
+                    capnp_rpc::new_client(SuccessfulCancelRunner);
+                client
+                    .register_test_brain_runner_client("shared", lease.lease_id, runner)
+                    .await
+                    .unwrap();
+                assert_eq!(client.test_active_runner_registrations(), 1);
+                client
+                    .brain_release_runner("shared", lease.lease_id)
+                    .await
+                    .unwrap();
+                assert_eq!(client.test_active_runner_registrations(), 0);
+
+                shutdown.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+                    .await
+                    .expect("graceful daemon EOF did not retire")
+                    .unwrap()
+                    .unwrap();
+                tokio::task::yield_now().await;
+                assert!(!client.test_runner_process_poisoned());
+                assert!(server
+                    .brain_runners()
+                    .test_connection_resources_retired(connection));
             })
             .await;
     }
@@ -7534,9 +7982,45 @@ async fn handle_connection_with_shutdown(
     connection_id: uuid::Uuid,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    let peer_process_identity = unix_peer_process_identity(&stream)?;
+    handle_connection_with_shutdown_for_peer(
+        stream,
+        server,
+        connection_id,
+        shutdown,
+        peer_process_identity,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn handle_connection_with_id_and_peer_process(
+    stream: tokio::net::UnixStream,
+    server: Arc<AgentServer>,
+    connection_id: uuid::Uuid,
+    peer_process_identity: crate::server::RunnerProcessIdentity,
+) -> Result<()> {
+    handle_connection_with_shutdown_for_peer(
+        stream,
+        server,
+        connection_id,
+        tokio_util::sync::CancellationToken::new(),
+        peer_process_identity,
+    )
+    .await
+}
+
+async fn handle_connection_with_shutdown_for_peer(
+    stream: tokio::net::UnixStream,
+    server: Arc<AgentServer>,
+    connection_id: uuid::Uuid,
+    shutdown: tokio_util::sync::CancellationToken,
+    peer_process_identity: crate::server::RunnerProcessIdentity,
+) -> Result<()> {
     let dispatch_admission = server
         .brain_runners()
         .open_connection_dispatch(connection_id);
+    let transport_closed = TransportClosedProof(Arc::clone(&dispatch_admission));
     let (reader, writer) = stream.into_split();
 
     let network = twoparty::VatNetwork::new(
@@ -7546,7 +8030,11 @@ async fn handle_connection_with_shutdown(
         Default::default(),
     );
 
-    let daemon_impl = FinchDaemonImpl::new(Arc::clone(&server), connection_id);
+    let daemon_impl = FinchDaemonImpl::new_with_peer_process(
+        Arc::clone(&server),
+        connection_id,
+        peer_process_identity,
+    );
     let daemon_client: finch_daemon::Client = capnp_rpc::new_client(daemon_impl);
 
     let mut rpc = Box::pin(RpcSystem::new(
@@ -7562,7 +8050,7 @@ async fn handle_connection_with_shutdown(
     // Dropping the RpcSystem revokes every capability transported by this
     // connection. Publish that proof before waiting for active bridge guards:
     // a hostile callback bridge may itself be awaiting this exact boundary.
-    dispatch_admission.mark_transport_closed();
+    transport_closed.mark();
     let teardown = server
         .brain_runners()
         .begin_connection_teardown(connection_id);
@@ -7576,20 +8064,36 @@ async fn handle_connection_with_shutdown(
             .push(*lease_id);
     }
     for (brain, lease_ids) in leases_by_brain {
-        let mut delay = std::time::Duration::from_millis(10);
-        loop {
-            match server
-                .brain_store()
-                .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
-            {
-                Ok(_) => break,
-                Err(error) => {
-                    tracing::error!(brain = %brain, %error, retry_ms = delay.as_millis(),
-                        "disconnected runner audit reconciliation remains pending");
+        if let Err(error) = server
+            .brain_store()
+            .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
+        {
+            tracing::error!(brain = %brain, %error,
+                "disconnected runner audit reconciliation remains pending");
+            let retry_store = server.brain_store().clone();
+            tokio::spawn(async move {
+                let mut delay = std::time::Duration::from_millis(10);
+                for attempt in 1..=8 {
                     tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                    match retry_store
+                        .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
+                    {
+                        Ok(_) => break,
+                        Err(error) => {
+                            tracing::error!(brain = %brain, %error, attempt, retry_ms = delay.as_millis(),
+                                "disconnected runner audit reconciliation retry remains pending");
+                            if attempt == 8 {
+                                // The durable audit rows remain the restart
+                                // recovery owner. Bound this connection-local
+                                // retry so forced ejection cannot leak one
+                                // forever-live task per hostile frontend.
+                                break;
+                            }
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        }
+                    }
                 }
-            }
+            });
         }
     }
     let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
@@ -7610,4 +8114,67 @@ async fn handle_connection_with_shutdown(
     }
     teardown.finish()?;
     result
+}
+
+struct TransportClosedProof(Arc<crate::server::ConnectionDispatchAdmission>);
+
+impl TransportClosedProof {
+    fn mark(&self) {
+        self.0.mark_transport_closed();
+    }
+}
+
+impl Drop for TransportClosedProof {
+    fn drop(&mut self) {
+        self.mark();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unix_peer_process_identity(
+    stream: &tokio::net::UnixStream,
+) -> Result<crate::server::RunnerProcessIdentity> {
+    use std::os::fd::AsRawFd as _;
+    let mut credential: nix::libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&credential) as nix::libc::socklen_t;
+    let result = unsafe {
+        nix::libc::getsockopt(
+            stream.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_PEERCRED,
+            (&mut credential as *mut nix::libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    anyhow::ensure!(result == 0, "runner IPC peer credentials are unavailable");
+    anyhow::ensure!(credential.pid > 1, "runner IPC peer PID is invalid");
+    crate::server::RunnerProcessIdentity::for_pid(credential.pid as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn unix_peer_process_identity(
+    stream: &tokio::net::UnixStream,
+) -> Result<crate::server::RunnerProcessIdentity> {
+    use std::os::fd::AsRawFd as _;
+    let mut pid: nix::libc::pid_t = 0;
+    let mut length = std::mem::size_of_val(&pid) as nix::libc::socklen_t;
+    let result = unsafe {
+        nix::libc::getsockopt(
+            stream.as_raw_fd(),
+            nix::libc::SOL_LOCAL,
+            nix::libc::LOCAL_PEERPID,
+            (&mut pid as *mut nix::libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    anyhow::ensure!(result == 0, "runner IPC peer credentials are unavailable");
+    anyhow::ensure!(pid > 1, "runner IPC peer PID is invalid");
+    crate::server::RunnerProcessIdentity::for_pid(pid as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unix_peer_process_identity(
+    _stream: &tokio::net::UnixStream,
+) -> Result<crate::server::RunnerProcessIdentity> {
+    anyhow::bail!("runner IPC peer identity is unsupported on this Unix platform")
 }

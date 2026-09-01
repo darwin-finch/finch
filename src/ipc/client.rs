@@ -53,9 +53,9 @@ pub struct IpcClient {
     _rpc_handle: std::rc::Rc<RpcTask>,
 }
 
-struct RunnerProcessIdentity {
-    epoch: uuid::Uuid,
-    poisoned: std::sync::atomic::AtomicBool,
+pub(crate) struct RunnerProcessIdentity {
+    pub(crate) epoch: uuid::Uuid,
+    pub(crate) poisoned: std::sync::atomic::AtomicBool,
 }
 
 fn runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
@@ -69,10 +69,17 @@ fn runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
     }))
 }
 
+#[cfg(test)]
+fn fresh_runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
+    std::sync::Arc::new(RunnerProcessIdentity {
+        epoch: uuid::Uuid::new_v4(),
+        poisoned: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
 struct RpcConnectionState {
     process: std::sync::Arc<RunnerProcessIdentity>,
-    runner_bearing: std::sync::atomic::AtomicBool,
-    graceful_shutdown: std::sync::atomic::AtomicBool,
+    active_runner_registrations: std::sync::atomic::AtomicUsize,
 }
 
 struct RpcTask {
@@ -85,9 +92,6 @@ impl Drop for RpcTask {
         // Dropping JoinHandle detaches rather than cancels. Abort when the
         // final IpcClient clone disappears so the daemon observes connection
         // loss and releases connection-scoped identities/callbacks promptly.
-        self.state
-            .graceful_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
         self.handle.abort();
     }
 }
@@ -100,8 +104,7 @@ impl IpcClient {
                 epoch: uuid::Uuid::new_v4(),
                 poisoned: std::sync::atomic::AtomicBool::new(false),
             }),
-            runner_bearing: std::sync::atomic::AtomicBool::new(false),
-            graceful_shutdown: std::sync::atomic::AtomicBool::new(false),
+            active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
         });
         Self {
             client,
@@ -126,11 +129,11 @@ impl IpcClient {
         request
             .get()
             .set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
+        request.send().promise.await?;
         self._rpc_handle
             .state
-            .runner_bearing
-            .store(true, std::sync::atomic::Ordering::Release);
-        request.send().promise.await?;
+            .active_runner_registrations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 
@@ -170,24 +173,15 @@ impl IpcClient {
 
         let state = std::sync::Arc::new(RpcConnectionState {
             process,
-            runner_bearing: std::sync::atomic::AtomicBool::new(false),
-            graceful_shutdown: std::sync::atomic::AtomicBool::new(false),
+            active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
         });
         let task_state = std::sync::Arc::clone(&state);
         let handle = tokio::task::spawn_local(async move {
             let _ = rpc_system.await;
-            if task_state
-                .runner_bearing
-                .load(std::sync::atomic::Ordering::Acquire)
-                && !task_state
-                    .graceful_shutdown
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                task_state
-                    .process
-                    .poisoned
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
+            // EOF, including an ordinary daemon restart, is not proof of
+            // forced ejection. Only the explicit callback or a typed durable
+            // registration rejection may poison this process identity.
+            let _ = task_state;
         });
 
         let client = Self {
@@ -230,6 +224,19 @@ impl IpcClient {
             .state
             .process
             .poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_runner_process_identity(&self) -> std::sync::Arc<RunnerProcessIdentity> {
+        std::sync::Arc::clone(&self._rpc_handle.state.process)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_active_runner_registrations(&self) -> usize {
+        self._rpc_handle
+            .state
+            .active_runner_registrations
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -676,6 +683,15 @@ impl IpcClient {
             params.set_lease_id(&lease_id.0.to_string());
         }
         request.send().promise.await?;
+        let _ = self
+            ._rpc_handle
+            .state
+            .active_runner_registrations
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active != 0).then_some(active - 1),
+            );
         Ok(())
     }
 
@@ -780,6 +796,7 @@ impl IpcClient {
         let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
             event_tx,
             memory_callbacks: Default::default(),
+            process: std::sync::Arc::clone(&self._rpc_handle.state.process),
         });
         let mut request = self.client.register_brain_runner_request();
         {
@@ -789,15 +806,21 @@ impl IpcClient {
             params.set_runner(runner);
             params.set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
         }
+        let reply = request.send().promise.await.map_err(|error| {
+            let error = map_runner_registration_error(error);
+            if is_runner_process_quarantined(&error) {
+                self._rpc_handle
+                    .state
+                    .process
+                    .poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            error
+        })?;
         self._rpc_handle
             .state
-            .runner_bearing
-            .store(true, std::sync::atomic::Ordering::Release);
-        let reply = request
-            .send()
-            .promise
-            .await
-            .map_err(map_runner_registration_error)?;
+            .active_runner_registrations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let response = reply.get()?;
         let control: brain_runner_control::Client = response.get_control()?;
         let (subagent_control, mut subagent_rx) =
@@ -868,9 +891,26 @@ fn map_runner_registration_error(error: capnp::Error) -> anyhow::Error {
         anyhow::anyhow!(
             "the running Finch daemon uses an older IPC schema; restart the daemon and reconnect"
         )
+    } else if error
+        .to_string()
+        .contains(crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE)
+    {
+        anyhow::Error::new(RunnerProcessQuarantined)
     } else {
         anyhow::Error::new(error)
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "runner process was quarantined after forced callback ejection; restart the frontend process"
+)]
+pub(crate) struct RunnerProcessQuarantined;
+
+pub(crate) fn is_runner_process_quarantined(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RunnerProcessQuarantined>().is_some())
 }
 
 fn ensure_compatible_protocol(protocol_version: u32) -> Result<()> {
@@ -895,6 +935,7 @@ struct BrainRunnerImpl {
             >,
         >,
     >,
+    process: std::sync::Arc<RunnerProcessIdentity>,
 }
 
 #[derive(Clone)]
@@ -1762,6 +1803,27 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(())
         })
     }
+
+    fn eject_process(
+        &mut self,
+        params: brain_runner::EjectProcessParams,
+        _results: brain_runner::EjectProcessResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        if let Err(error) = required_runner_text(params.get_reason(), "ejection reason") {
+            return Promise::err(error);
+        }
+        // This monotonic store happens before acknowledging the daemon. A
+        // concurrent final-client Drop cannot turn an observed ejection into
+        // an ordinary EOF, and a later reconnect shares this process state.
+        self.process
+            .poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        Promise::ok(())
+    }
 }
 
 fn encode_runner_effect_records(
@@ -2253,7 +2315,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 11);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 12);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2262,29 +2324,29 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 10,
+                protocol_version: 11,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 10"));
-            assert!(error.contains("requires 11"));
+            assert!(error.contains("protocol 11"));
+            assert!(error.contains("requires 12"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 11,
+                protocol_version: 12,
                 query_calls: std::rc::Rc::clone(&new_daemon_calls),
             });
             let request = daemon.ping_request();
             let reply = request.send().promise.await.unwrap();
             let protocol_version = reply.get().unwrap().get_protocol_version();
-            let error = ensure_protocol_generation(protocol_version, 10)
+            let error = ensure_protocol_generation(protocol_version, 11)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 11"));
-            assert!(error.contains("requires 10"));
+            assert!(error.contains("protocol 12"));
+            assert!(error.contains("requires 11"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);
         }));
@@ -2423,6 +2485,7 @@ mod tests {
             let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
                 event_tx,
                 memory_callbacks: Default::default(),
+                process: fresh_runner_process_identity(),
             });
             let control: finch_ipc_capnp::brain_program_control::Client =
                 capnp_rpc::new_client(UnusedProgramControl);
@@ -2456,6 +2519,66 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_ejection_poison_survives_final_client_drop_but_ordinary_drop_does_not_poison()
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let ordinary_process = fresh_runner_process_identity();
+            let ordinary_state = std::sync::Arc::new(RpcConnectionState {
+                process: std::sync::Arc::clone(&ordinary_process),
+                active_runner_registrations: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let ordinary_client = IpcClient {
+                client: capnp_rpc::new_client(ProtocolFixtureDaemon {
+                    protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+                    query_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+                _rpc_handle: std::rc::Rc::new(RpcTask {
+                    handle: tokio::task::spawn_local(async {}),
+                    state: ordinary_state,
+                }),
+            };
+            drop(ordinary_client);
+            assert!(!ordinary_process
+                .poisoned
+                .load(std::sync::atomic::Ordering::Acquire));
+
+            let poisoned_process = fresh_runner_process_identity();
+            let poisoned_state = std::sync::Arc::new(RpcConnectionState {
+                process: std::sync::Arc::clone(&poisoned_process),
+                active_runner_registrations: std::sync::atomic::AtomicUsize::new(1),
+            });
+            let poisoned_client = IpcClient {
+                client: capnp_rpc::new_client(ProtocolFixtureDaemon {
+                    protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+                    query_calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                }),
+                _rpc_handle: std::rc::Rc::new(RpcTask {
+                    handle: tokio::task::spawn_local(async {}),
+                    state: poisoned_state,
+                }),
+            };
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+                event_tx,
+                memory_callbacks: Default::default(),
+                process: std::sync::Arc::clone(&poisoned_process),
+            });
+            let mut ejection = runner.eject_process_request();
+            ejection.get().set_reason("causal test ejection");
+            ejection.send().promise.await.unwrap();
+            drop(poisoned_client);
+            assert!(poisoned_process
+                .poisoned
+                .load(std::sync::atomic::Ordering::Acquire));
+        }));
+    }
+
+    #[test]
     fn test_runner_request_text_fails_closed_at_callback_boundary() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2467,6 +2590,7 @@ mod tests {
             let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
                 event_tx,
                 memory_callbacks: Default::default(),
+                process: fresh_runner_process_identity(),
             });
 
             let mut missing_program = runner.run_program_request();

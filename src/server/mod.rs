@@ -13,7 +13,7 @@ pub mod openai_types; // Public for client access
 pub use brain_approval::BrainApprovalBroker;
 pub(crate) use brain_runner::{
     BoundedRunnerRequest, ConnectionDispatchAdmission, RunnerEffectAuditControlRequest,
-    RunnerEffectAuditReservationRequest, RunnerHostEffectFinishRequest,
+    RunnerEffectAuditReservationRequest, RunnerHostEffectFinishRequest, RunnerProcessIdentity,
 };
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerDeadlines,
@@ -261,7 +261,10 @@ impl AgentServer {
                 machine,
                 Some(state_root.join("brains")),
             ),
-            brain_runners: BrainRunnerBroker::default(),
+            brain_runners: BrainRunnerBroker::with_deadlines_and_quarantine_path(
+                RunnerDeadlines::default(),
+                Some(state_root.join("runner-process-quarantine-v1.json")),
+            )?,
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials,
             mcp_servers: std::collections::HashMap::new(),
@@ -330,7 +333,10 @@ impl AgentServer {
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
             brain_store: store,
-            brain_runners: BrainRunnerBroker::with_deadlines(runner_deadlines),
+            brain_runners: BrainRunnerBroker::with_deadlines_and_quarantine_path(
+                runner_deadlines,
+                Some(state_root.join("runner-process-quarantine-v1.json")),
+            )?,
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials: credentials,
             mcp_servers: std::collections::HashMap::new(),
@@ -401,7 +407,10 @@ impl AgentServer {
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::new()?),
             brain_store: crate::brain::store::BrainStore::new(machine),
-            brain_runners: BrainRunnerBroker::default(),
+            brain_runners: BrainRunnerBroker::with_deadlines_and_quarantine_path(
+                RunnerDeadlines::default(),
+                Some(credential_state.join("runner-process-quarantine-v1.json")),
+            )?,
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials,
             mcp_servers,
