@@ -49,6 +49,12 @@ unrelated same-name process survives the TUI smoke.
   handlers in-process and never launches or contacts a daemon.
 - `tests/service_discovery_test.rs` is non-Brain and does not advertise a
   service. Its manual examples are not automated entrypoints.
+- `tests/tui_integration_test.rs` contains supervised PTY cases. They require
+  authenticated isolation proof and skip otherwise; CI re-runs them through
+  `scripts/test_brains.sh`. Spawned PTY children are either copies of the
+  integration test binary or the exact Cargo-built Finch binary; all remain in
+  the authenticated supervisor process group, and bounded waits kill and reap
+  them on timeout. The legacy interactive smoke remains ignored.
 - `tests/no_external_provider_binary_test.rs` is the independent #173
   binary-removal regression. It uses its own `tempfile` HOME and process group;
   it neither constructs a Brain nor reads the user's Finch state.

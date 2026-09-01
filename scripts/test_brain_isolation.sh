@@ -696,6 +696,7 @@ tests/live/parity.rs
 tests/live/providers.rs
 tests/no_external_provider_binary_test.rs
 tests/service_discovery_test.rs
+tests/tui_integration_test.rs
 tests/worker_integration_test.rs
 EOF
 )"

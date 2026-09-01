@@ -4912,6 +4912,10 @@ impl TuiRenderer {
     /// Called from the event loop on every tick.
     /// Commits newly-completed messages to permanent scrollback, then redraws.
     pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
+        if !self.is_active {
+            return Ok(());
+        }
+
         let messages = self.output_manager.get_messages();
 
         let unprinted: Vec<MessageRef> = messages
@@ -4985,6 +4989,10 @@ impl TuiRenderer {
 
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
+        if !self.is_active {
+            return Ok(());
+        }
+
         if self.viewport_invalidated {
             self.redraw_full_viewport()?;
             return self.draw_poset_overlay();
@@ -5029,6 +5037,10 @@ impl TuiRenderer {
 
     /// Kept for API compatibility.  Forces a redraw if flagged.
     pub fn check_and_refresh(&mut self) -> Result<()> {
+        if !self.is_active {
+            return Ok(());
+        }
+
         if self.needs_full_refresh {
             self.needs_full_refresh = false;
             self.erase_live_area()?;
@@ -6681,6 +6693,51 @@ fn terminal_char_width(ch: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_headless_renderer_flush_is_noop_without_terminal_session() {
+        let colors = ColorScheme::default();
+        let output_manager = Arc::new(OutputManager::new(colors.clone()));
+        let status_bar = Arc::new(StatusBar::new());
+        let mut renderer =
+            TuiRenderer::new_headless(Arc::clone(&output_manager), status_bar, colors);
+        let work = output_manager.start_work_unit("Brain program output");
+        work.set_response("effect completed");
+        work.set_complete();
+
+        renderer
+            .flush_output_safe(&output_manager)
+            .expect("inactive headless rendering must not acquire terminal output");
+        renderer
+            .render()
+            .expect("inactive headless rendering must not draw terminal output");
+        renderer.trigger_refresh();
+        renderer
+            .check_and_refresh()
+            .expect("inactive headless refresh must not draw terminal output");
+        assert!(
+            renderer.printed_ids.is_empty(),
+            "inactive headless flush must not mark terminal output as published"
+        );
+
+        renderer.is_active = true;
+        let active_error = renderer
+            .flush_output_safe(&output_manager)
+            .expect_err("an active renderer without a terminal session must fail closed");
+        #[cfg(unix)]
+        assert!(
+            active_error
+                .to_string()
+                .contains("terminal writer captured no initialized generation"),
+            "unexpected active renderer error: {active_error:#}"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !active_error.to_string().is_empty(),
+            "active renderer lifecycle failure must include a diagnostic"
+        );
+        renderer.is_active = false;
+    }
 
     #[test]
     fn test_portable_terminal_protocol_contract_is_activation_cleanup_symmetric() {

@@ -6832,6 +6832,9 @@ Rules:\n\
             return Ok(());
         }
         let mut tui = self.tui_renderer.lock().await;
+        if !tui.is_active() {
+            return Ok(());
+        }
 
         // After returning from an external editor, call resume() to reset
         // active_rows so the TUI live area repaints from scratch.
