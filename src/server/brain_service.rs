@@ -2321,19 +2321,36 @@ mod tests {
             completed
         );
         let terminal_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
+        assert_eq!(
+            service
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("duplicate terminal publication".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "an exact post-parent-terminal Finish retry appended an event"
+        );
+
         let error = service
             .transition_subagent_run(
                 "shared",
                 child.run_id,
-                BrainRunStatus::Completed,
-                Some("duplicate terminal publication".into()),
+                BrainRunStatus::Failed,
+                Some("conflicting terminal publication".into()),
             )
             .unwrap_err();
         assert!(error.to_string().contains("inactive Brain run"));
         assert_eq!(
             serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
             terminal_snapshot,
-            "a post-parent-terminal finish changed the event log or run graph"
+            "a conflicting post-parent-terminal Finish changed the event log or run graph"
         );
 
         let error = service
@@ -2365,6 +2382,120 @@ mod tests {
                 Some("conflicting terminal status".into()),
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_subagent_finish_is_idempotent_while_parent_awaits_approval() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let request = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "delegate while approval is pending".into(),
+                },
+            )
+            .unwrap();
+        let parent = service
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                request.seq,
+                driver.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let child = service
+            .start_subagent_for_run(
+                "shared",
+                parent.run_id,
+                uuid::Uuid::new_v4(),
+                Some("approval-independent child".into()),
+            )
+            .unwrap();
+        service
+            .store
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::AwaitingApproval,
+                None,
+            )
+            .unwrap();
+
+        let completed = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Completed,
+                Some("done while approval waits".into()),
+            )
+            .unwrap();
+        let completed_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
+        assert_eq!(
+            service
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("lost-reply retry".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            completed_snapshot,
+            "an exact AwaitingApproval Finish retry appended an event"
+        );
+
+        service
+            .store
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::Failed,
+                None,
+            )
+            .unwrap();
+        let terminal_snapshot = serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap();
+        assert_eq!(
+            service
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("retry after parent terminal".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot
+        );
+        let error = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Cancelled,
+                Some("conflicting late finish".into()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("inactive Brain run"));
+        assert_eq!(
+            serde_json::to_vec(&service.snapshot("shared").unwrap()).unwrap(),
+            terminal_snapshot,
+            "a conflicting post-terminal Finish changed the event log or run graph"
+        );
     }
 
     #[tokio::test]

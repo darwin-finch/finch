@@ -3102,9 +3102,10 @@ impl BrainStore {
     }
 
     /// Publish a subagent terminal transition only while its parent still
-    /// owns active execution authority. The parent check and status append
-    /// share the Brain write lock, so parent terminalization cannot race a
-    /// late reverse-control publication into the durable log.
+    /// owns active execution authority. An exact same-status retry returns
+    /// the existing child even after parent terminalization because it cannot
+    /// append an effect. For a new transition, the parent check and status
+    /// append share the Brain write lock.
     pub(crate) fn transition_subagent_run_if_parent_active(
         &self,
         name: &str,
@@ -3140,6 +3141,9 @@ impl BrainStore {
                 current.kind == BrainRunKind::Subagent,
                 "run is not a subagent"
             );
+            if current.status == status {
+                return Ok(current.clone());
+            }
             let parent_run_id = current
                 .parent_run_id
                 .context("subagent run has no parent")?;
@@ -3148,12 +3152,12 @@ impl BrainStore {
                 .get(&parent_run_id)
                 .with_context(|| format!("parent Brain run {} does not exist", parent_run_id.0))?;
             anyhow::ensure!(
-                parent.status == BrainRunStatus::Running,
+                matches!(
+                    parent.status,
+                    BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+                ),
                 "inactive Brain run cannot finish a subagent child"
             );
-            if current.status == status {
-                return Ok(current.clone());
-            }
         }
         validate_run_transition(current.status, status)?;
         self.push_locked_for_run(
