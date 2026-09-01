@@ -18,6 +18,7 @@ substitution_pid=''
 supervisor_backup=''
 supervisor_backup_target=''
 substitution_restored=''
+shell_wrong_digest_supervisor=''
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
@@ -28,6 +29,9 @@ cleanup_regression() {
   if [[ -n "$substitution_pid" ]]; then
     kill "$substitution_pid" 2>/dev/null || true
     wait "$substitution_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$shell_wrong_digest_supervisor" ]]; then
+    rm -f -- "$shell_wrong_digest_supervisor"
   fi
   exec 7>&- 2>/dev/null || true
   rm -rf -- "$scratch"
@@ -227,23 +231,47 @@ fi
 # The digest in a content-addressed supervisor name is authority, not a label.
 # Run trusted supervisor bytes from a deliberately false digest path and prove
 # that both independent validators reject the inherited proof.
-wrong_digest_supervisor="$launcher_target/debug/finch-test-supervisor-pinned-sha256-$(printf '0%.0s' {1..64})"
+false_supervisor_digest="$(printf '%s' "$scratch" | shasum -a 256 | awk '{print $1}')"
+actual_observed_digest="$(shasum -a 256 "$observed_supervisor" | awk '{print $1}')"
+if [[ "$false_supervisor_digest" == "$actual_observed_digest" ]]; then
+  false_supervisor_digest="$(printf '%s-different' "$scratch" | shasum -a 256 | awk '{print $1}')"
+fi
+wrong_digest_supervisor="$launcher_target/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
 install -m 0555 "$observed_supervisor" "$wrong_digest_supervisor"
 phase=rust-rejects-wrong-content-addressed-supervisor-name
+rust_wrong_digest_diagnostic="$scratch/rust-wrong-digest-diagnostic"
 if FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
-  "$wrong_digest_supervisor" "$wrong_digest_supervisor" --verify-inherited-proof >/dev/null 2>&1; then
+  FINCH_TEST_PROOF_DIAGNOSTICS=1 \
+  "$wrong_digest_supervisor" "$wrong_digest_supervisor" --verify-inherited-proof \
+  >/dev/null 2>"$rust_wrong_digest_diagnostic"; then
   echo "Rust proof validation accepted supervisor bytes under a false digest name" >&2
   exit 1
 fi
-phase=shell-rejects-wrong-content-addressed-supervisor-name
-if FINCH_SHELL_PROOF_LIBRARY="$repo_root/scripts/lib/brain_test_isolation.sh" \
-  FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
-  "$wrong_digest_supervisor" bash -c \
-  'source "$FINCH_SHELL_PROOF_LIBRARY"; brain_test_isolation_is_active' >/dev/null 2>&1; then
-  echo "shell proof validation accepted supervisor bytes under a false digest name" >&2
+if ! grep -q 'does not contain the image named by its path' "$rust_wrong_digest_diagnostic"; then
+  echo "Rust proof validation rejected the false digest name for an unrelated reason" >&2
+  sed 's/^/Rust diagnostic: /' "$rust_wrong_digest_diagnostic" >&2
   exit 1
 fi
-rm -f -- "$wrong_digest_supervisor"
+phase=shell-rejects-wrong-content-addressed-supervisor-name
+shell_wrong_digest_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
+shell_wrong_digest_diagnostic="$scratch/shell-wrong-digest-diagnostic"
+install -m 0555 "$observed_supervisor" "$shell_wrong_digest_supervisor"
+shell_wrong_digest_status=0
+FINCH_TEST_PROOF_DIAGNOSTICS=1 \
+  brain_isolation_supervisor_digest_for_profile "$repo_root" "$shell_wrong_digest_supervisor" \
+  >/dev/null 2>"$shell_wrong_digest_diagnostic" || shell_wrong_digest_status=$?
+if [[ "$shell_wrong_digest_status" -eq 0 ]]; then
+  echo "shell supervisor-profile validation accepted bytes under a false digest name" >&2
+  exit 1
+fi
+if [[ "$(cat "$shell_wrong_digest_diagnostic")" != \
+  'Brain test shell authority rejected: supervisor-content-path-binding' ]]; then
+  echo "shell supervisor-profile validation rejected the false digest name for an unrelated reason" >&2
+  sed 's/^/shell diagnostic: /' "$shell_wrong_digest_diagnostic" >&2
+  exit 1
+fi
+rm -f -- "$wrong_digest_supervisor" "$shell_wrong_digest_supervisor"
+shell_wrong_digest_supervisor=''
 
 # Exercise the same live-inode substitution boundary against the exact
 # content-addressed image produced above, even when CI selected a legacy pin
