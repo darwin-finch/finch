@@ -291,6 +291,13 @@ fn stdout_status_flags() -> anyhow::Result<i32> {
 }
 
 #[cfg(unix)]
+fn open_descriptor_set() -> std::collections::BTreeSet<i32> {
+    (0..256)
+        .filter(|fd| unsafe { nix::libc::fcntl(*fd, nix::libc::F_GETFD) } >= 0)
+        .collect()
+}
+
+#[cfg(unix)]
 fn fill_terminal_and_notify_control() -> anyhow::Result<()> {
     let control_fd: i32 = std::env::var("FINCH_TEST_TERMINAL_CONTROL_FD")?.parse()?;
     let mut path = [0_i8; 1024];
@@ -387,6 +394,19 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         marker(b"FINCH_SIGNAL_TRANSPORT_ROLLED_BACK")?;
         return Ok(());
     }
+    if mode == "signal-descriptor-free" {
+        let before = open_descriptor_set();
+        let signals = finch::cli::tui::BinaryTerminalSession::install()?
+            .ok_or_else(|| anyhow::anyhow!("atomic signal owner missing"))?;
+        let after = open_descriptor_set();
+        anyhow::ensure!(
+            after == before,
+            "atomic signal ownership allocated inheritable/reusable descriptors: before={before:?} after={after:?}"
+        );
+        drop(signals);
+        marker(b"FINCH_SIGNAL_DESCRIPTOR_FREE")?;
+        return Ok(());
+    }
 
     let preserves_host_signal = matches!(mode.as_str(), "binary-owner-drop" | "owner-windows");
     if preserves_host_signal {
@@ -408,6 +428,8 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             | "signal-full"
             | "signal-stop-full"
             | "handler-reuse"
+            | "handler-replacement-signal"
+            | "signal-paused-cleanup"
     );
     let mut signals = if needs_binary_owner {
         finch::cli::tui::BinaryTerminalSession::install()?
@@ -520,27 +542,35 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         }
         "cloexec" => {
             let fd = finch::cli::tui::supervised_terminal_restore_fd()?;
-            let (signal_read, signal_write) = signals
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?
-                .supervised_signal_fds()?;
-            for signal_fd in [signal_read, signal_write] {
-                let descriptor = unsafe { nix::libc::fcntl(signal_fd, nix::libc::F_GETFD) };
-                let status = unsafe { nix::libc::fcntl(signal_fd, nix::libc::F_GETFL) };
-                anyhow::ensure!(descriptor & nix::libc::FD_CLOEXEC != 0);
-                anyhow::ensure!(status & nix::libc::O_NONBLOCK != 0);
-            }
+            let descriptor = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+            let status = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+            anyhow::ensure!(descriptor & nix::libc::FD_CLOEXEC != 0);
+            anyhow::ensure!(status & nix::libc::O_NONBLOCK != 0);
             let mut exec_child = Command::new(std::env::current_exe()?)
                 .args(["--exact", "tui_terminal_session_child"])
                 .env("FINCH_TEST_TERMINAL_SESSION_CHILD", "fd-check")
-                .env(
-                    "FINCH_TEST_RESTORE_FDS",
-                    format!("{fd},{signal_read},{signal_write}"),
-                )
+                .env("FINCH_TEST_RESTORE_FDS", fd.to_string())
                 .spawn()?;
             let status = wait_for_child(&mut exec_child, Instant::now() + Duration::from_secs(2));
             anyhow::ensure!(status.success(), "restore fd inherited by exec child");
             renderer.shutdown()
+        }
+        "signal-paused-cleanup" => {
+            finch::cli::tui::supervised_set_terminal_cleanup_pause(true)?;
+            let _cleanup = std::thread::spawn(move || renderer.shutdown());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_cleanup_is_paused()? {
+                anyhow::ensure!(Instant::now() < deadline, "terminal cleanup did not pause");
+                std::thread::yield_now();
+            }
+            marker(b"FINCH_SIGNAL_PAUSED_CLEANUP_READY")?;
+            loop {
+                std::thread::park();
+            }
+            #[allow(unreachable_code)]
+            {
+                Ok(())
+            }
         }
         "sequential" => {
             renderer.shutdown()?;
@@ -585,7 +615,7 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             let signals = signals
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
-            signals.supervised_fill_signal_transport()?;
+            signals.supervised_pause_signal_listener()?;
             renderer.shutdown()?;
             let started = Instant::now();
             drop(signals);
@@ -600,8 +630,8 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             let signals = signals
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("binary signal owner missing"))?;
-            signals.supervised_fill_signal_transport()?;
-            marker(b"FINCH_SIGNAL_QUEUE_FULL")?;
+            signals.supervised_pause_signal_listener()?;
+            marker(b"FINCH_SIGNAL_LISTENER_PAUSED")?;
             let mut acknowledge = 0_u8;
             std::io::stdin().read_exact(std::slice::from_mut(&mut acknowledge))?;
             anyhow::ensure!(acknowledge == b'G', "invalid full-queue acknowledgement");
@@ -610,7 +640,12 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 std::thread::park();
             }
         }
-        "handler-reuse" => {
+        "handler-reuse" | "handler-replacement-signal" => {
+            let replacement_signal = mode == "handler-replacement-signal";
+            // This pause is immediately after the production handler's single
+            // atomic owner+generation load. At the old split-load tip, cleanup
+            // below cleared the session before the second load and silently
+            // lost this already-delivered signal.
             finch::cli::tui::supervised_set_terminal_signal_handler_pause(true)?;
             let observed_errno = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
             let observed_errno_clone = std::sync::Arc::clone(&observed_errno);
@@ -633,7 +668,16 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
 
             let second_signals = finch::cli::tui::BinaryTerminalSession::install()?
                 .ok_or_else(|| anyhow::anyhow!("replacement binary signal owner missing"))?;
+            if replacement_signal {
+                second_signals.supervised_pause_signal_listener()?;
+            }
             let mut second = new_renderer()?;
+            if replacement_signal {
+                // Publish the replacement generation's SIGTERM while the old
+                // handler still holds its captured token. At the previous tip,
+                // resuming the old handler overwrote this pending signal.
+                unsafe { nix::libc::raise(nix::libc::SIGTERM) };
+            }
             finch::cli::tui::supervised_set_terminal_signal_handler_pause(false)?;
             handler_thread
                 .join()
@@ -645,9 +689,68 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             for _ in 0..10_000 {
                 std::thread::yield_now();
             }
+            if replacement_signal {
+                second_signals.supervised_resume_signal_listener()?;
+                loop {
+                    std::thread::park();
+                }
+            }
             second.shutdown()?;
             drop(second_signals);
             marker(b"FINCH_HANDLER_REUSE_SAFE")?;
+            Ok(())
+        }
+        "writer-after-reset" => {
+            finch::cli::tui::supervised_set_terminal_writer_pause(true)?;
+            let writer = std::thread::spawn(|| {
+                finch::cli::tui::supervised_publish_terminal_bytes(b"FINCH_STALE_FRAME")
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_writer_is_paused()? {
+                anyhow::ensure!(Instant::now() < deadline, "terminal writer did not pause");
+                std::thread::yield_now();
+            }
+            finch::cli::tui::emergency_restore_terminal();
+            finch::cli::tui::supervised_set_terminal_writer_pause(false)?;
+            anyhow::ensure!(
+                writer
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("terminal writer panicked"))?
+                    .is_err(),
+                "admitted writer published after terminal reset"
+            );
+            marker(b"FINCH_WRITER_REVOKED")?;
+            Ok(())
+        }
+        "writer-gate-timeout" => {
+            finch::cli::tui::supervised_set_terminal_writer_gate_pause(true)?;
+            let writer = std::thread::spawn(|| {
+                finch::cli::tui::supervised_publish_terminal_bytes(b"FINCH_STALE_GATE_FRAME")
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_writer_gate_is_paused()? {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "terminal writer did not pause while admitted"
+                );
+                std::thread::yield_now();
+            }
+            // The first bounded cleanup cannot own the publication gate. It
+            // must fail closed: no restoration record, replacement admission,
+            // or reset bytes may be published yet.
+            finch::cli::tui::emergency_restore_terminal();
+            finch::cli::tui::supervised_set_terminal_writer_gate_pause(false)?;
+            anyhow::ensure!(
+                writer
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("gated terminal writer panicked"))?
+                    .is_err(),
+                "revoked gated writer published after cleanup timeout"
+            );
+            // Once the nonblocking writer releases the gate, a later bounded
+            // cleanup takes over the abandoned owner and repairs exactly once.
+            finch::cli::tui::emergency_restore_terminal();
+            marker(b"FINCH_WRITER_TIMEOUT_REPAIRED")?;
             Ok(())
         }
         "overlapping-cleanup" => {
@@ -841,7 +944,7 @@ fn test_binary_terminal_session_restores_all_external_signals() {
 
 #[cfg(unix)]
 #[test]
-fn test_binary_terminal_signal_is_not_lost_when_transport_is_full() {
+fn test_binary_terminal_signal_is_not_lost_while_atomic_listener_is_paused() {
     let _serial = terminal_pty_test_lock();
     if !supervised_pty_authority_or_skip() {
         return;
@@ -852,7 +955,7 @@ fn test_binary_terminal_signal_is_not_lost_when_transport_is_full() {
         &mut master,
         &mut transcript,
         Instant::now() + Duration::from_secs(5),
-        b"FINCH_SIGNAL_QUEUE_FULL",
+        b"FINCH_SIGNAL_LISTENER_PAUSED",
     ));
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id() as i32),
@@ -862,6 +965,41 @@ fn test_binary_terminal_signal_is_not_lost_when_transport_is_full() {
     master.write_all(b"G").unwrap();
     master.flush().unwrap();
     let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(2));
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_signal_takes_over_paused_cleanup_before_process_exit() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    // At 4e991716 the listener ignored cleanup's 100 ms timeout and called
+    // `_exit`, so this exact pause left the PTY raw with protocols enabled.
+    let (mut child, mut master, slave, original) = spawn_terminal_child("signal-paused-cleanup");
+    let mut transcript = Vec::new();
+    assert!(read_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(5),
+        b"FINCH_SIGNAL_PAUSED_CLEANUP_READY",
+    ));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(3));
     drain_pty(
         &mut master,
         &mut transcript,
@@ -1006,6 +1144,7 @@ fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
     }
     for mode in [
         "cloexec",
+        "signal-descriptor-free",
         "signal-create-failure",
         "sequential",
         "repeated",
@@ -1070,7 +1209,7 @@ fn test_terminal_cleanup_is_bounded_under_unread_backpressure() {
 
 #[cfg(unix)]
 #[test]
-fn test_signal_transport_drop_is_bounded_and_fd_reuse_is_stale_safe() {
+fn test_atomic_signal_owner_drop_is_bounded_and_snapshot_is_replacement_safe() {
     let _serial = terminal_pty_test_lock();
     if !supervised_pty_authority_or_skip() {
         return;
@@ -1091,6 +1230,73 @@ fn test_signal_transport_drop_is_bounded_and_fd_reuse_is_stale_safe() {
         ));
         assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(2)).success());
         assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_paused_old_handler_cannot_overwrite_replacement_generation_signal() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    // Before pending publication revalidated the complete dispatch token, the
+    // resumed old handler overwrote the replacement generation's SIGTERM. The
+    // replacement listener discarded that stale token and the process hung.
+    let (mut child, mut master, slave, original) =
+        spawn_terminal_child("handler-replacement-signal");
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(3));
+    let mut transcript = Vec::new();
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(status.code(), Some(128 + nix::libc::SIGTERM));
+    assert_eq!(terminal_modes(&slave), original);
+    // The replacement cleanup flushes A's queued output before publishing its
+    // own reset, so the transcript contains exactly B's signal-reset sequence.
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_admitted_terminal_writers_are_revoked_before_reset_publication() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    for (mode, marker) in [
+        ("writer-after-reset", b"FINCH_WRITER_REVOKED".as_slice()),
+        (
+            "writer-gate-timeout",
+            b"FINCH_WRITER_TIMEOUT_REPAIRED".as_slice(),
+        ),
+    ] {
+        let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
+        let mut transcript = Vec::new();
+        assert!(read_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(5),
+            marker,
+        ));
+        assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(2)).success());
+        drain_pty(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_millis(100),
+        );
+        assert_eq!(terminal_modes(&slave), original, "{mode}");
+        assert!(!transcript
+            .windows(b"FINCH_STALE_FRAME".len())
+            .any(|bytes| bytes == b"FINCH_STALE_FRAME"));
+        assert!(!transcript
+            .windows(b"FINCH_STALE_GATE_FRAME".len())
+            .any(|bytes| bytes == b"FINCH_STALE_GATE_FRAME"));
+        assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1, "{mode}");
     }
 }
 

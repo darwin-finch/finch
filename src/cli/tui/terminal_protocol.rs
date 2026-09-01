@@ -44,8 +44,9 @@ pub(crate) fn activate() -> io::Result<()> {
 
 /// Restore every portable protocol mode and raw mode on non-Unix hosts.
 #[cfg(not(unix))]
-pub(crate) fn cleanup() {
+pub(crate) fn cleanup() -> io::Result<()> {
     let mut stdout = io::stdout();
-    let _ = write_reset(&mut stdout);
-    let _ = terminal::disable_raw_mode();
+    let reset_result = write_reset(&mut stdout);
+    let raw_result = terminal::disable_raw_mode();
+    reset_result.and(raw_result)
 }

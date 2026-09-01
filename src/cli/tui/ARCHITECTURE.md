@@ -18,9 +18,23 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   modes, closed its descriptor, and returned to `INACTIVE`; stale generation cleanup is a no-op.
 - Public `TuiRenderer` construction never changes process signal handlers. The Finch binary creates
   `BinaryTerminalSession` before renderer activation; SIGINT/SIGTERM/SIGHUP are armed and restored
-  with each active terminal generation.
+  with each active terminal generation. Its handler captures one atomic owner+generation token and
+  publishes into per-signal atomic pending slots; it owns no pipe/socket descriptor that can leak
+  across `exec` or be reused underneath a stale handler.
 - Emergency cleanup uses the generation's nonblocking, close-on-exec tty descriptor and never waits
   for the renderer/global mutex or ordinary stdout.
+- Renderer output is admitted against the active generation, serialized only around a nonblocking
+  tty write, and revalidated after admission. `ACTIVE -> CLEANING` revokes parked writers before
+  reset; a writer-gate timeout leaves the generation fail-closed for bounded takeover and never
+  records restoration prematurely.
+- The 100 ms writer-quiescence bound assumes normal scheduler progress for a thread executing the
+  short `O_NONBLOCK` write section. If a thread is artificially suspended while holding that gate,
+  cleanup returns a timeout without resetting, admitting a replacement, re-enabling ordinary
+  stdout, or recording restoration; after the writer resumes and observes revocation, a later
+  bounded cleanup owner repairs the same generation.
+- The actual non-Unix `TuiRenderer` owns the same bounded exclusive session lease across activation,
+  suspend/resume, emergency cleanup, shutdown, and Drop. Windows CI compiles and tests that exact
+  lifecycle source together with the portable protocol source.
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).

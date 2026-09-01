@@ -107,7 +107,7 @@ pub fn shutdown_global_tui() -> anyhow::Result<()> {
                     // The restore path owns a separate nonblocking tty
                     // descriptor on Unix, so stdout backpressure cannot turn a
                     // lock timeout into another unbounded wait.
-                    super::tui::emergency_restore_terminal();
+                    super::tui::emergency_restore_terminal_result()?;
                     return Ok(());
                 }
                 // Wait a bit and try again

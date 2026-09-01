@@ -46,6 +46,8 @@ mod status_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
 #[cfg(any(not(unix), test))]
+mod terminal_lifecycle;
+#[cfg(any(not(unix), test))]
 mod terminal_protocol;
 
 use accordion::{AccordionState, RenderedTranscriptLine};
@@ -95,6 +97,8 @@ struct TerminalCoordinator {
     original: std::cell::UnsafeCell<std::mem::MaybeUninit<nix::libc::termios>>,
     modes: std::sync::atomic::AtomicU8,
     termination_requested: std::sync::atomic::AtomicBool,
+    cleanup_owner: std::sync::atomic::AtomicU64,
+    restored_generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(unix)]
@@ -108,7 +112,28 @@ static TERMINAL_COORDINATOR: TerminalCoordinator = TerminalCoordinator {
     original: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
     modes: std::sync::atomic::AtomicU8::new(0),
     termination_requested: std::sync::atomic::AtomicBool::new(false),
+    cleanup_owner: std::sync::atomic::AtomicU64::new(0),
+    restored_generation: std::sync::atomic::AtomicU64::new(0),
 };
+
+#[cfg(unix)]
+static NEXT_TERMINAL_CLEANUP_OWNER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+static TERMINAL_OUTPUT_GATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SUPERVISED_WRITER_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SUPERVISED_WRITER_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SUPERVISED_WRITER_GATE_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SUPERVISED_WRITER_GATE_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(unix)]
 struct TerminalSessionState {
@@ -137,9 +162,19 @@ impl TerminalSessionState {
         }
         let generation = TERMINAL_COORDINATOR
             .generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1)
-            .max(1);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(if current >= SIGNAL_GENERATION_MASK {
+                    1
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap_or(0);
+        let generation = if generation >= SIGNAL_GENERATION_MASK {
+            1
+        } else {
+            generation + 1
+        };
         TERMINAL_COORDINATOR
             .generation
             .store(generation, Ordering::Release);
@@ -147,6 +182,9 @@ impl TerminalSessionState {
             .termination_requested
             .store(false, Ordering::Release);
         TERMINAL_COORDINATOR.modes.store(0, Ordering::Release);
+        TERMINAL_COORDINATOR
+            .cleanup_owner
+            .store(0, Ordering::Release);
 
         let fd = match open_current_stdout_tty() {
             Ok(fd) => fd,
@@ -170,11 +208,7 @@ impl TerminalSessionState {
         unsafe { (*TERMINAL_COORDINATOR.original.get()).write(original) };
         TERMINAL_COORDINATOR.fd.store(fd, Ordering::Release);
         if let Err(error) = arm_binary_terminal_signals(generation) {
-            unsafe { nix::libc::close(fd) };
-            TERMINAL_COORDINATOR.fd.store(-1, Ordering::Release);
-            TERMINAL_COORDINATOR
-                .phase
-                .store(SESSION_INACTIVE, Ordering::Release);
+            rollback_terminal_activation(generation);
             return Err(error);
         }
 
@@ -286,6 +320,31 @@ impl Drop for TerminalSessionState {
     }
 }
 
+#[cfg(not(unix))]
+struct TerminalSessionState {
+    lease: terminal_lifecycle::ExclusiveTerminalLease,
+}
+
+#[cfg(not(unix))]
+impl TerminalSessionState {
+    fn activate() -> io::Result<Self> {
+        let lease =
+            terminal_lifecycle::ExclusiveTerminalLease::activate(terminal_protocol::activate)?;
+        Ok(Self { lease })
+    }
+
+    fn cleanup(&self) -> io::Result<()> {
+        self.lease.cleanup(terminal_protocol::cleanup)
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for TerminalSessionState {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
 #[cfg(unix)]
 fn open_current_stdout_tty() -> io::Result<RawFd> {
     let mut path = [0_i8; 1024];
@@ -382,6 +441,121 @@ fn write_nonblocking(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     ))
 }
 
+struct TerminalOutput {
+    #[cfg(unix)]
+    generation: u64,
+    #[cfg(not(unix))]
+    stdout: io::Stdout,
+}
+
+fn terminal_output() -> TerminalOutput {
+    #[cfg(unix)]
+    {
+        TerminalOutput {
+            generation: TERMINAL_COORDINATOR
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        TerminalOutput {
+            stdout: io::stdout(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TerminalOutputGate;
+
+#[cfg(unix)]
+impl Drop for TerminalOutputGate {
+    fn drop(&mut self) {
+        TERMINAL_OUTPUT_GATE.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+fn acquire_terminal_output_gate() -> io::Result<TerminalOutputGate> {
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    loop {
+        if TERMINAL_OUTPUT_GATE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(TerminalOutputGate);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "terminal output writer did not quiesce within 100ms",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn publish_terminal_bytes(generation: u64, bytes: &[u8]) -> io::Result<usize> {
+    use std::sync::atomic::Ordering;
+    if SUPERVISED_WRITER_PAUSE.load(Ordering::Acquire) {
+        SUPERVISED_WRITER_PAUSED.store(true, Ordering::Release);
+        while SUPERVISED_WRITER_PAUSE.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        SUPERVISED_WRITER_PAUSED.store(false, Ordering::Release);
+    }
+    let _gate = acquire_terminal_output_gate()?;
+    if SUPERVISED_WRITER_GATE_PAUSE.load(Ordering::Acquire) {
+        SUPERVISED_WRITER_GATE_PAUSED.store(true, Ordering::Release);
+        while SUPERVISED_WRITER_GATE_PAUSE.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        SUPERVISED_WRITER_GATE_PAUSED.store(false, Ordering::Release);
+    }
+    if TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) != SESSION_ACTIVE
+        || TERMINAL_COORDINATOR.generation.load(Ordering::Acquire) != generation
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal writer admission was revoked by cleanup",
+        ));
+    }
+    let fd = TERMINAL_COORDINATOR.fd.load(Ordering::Acquire);
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal writer has no active descriptor",
+        ));
+    }
+    write_nonblocking_count(fd, bytes)
+}
+
+impl Write for TerminalOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            publish_terminal_bytes(self.generation, bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            self.stdout.write(bytes)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            self.stdout.flush()
+        }
+    }
+}
+
 #[cfg(unix)]
 fn rollback_terminal_activation(generation: u64) {
     use std::sync::atomic::Ordering;
@@ -398,8 +572,30 @@ fn rollback_terminal_activation(generation: u64) {
         )
         .is_ok()
     {
-        let _ = finish_terminal_cleanup(generation);
+        let owner = claim_terminal_cleanup_owner();
+        let _ = finish_terminal_cleanup(generation, owner);
     }
+}
+
+#[cfg(unix)]
+fn claim_terminal_cleanup_owner() -> u64 {
+    use std::sync::atomic::Ordering;
+    let owner = NEXT_TERMINAL_CLEANUP_OWNER
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+        .max(1);
+    TERMINAL_COORDINATOR
+        .cleanup_owner
+        .store(owner, Ordering::Release);
+    owner
+}
+
+#[cfg(unix)]
+fn owns_terminal_cleanup(generation: u64, owner: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    TERMINAL_COORDINATOR.generation.load(Ordering::Acquire) == generation
+        && TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) == SESSION_CLEANING
+        && TERMINAL_COORDINATOR.cleanup_owner.load(Ordering::Acquire) == owner
 }
 
 #[cfg(unix)]
@@ -414,16 +610,132 @@ fn cleanup_terminal_generation(generation: u64) -> io::Result<()> {
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => finish_terminal_cleanup(generation),
+        Ok(_) => {
+            let owner = claim_terminal_cleanup_owner();
+            finish_terminal_cleanup(generation, owner)
+        }
         Err(SESSION_INACTIVE) => Ok(()),
-        Err(SESSION_CLEANING) => wait_for_terminal_cleanup(generation),
+        Err(SESSION_CLEANING) => match wait_for_terminal_cleanup(generation) {
+            Ok(()) => Ok(()),
+            Err(_) if TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) == SESSION_CLEANING => {
+                let owner = claim_terminal_cleanup_owner();
+                finish_terminal_cleanup(generation, owner)
+            }
+            Err(error) => Err(error),
+        },
         Err(SESSION_ACTIVATING) => {
             TERMINAL_COORDINATOR
                 .termination_requested
                 .store(true, Ordering::Release);
-            wait_for_terminal_cleanup(generation)
+            match wait_for_terminal_cleanup(generation) {
+                Ok(()) => Ok(()),
+                Err(_)
+                    if TERMINAL_COORDINATOR
+                        .phase
+                        .compare_exchange(
+                            SESSION_ACTIVATING,
+                            SESSION_CLEANING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok() =>
+                {
+                    let owner = claim_terminal_cleanup_owner();
+                    finish_terminal_cleanup(generation, owner)
+                }
+                Err(error) => Err(error),
+            }
         }
         Err(_) => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_terminal_generation_for_signal(generation: u64) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    loop {
+        if TERMINAL_COORDINATOR.generation.load(Ordering::Acquire) != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "signal belongs to a replaced terminal generation",
+            ));
+        }
+        if TERMINAL_COORDINATOR
+            .restored_generation
+            .load(Ordering::Acquire)
+            == generation
+        {
+            return Ok(());
+        }
+        match TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) {
+            SESSION_ACTIVE => {
+                if TERMINAL_COORDINATOR
+                    .phase
+                    .compare_exchange(
+                        SESSION_ACTIVE,
+                        SESSION_CLEANING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let owner = claim_terminal_cleanup_owner();
+                    if finish_terminal_cleanup(generation, owner).is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+            SESSION_ACTIVATING => {
+                TERMINAL_COORDINATOR
+                    .termination_requested
+                    .store(true, Ordering::Release);
+                let deadline = std::time::Instant::now() + Duration::from_millis(100);
+                while TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) == SESSION_ACTIVATING
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                if TERMINAL_COORDINATOR
+                    .phase
+                    .compare_exchange(
+                        SESSION_ACTIVATING,
+                        SESSION_CLEANING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let owner = claim_terminal_cleanup_owner();
+                    let _ = finish_terminal_cleanup(generation, owner);
+                }
+            }
+            SESSION_CLEANING => {
+                let observed_owner = TERMINAL_COORDINATOR.cleanup_owner.load(Ordering::Acquire);
+                let deadline = std::time::Instant::now() + Duration::from_millis(100);
+                while TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) == SESSION_CLEANING
+                    && TERMINAL_COORDINATOR.cleanup_owner.load(Ordering::Acquire) == observed_owner
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                if TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) == SESSION_CLEANING
+                    && TERMINAL_COORDINATOR.cleanup_owner.load(Ordering::Acquire) == observed_owner
+                {
+                    let owner = claim_terminal_cleanup_owner();
+                    let _ = finish_terminal_cleanup(generation, owner);
+                }
+            }
+            SESSION_INACTIVE => {
+                return Err(io::Error::other(
+                    "terminal became inactive without a successful restoration record",
+                ));
+            }
+            _ => {}
+        }
+        // A failed restore never authorizes process exit or replacement. Keep
+        // repairing this exact generation until termios, protocols, and signal
+        // dispositions have all succeeded.
+        std::thread::yield_now();
     }
 }
 
@@ -446,9 +758,25 @@ fn wait_for_terminal_cleanup(generation: u64) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn finish_terminal_cleanup(generation: u64) -> io::Result<()> {
+fn finish_terminal_cleanup(generation: u64, owner: u64) -> io::Result<()> {
     use std::sync::atomic::Ordering;
-    supervised_pause_during_terminal_cleanup();
+    supervised_pause_during_terminal_cleanup(generation, owner);
+    if !owns_terminal_cleanup(generation, owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal cleanup ownership was taken over",
+        ));
+    }
+    // ACTIVE -> CLEANING revoked new admissions before this wait. Every
+    // production renderer write is nonblocking while it holds this gate, so a
+    // successful acquisition proves no admitted frame can publish after reset.
+    let _output_gate = acquire_terminal_output_gate()?;
+    if !owns_terminal_cleanup(generation, owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal cleanup ownership changed while writers quiesced",
+        ));
+    }
     let fd = TERMINAL_COORDINATOR.fd.load(Ordering::Acquire);
     let modes = TERMINAL_COORDINATOR.modes.load(Ordering::Acquire);
     let original = unsafe { (*TERMINAL_COORDINATOR.original.get()).assume_init_ref() };
@@ -457,7 +785,9 @@ fn finish_terminal_cleanup(generation: u64) -> io::Result<()> {
         first_error = Some(io::Error::last_os_error());
     }
     if fd >= 0 {
-        unsafe { nix::libc::tcflush(fd, nix::libc::TCOFLUSH) };
+        if unsafe { nix::libc::tcflush(fd, nix::libc::TCOFLUSH) } < 0 && first_error.is_none() {
+            first_error = Some(io::Error::last_os_error());
+        }
         for reset in terminal_protocol_resets(modes) {
             if let Err(error) = write_nonblocking(fd, reset) {
                 if first_error.is_none() {
@@ -465,21 +795,45 @@ fn finish_terminal_cleanup(generation: u64) -> io::Result<()> {
                 }
             }
         }
-        unsafe { nix::libc::close(fd) };
     }
-    TERMINAL_COORDINATOR.fd.store(-1, Ordering::Release);
-    TERMINAL_COORDINATOR.modes.store(0, Ordering::Release);
+    if !owns_terminal_cleanup(generation, owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal cleanup ownership changed during restoration",
+        ));
+    }
     let signal_result = disarm_binary_terminal_signals(generation);
-    TERMINAL_COORDINATOR
-        .phase
-        .store(SESSION_INACTIVE, Ordering::Release);
     if first_error.is_none() {
         first_error = signal_result.err();
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    if let Some(error) = first_error {
+        return Err(error);
     }
+    if !owns_terminal_cleanup(generation, owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal cleanup ownership changed before publication",
+        ));
+    }
+    if fd >= 0
+        && TERMINAL_COORDINATOR
+            .fd
+            .compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        unsafe { nix::libc::close(fd) };
+    }
+    TERMINAL_COORDINATOR.modes.store(0, Ordering::Release);
+    TERMINAL_COORDINATOR
+        .restored_generation
+        .store(generation, Ordering::Release);
+    TERMINAL_COORDINATOR
+        .cleanup_owner
+        .store(0, Ordering::Release);
+    TERMINAL_COORDINATOR
+        .phase
+        .store(SESSION_INACTIVE, Ordering::Release);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -505,15 +859,16 @@ fn active_terminal_generation() -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn cleanup_active_terminal() {
+fn cleanup_active_terminal() -> io::Result<()> {
     if let Some(generation) = active_terminal_generation() {
-        let _ = cleanup_terminal_generation(generation);
+        return cleanup_terminal_generation(generation);
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn cleanup_active_terminal() {
-    terminal_protocol::cleanup();
+fn cleanup_active_terminal() -> io::Result<()> {
+    terminal_lifecycle::cleanup_active(terminal_protocol::cleanup)
 }
 
 fn supervised_activation_failure_requested(stage: &str) -> bool {
@@ -574,6 +929,7 @@ fn require_terminal_supervisor() -> io::Result<()> {
 pub fn supervised_set_terminal_cleanup_pause(paused: bool) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     require_terminal_supervisor()?;
+    SUPERVISED_CLEANUP_PAUSE_OWNER.store(0, Ordering::Release);
     SUPERVISED_CLEANUP_PAUSE.store(paused, Ordering::Release);
     Ok(())
 }
@@ -587,6 +943,56 @@ pub fn supervised_terminal_cleanup_is_paused() -> io::Result<bool> {
     Ok(SUPERVISED_CLEANUP_PAUSED.load(Ordering::Acquire))
 }
 
+/// Pause or release a renderer writer after it captures the active generation
+/// but before its final admission check and nonblocking publication.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_set_terminal_writer_pause(paused: bool) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    SUPERVISED_WRITER_PAUSE.store(paused, Ordering::Release);
+    Ok(())
+}
+
+/// Report whether a supervised writer reached its deterministic admission gap.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_terminal_writer_is_paused() -> io::Result<bool> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok(SUPERVISED_WRITER_PAUSED.load(Ordering::Acquire))
+}
+
+/// Pause or release a writer while it owns the short nonblocking publication
+/// gate. Cleanup must time out without falsely recording restoration; after the
+/// writer observes revocation, a later bounded takeover repairs the generation.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_set_terminal_writer_gate_pause(paused: bool) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    SUPERVISED_WRITER_GATE_PAUSE.store(paused, Ordering::Release);
+    Ok(())
+}
+
+/// Report whether the supervised writer is holding the publication gate.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_terminal_writer_gate_is_paused() -> io::Result<bool> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok(SUPERVISED_WRITER_GATE_PAUSED.load(Ordering::Acquire))
+}
+
+/// Exercise the exact production terminal publisher from a supervised child.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_publish_terminal_bytes(bytes: &[u8]) -> io::Result<()> {
+    require_terminal_supervisor()?;
+    let mut output = terminal_output();
+    output.write_all(bytes)
+}
+
 /// Pause or release a signal handler after it snapshots the old owner/session.
 /// The handler itself consults atomics only, preserving async-signal safety.
 #[cfg(unix)]
@@ -594,6 +1000,7 @@ pub fn supervised_terminal_cleanup_is_paused() -> io::Result<bool> {
 pub fn supervised_set_terminal_signal_handler_pause(paused: bool) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     require_terminal_supervisor()?;
+    SUPERVISED_HANDLER_PAUSE_DISPATCH.store(0, Ordering::Release);
     SUPERVISED_HANDLER_PAUSE.store(paused, Ordering::Release);
     Ok(())
 }
@@ -623,23 +1030,22 @@ unsafe impl Sync for PreviousSignalActions {}
 static PREVIOUS_SIGNAL_ACTIONS: PreviousSignalActions =
     PreviousSignalActions(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
 #[cfg(unix)]
-static NEXT_BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static NEXT_BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(0);
 #[cfg(unix)]
-static BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static BINARY_SIGNAL_OWNER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 #[cfg(unix)]
-const BINARY_SIGNAL_OWNER_DROPPING: u32 = u32::MAX;
+const BINARY_SIGNAL_OWNER_DROPPING: u16 = u16::MAX;
 #[cfg(unix)]
-static BINARY_SIGNAL_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+const SIGNAL_GENERATION_MASK: u64 = (1_u64 << 48) - 1;
 #[cfg(unix)]
-static SIGNAL_DISPATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGNAL_ARMED_DISPATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(unix)]
-static SIGNAL_ARMED_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGNAL_PENDING_INT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(unix)]
-static SIGNAL_PENDING_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGNAL_PENDING_TERM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(unix)]
-static SIGNAL_PENDING_OWNER_AND_NUMBER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SIGNAL_PENDING_HUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(unix)]
 static SIGNAL_INSTALLED_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 #[cfg(unix)]
@@ -651,11 +1057,17 @@ static SUPERVISED_HANDLER_PAUSE: std::sync::atomic::AtomicBool =
 static SUPERVISED_HANDLER_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
+static SUPERVISED_HANDLER_PAUSE_DISPATCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
 static SUPERVISED_CLEANUP_PAUSE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
 static SUPERVISED_CLEANUP_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SUPERVISED_CLEANUP_PAUSE_OWNER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
 unsafe fn signal_errno() -> nix::libc::c_int {
@@ -733,48 +1145,91 @@ unsafe fn restore_signal_errno(_: nix::libc::c_int) {}
 extern "C" fn terminal_signal_handler(signal: nix::libc::c_int) {
     use std::sync::atomic::Ordering;
     let saved_errno = unsafe { signal_errno() };
-    let dispatch = SIGNAL_DISPATCH.load(Ordering::Acquire);
-    let owner = (dispatch >> 32) as u32;
-    let fd = dispatch as u32 as i32;
-    let session = SIGNAL_ARMED_SESSION.load(Ordering::Acquire);
-    if owner != 0 && fd >= 0 && session != 0 {
-        if SUPERVISED_HANDLER_PAUSE.load(Ordering::Acquire) {
+    // Owner and terminal generation are one release/acquire snapshot. The old
+    // two-atomic representation could be disarmed between its loads and lose a
+    // signal that had already entered this handler.
+    let dispatch = SIGNAL_ARMED_DISPATCH.load(Ordering::Acquire);
+    if dispatch != 0 {
+        if SUPERVISED_HANDLER_PAUSE.load(Ordering::Acquire)
+            && (SUPERVISED_HANDLER_PAUSE_DISPATCH
+                .compare_exchange(0, dispatch, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                || SUPERVISED_HANDLER_PAUSE_DISPATCH.load(Ordering::Acquire) == dispatch)
+        {
             SUPERVISED_HANDLER_PAUSED.store(true, Ordering::Release);
             while SUPERVISED_HANDLER_PAUSE.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
             SUPERVISED_HANDLER_PAUSED.store(false, Ordering::Release);
         }
-        let mut message = [0_u8; 16];
-        message[..4].copy_from_slice(&signal.to_ne_bytes());
-        message[4..8].copy_from_slice(&owner.to_ne_bytes());
-        message[8..16].copy_from_slice(&session.to_ne_bytes());
-        SIGNAL_PENDING_SESSION.store(session, Ordering::Release);
-        SIGNAL_PENDING_OWNER_AND_NUMBER.store(
-            (u64::from(owner) << 32) | u64::from(signal as u32),
-            Ordering::Release,
-        );
-        unsafe {
-            nix::libc::send(
-                fd,
-                message.as_ptr().cast(),
-                message.len(),
-                nix::libc::MSG_DONTWAIT | nix::libc::MSG_NOSIGNAL,
-            )
-        };
+        if let Some(pending) = pending_terminal_signal(signal) {
+            // Standard signals are already coalescing. One lock-free slot per
+            // signal preserves that contract without any inheritable/reusable
+            // descriptor or async-handler I/O.
+            publish_pending_terminal_signal(pending, dispatch);
+        }
     }
     unsafe { restore_signal_errno(saved_errno) };
+}
+
+#[cfg(unix)]
+fn publish_pending_terminal_signal(pending: &std::sync::atomic::AtomicU64, dispatch: u64) {
+    use std::sync::atomic::Ordering;
+    loop {
+        let observed = pending.load(Ordering::Acquire);
+        // Revalidate after loading the replacement candidate. If this handler
+        // was paused across disarm/re-arm, it cannot overwrite a newer
+        // generation. Conversely, the current generation may replace a stale
+        // pending token left by an old detached listener.
+        if SIGNAL_ARMED_DISPATCH.load(Ordering::Acquire) != dispatch {
+            return;
+        }
+        if pending
+            .compare_exchange(observed, dispatch, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn pending_terminal_signal(
+    signal: nix::libc::c_int,
+) -> Option<&'static std::sync::atomic::AtomicU64> {
+    match signal {
+        nix::libc::SIGINT => Some(&SIGNAL_PENDING_INT),
+        nix::libc::SIGTERM => Some(&SIGNAL_PENDING_TERM),
+        nix::libc::SIGHUP => Some(&SIGNAL_PENDING_HUP),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn signal_dispatch(owner: u16, generation: u64) -> io::Result<u64> {
+    if generation == 0 || generation > SIGNAL_GENERATION_MASK {
+        return Err(io::Error::other(
+            "terminal generation exceeds atomic signal dispatch capacity",
+        ));
+    }
+    Ok((u64::from(owner) << 48) | generation)
+}
+
+#[cfg(unix)]
+fn signal_dispatch_owner(dispatch: u64) -> u16 {
+    (dispatch >> 48) as u16
+}
+
+#[cfg(unix)]
+fn signal_dispatch_generation(dispatch: u64) -> u64 {
+    dispatch & SIGNAL_GENERATION_MASK
 }
 
 /// Scoped signal ownership for the Finch binary's active terminal session.
 /// Public [`TuiRenderer`] construction never installs signal handlers.
 pub struct BinaryTerminalSession {
     #[cfg(unix)]
-    owner: u32,
-    #[cfg(unix)]
-    read_fd: RawFd,
-    #[cfg(unix)]
-    write_fd: RawFd,
+    owner: u16,
     #[cfg(unix)]
     listener_stop: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(unix)]
@@ -785,54 +1240,6 @@ pub struct BinaryTerminalSession {
     listener_done: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(unix)]
     listener: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(unix)]
-fn close_signal_sockets(sockets: &mut [RawFd; 2]) {
-    for fd in sockets {
-        if *fd >= 0 {
-            unsafe { nix::libc::close(*fd) };
-            *fd = -1;
-        }
-    }
-}
-
-#[cfg(unix)]
-fn set_signal_socket_flag(
-    fd: RawFd,
-    get_command: nix::libc::c_int,
-    set_command: nix::libc::c_int,
-    flag: nix::libc::c_int,
-) -> io::Result<()> {
-    let current = unsafe { nix::libc::fcntl(fd, get_command) };
-    if current < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { nix::libc::fcntl(fd, set_command, current | flag) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn configure_signal_sockets(sockets: &[RawFd; 2]) -> io::Result<()> {
-    for &fd in sockets {
-        set_signal_socket_flag(
-            fd,
-            nix::libc::F_GETFD,
-            nix::libc::F_SETFD,
-            nix::libc::FD_CLOEXEC,
-        )?;
-    }
-    for &fd in sockets {
-        set_signal_socket_flag(
-            fd,
-            nix::libc::F_GETFL,
-            nix::libc::F_SETFL,
-            nix::libc::O_NONBLOCK,
-        )?;
-    }
-    Ok(())
 }
 
 impl BinaryTerminalSession {
@@ -862,32 +1269,12 @@ impl BinaryTerminalSession {
             ));
         }
 
-        let mut sockets = [-1; 2];
-        if unsafe {
-            nix::libc::socketpair(
-                nix::libc::AF_UNIX,
-                nix::libc::SOCK_DGRAM,
-                0,
-                sockets.as_mut_ptr(),
-            )
-        } < 0
-        {
-            BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
-            return Err(io::Error::last_os_error());
-        }
         if supervised_signal_transport_failure_requested() {
-            close_signal_sockets(&mut sockets);
             BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
             return Err(io::Error::other(
-                "injected signal transport descriptor setup failure",
+                "injected atomic signal transport setup failure",
             ));
         }
-        if let Err(error) = configure_signal_sockets(&sockets) {
-            close_signal_sockets(&mut sockets);
-            BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
-            return Err(error);
-        }
-        let read_fd = sockets[0];
         let listener_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listener_stop_clone = Arc::clone(&listener_stop);
         let listener_pause = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -899,7 +1286,6 @@ impl BinaryTerminalSession {
         let listener = match std::thread::Builder::new()
             .name("finch-terminal-signals".into())
             .spawn(move || {
-                let mut message = [0_u8; 16];
                 loop {
                     if listener_stop_clone.load(Ordering::Acquire) {
                         break;
@@ -914,94 +1300,37 @@ impl BinaryTerminalSession {
                         listener_paused_clone.store(false, Ordering::Release);
                         continue;
                     }
-                    let pending = SIGNAL_PENDING_OWNER_AND_NUMBER.load(Ordering::Acquire);
-                    if pending != 0
-                        && (pending >> 32) as u32 == owner
-                        && SIGNAL_PENDING_OWNER_AND_NUMBER
-                            .compare_exchange(pending, 0, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                    {
-                        let pending_owner = (pending >> 32) as u32;
-                        let pending_signal = pending as u32 as i32;
-                        let pending_session = SIGNAL_PENDING_SESSION.load(Ordering::Acquire);
-                        let current_owner = BINARY_SIGNAL_OWNER.load(Ordering::Acquire);
-                        if pending_owner == owner
-                            && (current_owner == owner
-                                || current_owner == BINARY_SIGNAL_OWNER_DROPPING)
-                            && TERMINAL_COORDINATOR.generation.load(Ordering::Acquire)
-                                == pending_session
+                    for (signal, pending) in [
+                        (nix::libc::SIGINT, &SIGNAL_PENDING_INT),
+                        (nix::libc::SIGTERM, &SIGNAL_PENDING_TERM),
+                        (nix::libc::SIGHUP, &SIGNAL_PENDING_HUP),
+                    ] {
+                        let dispatch = pending.load(Ordering::Acquire);
+                        if dispatch == 0
+                            || signal_dispatch_owner(dispatch) != owner
+                            || pending
+                                .compare_exchange(dispatch, 0, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
                         {
-                            unsafe { nix::libc::close(nix::libc::STDOUT_FILENO) };
-                            let _ = cleanup_terminal_generation(pending_session);
-                            unsafe { nix::libc::_exit(128 + pending_signal) };
-                        }
-                    }
-                    let mut poll_fd = nix::libc::pollfd {
-                        fd: read_fd,
-                        events: nix::libc::POLLIN,
-                        revents: 0,
-                    };
-                    let ready = unsafe { nix::libc::poll(&mut poll_fd, 1, 1_000) };
-                    if ready < 0 {
-                        if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                             continue;
                         }
-                        break;
-                    }
-                    if ready == 0 || poll_fd.revents & nix::libc::POLLIN == 0 {
-                        continue;
-                    }
-                    let received = unsafe {
-                        nix::libc::recv(read_fd, message.as_mut_ptr().cast(), message.len(), 0)
-                    };
-                    if received < 0 {
-                        let error = io::Error::last_os_error();
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                        ) {
-                            continue;
+                        let generation = signal_dispatch_generation(dispatch);
+                        if cleanup_terminal_generation_for_signal(generation).is_ok() {
+                            unsafe { nix::libc::_exit(128 + signal) };
                         }
-                        break;
                     }
-                    if received as usize != message.len() {
-                        continue;
-                    }
-                    let signal = i32::from_ne_bytes(message[..4].try_into().unwrap());
-                    let message_owner = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                    let session = u64::from_ne_bytes(message[8..16].try_into().unwrap());
-                    let current_owner = BINARY_SIGNAL_OWNER.load(Ordering::Acquire);
-                    if message_owner != owner
-                        || (current_owner != owner && current_owner != BINARY_SIGNAL_OWNER_DROPPING)
-                        || TERMINAL_COORDINATOR.generation.load(Ordering::Acquire) != session
-                    {
-                        continue;
-                    }
-                    // Signal termination owns the process from here. Closing
-                    // the blocking writer prevents an admitted frame from
-                    // writing after the nonblocking restore descriptor resets.
-                    unsafe { nix::libc::close(nix::libc::STDOUT_FILENO) };
-                    let _ = cleanup_terminal_generation(session);
-                    unsafe { nix::libc::_exit(128 + signal) };
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                unsafe { nix::libc::close(read_fd) };
                 listener_done_clone.store(true, Ordering::Release);
             }) {
             Ok(listener) => listener,
             Err(error) => {
-                unsafe {
-                    nix::libc::close(sockets[0]);
-                    nix::libc::close(sockets[1]);
-                }
                 BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
                 return Err(error);
             }
         };
-        BINARY_SIGNAL_WRITE_FD.store(sockets[1], Ordering::Release);
         Ok(Some(Self {
             owner,
-            read_fd: sockets[0],
-            write_fd: sockets[1],
             listener_stop,
             listener_pause,
             listener_paused,
@@ -1010,49 +1339,14 @@ impl BinaryTerminalSession {
         }))
     }
 
-    /// Return the signal transport descriptors to a proof-gated regression.
+    /// Pause the atomic signal listener so a pending-slot regression can prove
+    /// that a delivered signal is retained without descriptor backpressure.
     #[cfg(unix)]
     #[doc(hidden)]
-    pub fn supervised_signal_fds(&self) -> io::Result<(RawFd, RawFd)> {
-        require_terminal_supervisor()?;
-        Ok((self.read_fd, self.write_fd))
-    }
-
-    /// Fill the nonblocking signal transport until it reports `EAGAIN`.
-    #[cfg(unix)]
-    #[doc(hidden)]
-    pub fn supervised_fill_signal_transport(&self) -> io::Result<()> {
+    pub fn supervised_pause_signal_listener(&self) -> io::Result<()> {
         use std::sync::atomic::Ordering;
         require_terminal_supervisor()?;
         self.listener_pause.store(true, Ordering::Release);
-        // The listener may already be blocked in poll. A deliberately invalid
-        // datagram wakes it so it can observe the proof-gated pause request.
-        let wake = [0_u8; 16];
-        let mut interrupted = 0_u8;
-        loop {
-            let sent = unsafe {
-                nix::libc::send(
-                    self.write_fd,
-                    wake.as_ptr().cast(),
-                    wake.len(),
-                    nix::libc::MSG_DONTWAIT | nix::libc::MSG_NOSIGNAL,
-                )
-            };
-            if sent == wake.len() as isize {
-                break;
-            }
-            if sent >= 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "signal listener wake datagram was incomplete",
-                ));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted || interrupted >= 8 {
-                return Err(error);
-            }
-            interrupted = interrupted.saturating_add(1);
-        }
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while !self.listener_paused.load(Ordering::Acquire) {
             if std::time::Instant::now() >= deadline {
@@ -1063,33 +1357,10 @@ impl BinaryTerminalSession {
             }
             std::thread::yield_now();
         }
-        let message = [0_u8; 16];
-        loop {
-            let sent = unsafe {
-                nix::libc::send(
-                    self.write_fd,
-                    message.as_ptr().cast(),
-                    message.len(),
-                    nix::libc::MSG_DONTWAIT | nix::libc::MSG_NOSIGNAL,
-                )
-            };
-            if sent >= 0 {
-                continue;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.kind() == io::ErrorKind::WouldBlock
-                || error.raw_os_error() == Some(nix::libc::ENOBUFS)
-            {
-                return Ok(());
-            }
-            return Err(error);
-        }
+        Ok(())
     }
 
-    /// Release a listener paused by [`Self::supervised_fill_signal_transport`].
+    /// Release a listener paused by [`Self::supervised_pause_signal_listener`].
     #[cfg(unix)]
     #[doc(hidden)]
     pub fn supervised_resume_signal_listener(&self) -> io::Result<()> {
@@ -1139,15 +1410,8 @@ fn arm_binary_terminal_signals(generation: u64) -> io::Result<()> {
             "binary terminal signal owner is shutting down",
         ));
     }
-    let write_fd = BINARY_SIGNAL_WRITE_FD.load(Ordering::Acquire);
-    if write_fd < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "binary terminal signal transport is unavailable",
-        ));
-    }
     acquire_signal_transition()?;
-    if SIGNAL_ARMED_SESSION.load(Ordering::Acquire) != 0 {
+    if SIGNAL_ARMED_DISPATCH.load(Ordering::Acquire) != 0 {
         SIGNAL_TRANSITION.store(false, Ordering::Release);
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1155,11 +1419,17 @@ fn arm_binary_terminal_signals(generation: u64) -> io::Result<()> {
         ));
     }
 
-    SIGNAL_ARMED_SESSION.store(generation, Ordering::Release);
-    SIGNAL_DISPATCH.store(
-        (u64::from(owner) << 32) | u64::from(write_fd as u32),
-        Ordering::Release,
-    );
+    let dispatch = match signal_dispatch(owner, generation) {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            SIGNAL_TRANSITION.store(false, Ordering::Release);
+            return Err(error);
+        }
+    };
+    // Publish the complete snapshot before installing our first handler. A
+    // signal before sigaction still follows the embedding host's old contract;
+    // a signal after sigaction can never observe a half-armed snapshot.
+    SIGNAL_ARMED_DISPATCH.store(dispatch, Ordering::Release);
     let previous = unsafe {
         (*PREVIOUS_SIGNAL_ACTIONS.0.get())
             .as_mut_ptr()
@@ -1183,13 +1453,21 @@ fn arm_binary_terminal_signals(generation: u64) -> io::Result<()> {
         installed_mask |= 1 << index;
     }
     if let Some(error) = first_error {
+        let mut remaining_mask = 0_u8;
         for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate().rev() {
             if installed_mask & (1 << index) != 0 {
-                unsafe { nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut()) };
+                if unsafe {
+                    nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut())
+                } < 0
+                {
+                    remaining_mask |= 1 << index;
+                }
             }
         }
-        SIGNAL_DISPATCH.store(0, Ordering::Release);
-        SIGNAL_ARMED_SESSION.store(0, Ordering::Release);
+        SIGNAL_INSTALLED_MASK.store(remaining_mask, Ordering::Release);
+        if remaining_mask == 0 {
+            SIGNAL_ARMED_DISPATCH.store(0, Ordering::Release);
+        }
         SIGNAL_TRANSITION.store(false, Ordering::Release);
         return Err(error);
     }
@@ -1201,11 +1479,13 @@ fn arm_binary_terminal_signals(generation: u64) -> io::Result<()> {
 #[cfg(unix)]
 fn disarm_binary_terminal_signals(generation: u64) -> io::Result<()> {
     use std::sync::atomic::Ordering;
-    if SIGNAL_ARMED_SESSION.load(Ordering::Acquire) != generation {
+    let dispatch = SIGNAL_ARMED_DISPATCH.load(Ordering::Acquire);
+    if dispatch == 0 || signal_dispatch_generation(dispatch) != generation {
         return Ok(());
     }
     acquire_signal_transition()?;
-    if SIGNAL_ARMED_SESSION.load(Ordering::Acquire) != generation {
+    let dispatch = SIGNAL_ARMED_DISPATCH.load(Ordering::Acquire);
+    if dispatch == 0 || signal_dispatch_generation(dispatch) != generation {
         SIGNAL_TRANSITION.store(false, Ordering::Release);
         return Ok(());
     }
@@ -1216,18 +1496,27 @@ fn disarm_binary_terminal_signals(generation: u64) -> io::Result<()> {
             .cast::<nix::libc::sigaction>()
     };
     let mut first_error = None;
+    let mut remaining_mask = 0_u8;
     for (index, signal) in TERMINAL_SIGNALS.into_iter().enumerate().rev() {
         if installed_mask & (1 << index) == 0 {
             continue;
         }
-        if unsafe { nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut()) } < 0
-            && first_error.is_none()
-        {
-            first_error = Some(io::Error::last_os_error());
+        if unsafe { nix::libc::sigaction(signal, previous.add(index), std::ptr::null_mut()) } < 0 {
+            remaining_mask |= 1 << index;
+            if first_error.is_none() {
+                first_error = Some(io::Error::last_os_error());
+            }
         }
     }
-    SIGNAL_DISPATCH.store(0, Ordering::Release);
-    SIGNAL_ARMED_SESSION.store(0, Ordering::Release);
+    // Restore every host disposition before withdrawing the snapshot. A new
+    // signal after each sigaction therefore follows the host handler; an old
+    // handler already in flight retains the exact atomic snapshot it observed.
+    SIGNAL_INSTALLED_MASK.store(remaining_mask, Ordering::Release);
+    if remaining_mask == 0 {
+        SIGNAL_ARMED_DISPATCH
+            .compare_exchange(dispatch, 0, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+    }
     SIGNAL_TRANSITION.store(false, Ordering::Release);
     match first_error {
         Some(error) => Err(error),
@@ -1236,13 +1525,22 @@ fn disarm_binary_terminal_signals(generation: u64) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn supervised_pause_during_terminal_cleanup() {
+fn supervised_pause_during_terminal_cleanup(generation: u64, owner: u64) {
     use std::sync::atomic::Ordering;
     if !SUPERVISED_CLEANUP_PAUSE.load(Ordering::Acquire) {
         return;
     }
+    if SUPERVISED_CLEANUP_PAUSE_OWNER
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+        && SUPERVISED_CLEANUP_PAUSE_OWNER.load(Ordering::Acquire) != owner
+    {
+        return;
+    }
     SUPERVISED_CLEANUP_PAUSED.store(true, Ordering::Release);
-    while SUPERVISED_CLEANUP_PAUSE.load(Ordering::Acquire) {
+    while SUPERVISED_CLEANUP_PAUSE.load(Ordering::Acquire)
+        && owns_terminal_cleanup(generation, owner)
+    {
         std::thread::yield_now();
     }
     SUPERVISED_CLEANUP_PAUSED.store(false, Ordering::Release);
@@ -1276,19 +1574,14 @@ impl Drop for BinaryTerminalSession {
             if let Some(generation) = active_terminal_generation() {
                 let _ = cleanup_terminal_generation(generation);
             }
-            let armed = SIGNAL_ARMED_SESSION.load(Ordering::Acquire);
+            let armed = SIGNAL_ARMED_DISPATCH.load(Ordering::Acquire);
             if armed != 0 {
-                let _ = disarm_binary_terminal_signals(armed);
+                let _ = disarm_binary_terminal_signals(signal_dispatch_generation(armed));
             }
-            SIGNAL_DISPATCH.store(0, Ordering::Release);
-            BINARY_SIGNAL_WRITE_FD.store(-1, Ordering::Release);
+            SIGNAL_ARMED_DISPATCH.store(0, Ordering::Release);
         }
         self.listener_stop.store(true, Ordering::Release);
         self.listener_pause.store(false, Ordering::Release);
-        unsafe {
-            nix::libc::shutdown(self.write_fd, nix::libc::SHUT_RDWR);
-            nix::libc::close(self.write_fd);
-        }
         if owns_global {
             BINARY_SIGNAL_OWNER.store(0, Ordering::Release);
         }
@@ -1296,9 +1589,9 @@ impl Drop for BinaryTerminalSession {
         while !self.listener_done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
-        // The listener owns and closes read_fd. If it did not receive CPU time
-        // within the bound, detaching leaves that close pending rather than
-        // reusing the descriptor underneath a paused listener.
+        // Detaching after the bound is safe: the listener owns no descriptor or
+        // terminal state, and owner-tagged pending slots cannot target a later
+        // BinaryTerminalSession.
         let _ = self.listener.take();
     }
 }
@@ -1310,7 +1603,14 @@ impl Drop for BinaryTerminalSession {
 /// alone is insufficient — bracketed paste and kitty keyboard enhancement
 /// remain enabled and their escape sequences leak into the user's shell.
 pub fn emergency_restore_terminal() {
-    cleanup_active_terminal();
+    let _ = emergency_restore_terminal_result();
+}
+
+/// Restore the active generation and report whether restoration actually
+/// completed. Callers returning control to an embedding host must not treat a
+/// bounded timeout as successful cleanup.
+pub(crate) fn emergency_restore_terminal_result() -> io::Result<()> {
+    cleanup_active_terminal()
 }
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
@@ -2237,7 +2537,6 @@ pub enum PosetPanelMode {
 
 #[allow(dead_code)]
 pub struct TuiRenderer {
-    #[cfg(unix)]
     terminal_session: Mutex<Option<TerminalSessionState>>,
     output_manager: Arc<OutputManager>,
     status_bar: Arc<StatusBar>,
@@ -2353,7 +2652,6 @@ impl TuiRenderer {
     ) -> Self {
         output_manager.disable_stdout();
         Self {
-            #[cfg(unix)]
             terminal_session: Mutex::new(None),
             output_manager,
             status_bar,
@@ -2403,11 +2701,8 @@ impl TuiRenderer {
         status_bar: Arc<StatusBar>,
         colors: ColorScheme,
     ) -> Result<Self> {
-        #[cfg(unix)]
         let terminal_session =
             TerminalSessionState::activate().context("Failed to activate terminal session")?;
-        #[cfg(not(unix))]
-        terminal_protocol::activate().context("Failed to activate terminal session")?;
 
         // Suppress OutputManager's own stdout writes — we own the terminal.
         output_manager.disable_stdout();
@@ -2415,7 +2710,6 @@ impl TuiRenderer {
         let command_history = Self::load_history();
 
         Ok(TuiRenderer {
-            #[cfg(unix)]
             terminal_session: Mutex::new(Some(terminal_session)),
             output_manager,
             status_bar,
@@ -2656,7 +2950,7 @@ impl TuiRenderer {
     /// (not necessarily at the bottom row), so we must use that field — not
     /// `active_rows - 1` — to reach the top correctly.
     pub fn erase_live_area(&mut self) -> Result<()> {
-        let mut stdout = io::stdout();
+        let mut stdout = terminal_output();
         // Begin the synchronized update here so erase + draw are one atomic
         // terminal operation — eliminates the blank-flash between them.
         // Never clear from the cursor to the bottom of the terminal here. A
@@ -2675,7 +2969,7 @@ impl TuiRenderer {
 
     /// Draw the live area from scratch and track `active_rows`.
     pub fn draw_live_area(&mut self) -> Result<()> {
-        let mut stdout = io::stdout();
+        let mut stdout = terminal_output();
 
         let mut rows: usize = 0;
 
@@ -3357,7 +3651,7 @@ impl TuiRenderer {
         }
 
         if !to_commit.is_empty() {
-            let mut stdout = io::stdout();
+            let mut stdout = terminal_output();
             prepare_canonical_commit_guarded(&mut stdout)?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
@@ -3430,7 +3724,7 @@ impl TuiRenderer {
         let start_col = (term_cols as usize).saturating_sub(vis_len + 1) as u16;
 
         let label = format!("{}{}{}", DIM_GRAY, text, RESET);
-        let mut stdout = io::stdout();
+        let mut stdout = terminal_output();
         execute!(stdout, cursor::SavePosition)?;
         execute!(stdout, cursor::MoveTo(start_col, 0))?;
         execute!(stdout, Print(&label))?;
@@ -3480,7 +3774,6 @@ impl TuiRenderer {
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    #[cfg(unix)]
     fn take_terminal_session_bounded(&self) -> io::Result<Option<TerminalSessionState>> {
         let deadline = std::time::Instant::now() + Duration::from_millis(100);
         loop {
@@ -3502,7 +3795,6 @@ impl TuiRenderer {
         }
     }
 
-    #[cfg(unix)]
     fn replace_terminal_session_bounded(
         &self,
         replacement: TerminalSessionState,
@@ -3549,22 +3841,18 @@ impl TuiRenderer {
             return Ok(());
         }
         self.is_active = false;
-        #[cfg(unix)]
         let cleanup_result = match self.take_terminal_session_bounded() {
             Ok(Some(session)) => session.cleanup(),
             Ok(None) => Ok(()),
             Err(error) => {
-                cleanup_active_terminal();
+                let _ = cleanup_active_terminal();
                 Err(error)
             }
         };
-        #[cfg(not(unix))]
-        let cleanup_result = {
-            emergency_restore_terminal();
-            Ok::<(), io::Error>(())
-        };
         Self::save_history(&self.command_history);
-        self.output_manager.enable_stdout();
+        if cleanup_result.is_ok() {
+            self.output_manager.enable_stdout();
+        }
         cleanup_result.map_err(Into::into)
     }
 
@@ -3575,29 +3863,21 @@ impl TuiRenderer {
     /// Temporarily release the terminal so another full-screen TUI (e.g. the
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
-        #[cfg(unix)]
         match self.take_terminal_session_bounded() {
             Ok(Some(session)) => session.cleanup()?,
             Ok(None) => {}
             Err(error) => {
-                cleanup_active_terminal();
+                let _ = cleanup_active_terminal();
                 return Err(error.into());
             }
         }
-        #[cfg(not(unix))]
-        emergency_restore_terminal();
         Ok(())
     }
 
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
-        #[cfg(unix)]
-        {
-            let replacement = TerminalSessionState::activate()?;
-            self.replace_terminal_session_bounded(replacement)?;
-        }
-        #[cfg(not(unix))]
-        terminal_protocol::activate()?;
+        let replacement = TerminalSessionState::activate()?;
+        self.replace_terminal_session_bounded(replacement)?;
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -3610,13 +3890,8 @@ impl TuiRenderer {
     /// deliberately stronger than [`Self::resume`]: emergency restoration
     /// also pops keyboard enhancements and disables bracketed paste.
     pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
-        #[cfg(unix)]
-        {
-            let replacement = TerminalSessionState::activate()?;
-            self.replace_terminal_session_bounded(replacement)?;
-        }
-        #[cfg(not(unix))]
-        terminal_protocol::activate()?;
+        let replacement = TerminalSessionState::activate()?;
+        self.replace_terminal_session_bounded(replacement)?;
         self.output_manager.disable_stdout();
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -3632,18 +3907,19 @@ impl Drop for TuiRenderer {
         // shutdown() sets is_active = false before doing anything, so this is
         // idempotent — if shutdown() already ran, this is a no-op.
         if self.is_active {
-            #[cfg(unix)]
-            match self.terminal_session.try_lock() {
+            let restored = match self.terminal_session.try_lock() {
                 Ok(mut owned) => {
                     if let Some(session) = owned.take() {
-                        let _ = session.cleanup();
+                        session.cleanup().is_ok()
+                    } else {
+                        true
                     }
                 }
-                Err(_) => cleanup_active_terminal(),
+                Err(_) => cleanup_active_terminal().is_ok(),
+            };
+            if restored {
+                self.output_manager.enable_stdout();
             }
-            #[cfg(not(unix))]
-            emergency_restore_terminal();
-            self.output_manager.enable_stdout();
         }
     }
 }
@@ -4006,7 +4282,7 @@ impl TuiRenderer {
             .sum();
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
 
-        let mut stdout = io::stdout();
+        let mut stdout = terminal_output();
         let paint = if synchronized_update_open {
             continue_full_viewport_paint(&mut stdout, plan, &transcript)
         } else {
@@ -4023,7 +4299,7 @@ impl TuiRenderer {
         // draw_live_area closes the synchronized update begun above.
         let draw = self.draw_live_area();
         if draw.is_err() {
-            let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+            let _ = execute!(terminal_output(), EndSynchronizedUpdate);
         }
         draw
     }
@@ -4632,8 +4908,8 @@ impl TuiRenderer {
         use ratatui::widgets::Widget;
         use ratatui::{backend::CrosstermBackend, Terminal};
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(io::stdout());
+        execute!(terminal_output(), EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(terminal_output());
         let mut term = Terminal::new(backend).context("Failed to create wizard terminal")?;
 
         let result = loop {
@@ -4654,7 +4930,7 @@ impl TuiRenderer {
             }
         };
 
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(terminal_output(), LeaveAlternateScreen)?;
         self.active_rows = 0;
         Ok(result)
     }
@@ -4728,8 +5004,8 @@ impl TuiRenderer {
 
         let colors = self.colors.clone();
 
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(io::stdout());
+        execute!(terminal_output(), EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(terminal_output());
         let mut term = Terminal::new(backend).context("Failed to create file viewer terminal")?;
 
         let mut scroll: usize = 0;
@@ -4855,7 +5131,7 @@ impl TuiRenderer {
             }
         }
 
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(terminal_output(), LeaveAlternateScreen)?;
         self.active_rows = 0;
         Ok(())
     }
