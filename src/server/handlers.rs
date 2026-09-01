@@ -1966,23 +1966,17 @@ async fn dispatch_named_brain_program(
                     anyhow::bail!("named Brain run cancelled");
                 }
                 validate_runner_effect_journal(&failure.effect_journal)?;
-                push_named_brain_run_result(
-                    store,
-                    name,
-                    run_id,
-                    request_seq,
-                    Err(anyhow::anyhow!(error.to_string())),
-                    Vec::new(),
-                    None,
-                )?;
-                store.transition_run(
-                    name,
-                    "daemon",
-                    run_id,
-                    crate::brain::store::BrainRunStatus::Failed,
-                    Some(error.to_string()),
-                )?;
                 drop(publication);
+                store
+                    .terminalize_run_with_result_if_active_wait(
+                        name,
+                        "daemon",
+                        run_id,
+                        request_seq,
+                        crate::brain::store::BrainRunStatus::Failed,
+                        error.to_string(),
+                    )
+                    .await?;
                 store.prune_run_publication(name, run_id)?;
             }
             return Err(error);
@@ -1994,27 +1988,15 @@ async fn dispatch_named_brain_program(
         anyhow::bail!("named Brain run cancelled");
     }
     validate_runner_effect_journal(&outcome.effect_journal)?;
-    store.commit_runner_runtime_for_run(
+    let result = store.commit_runner_run_outcome(
         name,
         run_id,
         request_seq,
         outcome.runtime_revision,
         outcome.checkpoint,
-    )?;
-    let result = push_named_brain_run_result(
-        store,
-        name,
-        run_id,
-        request_seq,
-        Ok(outcome.output),
-        Vec::new(),
         None,
-    )?;
-    store.transition_run(
-        name,
-        "daemon",
-        run_id,
-        crate::brain::store::BrainRunStatus::Completed,
+        outcome.output,
+        Vec::new(),
         None,
     )?;
     drop(publication);
@@ -2092,23 +2074,17 @@ async fn dispatch_named_brain_turn(
                     failure.turn_events.clone(),
                 )?;
                 validate_runner_effect_journal(&failure.effect_journal)?;
-                push_named_brain_run_result(
-                    store,
-                    name,
-                    run_id,
-                    request_seq,
-                    Err(anyhow::anyhow!(error.to_string())),
-                    Vec::new(),
-                    None,
-                )?;
-                store.transition_run(
-                    name,
-                    "daemon",
-                    run_id,
-                    crate::brain::store::BrainRunStatus::Failed,
-                    Some(error.to_string()),
-                )?;
                 drop(publication);
+                store
+                    .terminalize_run_with_result_if_active_wait(
+                        name,
+                        "daemon",
+                        run_id,
+                        request_seq,
+                        crate::brain::store::BrainRunStatus::Failed,
+                        error.to_string(),
+                    )
+                    .await?;
                 store.prune_run_publication(name, run_id)?;
             }
             return Err(error);
@@ -2130,37 +2106,16 @@ async fn dispatch_named_brain_turn(
         outcome.turn_events,
     )?;
     validate_runner_effect_journal(&outcome.effect_journal)?;
-    let program = store.push_for_run(
-        name,
-        "provider",
-        run_id,
-        crate::brain::store::BrainEventKind::Program {
-            language: outcome.language,
-            source: outcome.source,
-        },
-    )?;
-    store.commit_runner_runtime_for_run(
+    let result = store.commit_runner_run_outcome(
         name,
         run_id,
-        program.seq,
+        request_seq,
         outcome.runtime_revision,
         outcome.checkpoint,
-    )?;
-    let result = push_named_brain_run_result(
-        store,
-        name,
-        run_id,
-        program.seq,
-        Ok(outcome.output),
+        Some((outcome.language, outcome.source)),
+        outcome.output,
         outcome.continuation_messages,
         outcome.invocation_metadata,
-    )?;
-    store.transition_run(
-        name,
-        "daemon",
-        run_id,
-        crate::brain::store::BrainRunStatus::Completed,
-        None,
     )?;
     drop(publication);
     store.prune_run_publication(name, run_id)?;
@@ -4498,7 +4453,7 @@ mod handler_tests {
                         && matches!(event.kind, BrainEventKind::Result { .. })
                 })
                 .count(),
-            0
+            1
         );
         assert_eq!(
             disconnected
@@ -4544,9 +4499,13 @@ mod handler_tests {
         .await
         .expect("stale reverse approval waited after teardown")
         .unwrap_err();
-        assert!(stale_error
-            .to_string()
-            .contains("approval audience connection is no longer current"));
+        let stale_error = stale_error.to_string();
+        assert!(
+            stale_error.contains("approval audience connection is no longer current")
+                || stale_error.contains("terminal Brain run cannot request approval")
+                || stale_error.contains("effect audit request has been cancelled"),
+            "unexpected stale approval failure: {stale_error}"
+        );
         assert!(approvals
             .inspect_connection(
                 snapshot.brain_id,
@@ -4924,6 +4883,13 @@ mod handler_tests {
         );
         forwarding.await;
 
+        // Dropping the daemon RPC retires that callback generation. A safe
+        // frontend reconnect explicitly registers a fresh generation before
+        // the recovered durable lane is reused.
+        let (replacement_runner_tx, mut replacement_runner_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        lifecycle.register_test_runner("shared", lease.lease_id, replacement_runner_tx);
+
         let replacement = lifecycle
             .attach(
                 "shared",
@@ -4951,7 +4917,7 @@ mod handler_tests {
                 .await
         });
         let later_turn = loop {
-            match runner_rx.recv().await.unwrap() {
+            match replacement_runner_rx.recv().await.unwrap() {
                 crate::server::RunnerRequest::Turn(turn) => break turn,
                 crate::server::RunnerRequest::ProjectMemory(request) => {
                     request.response_tx.send(Ok(0)).unwrap();

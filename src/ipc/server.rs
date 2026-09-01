@@ -376,9 +376,9 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
             Ok(language) => program_language_from_capnp(language),
             Err(error) => return Promise::err(error.into()),
         };
-        let source = match params.get_source() {
-            Ok(source) => source.to_str().unwrap_or("").to_string(),
-            Err(error) => return Promise::err(error),
+        let source = match decode_required_text(params.get_source(), "runner schedule source") {
+            Ok(source) => source,
+            Err(error) => return Promise::err(capnp::Error::failed(error)),
         };
         let grant_ceiling = match params
             .get_grant_ceiling()
@@ -1354,7 +1354,10 @@ impl brain_service::Server for BrainRpcService {
             Ok(language) => program_language_from_capnp(language),
             Err(error) => return Promise::err(error.into()),
         };
-        let source = pry!(params.get_source()).to_str().unwrap_or("").to_string();
+        let source = match decode_required_text(params.get_source(), "schedule source") {
+            Ok(source) => source,
+            Err(error) => return Promise::err(capnp::Error::failed(error)),
+        };
         let grant_ceiling = match params
             .get_grant_ceiling()
             .map_err(anyhow::Error::from)
@@ -1928,6 +1931,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+        let queued_broker = broker.clone();
         let queued_brain = brain.clone();
         let registered_brain = brain.clone();
         let registered_connection_id = self.connection_id;
@@ -1966,7 +1970,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
         // Return the registration bootstrap first. The frontend then marks
         // this lease active before the queued callback reaches its event loop.
         tokio::task::spawn_local(async move {
-            tokio::task::yield_now().await;
+            if let Err(error) = queued_broker
+                .wait_registration_active(&queued_brain, registration_id)
+                .await
+            {
+                tracing::warn!(brain = %queued_brain, %error,
+                    "runner registration retired before queued work could resume");
+                return;
+            }
             if let Err(error) = queued_lifecycle
                 .resume_queued_runs(queued_brain.clone(), lease_id)
                 .await
@@ -2530,26 +2541,17 @@ fn decode_runner_program_result(
             .get_effect_journal()
             .map_err(|error| error.to_string())?,
     )?;
-    let error = result
-        .get_error()
-        .ok()
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+    let error = decode_required_text(result.get_error(), "runner program error")?;
     if !error.is_empty() {
         return Err(crate::server::RunnerProgramError {
-            message: error.to_string(),
+            message: error,
             effect_journal,
         });
     }
     let checkpoint = decode_checkpoint(result.get_checkpoint().map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     Ok(crate::server::RunnerProgramResult {
-        output: result
-            .get_output()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
+        output: decode_required_text(result.get_output(), "runner program output")?,
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
         effect_journal,
@@ -2560,11 +2562,7 @@ fn decode_runner_turn_result(
     result: capnp::Result<finch_ipc_capnp::brain_turn_result::Reader<'_>>,
 ) -> Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
     let result = result.map_err(|error| error.to_string())?;
-    let error = result
-        .get_error()
-        .ok()
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+    let error = decode_required_text(result.get_error(), "runner turn error")?;
     let mut turn_events = Vec::new();
     let encoded_turn_events = result
         .get_turn_events()
@@ -2579,7 +2577,7 @@ fn decode_runner_turn_result(
     )?;
     if !error.is_empty() {
         return Err(crate::server::RunnerTurnError {
-            message: error.to_string(),
+            message: error,
             turn_events,
             effect_journal,
         });
@@ -2607,21 +2605,11 @@ fn decode_runner_turn_result(
         None
     };
     Ok(crate::server::RunnerTurnResult {
-        source: result
-            .get_source()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
+        source: decode_required_text(result.get_source(), "runner turn source")?,
         language: program_language_from_capnp(
             result.get_language().map_err(|error| error.to_string())?,
         ),
-        output: result
-            .get_output()
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string(),
+        output: decode_required_text(result.get_output(), "runner turn output")?,
         continuation_messages: crate::ipc::brain_codec::decode_continuation_messages(
             result
                 .get_continuation_messages()
@@ -2660,21 +2648,26 @@ fn decode_runner_effect_records(
         .collect()
 }
 
+fn decode_required_text(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+    field: &str,
+) -> Result<String, String> {
+    value
+        .map_err(|error| format!("could not read {field}: {error}"))?
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|error| format!("{field} is not valid UTF-8: {error}"))
+}
+
 fn decode_runner_turn_event(
     encoded: finch_ipc_capnp::brain_turn_event::Reader<'_>,
 ) -> Result<crate::server::RunnerTurnEvent, String> {
-    let text = |value: capnp::Result<capnp::text::Reader<'_>>| {
-        value
-            .ok()
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string()
-    };
-    let tool_id = text(encoded.get_tool_id());
+    let text = |value, field| decode_required_text(value, field);
+    let tool_id = text(encoded.get_tool_id(), "runner turn event tool id")?;
     match encoded.get_kind().map_err(|error| error.to_string())? {
         finch_ipc_capnp::BrainTurnEventKind::Call => Ok(crate::server::RunnerTurnEvent::Call {
             tool_id,
-            name: text(encoded.get_name()),
+            name: text(encoded.get_name(), "runner turn event tool name")?,
             input: super::brain_codec::decode_json_value(
                 encoded.get_input().map_err(|error| error.to_string())?,
             )
@@ -2682,14 +2675,14 @@ fn decode_runner_turn_event(
         }),
         finch_ipc_capnp::BrainTurnEventKind::Result => Ok(crate::server::RunnerTurnEvent::Result {
             tool_id,
-            output: text(encoded.get_output()),
+            output: text(encoded.get_output(), "runner turn event output")?,
             is_error: encoded.get_is_error(),
         }),
         finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested => {
             Ok(crate::server::RunnerTurnEvent::ApprovalRequested {
-                approval_id: text(encoded.get_approval_id()),
-                approval_kind: text(encoded.get_approval_kind()),
-                subject: text(encoded.get_subject()),
+                approval_id: text(encoded.get_approval_id(), "runner approval id")?,
+                approval_kind: text(encoded.get_approval_kind(), "runner approval kind")?,
+                subject: text(encoded.get_subject(), "runner approval subject")?,
                 audience: decode_approval_audience(
                     encoded
                         .get_approval_audience()
@@ -2704,7 +2697,7 @@ fn decode_runner_turn_event(
         }
         finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided => {
             Ok(crate::server::RunnerTurnEvent::ApprovalDecided {
-                approval_id: text(encoded.get_approval_id()),
+                approval_id: text(encoded.get_approval_id(), "runner approval id")?,
                 decision: super::brain_codec::decode_json_value(
                     encoded.get_decision().map_err(|error| error.to_string())?,
                 )
@@ -2720,6 +2713,16 @@ mod tests {
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
         require_approval_connection, BrainRpcService, BrainRunnerControlImpl, FinchDaemonImpl,
     };
+
+    #[test]
+    fn runner_result_text_rejects_malformed_utf8_instead_of_coercing_empty() {
+        let error = super::decode_required_text(
+            Ok(capnp::text::Reader(&[0xff, 0xfe])),
+            "runner program output",
+        )
+        .unwrap_err();
+        assert!(error.contains("runner program output is not valid UTF-8"));
+    }
     use crate::ipc::brain_codec::encode_approval_audience;
 
     #[test]
@@ -3140,6 +3143,100 @@ mod tests {
         fn name(&self) -> &str {
             "effect-test"
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_reconnect_installs_the_canonical_checkpoint_over_a_late_local_commit() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store,
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([93; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                    FinchDaemonImpl::new(std::sync::Arc::clone(&server), uuid::Uuid::new_v4()),
+                );
+                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                let snapshot = ipc.brain_snapshot("shared").await.unwrap();
+                let subject = "runner@box.local/reconnect-rollback";
+                ipc.brain_claim_runner_identity(subject).await.unwrap();
+                let lease = ipc
+                    .brain_acquire_runner("shared", subject, &snapshot.environment, None, 300_000)
+                    .await
+                    .unwrap();
+
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                runtime
+                    .submit_typed_only(crate::runtime::ProgramSubmission {
+                        language: crate::programs::ProgramLanguage::Forth,
+                        source_id: Some("cancelled-late-local-commit".into()),
+                        source: "1".into(),
+                        intent: "prove reconnect rollback uses daemon bootstrap".into(),
+                        effect: crate::programs::ExecutionEffect::Pure,
+                        declared_capabilities: Vec::new(),
+                        manifest_generation: runtime.manifest_generation(),
+                        expected_revision: Some(0),
+                        budget: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(runtime.revision(), 1);
+
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input: serde_json::Value::Null,
+                        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    });
+                let registry = crate::tools::registry::ToolRegistry::new();
+                let permissions = crate::tools::permissions::PermissionManager::new();
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        registry,
+                        permissions,
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .unwrap(),
+                ));
+                let event_loop = crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    std::sync::Arc::clone(&runtime),
+                );
+                let bootstrap = ipc
+                    .register_brain_runner(
+                        "shared",
+                        lease.lease_id,
+                        event_loop.named_brain_event_sender_for_test(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(bootstrap.runtime_revision, 0);
+                event_loop
+                    .install_runner_bootstrap(bootstrap)
+                    .await
+                    .unwrap();
+                assert_eq!(runtime.revision(), 0);
+                assert!(runtime
+                    .revision_history()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.revision == 0)
+                    .unwrap()
+                    .stack
+                    .is_empty());
+            })
+            .await;
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
@@ -3600,18 +3697,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_cancel_observation_rejects_forwarding_without_cancel_delivery() {
-        let (cancelled_tx, mut cancelled_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut forwarding = Box::pin(async {});
-
-        let observation =
-            observe_cancel_before_forwarding_returns(&mut cancelled_rx, &mut forwarding).await;
-
-        assert_eq!(observation, (None, true));
-        drop(cancelled_tx);
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn test_abandoning_daemon_rpc_physically_cancels_the_exact_frontend_callback() {
         let temp = tempfile::tempdir().unwrap();
@@ -3692,6 +3777,14 @@ mod tests {
             _ = &mut forwarding => panic!("program forwarding ended before it started"),
         };
         assert_eq!(started, run.run_id);
+        assert!(matches!(
+            futures::poll!(&mut forwarding),
+            std::task::Poll::Pending
+        ));
+        assert!(matches!(
+            cancelled_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
         cancel.cancel();
         let (cancelled, forwarding_completed) =
             observe_cancel_before_forwarding_returns(&mut cancelled_rx, &mut forwarding).await;
@@ -3713,11 +3806,18 @@ mod tests {
                     Some(temp.path().join("brains")),
                 );
                 let server = std::sync::Arc::new(
-                    crate::server::AgentServer::for_brain_protocol_test(
+                    crate::server::AgentServer::for_brain_protocol_test_with_runner_deadlines(
                         store.clone(),
                         crate::brain::credential::BrainCredentialAuthority::ephemeral([92; 32]),
                         "test-password".into(),
                         temp.path(),
+                        crate::server::RunnerDeadlines {
+                            program: std::time::Duration::from_secs(2),
+                            turn: std::time::Duration::from_secs(2),
+                            cancel: std::time::Duration::from_secs(2),
+                            project_memory: std::time::Duration::from_secs(2),
+                            callback_cleanup: std::time::Duration::from_millis(50),
+                        },
                     )
                     .unwrap(),
                 );
@@ -3867,7 +3967,10 @@ mod tests {
                     }
                 });
                 let replacement_lifecycle = lifecycle.clone();
+                let (replacement_attempted_tx, replacement_attempted_rx) =
+                    tokio::sync::oneshot::channel();
                 let replacement_submission = tokio::task::spawn_local(async move {
+                    let _ = replacement_attempted_tx.send(());
                     replacement_lifecycle
                         .submit(
                             "shared",
@@ -3881,9 +3984,9 @@ mod tests {
                         .await
                 });
 
-                for _ in 0..8 {
-                    tokio::task::yield_now().await;
-                }
+                replacement_attempted_rx
+                    .await
+                    .expect("replacement submission task did not reach admission");
                 assert!(
                     !old_submission.is_finished(),
                     "expired run lane returned before its physical IPC callback settled"
@@ -3892,6 +3995,18 @@ mod tests {
                     !replacement_submission.is_finished()
                         && replacement_started_rx.try_recv().is_err(),
                     "replacement callback overlapped the nonquiescent expired generation"
+                );
+
+                let replacement_run_id = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    &mut replacement_started_rx,
+                )
+                .await
+                .expect("replacement callback did not start after bounded cleanup")
+                .unwrap();
+                assert!(
+                    old_submission.is_finished(),
+                    "expired run lane did not terminalize after bounded callback cleanup"
                 );
 
                 release_old.notify_one();
@@ -3914,13 +4029,6 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 assert_eq!(old_outcome.run.unwrap().run_id, old_run_id);
-                let replacement_run_id = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    &mut replacement_started_rx,
-                )
-                .await
-                .expect("replacement callback did not start after cleanup")
-                .unwrap();
                 let replacement_outcome = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     replacement_submission,
@@ -3967,6 +4075,35 @@ mod tests {
                 );
                 assert!(snapshot.effect_audits.is_empty());
                 assert!(!snapshot.events.iter().any(|event| matches!(
+                    &event.kind,
+                    crate::brain::store::BrainEventKind::Result { output, error, .. }
+                        if output.contains("late stale generation")
+                            || error.as_deref().is_some_and(|error| error.contains("late stale generation"))
+                )));
+
+                let reopened = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let reopened_snapshot = reopened.snapshot("shared").unwrap();
+                for run_id in [old_run_id, replacement_run_id] {
+                    assert_eq!(
+                        reopened_snapshot
+                            .events
+                            .iter()
+                            .filter(|event| {
+                                event.run_id == Some(run_id)
+                                    && matches!(
+                                        event.kind,
+                                        crate::brain::store::BrainEventKind::Result { .. }
+                                    )
+                            })
+                            .count(),
+                        1,
+                        "reopen must preserve exactly one canonical result per terminal run"
+                    );
+                }
+                assert!(!reopened_snapshot.events.iter().any(|event| matches!(
                     &event.kind,
                     crate::brain::store::BrainEventKind::Result { output, error, .. }
                         if output.contains("late stale generation")
@@ -4254,24 +4391,21 @@ mod tests {
             .run_until(async {
                 let (_temp, store, server, connection_id, lease_id, result) =
                     partial_frame_connection_teardown_fixture(true).await;
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("could not reconcile effect audits"));
+                result.expect("transient audit failure must be retried by the teardown owner");
                 let replacement = uuid::Uuid::new_v4();
-                assert!(server
+                server
                     .brain_runners()
                     .claim_connection_identity(replacement, "runner@box.local/partial")
-                    .is_err());
-                assert!(server
+                    .unwrap();
+                server
                     .brain_runners()
                     .claim_connection_lease(replacement, "shared", lease_id)
-                    .is_err());
+                    .unwrap();
                 assert_eq!(
                     store
                         .reconcile_effect_audits_for_disconnected_leases("shared", &[lease_id])
                         .unwrap(),
-                    2
+                    0
                 );
                 server
                     .brain_runners()
@@ -4883,14 +5017,21 @@ mod tests {
                             ref outcome_kind, ..
                         }
                     } if outcome_kind == "acknowledged"));
-                assert!(!snapshot.events.iter().any(|event| matches!(
-                    event.kind,
-                    crate::brain::store::BrainEventKind::ToolResult { .. }
-                        | crate::brain::store::BrainEventKind::Result { .. }
-                        | crate::brain::store::BrainEventKind::Program { .. }
-                        | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
-                        | crate::brain::store::BrainEventKind::EffectRecorded { .. }
-                )));
+                assert!(!snapshot.events.iter().any(|event| {
+                    matches!(
+                        event.kind,
+                        crate::brain::store::BrainEventKind::ToolResult { .. }
+                            | crate::brain::store::BrainEventKind::Program { .. }
+                            | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
+                            | crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                    ) || matches!(
+                        &event.kind,
+                        crate::brain::store::BrainEventKind::Result {
+                            error: None,
+                            ..
+                        }
+                    )
+                }));
                 assert_eq!(
                     serde_json::to_value(conversation.read().await.get_messages()).unwrap(),
                     conversation_before_late_finish,
@@ -5806,14 +5947,21 @@ async fn serve_ipc_listener(
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     accepted = listener.accept() => match accepted {
                         Ok((stream, _addr)) => {
                             let server = Arc::clone(&server);
-                            tokio::task::spawn_local(async move {
-                                if let Err(e) = handle_connection(stream, server).await {
+                            let connection_shutdown = shutdown.clone();
+                            connections.spawn_local(async move {
+                                if let Err(e) = handle_connection_with_shutdown(
+                                    stream,
+                                    server,
+                                    uuid::Uuid::new_v4(),
+                                    connection_shutdown,
+                                ).await {
                                     tracing::warn!("IPC connection error: {}", e);
                                 }
                             });
@@ -5824,6 +5972,11 @@ async fn serve_ipc_listener(
                     }
                 }
             }
+            while let Some(result) = connections.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "IPC connection task failed during shutdown drain");
+                }
+            }
         })
         .await;
     if remove_on_shutdown && path.exists() {
@@ -5832,14 +5985,25 @@ async fn serve_ipc_listener(
     Ok(())
 }
 
-async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServer>) -> Result<()> {
-    handle_connection_with_id(stream, server, uuid::Uuid::new_v4()).await
-}
-
 async fn handle_connection_with_id(
     stream: tokio::net::UnixStream,
     server: Arc<AgentServer>,
     connection_id: uuid::Uuid,
+) -> Result<()> {
+    handle_connection_with_shutdown(
+        stream,
+        server,
+        connection_id,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn handle_connection_with_shutdown(
+    stream: tokio::net::UnixStream,
+    server: Arc<AgentServer>,
+    connection_id: uuid::Uuid,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
 
@@ -5853,9 +6017,13 @@ async fn handle_connection_with_id(
     let daemon_impl = FinchDaemonImpl::new(Arc::clone(&server), connection_id);
     let daemon_client: finch_daemon::Client = capnp_rpc::new_client(daemon_impl);
 
-    let result = RpcSystem::new(Box::new(network), Some(daemon_client.client))
-        .await
-        .map_err(anyhow::Error::from);
+    let rpc = RpcSystem::new(Box::new(network), Some(daemon_client.client));
+    tokio::pin!(rpc);
+    let result = tokio::select! {
+        result = &mut rpc => result.map_err(anyhow::Error::from),
+        _ = shutdown.cancelled() => Ok(()),
+    };
+    drop(rpc);
     let teardown = server
         .brain_runners()
         .begin_connection_teardown(connection_id);
@@ -5869,12 +6037,21 @@ async fn handle_connection_with_id(
             .push(*lease_id);
     }
     for (brain, lease_ids) in leases_by_brain {
-        server
-            .brain_store()
-            .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
-            .with_context(|| {
-                format!("could not reconcile effect audits for disconnected Brain '{brain}'")
-            })?;
+        let mut delay = std::time::Duration::from_millis(10);
+        loop {
+            match server
+                .brain_store()
+                .reconcile_effect_audits_for_disconnected_leases(&brain, &lease_ids)
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::error!(brain = %brain, %error, retry_ms = delay.as_millis(),
+                        "disconnected runner audit reconciliation remains pending");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
     }
     let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
     for (brain, attachment_id, attachment_connection_id) in &teardown.attachments {

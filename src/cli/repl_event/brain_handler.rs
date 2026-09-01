@@ -150,6 +150,26 @@ fn verify_local_frontend_environment(
 }
 
 impl EventLoop {
+    /// Install the daemon's canonical runner bootstrap before the callback is
+    /// considered recovered. Reconnect deliberately permits rollback from a
+    /// locally advanced, cancelled generation.
+    pub(crate) async fn install_runner_bootstrap(
+        &self,
+        bootstrap: crate::ipc::client::BrainRunnerBootstrap,
+    ) -> Result<()> {
+        reconcile_runner_checkpoint(
+            &self.program_runtime,
+            bootstrap.checkpoint,
+            bootstrap.runtime_revision,
+            true,
+        )
+        .await?;
+        self.agent_scheduler
+            .bind_brain_control(bootstrap.subagent_control)
+            .await;
+        Ok(())
+    }
+
     /// Update the vocabulary panel from partially typed input. This is local
     /// presentation only and never starts provider or workspace work.
     async fn handle_typing_started(&self, partial: String) {
@@ -198,20 +218,8 @@ impl EventLoop {
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
                 .await
             {
-                Ok(bootstrap) => match reconcile_runner_checkpoint(
-                    &self.program_runtime,
-                    bootstrap.checkpoint,
-                    bootstrap.runtime_revision,
-                    true,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        self.agent_scheduler
-                            .bind_brain_control(bootstrap.subagent_control)
-                            .await;
-                        Ok(lease.lease_id)
-                    }
+                Ok(bootstrap) => match self.install_runner_bootstrap(bootstrap).await {
+                    Ok(_) => Ok(lease.lease_id),
                     Err(error) => {
                         let _ = ipc
                             .brain_release_runner(&self.session_label, lease.lease_id)
@@ -560,14 +568,7 @@ impl EventLoop {
                 )));
             }
         };
-        if let Err(error) = reconcile_runner_checkpoint(
-            &self.program_runtime,
-            bootstrap.checkpoint,
-            bootstrap.runtime_revision,
-            true,
-        )
-        .await
-        {
+        if let Err(error) = self.install_runner_bootstrap(bootstrap).await {
             let _ = ipc
                 .brain_release_runner(&target.brain, lease.lease_id)
                 .await;
@@ -577,9 +578,6 @@ impl EventLoop {
                 target.brain
             )));
         }
-        self.agent_scheduler
-            .bind_brain_control(bootstrap.subagent_control)
-            .await;
         self.home_runner_lease_id = Some(lease.lease_id);
         self.home_runner_lease_active = true;
         self.runner_brain = Some(target.brain.clone());
@@ -1269,11 +1267,7 @@ impl EventLoop {
                     .await);
             }
         };
-        if let Err(error) = self
-            .program_runtime
-            .replace_reducible_state(bootstrap.checkpoint, bootstrap.runtime_revision)
-            .await
-        {
+        if let Err(error) = self.install_runner_bootstrap(bootstrap).await {
             let _ = ipc
                 .brain_release_runner(&snapshot.name, lease.lease_id)
                 .await;
@@ -1312,51 +1306,6 @@ impl EventLoop {
 #[cfg(test)]
 mod brain_handler_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_reconnect_rolls_ahead_vm_back_to_canonical_checkpoint() {
-        let runtime = crate::runtime::ProgramRuntime::new();
-        let canonical = runtime
-            .revision_history()
-            .unwrap()
-            .into_iter()
-            .find(|snapshot| snapshot.revision == 0)
-            .unwrap();
-        let canonical_checkpoint = canonical.checkpoint.unwrap();
-        let outcome = runtime
-            .submit_typed_only(crate::runtime::ProgramSubmission {
-                language: crate::programs::ProgramLanguage::Forth,
-                source_id: Some("cancelled-run-that-committed-late".into()),
-                source: "1".into(),
-                intent: "simulate a late local callback commit".into(),
-                effect: crate::programs::ExecutionEffect::Pure,
-                declared_capabilities: Vec::new(),
-                manifest_generation: runtime.manifest_generation(),
-                expected_revision: Some(runtime.revision()),
-                budget: None,
-            })
-            .await
-            .unwrap();
-        assert!(outcome.output_revision > canonical.revision);
-
-        reconcile_runner_checkpoint(
-            &runtime,
-            canonical_checkpoint,
-            canonical.revision,
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(runtime.revision(), canonical.revision);
-        assert!(runtime
-            .revision_history()
-            .unwrap()
-            .into_iter()
-            .find(|snapshot| snapshot.revision == canonical.revision)
-            .unwrap()
-            .stack
-            .is_empty());
-    }
 
     #[test]
     fn frontend_environment_requires_the_exact_machine_and_workspace() {

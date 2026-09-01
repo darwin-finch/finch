@@ -2179,6 +2179,11 @@ impl EventLoop {
     }
 
     #[cfg(test)]
+    pub(crate) fn named_brain_event_sender_for_test(&self) -> mpsc::UnboundedSender<ReplEvent> {
+        self.event_tx.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_effect_audit_test_wrapper(
         &mut self,
         wrapper: Arc<

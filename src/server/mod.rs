@@ -295,6 +295,23 @@ impl AgentServer {
         password: String,
         state_root: &std::path::Path,
     ) -> Result<Self> {
+        Self::for_brain_protocol_test_with_runner_deadlines(
+            store,
+            credentials,
+            password,
+            state_root,
+            RunnerDeadlines::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_brain_protocol_test_with_runner_deadlines(
+        store: crate::brain::store::BrainStore,
+        credentials: crate::brain::credential::BrainCredentialAuthority,
+        password: String,
+        state_root: &std::path::Path,
+        runner_deadlines: RunnerDeadlines,
+    ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
         let bootstrap_loader = Arc::new(BootstrapLoader::new(generator_state.clone(), None));
         Ok(Self {
@@ -313,7 +330,7 @@ impl AgentServer {
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
             brain_store: store,
-            brain_runners: BrainRunnerBroker::default(),
+            brain_runners: BrainRunnerBroker::with_deadlines(runner_deadlines),
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials: credentials,
             mcp_servers: std::collections::HashMap::new(),

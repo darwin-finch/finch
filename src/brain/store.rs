@@ -1083,11 +1083,15 @@ pub struct BrainStore {
     /// independent until a new connection explicitly dispatches it.
     run_connection_authority: Arc<RwLock<RunConnectionAuthority>>,
     disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
+    effect_audit_retry_owners:
+        Arc<std::sync::Mutex<HashSet<(String, crate::runtime::effect_log::EffectAuditIdentity)>>>,
     effect_audit_storage: Arc<std::sync::Mutex<HashMap<String, EffectAuditStorage>>>,
     #[cfg(test)]
     fail_event_batches: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     fail_cancellation_terminal_appends: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    fail_effect_audit_archives: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     cancellation_reservation_pause:
         Arc<std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
@@ -1317,11 +1321,14 @@ impl BrainStore {
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
             run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
             disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            effect_audit_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
             effect_audit_storage: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             fail_event_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             fail_cancellation_terminal_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_effect_audit_archives: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             cancellation_reservation_pause: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -1487,13 +1494,6 @@ impl BrainStore {
         let run = self.inspect_run(name, run_id)?;
         anyhow::ensure!(!run.status.is_terminal(), "Brain run has already finished");
         gate.cancel_requested = true;
-        Ok(())
-    }
-
-    pub(crate) async fn clear_run_cancellation(&self, name: &str, run_id: RunId) -> Result<()> {
-        self.acquire_run_publication(name, run_id)
-            .await?
-            .cancel_requested = false;
         Ok(())
     }
 
@@ -1942,16 +1942,78 @@ impl BrainStore {
                 "begun effect outcome requires its durable host permit"
             );
         }
-        self.append_effect_audit_transition_locked(
-            name,
-            state,
-            crate::runtime::effect_log::EffectAuditTransition::Finish {
-                identity,
-                authority_id: grant.authority.authority_id,
-                outcome,
-            },
-        )?;
+        let transition = crate::runtime::effect_log::EffectAuditTransition::Finish {
+            identity,
+            authority_id: grant.authority.authority_id,
+            outcome,
+        };
+        if let Err(error) = self.append_effect_audit_transition_locked(name, state, transition) {
+            drop(brains);
+            self.schedule_effect_audit_archive_retry(name.to_string(), identity);
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn schedule_effect_audit_archive_retry(
+        &self,
+        name: String,
+        identity: crate::runtime::effect_log::EffectAuditIdentity,
+    ) {
+        let key = (name.clone(), identity);
+        if !self
+            .effect_audit_retry_owners
+            .lock()
+            .expect("effect-audit retry registry poisoned")
+            .insert(key.clone())
+        {
+            return;
+        }
+        let store = self.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.effect_audit_retry_owners
+                .lock()
+                .expect("effect-audit retry registry poisoned")
+                .remove(&key);
+            tracing::error!(brain = %name, %identity.execution_id,
+                "terminal effect-audit archive has no live retry runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            let mut delay = std::time::Duration::from_millis(10);
+            loop {
+                let archived = (|| -> Result<bool> {
+                    let mut brains = store.brains.write().expect("shared brain lock poisoned");
+                    let state = brains
+                        .get_mut(&name)
+                        .context("Brain was removed concurrently")?;
+                    if state.effect_audits.get(&identity).is_none() {
+                        return Ok(true);
+                    }
+                    let seq = state.revision;
+                    store.archive_terminal_effect_audits_batch_locked(
+                        &name,
+                        state,
+                        &[(seq, identity)],
+                    )?;
+                    Ok(state.effect_audits.get(&identity).is_none())
+                })();
+                match archived {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => tracing::error!(brain = %name, %error,
+                        retry_ms = delay.as_millis(),
+                        "terminal effect-audit archive remains pending"),
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+            store
+                .effect_audit_retry_owners
+                .lock()
+                .expect("effect-audit retry registry poisoned")
+                .remove(&key);
+        });
     }
 
     fn validate_effect_grant_for_new_work(
@@ -2134,6 +2196,24 @@ impl BrainStore {
         state: &mut BrainState,
         terminal: &[(u64, crate::runtime::effect_log::EffectAuditIdentity)],
     ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_effect_audit_archives
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected terminal effect-audit archive failure");
+        }
         let mut fences = Vec::new();
         let mut observers = Vec::new();
         for (seq, identity) in terminal {
@@ -3085,7 +3165,9 @@ impl BrainStore {
         detail: String,
         publication: tokio::sync::OwnedMutexGuard<RunPublicationGate>,
     ) -> Result<Option<BrainEvent>> {
-        if publication.cancel_requested() || self.run_cancellation_reserved(name, run_id)? {
+        if status != BrainRunStatus::Cancelled
+            && (publication.cancel_requested() || self.run_cancellation_reserved(name, run_id)?)
+        {
             return Ok(None);
         }
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
@@ -4934,6 +5016,140 @@ impl BrainStore {
         )
     }
 
+    /// Atomically publish one frontend-owned runtime checkpoint, its optional
+    /// provider program, canonical Result, and terminal run status. The blob
+    /// is written first (an unreferenced blob is harmless); the authoritative
+    /// event batch is appended before any in-memory runtime becomes visible.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_runner_run_outcome(
+        &self,
+        name: &str,
+        run_id: RunId,
+        runtime_request_seq: u64,
+        runtime_revision: u64,
+        checkpoint: crate::vm::TypedRuntimeCheckpoint,
+        program: Option<(ProgramLanguage, String)>,
+        output: String,
+        continuation_messages: Vec<crate::claude::Message>,
+        invocation_metadata: Option<crate::providers::types::InvocationMetadata>,
+    ) -> Result<BrainEvent> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        if let Some(metadata) = &invocation_metadata {
+            metadata.validate()?;
+        }
+        let restored = crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
+            checkpoint.clone(),
+            runtime_revision,
+        )?;
+        let encoded = crate::ipc::checkpoint_codec::encode_checkpoint_bytes(&checkpoint)?;
+        let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
+        self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
+
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains
+            .get_mut(name)
+            .context("Brain was removed concurrently")?;
+        let run = state
+            .runs
+            .get(&run_id)
+            .context("Brain run does not exist")?;
+        validate_run_transition(run.status, BrainRunStatus::Completed)?;
+        if let Some(current) = state.runtime_checkpoint.as_ref() {
+            anyhow::ensure!(
+                runtime_revision > current.durable_revision,
+                "runner checkpoint revision {runtime_revision} does not advance durable revision {}",
+                current.durable_revision
+            );
+        }
+        let now = unix_millis();
+        let mut next_seq = state.revision + 1;
+        let mut events = Vec::with_capacity(4);
+        let mut committed_request_seq = runtime_request_seq;
+        if let Some((language, source)) = program {
+            events.push(BrainEvent {
+                schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                brain_id: state.brain_id,
+                seq: next_seq,
+                environment_generation: self.environment.generation,
+                sender: "provider".into(),
+                created_ms: now,
+                run_id: Some(run_id),
+                mutation: None,
+                kind: BrainEventKind::Program { language, source },
+            });
+            committed_request_seq = next_seq;
+            next_seq += 1;
+        }
+        events.push(BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq,
+            environment_generation: self.environment.generation,
+            sender: "runner".into(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::RuntimeCommitted {
+                request_seq: committed_request_seq,
+                runtime_revision,
+                checkpoint_sha256: checkpoint_sha256.clone(),
+            },
+        });
+        next_seq += 1;
+        let result = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq,
+            environment_generation: self.environment.generation,
+            sender: "daemon".into(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::Result {
+                request_seq: committed_request_seq,
+                output,
+                error: None,
+                continuation_messages,
+                invocation_metadata,
+            },
+        };
+        events.push(result.clone());
+        events.push(BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq + 1,
+            environment_generation: self.environment.generation,
+            sender: "daemon".into(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Completed,
+                detail: None,
+            },
+        });
+        self.append_event_batch(name, &events)?;
+        let tx = state.tx.clone();
+        for event in &events {
+            state.apply(event.clone());
+        }
+        drop(brains);
+        self.runtime_checkpoints
+            .write()
+            .expect("shared brain checkpoint lock poisoned")
+            .insert(checkpoint_sha256, checkpoint);
+        self.runtimes
+            .write()
+            .expect("shared brain runtime lock poisoned")
+            .insert(name.to_string(), Arc::new(restored));
+        for event in events {
+            let _ = tx.send(event);
+        }
+        Ok(result)
+    }
+
     fn commit_runner_runtime_inner(
         &self,
         name: &str,
@@ -5408,6 +5624,10 @@ impl BrainStore {
             if let Some(intent) = disconnect_intents.remove(&run_id) {
                 let next_seq = state.revision + 1;
                 let now = unix_millis();
+                let existing_result = state.events.iter().any(|event| {
+                    event.run_id == Some(run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. })
+                });
                 let result = BrainEvent {
                     schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                     brain_id: state.brain_id,
@@ -5428,7 +5648,7 @@ impl BrainStore {
                 let terminal = BrainEvent {
                     schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                     brain_id: state.brain_id,
-                    seq: next_seq + 1,
+                    seq: next_seq + u64::from(!existing_result),
                     environment_generation: self.environment.generation,
                     sender: intent.sender.clone(),
                     created_ms: now,
@@ -5440,9 +5660,16 @@ impl BrainStore {
                         detail: Some(intent.detail.clone()),
                     },
                 };
-                match self.append_event_batch(name, &[result.clone(), terminal.clone()]) {
+                let events = if existing_result {
+                    vec![terminal.clone()]
+                } else {
+                    vec![result.clone(), terminal.clone()]
+                };
+                match self.append_event_batch(name, &events) {
                     Ok(()) => {
-                        state.apply(result);
+                        if !existing_result {
+                            state.apply(result);
+                        }
                         state.apply(terminal);
                         self.clear_disconnect_intent(name, run_id)?;
                     }
@@ -5454,40 +5681,13 @@ impl BrainStore {
                 }
                 continue;
             }
-            let run = state
-                .runs
-                .get(&run_id)
-                .expect("orphaned run disappeared during restart reconciliation");
             let detail = "daemon restarted after the runner generation disappeared".to_string();
-            let existing_result = state.events.iter().any(|event| {
-                event.run_id == Some(run_id) && matches!(event.kind, BrainEventKind::Result { .. })
-            });
             let now = unix_millis();
             let next_seq = state.revision + 1;
-            let mut terminal_events = Vec::with_capacity(2);
-            if !existing_result {
-                terminal_events.push(BrainEvent {
-                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
-                    brain_id: state.brain_id,
-                    seq: next_seq,
-                    environment_generation: self.environment.generation,
-                    sender: "daemon".into(),
-                    created_ms: now,
-                    run_id: Some(run_id),
-                    mutation: None,
-                    kind: BrainEventKind::Result {
-                        request_seq: run.request_seq,
-                        output: String::new(),
-                        error: Some(detail.clone()),
-                        continuation_messages: Vec::new(),
-                        invocation_metadata: None,
-                    },
-                });
-            }
-            terminal_events.push(BrainEvent {
+            let terminal_events = vec![BrainEvent {
                 schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                 brain_id: state.brain_id,
-                seq: next_seq + u64::from(!existing_result),
+                seq: next_seq,
                 environment_generation: self.environment.generation,
                 sender: "daemon".into(),
                 created_ms: now,
@@ -5495,10 +5695,10 @@ impl BrainStore {
                 mutation: None,
                 kind: BrainEventKind::RunStatusChanged {
                     run_id,
-                    status: BrainRunStatus::Failed,
+                    status: BrainRunStatus::Interrupted,
                     detail: Some(detail),
                 },
-            });
+            }];
             self.append_event_batch(name, &terminal_events)?;
             for event in terminal_events {
                 state.apply(event);
@@ -6057,6 +6257,20 @@ impl BrainStore {
             Ok(())
         })?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_effect_audit_archive_for_test(&self) {
+        self.fail_effect_audit_archives
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn pending_effect_audit_archive_retries_for_test(&self) -> usize {
+        self.effect_audit_retry_owners
+            .lock()
+            .expect("effect-audit retry registry poisoned")
+            .len()
     }
 
     #[cfg(test)]
@@ -7159,6 +7373,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runner_outcome_batch_is_all_or_nothing_across_failure_reopen_and_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt { text: "run".into() },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        store.fail_next_event_batch_for_test();
+        assert!(store
+            .commit_runner_run_outcome(
+                "shared",
+                run.run_id,
+                prompt.seq,
+                0,
+                checkpoint.clone(),
+                None,
+                "success".into(),
+                Vec::new(),
+                None,
+            )
+            .is_err());
+        let failed = store.snapshot("shared").unwrap();
+        assert!(!failed.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(
+                    event.kind,
+                    BrainEventKind::RuntimeCommitted { .. }
+                        | BrainEventKind::Result { .. }
+                        | BrainEventKind::RunStatusChanged {
+                            status: BrainRunStatus::Completed,
+                            ..
+                        }
+                )
+        }));
+        drop(store);
+
+        let reopened = BrainStore::with_root("box.local", Some(root));
+        assert_eq!(
+            reopened.inspect_run("shared", run.run_id).unwrap().status,
+            BrainRunStatus::Interrupted
+        );
+        reopened
+            .transition_run(
+                "shared",
+                "alice",
+                run.run_id,
+                BrainRunStatus::Running,
+                Some("explicitly resumed after restart".into()),
+            )
+            .unwrap();
+        reopened
+            .commit_runner_run_outcome(
+                "shared",
+                run.run_id,
+                prompt.seq,
+                0,
+                checkpoint,
+                None,
+                "success".into(),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        let recovered = reopened.snapshot("shared").unwrap();
+        assert_eq!(
+            recovered
+                .runs
+                .iter()
+                .find(|candidate| candidate.run_id == run.run_id)
+                .unwrap()
+                .status,
+            BrainRunStatus::Completed
+        );
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == Some(run.run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. })
+                })
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn disconnect_terminal_retry_owner_survives_extended_transient_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -7447,9 +7772,9 @@ mod tests {
                 .inspect_run("shared", parent.run_id)
                 .unwrap()
                 .status,
-            BrainRunStatus::Failed
+            BrainRunStatus::Interrupted
         );
-        assert!(restarted
+        let resumed_child = restarted
             .start_run_with_parent(
                 "shared",
                 "alice",
@@ -7459,11 +7784,12 @@ mod tests {
                 BrainRunStatus::QueuedForEnvironment,
                 Some(parent.run_id),
             )
-            .is_err());
+            .unwrap();
+        assert_eq!(resumed_child.parent_run_id, Some(parent.run_id));
     }
 
     #[test]
-    fn test_restart_terminalizes_started_runs_without_replaying_queued_runs() {
+    fn test_restart_interrupts_started_runs_without_replaying_queued_runs() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
@@ -7518,7 +7844,7 @@ mod tests {
                 .find(|candidate| candidate.run_id == running.run_id)
                 .unwrap()
                 .status,
-            BrainRunStatus::Failed
+            BrainRunStatus::Interrupted
         );
         assert_eq!(
             snapshot
@@ -7534,7 +7860,7 @@ mod tests {
                 event.kind,
                 BrainEventKind::RunStatusChanged {
                     run_id,
-                    status: BrainRunStatus::Failed,
+                    status: BrainRunStatus::Interrupted,
                     ..
                 } if run_id == running.run_id
             )
@@ -7548,7 +7874,7 @@ mod tests {
                         && matches!(event.kind, BrainEventKind::Result { .. })
                 })
                 .count(),
-            1
+            0
         );
         assert_eq!(
             snapshot
@@ -7561,7 +7887,7 @@ mod tests {
                             run_id,
                             status,
                             ..
-                        } if run_id == running.run_id && status.is_terminal()
+                        } if run_id == running.run_id && status == BrainRunStatus::Interrupted
                     )
                 })
                 .count(),
@@ -8073,7 +8399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_initialization_attempt_is_retried_after_restart() {
+    fn test_interrupted_initialization_attempt_is_retried_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
@@ -8124,7 +8450,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             restarted.inspect_run("shared", run.run_id).unwrap().status,
-            BrainRunStatus::Failed
+            BrainRunStatus::Interrupted
         );
         let retry = restarted
             .schedule_initialization(
@@ -10617,6 +10943,42 @@ mod tests {
             .events
             .iter()
             .any(|event| matches!(event.kind, BrainEventKind::ToolResult { .. })));
+    }
+
+    #[tokio::test]
+    async fn terminal_effect_audit_archive_failure_has_a_live_retry_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let identity = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(0, "write"))
+            .unwrap();
+        let permit = store.begin_effect_audit(&grant, identity).unwrap();
+        store.fail_next_effect_audit_archive_for_test();
+        assert!(store
+            .finish_effect_audit(
+                &grant,
+                Some(&permit),
+                identity,
+                crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                },
+            )
+            .is_err());
+        assert_eq!(store.pending_effect_audit_archive_retries_for_test(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store.pending_effect_audit_archive_retries_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("effect-audit archive retry owner did not quiesce");
+        drop(store);
+        let reopened = BrainStore::with_root("box.local", Some(root));
+        let snapshot = reopened.snapshot("shared").unwrap();
+        assert_eq!(snapshot.effect_audits.len(), 1);
+        assert!(snapshot.effect_audits[0].state.is_terminal());
     }
 
     #[test]
