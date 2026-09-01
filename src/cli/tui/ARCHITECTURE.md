@@ -30,9 +30,11 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   for the renderer/global mutex or ordinary stdout.
 - Activation protocol writes and renderer output use the same per-generation admission gate, have
   absolute 100 ms deadlines and bounded write chunks, and revalidate after admission.
-  `ACTIVE -> CLEANING` revokes parked writers before
-  reset; a writer-gate timeout leaves the generation fail-closed for bounded takeover and never
-  records restoration prematurely.
+  The atomic lease distinguishes an admitted pre-effect token from an executing tty effect.
+  `ACTIVE -> CLEANING` may CAS-revoke an application-stalled pre-effect token, whose stale guard can
+  no longer publish or clear its replacement; it never overtakes an executing nonblocking write.
+  Activation failures aggregate their stage and rollback errors, retain explicit `CLEANING` repair
+  ownership on incomplete rollback, and never report a false restored state.
 - Application waits and nonblocking write loops use absolute deadlines. Their bound assumes that a
   runnable thread executing Finch's short gate section is scheduled, and that supported tty/console
   kernel calls return. It is not a mathematical wall-clock claim against a frozen process, stopped
@@ -40,12 +42,18 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   progress is withheld, library cleanup returns `TimedOut` without resetting, admitting a
   replacement, re-enabling ordinary stdout, recording restoration, or retry-spinning. The same
   generation remains `CLEANING`; a later bounded attempt repairs it after an observable progress
-  epoch. Binary signal/IPC/panic termination completes within its larger absolute deadline under
-  this supported-progress precondition and never treats a failed restoration as successful.
+  epoch. Binary signal termination retries at a bounded active cadence; the process-lifetime monitor
+  uses a materially lower idle cadence. IPC Quit latches one decoded `ControlMessage` and retries
+  bounded restoration on progress/recovery ticks without another message. The panic hook makes one
+  bounded, latched restoration attempt and always returns to Rust's unwind policy rather than
+  parking forever. These binary paths complete within their larger absolute deadline under this
+  supported-progress precondition and never treat a failed restoration as successful.
 - The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
   exclusive lease, exact output generation, raw/protocol activation, bounded staged output, cleanup,
-  and Drop. Synchronous console operations run only on its bounded-capacity worker; caller deadlines
-  revoke admission while actor ordering ensures prior output cannot overtake reset. Activation and
+  and Drop. Every staged Write/Flush carries shared `Pending -> Executing/Cancelled -> Complete`
+  state and an expiry. A caller reports timeout only if its CAS cancels `Pending`; if the actor wins,
+  it waits for that single bounded effect. Thus no queued command can publish after its caller has
+  reported timeout, even when the actor resumes while the session remains `ACTIVE`. Activation and
   rollback failures are aggregated. Failed, unknown, or backpressured cleanup relinquishes only its
   attempt owner, leaves the generation `CLEANING`, and rejects stale writers and replacements until
   retry repairs it. Windows CI compiles and exercises this exact production actor and actual

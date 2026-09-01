@@ -101,6 +101,7 @@ fn run_probe() {
         cleanup_protocols,
     )
     .unwrap();
+    let effects_before = terminal_lifecycle::supervised_actor_write_effects();
     terminal_lifecycle::supervised_set_actor_pause(true);
     let writer_renderer = Arc::new(renderer);
     let writer_clone = Arc::clone(&writer_renderer);
@@ -111,13 +112,29 @@ fn run_probe() {
         std::thread::yield_now();
     }
     assert!(writer.join().unwrap().is_err());
-    assert!(writer_renderer.cleanup().is_err());
-    assert!(terminal_lifecycle::PortableRendererSession::activate(
-        activate_protocols,
-        cleanup_protocols,
-    )
-    .is_err());
     terminal_lifecycle::supervised_set_actor_pause(false);
+    assert_eq!(writer_renderer.write(b"live-frame").unwrap(), 10);
+    assert_eq!(
+        terminal_lifecycle::supervised_actor_write_effects(),
+        effects_before + 1
+    );
+
+    let flush_effects_before = terminal_lifecycle::supervised_actor_flush_effects();
+    terminal_lifecycle::supervised_set_actor_pause(true);
+    let generation = writer_renderer.generation();
+    let flush = std::thread::spawn(move || terminal_lifecycle::flush_generation(generation));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !terminal_lifecycle::supervised_actor_is_paused() {
+        assert!(Instant::now() < deadline, "portable actor did not pause");
+        std::thread::yield_now();
+    }
+    assert!(flush.join().unwrap().is_err());
+    terminal_lifecycle::supervised_set_actor_pause(false);
+    terminal_lifecycle::flush_generation(writer_renderer.generation()).unwrap();
+    assert_eq!(
+        terminal_lifecycle::supervised_actor_flush_effects(),
+        flush_effects_before + 1
+    );
     writer_renderer.cleanup().unwrap();
 
     FAIL_ACTIVATION.store(true, Ordering::Release);

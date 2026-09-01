@@ -72,6 +72,8 @@ const MODE_PASTE: u8 = 1 << 1;
 const MODE_MOUSE: u8 = 1 << 2;
 #[cfg(unix)]
 const MODE_KEYBOARD: u8 = 1 << 3;
+#[cfg(unix)]
+const MODE_CURSOR: u8 = 1 << 4;
 
 #[cfg(unix)]
 const SESSION_INACTIVE: u8 = 0;
@@ -104,7 +106,12 @@ struct TerminalGeneration {
     fd: std::sync::atomic::AtomicI32,
     original: nix::libc::termios,
     modes: std::sync::atomic::AtomicU8,
-    output_gate_owner: std::sync::atomic::AtomicU64,
+    output_flushed: std::sync::atomic::AtomicBool,
+    // Zero is free, a low-63-bit token is admitted but has not started an
+    // effect, and the high bit marks a bounded nonblocking tty effect in
+    // progress. Termination may revoke only the admitted form: once executing,
+    // cleanup waits for the supported kernel call to return.
+    output_gate_state: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(unix)]
@@ -137,6 +144,10 @@ static SUPERVISED_WRITER_GATE_PAUSED: std::sync::atomic::AtomicBool =
 #[cfg(unix)]
 static NEXT_TERMINAL_GATE_OWNER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(unix)]
+const TERMINAL_GATE_EXECUTING: u64 = 1 << 63;
+#[cfg(unix)]
+const TERMINAL_GATE_OWNER_MASK: u64 = !TERMINAL_GATE_EXECUTING;
 #[cfg(unix)]
 static TERMINAL_PROGRESS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -300,7 +311,8 @@ impl TerminalSessionState {
             fd: std::sync::atomic::AtomicI32::new(fd),
             original,
             modes: std::sync::atomic::AtomicU8::new(0),
-            output_gate_owner: std::sync::atomic::AtomicU64::new(0),
+            output_flushed: std::sync::atomic::AtomicBool::new(false),
+            output_gate_state: std::sync::atomic::AtomicU64::new(0),
         });
         if let Err(error) = publish_terminal_generation(Arc::clone(&record)) {
             unsafe { nix::libc::close(fd) };
@@ -312,8 +324,7 @@ impl TerminalSessionState {
         if let Err(error) = run_terminal_activation_stage(&record, "signals", |_| {
             arm_binary_terminal_signals(generation)
         }) {
-            rollback_terminal_activation(generation);
-            return Err(error);
+            return Err(terminal_activation_error(generation, error));
         }
 
         let mut raw = record.original;
@@ -325,66 +336,63 @@ impl TerminalSessionState {
             record.modes.fetch_or(MODE_RAW, Ordering::Release);
             Ok(())
         }) {
-            rollback_terminal_activation(generation);
-            return Err(error);
+            return Err(terminal_activation_error(generation, error));
         }
         if activation_must_rollback("raw") {
-            rollback_terminal_activation(generation);
-            return Err(io::Error::other(
-                "terminal activation stopped after raw mode",
+            return Err(terminal_activation_error(
+                generation,
+                io::Error::other("terminal activation stopped after raw mode"),
             ));
         }
         if let Err(error) = acquire_terminal_protocol(&record, "paste", ENABLE_PASTE, MODE_PASTE) {
-            rollback_terminal_activation(generation);
-            return Err(error);
+            return Err(terminal_activation_error(generation, error));
         }
         if activation_must_rollback("paste") {
-            rollback_terminal_activation(generation);
-            return Err(io::Error::other(
-                "terminal activation stopped after bracketed paste",
+            return Err(terminal_activation_error(
+                generation,
+                io::Error::other("terminal activation stopped after bracketed paste"),
             ));
         }
         if let Err(error) = acquire_terminal_protocol(&record, "mouse", ENABLE_MOUSE, MODE_MOUSE) {
-            rollback_terminal_activation(generation);
-            return Err(error);
+            return Err(terminal_activation_error(generation, error));
         }
         if activation_must_rollback("mouse") {
-            rollback_terminal_activation(generation);
-            return Err(io::Error::other(
-                "terminal activation stopped after mouse capture",
+            return Err(terminal_activation_error(
+                generation,
+                io::Error::other("terminal activation stopped after mouse capture"),
             ));
         }
         if let Err(error) =
             acquire_terminal_protocol(&record, "keyboard", PUSH_KEYBOARD, MODE_KEYBOARD)
         {
-            rollback_terminal_activation(generation);
-            return Err(error);
+            return Err(terminal_activation_error(generation, error));
         }
         if activation_must_rollback("keyboard") {
-            rollback_terminal_activation(generation);
-            return Err(io::Error::other(
-                "terminal activation stopped after keyboard enhancement",
+            return Err(terminal_activation_error(
+                generation,
+                io::Error::other("terminal activation stopped after keyboard enhancement"),
             ));
         }
         if let Err(error) = run_terminal_activation_stage(&record, "cursor", |fd| {
             write_terminal_activation_stage("cursor", fd, b"\x1b[?25h").and_then(|written| {
-                (written == b"\x1b[?25h".len())
-                    .then_some(())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "terminal cursor activation was incomplete",
-                        )
-                    })
+                if written > 0 {
+                    record.modes.fetch_or(MODE_CURSOR, Ordering::Release);
+                }
+                if written != b"\x1b[?25h".len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "terminal cursor activation was incomplete",
+                    ));
+                }
+                Ok(())
             })
         }) {
-            rollback_terminal_activation(generation);
-            return Err(error);
+            return Err(terminal_activation_error(generation, error));
         }
         if activation_must_rollback("cursor") {
-            rollback_terminal_activation(generation);
-            return Err(io::Error::other(
-                "terminal activation stopped after cursor restoration",
+            return Err(terminal_activation_error(
+                generation,
+                io::Error::other("terminal activation stopped after cursor restoration"),
             ));
         }
         if TERMINAL_COORDINATOR
@@ -397,21 +405,28 @@ impl TerminalSessionState {
             )
             .is_err()
         {
-            rollback_terminal_activation(generation);
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "terminal activation interrupted by shutdown",
+            return Err(terminal_activation_error(
+                generation,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal activation interrupted by shutdown",
+                ),
             ));
         }
         if TERMINAL_COORDINATOR
             .termination_requested
             .load(Ordering::Acquire)
         {
-            let _ = cleanup_terminal_generation(generation);
-            return Err(io::Error::new(
+            let activation = io::Error::new(
                 io::ErrorKind::Interrupted,
                 "terminal activation interrupted by shutdown",
-            ));
+            );
+            return match cleanup_terminal_generation(generation) {
+                Ok(()) => Err(activation),
+                Err(rollback) => Err(io::Error::other(format!(
+                    "{activation}; terminal activation rollback failed: {rollback}"
+                ))),
+            };
         }
         Ok(Self { generation })
     }
@@ -505,7 +520,7 @@ fn run_terminal_activation_stage(
             format!("terminal {stage} activation was revoked"),
         ));
     }
-    let _gate = acquire_terminal_output_gate(
+    let gate = acquire_terminal_output_gate(
         record,
         std::time::Instant::now() + Duration::from_millis(100),
     )?;
@@ -522,6 +537,15 @@ fn run_terminal_activation_stage(
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "terminal activation descriptor was revoked",
+        ));
+    }
+    let _effect = gate.begin_effect()?;
+    if terminal_activation_is_revoked()
+        || record.generation != active_terminal_generation().unwrap_or(0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!("terminal {stage} activation was revoked before its effect"),
         ));
     }
     operation(fd)
@@ -652,7 +676,7 @@ impl Drop for TerminalOutputGate<'_> {
     fn drop(&mut self) {
         if self
             .record
-            .output_gate_owner
+            .output_gate_state
             .compare_exchange(
                 self.owner,
                 0,
@@ -679,6 +703,51 @@ impl Drop for TerminalOutputGate<'_> {
 }
 
 #[cfg(unix)]
+struct TerminalEffectGate<'a> {
+    record: &'a TerminalGeneration,
+    owner: u64,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEffectGate<'_> {
+    fn drop(&mut self) {
+        self.record
+            .output_gate_state
+            .compare_exchange(
+                self.owner | TERMINAL_GATE_EXECUTING,
+                self.owner,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok();
+    }
+}
+
+#[cfg(unix)]
+impl<'a> TerminalOutputGate<'a> {
+    fn begin_effect(&self) -> io::Result<TerminalEffectGate<'a>> {
+        self.record
+            .output_gate_state
+            .compare_exchange(
+                self.owner,
+                self.owner | TERMINAL_GATE_EXECUTING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "terminal output admission was revoked before its effect",
+                )
+            })?;
+        Ok(TerminalEffectGate {
+            record: self.record,
+            owner: self.owner,
+        })
+    }
+}
+
+#[cfg(unix)]
 fn acquire_terminal_output_gate(
     record: &TerminalGeneration,
     deadline: std::time::Instant,
@@ -694,16 +763,40 @@ fn acquire_terminal_output_gate(
     let owner = NEXT_TERMINAL_GATE_OWNER
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1)
-        .max(1);
+        & TERMINAL_GATE_OWNER_MASK;
+    let owner = owner.max(1);
+    let revoke_after = std::time::Instant::now() + Duration::from_millis(50);
     loop {
         if record
-            .output_gate_owner
+            .output_gate_state
             .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             HELD_TERMINAL_GATE.with(|held| held.set(record));
             HELD_TERMINAL_GATE_OWNER.with(|held| held.set(owner));
             return Ok(TerminalOutputGate { record, owner });
+        }
+        // Once termination has revoked ACTIVE, a thread parked in application
+        // code before `begin_effect` cannot ever publish: atomically replace
+        // only its non-executing token. An executing write/reset is never
+        // overtaken and completes under the documented scheduler/kernel
+        // progress precondition.
+        if TERMINAL_COORDINATOR
+            .termination_requested
+            .load(Ordering::Acquire)
+            && std::time::Instant::now() >= revoke_after
+        {
+            let stalled = record.output_gate_state.load(Ordering::Acquire);
+            if stalled != 0
+                && stalled & TERMINAL_GATE_EXECUTING == 0
+                && record
+                    .output_gate_state
+                    .compare_exchange(stalled, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                publish_terminal_progress();
+                continue;
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -729,7 +822,7 @@ fn revoke_current_thread_terminal_ownership() -> bool {
             return false;
         }
         let revoked = unsafe { &*record }
-            .output_gate_owner
+            .output_gate_state
             .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if revoked {
@@ -759,7 +852,7 @@ fn publish_terminal_bytes(record: &Arc<TerminalGeneration>, bytes: &[u8]) -> io:
         }
         SUPERVISED_WRITER_PAUSED.store(false, Ordering::Release);
     }
-    let _gate = acquire_terminal_output_gate(
+    let gate = acquire_terminal_output_gate(
         record,
         std::time::Instant::now() + Duration::from_millis(100),
     )?;
@@ -783,6 +876,15 @@ fn publish_terminal_bytes(record: &Arc<TerminalGeneration>, bytes: &[u8]) -> io:
         return Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "terminal writer has no active descriptor",
+        ));
+    }
+    let _effect = gate.begin_effect()?;
+    if TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) != SESSION_ACTIVE
+        || TERMINAL_COORDINATOR.generation.load(Ordering::Acquire) != record.generation
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal writer admission was revoked before publication",
         ));
     }
     write_nonblocking_count(
@@ -823,30 +925,54 @@ impl Write for TerminalOutput {
 }
 
 #[cfg(unix)]
-fn rollback_terminal_activation(generation: u64) {
+fn terminal_activation_error(generation: u64, activation: io::Error) -> io::Error {
+    match rollback_terminal_activation(generation) {
+        Ok(()) => activation,
+        Err(rollback) => io::Error::other(format!(
+            "terminal activation failed: {activation}; rollback failed: {rollback}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn rollback_terminal_activation(generation: u64) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     if TERMINAL_COORDINATOR.generation.load(Ordering::Acquire) != generation {
-        return;
+        return Ok(());
     }
-    if TERMINAL_COORDINATOR
-        .phase
-        .compare_exchange(
-            SESSION_ACTIVATING,
-            SESSION_CLEANING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-    {
-        let owner = claim_terminal_cleanup_owner();
-        let _ = finish_terminal_cleanup(generation, owner);
-        return;
+    match TERMINAL_COORDINATOR.phase.compare_exchange(
+        SESSION_ACTIVATING,
+        SESSION_CLEANING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) | Err(SESSION_CLEANING) => {}
+        Err(SESSION_INACTIVE) => return Ok(()),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminal activation rollback observed an incompatible phase",
+            ));
+        }
     }
-    // A concurrent termination path may already have revoked ACTIVATING and
-    // then exhausted its own absolute deadline while this activation stage
-    // still held the gate. The activation caller owns no session guard yet, so
-    // make one bounded repair attempt instead of stranding CLEANING ownerless.
-    let _ = cleanup_terminal_generation(generation);
+    // The constructor has no session guard whose Drop could retry. Claim an
+    // explicit repair owner and retain that token on failure; later bounded
+    // cleanup may take it over, but INACTIVE is never published speculatively.
+    let owner = claim_terminal_cleanup_owner();
+    let result = finish_terminal_cleanup_inner(
+        generation,
+        owner,
+        std::time::Instant::now() + Duration::from_millis(100),
+    );
+    HELD_TERMINAL_CLEANUP_OWNER.with(|held| {
+        if held.get() == owner {
+            held.set(0);
+        }
+    });
+    if result.is_err() {
+        publish_terminal_progress();
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -967,15 +1093,6 @@ fn cleanup_terminal_generation_until(
 }
 
 #[cfg(unix)]
-fn finish_terminal_cleanup(generation: u64, owner: u64) -> io::Result<()> {
-    finish_terminal_cleanup_until(
-        generation,
-        owner,
-        std::time::Instant::now() + Duration::from_millis(100),
-    )
-}
-
-#[cfg(unix)]
 fn finish_terminal_cleanup_until(
     generation: u64,
     owner: u64,
@@ -1028,7 +1145,7 @@ fn finish_terminal_cleanup_inner(
     // ACTIVE -> CLEANING revoked new admissions before this wait. Every
     // production renderer write is nonblocking while it holds this gate, so a
     // successful acquisition proves no admitted frame can publish after reset.
-    let _output_gate = acquire_terminal_output_gate(&record, deadline)?;
+    let output_gate = acquire_terminal_output_gate(&record, deadline)?;
     if !owns_terminal_cleanup(generation, owner) {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -1037,19 +1154,45 @@ fn finish_terminal_cleanup_inner(
     }
     let fd = record.fd.load(Ordering::Acquire);
     let modes = record.modes.load(Ordering::Acquire);
+    let _effect = output_gate.begin_effect()?;
+    if !owns_terminal_cleanup(generation, owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal cleanup ownership changed before restoration effect",
+        ));
+    }
     let mut first_error = None;
-    if fd >= 0 && unsafe { nix::libc::tcsetattr(fd, nix::libc::TCSANOW, &record.original) } < 0 {
+    if supervised_rollback_failure_requested() {
+        first_error = Some(io::Error::other(
+            "injected terminal activation rollback failure",
+        ));
+    } else if fd < 0 {
+        first_error = Some(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "terminal cleanup descriptor was revoked before restoration",
+        ));
+    } else if unsafe { nix::libc::tcsetattr(fd, nix::libc::TCSANOW, &record.original) } < 0 {
         first_error = Some(io::Error::last_os_error());
+    } else {
+        record.modes.fetch_and(!MODE_RAW, Ordering::AcqRel);
     }
     if fd >= 0 {
-        if unsafe { nix::libc::tcflush(fd, nix::libc::TCOFLUSH) } < 0 && first_error.is_none() {
-            first_error = Some(io::Error::last_os_error());
+        if !record.output_flushed.load(Ordering::Acquire) {
+            if unsafe { nix::libc::tcflush(fd, nix::libc::TCOFLUSH) } < 0 {
+                if first_error.is_none() {
+                    first_error = Some(io::Error::last_os_error());
+                }
+            } else {
+                record.output_flushed.store(true, Ordering::Release);
+            }
         }
-        for reset in terminal_protocol_resets(modes) {
+        for (mode, reset) in terminal_protocol_resets(modes) {
             if let Err(error) = write_nonblocking_until(fd, reset, deadline) {
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
+            } else {
+                record.modes.fetch_and(!mode, Ordering::AcqRel);
             }
         }
     }
@@ -1093,15 +1236,14 @@ fn finish_terminal_cleanup_inner(
 }
 
 #[cfg(unix)]
-fn terminal_protocol_resets(modes: u8) -> impl Iterator<Item = &'static [u8]> {
-    let keyboard = (modes & MODE_KEYBOARD != 0).then_some(b"\x1b[<1u".as_slice());
-    let mouse = (modes & MODE_MOUSE != 0).then_some(b"\x1b[?1000l\x1b[?1006l".as_slice());
-    let paste = (modes & MODE_PASTE != 0).then_some(b"\x1b[?2004l".as_slice());
-    keyboard
-        .into_iter()
-        .chain(mouse)
-        .chain(paste)
-        .chain(std::iter::once(b"\x1b[?25h\x1b[0m\r\n".as_slice()))
+fn terminal_protocol_resets(modes: u8) -> impl Iterator<Item = (u8, &'static [u8])> {
+    let keyboard = (modes & MODE_KEYBOARD != 0).then_some((MODE_KEYBOARD, b"\x1b[<1u".as_slice()));
+    let mouse =
+        (modes & MODE_MOUSE != 0).then_some((MODE_MOUSE, b"\x1b[?1000l\x1b[?1006l".as_slice()));
+    let paste = (modes & MODE_PASTE != 0).then_some((MODE_PASTE, b"\x1b[?2004l".as_slice()));
+    let cursor =
+        (modes & MODE_CURSOR != 0).then_some((MODE_CURSOR, b"\x1b[?25h\x1b[0m\r\n".as_slice()));
+    keyboard.into_iter().chain(mouse).chain(paste).chain(cursor)
 }
 
 #[cfg(unix)]
@@ -1139,6 +1281,11 @@ fn cleanup_active_terminal_until(deadline: std::time::Instant) -> io::Result<()>
 
 fn supervised_activation_failure_requested(stage: &str) -> bool {
     std::env::var("FINCH_TEST_TUI_FAIL_AFTER").ok().as_deref() == Some(stage)
+        && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+}
+
+fn supervised_rollback_failure_requested() -> bool {
+    std::env::var_os("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK").is_some()
         && matches!(crate::brain::isolated_test_proof_if_present(), Ok(Some(_)))
 }
 
@@ -1286,7 +1433,7 @@ pub fn supervised_verify_stale_terminal_gate_cas() -> io::Result<()> {
         std::time::Instant::now() + Duration::from_millis(100),
     )?;
     drop(stale);
-    if record.output_gate_owner.load(Ordering::Acquire) != replacement.owner {
+    if record.output_gate_state.load(Ordering::Acquire) != replacement.owner {
         return Err(io::Error::other(
             "stale terminal gate cleared its replacement owner",
         ));
@@ -1388,11 +1535,35 @@ pub fn supervised_terminal_signal_is_pending() -> io::Result<bool> {
 pub fn supervised_set_signal_transition_stall(stalled: bool) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     require_terminal_supervisor()?;
+    if stalled {
+        SUPERVISED_SIGNAL_TRANSITION_STALL_OBSERVED.store(false, Ordering::Release);
+    }
     SUPERVISED_SIGNAL_TRANSITION_STALL.store(stalled, Ordering::Release);
     if !stalled {
         publish_terminal_progress();
     }
     Ok(())
+}
+
+/// Report whether a real signal transition reached the injected stall.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_signal_transition_stall_is_observed() -> io::Result<bool> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok(SUPERVISED_SIGNAL_TRANSITION_STALL_OBSERVED.load(Ordering::Acquire))
+}
+
+/// Report whether a fail-closed generation retains an explicit repair owner.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn supervised_terminal_cleanup_owner_is_retained() -> io::Result<bool> {
+    use std::sync::atomic::Ordering;
+    require_terminal_supervisor()?;
+    Ok(
+        TERMINAL_COORDINATOR.phase.load(Ordering::Acquire) == SESSION_CLEANING
+            && TERMINAL_COORDINATOR.cleanup_owner.load(Ordering::Acquire) != 0,
+    )
 }
 
 #[cfg(unix)]
@@ -1447,6 +1618,9 @@ static SIGNAL_INSTALLED_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::A
 static SIGNAL_TRANSITION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
 static SUPERVISED_SIGNAL_TRANSITION_STALL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static SUPERVISED_SIGNAL_TRANSITION_STALL_OBSERVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
 static SUPERVISED_SIGNAL_DISARM_FAILURE: std::sync::atomic::AtomicBool =
@@ -1697,10 +1871,11 @@ fn ensure_terminal_signal_monitor() -> io::Result<()> {
 #[cfg(unix)]
 fn terminal_signal_monitor() {
     use std::sync::atomic::Ordering;
-    let mut retry_after_progress: Option<(u64, usize)> = None;
-    let mut pending_recovery_retry_available = false;
-    let mut drop_retry_after_progress: Option<u64> = None;
-    let mut drop_recovery_retry_available = false;
+    const ACTIVE_POLL: Duration = Duration::from_millis(1);
+    const IDLE_POLL: Duration = Duration::from_millis(25);
+    const RECOVERY_RETRY: Duration = Duration::from_millis(25);
+    let mut pending_retry: Option<(u64, usize, std::time::Instant)> = None;
+    let mut drop_retry: Option<(u64, std::time::Instant)> = None;
     loop {
         if SUPERVISED_SIGNAL_MONITOR_PAUSE.load(Ordering::Acquire) {
             SUPERVISED_SIGNAL_MONITOR_PAUSED.store(true, Ordering::Release);
@@ -1714,13 +1889,15 @@ fn terminal_signal_monitor() {
         if observed_pending != 0 {
             let progress_epoch = TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire);
             let signal_epoch = SIGNAL_PENDING_EPOCH.load(Ordering::Acquire);
-            let same_failed_epoch = retry_after_progress == Some((progress_epoch, signal_epoch));
-            if same_failed_epoch && !pending_recovery_retry_available {
-                std::thread::sleep(Duration::from_millis(1));
+            if matches!(
+                pending_retry,
+                Some((failed_progress, failed_signal, retry_at))
+                    if failed_progress == progress_epoch
+                        && failed_signal == signal_epoch
+                        && std::time::Instant::now() < retry_at
+            ) {
+                std::thread::sleep(ACTIVE_POLL);
                 continue;
-            }
-            if same_failed_epoch {
-                pending_recovery_retry_available = false;
             }
             // Latch before withdrawing the bits so Drop can never observe a
             // false empty window and release ownership ahead of termination.
@@ -1742,26 +1919,21 @@ fn terminal_signal_monitor() {
                 // cleanup transition, or newly delivered signal publishes
                 // observable progress.
                 SIGNAL_PENDING_MASK.fetch_or(pending, Ordering::AcqRel);
-                retry_after_progress = Some((
+                pending_retry = Some((
                     TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire),
                     SIGNAL_PENDING_EPOCH.load(Ordering::Acquire),
+                    std::time::Instant::now() + RECOVERY_RETRY,
                 ));
-                if !same_failed_epoch {
-                    // One additional bounded attempt handles a transient
-                    // sigaction/cleanup failure without becoming an infinite
-                    // retry loop. A second failure waits for real progress.
-                    pending_recovery_retry_available = true;
-                }
             }
         } else if BINARY_SIGNAL_OWNER.load(Ordering::Acquire) == BINARY_SIGNAL_OWNER_DROPPING {
             let progress_epoch = TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire);
-            let same_failed_epoch = drop_retry_after_progress == Some(progress_epoch);
-            if same_failed_epoch && !drop_recovery_retry_available {
-                std::thread::sleep(Duration::from_millis(1));
+            if matches!(
+                drop_retry,
+                Some((failed_progress, retry_at))
+                    if failed_progress == progress_epoch && std::time::Instant::now() < retry_at
+            ) {
+                std::thread::sleep(ACTIVE_POLL);
                 continue;
-            }
-            if same_failed_epoch {
-                drop_recovery_retry_available = false;
             }
             let deadline = std::time::Instant::now() + Duration::from_millis(100);
             if restore_terminal_before_termination_until(deadline).is_ok()
@@ -1777,18 +1949,18 @@ fn terminal_signal_monitor() {
                         Ordering::Acquire,
                     )
                     .ok();
-                retry_after_progress = None;
-                pending_recovery_retry_available = false;
-                drop_retry_after_progress = None;
-                drop_recovery_retry_available = false;
+                pending_retry = None;
+                drop_retry = None;
             } else {
-                drop_retry_after_progress = Some(TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire));
-                if !same_failed_epoch {
-                    drop_recovery_retry_available = true;
-                }
+                drop_retry = Some((
+                    TERMINAL_PROGRESS_EPOCH.load(Ordering::Acquire),
+                    std::time::Instant::now() + RECOVERY_RETRY,
+                ));
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        let active = SIGNAL_PENDING_MASK.load(Ordering::Acquire) != 0
+            || BINARY_SIGNAL_OWNER.load(Ordering::Acquire) == BINARY_SIGNAL_OWNER_DROPPING;
+        std::thread::sleep(if active { ACTIVE_POLL } else { IDLE_POLL });
     }
 }
 
@@ -1803,6 +1975,7 @@ fn acquire_signal_transition_until(deadline: std::time::Instant) -> io::Result<(
     use std::sync::atomic::Ordering;
     loop {
         if SUPERVISED_SIGNAL_TRANSITION_STALL.load(Ordering::Acquire) {
+            SUPERVISED_SIGNAL_TRANSITION_STALL_OBSERVED.store(true, Ordering::Release);
             if std::time::Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -2016,6 +2189,20 @@ impl Drop for BinaryTerminalSession {
 /// bounded timeout as successful cleanup.
 pub fn emergency_restore_terminal_result() -> io::Result<()> {
     cleanup_active_terminal()
+}
+
+/// Monotonic application progress observed by latched binary termination
+/// paths. It is deliberately only a wakeup hint; cleanup always revalidates
+/// exact generation and owner state.
+pub(crate) fn terminal_progress_epoch() -> u64 {
+    #[cfg(unix)]
+    {
+        TERMINAL_PROGRESS_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(unix))]
+    {
+        terminal_lifecycle::progress_epoch()
+    }
 }
 
 /// Restore terminal and host signal state before a binary termination path.

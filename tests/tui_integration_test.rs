@@ -360,6 +360,34 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if mode == "activation-rollback-failure" {
+        let stdout_flags = stdout_status_flags()?;
+        std::env::set_var("FINCH_TEST_TUI_FAIL_AFTER", "paste");
+        std::env::set_var("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK", "1");
+        let error = match new_renderer() {
+            Ok(_) => anyhow::bail!("injected activation rollback failure succeeded"),
+            Err(error) => error,
+        };
+        std::env::remove_var("FINCH_TEST_TUI_FAIL_AFTER");
+        std::env::remove_var("FINCH_TEST_TUI_FAIL_ACTIVATION_ROLLBACK");
+        let error = format!("{error:#}");
+        anyhow::ensure!(error.contains("activation stopped after bracketed paste"));
+        anyhow::ensure!(error.contains("rollback failed"));
+        anyhow::ensure!(
+            finch::cli::tui::supervised_terminal_cleanup_owner_is_retained()?,
+            "failed activation rollback lost its explicit CLEANING repair owner"
+        );
+        anyhow::ensure!(
+            new_renderer().is_err(),
+            "failed activation rollback falsely published INACTIVE"
+        );
+        finch::cli::tui::emergency_restore_terminal_result()?;
+        anyhow::ensure!(stdout_status_flags()? == stdout_flags);
+        let mut replacement = new_renderer()?;
+        replacement.shutdown()?;
+        marker(b"FINCH_ACTIVATION_ROLLBACK_REPAIRED")?;
+        return Ok(());
+    }
     if mode.starts_with("init-") || mode.starts_with("short-") {
         let stdout_flags = stdout_status_flags()?;
         if let Some(stage) = mode.strip_prefix("init-") {
@@ -1169,7 +1197,13 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    for gate_mode in ["none", "other-thread", "same-thread", "cleanup-owner"] {
+    for gate_mode in [
+        "none",
+        "other-thread",
+        "other-thread-permanent",
+        "same-thread",
+        "cleanup-owner",
+    ] {
         let (mut master, slave) = open_owned_pty();
         let original = terminal_modes(&slave);
         let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
@@ -1183,16 +1217,30 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
-        if gate_mode == "other-thread" {
+        if matches!(gate_mode, "other-thread" | "other-thread-permanent") {
             command.env("FINCH_TEST_TUI_MAIN_PANIC_GATE_HELD", "1");
+            if gate_mode == "other-thread-permanent" {
+                command.env("FINCH_TEST_TUI_MAIN_PANIC_GATE_PERMANENT", "1");
+            }
         } else if gate_mode == "same-thread" {
             command.env("FINCH_TEST_TUI_MAIN_PANIC_SAME_THREAD_GATE", "1");
         } else if gate_mode == "cleanup-owner" {
             command.env("FINCH_TEST_TUI_MAIN_PANIC_CLEANUP_OWNER", "1");
         }
         let mut child = command.spawn().expect("spawn Finch main panic-hook probe");
-        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
         let mut transcript = Vec::new();
+        assert!(
+            read_until(
+                &mut master,
+                &mut transcript,
+                Instant::now() + Duration::from_secs(20),
+                b"FINCH_MAIN_PANIC_ARMED",
+            ),
+            "Finch did not arm panic probe: {}",
+            String::from_utf8_lossy(&transcript)
+        );
+        let started = Instant::now();
+        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(2));
         drain_pty(
             &mut master,
             &mut transcript,
@@ -1212,6 +1260,16 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
             _ => "supervised panic after Finch terminal activation",
         };
         assert!(String::from_utf8_lossy(&transcript).contains(expected_panic));
+        assert!(
+            !transcript
+                .windows(b"FINCH_PANIC_FRAME".len())
+                .any(|window| window == b"FINCH_PANIC_FRAME"),
+            "revoked panic writer published after reset"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "panic hook did not return to bounded unwind for {gate_mode}"
+        );
     }
 }
 
@@ -1247,6 +1305,75 @@ fn test_finch_binary_quit_helper_revokes_same_thread_gate_before_exit() {
         Instant::now() + Duration::from_millis(100),
     );
     assert_eq!(status.code(), Some(23));
+    assert_eq!(terminal_modes(&slave), original);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+}
+
+/// One real `/quit` keystroke is encoded as ControlMessage by the production
+/// input task. Fail-before: the watcher discarded its intent after the first
+/// bounded restore failure and waited forever for a second message.
+#[cfg(unix)]
+#[test]
+fn test_real_ipc_quit_latches_and_retries_after_terminal_progress() {
+    let _serial = terminal_pty_test_lock();
+    if !supervised_pty_authority_or_skip() {
+        return;
+    }
+    let (mut master, slave) = open_owned_pty();
+    let original = terminal_modes(&slave);
+    let mut control = [-1; 2];
+    assert_eq!(unsafe { nix::libc::pipe(control.as_mut_ptr()) }, 0);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        .arg("--cloud-only")
+        .env(
+            "ANTHROPIC_API_KEY",
+            "sk-ant-finch-terminal-regression-placeholder",
+        )
+        .env("FINCH_TEST_TUI_MAIN_IPC_QUIT_RETRY", "1")
+        .env("FINCH_TEST_TERMINAL_CONTROL_FD", control[1].to_string())
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
+        .spawn()
+        .expect("spawn Finch real IPC quit probe");
+    unsafe { nix::libc::close(control[1]) };
+    let mut transcript = Vec::new();
+    assert!(
+        read_until(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_secs(20),
+            b"accept edits on",
+        ),
+        "Finch did not reach input: {}",
+        String::from_utf8_lossy(&transcript)
+    );
+    master.write_all(b"/quit\r").unwrap();
+    master.flush().unwrap();
+    let stalled = read_control_byte(
+        &mut child,
+        control[0],
+        Instant::now() + Duration::from_secs(2),
+    );
+    unsafe { nix::libc::close(control[0]) };
+    assert_eq!(
+        stalled, b'S',
+        "real Quit did not reach the stalled transition"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "quit watcher exited during its causally stalled first restore attempt"
+    );
+    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(4));
+    drain_pty(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert!(status.success(), "latched IPC quit failed: {status}");
     assert_eq!(terminal_modes(&slave), original);
     assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
     assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
@@ -1293,6 +1420,7 @@ fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
         "signal-descriptor-free",
         "repeated-signal-owners",
         "signal-create-failure",
+        "activation-rollback-failure",
         "sequential",
         "repeated",
         "overlapping-cleanup",

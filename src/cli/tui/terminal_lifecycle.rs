@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const INACTIVE: u8 = 0;
@@ -11,6 +11,10 @@ const CLEANING: u8 = 3;
 const APPLICATION_TIMEOUT: Duration = Duration::from_millis(100);
 const ACTOR_QUEUE_BOUND: usize = 4;
 const OUTPUT_CHUNK_BOUND: usize = 4096;
+const OPERATION_PENDING: u8 = 0;
+const OPERATION_EXECUTING: u8 = 1;
+const OPERATION_CANCELLED: u8 = 2;
+const OPERATION_COMPLETE: u8 = 3;
 
 pub(crate) type ProtocolOperation = fn() -> io::Result<()>;
 
@@ -20,11 +24,14 @@ static CLEANUP_OWNER: AtomicU64 = AtomicU64::new(0);
 static NEXT_CLEANUP_OWNER: AtomicU64 = AtomicU64::new(0);
 static OUTPUT_GATE_OWNER: AtomicU64 = AtomicU64::new(0);
 static NEXT_OUTPUT_GATE_OWNER: AtomicU64 = AtomicU64::new(0);
+static PROGRESS_EPOCH: AtomicU64 = AtomicU64::new(0);
 static ACTOR: OnceLock<SyncSender<ActorCommand>> = OnceLock::new();
 static SUPERVISED_OUTPUT_GATE_PAUSE: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_OUTPUT_GATE_PAUSED: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_ACTOR_PAUSE: AtomicBool = AtomicBool::new(false);
 static SUPERVISED_ACTOR_PAUSED: AtomicBool = AtomicBool::new(false);
+static SUPERVISED_ACTOR_WRITE_EFFECTS: AtomicU64 = AtomicU64::new(0);
+static SUPERVISED_ACTOR_FLUSH_EFFECTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static SUPERVISED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -39,15 +46,22 @@ struct OutputGate {
 
 impl Drop for OutputGate {
     fn drop(&mut self) {
-        OUTPUT_GATE_OWNER
+        if OUTPUT_GATE_OWNER
             .compare_exchange(self.owner, 0, Ordering::AcqRel, Ordering::Acquire)
-            .ok();
+            .is_ok()
+        {
+            PROGRESS_EPOCH.fetch_add(1, Ordering::Release);
+        }
         HELD_OUTPUT_GATE_OWNER.with(|held| {
             if held.get() == self.owner {
                 held.set(0);
             }
         });
     }
+}
+
+pub(crate) fn progress_epoch() -> u64 {
+    PROGRESS_EPOCH.load(Ordering::Acquire)
 }
 
 fn acquire_output_gate_until(deadline: Instant) -> io::Result<OutputGate> {
@@ -114,12 +128,56 @@ enum ActorCommand {
     Write {
         generation: u64,
         bytes: Vec<u8>,
+        operation: Arc<ActorOperation>,
         reply: SyncSender<ActorReply>,
     },
     Flush {
         generation: u64,
+        operation: Arc<ActorOperation>,
         reply: SyncSender<ActorReply>,
     },
+}
+
+struct ActorOperation {
+    state: AtomicU8,
+    expires: Instant,
+}
+
+impl ActorOperation {
+    fn new(expires: Instant) -> Self {
+        Self {
+            state: AtomicU8::new(OPERATION_PENDING),
+            expires,
+        }
+    }
+
+    fn claim(&self) -> bool {
+        if Instant::now() >= self.expires
+            && self
+                .state
+                .compare_exchange(
+                    OPERATION_PENDING,
+                    OPERATION_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                OPERATION_PENDING,
+                OPERATION_EXECUTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn complete(&self) {
+        self.state.store(OPERATION_COMPLETE, Ordering::Release);
+    }
 }
 
 struct ActorSession {
@@ -209,13 +267,22 @@ fn terminal_actor(receiver: Receiver<ActorCommand>) {
             ActorCommand::Write {
                 generation,
                 bytes,
+                operation,
                 reply,
             } => {
+                if !operation.claim() {
+                    let _ = reply.send(ActorReply::Written(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "portable terminal write was cancelled before execution",
+                    ))));
+                    continue;
+                }
                 let result = match session.as_ref() {
                     Some(active)
                         if active.generation == generation
                             && PHASE.load(Ordering::Acquire) == ACTIVE =>
                     {
+                        SUPERVISED_ACTOR_WRITE_EFFECTS.fetch_add(1, Ordering::AcqRel);
                         io::stdout().write(&bytes)
                     }
                     _ => Err(io::Error::new(
@@ -223,14 +290,27 @@ fn terminal_actor(receiver: Receiver<ActorCommand>) {
                         "portable terminal actor rejected a stale writer",
                     )),
                 };
+                operation.complete();
                 let _ = reply.send(ActorReply::Written(result));
             }
-            ActorCommand::Flush { generation, reply } => {
+            ActorCommand::Flush {
+                generation,
+                operation,
+                reply,
+            } => {
+                if !operation.claim() {
+                    let _ = reply.send(ActorReply::Unit(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "portable terminal flush was cancelled before execution",
+                    ))));
+                    continue;
+                }
                 let result = match session.as_ref() {
                     Some(active)
                         if active.generation == generation
                             && PHASE.load(Ordering::Acquire) == ACTIVE =>
                     {
+                        SUPERVISED_ACTOR_FLUSH_EFFECTS.fetch_add(1, Ordering::AcqRel);
                         io::stdout().flush()
                     }
                     _ => Err(io::Error::new(
@@ -238,6 +318,7 @@ fn terminal_actor(receiver: Receiver<ActorCommand>) {
                         "portable terminal actor rejected a stale flush",
                     )),
                 };
+                operation.complete();
                 let _ = reply.send(ActorReply::Unit(result));
             }
         }
@@ -310,6 +391,54 @@ fn wait_reply_until(receiver: &Receiver<ActorReply>, deadline: Instant) -> io::R
     }
 }
 
+fn wait_effect_reply_until(
+    receiver: &Receiver<ActorReply>,
+    operation: &ActorOperation,
+    deadline: Instant,
+) -> io::Result<ActorReply> {
+    loop {
+        match receiver.try_recv() {
+            Ok(reply) => return Ok(reply),
+            Err(TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "portable terminal actor response channel closed",
+                ));
+            }
+            Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::yield_now();
+            }
+            Err(TryRecvError::Empty) => match operation.state.compare_exchange(
+                OPERATION_PENDING,
+                OPERATION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(OPERATION_CANCELLED) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "portable terminal actor operation was cancelled before execution",
+                    ));
+                }
+                Err(OPERATION_EXECUTING) | Err(OPERATION_COMPLETE) => {
+                    // The actor won the effect claim, so returning a timeout
+                    // would permit publication after the caller observed a
+                    // terminal result. The staged operation is one bounded
+                    // write/flush and completes under the supported console
+                    // progress precondition; wait for its exact reply.
+                    return receiver.recv().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "portable terminal actor response channel closed",
+                        )
+                    });
+                }
+                Err(_) => continue,
+            },
+        }
+    }
+}
+
 fn unit_command_until(
     deadline: Instant,
     build: impl FnOnce(SyncSender<ActorReply>) -> ActorCommand,
@@ -355,16 +484,18 @@ pub(crate) fn write_generation(generation: u64, bytes: &[u8]) -> io::Result<usiz
         SUPERVISED_OUTPUT_GATE_PAUSED.store(false, Ordering::Release);
     }
     validate_writer_generation(generation)?;
+    let operation = Arc::new(ActorOperation::new(deadline));
     let (reply, response) = mpsc::sync_channel(1);
     send_command_until(
         ActorCommand::Write {
             generation,
             bytes: bytes[..bytes.len().min(OUTPUT_CHUNK_BOUND)].to_vec(),
+            operation: Arc::clone(&operation),
             reply,
         },
         deadline,
     )?;
-    match wait_reply_until(&response, deadline)? {
+    match wait_effect_reply_until(&response, &operation, deadline)? {
         ActorReply::Written(result) => result,
         ActorReply::Unit(_) => Err(io::Error::other(
             "portable terminal actor returned the wrong write response",
@@ -376,7 +507,22 @@ pub(crate) fn flush_generation(generation: u64) -> io::Result<()> {
     let deadline = Instant::now() + APPLICATION_TIMEOUT;
     let _gate = acquire_output_gate_until(deadline)?;
     validate_writer_generation(generation)?;
-    unit_command_until(deadline, |reply| ActorCommand::Flush { generation, reply })
+    let operation = Arc::new(ActorOperation::new(deadline));
+    let (reply, response) = mpsc::sync_channel(1);
+    send_command_until(
+        ActorCommand::Flush {
+            generation,
+            operation: Arc::clone(&operation),
+            reply,
+        },
+        deadline,
+    )?;
+    match wait_effect_reply_until(&response, &operation, deadline)? {
+        ActorReply::Unit(result) => result,
+        ActorReply::Written(_) => Err(io::Error::other(
+            "portable terminal actor returned the wrong flush response",
+        )),
+    }
 }
 
 pub(crate) fn supervised_set_output_gate_pause(paused: bool) {
@@ -399,6 +545,14 @@ pub(crate) fn supervised_set_actor_pause(paused: bool) {
 
 pub(crate) fn supervised_actor_is_paused() -> bool {
     SUPERVISED_ACTOR_PAUSED.load(Ordering::Acquire)
+}
+
+pub(crate) fn supervised_actor_write_effects() -> u64 {
+    SUPERVISED_ACTOR_WRITE_EFFECTS.load(Ordering::Acquire)
+}
+
+pub(crate) fn supervised_actor_flush_effects() -> u64 {
+    SUPERVISED_ACTOR_FLUSH_EFFECTS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -678,6 +832,7 @@ mod tests {
         // its delayed execution; cleanup stays fail-closed until actor progress.
         let renderer =
             PortableRendererSession::activate(activate_protocols, cleanup_protocols).unwrap();
+        let effects_before = supervised_actor_write_effects();
         supervised_set_actor_pause(true);
         let generation = renderer.generation();
         let writer = std::thread::spawn(move || write_generation(generation, b"staged-frame"));
@@ -687,9 +842,26 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(writer.join().unwrap().is_err());
-        assert!(renderer.cleanup().is_err());
-        assert!(PortableRendererSession::activate(activate_protocols, cleanup_protocols).is_err());
+        // Fail-before: the old actor ran the queued command after its caller
+        // had reported timeout. Resume while the generation is still ACTIVE;
+        // only the subsequent live write may cross the production effect edge.
         supervised_set_actor_pause(false);
+        assert_eq!(renderer.write(b"live-frame").unwrap(), 10);
+        assert_eq!(supervised_actor_write_effects(), effects_before + 1);
+
+        let flush_effects_before = supervised_actor_flush_effects();
+        supervised_set_actor_pause(true);
+        let generation = renderer.generation();
+        let flush = std::thread::spawn(move || flush_generation(generation));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !supervised_actor_is_paused() {
+            assert!(Instant::now() < deadline, "portable actor did not pause");
+            std::thread::yield_now();
+        }
+        assert!(flush.join().unwrap().is_err());
+        supervised_set_actor_pause(false);
+        flush_generation(renderer.generation()).unwrap();
+        assert_eq!(supervised_actor_flush_effects(), flush_effects_before + 1);
         renderer.cleanup().unwrap();
         PortableRendererSession::activate(activate_protocols, cleanup_protocols)
             .unwrap()

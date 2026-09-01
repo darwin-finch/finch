@@ -1145,6 +1145,8 @@ async fn main() -> Result<()> {
         && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
     {
         #[cfg(unix)]
+        finch::cli::tui::supervised_publish_terminal_bytes(b"FINCH_MAIN_PANIC_ARMED")?;
+        #[cfg(unix)]
         if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_CLEANUP_OWNER").is_some() {
             finch::cli::tui::supervised_panic_while_owning_terminal_cleanup();
         }
@@ -1165,12 +1167,41 @@ async fn main() -> Result<()> {
                 );
                 std::thread::yield_now();
             }
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                let _ = finch::cli::tui::supervised_set_terminal_writer_gate_pause(false);
-            });
+            if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_GATE_PERMANENT").is_none() {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let _ = finch::cli::tui::supervised_set_terminal_writer_gate_pause(false);
+                });
+            }
         }
         panic!("supervised panic after Finch terminal activation");
+    }
+    #[cfg(unix)]
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_IPC_QUIT_RETRY").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        finch::cli::tui::supervised_set_signal_transition_stall(true)?;
+        std::thread::spawn(|| {
+            while !finch::cli::tui::supervised_signal_transition_stall_is_observed()
+                .unwrap_or(false)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if let Some(fd) = std::env::var("FINCH_TEST_TERMINAL_CONTROL_FD")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+            {
+                let marker = b'S';
+                unsafe {
+                    nix::libc::write(fd, (&marker as *const u8).cast(), 1);
+                }
+            }
+            // Outlive the first 500ms quit cleanup attempt. Releasing the
+            // transition publishes progress; the already-latched watcher must
+            // retry without another ControlMessage.
+            std::thread::sleep(std::time::Duration::from_millis(550));
+            let _ = finch::cli::tui::supervised_set_signal_transition_stall(false);
+        });
     }
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
@@ -1237,15 +1268,13 @@ async fn main() -> Result<()> {
 fn install_panic_handler() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if finch::cli::tui::restore_terminal_before_termination().is_err() {
-            // Never resume unwinding across a fail-closed terminal generation.
-            // This branch is outside the supported scheduler/console progress
-            // contract; parking does not falsely report restoration or retry
-            // an application-owned gate forever.
-            loop {
-                std::thread::park();
-            }
-        }
+        // The restore helper latches termination and uses one absolute
+        // deadline. Under the supported scheduler/kernel progress model it
+        // safely revokes a pre-effect application stall and restores exactly;
+        // outside that model it leaves the generation fail-closed. The hook
+        // must still return to Rust's bounded panic policy instead of parking
+        // the process forever.
+        let _ = finch::cli::tui::restore_terminal_before_termination();
 
         // Call the default panic handler
         default_panic(info);

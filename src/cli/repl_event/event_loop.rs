@@ -1929,30 +1929,48 @@ impl EventLoop {
         // when the loop is blocked mid-streaming or mid-tool execution.
         let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
-            while let Some(bytes) = quit_rx.recv().await {
-                let mut cursor = std::io::Cursor::new(bytes);
-                let ok = capnp::serialize::read_message(
-                    &mut cursor,
-                    capnp::message::ReaderOptions::new(),
-                )
-                .and_then(|reader| {
-                    reader
-                        .get_root::<crate::finch_ipc_capnp::control_message::Reader>()
-                        .map(|ctrl| {
-                            matches!(
-                                ctrl.which(),
-                                Ok(crate::finch_ipc_capnp::control_message::Which::Quit(_))
-                            )
-                        })
-                })
-                .unwrap_or(false);
+            let mut quit_latched = false;
+            loop {
+                if !quit_latched {
+                    let Some(bytes) = quit_rx.recv().await else {
+                        return;
+                    };
+                    let mut cursor = std::io::Cursor::new(bytes);
+                    quit_latched = capnp::serialize::read_message(
+                        &mut cursor,
+                        capnp::message::ReaderOptions::new(),
+                    )
+                    .and_then(|reader| {
+                        reader
+                            .get_root::<crate::finch_ipc_capnp::control_message::Reader>()
+                            .map(|ctrl| {
+                                matches!(
+                                    ctrl.which(),
+                                    Ok(crate::finch_ipc_capnp::control_message::Which::Quit(_))
+                                )
+                            })
+                    })
+                    .unwrap_or(false);
+                    if !quit_latched {
+                        continue;
+                    }
+                }
 
-                if ok {
-                    // A timeout leaves the generation fail-closed. Do not
-                    // translate that into a successful quit with a dirty
-                    // terminal; a later control message may retry after the
-                    // application owner has made progress.
-                    let _ = crate::cli::tui::exit_process_after_terminal_restore(0);
+                let observed_progress = crate::cli::tui::terminal_progress_epoch();
+                if crate::cli::tui::exit_process_after_terminal_restore(0).is_ok() {
+                    unreachable!("successful terminal restore exits the process");
+                }
+
+                // Quit intent is durable after one decoded ControlMessage.
+                // Each cleanup attempt has its own absolute deadline; wait for
+                // application progress (with a low-frequency recovery tick)
+                // before retrying, without requiring a second user message or
+                // busy-looping a fail-closed generation.
+                let retry_at = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                while crate::cli::tui::terminal_progress_epoch() == observed_progress
+                    && std::time::Instant::now() < retry_at
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         });
