@@ -72,11 +72,27 @@ jobs:
           # the resolved tree rather than trusting the manifest constraint.
           cargo tree --invert quick-xml --edges normal,build,dev --prefix none --format '{p}' \
             | sort -u | tee quick-xml-tree.txt
-          if grep -qE '^quick-xml v0\.(3[0-9]|[0-2]?[0-9])\.' quick-xml-tree.txt; then
-            echo 'a quick-xml below 0.41 is still reachable' >&2
+
+          # Compare with `sort -V` rather than matching version shapes with a
+          # regex. A pattern tuned to "below 0.41" gets this wrong in both
+          # directions as the ecosystem moves: it has to be widened for every
+          # new minor, and a version it does not anticipate matches neither the
+          # vulnerable nor the fixed pattern, so the step fails with no
+          # diagnostic on a graph that is perfectly fine.
+          minimum=0.41.0
+          found=$(sed -n 's/^quick-xml v\([0-9][0-9.]*\).*/\1/p' quick-xml-tree.txt | sort -u)
+          if [[ -z "$found" ]]; then
+            echo 'no quick-xml in the graph at all: the assertion below would be vacuous' >&2
             exit 1
           fi
-          grep -qE '^quick-xml v0\.4[1-9]\.|^quick-xml v[1-9]' quick-xml-tree.txt
+          for version in $found; do
+            oldest=$(printf '%s\n%s\n' "$version" "$minimum" | sort -V | head -n1)
+            if [[ "$oldest" == "$version" && "$version" != "$minimum" ]]; then
+              echo "quick-xml $version is below the fixed $minimum and is still reachable" >&2
+              exit 1
+            fi
+            echo "quick-xml $version is at or above the fixed $minimum"
+          done
       - name: Report full-audit outcome
         shell: bash
         run: |

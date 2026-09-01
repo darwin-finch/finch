@@ -29,6 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Spreadsheet text now has leading and trailing whitespace stripped** when the
+  cell does not declare `xml:space="preserve"` — the behaviour quick-xml 0.41
+  specifies. Files Finch writes always declare it, so their values are
+  unaffected; files from Excel on some paths, LibreOffice, ODS producers and
+  hand-written XML may read back trimmed where they previously did not. (#185)
+- **A carriage return in a cell now reads back as a carriage return.** It was
+  previously returned as the raw `_x000D_` escape. (#185)
+- **`xlsx@` and `xlsx!` reject an address outside Excel's sheet limits** by
+  name, instead of returning an empty string, failing with an opaque integer
+  conversion error, or — for an eight-letter column — overflowing to a
+  different cell. (#185)
 - Declared `rust-version = "1.98"`, matching the pinned toolchain. Calamine
   0.36.1 requires 1.88; the floor is now explicit rather than transitive. (#185)
 

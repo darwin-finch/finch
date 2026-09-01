@@ -10733,15 +10733,34 @@ fn parse_cell_addr(addr: &str) -> Option<(u32, u32)> {
         return None;
     }
     let row: u32 = row_str.parse().ok()?;
-    if row == 0 {
+    if row == 0 || row > EXCEL_MAX_ROWS {
         return None;
     }
+    // Checked, and bounded by the sheet.
+    //
+    // `col * 26 + n` overflows on an eight-letter column: `AAAAAAAA1` panicked
+    // in a debug build and wrapped silently to a wrong column in a release one,
+    // from a user-supplied address. Bounding at Excel's limit also gives the
+    // callers one place to reject an out-of-sheet address, instead of
+    // `xlsx@` returning "" for it and `xlsx!` failing much later inside a
+    // `u16::try_from` with "out of range integral type conversion attempted".
     let mut col = 0u32;
     for c in col_str.chars() {
-        col = col * 26 + (c as u32 - b'A' as u32 + 1);
+        col = col
+            .checked_mul(26)?
+            .checked_add(c as u32 - b'A' as u32 + 1)?;
+        if col > EXCEL_MAX_COLUMNS {
+            return None;
+        }
     }
     Some((row - 1, col - 1))
 }
+
+/// Excel's sheet limits, which XLSX inherits: 1,048,576 rows by 16,384 columns
+/// (A1 through XFD1048576). An address outside them cannot name a cell in any
+/// workbook Finch can read or write.
+const EXCEL_MAX_ROWS: u32 = 1_048_576;
+const EXCEL_MAX_COLUMNS: u32 = 16_384;
 
 /// Format a calamine `Data` cell value as a plain string.
 fn data_to_string(cell: &calamine::Data) -> String {
@@ -10766,8 +10785,12 @@ fn data_to_string(cell: &calamine::Data) -> String {
 /// Read one cell from an xlsx/xls/ods file.  Sheet name `None` → first sheet.
 pub(crate) fn xlsx_read_cell(path: &str, sheet: Option<&str>, addr: &str) -> Result<String> {
     use calamine::{open_workbook_auto, Reader};
-    let (row, col) =
-        parse_cell_addr(addr).ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
+    let (row, col) = parse_cell_addr(addr).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid cell address: {addr}. Addresses run from A1 to \
+                 XFD{EXCEL_MAX_ROWS}, Excel's sheet limit."
+        )
+    })?;
     let mut wb =
         open_workbook_auto(path).map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
     let sheet_name = match sheet {
@@ -10804,8 +10827,12 @@ fn xlsx_write_cell(path: &str, addr: &str, value: &str) -> Result<()> {
     use calamine::{open_workbook_auto, Reader};
     use rust_xlsxwriter::Workbook;
 
-    let (target_row, target_col) =
-        parse_cell_addr(addr).ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
+    let (target_row, target_col) = parse_cell_addr(addr).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid cell address: {addr}. Addresses run from A1 to \
+                 XFD{EXCEL_MAX_ROWS}, Excel's sheet limit."
+        )
+    })?;
 
     let mut wb_in =
         open_workbook_auto(path).map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
@@ -12706,6 +12733,57 @@ mod tests {
             error.to_string().contains("cannot read sheet"),
             "naming a sheet that does not exist must error; got {error}"
         );
+    }
+
+    /// The same round trip through the actual `xlsx@` and `xlsx!` words.
+    ///
+    /// Every other test here calls the private helpers. That matters for this
+    /// bug specifically: `Builtin::XlsxWriteCell` pushes a failed write into
+    /// `self.out` rather than failing the program, so "the word reported
+    /// success and changed nothing" is a symptom that only exists at the word
+    /// boundary — and the helper-level tests could not see it.
+    #[test]
+    fn test_xlsx_words_round_trip_on_a_sheet_that_does_not_start_at_a1() {
+        let (_dir, path) = spreadsheet_fixture("Data", &[(2, 1, "B3 original"), (2, 2, "C3 keep")]);
+
+        let read = Forth::run(&format!("s\" {path}\" s\" B3\" xlsx@ type")).unwrap();
+        assert_eq!(read.trim(), "B3 original");
+
+        let wrote = Forth::run(&format!("s\" B3 patched\" s\" {path}\" s\" B3\" xlsx!")).unwrap();
+        assert!(
+            !wrote.contains("xlsx!:"),
+            "the word must not report an error; got {wrote:?}"
+        );
+
+        let after = Forth::run(&format!("s\" {path}\" s\" B3\" xlsx@ type")).unwrap();
+        assert_eq!(
+            after.trim(),
+            "B3 patched",
+            "the word reported success, so the cell must actually have changed"
+        );
+        let neighbour = Forth::run(&format!("s\" {path}\" s\" C3\" xlsx@ type")).unwrap();
+        assert_eq!(neighbour.trim(), "C3 keep", "neighbours must not move");
+    }
+
+    /// An address outside Excel's sheet limits is refused by name, through the
+    /// word, rather than overflowing or failing later with an opaque
+    /// conversion error.
+    #[test]
+    fn test_xlsx_words_reject_an_out_of_sheet_address() {
+        let (_dir, path) = spreadsheet_fixture("Data", &[(0, 0, "A1")]);
+        // `ZZZZ1` is column 475,254 — past XFD. It used to reach
+        // `u16::try_from` and surface as "out of range integral type
+        // conversion attempted".
+        let out = Forth::run(&format!("s\" x\" s\" {path}\" s\" ZZZZ1\" xlsx!")).unwrap();
+        assert!(
+            out.contains("invalid cell address") && out.contains("XFD"),
+            "the error must name the limit that was exceeded; got {out:?}"
+        );
+        // And an eight-letter column must not overflow.
+        assert_eq!(parse_cell_addr("AAAAAAAA1"), None);
+        assert_eq!(parse_cell_addr("XFD1048576"), Some((1_048_575, 16_383)));
+        assert_eq!(parse_cell_addr("XFE1"), None);
+        assert_eq!(parse_cell_addr("A1048577"), None);
     }
 
     /// Cell addresses are absolute; `Range::rows()` is relative to the used
