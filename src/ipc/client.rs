@@ -95,6 +95,23 @@ impl RunnerProcessIdentity {
         }
         Ok(send())
     }
+
+    /// Publish a terminal server rejection in the same total order as every
+    /// runner send. A send already holding admission completes before this
+    /// store; every later sender observes poison and fails locally.
+    fn publish_remote_poison(&self) {
+        self.publish_remote_poison_after_admission(|| {});
+    }
+
+    fn publish_remote_poison_after_admission(&self, admitted: impl FnOnce()) {
+        let _admission = self
+            .runner_rpc_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admitted();
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 fn runner_process_identity() -> std::sync::Arc<RunnerProcessIdentity> {
@@ -160,7 +177,9 @@ impl IpcClient {
             .get()
             .set_process_epoch(&self._rpc_handle.state.process.epoch.to_string());
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        promise.await?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         self._rpc_handle
             .state
             .active_runner_registrations
@@ -197,6 +216,14 @@ impl IpcClient {
         // promise without polling it, so admission is never held across an
         // await or re-entered by a response callback.
         self._rpc_handle.state.process.with_rpc_admission(send)
+    }
+
+    fn observe_runner_rpc_error(&self, error: capnp::Error) -> anyhow::Error {
+        let error = map_runner_rpc_error(error);
+        if is_runner_process_quarantined(&error) {
+            self._rpc_handle.state.process.publish_remote_poison();
+        }
+        error
     }
 
     #[cfg(test)]
@@ -448,9 +475,11 @@ impl IpcClient {
     async fn runner_brain_service(&self) -> Result<brain_service::Client> {
         #[cfg(test)]
         self.wait_runner_rpc_admission_pause_for_test().await;
-        let request = self.client.brain_service_request();
+        let request = self.client.runner_brain_service_request();
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        let reply = promise.await?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         Ok(reply.get()?.get_service()?)
     }
 
@@ -470,7 +499,9 @@ impl IpcClient {
         let mut request = service.snapshot_request();
         request.get().set_brain(brain);
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        let reply = promise.await?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_snapshot(reply.get()?.get_snapshot()?)
     }
 
@@ -800,7 +831,9 @@ impl IpcClient {
             params.set_ttl_ms(ttl_ms);
         }
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        let reply = promise.await?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
@@ -809,7 +842,9 @@ impl IpcClient {
         let mut request = service.claim_runner_identity_request();
         request.get().set_subject(subject);
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        promise.await?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         Ok(())
     }
 
@@ -826,7 +861,9 @@ impl IpcClient {
             params.set_lease_id(&lease_id.0.to_string());
         }
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        promise.await?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         let _ = self
             ._rpc_handle
             .state
@@ -848,7 +885,7 @@ impl IpcClient {
         environment: &crate::brain::store::BrainEnvironment,
         ttl_ms: u64,
     ) -> Result<crate::brain::store::BrainRunnerHandoff> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.request_runner_handoff_request();
         {
             let mut params = request.get();
@@ -859,7 +896,10 @@ impl IpcClient {
             encode_environment(params.reborrow().init_environment(), environment);
             params.set_ttl_ms(ttl_ms);
         }
-        let reply = request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_runner_handoff(reply.get()?.get_handoff()?)
     }
 
@@ -882,7 +922,9 @@ impl IpcClient {
             params.set_ttl_ms(ttl_ms);
         }
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        let reply = promise.await?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
@@ -892,7 +934,7 @@ impl IpcClient {
         handoff_id: crate::brain::store::RunnerHandoffId,
         sender: &str,
     ) -> Result<()> {
-        let service = self.brain_service().await?;
+        let service = self.runner_brain_service().await?;
         let mut request = service.cancel_runner_handoff_request();
         {
             let mut params = request.get();
@@ -900,7 +942,10 @@ impl IpcClient {
             params.set_handoff_id(&handoff_id.0.to_string());
             params.set_sender(sender);
         }
-        request.send().promise.await?;
+        let promise = self.send_runner_rpc(|| request.send().promise)?;
+        promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         Ok(())
     }
 
@@ -961,17 +1006,9 @@ impl IpcClient {
         #[cfg(test)]
         self.wait_runner_rpc_admission_pause_for_test().await;
         let promise = self.send_runner_rpc(|| request.send().promise)?;
-        let reply = promise.await.map_err(|error| {
-            let error = map_runner_registration_error(error);
-            if is_runner_process_quarantined(&error) {
-                self._rpc_handle
-                    .state
-                    .process
-                    .poisoned
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-            error
-        })?;
+        let reply = promise
+            .await
+            .map_err(|error| self.observe_runner_rpc_error(error))?;
         self._rpc_handle
             .state
             .active_runner_registrations
@@ -1041,7 +1078,7 @@ impl IpcClient {
     }
 }
 
-fn map_runner_registration_error(error: capnp::Error) -> anyhow::Error {
+fn map_runner_rpc_error(error: capnp::Error) -> anyhow::Error {
     if error.kind == capnp::ErrorKind::Unimplemented {
         anyhow::anyhow!(
             "the running Finch daemon uses an older IPC schema; restart the daemon and reconnect"
@@ -2479,7 +2516,7 @@ mod tests {
 
     #[test]
     fn mixed_ipc_generations_reject_before_query_or_stream_use() {
-        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 12);
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 13);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2488,29 +2525,29 @@ mod tests {
         runtime.block_on(local.run_until(async {
             let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 11,
+                protocol_version: 12,
                 query_calls: std::rc::Rc::clone(&old_daemon_calls),
             });
             let client = IpcClient::from_test_client(daemon);
             let error = client.ping().await.unwrap_err().to_string();
-            assert!(error.contains("protocol 11"));
-            assert!(error.contains("requires 12"));
+            assert!(error.contains("protocol 12"));
+            assert!(error.contains("requires 13"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(old_daemon_calls.get(), 0);
 
             let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
-                protocol_version: 12,
+                protocol_version: 13,
                 query_calls: std::rc::Rc::clone(&new_daemon_calls),
             });
             let request = daemon.ping_request();
             let reply = request.send().promise.await.unwrap();
             let protocol_version = reply.get().unwrap().get_protocol_version();
-            let error = ensure_protocol_generation(protocol_version, 11)
+            let error = ensure_protocol_generation(protocol_version, 12)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("protocol 12"));
-            assert!(error.contains("requires 11"));
+            assert!(error.contains("protocol 13"));
+            assert!(error.contains("requires 12"));
             assert!(error.contains("restart the daemon"));
             assert_eq!(new_daemon_calls.get(), 0);
         }));
@@ -2756,6 +2793,65 @@ mod tests {
     }
 
     #[test]
+    fn test_remote_quarantine_publication_is_totally_ordered_with_runner_sends() {
+        let process = fresh_runner_process_identity();
+        let sends = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sender_process = std::sync::Arc::clone(&process);
+        let sender_sends = std::sync::Arc::clone(&sends);
+        let sender = std::thread::spawn(move || {
+            sender_process
+                .with_rpc_admission(|| {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    sender_sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .unwrap();
+        });
+        admitted_rx.recv().unwrap();
+
+        let publisher_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publisher_thread_started = std::sync::Arc::clone(&publisher_started);
+        let (publication_admitted_tx, publication_admitted_rx) = std::sync::mpsc::channel();
+        let (publication_release_tx, publication_release_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let poison_process = std::sync::Arc::clone(&process);
+        let publisher = std::thread::spawn(move || {
+            publisher_thread_started.wait();
+            poison_process.publish_remote_poison_after_admission(|| {
+                publication_admitted_tx.send(()).unwrap();
+                publication_release_rx.recv().unwrap();
+            });
+            published_tx.send(()).unwrap();
+        });
+        publisher_started.wait();
+        assert!(!process.poisoned.load(std::sync::atomic::Ordering::Acquire));
+
+        release_tx.send(()).unwrap();
+        sender.join().unwrap();
+        publication_admitted_rx.recv().unwrap();
+        assert!(!process.poisoned.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        publication_release_tx.send(()).unwrap();
+        published_rx.recv().unwrap();
+        publisher.join().unwrap();
+        assert!(process.poisoned.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let later = process.with_rpc_admission(|| {
+            sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(is_runner_process_quarantined(&later.unwrap_err()));
+        assert_eq!(
+            sends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a runner send occurred after terminal poison publication"
+        );
+    }
+
+    #[test]
     fn test_runner_request_text_fails_closed_at_callback_boundary() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2928,9 +3024,8 @@ mod tests {
 
     #[test]
     fn runner_registration_explains_an_older_daemon_schema() {
-        let error = map_runner_registration_error(capnp::Error::unimplemented(
-            "remote method missing".into(),
-        ));
+        let error =
+            map_runner_rpc_error(capnp::Error::unimplemented("remote method missing".into()));
         let message = error.to_string();
         assert!(message.contains("older IPC schema"));
         assert!(message.contains("restart the daemon"));

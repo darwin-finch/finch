@@ -57,9 +57,20 @@ struct BrainRpcService {
     lifecycle: crate::server::BrainLifecycleService,
     runners: crate::server::BrainRunnerBroker,
     connection_id: uuid::Uuid,
+    /// Present only on the v13 runnerBrainService capability. Runner lease
+    /// operations require this kernel-derived binding; ordinary brainService
+    /// remains available for attachments and nonrunner snapshots.
+    runner_process_identity: Option<crate::server::RunnerProcessIdentity>,
 }
 
 impl BrainRpcService {
+    fn require_runner_process_admitted(&self) -> anyhow::Result<()> {
+        let identity = self.runner_process_identity.context(
+            "runner lifecycle methods require a peer-identity-bound runnerBrainService capability",
+        )?;
+        self.runners.ensure_runner_process_admitted(identity)
+    }
+
     fn acquire_connection_runner(
         &self,
         brain: &str,
@@ -846,6 +857,13 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::SnapshotParams,
         mut results: brain_service::SnapshotResults,
     ) -> Promise<(), capnp::Error> {
+        if self.runner_process_identity.is_some() {
+            if let Err(error) = self.require_runner_process_admitted() {
+                return Promise::err(capnp::Error::failed(error.to_string()));
+            }
+            #[cfg(test)]
+            self.runners.record_runner_snapshot_for_test();
+        }
         let brain = pry!(pry!(params.get()).get_brain())
             .to_str()
             .unwrap_or("")
@@ -1107,6 +1125,11 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::AcquireRunnerParams,
         mut results: brain_service::AcquireRunnerResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.require_runner_process_admitted() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        #[cfg(test)]
+        self.runners.record_runner_acquire_for_test();
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let subject = pry!(params.get_subject())
@@ -1150,6 +1173,11 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::ReleaseRunnerParams,
         _results: brain_service::ReleaseRunnerResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.require_runner_process_admitted() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        #[cfg(test)]
+        self.runners.record_runner_release_for_test();
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let lease_id = match parse_runner_lease_id(params.get_lease_id()) {
@@ -1175,6 +1203,9 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::RequestRunnerHandoffParams,
         mut results: brain_service::RequestRunnerHandoffResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.require_runner_process_admitted() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let requested_by = pry!(params.get_requested_by())
@@ -1217,6 +1248,9 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::AcceptRunnerHandoffParams,
         mut results: brain_service::AcceptRunnerHandoffResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.require_runner_process_admitted() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let target_subject = pry!(params.get_target_subject())
@@ -1267,6 +1301,9 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::CancelRunnerHandoffParams,
         _results: brain_service::CancelRunnerHandoffResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.require_runner_process_admitted() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let handoff_id = match parse_runner_handoff_id(params.get_handoff_id()) {
@@ -1506,6 +1543,11 @@ impl brain_service::Server for BrainRpcService {
         params: brain_service::ClaimRunnerIdentityParams,
         _results: brain_service::ClaimRunnerIdentityResults,
     ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.require_runner_process_admitted() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        #[cfg(test)]
+        self.runners.record_runner_claim_for_test();
         let subject = pry!(pry!(params.get()).get_subject())
             .to_str()
             .unwrap_or("")
@@ -1893,6 +1935,22 @@ impl finch_daemon::Server for FinchDaemonImpl {
         params: finch_daemon::RegisterBrainRunnerParams,
         mut results: finch_daemon::RegisterBrainRunnerResults,
     ) -> Promise<(), capnp::Error> {
+        // This kernel-derived durable-ledger check must precede request
+        // parsing, snapshot/checkpoint reads, lease inspection, or callback
+        // construction. A lost eject notification therefore cannot let a
+        // restarted daemon expose or mutate runner state before registration
+        // finally notices the old process identity.
+        if let Err(error) = self
+            .server
+            .brain_runners()
+            .ensure_runner_process_admitted(self.peer_process_identity)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        #[cfg(test)]
+        self.server
+            .brain_runners()
+            .record_runner_register_for_test();
         let params = pry!(params.get());
         let brain = match decode_required_text(params.get_brain(), "runner brain") {
             Ok(value) => value,
@@ -2066,6 +2124,29 @@ impl finch_daemon::Server for FinchDaemonImpl {
             lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
             runners: self.server.brain_runners().clone(),
             connection_id: self.connection_id,
+            runner_process_identity: None,
+        });
+        results.get().set_service(service);
+        Promise::ok(())
+    }
+
+    fn runner_brain_service(
+        &mut self,
+        _params: finch_daemon::RunnerBrainServiceParams,
+        mut results: finch_daemon::RunnerBrainServiceResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self
+            .server
+            .brain_runners()
+            .ensure_runner_process_admitted(self.peer_process_identity)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let service: brain_service::Client = capnp_rpc::new_client(BrainRpcService {
+            lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
+            runners: self.server.brain_runners().clone(),
+            connection_id: self.connection_id,
+            runner_process_identity: Some(self.peer_process_identity),
         });
         results.get().set_service(service);
         Promise::ok(())
@@ -5716,6 +5797,7 @@ mod tests {
     struct CountingRunnerRestoreDaemon {
         counts: std::sync::Arc<RunnerRestoreRpcCounts>,
         store: crate::brain::store::BrainStore,
+        registration_error: &'static str,
     }
 
     impl super::finch_ipc_capnp::finch_daemon::Server for CountingRunnerRestoreDaemon {
@@ -5750,6 +5832,23 @@ mod tests {
             capnp::capability::Promise::ok(())
         }
 
+        fn runner_brain_service(
+            &mut self,
+            _params: super::finch_ipc_capnp::finch_daemon::RunnerBrainServiceParams,
+            mut results: super::finch_ipc_capnp::finch_daemon::RunnerBrainServiceResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.counts
+                .brain_service
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let service: super::finch_ipc_capnp::brain_service::Client =
+                capnp_rpc::new_client(CountingRunnerRestoreBrainService {
+                    counts: std::sync::Arc::clone(&self.counts),
+                    store: self.store.clone(),
+                });
+            results.get().set_service(service);
+            capnp::capability::Promise::ok(())
+        }
+
         fn register_brain_runner(
             &mut self,
             _params: super::finch_ipc_capnp::finch_daemon::RegisterBrainRunnerParams,
@@ -5758,9 +5857,7 @@ mod tests {
             self.counts
                 .register
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            capnp::capability::Promise::err(capnp::Error::failed(
-                "restore counter deliberately rejects callback registration".into(),
-            ))
+            capnp::capability::Promise::err(capnp::Error::failed(self.registration_error.into()))
         }
     }
 
@@ -5768,6 +5865,7 @@ mod tests {
         stream: tokio::net::UnixStream,
         counts: std::sync::Arc<RunnerRestoreRpcCounts>,
         store: crate::brain::store::BrainStore,
+        registration_error: &'static str,
     ) -> tokio::task::JoinHandle<()> {
         use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
         let (reader, writer) = stream.into_split();
@@ -5778,7 +5876,11 @@ mod tests {
             Default::default(),
         );
         let daemon: super::finch_ipc_capnp::finch_daemon::Client =
-            capnp_rpc::new_client(CountingRunnerRestoreDaemon { counts, store });
+            capnp_rpc::new_client(CountingRunnerRestoreDaemon {
+                counts,
+                store,
+                registration_error,
+            });
         tokio::task::spawn_local(async move {
             let _ = capnp_rpc::RpcSystem::new(Box::new(network), Some(daemon.client)).await;
         })
@@ -5806,6 +5908,142 @@ mod tests {
         )
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_generic_brain_service_cannot_bypass_peer_bound_runner_lifecycle() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let original_lease = store.snapshot("shared").unwrap().runner_lease;
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store.clone(),
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([58; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let connection_id = uuid::Uuid::new_v4();
+                server
+                    .brain_runners()
+                    .open_connection_dispatch(connection_id);
+                let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                    FinchDaemonImpl::new(std::sync::Arc::clone(&server), connection_id),
+                );
+                let reply = daemon.brain_service_request().send().promise.await.unwrap();
+                let service = reply.get().unwrap().get_service().unwrap();
+
+                // Ordinary reads remain available on the generic capability.
+                let mut snapshot = service.snapshot_request();
+                snapshot.get().set_brain("shared");
+                snapshot.send().promise.await.unwrap();
+
+                let mut claim = service.claim_runner_identity_request();
+                claim.get().set_subject("runner@box.local/raw-bypass");
+                let error = claim
+                    .send()
+                    .promise
+                    .await
+                    .err()
+                    .expect("generic runner identity claim must be rejected");
+                assert!(error
+                    .to_string()
+                    .contains("peer-identity-bound runnerBrainService"));
+                let error = service
+                    .acquire_runner_request()
+                    .send()
+                    .promise
+                    .await
+                    .err()
+                    .expect("generic runner lease acquisition must be rejected");
+                assert!(error
+                    .to_string()
+                    .contains("peer-identity-bound runnerBrainService"));
+                let error = service
+                    .release_runner_request()
+                    .send()
+                    .promise
+                    .await
+                    .err()
+                    .expect("generic runner lease release must be rejected");
+                assert!(error
+                    .to_string()
+                    .contains("peer-identity-bound runnerBrainService"));
+                assert_eq!(
+                    store.snapshot("shared").unwrap().runner_lease,
+                    original_lease
+                );
+                assert_eq!(
+                    server.brain_runners().runner_lifecycle_counts_for_test(),
+                    [0; 5]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_startup_registration_quarantine_stays_typed_and_starts_no_renewal() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let mut event_loop = runner_restore_event_loop(temp.path());
+                let runner_subject = event_loop.runner_subject_for_test().to_string();
+                let machine = hostname::get().unwrap().into_string().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    machine,
+                    Some(temp.path().join("brains")),
+                );
+                store
+                    .acquire_runner_lease("shared", &runner_subject, 1, None, 300_000)
+                    .unwrap();
+                let original_lease = store.snapshot("shared").unwrap().runner_lease;
+                let counts = std::sync::Arc::new(RunnerRestoreRpcCounts::default());
+                let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+                let server = spawn_counting_runner_restore_daemon(
+                    server_stream,
+                    std::sync::Arc::clone(&counts),
+                    store.clone(),
+                    crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE,
+                );
+                let client =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(client_stream)
+                        .await
+                        .unwrap();
+                counts.reset();
+                event_loop.set_ipc_client_for_test(client.clone());
+
+                let error = event_loop.register_home_brain_for_test().await.unwrap_err();
+                assert!(
+                    crate::ipc::is_runner_process_quarantined(&error),
+                    "startup did not preserve the typed quarantine: {error:#}"
+                );
+                assert!(client.test_runner_process_poisoned());
+                assert_eq!(event_loop.runner_renewal_epoch_for_test(), 0);
+                assert_eq!(counts.claim.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(counts.snapshot.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(
+                    counts
+                        .acquire_or_renew
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                assert_eq!(counts.register.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(counts.release.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(
+                    store.snapshot("shared").unwrap().runner_lease,
+                    original_lease
+                );
+                assert!(event_loop.next_queued_event_for_test().await.is_none());
+                server.abort();
+                let _ = server.await;
+            })
+            .await;
+    }
+
     #[test]
     fn test_lost_eject_and_failed_promotion_reject_same_live_child_after_server_restart() {
         const CHILD_SOCKET: &str = "FINCH_TEST_RUNNER_LEDGER_CHILD_SOCKET";
@@ -5822,10 +6060,23 @@ mod tests {
                     crate::ipc::IpcClient::from_stream_with_fresh_test_process(first_stream)
                         .await
                         .unwrap();
+                let snapshot = first.brain_snapshot("shared").await.unwrap();
+                first.brain_claim_runner_identity("runner").await.unwrap();
                 let runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(SuccessfulCancelRunner);
                 let lease_id =
                     crate::brain::store::RunnerLeaseId(uuid::Uuid::parse_str(&lease).unwrap());
+                let renewed = first
+                    .brain_acquire_runner(
+                        "shared",
+                        "runner",
+                        &snapshot.environment,
+                        Some(lease_id),
+                        300_000,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(renewed.lease_id, lease_id);
                 first
                     .register_test_brain_runner_client("shared", lease_id, runner)
                     .await
@@ -5842,23 +6093,64 @@ mod tests {
                 .expect("child did not observe first daemon transport loss");
                 drop(first);
 
+                // A fresh local process scope models a lost ejectProcess:
+                // only the restarted daemon's disk ledger knows this still-
+                // live OS process is terminal.
                 let second_stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
                 let second =
                     crate::ipc::IpcClient::from_stream_with_fresh_test_process(second_stream)
                         .await
                         .unwrap();
+                let temp = tempfile::tempdir().unwrap();
+                let mut restore_loop = runner_restore_event_loop(temp.path());
+                restore_loop.set_ipc_client_for_test(second.clone());
+                restore_loop
+                    .handle_named_brain_event_for_test(runner_reconnect_event(
+                        snapshot.environment.clone(),
+                        lease_id,
+                    ))
+                    .await
+                    .unwrap();
+                assert!(second.test_runner_process_poisoned());
+                assert!(restore_loop.next_queued_event_for_test().await.is_none());
+                drop(restore_loop);
+                drop(second);
+
+                let startup_stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let startup =
+                    crate::ipc::IpcClient::from_stream_with_fresh_test_process(startup_stream)
+                        .await
+                        .unwrap();
+                let mut startup_loop = runner_restore_event_loop(temp.path());
+                startup_loop.set_ipc_client_for_test(startup.clone());
+                let error = startup_loop
+                    .register_home_brain_for_test()
+                    .await
+                    .unwrap_err();
+                assert!(crate::ipc::is_runner_process_quarantined(&error));
+                assert!(startup.test_runner_process_poisoned());
+                assert!(startup_loop.next_queued_event_for_test().await.is_none());
+                drop(startup_loop);
+                drop(startup);
+
+                // No manual identity or lease claim precedes this raw direct
+                // registration. Peer-ledger rejection must win before those
+                // checks or any snapshot/checkpoint read.
+                let raw_stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let raw = crate::ipc::IpcClient::from_stream_with_fresh_test_process(raw_stream)
+                    .await
+                    .unwrap();
                 let runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(SuccessfulCancelRunner);
-                let error = second
+                let error = raw
                     .register_test_brain_runner_client("shared", lease_id, runner)
                     .await
                     .unwrap_err();
                 assert!(
-                    error
-                        .to_string()
-                        .contains(crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE),
-                    "restart admitted an unresolved same-process runner: {error}"
+                    crate::ipc::is_runner_process_quarantined(&error),
+                    "restart did not preserve the typed quarantine: {error:#}"
                 );
+                assert!(raw.test_runner_process_poisoned());
             }));
             return;
         }
@@ -5876,8 +6168,9 @@ mod tests {
             let socket = temp.path().join("runner-ledger.sock");
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
             let brain_root = temp.path().join("brains");
+            let machine = hostname::get().unwrap().into_string().unwrap();
             let store = crate::brain::store::BrainStore::with_root(
-                "box.local",
+                machine,
                 Some(brain_root.clone()),
             );
             let lease = store
@@ -5909,10 +6202,6 @@ mod tests {
             .expect("child did not connect to first server")
             .unwrap();
             let first_connection = uuid::Uuid::new_v4();
-            server
-                .brain_runners()
-                .claim_connection_lease(first_connection, "shared", lease.lease_id)
-                .unwrap();
             let first_server = std::sync::Arc::clone(&server);
             let first_handler = tokio::task::spawn_local(async move {
                 super::handle_connection_with_id(first_stream, first_server, first_connection).await
@@ -5927,6 +6216,11 @@ mod tests {
             })
             .await
             .expect("child registration was not acknowledged");
+            let invariant_lease = server
+                .brain_store()
+                .snapshot("shared")
+                .unwrap()
+                .runner_lease;
             server
                 .brain_runners()
                 .fail_next_quarantine_promotion_for_test();
@@ -5957,7 +6251,7 @@ mod tests {
             let restarted = std::sync::Arc::new(
                 crate::server::AgentServer::for_brain_protocol_test(
                     crate::brain::store::BrainStore::with_root(
-                        "box.local",
+                        hostname::get().unwrap().into_string().unwrap(),
                         Some(brain_root),
                     ),
                     crate::brain::credential::BrainCredentialAuthority::ephemeral([86; 32]),
@@ -5965,6 +6259,16 @@ mod tests {
                     temp.path(),
                 )
                 .unwrap(),
+            );
+            let restart_invariant_lease = restarted
+                .brain_store()
+                .snapshot("shared")
+                .unwrap()
+                .runner_lease;
+            assert_eq!(
+                restart_invariant_lease.as_ref().map(|lease| lease.lease_id),
+                invariant_lease.as_ref().map(|lease| lease.lease_id),
+                "disk restart lost the durable runner lease identity"
             );
             let (second_stream, _) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -5974,23 +6278,77 @@ mod tests {
             .expect("same live child did not reconnect to restarted server")
             .unwrap();
             let second_connection = uuid::Uuid::new_v4();
-            restarted
-                .brain_runners()
-                .claim_connection_lease(second_connection, "shared", lease.lease_id)
-                .unwrap();
             let second_server = std::sync::Arc::clone(&restarted);
             let second_handler = tokio::task::spawn_local(async move {
                 super::handle_connection_with_id(second_stream, second_server, second_connection)
                     .await
+            });
+
+            let (startup_stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("same live child did not connect for startup recovery")
+            .unwrap();
+            let startup_server = std::sync::Arc::clone(&restarted);
+            let startup_handler = tokio::task::spawn_local(async move {
+                super::handle_connection_with_id(
+                    startup_stream,
+                    startup_server,
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+            });
+
+            let (raw_stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                listener.accept(),
+            )
+            .await
+            .expect("same live child did not connect for raw registration")
+            .unwrap();
+            let raw_server = std::sync::Arc::clone(&restarted);
+            let raw_handler = tokio::task::spawn_local(async move {
+                super::handle_connection_with_id(raw_stream, raw_server, uuid::Uuid::new_v4()).await
             });
             let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
                 .await
                 .expect("same-process restart child did not exit")
                 .unwrap();
             assert!(status.success());
+            assert_eq!(
+                restarted
+                    .brain_runners()
+                    .runner_lifecycle_counts_for_test(),
+                [0; 5],
+                "restart recovery crossed a runner lifecycle boundary before durable peer rejection"
+            );
+            assert_eq!(
+                restarted
+                    .brain_store()
+                    .snapshot("shared")
+                    .unwrap()
+                    .runner_lease,
+                restart_invariant_lease,
+                "rejected startup/restore/direct attempts mutated the restarted durable lease"
+            );
+            assert!(!restarted
+                .brain_runners()
+                .has_registration("shared", lease.lease_id));
             tokio::time::timeout(std::time::Duration::from_secs(2), second_handler)
                 .await
                 .expect("rejected child connection did not retire")
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), startup_handler)
+                .await
+                .expect("startup-rejected child connection did not retire")
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), raw_handler)
+                .await
+                .expect("raw-rejected child connection did not retire")
                 .unwrap()
                 .unwrap();
         }));
@@ -6010,6 +6368,7 @@ mod tests {
             first_server_stream,
             std::sync::Arc::clone(&counts),
             store.clone(),
+            "restore counter deliberately rejects callback registration",
         );
         let first = crate::ipc::IpcClient::from_stream_with_fresh_test_process(first_client_stream)
             .await
@@ -6020,6 +6379,7 @@ mod tests {
             replacement_server_stream,
             std::sync::Arc::clone(&counts),
             store,
+            "restore counter deliberately rejects callback registration",
         );
         let replacement = first
             .reconnect_test_process(replacement_client_stream)
@@ -7865,6 +8225,7 @@ mod tests {
                     lifecycle: self.lifecycle.clone(),
                     runners: self.runners.clone(),
                     connection_id: self.connection_id,
+                    runner_process_identity: None,
                 });
             results.get().set_service(service);
             capnp::capability::Promise::ok(())
@@ -7975,6 +8336,7 @@ mod tests {
             lifecycle: lifecycle.clone(),
             runners: runners.clone(),
             connection_id: first_connection,
+            runner_process_identity: None,
         };
         let lease = first
             .acquire_connection_runner("shared", subject, &environment, None, 60_000)
@@ -7992,6 +8354,7 @@ mod tests {
             lifecycle,
             runners: runners.clone(),
             connection_id: replacement_connection,
+            runner_process_identity: None,
         };
         let renewed = replacement
             .acquire_connection_runner(

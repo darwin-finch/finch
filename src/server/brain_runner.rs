@@ -1067,6 +1067,18 @@ pub struct BrainRunnerBroker {
             )>,
         >,
     >,
+    #[cfg(test)]
+    runner_lifecycle_test_counts: Arc<RunnerLifecycleTestCounts>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RunnerLifecycleTestCounts {
+    claim: AtomicUsize,
+    snapshot: AtomicUsize,
+    acquire_or_renew: AtomicUsize,
+    release: AtomicUsize,
+    register: AtomicUsize,
 }
 
 impl Default for BrainRunnerBroker {
@@ -1349,7 +1361,65 @@ impl BrainRunnerBroker {
             fence_install_pause: Arc::default(),
             #[cfg(test)]
             teardown_retry_pause: Arc::default(),
+            #[cfg(test)]
+            runner_lifecycle_test_counts: Arc::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_runner_claim_for_test(&self) {
+        self.runner_lifecycle_test_counts
+            .claim
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_runner_snapshot_for_test(&self) {
+        self.runner_lifecycle_test_counts
+            .snapshot
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_runner_acquire_for_test(&self) {
+        self.runner_lifecycle_test_counts
+            .acquire_or_renew
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_runner_release_for_test(&self) {
+        self.runner_lifecycle_test_counts
+            .release
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_runner_register_for_test(&self) {
+        self.runner_lifecycle_test_counts
+            .register
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runner_lifecycle_counts_for_test(&self) -> [usize; 5] {
+        [
+            self.runner_lifecycle_test_counts
+                .claim
+                .load(Ordering::SeqCst),
+            self.runner_lifecycle_test_counts
+                .snapshot
+                .load(Ordering::SeqCst),
+            self.runner_lifecycle_test_counts
+                .acquire_or_renew
+                .load(Ordering::SeqCst),
+            self.runner_lifecycle_test_counts
+                .release
+                .load(Ordering::SeqCst),
+            self.runner_lifecycle_test_counts
+                .register
+                .load(Ordering::SeqCst),
+        ]
     }
 
     fn track_inflight(
@@ -1873,6 +1943,43 @@ impl BrainRunnerBroker {
         }
     }
 
+    /// Reject a kernel-derived peer identity before it can read runner
+    /// recovery state or mutate runner lifecycle authority. This is the
+    /// restart-safe counterpart to the frontend's process-local poison bit:
+    /// loaded durable uncertainty remains authoritative when ejectProcess was
+    /// lost with the old daemon transport.
+    pub(crate) fn ensure_runner_process_admitted(
+        &self,
+        process_identity: RunnerProcessIdentity,
+    ) -> Result<()> {
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        Self::ensure_runner_process_admitted_locked(&authority, process_identity)
+    }
+
+    fn ensure_runner_process_admitted_locked(
+        authority: &ConnectionAuthority,
+        process_identity: RunnerProcessIdentity,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !authority
+                .quarantined_runner_processes
+                .contains(&process_identity),
+            "{}: runner process identity was quarantined after forced callback ejection",
+            crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE
+        );
+        anyhow::ensure!(
+            !authority
+                .uncertain_runner_processes
+                .contains(&process_identity),
+            "{}: runner process identity has an unresolved durable runner-bearing marker from a prior daemon instance",
+            crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE
+        );
+        Ok(())
+    }
+
     pub(crate) fn require_connection_identity(
         &self,
         connection_id: uuid::Uuid,
@@ -2074,20 +2181,7 @@ impl BrainRunnerBroker {
             authority.leases.get(&(brain.clone(), lease_id)) == Some(&connection_id),
             "runner lease is not owned by this IPC connection"
         );
-        anyhow::ensure!(
-            !authority
-                .quarantined_runner_processes
-                .contains(&process_identity),
-            "{}: runner process identity was quarantined after forced callback ejection",
-            crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE
-        );
-        anyhow::ensure!(
-            !authority
-                .uncertain_runner_processes
-                .contains(&process_identity),
-            "{}: runner process identity has an unresolved durable runner-bearing marker from a prior daemon instance",
-            crate::ipc::RUNNER_PROCESS_QUARANTINED_CODE
-        );
+        Self::ensure_runner_process_admitted_locked(&authority, process_identity)?;
         anyhow::ensure!(
             authority
                 .runner_process_owners

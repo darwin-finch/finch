@@ -32,6 +32,6 @@ pub use transport::DAEMON_SOCK_PATH;
 /// Increment this whenever a change requires both processes to come from the
 /// same build generation. Older daemons leave the added ping field at zero,
 /// so new frontends fail before acquiring Brain identities or callbacks.
-pub const IPC_PROTOCOL_VERSION: u32 = 12;
+pub const IPC_PROTOCOL_VERSION: u32 = 13;
 
 pub(crate) const RUNNER_PROCESS_QUARANTINED_CODE: &str = "FINCH_RUNNER_PROCESS_QUARANTINED";

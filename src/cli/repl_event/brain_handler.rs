@@ -205,7 +205,7 @@ impl EventLoop {
             .context("claim this frontend's runner identity")?;
         let snapshot = ipc.brain_runner_snapshot(&self.session_label).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
-        let initial = ipc
+        let initial = match ipc
             .brain_acquire_runner(
                 &self.session_label,
                 &self.runner_subject,
@@ -213,7 +213,13 @@ impl EventLoop {
                 None,
                 30_000,
             )
-            .await;
+            .await
+        {
+            Err(error) if crate::ipc::is_runner_process_quarantined(&error) => {
+                return Err(error);
+            }
+            result => result,
+        };
         let initial_registration = match (&initial, self.ipc_client.as_ref()) {
             (Ok(lease), Some(ipc)) => match ipc
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
@@ -229,6 +235,13 @@ impl EventLoop {
                         Err(error.to_string())
                     }
                 },
+                Err(error) if crate::ipc::is_runner_process_quarantined(&error) => {
+                    // The server's durable PID/start ledger is authoritative.
+                    // Preserve this typed terminal result and the durable
+                    // lease; starting renewal here would recreate the exact
+                    // post-quarantine claim/snapshot/acquire churn.
+                    return Err(error);
+                }
                 Err(error) => Err(error.to_string()),
             },
             (Ok(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),

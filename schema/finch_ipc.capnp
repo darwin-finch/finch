@@ -1609,4 +1609,9 @@ interface FinchDaemon {
   # capability allows later protocol evolution without adding every Brain
   # operation directly to FinchDaemon.
   brainService @5 () -> (service :BrainService);
+
+  # Return a runner-only lifecycle capability bound to the kernel-derived
+  # PID/start identity of this Unix peer. Creation and each runner operation
+  # fail closed while that identity is quarantined or durably uncertain.
+  runnerBrainService @6 () -> (service :BrainService);
 }

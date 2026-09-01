@@ -2226,6 +2226,17 @@ impl EventLoop {
     }
 
     #[cfg(test)]
+    pub(crate) async fn register_home_brain_for_test(&self) -> Result<()> {
+        self.register_home_brain().await.map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runner_renewal_epoch_for_test(&self) -> u64 {
+        self.runner_renewal_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn next_queued_event_for_test(&mut self) -> Option<ReplEvent> {
         tokio::time::timeout(std::time::Duration::from_millis(150), self.event_rx.recv())
             .await
