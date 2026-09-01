@@ -1180,7 +1180,15 @@ pub const RUNNER_UNAVAILABLE_PREFIX: &str = "runner-unavailable: ";
 ///
 /// `Unavailable` is either constructed by the broker from its own view of the
 /// registration and the channel, or declared by the runner with
-/// `RUNNER_UNAVAILABLE_PREFIX`. `Rejected` is a reply about this turn alone.
+/// `RUNNER_UNAVAILABLE_PREFIX`.
+///
+/// `Rejected` is everything else. That is *usually* a decision about one turn —
+/// the content-conflict rejection a re-projected identity produces — but not
+/// always: a store-level failure inside `insert_brain_conversation` (disk full,
+/// database locked, embedding failure) is systemic and still arrives here
+/// unprefixed, so a replay pass will walk every run paying a round trip each.
+/// Narrowing that means classifying `MemorySystem`'s errors, which is separate
+/// work; do not read this variant as a guarantee that the failure is per-turn.
 #[derive(Debug)]
 pub enum RunnerProjectionError {
     /// The runner is absent, stale, or gone. Every later projection in the

@@ -947,6 +947,12 @@ interface BrainRunner {
   runProgram @0 (request :BrainProgramRequest) -> (result :BrainProgramResult);
   runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
   cancelRun  @2 (brain :Text, runId :Text) -> (cancelled :Bool, error :Text);
+  # `error` reserves one prefix: a message beginning with "runner-unavailable: "
+  # declares a condition that will repeat for every later run in the same
+  # replay pass — memory disabled on the runner, the lease not held, the
+  # transport broken — rather than a decision about this one turn. The daemon
+  # aborts the pass on it instead of walking the remaining runs. Any other
+  # message is per-turn. See RUNNER_UNAVAILABLE_PREFIX in src/server/brain_runner.rs.
   projectMemory @3 (request :BrainMemoryProjectionRequest) -> (inserted :UInt32, error :Text);
 }
 

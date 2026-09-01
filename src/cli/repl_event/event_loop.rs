@@ -5301,28 +5301,53 @@ Rules:\n\
         let _ = request.response_tx.send(Ok(true));
     }
 
+    /// Whether this runner can project ANY memory right now.
+    ///
+    /// Both conditions are systemic, not about one turn: a replay pass walks
+    /// every completed run in the Brain and each of them fails identically, so
+    /// each error carries `RUNNER_UNAVAILABLE_PREFIX` and the pass aborts at the
+    /// first rather than paying an IPC round trip and a log line per run under
+    /// the Brain's execution lock.
+    ///
+    /// Split out from `project_named_brain_memory` so the prefix is testable:
+    /// constructing a whole `EventLoop` is impractical, and a test that supplies
+    /// the prefix as its own literal pins the consumer while leaving the
+    /// producer free to stop emitting it.
+    fn runner_can_project_memory(
+        runner_brain: Option<&str>,
+        lease_active: bool,
+        memory_enabled: bool,
+        brain: &str,
+    ) -> anyhow::Result<()> {
+        if runner_brain != Some(brain) || !lease_active {
+            anyhow::bail!(
+                "{}frontend does not hold the runner lease for named Brain '{brain}'",
+                crate::server::RUNNER_UNAVAILABLE_PREFIX
+            );
+        }
+        anyhow::ensure!(
+            memory_enabled,
+            "{}memory is disabled on the environment runner",
+            crate::server::RUNNER_UNAVAILABLE_PREFIX
+        );
+        Ok(())
+    }
+
     async fn project_named_brain_memory(
         &self,
         request: crate::server::RunnerMemoryProjectionRequest,
     ) {
         let result = async {
-            if self.runner_brain.as_deref() != Some(request.brain.as_str())
-                || !self.home_runner_lease_active
-            {
-                // Systemic, not about this turn: every later run in the same
-                // replay fails identically, so say so with the shared prefix.
-                anyhow::bail!(
-                    "{}frontend does not hold the runner lease for named Brain '{}'",
-                    crate::server::RUNNER_UNAVAILABLE_PREFIX,
-                    request.brain
-                );
-            }
-            let memory = self.memory_system.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{}memory is disabled on the environment runner",
-                    crate::server::RUNNER_UNAVAILABLE_PREFIX
-                )
-            })?;
+            Self::runner_can_project_memory(
+                self.runner_brain.as_deref(),
+                self.home_runner_lease_active,
+                self.memory_system.is_some(),
+                &request.brain,
+            )?;
+            let memory = self
+                .memory_system
+                .as_ref()
+                .expect("checked by runner_can_project_memory");
             let provenance = crate::memory::BrainConversationProvenance {
                 brain_id: request.brain_id.0.to_string(),
                 run_id: request.run_id.0.to_string(),
@@ -8781,6 +8806,69 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    /// Every systemic condition the runner can report must reach the broker as
+    /// `Unavailable`, not as a per-turn rejection.
+    ///
+    /// The round trip, not a literal: the errors come from the production guard
+    /// and are classified by the production `try_project_memory` path, so
+    /// dropping the prefix from either half fails here. #254.
+    #[test]
+    fn runner_declines_to_project_memory_with_the_systemic_prefix() {
+        use crate::server::RUNNER_UNAVAILABLE_PREFIX;
+
+        let cases = [
+            // No lease on this Brain.
+            (Some("other"), true, true, "does not hold the runner lease"),
+            // Lease lapsed.
+            (
+                Some("shared"),
+                false,
+                true,
+                "does not hold the runner lease",
+            ),
+            // Memory disabled — an ordinary supported configuration.
+            (
+                Some("shared"),
+                true,
+                false,
+                "memory is disabled on the environment runner",
+            ),
+        ];
+
+        for (runner_brain, lease_active, memory_enabled, expected) in cases {
+            let error = super::EventLoop::runner_can_project_memory(
+                runner_brain,
+                lease_active,
+                memory_enabled,
+                "shared",
+            )
+            .expect_err("this configuration cannot project memory");
+            let message = error.to_string();
+            assert!(
+                message.starts_with(RUNNER_UNAVAILABLE_PREFIX),
+                "a systemic condition must declare itself so replay aborts \
+                 instead of retrying every run; got {message:?}"
+            );
+            assert!(
+                message.contains(expected),
+                "the reason must survive the prefix; got {message:?}"
+            );
+            // The broker strips exactly this prefix to build `Unavailable`, so
+            // what remains has to be a usable reason rather than an empty
+            // string.
+            assert!(
+                message
+                    .strip_prefix(RUNNER_UNAVAILABLE_PREFIX)
+                    .is_some_and(|reason| !reason.trim().is_empty()),
+                "stripping the prefix must leave the reason; got {message:?}"
+            );
+        }
+
+        // The healthy configuration must not be declined.
+        super::EventLoop::runner_can_project_memory(Some("shared"), true, true, "shared")
+            .expect("a leased runner with memory enabled must project");
+    }
+
     fn admitting_llm_channel() -> (
         tokio::sync::mpsc::UnboundedSender<super::LlmRequest>,
         tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
