@@ -1948,7 +1948,7 @@ impl EventLoop {
                 .unwrap_or(false);
 
                 if ok {
-                    crate::cli::tui::emergency_restore_terminal();
+                    crate::cli::tui::restore_terminal_before_termination();
                     std::process::exit(0);
                 }
             }
@@ -5508,7 +5508,8 @@ Rules:\n\
             &brain,
         );
         crate::set_tui_active(false);
-        crate::cli::tui::emergency_restore_terminal();
+        crate::cli::tui::emergency_restore_terminal_result()
+            .context("restore terminal before frontend replacement")?;
 
         let mut command = std::process::Command::new(&restart.binary_path);
         command.args(args);
@@ -5540,6 +5541,7 @@ Rules:\n\
                     restart.binary_path.display()
                 )
             })?;
+            crate::cli::tui::restore_terminal_before_termination();
             std::process::exit(0);
         }
     }

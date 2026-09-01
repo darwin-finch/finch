@@ -430,6 +430,8 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             | "handler-reuse"
             | "handler-replacement-signal"
             | "signal-paused-cleanup"
+            | "signal-transition-recovery"
+            | "signal-disarm-recovery"
     );
     let mut signals = if needs_binary_owner {
         finch::cli::tui::BinaryTerminalSession::install()?
@@ -572,6 +574,58 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 Ok(())
             }
         }
+        "signal-transition-recovery" => {
+            finch::cli::tui::supervised_set_signal_transition_stall(true)?;
+            anyhow::ensure!(
+                renderer.shutdown().is_err(),
+                "stalled signal transition falsely completed cleanup"
+            );
+            drop(renderer);
+            let started = Instant::now();
+            drop(signals.take());
+            anyhow::ensure!(
+                // One bounded call may first wait for the abandoned cleanup
+                // owner and then time out acquiring the signal transition.
+                started.elapsed() < Duration::from_millis(400),
+                "signal owner Drop blocked on stalled transition"
+            );
+            anyhow::ensure!(
+                finch::cli::tui::BinaryTerminalSession::install().is_err(),
+                "Drop released signal ownership before restoring dispositions"
+            );
+            finch::cli::tui::supervised_set_signal_transition_stall(false)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let replacement = loop {
+                match finch::cli::tui::BinaryTerminalSession::install() {
+                    Ok(Some(owner)) => break owner,
+                    _ if Instant::now() < deadline => std::thread::yield_now(),
+                    _ => anyhow::bail!("signal owner did not recover before deadline"),
+                }
+            };
+            drop(replacement);
+            marker(b"FINCH_SIGNAL_TRANSITION_RECOVERED")?;
+            Ok(())
+        }
+        "signal-disarm-recovery" => {
+            finch::cli::tui::supervised_fail_next_signal_disarm()?;
+            anyhow::ensure!(
+                renderer.shutdown().is_err(),
+                "injected sigaction restore failure falsely completed cleanup"
+            );
+            drop(renderer);
+            drop(signals.take());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let replacement = loop {
+                match finch::cli::tui::BinaryTerminalSession::install() {
+                    Ok(Some(owner)) => break owner,
+                    _ if Instant::now() < deadline => std::thread::yield_now(),
+                    _ => anyhow::bail!("signal owner did not recover after sigaction failure"),
+                }
+            };
+            drop(replacement);
+            marker(b"FINCH_SIGNAL_DISARM_RECOVERED")?;
+            Ok(())
+        }
         "sequential" => {
             renderer.shutdown()?;
             let mut changed = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
@@ -641,11 +695,9 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
             }
         }
         "handler-reuse" | "handler-replacement-signal" => {
-            let replacement_signal = mode == "handler-replacement-signal";
-            // This pause is immediately after the production handler's single
-            // atomic owner+generation load. At the old split-load tip, cleanup
-            // below cleared the session before the second load and silently
-            // lost this already-delivered signal.
+            // This pause is the production handler's first operation, before
+            // dispatch capture. The old single-handler action could be
+            // disarmed/rearmed here and load zero or the replacement token.
             finch::cli::tui::supervised_set_terminal_signal_handler_pause(true)?;
             let observed_errno = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
             let observed_errno_clone = std::sync::Arc::clone(&observed_errno);
@@ -662,22 +714,16 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 anyhow::ensure!(Instant::now() < deadline, "signal handler did not pause");
                 std::thread::yield_now();
             }
-            renderer.shutdown()?;
+            anyhow::ensure!(
+                renderer.shutdown().is_err(),
+                "cleanup falsely completed while an entered handler was paused"
+            );
             drop(renderer);
             drop(signals.take());
-
-            let second_signals = finch::cli::tui::BinaryTerminalSession::install()?
-                .ok_or_else(|| anyhow::anyhow!("replacement binary signal owner missing"))?;
-            if replacement_signal {
-                second_signals.supervised_pause_signal_listener()?;
-            }
-            let mut second = new_renderer()?;
-            if replacement_signal {
-                // Publish the replacement generation's SIGTERM while the old
-                // handler still holds its captured token. At the previous tip,
-                // resuming the old handler overwrote this pending signal.
-                unsafe { nix::libc::raise(nix::libc::SIGTERM) };
-            }
+            anyhow::ensure!(
+                finch::cli::tui::BinaryTerminalSession::install().is_err(),
+                "signal owner became reusable before entered handler completed"
+            );
             finch::cli::tui::supervised_set_terminal_signal_handler_pause(false)?;
             handler_thread
                 .join()
@@ -686,19 +732,9 @@ fn tui_terminal_session_child() -> anyhow::Result<()> {
                 observed_errno.load(Ordering::Acquire) == nix::libc::EDOM,
                 "terminal signal handler changed the interrupted thread's errno"
             );
-            for _ in 0..10_000 {
-                std::thread::yield_now();
+            loop {
+                std::thread::park();
             }
-            if replacement_signal {
-                second_signals.supervised_resume_signal_listener()?;
-                loop {
-                    std::thread::park();
-                }
-            }
-            second.shutdown()?;
-            drop(second_signals);
-            marker(b"FINCH_HANDLER_REUSE_SAFE")?;
-            Ok(())
         }
         "writer-after-reset" => {
             finch::cli::tui::supervised_set_terminal_writer_pause(true)?;
@@ -1074,37 +1110,42 @@ fn test_finch_main_panic_hook_restores_terminal_protocols() {
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    let (mut master, slave) = open_owned_pty();
-    let original = terminal_modes(&slave);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
-        .arg("--cloud-only")
-        .env(
-            "ANTHROPIC_API_KEY",
-            "sk-ant-finch-terminal-regression-placeholder",
-        )
-        .env("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE", "1")
-        .stdin(Stdio::from(slave.try_clone().unwrap()))
-        .stdout(Stdio::from(slave.try_clone().unwrap()))
-        .stderr(Stdio::from(slave.try_clone().unwrap()))
-        .spawn()
-        .expect("spawn Finch main panic-hook probe");
-    let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
-    let mut transcript = Vec::new();
-    drain_pty(
-        &mut master,
-        &mut transcript,
-        Instant::now() + Duration::from_millis(100),
-    );
-    assert!(
-        !status.success(),
-        "supervised main panic unexpectedly succeeded"
-    );
-    assert_eq!(terminal_modes(&slave), original);
-    assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
-    assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
-    assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
-    assert!(String::from_utf8_lossy(&transcript)
-        .contains("supervised panic after Finch terminal activation"));
+    for gate_held in [false, true] {
+        let (mut master, slave) = open_owned_pty();
+        let original = terminal_modes(&slave);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+        command
+            .arg("--cloud-only")
+            .env(
+                "ANTHROPIC_API_KEY",
+                "sk-ant-finch-terminal-regression-placeholder",
+            )
+            .env("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE", "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave.try_clone().unwrap()));
+        if gate_held {
+            command.env("FINCH_TEST_TUI_MAIN_PANIC_GATE_HELD", "1");
+        }
+        let mut child = command.spawn().expect("spawn Finch main panic-hook probe");
+        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(20));
+        let mut transcript = Vec::new();
+        drain_pty(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_millis(100),
+        );
+        assert!(
+            !status.success(),
+            "supervised main panic unexpectedly succeeded"
+        );
+        assert_eq!(terminal_modes(&slave), original);
+        assert_eq!(count_bytes(&transcript, b"\x1b[?2004l"), 1);
+        assert_eq!(count_bytes(&transcript, b"\x1b[?1000l"), 1);
+        assert_eq!(count_bytes(&transcript, b"\x1b[<1u"), 1);
+        assert!(String::from_utf8_lossy(&transcript)
+            .contains("supervised panic after Finch terminal activation"));
+    }
 }
 
 #[cfg(unix)]
@@ -1149,9 +1190,22 @@ fn test_terminal_descriptors_are_cloexec_and_sessions_repeat_without_overlap() {
         "sequential",
         "repeated",
         "overlapping-cleanup",
+        "signal-transition-recovery",
+        "signal-disarm-recovery",
     ] {
-        let (mut child, _master, slave, original) = spawn_terminal_child(mode);
-        assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(5)).success());
+        let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
+        let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(5));
+        let mut transcript = Vec::new();
+        drain_pty(
+            &mut master,
+            &mut transcript,
+            Instant::now() + Duration::from_millis(100),
+        );
+        assert!(
+            status.success(),
+            "{mode} failed: {status}: {}",
+            String::from_utf8_lossy(&transcript)
+        );
         assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
     }
 }
@@ -1209,40 +1263,35 @@ fn test_terminal_cleanup_is_bounded_under_unread_backpressure() {
 
 #[cfg(unix)]
 #[test]
-fn test_atomic_signal_owner_drop_is_bounded_and_snapshot_is_replacement_safe() {
+fn test_atomic_signal_owner_drop_is_bounded() {
     let _serial = terminal_pty_test_lock();
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    for mode in ["signal-stop-full", "handler-reuse"] {
-        let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
-        let marker = if mode == "signal-stop-full" {
-            b"FINCH_SIGNAL_STOP_BOUNDED".as_slice()
-        } else {
-            b"FINCH_HANDLER_REUSE_SAFE".as_slice()
-        };
-        let mut transcript = Vec::new();
-        assert!(read_until(
-            &mut master,
-            &mut transcript,
-            Instant::now() + Duration::from_secs(5),
-            marker,
-        ));
-        assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(2)).success());
-        assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
-    }
+    let mode = "signal-stop-full";
+    let (mut child, mut master, slave, original) = spawn_terminal_child(mode);
+    let marker = b"FINCH_SIGNAL_STOP_BOUNDED".as_slice();
+    let mut transcript = Vec::new();
+    assert!(read_until(
+        &mut master,
+        &mut transcript,
+        Instant::now() + Duration::from_secs(5),
+        marker,
+    ));
+    assert!(wait_for_child(&mut child, Instant::now() + Duration::from_secs(2)).success());
+    assert_eq!(terminal_modes(&slave), original, "{mode} termios mismatch");
 }
 
 #[cfg(unix)]
 #[test]
-fn test_paused_old_handler_cannot_overwrite_replacement_generation_signal() {
+fn test_entered_handler_retains_identity_until_signal_cleanup_exits() {
     let _serial = terminal_pty_test_lock();
     if !supervised_pty_authority_or_skip() {
         return;
     }
-    // Before pending publication revalidated the complete dispatch token, the
-    // resumed old handler overwrote the replacement generation's SIGTERM. The
-    // replacement listener discarded that stale token and the process hung.
+    // At the reviewed tip a handler paused before its global dispatch load
+    // could observe zero or a replacement generation. The entry-stable slot
+    // keeps ownership fail-closed until this exact SIGTERM is restored/exited.
     let (mut child, mut master, slave, original) =
         spawn_terminal_child("handler-replacement-signal");
     let status = wait_for_child(&mut child, Instant::now() + Duration::from_secs(3));

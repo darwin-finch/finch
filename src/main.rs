@@ -1138,6 +1138,24 @@ async fn main() -> Result<()> {
     if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE").is_some()
         && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
     {
+        if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_GATE_HELD").is_some() {
+            finch::cli::tui::supervised_set_terminal_writer_gate_pause(true)?;
+            std::thread::spawn(|| {
+                let _ = finch::cli::tui::supervised_publish_terminal_bytes(b"FINCH_PANIC_FRAME");
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_writer_gate_is_paused()? {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "panic probe writer did not acquire terminal gate"
+                );
+                std::thread::yield_now();
+            }
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = finch::cli::tui::supervised_set_terminal_writer_gate_pause(false);
+            });
+        }
         panic!("supervised panic after Finch terminal activation");
     }
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
@@ -1205,7 +1223,7 @@ async fn main() -> Result<()> {
 fn install_panic_handler() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        finch::cli::tui::emergency_restore_terminal();
+        finch::cli::tui::restore_terminal_before_termination();
 
         // Call the default panic handler
         default_panic(info);

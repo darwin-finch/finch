@@ -14,17 +14,21 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 **Terminal-session lifecycle:**
 - A process-global generation token is `ACTIVATING`, `ACTIVE`, or `CLEANING` for the complete
   interval in which its tty snapshot, protocol modes, or restore descriptor can still be used.
+- Cleanup can access only a fully initialized per-generation record published after `tcgetattr`;
+  the original termios, descriptor, and completed activation-stage bits are ordinary initialized
+  fields, never a shared `MaybeUninit` snapshot.
 - A replacement session may activate only after the prior generation restored termios and protocol
   modes, closed its descriptor, and returned to `INACTIVE`; stale generation cleanup is a no-op.
 - Public `TuiRenderer` construction never changes process signal handlers. The Finch binary creates
   `BinaryTerminalSession` before renderer activation; SIGINT/SIGTERM/SIGHUP are armed and restored
-  with each active terminal generation. Its handler captures one atomic owner+generation token and
-  publishes into per-signal atomic pending slots; it owns no pipe/socket descriptor that can leak
-  across `exec` or be reused underneath a stale handler.
+  with each active terminal generation. Alternating installed trampolines increment a slot-specific
+  in-flight epoch before capturing their immutable owner+generation token, so entered old handlers
+  cannot observe zero or a replacement identity. Pending delivery remains descriptor-free.
 - Emergency cleanup uses the generation's nonblocking, close-on-exec tty descriptor and never waits
   for the renderer/global mutex or ordinary stdout.
-- Renderer output is admitted against the active generation, serialized only around a nonblocking
-  tty write, and revalidated after admission. `ACTIVE -> CLEANING` revokes parked writers before
+- Activation protocol writes and renderer output use the same per-generation admission gate, have
+  absolute 100 ms deadlines and bounded write chunks, and revalidate after admission.
+  `ACTIVE -> CLEANING` revokes parked writers before
   reset; a writer-gate timeout leaves the generation fail-closed for bounded takeover and never
   records restoration prematurely.
 - The 100 ms writer-quiescence bound assumes normal scheduler progress for a thread executing the
@@ -32,9 +36,11 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   cleanup returns a timeout without resetting, admitting a replacement, re-enabling ordinary
   stdout, or recording restoration; after the writer resumes and observes revocation, a later
   bounded cleanup owner repairs the same generation.
-- The actual non-Unix `TuiRenderer` owns the same bounded exclusive session lease across activation,
-  suspend/resume, emergency cleanup, shutdown, and Drop. Windows CI compiles and tests that exact
-  lifecycle source together with the portable protocol source.
+- The actual non-Unix `TuiRenderer` owns a `PortableRendererSession` actor that couples the bounded
+  exclusive lease, exact output generation, protocol activation, cleanup, and Drop. Failed or
+  backpressured cleanup relinquishes only its attempt owner, leaves the generation `CLEANING`, and
+  rejects stale writers and replacements until retry repairs it. Windows CI constructs and tests
+  this exact actor together with the portable protocol source.
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
