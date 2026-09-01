@@ -26,10 +26,16 @@ fn cleanup_protocols() -> std::io::Result<()> {
 
 #[cfg(test)]
 fn run_probe() {
-    let mut activation = Vec::new();
-    terminal_protocol::write_activation(&mut activation).unwrap();
-    let mut cleanup = Vec::new();
-    terminal_protocol::write_reset(&mut cleanup).unwrap();
+    #[cfg(unix)]
+    {
+        // Crossterm serializes these commands as ANSI bytes on Unix. On
+        // Windows it dispatches keyboard enhancement through the legacy
+        // console API, which intentionally reports Unsupported.
+        let mut activation = Vec::new();
+        terminal_protocol::write_activation(&mut activation).unwrap();
+        let mut cleanup = Vec::new();
+        terminal_protocol::write_reset(&mut cleanup).unwrap();
+    }
 
     #[cfg(not(unix))]
     {
@@ -176,24 +182,6 @@ fn run_probe() {
         .is_err()
     );
     terminal_lifecycle::cleanup_active(cleanup_protocols).unwrap();
-
-    #[cfg(windows)]
-    {
-        // WriteConsole/Flush on a console handle has no cancellable or
-        // nonblocking contract. The actual cfg(not(unix)) renderer therefore
-        // rejects stdout before raw/protocol activation instead of claiming a
-        // bounded TUI. ConPTY conformance remains an explicit acceptance gate.
-        let error = match terminal_lifecycle::PortableRendererSession::activate(
-            terminal_protocol::activate,
-            terminal_protocol::cleanup,
-        ) {
-            Ok(_) => panic!("unsupported Windows stdout activated a renderer"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        assert_eq!(terminal_lifecycle::active_generation(), 0);
-        eprintln!("FINCH_WINDOWS_CONPTY_ACCEPTANCE_GATED:stdout-not-cancellable");
-    }
 }
 
 #[cfg(test)]
@@ -220,4 +208,28 @@ fn main() {
 fn test_exact_portable_renderer_actor_production_boundary() {
     let _serial = terminal_lifecycle::supervised_test_lock();
     run_probe();
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn test_windows_production_renderer_rejects_unbounded_stdout_before_protocol_activation() {
+    let _serial = terminal_lifecycle::supervised_test_lock();
+
+    // WriteConsole/Flush on a console handle has no cancellable or nonblocking
+    // contract. The actual cfg(not(unix)) renderer therefore rejects stdout
+    // before raw/protocol activation instead of claiming a bounded TUI.
+    let error = match terminal_lifecycle::PortableRendererSession::activate(
+        terminal_protocol::activate,
+        terminal_protocol::cleanup,
+    ) {
+        Ok(_) => panic!("unsupported Windows stdout activated a renderer"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(
+        error.to_string(),
+        "portable TUI stdout has no proven cancellable/nonblocking console write contract"
+    );
+    assert_eq!(terminal_lifecycle::active_generation(), 0);
+    eprintln!("FINCH_WINDOWS_CONPTY_ACCEPTANCE_GATED:stdout-not-cancellable");
 }

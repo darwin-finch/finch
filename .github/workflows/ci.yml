@@ -48,7 +48,17 @@ jobs:
     - name: Verify clean-checkout formatting
       run: cargo fmt --all -- --check
 
-    - name: Test exact portable terminal actor (real console when available)
+  windows-terminal-actor-probe:
+    name: Portable terminal actor probe (Windows stdout unsupported)
+    runs-on: windows-2025
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+
+    - name: Test exact portable terminal actor (real console remains acceptance-gated)
       run: cargo test --manifest-path .github/issue-264-windows-probe/Cargo.toml -- --nocapture
 
   test:
