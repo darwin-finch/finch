@@ -1237,16 +1237,6 @@ impl BrainStore {
         runtime.spawn(async move {
             let mut delay = std::time::Duration::from_millis(10);
             loop {
-                let publication = match store.acquire_run_publication(&name, run_id).await {
-                    Ok(publication) => publication,
-                    Err(error) => {
-                        tracing::error!(brain = %name, run_id = %run_id.0, %error,
-                            "reserved cancellation retry could not acquire publication gate");
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(std::time::Duration::from_secs(5));
-                        continue;
-                    }
-                };
                 let terminal = store
                     .inspect_run(&name, run_id)
                     .is_ok_and(|run| run.status.is_terminal());
@@ -1254,11 +1244,9 @@ impl BrainStore {
                     .run_cancellation_reserved(&name, run_id)
                     .unwrap_or(false);
                 if terminal || !reserved {
-                    drop(publication);
                     break;
                 }
                 let result = store.complete_reserved_run_cancellation(&name, &sender, run_id);
-                drop(publication);
                 match result {
                     Ok(_) => {
                         let _ = store.prune_run_publication(&name, run_id);
@@ -3182,6 +3170,27 @@ impl BrainStore {
             self.clear_disconnect_intent(name, run_id)?;
             return Ok(None);
         }
+        let existing = state
+            .events
+            .iter()
+            .find(|event| {
+                event.run_id == Some(run_id) && matches!(event.kind, BrainEventKind::Result { .. })
+            })
+            .cloned();
+        // A Result is the durable observable outcome. If a crash happened
+        // after publishing it but before its status event, recover a terminal
+        // status coherent with that exact Result rather than attaching a new
+        // contradictory failure to a previously published success.
+        let (status, detail) = match existing.as_ref().map(|event| &event.kind) {
+            Some(BrainEventKind::Result { error: None, .. }) => (
+                BrainRunStatus::Completed,
+                "recovered previously published successful result".to_string(),
+            ),
+            Some(BrainEventKind::Result {
+                error: Some(error), ..
+            }) if status == BrainRunStatus::Completed => (BrainRunStatus::Failed, error.clone()),
+            _ => (status, detail),
+        };
         validate_run_transition(current.status, status)?;
         let intent = DisconnectTerminalizationIntent {
             sender: sender.to_string(),
@@ -3191,13 +3200,6 @@ impl BrainStore {
             detail: detail.clone(),
         };
         self.persist_disconnect_intent(name, &intent)?;
-        let existing = state
-            .events
-            .iter()
-            .find(|event| {
-                event.run_id == Some(run_id) && matches!(event.kind, BrainEventKind::Result { .. })
-            })
-            .cloned();
         let next_seq = state.revision + 1;
         let now = unix_millis();
         let result = existing.unwrap_or_else(|| BrainEvent {
@@ -3498,13 +3500,18 @@ impl BrainStore {
         if current.status == BrainRunStatus::Cancelled {
             return Ok(current);
         }
-        self.transition_run(
+        let terminalized = self.terminalize_run_with_result_if_active(
             name,
             sender,
             run_id,
+            current.request_seq,
             BrainRunStatus::Cancelled,
-            Some("cancelled by initiating driver".into()),
-        )
+            "cancelled by initiating driver".into(),
+        )?;
+        if terminalized.is_none() && !self.inspect_run(name, run_id)?.status.is_terminal() {
+            anyhow::bail!("reserved cancellation publication is busy");
+        }
+        self.inspect_run(name, run_id)
     }
 
     pub(crate) fn pending_reserved_cancellations_for_attachment(
@@ -3538,10 +3545,6 @@ impl BrainStore {
         sender: &str,
         run_id: RunId,
     ) -> Result<bool> {
-        let publication = match self.run_publication_gate(name, run_id)?.try_lock_owned() {
-            Ok(publication) => publication,
-            Err(_) => return Ok(false),
-        };
         if !self.run_cancellation_reserved(name, run_id)? {
             return Ok(false);
         }
@@ -3550,7 +3553,6 @@ impl BrainStore {
             return Ok(false);
         }
         self.complete_reserved_run_cancellation(name, sender, run_id)?;
-        drop(publication);
         self.prune_run_publication(name, run_id)?;
         Ok(true)
     }
@@ -5596,23 +5598,69 @@ impl BrainStore {
             .collect::<Vec<_>>();
         for run_id in orphaned_runs {
             if Self::state_has_run_cancellation_reservation(&state, run_id) {
-                let event = BrainEvent {
+                let run = state
+                    .runs
+                    .get(&run_id)
+                    .expect("orphaned reserved run disappeared")
+                    .clone();
+                let existing_result = state.events.iter().find(|event| {
+                    event.run_id == Some(run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. })
+                });
+                let next_seq = state.revision + 1;
+                let now = unix_millis();
+                let result = existing_result.is_none().then(|| BrainEvent {
                     schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                     brain_id: state.brain_id,
-                    seq: state.revision + 1,
+                    seq: next_seq,
                     environment_generation: self.environment.generation,
                     sender: "daemon".into(),
-                    created_ms: unix_millis(),
+                    created_ms: now,
+                    run_id: Some(run_id),
+                    mutation: None,
+                    kind: BrainEventKind::Result {
+                        request_seq: run.request_seq,
+                        output: String::new(),
+                        error: Some("cancelled by initiating driver".into()),
+                        continuation_messages: Vec::new(),
+                        invocation_metadata: None,
+                    },
+                });
+                let (status, detail) = match existing_result.map(|event| &event.kind) {
+                    Some(BrainEventKind::Result { error: None, .. }) => (
+                        BrainRunStatus::Completed,
+                        "recovered previously published successful result".to_string(),
+                    ),
+                    Some(BrainEventKind::Result {
+                        error: Some(error), ..
+                    }) => (BrainRunStatus::Cancelled, error.clone()),
+                    _ => (
+                        BrainRunStatus::Cancelled,
+                        "cancelled by initiating driver".to_string(),
+                    ),
+                };
+                let terminal = BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id: state.brain_id,
+                    seq: next_seq + u64::from(result.is_some()),
+                    environment_generation: self.environment.generation,
+                    sender: "daemon".into(),
+                    created_ms: now,
                     run_id: Some(run_id),
                     mutation: None,
                     kind: BrainEventKind::RunStatusChanged {
                         run_id,
-                        status: BrainRunStatus::Cancelled,
-                        detail: Some("cancelled by initiating driver".into()),
+                        status,
+                        detail: Some(detail),
                     },
                 };
-                match self.append_event(name, &event) {
-                    Ok(()) => state.apply(event),
+                let events = result.into_iter().chain([terminal]).collect::<Vec<_>>();
+                match self.append_event_batch(name, &events) {
+                    Ok(()) => {
+                        for event in events {
+                            state.apply(event);
+                        }
+                    }
                     Err(error) => {
                         tracing::error!(brain = %name, run_id = %run_id.0, %error,
                             "restart could not complete reserved cancellation; requeueing");
@@ -6174,6 +6222,32 @@ impl BrainStore {
 
     fn append_event_batch(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
         anyhow::ensure!(!events.is_empty(), "Brain event batch cannot be empty");
+        #[cfg(test)]
+        if events.iter().any(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::RunStatusChanged {
+                    status: BrainRunStatus::Cancelled,
+                    ..
+                }
+            )
+        }) && self
+            .fail_cancellation_terminal_appends
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected reserved cancellation terminal append failure");
+        }
         #[cfg(test)]
         if self
             .fail_event_batches
@@ -7368,6 +7442,75 @@ mod tests {
                     BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
                         if event_run_id == run.run_id && status.is_terminal()
                 ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_recovery_keeps_existing_success_result_and_derives_completed_terminal_status() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "recover".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        store
+            .push_for_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainEventKind::Result {
+                    request_seq: prompt.seq,
+                    output: "already published".into(),
+                    error: None,
+                    continuation_messages: Vec::new(),
+                    invocation_metadata: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .terminalize_run_with_result_if_active(
+                "shared",
+                "daemon",
+                run.run_id,
+                prompt.seq,
+                BrainRunStatus::Failed,
+                "runner generation disappeared".into(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.inspect_run("shared", run.run_id).unwrap().status,
+            BrainRunStatus::Completed
+        );
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == Some(run.run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. })
+                })
                 .count(),
             1
         );
@@ -9967,8 +10110,26 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!snapshot.events.iter().any(|event| {
-            event.run_id == Some(run.run_id) && matches!(event.kind, BrainEventKind::Result { .. })
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == Some(run.run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. })
+                })
+                .count(),
+            1
+        );
+        assert!(snapshot.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(
+                    &event.kind,
+                    BrainEventKind::Result {
+                        error: Some(error),
+                        ..
+                    } if error == "cancelled by initiating driver"
+                )
         }));
         assert!(
             restarted

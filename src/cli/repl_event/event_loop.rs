@@ -292,7 +292,15 @@ pub struct EventLoop {
 
     /// Cancellation controls for typed programs delegated by the Brain daemon.
     pending_named_brain_programs:
-        std::collections::HashMap<crate::brain::store::RunId, tokio_util::sync::CancellationToken>,
+        std::collections::HashMap<crate::brain::store::RunId, PendingNamedBrainProgram>,
+
+    /// Canonical daemon checkpoint returned by a renewal while an older
+    /// callback is still physically active. It must be installed before the
+    /// next callback can observe or checkpoint frontend VM state.
+    pending_runner_bootstrap: Option<crate::ipc::client::BrainRunnerBootstrap>,
+    /// Once any callback overlapping the pending bootstrap fails or is
+    /// cancelled, the eventual idle transition must restore that bootstrap.
+    pending_runner_reconciliation_required: bool,
 
     /// Source/output already rendered while this frontend serviced its home
     /// Brain callback. Matching canonical events advance this marker without
@@ -689,6 +697,28 @@ struct PendingNamedBrainTurn {
     /// Query metadata carries a clone to each submitted ProgramRun.
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
+}
+
+struct PendingNamedBrainProgram {
+    cancel: tokio_util::sync::CancellationToken,
+    /// True only after the exact program callback has physically settled.
+    finished: tokio::sync::watch::Receiver<bool>,
+}
+
+async fn wait_for_named_brain_program_settlement(
+    mut finished: tokio::sync::watch::Receiver<bool>,
+    callback_cancel: tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if *finished.borrow() {
+        return true;
+    }
+    tokio::select! {
+        biased;
+        _ = callback_cancel.cancelled() => false,
+        _ = tokio::time::sleep_until(deadline) => false,
+        changed = finished.changed() => changed.is_ok() && *finished.borrow(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2028,6 +2058,8 @@ impl EventLoop {
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_turn_callback_watches: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
+            pending_runner_bootstrap: None,
+            pending_runner_reconciliation_required: false,
             local_brain_projections: std::collections::VecDeque::new(),
             brain_projection_revisions: std::collections::HashMap::new(),
             remote_brain_tool_unit: None,
@@ -2181,6 +2213,44 @@ impl EventLoop {
     #[cfg(test)]
     pub(crate) fn named_brain_event_sender_for_test(&self) -> mpsc::UnboundedSender<ReplEvent> {
         self.event_tx.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ipc_client_for_test(&mut self, ipc_client: crate::ipc::IpcClient) {
+        self.ipc_client = Some(ipc_client);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_named_brain_program_active_for_test(
+        &mut self,
+        run_id: crate::brain::store::RunId,
+    ) -> (
+        tokio_util::sync::CancellationToken,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (finished_tx, finished) = tokio::sync::watch::channel(false);
+        self.pending_named_brain_programs.insert(
+            run_id,
+            PendingNamedBrainProgram {
+                cancel: cancel.clone(),
+                finished,
+            },
+        );
+        (cancel, finished_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_runner_bootstrap_for_test(&self) -> bool {
+        self.pending_runner_bootstrap.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn handle_named_brain_event_for_test(
+        &mut self,
+        event: ReplEvent,
+    ) -> Result<()> {
+        self.handle_event(event).await
     }
 
     #[cfg(test)]
@@ -2470,7 +2540,12 @@ impl EventLoop {
                         ReplEvent::NamedBrainTurnCallbackCancelled { .. } => {
                             "NamedBrainTurnCallbackCancelled"
                         }
-                        ReplEvent::NamedBrainProgramFinished(_) => "NamedBrainProgramFinished",
+                        ReplEvent::NamedBrainProgramFinished { .. } => {
+                            "NamedBrainProgramFinished"
+                        }
+                        ReplEvent::NamedBrainProgramCancellationSettled { .. } => {
+                            "NamedBrainProgramCancellationSettled"
+                        }
                         ReplEvent::FrontendRestartReady { .. } => "FrontendRestartReady",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
@@ -4898,31 +4973,31 @@ Rules:\n\
                             // Once idle, exact reconciliation rolls back any
                             // local revision that crossed a prior cancellation
                             // boundary instead of treating it as newer truth.
-                            let runner_work_active = self.active_query_id.read().await.is_some()
-                                || !self.pending_named_brain_turns.is_empty()
+                            let runner_work_active = !self.pending_named_brain_turns.is_empty()
                                 || !self.pending_named_brain_programs.is_empty();
-                            let reconciliation = if runner_work_active {
+                            if runner_work_active {
+                                if self.pending_runner_bootstrap.is_none() {
+                                    self.pending_runner_reconciliation_required = false;
+                                }
+                                self.pending_runner_bootstrap = Some(bootstrap);
                                 Ok(())
                             } else {
-                                reconcile_runner_checkpoint(
+                                let reconciliation = reconcile_runner_checkpoint(
                                     &self.program_runtime,
                                     bootstrap.checkpoint,
                                     bootstrap.runtime_revision,
                                     false,
                                 )
-                                .await
-                            };
-                            match reconciliation {
-                                Ok(_) => {
+                                .await;
+                                if let Err(error) = reconciliation {
+                                    let _ = ipc.brain_release_runner(&brain, lease_id).await;
+                                    self.agent_scheduler.clear_brain_control().await;
+                                    Err(error.to_string())
+                                } else {
                                     self.agent_scheduler
                                         .bind_brain_control(bootstrap.subagent_control)
                                         .await;
                                     Ok(())
-                                }
-                                Err(error) => {
-                                    let _ = ipc.brain_release_runner(&brain, lease_id).await;
-                                    self.agent_scheduler.clear_brain_control().await;
-                                    Err(error.to_string())
                                 }
                             }
                         }
@@ -4985,23 +5060,71 @@ Rules:\n\
                 }
             }
             ReplEvent::NamedBrainProgramRequested(request) => {
-                self.dispatch_named_brain_program(request);
+                self.dispatch_named_brain_program(request.request, request.cancel);
             }
             ReplEvent::NamedBrainTurnRequested(request) => {
-                self.dispatch_named_brain_turn(request).await?;
+                self.dispatch_named_brain_turn(request.request, request.cancel)
+                    .await?;
             }
             ReplEvent::NamedBrainMemoryProjectionRequested(request) => {
-                self.project_named_brain_memory(request).await;
+                self.project_named_brain_memory(request.request, request.cancel)
+                    .await;
             }
             ReplEvent::NamedBrainRunCancelRequested(request) => {
-                self.cancel_named_brain_run(request).await;
+                self.cancel_named_brain_run(request.request, request.cancel, request.deadline)
+                    .await;
             }
             ReplEvent::NamedBrainTurnCallbackCancelled { query_id, run_id } => {
                 self.cancel_named_brain_turn_callback(query_id, run_id)
                     .await;
             }
-            ReplEvent::NamedBrainProgramFinished(run_id) => {
+            ReplEvent::NamedBrainProgramFinished {
+                run_id,
+                preserve_local_checkpoint,
+                reconciliation_tx,
+            } => {
                 self.pending_named_brain_programs.remove(&run_id);
+                let reconciliation = self
+                    .settle_pending_runner_bootstrap_if_idle(preserve_local_checkpoint)
+                    .await
+                    .map_err(|error| error.to_string());
+                if let Err(error) = &reconciliation {
+                    self.home_runner_lease_active = false;
+                    self.agent_scheduler.clear_brain_control().await;
+                    self.last_home_runner_error = Some(error.clone());
+                }
+                let _ = reconciliation_tx.send(reconciliation);
+            }
+            ReplEvent::NamedBrainProgramCancellationSettled {
+                run_id,
+                response_tx,
+                result,
+            } => {
+                if result.is_ok() && self.pending_named_brain_programs.contains_key(&run_id) {
+                    // The program task enqueues `NamedBrainProgramFinished`
+                    // before publishing its physical-settlement watch. Keep
+                    // the ACK behind that event even if different sender
+                    // clones are scheduled adversarially.
+                    let _ = self
+                        .event_tx
+                        .send(ReplEvent::NamedBrainProgramCancellationSettled {
+                            run_id,
+                            response_tx,
+                            result,
+                        });
+                    return Ok(());
+                }
+                let result = if result.is_ok() && !self.home_runner_lease_active {
+                    Err(self.last_home_runner_error.clone().unwrap_or_else(|| {
+                        "named Brain runner became unavailable during cancellation".into()
+                    }))
+                } else {
+                    result
+                };
+                if result.is_ok() {
+                    debug_assert!(self.pending_runner_bootstrap.is_none());
+                }
+                let _ = response_tx.send(result);
             }
             ReplEvent::FrontendRestartReady {
                 brain,
@@ -5032,7 +5155,45 @@ Rules:\n\
         Ok(())
     }
 
-    fn dispatch_named_brain_program(&mut self, request: crate::server::RunnerProgramRequest) {
+    async fn settle_pending_runner_bootstrap_if_idle(
+        &mut self,
+        preserve_local_checkpoint: bool,
+    ) -> Result<()> {
+        if self.pending_runner_bootstrap.is_none() {
+            return Ok(());
+        }
+        if !preserve_local_checkpoint {
+            self.pending_runner_reconciliation_required = true;
+        }
+        if !self.pending_named_brain_turns.is_empty()
+            || !self.pending_named_brain_programs.is_empty()
+        {
+            return Ok(());
+        }
+        let Some(bootstrap) = self.pending_runner_bootstrap.take() else {
+            return Ok(());
+        };
+        let reconcile = std::mem::take(&mut self.pending_runner_reconciliation_required);
+        if reconcile {
+            reconcile_runner_checkpoint(
+                &self.program_runtime,
+                bootstrap.checkpoint,
+                bootstrap.runtime_revision,
+                true,
+            )
+            .await?;
+        }
+        self.agent_scheduler
+            .bind_brain_control(bootstrap.subagent_control)
+            .await;
+        Ok(())
+    }
+
+    fn dispatch_named_brain_program(
+        &mut self,
+        request: crate::server::RunnerProgramRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
         if self.runner_brain.as_deref() != Some(request.brain.as_str())
             || !self.home_runner_lease_active
         {
@@ -5048,9 +5209,14 @@ Rules:\n\
         let event_tx = self.event_tx.clone();
         let run_id = request.run_id;
         let request_seq = request.request_seq;
-        let cancel = request.cancel.clone();
-        self.pending_named_brain_programs
-            .insert(run_id, cancel.clone());
+        let (finished_tx, finished_rx) = tokio::sync::watch::channel(false);
+        self.pending_named_brain_programs.insert(
+            run_id,
+            PendingNamedBrainProgram {
+                cancel: cancel.clone(),
+                finished: finished_rx,
+            },
+        );
         tokio::task::spawn_local(async move {
             agent_scheduler
                 .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
@@ -5171,16 +5337,43 @@ Rules:\n\
                     effect_journal,
                 })
             };
-            let result = execution.await;
+            let mut result = execution.await;
             agent_scheduler.set_active_brain_parent(None).await;
+            let preserve_local_checkpoint = result.is_ok();
+            let (reconciliation_tx, reconciliation_rx) = tokio::sync::oneshot::channel();
+            let reconciliation = if event_tx
+                .send(ReplEvent::NamedBrainProgramFinished {
+                    run_id,
+                    preserve_local_checkpoint,
+                    reconciliation_tx,
+                })
+                .is_err()
+            {
+                Err("frontend event loop stopped before program reconciliation".to_string())
+            } else {
+                reconciliation_rx.await.unwrap_or_else(|_| {
+                    Err("frontend event loop dropped program reconciliation".to_string())
+                })
+            };
+            if let Err(error) = reconciliation {
+                let effect_journal = match &result {
+                    Ok(result) => result.effect_journal.clone(),
+                    Err(error) => error.effect_journal.clone(),
+                };
+                result = Err(crate::server::RunnerProgramError {
+                    message: error,
+                    effect_journal,
+                });
+            }
             let _ = request.response_tx.send(result);
-            let _ = event_tx.send(ReplEvent::NamedBrainProgramFinished(run_id));
+            finished_tx.send_replace(true);
         });
     }
 
     async fn dispatch_named_brain_turn(
         &mut self,
         request: crate::server::RunnerTurnRequest,
+        callback_cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         if self.runner_brain.as_deref() != Some(request.brain.as_str())
             || !self.home_runner_lease_active
@@ -5197,7 +5390,6 @@ Rules:\n\
                 }));
             return Ok(());
         }
-        let callback_cancel = request.cancel.clone();
         if self.active_query_id.read().await.is_some() {
             let _ = request
                 .response_tx
@@ -5231,11 +5423,14 @@ Rules:\n\
                 },
             )
             .await;
-        let mut effect_audit = request.effect_audit;
+        let effect_audit = request.effect_audit;
         #[cfg(test)]
-        if let Some(wrapper) = &self.effect_audit_test_wrapper {
-            effect_audit = effect_audit.map(|control| wrapper(control));
-        }
+        let effect_audit = self
+            .effect_audit_test_wrapper
+            .as_ref()
+            .map_or(effect_audit.clone(), |wrapper| {
+                effect_audit.map(|control| wrapper(control))
+            });
         if let Some(effect_audit) = effect_audit.clone() {
             self.query_states
                 .bind_effect_audit(query_id, effect_audit)
@@ -5321,7 +5516,12 @@ Rules:\n\
         Ok(())
     }
 
-    async fn cancel_named_brain_run(&mut self, request: crate::server::RunnerCancelRequest) {
+    async fn cancel_named_brain_run(
+        &mut self,
+        request: crate::server::RunnerCancelRequest,
+        callback_cancel: tokio_util::sync::CancellationToken,
+        deadline: tokio::time::Instant,
+    ) {
         if self.runner_brain.as_deref() != Some(request.brain.as_str())
             || !self.home_runner_lease_active
         {
@@ -5331,9 +5531,29 @@ Rules:\n\
             )));
             return;
         }
-        if let Some(cancel) = self.pending_named_brain_programs.get(&request.run_id) {
+        if let Some((cancel, finished)) = self
+            .pending_named_brain_programs
+            .get(&request.run_id)
+            .map(|pending| (pending.cancel.clone(), pending.finished.clone()))
+        {
             cancel.cancel();
-            let _ = request.response_tx.send(Ok(true));
+            let event_tx = self.event_tx.clone();
+            let run_id = request.run_id;
+            tokio::task::spawn_local(async move {
+                let settled =
+                    wait_for_named_brain_program_settlement(finished, callback_cancel, deadline)
+                        .await;
+                let result = if settled {
+                    Ok(true)
+                } else {
+                    Err("timed out waiting for named Brain program cancellation to settle".into())
+                };
+                let _ = event_tx.send(ReplEvent::NamedBrainProgramCancellationSettled {
+                    run_id,
+                    response_tx: request.response_tx,
+                    result,
+                });
+            });
             return;
         }
         let query_id = self
@@ -5402,6 +5622,7 @@ Rules:\n\
     async fn project_named_brain_memory(
         &self,
         request: crate::server::RunnerMemoryProjectionRequest,
+        cancel: tokio_util::sync::CancellationToken,
     ) {
         let result = async {
             if self.runner_brain.as_deref() != Some(request.brain.as_str())
@@ -5426,7 +5647,7 @@ Rules:\n\
                 ("user", request.prompt.as_str()),
                 ("assistant", request.source.as_str()),
             ] {
-                if request.cancel.is_cancelled() {
+                if cancel.is_cancelled() {
                     anyhow::bail!("named Brain memory projection cancelled");
                 }
                 if !content.trim().is_empty() {
@@ -5440,7 +5661,7 @@ Rules:\n\
                     tokio::pin!(insertion);
                     let inserted_new = tokio::select! {
                         biased;
-                        _ = request.cancel.cancelled() => {
+                        _ = cancel.cancelled() => {
                             anyhow::bail!("named Brain memory projection cancelled");
                         }
                         result = &mut insertion => result?,
@@ -5450,7 +5671,7 @@ Rules:\n\
                     }
                 }
             }
-            if request.cancel.is_cancelled() {
+            if cancel.is_cancelled() {
                 anyhow::bail!("named Brain memory projection cancelled");
             }
             Ok::<usize, anyhow::Error>(inserted)
@@ -5499,57 +5720,74 @@ Rules:\n\
         // earlier would prevent an already-begun detached effect from filing
         // its one authoritative late outcome.
         drop(effect_audit);
-        if cancellation_requested {
-            let _ = response_tx.send(Err(crate::server::RunnerTurnError {
+        let mut result = if cancellation_requested {
+            Err(crate::server::RunnerTurnError {
                 message: "named Brain run cancelled".into(),
                 turn_events,
                 effect_journal,
-            }));
-            return;
-        }
-        let commit_ack = restart.map(|restart| {
-            let (commit_tx, mut commit_rx) =
-                tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerTurnCommitNotice>();
-            let event_tx = self.event_tx.clone();
-            tokio::spawn(async move {
-                let Some(notice) = commit_rx.recv().await else {
-                    return;
-                };
-                if notice.status == crate::brain::store::BrainRunStatus::Completed {
-                    let _ = event_tx.send(ReplEvent::FrontendRestartReady {
-                        brain,
-                        run_id,
-                        restart,
-                    });
-                } else {
-                    let _ = event_tx.send(ReplEvent::OutputReady {
-                        message: format!(
-                            "Frontend restart cancelled because Brain run {} ended as {:?}: {}",
-                            run_id.0, notice.status, notice.detail
-                        ),
-                    });
-                }
+            })
+        } else {
+            let commit_ack = restart.map(|restart| {
+                let (commit_tx, mut commit_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerTurnCommitNotice>();
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let Some(notice) = commit_rx.recv().await else {
+                        return;
+                    };
+                    if notice.status == crate::brain::store::BrainRunStatus::Completed {
+                        let _ = event_tx.send(ReplEvent::FrontendRestartReady {
+                            brain,
+                            run_id,
+                            restart,
+                        });
+                    } else {
+                        let _ = event_tx.send(ReplEvent::OutputReady {
+                            message: format!(
+                                "Frontend restart cancelled because Brain run {} ended as {:?}: {}",
+                                run_id.0, notice.status, notice.detail
+                            ),
+                        });
+                    }
+                });
+                crate::server::RunnerTurnCommitAck::new(commit_tx)
             });
-            crate::server::RunnerTurnCommitAck::new(commit_tx)
-        });
-        let messages = self
-            .conversation
-            .try_read()
-            .map(|conversation| conversation.get_messages())
-            .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"));
-        let result = assemble_named_brain_turn(
-            &mut self.local_brain_projections,
-            run_id,
-            messages,
-            self.program_runtime.as_ref(),
-            output,
-            turn_events,
-            effect_journal,
-            commit_ack,
-            transient_output_unit,
-            invocation_metadata,
-            initial_message_count,
-        );
+            let messages = self
+                .conversation
+                .try_read()
+                .map(|conversation| conversation.get_messages())
+                .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"));
+            assemble_named_brain_turn(
+                &mut self.local_brain_projections,
+                run_id,
+                messages,
+                self.program_runtime.as_ref(),
+                output,
+                turn_events,
+                effect_journal,
+                commit_ack,
+                transient_output_unit,
+                invocation_metadata,
+                initial_message_count,
+            )
+        };
+        let preserve_local_checkpoint = result.is_ok();
+        if let Err(error) = self
+            .settle_pending_runner_bootstrap_if_idle(preserve_local_checkpoint)
+            .await
+        {
+            self.home_runner_lease_active = false;
+            self.agent_scheduler.clear_brain_control().await;
+            let (turn_events, effect_journal) = match &result {
+                Ok(result) => (result.turn_events.clone(), result.effect_journal.clone()),
+                Err(error) => (error.turn_events.clone(), error.effect_journal.clone()),
+            };
+            result = Err(crate::server::RunnerTurnError {
+                message: format!("could not reconcile renewed runner checkpoint: {error:#}"),
+                turn_events,
+                effect_journal,
+            });
+        }
         let _ = response_tx.send(result);
     }
 
@@ -8891,6 +9129,21 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn test_program_cancellation_waits_for_physical_callback_settlement() {
+        let (finished_tx, finished_rx) = tokio::sync::watch::channel(false);
+        let callback_cancel = tokio_util::sync::CancellationToken::new();
+        let settlement = tokio::spawn(super::wait_for_named_brain_program_settlement(
+            finished_rx,
+            callback_cancel,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!settlement.is_finished());
+        finished_tx.send_replace(true);
+        assert!(settlement.await.unwrap());
+    }
+
     fn admitting_llm_channel() -> (
         tokio::sync::mpsc::UnboundedSender<super::LlmRequest>,
         tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,

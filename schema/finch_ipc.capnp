@@ -947,6 +947,9 @@ interface BrainRunner {
   runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
   cancelRun  @2 (brain :Text, runId :Text) -> (cancelled :Bool, error :Text);
   projectMemory @3 (request :BrainMemoryProjectionRequest) -> (inserted :UInt32, error :Text);
+  # Cancels and waits for one memory projection's frontend insertion future.
+  # The reply is the physical-quiescence acknowledgement for that exact run.
+  cancelMemory @4 (brain :Text, runId :Text) -> ();
 }
 
 # Long-lived reverse capability bound to the exact registered runner lease.

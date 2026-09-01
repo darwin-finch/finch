@@ -2093,7 +2093,6 @@ fn decode_schedule_policy(
 
 async fn await_runner_rpc<T, F>(
     response_tx: &mut tokio::sync::oneshot::Sender<T>,
-    cancel: &tokio_util::sync::CancellationToken,
     rpc: F,
 ) -> Option<F::Output>
 where
@@ -2101,7 +2100,6 @@ where
 {
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => None,
         _ = response_tx.closed() => None,
         reply = rpc => Some(reply),
     }
@@ -2131,6 +2129,30 @@ async fn cancel_frontend_run(
     }
 }
 
+async fn cancel_frontend_memory(
+    runner: &finch_ipc_capnp::brain_runner::Client,
+    brain: &str,
+    run_id: crate::brain::store::RunId,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let mut cancel = runner.cancel_memory_request();
+    cancel.get().set_brain(brain);
+    cancel.get().set_run_id(&run_id.0.to_string());
+    match tokio::time::timeout_at(deadline, cancel.send().promise).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(brain = %brain, run_id = %run_id.0, %error,
+                "could not cancel abandoned runner memory projection");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(brain = %brain, run_id = %run_id.0,
+                "timed out cancelling abandoned runner memory projection");
+            false
+        }
+    }
+}
+
 async fn settle_cancelled_frontend_rpc<F>(
     rpc: &mut std::pin::Pin<Box<F>>,
     deadline: tokio::time::Instant,
@@ -2151,6 +2173,7 @@ async fn forward_runner_request(
 ) {
     match request {
         crate::server::RunnerRequest::Program(request) => {
+            let callback_cancel = tokio_util::sync::CancellationToken::new();
             let audit_grant = match server.brain_store().issue_effect_audit_authority(
                 &request.brain,
                 request.run_id,
@@ -2210,27 +2233,27 @@ async fn forward_runner_request(
                             lease_id,
                             connection_id: connection_id.map(|id| id.0),
                             active: std::sync::Arc::clone(&audit_active),
-                            cancel: request.cancel.clone(),
+                            cancel: callback_cancel.clone(),
                         }),
                     });
                 payload.set_control(control);
             }
             let mut response_tx = request.response_tx;
             let mut rpc = Box::pin(call.send().promise);
-            let reply = await_runner_rpc(&mut response_tx, &request.cancel, rpc.as_mut()).await;
+            let reply = await_runner_rpc(&mut response_tx, rpc.as_mut()).await;
             if reply.is_none() {
                 // Close effect admission before any cancellation RPC awaits.
                 // The daemon may terminalize the run as soon as this exact
                 // request token fires, so no callback may reserve a new host
                 // effect during the bounded remote-cleanup window.
                 audit_active.store(false, std::sync::atomic::Ordering::Release);
-                request.cancel.cancel();
+                callback_cancel.cancel();
                 let cleanup_deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                let cancel_ack =
-                    cancel_frontend_run(&runner, &request.brain, request.run_id, cleanup_deadline)
-                        .await;
-                let settled = settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline).await;
+                let (cancel_ack, settled) = tokio::join!(
+                    cancel_frontend_run(&runner, &request.brain, request.run_id, cleanup_deadline),
+                    settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline)
+                );
                 if !(cancel_ack && settled) {
                     if let Some(registration_id) = registration_id {
                         server
@@ -2272,10 +2295,11 @@ async fn forward_runner_request(
                 }
             };
             if response_tx.send(result).is_err() {
-                request.cancel.cancel();
+                callback_cancel.cancel();
             }
         }
         crate::server::RunnerRequest::Turn(request) => {
+            let callback_cancel = tokio_util::sync::CancellationToken::new();
             let audit_grant = match server.brain_store().issue_effect_audit_authority(
                 &request.brain,
                 request.run_id,
@@ -2330,7 +2354,7 @@ async fn forward_runner_request(
                                     lease_id,
                                     connection_id: connection_id.map(|id| id.0),
                                     active: std::sync::Arc::clone(&audit_active),
-                                    cancel: request.cancel.clone(),
+                                    cancel: callback_cancel.clone(),
                                 }),
                             });
                         payload.set_control(control);
@@ -2341,24 +2365,23 @@ async fn forward_runner_request(
                     Ok(()) => {
                         let mut response_tx = request.response_tx;
                         let mut rpc = Box::pin(call.send().promise);
-                        let reply =
-                            await_runner_rpc(&mut response_tx, &request.cancel, rpc.as_mut()).await;
+                        let reply = await_runner_rpc(&mut response_tx, rpc.as_mut()).await;
                         if reply.is_none() {
                             // Fence new effects before waiting for the
                             // frontend to acknowledge physical cancellation.
                             audit_active.store(false, std::sync::atomic::Ordering::Release);
-                            request.cancel.cancel();
+                            callback_cancel.cancel();
                             let cleanup_deadline =
                                 tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                            let cancel_ack = cancel_frontend_run(
-                                &runner,
-                                &request.brain,
-                                request.run_id,
-                                cleanup_deadline,
-                            )
-                            .await;
-                            let settled =
-                                settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline).await;
+                            let (cancel_ack, settled) = tokio::join!(
+                                cancel_frontend_run(
+                                    &runner,
+                                    &request.brain,
+                                    request.run_id,
+                                    cleanup_deadline
+                                ),
+                                settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline)
+                            );
                             if !(cancel_ack && settled) {
                                 if let Some(registration_id) = registration_id {
                                     server
@@ -2412,10 +2435,11 @@ async fn forward_runner_request(
                 }
             };
             if response_tx.send(result).is_err() {
-                request.cancel.cancel();
+                callback_cancel.cancel();
             }
         }
         crate::server::RunnerRequest::ProjectMemory(request) => {
+            let callback_cancel = tokio_util::sync::CancellationToken::new();
             let mut call = runner.project_memory_request();
             {
                 let mut payload = call.get().init_request();
@@ -2428,10 +2452,26 @@ async fn forward_runner_request(
             }
             let mut response_tx = request.response_tx;
             let mut rpc = Box::pin(call.send().promise);
-            let Some(reply) =
-                await_runner_rpc(&mut response_tx, &request.cancel, rpc.as_mut()).await
-            else {
-                request.cancel.cancel();
+            let Some(reply) = await_runner_rpc(&mut response_tx, rpc.as_mut()).await else {
+                callback_cancel.cancel();
+                let cleanup_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                let (cancel_ack, settled) = tokio::join!(
+                    cancel_frontend_memory(
+                        &runner,
+                        &request.brain,
+                        request.run_id,
+                        cleanup_deadline
+                    ),
+                    settle_cancelled_frontend_rpc(&mut rpc, cleanup_deadline)
+                );
+                if !(cancel_ack && settled) {
+                    if let Some(registration_id) = registration_id {
+                        server
+                            .brain_runners()
+                            .unregister(&request.brain, registration_id);
+                    }
+                }
                 return;
             };
             let result = match reply {
@@ -2461,20 +2501,17 @@ async fn forward_runner_request(
                 }
             };
             if response_tx.send(result).is_err() {
-                request.cancel.cancel();
+                callback_cancel.cancel();
             }
         }
         crate::server::RunnerRequest::Cancel(request) => {
             let mut call = runner.cancel_run_request();
             call.get().set_brain(&request.brain);
             call.get().set_run_id(&request.run_id.0.to_string());
+            let response_tx = request.response_tx;
             let reply = tokio::select! {
                 biased;
-                _ = request.cancel.cancelled() => None,
-                _ = tokio::time::sleep_until(request.deadline) => {
-                    request.cancel.cancel();
-                    None
-                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => None,
                 reply = call.send().promise => Some(reply),
             };
             let Some(reply) = reply else {
@@ -2506,7 +2543,7 @@ async fn forward_runner_request(
                     return;
                 }
             };
-            let _ = request.response_tx.send(result);
+            let _ = response_tx.send(result);
         }
     }
 }
@@ -3239,6 +3276,228 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_renewal_reconciles_active_work_before_successor_checkpoint() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(temp.path().join("brains")),
+                );
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store,
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([83; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                    FinchDaemonImpl::new(std::sync::Arc::clone(&server), uuid::Uuid::new_v4()),
+                );
+                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                let snapshot = ipc.brain_snapshot("shared").await.unwrap();
+                let subject = "runner@box.local/renewal-active-work";
+                ipc.brain_claim_runner_identity(subject).await.unwrap();
+                let lease = ipc
+                    .brain_acquire_runner("shared", subject, &snapshot.environment, None, 300_000)
+                    .await
+                    .unwrap();
+
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                runtime
+                    .submit_typed_only(crate::runtime::ProgramSubmission {
+                        language: crate::programs::ProgramLanguage::Forth,
+                        source_id: Some("cancelled-active-renewal-state".into()),
+                        source: "1".into(),
+                        intent: "model a local commit crossing cancellation".into(),
+                        effect: crate::programs::ExecutionEffect::Pure,
+                        declared_capabilities: Vec::new(),
+                        manifest_generation: runtime.manifest_generation(),
+                        expected_revision: Some(0),
+                        budget: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(runtime.revision(), 1);
+
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input: serde_json::Value::Null,
+                        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    });
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        crate::tools::registry::ToolRegistry::new(),
+                        crate::tools::permissions::PermissionManager::new(),
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .unwrap(),
+                ));
+                let mut event_loop = crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    std::sync::Arc::clone(&runtime),
+                );
+                event_loop.set_ipc_client_for_test(ipc.clone());
+                let active_run = crate::brain::store::RunId(uuid::Uuid::new_v4());
+                let _program_lifecycle =
+                    event_loop.mark_named_brain_program_active_for_test(active_run);
+                event_loop
+                    .handle_named_brain_event_for_test(
+                        crate::cli::repl_event::ReplEvent::RunnerLeaseStatus {
+                            brain: "shared".into(),
+                            environment: snapshot.environment,
+                            epoch: 0,
+                            lease_id: Some(lease.lease_id),
+                            detail: "renewed".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(event_loop.has_pending_runner_bootstrap_for_test());
+                assert_eq!(
+                    runtime.revision(),
+                    1,
+                    "renewal must not replace state while the prior callback is active"
+                );
+
+                let (reconciliation_tx, reconciliation_rx) = tokio::sync::oneshot::channel();
+                event_loop
+                    .handle_named_brain_event_for_test(
+                        crate::cli::repl_event::ReplEvent::NamedBrainProgramFinished {
+                            run_id: active_run,
+                            preserve_local_checkpoint: false,
+                            reconciliation_tx,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                reconciliation_rx.await.unwrap().unwrap();
+                assert!(!event_loop.has_pending_runner_bootstrap_for_test());
+                assert_eq!(runtime.revision(), 0);
+
+                runtime
+                    .submit_typed_only(crate::runtime::ProgramSubmission {
+                        language: crate::programs::ProgramLanguage::Forth,
+                        source_id: Some("successor-after-renewal".into()),
+                        source: "2".into(),
+                        intent: "prove cancelled ancestry is absent".into(),
+                        effect: crate::programs::ExecutionEffect::Pure,
+                        declared_capabilities: Vec::new(),
+                        manifest_generation: runtime.manifest_generation(),
+                        expected_revision: Some(0),
+                        budget: None,
+                    })
+                    .await
+                    .unwrap();
+                let successor = runtime
+                    .revision_history()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.revision == 1)
+                    .unwrap();
+                assert_eq!(successor.stack, vec![crate::vm::TypedValue::Int(2)]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_program_cancel_ack_follows_finished_event_and_physical_settlement() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input: serde_json::Value::Null,
+                        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    });
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        crate::tools::registry::ToolRegistry::new(),
+                        crate::tools::permissions::PermissionManager::new(),
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .unwrap(),
+                ));
+                let mut event_loop = crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    runtime,
+                );
+                let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+                let (program_cancel, finished_tx) =
+                    event_loop.mark_named_brain_program_active_for_test(run_id);
+                let (event_tx, driver) = event_loop.start_named_brain_test_runner("shared".into());
+                let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+                event_tx
+                    .send(
+                        crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
+                            crate::cli::repl_event::events::BoundedRunnerCancelRequest {
+                                request: crate::server::RunnerCancelRequest {
+                                    brain: "shared".into(),
+                                    run_id,
+                                    response_tx,
+                                },
+                                cancel: tokio_util::sync::CancellationToken::new(),
+                                deadline: tokio::time::Instant::now()
+                                    + std::time::Duration::from_secs(10),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    program_cancel.cancelled(),
+                )
+                .await
+                .expect("event loop did not request program cancellation");
+                assert!(matches!(
+                    response_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+
+                let (reconciliation_tx, reconciliation_rx) = tokio::sync::oneshot::channel();
+                event_tx
+                    .send(
+                        crate::cli::repl_event::ReplEvent::NamedBrainProgramFinished {
+                            run_id,
+                            preserve_local_checkpoint: false,
+                            reconciliation_tx,
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    response_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                reconciliation_rx.await.unwrap().unwrap();
+                assert!(matches!(
+                    response_rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                finished_tx.send_replace(true);
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut response_rx)
+                        .await
+                        .expect("cancellation ACK did not follow physical settlement")
+                        .unwrap()
+                        .unwrap(),
+                    true
+                );
+                event_tx
+                    .send(crate::cli::repl_event::ReplEvent::Shutdown)
+                    .unwrap();
+                driver.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
     impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
         fn run_program(
             &mut self,
@@ -3499,6 +3758,107 @@ mod tests {
         }
     }
 
+    struct DelayedMemoryCancellationRunner {
+        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
+        cancel: tokio_util::sync::CancellationToken,
+        release: std::sync::Arc<tokio::sync::Notify>,
+        finished: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for DelayedMemoryCancellationRunner {
+        fn run_program(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
+        }
+
+        fn project_memory(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            mut results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let run_id = params
+                .get()
+                .and_then(|params| params.get_request())
+                .and_then(|request| request.get_run_id())
+                .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(crate::brain::store::RunId)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                });
+            let run_id = match run_id {
+                Ok(run_id) => run_id,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let started = self.started.take().expect("memory callback called twice");
+            let cancel = self.cancel.clone();
+            let release = std::sync::Arc::clone(&self.release);
+            let finished = self.finished.clone();
+            capnp::capability::Promise::from_future(async move {
+                let _ = started.send(run_id);
+                cancel.cancelled().await;
+                release.notified().await;
+                results.get().set_error("memory projection cancelled");
+                finished.send_replace(true);
+                Ok(())
+            })
+        }
+
+        fn cancel_memory(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::CancelMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let run_id = params
+                .get()
+                .and_then(|params| params.get_run_id())
+                .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(crate::brain::store::RunId)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                });
+            let run_id = match run_id {
+                Ok(run_id) => run_id,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let _ = self.cancelled.send(run_id);
+            self.cancel.cancel();
+            let mut finished = self.finished.subscribe();
+            capnp::capability::Promise::from_future(async move {
+                let already_finished = *finished.borrow();
+                if !already_finished {
+                    finished.changed().await.map_err(|_| {
+                        capnp::Error::failed(
+                            "memory callback ended without physical settlement".into(),
+                        )
+                    })?;
+                }
+                Ok(())
+            })
+        }
+    }
+
     struct NonQuiescentExpiredProgramRunner {
         started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
         cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
@@ -3752,7 +4112,6 @@ mod tests {
                 cancelled: cancelled_tx,
                 stop: std::sync::Arc::new(tokio::sync::Notify::new()),
             });
-        let cancel = tokio_util::sync::CancellationToken::new();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = crate::server::RunnerProgramRequest {
             brain: "shared".into(),
@@ -3764,7 +4123,6 @@ mod tests {
             grant_ceiling: None,
             control_tx: None,
             effect_audit: None,
-            cancel: cancel.clone(),
             response_tx,
         };
         let mut forwarding = Box::pin(super::forward_test_runner_request(
@@ -3785,7 +4143,7 @@ mod tests {
             cancelled_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
-        cancel.cancel();
+        drop(response_rx);
         let (cancelled, forwarding_completed) =
             observe_cancel_before_forwarding_returns(&mut cancelled_rx, &mut forwarding).await;
         let cancelled = cancelled.expect("program forwarding ended without physical cancellation");
@@ -3793,7 +4151,102 @@ mod tests {
         if !forwarding_completed {
             forwarding.await;
         }
-        assert!(response_rx.await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_abandoned_memory_projection_waits_for_late_frontend_insertion_to_quiesce() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().join("brains")),
+        );
+        let attachment = store
+            .attach(
+                "shared",
+                "alice",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                crate::brain::store::BrainEventKind::Prompt {
+                    text: "remember this".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                crate::brain::store::BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let brain_id = store.snapshot("shared").unwrap().brain_id;
+        store
+            .acquire_runner_lease("shared", "runner", 1, None, 300_000)
+            .unwrap();
+        let server = std::sync::Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store,
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([57; 32]),
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap(),
+        );
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, mut cancelled_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (finished_tx, _finished_rx) = tokio::sync::watch::channel(false);
+        let runner: super::finch_ipc_capnp::brain_runner::Client =
+            capnp_rpc::new_client(DelayedMemoryCancellationRunner {
+                started: Some(started_tx),
+                cancelled: cancelled_tx,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                release: std::sync::Arc::clone(&release),
+                finished: finished_tx,
+            });
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = crate::server::RunnerMemoryProjectionRequest {
+            brain_id,
+            brain: "shared".into(),
+            run_id: run.run_id,
+            request_seq: prompt.seq,
+            prompt: "remember this".into(),
+            source: "stored answer".into(),
+            response_tx,
+        };
+        let mut forwarding = Box::pin(super::forward_test_runner_request(
+            runner,
+            std::sync::Arc::clone(&server),
+            crate::server::RunnerRequest::ProjectMemory(request),
+        ));
+        let started = tokio::select! {
+            started = &mut started_rx => started.unwrap(),
+            _ = &mut forwarding => panic!("memory forwarding ended before it started"),
+        };
+        assert_eq!(started, run.run_id);
+        drop(response_rx);
+        let cancelled = tokio::select! {
+            cancelled = cancelled_rx.recv() => cancelled.unwrap(),
+            _ = &mut forwarding => panic!("memory forwarding returned before cancellation ACK"),
+        };
+        assert_eq!(cancelled, run.run_id);
+        assert!(matches!(
+            futures::poll!(&mut forwarding),
+            std::task::Poll::Pending
+        ));
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), forwarding)
+            .await
+            .expect("memory forwarding did not wait for and observe physical settlement");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4184,7 +4637,6 @@ mod tests {
             grant_ceiling: None,
             control_tx: None,
             effect_audit: None,
-            cancel: tokio_util::sync::CancellationToken::new(),
             response_tx,
         };
         let runner: super::finch_ipc_capnp::brain_runner::Client =
@@ -4679,7 +5131,6 @@ mod tests {
             grant_ceiling: None,
             control_tx: None,
             effect_audit: None,
-            cancel: tokio_util::sync::CancellationToken::new(),
             response_tx,
         };
         let (permit_tx, permit_rx) = tokio::sync::oneshot::channel();

@@ -28,14 +28,11 @@ pub struct RunnerMemoryProjectionRequest {
     pub request_seq: u64,
     pub prompt: String,
     pub source: String,
-    /// Cancel only this physical callback. The token is process-local and is
-    /// bridged across Cap'n Proto by dropping/cancelling the exact RPC.
-    pub cancel: CancellationToken,
     pub response_tx: oneshot::Sender<Result<usize, String>>,
 }
 
 impl RunnerMemoryProjectionRequest {
-    /// Construct a memory callback request with an independently cancellable lifecycle.
+    /// Construct a memory callback request.
     pub fn new(
         brain_id: crate::brain::store::BrainId,
         brain: String,
@@ -52,7 +49,6 @@ impl RunnerMemoryProjectionRequest {
             request_seq,
             prompt,
             source,
-            cancel: CancellationToken::new(),
             response_tx,
         }
     }
@@ -62,25 +58,19 @@ impl RunnerMemoryProjectionRequest {
 pub struct RunnerCancelRequest {
     pub brain: String,
     pub run_id: RunId,
-    /// Bounds a cancellation callback independently of the run it targets.
-    pub cancel: CancellationToken,
-    pub deadline: tokio::time::Instant,
     pub response_tx: oneshot::Sender<Result<bool, String>>,
 }
 
 impl RunnerCancelRequest {
-    /// Construct a cancellation callback with the supplied absolute deadline.
+    /// Construct a cancellation callback request.
     pub fn new(
         brain: String,
         run_id: RunId,
-        deadline: tokio::time::Instant,
         response_tx: oneshot::Sender<Result<bool, String>>,
     ) -> Self {
         Self {
             brain,
             run_id,
-            cancel: CancellationToken::new(),
-            deadline,
             response_tx,
         }
     }
@@ -101,8 +91,6 @@ pub struct RunnerProgramRequest {
     /// Run-scoped write-ahead audit capability. Host bindings must reserve
     /// and begin through this proxy before applying a physical effect.
     pub effect_audit: Option<RunnerEffectAuditControl>,
-    /// Cancel only this physical callback without revoking the runner lease.
-    pub cancel: CancellationToken,
     pub response_tx: oneshot::Sender<Result<RunnerProgramResult, RunnerProgramError>>,
 }
 
@@ -129,7 +117,6 @@ impl RunnerProgramRequest {
             grant_ceiling,
             control_tx: None,
             effect_audit: None,
-            cancel: CancellationToken::new(),
             response_tx,
         }
     }
@@ -334,8 +321,6 @@ pub struct RunnerTurnRequest {
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
     /// Run-scoped write-ahead audit capability for physical host effects.
     pub effect_audit: Option<RunnerEffectAuditControl>,
-    /// Cancel only this physical callback without revoking the runner lease.
-    pub cancel: CancellationToken,
     pub response_tx: oneshot::Sender<Result<RunnerTurnResult, RunnerTurnError>>,
 }
 
@@ -362,7 +347,6 @@ impl RunnerTurnRequest {
             approval_connection_id,
             approval_tx: None,
             effect_audit: None,
-            cancel: CancellationToken::new(),
             response_tx,
         }
     }
@@ -674,6 +658,9 @@ pub struct BrainRunnerBroker {
     inflight: Arc<Mutex<HashMap<(String, RunId), HashMap<uuid::Uuid, oneshot::Sender<()>>>>>,
     cancelled_before_dispatch: Arc<Mutex<std::collections::HashSet<(String, RunId)>>>,
     deadlines: RunnerDeadlines,
+    #[cfg(test)]
+    registration_admission_pause:
+        Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>,
 }
 
 impl Default for BrainRunnerBroker {
@@ -820,6 +807,8 @@ impl BrainRunnerBroker {
             inflight: Arc::default(),
             cancelled_before_dispatch: Arc::default(),
             deadlines,
+            #[cfg(test)]
+            registration_admission_pause: Arc::default(),
         }
     }
 
@@ -856,6 +845,11 @@ impl BrainRunnerBroker {
             .expect("runner inflight lock poisoned")
             .remove(&(brain.to_string(), run_id));
         drop(requests);
+        // The execution-lane owner calls abort only after durable
+        // terminalization is complete or transferred to its retry owner.
+        // No admitted callback remains after the dropped senders settle, so
+        // this pre-dispatch race fence no longer needs process-lifetime storage.
+        self.retire_run_cancellation(brain, run_id);
     }
 
     /// Tell the exact leased runner to cancel one run without making the
@@ -869,29 +863,34 @@ impl BrainRunnerBroker {
         run_id: RunId,
     ) -> Result<()> {
         self.fence_run_cancellation(brain, run_id);
-        let registration = self
-            .registrations
-            .read()
-            .expect("runner broker lock poisoned")
-            .get(brain)
-            .cloned()
-            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
-        anyhow::ensure!(
-            registration.lease_id == lease_id,
-            "named Brain '{brain}' runner callback belongs to a stale lease"
-        );
-        let cancel = CancellationToken::new();
-        let (response_tx, _response_rx) = oneshot::channel();
-        registration
-            .tx
-            .send(RunnerRequest::Cancel(RunnerCancelRequest {
-                brain: brain.to_string(),
-                run_id,
-                cancel,
-                deadline: tokio::time::Instant::now() + self.deadlines.cancel,
-                response_tx,
-            }))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))
+        let result = (|| {
+            let registration = self
+                .registrations
+                .read()
+                .expect("runner broker lock poisoned")
+                .get(brain)
+                .cloned()
+                .with_context(|| {
+                    format!("named Brain '{brain}' has no connected runner callback")
+                })?;
+            anyhow::ensure!(
+                registration.lease_id == lease_id,
+                "named Brain '{brain}' runner callback belongs to a stale lease"
+            );
+            let (response_tx, _response_rx) = oneshot::channel();
+            registration
+                .tx
+                .send(RunnerRequest::Cancel(RunnerCancelRequest {
+                    brain: brain.to_string(),
+                    run_id,
+                    response_tx,
+                }))
+                .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))
+        })();
+        if result.is_err() {
+            self.retire_run_cancellation(brain, run_id);
+        }
+        result
     }
 
     pub(crate) fn fence_run_cancellation(&self, brain: &str, run_id: RunId) {
@@ -1088,6 +1087,15 @@ impl BrainRunnerBroker {
                 anyhow::bail!("Brain attachment is owned by another IPC connection")
             }
             _ => {
+                let dispatch = authority.dispatch.entry(connection_id).or_default();
+                anyhow::ensure!(
+                    !dispatch
+                        .state
+                        .lock()
+                        .expect("connection dispatch lock poisoned")
+                        .closed,
+                    "IPC connection is tearing down"
+                );
                 authority.attachments.insert(key, connection_id);
                 Ok(())
             }
@@ -1283,26 +1291,42 @@ impl BrainRunnerBroker {
             .unwrap_or_default();
         dispatch.close();
         drop(authority);
-        self.registrations
+        // Keep an invalidated head generation in the map until every request
+        // admitted through it has physically quiesced. Its RegistrationRequest
+        // drop then promotes a pending callback owned by another connection.
+        // Removing the head here would lose that promotion edge forever.
+        let mut registrations = self
+            .registrations
             .write()
-            .expect("runner broker lock poisoned")
-            .retain(|_, registration| {
-                let keep = registration.connection_id != Some(connection_id);
-                if !keep {
-                    registration.active.send_replace(false);
-                }
-                keep
-            });
-        self.pending_registrations
+            .expect("runner broker lock poisoned");
+        let mut pending = self
+            .pending_registrations
             .write()
-            .expect("runner pending-registration lock poisoned")
-            .retain(|_, registration| {
-                let keep = registration.connection_id != Some(connection_id);
-                if !keep {
-                    registration.active.send_replace(false);
-                }
-                keep
-            });
+            .expect("runner pending-registration lock poisoned");
+        let mut promote = Vec::new();
+        registrations.retain(|brain, registration| {
+            if registration.connection_id != Some(connection_id) {
+                return true;
+            }
+            registration.active.send_replace(false);
+            let keep = registration.in_flight.load(Ordering::Acquire) != 0;
+            if !keep {
+                promote.push(brain.clone());
+            }
+            keep
+        });
+        pending.retain(|_, registration| {
+            let keep = registration.connection_id != Some(connection_id);
+            if !keep {
+                registration.active.send_replace(false);
+            }
+            keep
+        });
+        drop(pending);
+        drop(registrations);
+        for brain in promote {
+            self.promote_pending_registration(&brain);
+        }
         self.registration_changes.notify_waiters();
         RunnerConnectionTeardown {
             broker: self.clone(),
@@ -1449,15 +1473,16 @@ impl BrainRunnerBroker {
         lease_id: RunnerLeaseId,
         operation: RunnerOperation,
     ) -> Result<(Registration, RegistrationRequest)> {
-        let registration = self
+        // Admission is atomic with replacement installation: retain the map
+        // read lock through validation and the in-flight increment so a writer
+        // cannot install generation B after we clone A but before A is counted.
+        let registrations = self
             .registrations
             .read()
-            .expect("runner broker lock poisoned")
-            .get(brain)
-            .cloned()
-            .ok_or_else(|| {
-                RunnerDispatchError::new(brain, operation, RunnerDispatchFailure::NoCallback)
-            })?;
+            .expect("runner broker lock poisoned");
+        let registration = registrations.get(brain).ok_or_else(|| {
+            RunnerDispatchError::new(brain, operation, RunnerDispatchFailure::NoCallback)
+        })?;
         if registration.lease_id != lease_id {
             return Err(RunnerDispatchError::new(
                 brain,
@@ -1474,7 +1499,19 @@ impl BrainRunnerBroker {
             )
             .into());
         }
+        #[cfg(test)]
+        if let Some((reached, release)) = self
+            .registration_admission_pause
+            .lock()
+            .expect("registration admission test hook poisoned")
+            .take()
+        {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
         registration.in_flight.fetch_add(1, Ordering::AcqRel);
+        let registration = registration.clone();
+        drop(registrations);
         let request = RegistrationRequest {
             broker: self.clone(),
             brain: brain.to_string(),
@@ -1559,16 +1596,6 @@ impl BrainRunnerBroker {
         self.fence_run_cancellation(brain, run_id);
         cancel.cancel();
 
-        // Durable run cancellation owns publication and effect fencing. Once
-        // that owner aborts the daemon wait, drop the callback receiver now so
-        // the original RPC settles without waiting for a begun physical
-        // effect. The effect-audit permit remains independently owned and its
-        // eventual terminal outcome cannot publish a run result.
-        if failure == RunnerDispatchFailure::RunAborted {
-            cancellation.disarm();
-            return Err(RunnerDispatchError::new(brain, operation, failure).into());
-        }
-
         // Do not release the durable run lane until the exact callback proves
         // quiescence by dropping its response sender. A late payload means the
         // frontend crossed the cancellation boundary and must re-register.
@@ -1634,7 +1661,6 @@ impl BrainRunnerBroker {
                     grant_ceiling,
                     control_tx: None,
                     effect_audit: None,
-                    cancel: cancel.clone(),
                     response_tx,
                 }))
                 .map_err(|_| self.disconnect_registration(brain, operation, &registration))?;
@@ -1692,7 +1718,6 @@ impl BrainRunnerBroker {
                     approval_connection_id,
                     approval_tx: None,
                     effect_audit: None,
-                    cancel: cancel.clone(),
                     response_tx,
                 }))
                 .map_err(|_| self.disconnect_registration(brain, operation, &registration))?;
@@ -1729,8 +1754,6 @@ impl BrainRunnerBroker {
             .send(RunnerRequest::Cancel(RunnerCancelRequest {
                 brain: brain.to_string(),
                 run_id,
-                cancel: cancel.clone(),
-                deadline,
                 response_tx,
             }))
             .map_err(|_| self.disconnect_registration(brain, operation, &registration))?;
@@ -1779,7 +1802,6 @@ impl BrainRunnerBroker {
                     request_seq,
                     prompt,
                     source,
-                    cancel: cancel.clone(),
                     response_tx,
                 },
             ))
@@ -1938,6 +1960,236 @@ mod tests {
         assert!(broker
             .require_connection_attachment(owner, "brain", attachment_id, attachment_connection_id,)
             .is_err());
+    }
+
+    #[test]
+    fn test_attachment_claim_is_rejected_after_connection_teardown_closes_dispatch() {
+        let broker = BrainRunnerBroker::default();
+        let connection_id = uuid::Uuid::new_v4();
+        broker
+            .claim_connection_identity(connection_id, "runner@box.local")
+            .unwrap();
+        let _teardown = broker.begin_connection_teardown(connection_id);
+
+        let error = broker
+            .claim_connection_attachment(
+                connection_id,
+                "brain",
+                AttachmentId(uuid::Uuid::new_v4()),
+                ConnectionId(uuid::Uuid::new_v4()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("tearing down"));
+    }
+
+    #[test]
+    fn test_registration_admission_is_atomic_with_replacement_installation() {
+        let broker = BrainRunnerBroker::default();
+        let lease_id = lease();
+        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, old_tx);
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *broker
+            .registration_admission_pause
+            .lock()
+            .expect("registration admission test hook poisoned") = Some((reached_tx, release_rx));
+
+        let admitting_broker = broker.clone();
+        let admitting = std::thread::spawn(move || {
+            admitting_broker
+                .registration("brain", lease_id, RunnerOperation::Program)
+                .unwrap()
+        });
+        reached_rx.recv().unwrap();
+
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let replacing_broker = broker.clone();
+        let replacing = std::thread::spawn(move || {
+            let (new_tx, new_rx) = mpsc::unbounded_channel();
+            replacing_broker.register("brain", lease_id, new_tx);
+            installed_tx.send(()).unwrap();
+            new_rx
+        });
+        assert!(installed_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+        release_tx.send(()).unwrap();
+        let (_registration, request) = admitting.join().unwrap();
+        installed_rx.recv().unwrap();
+        let _new_rx = replacing.join().unwrap();
+        assert_eq!(request.in_flight.load(Ordering::Acquire), 1);
+        drop(request);
+        assert!(broker.has_registration("brain", lease_id));
+    }
+
+    #[tokio::test]
+    async fn test_teardown_promotes_other_connection_pending_generation_after_inflight_quiesces() {
+        let broker = BrainRunnerBroker::default();
+        let old_connection = uuid::Uuid::new_v4();
+        let new_connection = uuid::Uuid::new_v4();
+        let old_lease = lease();
+        let new_lease = lease();
+        broker
+            .claim_connection_lease(old_connection, "brain", old_lease)
+            .unwrap();
+        broker
+            .claim_connection_lease(new_connection, "brain", new_lease)
+            .unwrap();
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        broker
+            .register_for_connection(old_connection, "brain", old_lease, old_tx)
+            .unwrap();
+
+        let dispatch_broker = broker.clone();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let dispatch = tokio::spawn(async move {
+            dispatch_broker
+                .dispatch_program(
+                    "brain",
+                    old_lease,
+                    run_id,
+                    1,
+                    ProgramLanguage::Lisp,
+                    "old".into(),
+                    RunnerProgramInteraction::Interactive,
+                    None,
+                )
+                .await
+        });
+        let RunnerRequest::Program(old_request) = old_rx.recv().await.unwrap() else {
+            panic!("expected old callback")
+        };
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+        let new_registration = broker
+            .register_for_connection(new_connection, "brain", new_lease, new_tx)
+            .unwrap();
+        let teardown = broker.begin_connection_teardown(old_connection);
+        assert!(!broker.has_registration("brain", old_lease));
+
+        drop(old_request.response_tx);
+        assert!(dispatch.await.unwrap().is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            broker.wait_registration_active("brain", new_registration),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(broker.has_registration("brain", new_lease));
+        teardown.wait_quiesced().await;
+    }
+
+    #[test]
+    fn test_public_runner_request_struct_literals_remain_source_compatible() {
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (program_tx, _program_rx) = oneshot::channel();
+        let _program = RunnerProgramRequest {
+            brain: "brain".into(),
+            run_id,
+            request_seq: 1,
+            language: ProgramLanguage::Lisp,
+            source: "noop".into(),
+            interaction: RunnerProgramInteraction::Interactive,
+            grant_ceiling: None,
+            control_tx: None,
+            effect_audit: None,
+            response_tx: program_tx,
+        };
+        let (turn_tx, _turn_rx) = oneshot::channel();
+        let _turn = RunnerTurnRequest {
+            brain: "brain".into(),
+            run_id,
+            request_seq: 1,
+            prompt: "prompt".into(),
+            context: Vec::new(),
+            approval_audience: test_approval_audience(),
+            approval_connection_id: None,
+            approval_tx: None,
+            effect_audit: None,
+            response_tx: turn_tx,
+        };
+        let (memory_tx, _memory_rx) = oneshot::channel();
+        let _memory = RunnerMemoryProjectionRequest {
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            brain: "brain".into(),
+            run_id,
+            request_seq: 1,
+            prompt: "prompt".into(),
+            source: "source".into(),
+            response_tx: memory_tx,
+        };
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let _cancel = RunnerCancelRequest {
+            brain: "brain".into(),
+            run_id,
+            response_tx: cancel_tx,
+        };
+    }
+
+    #[test]
+    fn test_cancelled_before_dispatch_fences_retire_with_run_abort() {
+        let broker = BrainRunnerBroker::default();
+        for _ in 0..10_000 {
+            let run_id = RunId(uuid::Uuid::new_v4());
+            broker.fence_run_cancellation("brain", run_id);
+            broker.abort_run("brain", run_id);
+        }
+        assert!(broker
+            .cancelled_before_dispatch
+            .lock()
+            .expect("runner cancellation-fence lock poisoned")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fenced_dispatch_cannot_retire_durable_fence_before_run_abort() {
+        let broker = BrainRunnerBroker::default();
+        let lease_id = lease();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, tx);
+        broker.fence_run_cancellation("brain", run_id);
+
+        assert!(broker
+            .dispatch_program(
+                "brain",
+                lease_id,
+                run_id,
+                1,
+                ProgramLanguage::Lisp,
+                "must not dispatch".into(),
+                RunnerProgramInteraction::Interactive,
+                None,
+            )
+            .await
+            .is_err());
+        assert!(broker
+            .cancelled_before_dispatch
+            .lock()
+            .expect("runner cancellation-fence lock poisoned")
+            .contains(&("brain".into(), run_id)));
+
+        broker.abort_run("brain", run_id);
+        assert!(!broker
+            .cancelled_before_dispatch
+            .lock()
+            .expect("runner cancellation-fence lock poisoned")
+            .contains(&("brain".into(), run_id)));
+    }
+
+    #[test]
+    fn test_failed_cancellation_dispatch_does_not_retain_a_fence() {
+        let broker = BrainRunnerBroker::default();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        assert!(broker
+            .request_run_cancellation("brain", lease(), run_id)
+            .is_err());
+        assert!(!broker
+            .cancelled_before_dispatch
+            .lock()
+            .expect("runner cancellation-fence lock poisoned")
+            .contains(&("brain".into(), run_id)));
     }
 
     #[tokio::test]
@@ -2196,11 +2448,8 @@ mod tests {
         let RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
             panic!("expected program request")
         };
-        let cancel = request.cancel.clone();
-
         tokio::time::advance(PROGRAM_DEADLINE).await;
         tokio::task::yield_now().await;
-        assert!(cancel.is_cancelled());
         assert!(!dispatch.is_finished());
         drop(request.response_tx);
         let error = dispatch.await.unwrap().unwrap_err();
@@ -2240,7 +2489,6 @@ mod tests {
 
         tokio::time::advance(PROGRAM_DEADLINE).await;
         tokio::task::yield_now().await;
-        assert!(request.cancel.is_cancelled());
         request
             .response_tx
             .send(Ok(program_result("crossed cancellation")))
@@ -2278,14 +2526,12 @@ mod tests {
         let RunnerRequest::Program(sender_drop_request) = rx.recv().await.unwrap() else {
             panic!("expected sender-drop request")
         };
-        let sender_drop_cancel = sender_drop_request.cancel.clone();
         drop(sender_drop_request.response_tx);
         assert_dispatch_failure(
             &sender_drop.await.unwrap().unwrap_err(),
             RunnerOperation::Program,
             RunnerDispatchFailure::ResponseDropped,
         );
-        assert!(sender_drop_cancel.is_cancelled());
 
         let receiver_drop_broker = broker.clone();
         let receiver_drop = tokio::spawn(async move {
@@ -2308,7 +2554,7 @@ mod tests {
         receiver_drop.abort();
         assert!(receiver_drop.await.unwrap_err().is_cancelled());
         tokio::task::yield_now().await;
-        assert!(receiver_drop_request.cancel.is_cancelled());
+        assert!(receiver_drop_request.response_tx.is_closed());
         assert!(receiver_drop_request
             .response_tx
             .send(Ok(program_result("late")))
@@ -2341,11 +2587,8 @@ mod tests {
         let RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
             panic!("expected turn request")
         };
-        let cancel = request.cancel.clone();
-
         tokio::time::advance(TURN_DEADLINE).await;
         tokio::task::yield_now().await;
-        assert!(cancel.is_cancelled());
         drop(request.response_tx);
         assert_dispatch_failure(
             &dispatch.await.unwrap().unwrap_err(),
@@ -2414,10 +2657,8 @@ mod tests {
         let RunnerRequest::Cancel(cancel_request) = rx.recv().await.unwrap() else {
             panic!("expected cancellation request")
         };
-        let cancel_token = cancel_request.cancel.clone();
         tokio::time::advance(CANCEL_DEADLINE).await;
         tokio::task::yield_now().await;
-        assert!(cancel_token.is_cancelled());
         drop(cancel_request.response_tx);
         assert_dispatch_failure(
             &cancel_dispatch.await.unwrap().unwrap_err(),
@@ -2442,10 +2683,8 @@ mod tests {
         let RunnerRequest::ProjectMemory(memory_request) = rx.recv().await.unwrap() else {
             panic!("expected memory request")
         };
-        let memory_cancel = memory_request.cancel.clone();
         tokio::time::advance(MEMORY_DEADLINE).await;
         tokio::task::yield_now().await;
-        assert!(memory_cancel.is_cancelled());
         drop(memory_request.response_tx);
         assert_dispatch_failure(
             &memory_dispatch.await.unwrap().unwrap_err(),
@@ -2482,10 +2721,8 @@ mod tests {
         let RunnerRequest::Program(stuck) = rx.recv().await.unwrap() else {
             panic!("expected first program request")
         };
-        let stuck_cancel = stuck.cancel.clone();
         tokio::time::advance(PROGRAM_DEADLINE).await;
         tokio::task::yield_now().await;
-        assert!(stuck_cancel.is_cancelled());
         assert!(!first.is_finished());
         drop(stuck.response_tx);
         assert_dispatch_failure(
@@ -2711,7 +2948,6 @@ mod tests {
         let (new_tx, mut new_rx) = mpsc::unbounded_channel();
         broker.register("brain", new_lease, new_tx);
         tokio::task::yield_now().await;
-        assert!(old_request.cancel.is_cancelled());
         assert!(
             !old_dispatch.is_finished(),
             "replacement must not release the old dispatch before callback cleanup"
@@ -2725,7 +2961,6 @@ mod tests {
             RunnerOperation::Program,
             RunnerDispatchFailure::GenerationInvalidated,
         );
-        assert!(old_request.cancel.is_cancelled());
         assert!(!broker.invalidate_lease("brain", old_lease));
         assert!(broker.has_registration("brain", new_lease));
 

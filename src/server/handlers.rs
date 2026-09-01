@@ -7985,7 +7985,6 @@ mod handler_tests {
         assert_eq!(stuck.run_id, runs[0].run_id);
         tokio::time::advance(program_deadline).await;
         tokio::task::yield_now().await;
-        assert!(stuck.cancel.is_cancelled());
         assert!(!resume.is_finished());
         assert!(rx.try_recv().is_err());
         // The frontend bridge retains this sender until exact cancelRun

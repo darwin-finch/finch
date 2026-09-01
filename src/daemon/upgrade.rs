@@ -242,6 +242,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
         anyhow::bail!("fresh daemon delivered the wrong runner callback");
     };
+    let request = request.request;
     anyhow::ensure!(
         request.brain == brain,
         "runner callback targeted the wrong Brain"
@@ -358,6 +359,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
         anyhow::bail!("restored callback delivered the wrong request");
     };
+    let request = request.request;
     anyhow::ensure!(
         request.brain == brain,
         "restored callback targeted the home Brain"
