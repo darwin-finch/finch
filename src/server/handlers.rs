@@ -1549,23 +1549,30 @@ fn committed_named_brain_memory_pair(
                 && matches!(event.kind, BrainEventKind::Program { .. })
         })
         .ok_or_else(|| anyhow::anyhow!("completed Brain turn has no provider Program event"))?;
-    anyhow::ensure!(
-        snapshot.events.iter().any(|event| {
-            matches!(
-                event.kind,
-                BrainEventKind::Result {
-                    request_seq,
-                    error: None,
-                    ..
-                } if request_seq == program.seq
-            )
-        }),
-        "completed Brain turn has no successful correlated Result event"
-    );
-    let BrainEventKind::Program { source, .. } = &program.kind else {
-        unreachable!("provider Program predicate checked above")
-    };
-    Ok((prompt, source.clone()))
+    // The rendered output, not the program that produced it.
+    //
+    // `persist_completed_turn_memory` deliberately hands named-Brain turns off
+    // to this path, so returning `Program { source }` here left the Brain half
+    // of #254 unfixed: memory kept indexing raw `(say ...)`, and
+    // `replay_committed_named_brain_memory` re-drove it on every runner
+    // registration. The correlated Result was already located to assert
+    // success; its `output` is what the user saw.
+    let output = snapshot
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            BrainEventKind::Result {
+                request_seq,
+                error: None,
+                output,
+                ..
+            } if *request_seq == program.seq => Some(output.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("completed Brain turn has no successful correlated Result event")
+        })?;
+    Ok((prompt, output))
 }
 
 /// Reissue semantic-memory projection from the canonical Brain log whenever
@@ -8725,7 +8732,18 @@ mod handler_tests {
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.request_seq, request_seq);
             assert_eq!(request.prompt, "remember this");
-            assert_eq!(request.source, source);
+            // #254: the projection carries what the turn produced, not the
+            // program that produced it. This assertion previously read
+            // `assert_eq!(request.source, source)` and is the regression for
+            // the named-Brain half of that fix — `persist_completed_turn_memory`
+            // defers Brain turns to this path, so leaving it on `source` kept
+            // memory indexing raw `(say ...)` while the non-Brain path was
+            // fixed.
+            assert_eq!(request.source, "remembered");
+            assert_ne!(
+                request.source, source,
+                "the emitted program must not be what gets remembered"
+            );
             let snapshot = callback_store.snapshot("shared").unwrap();
             assert_eq!(
                 snapshot
@@ -8860,7 +8878,12 @@ mod handler_tests {
                 assert_eq!(request.run_id, run.run_id);
                 assert_eq!(request.request_seq, prompt.seq);
                 assert_eq!(request.prompt, "remember after restart");
-                assert_eq!(request.source, "(say \"after restart\")");
+                // #254: replay projects the rendered output, not the program.
+                // This path re-drives on every runner registration, so leaving
+                // it on the source re-flooded memory with `(say ...)` on each
+                // reconnect.
+                assert_eq!(request.source, "after restart");
+                assert_ne!(request.source, "(say \"after restart\")");
                 request.response_tx.send(Ok(0)).unwrap();
             }
         });
