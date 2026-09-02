@@ -6905,12 +6905,13 @@ fn read_workbook_rows(
         .map(str::to_owned)
         .or_else(|| workbook.sheet_names().first().cloned())
         .ok_or_else(|| format!("workbook '{label}' has no sheets"))?;
-    // Bounded before the box is allocated, not after. The cell check further
-    // down bounds what Finch will iterate; it never bounded what calamine
-    // would allocate, so a two-cell sheet spanning A1 to XFD1048576 exhausted
-    // memory inside `worksheet_range` and never reached it (#282).
+    // Bounded before the box is allocated, not after. The cell check that used
+    // to sit further down bounded what Finch would iterate; it never bounded
+    // what calamine would allocate, so a two-cell sheet spanning A1 to
+    // XFD1048576 exhausted memory inside `worksheet_range` and never reached
+    // it (#282).
     let range = crate::workbook::bounded_worksheet_range(&mut workbook, &sheet, MAX_WORKBOOK_CELLS)
-        .map_err(|error| format!("cannot read workbook '{label}': {error}"))?;
+        .map_err(|error| format!("reading workbook '{label}': {error}"))?;
     // No second cell count here. `range.rows()` walks exactly the bounding box
     // that `bounded_worksheet_range` already refused to exceed, so a running
     // total could not reach the limit -- keeping the check would leave code
@@ -10666,6 +10667,35 @@ mod tests {
         assert!(
             error.contains("1048576 rows") && error.contains("16384 columns"),
             "the error must name the dimensions that made it too big: {error}"
+        );
+    }
+
+    /// And the same at the boundary when the header lies.
+    ///
+    /// The test above is caught by the constant-time check on the declared
+    /// extent, so it never exercises the streamed bound at the production
+    /// boundary. A file that declares `A1:B2` and holds a cell at
+    /// `XFD1048576` defeats a declared-only check entirely, and that is the
+    /// path this drives.
+    #[test]
+    fn read_workbook_rows_refuses_a_sheet_that_under_declares_its_extent() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&crate::workbook::fixtures::a_sheet_that_under_declares_its_extent())
+            .unwrap();
+        file.flush().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = read_workbook_rows(file.as_file(), "lying.xlsx", None)
+            .expect_err("the declared extent is not evidence about the cells");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "slow enough to have allocated the box"
+        );
+        assert!(
+            error.contains("actual extent"),
+            "must be refused on the streamed cells, not the header it lied in: {error}"
         );
     }
 

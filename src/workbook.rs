@@ -87,8 +87,9 @@ fn check_box(
 
 /// Open one worksheet with its bounding box checked before it is allocated.
 ///
-/// For XLSX and XLSB the check happens before any allocation, as described in
-/// the module docs. For XLS and ODS calamine offers no streaming reader, so the
+/// For XLSX and XLSB the check happens before the box is allocated, as
+/// described in the module docs. (The reader's own buffers and the vector of
+/// populated cells precede it; both are bounded, the latter explicitly.) For XLS and ODS calamine offers no streaming reader, so the
 /// box is measured only after `worksheet_range()` has built it: those formats
 /// still get the actionable error and still never silently truncate, but they
 /// do not get the allocation bound. XLS is capped by its own format at 65,536
@@ -104,9 +105,20 @@ pub(crate) fn bounded_worksheet_range<RS: Read + Seek>(
     max_cells: u64,
 ) -> Result<Range<Data>, String> {
     if let Sheets::Xlsx(xlsx) = workbook {
-        let mut reader = xlsx
-            .worksheet_cells_reader(sheet)
-            .map_err(|error| format!("cannot read workbook sheet '{sheet}': {error}"))?;
+        let mut reader = match xlsx.worksheet_cells_reader(sheet) {
+            Ok(reader) => reader,
+            // Chart sheets and dialog sheets are listed by `sheet_names()` and
+            // have no `sheetData`. calamine's own `worksheet_range_ref` warns
+            // and returns an empty range for these; propagating the error
+            // instead would make a workbook whose *first* sheet is a chart --
+            // ordinary Excel output, and the sheet picked when none is named --
+            // fail outright where it used to read zero rows.
+            Err(calamine::XlsxError::NotAWorksheet(kind)) => {
+                tracing::warn!(%sheet, %kind, "not a worksheet; reading it as empty");
+                return Ok(Range::empty());
+            }
+            Err(error) => return Err(format!("cannot read workbook sheet '{sheet}': {error}")),
+        };
         let declared = reader.dimensions();
         check_box(sheet, "declared", declared.start, declared.end, max_cells)?;
         return stream_bounded(sheet, max_cells, || {
@@ -116,6 +128,8 @@ pub(crate) fn bounded_worksheet_range<RS: Read + Seek>(
         });
     }
 
+    // Xlsb has no `NotAWorksheet` special case in calamine, so its error path
+    // stays as-is.
     if let Sheets::Xlsb(xlsb) = workbook {
         let mut reader = xlsb
             .worksheet_cells_reader(sheet)
@@ -160,6 +174,20 @@ where
         start = (start.0.min(row), start.1.min(col));
         end = (end.0.max(row), end.1.max(col));
         check_box(sheet, "actual", start, end, max_cells)?;
+        // The box is not the only thing that grows. A sheet repeating the same
+        // `<c r="A1">` element is a 1x1 box that passes the check on every
+        // iteration while this vector grows without limit -- and XLSX deflates
+        // that at roughly 1000:1, so the 512 MB file cap admits on the order of
+        // 1e10 of them. calamine's own reader has the same unbounded vector;
+        // bounding it here is what makes the module's claim about measuring
+        // memory before spending it actually hold.
+        if cells.len() as u64 >= max_cells {
+            return Err(format!(
+                "workbook sheet '{sheet}' contains more than {max_cells} populated cells, \
+                 which exceeds the limit even though the rectangle they span does not. \
+                 A sheet that repeats one address can do this from a very small file."
+            ));
+        }
         cells.push(Cell::new((row, col), Data::from(cell.get_value().clone())));
     }
     Ok(Range::from_sparse(cells))
@@ -251,6 +279,31 @@ pub(crate) mod fixtures {
             "A1:XFD1048576",
             &[("A1", "corner"), ("XFD1048576", "far corner")],
         )
+    }
+
+    /// A single chart sheet, which has no `sheetData` at all.
+    pub(crate) fn chartsheet() -> Vec<u8> {
+        let mut bytes = xlsx("A1:A1", &[("A1", "ignored")]);
+        // Rebuild with the worksheet part replaced by a chartsheet part. Simply
+        // renaming the element is enough: calamine dispatches on the root tag.
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let mut source = zip::ZipArchive::new(Cursor::new(std::mem::take(&mut bytes)))
+            .expect("fixture is a zip");
+        for index in 0..source.len() {
+            let mut entry = source.by_index(index).expect("zip entry");
+            let name = entry.name().to_string();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut body).expect("zip read");
+            if name == "xl/worksheets/sheet1.xml" {
+                body = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr/></chartsheet>"#
+                    .to_vec();
+            }
+            zip.start_file(name, SimpleFileOptions::default())
+                .expect("zip part");
+            zip.write_all(&body).expect("zip write");
+        }
+        zip.finish().expect("zip finish").into_inner()
     }
 
     /// The same trap, but the sheet lies about its size.
@@ -401,6 +454,38 @@ mod tests {
             error.contains("actual extent"),
             "a lying header must be caught on the streamed cells: {error}"
         );
+    }
+
+    /// A sheet whose cells all sit at one address is a 1x1 box.
+    ///
+    /// The box check passes on every iteration, so bounding the rectangle alone
+    /// leaves the vector of populated cells unbounded -- and XLSX deflates a
+    /// repeated element at roughly 1000:1, so the 512 MB file cap admits on the
+    /// order of 1e10 of them. calamine's own reader has the same hole.
+    #[test]
+    fn test_a_sheet_that_repeats_one_address_is_bounded_by_cell_count() {
+        let cells: Vec<(&str, &str)> = (0..200).map(|_| ("A1", "x")).collect();
+        let error = open_workbook_auto_from_rs(Cursor::new(fixtures::xlsx("A1:A1", &cells)))
+            .map(|mut wb| bounded_worksheet_range(&mut wb, "Sheet1", 100))
+            .expect("fixture opens")
+            .expect_err("200 cells exceeds a 100-cell limit even in a 1x1 box");
+        assert!(
+            error.contains("populated cells"),
+            "must be refused on the cell count, not the rectangle: {error}"
+        );
+    }
+
+    /// A chart sheet reads as empty, not as an error.
+    ///
+    /// `sheet_names()` lists chartsheets and dialogsheets, and calamine's own
+    /// `worksheet_range_ref` warns and returns an empty range for them.
+    /// Propagating the error instead would make a workbook whose first sheet is
+    /// a chart -- ordinary Excel output, and the sheet picked when none is
+    /// named -- fail outright where it used to read zero rows.
+    #[test]
+    fn test_a_chart_sheet_reads_as_empty_rather_than_failing() {
+        let range = read(fixtures::chartsheet()).expect("a chart sheet must not fail the read");
+        assert_eq!(range.rows().count(), 0);
     }
 
     #[test]

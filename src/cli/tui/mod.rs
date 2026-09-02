@@ -3435,25 +3435,32 @@ impl TuiRenderer {
                         // sheet into an empty preview, which reads as "this
                         // spreadsheet has no rows" -- the silent truncation
                         // #185 explicitly rules out (#282).
-                        let Some(name) = sheet_names.first().cloned() else {
-                            return Ok(());
-                        };
-                        match crate::workbook::bounded_worksheet_range(
-                            &mut wb,
-                            &name,
-                            crate::workbook::MAX_WORKBOOK_CELLS,
-                        ) {
-                            Ok(range) => Some(
-                                range
-                                    .rows()
-                                    .map(|row| {
-                                        row.iter().map(|c| c.to_string()).collect::<Vec<String>>()
-                                    })
-                                    .collect(),
-                            ),
-                            Err(error) => {
-                                Some(vec![vec![format!("cannot preview {path}: {error}")]])
-                            }
+                        // A workbook with no sheets still opens the viewer on
+                        // an empty grid, as it did before. Returning early here
+                        // skipped `EnterAlternateScreen` and gave the user no
+                        // output at all -- the silent no-op this change is
+                        // meant to remove, not introduce.
+                        match sheet_names.first() {
+                            None => Some(Vec::new()),
+                            Some(name) => match crate::workbook::bounded_worksheet_range(
+                                &mut wb,
+                                name,
+                                crate::workbook::MAX_WORKBOOK_CELLS,
+                            ) {
+                                Ok(range) => Some(
+                                    range
+                                        .rows()
+                                        .map(|row| {
+                                            row.iter()
+                                                .map(|c| c.to_string())
+                                                .collect::<Vec<String>>()
+                                        })
+                                        .collect(),
+                                ),
+                                Err(error) => {
+                                    Some(vec![vec![format!("cannot preview {path}: {error}")]])
+                                }
+                            },
                         }
                     }
                     Err(e) => Some(vec![vec![format!("error opening {path}: {e}")]]),
