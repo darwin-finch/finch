@@ -2083,7 +2083,7 @@ mod tests {
     /// freshly sampled hydration status. On the ordinary startup path -- which
     /// #242 made normal -- hydration finishes during the turn, so the fresh
     /// sample reads `Ready` and the accurate
-    /// "recalled 3 · searching 512 of 2048 entries" was replaced by a bare
+    /// "recalled 3 · searched at least 512 of 2048 entries" was replaced by a bare
     /// "recalled 3" at the moment the user actually read it. Carrying the
     /// observed index along with the count is what stops that (#275).
     #[tokio::test]

@@ -42,7 +42,7 @@ fn severity(status: &HydrationStatus) -> u8 {
 /// So the later sample contributes only its *kind*, never its counts. Taking
 /// the whole later sample was a subtler form of the same over-claim: with
 /// `before = Loading { loaded: 100 }` and the loader degrading at 1536 during
-/// the read, it rendered "recalled 3 · at least 1536 of 2048 entries searched"
+/// the read, it rendered "recalled 3 · only 1536 of 2048 entries loaded"
 /// for a read whose true coverage was somewhere in [100, 1536]. The earlier
 /// count is the only honest figure, and every string that prints it says "at
 /// least" for that reason.
@@ -88,10 +88,10 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // directly above this sentence. A vacuous bound is worse than no bound.
         HydrationStatus::Loading { loaded: 0, total } => Some(format!(
             "The memory index was still loading when this began, so how many of its \
-             {total} entries the read covered is unknown. Retrying shortly will reach more."
+             {total} entries the read covered is unknown. Retrying shortly may reach more."
         )),
         HydrationStatus::Loading { loaded, total } => Some(format!(
-            "The memory index is still loading: this read covered at least {loaded} of \
+            "The memory index was still loading when this read began: it covered at least {loaded} of \
              {total} entries. Retrying shortly may reach more."
         )),
         // Not "retrying will not find more": `degrade` fires on any batch read
@@ -105,6 +105,14 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // read, `observed` keeps the earlier sample's count, which is a lower
         // bound on what the read saw and lower than what finally loaded. Only a
         // sentence about the read is true of both.
+        // Reachable through `observed`'s count-carry when a read that began at
+        // zero meets a degrading loader. Vacuous rather than false, but the
+        // `Loading` arm above special-cases exactly this for exactly this
+        // reason: a bound of zero bounds nothing.
+        HydrationStatus::Degraded { loaded: 0, total, .. } => Some(format!(
+            "A read error stopped the memory index short, and how much of its {total} \
+             entries this read covered is unknown."
+        )),
         HydrationStatus::Degraded { loaded, total, .. } => Some(format!(
             "A read error stopped the memory index short: this read covered at least \
              {loaded} of {total} entries, and how much beyond that is unknown."
@@ -207,6 +215,11 @@ pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
         // wording must not imply progress is under way. It does not say the
         // state is permanent: `degrade` fires on any batch read error,
         // transient ones included, and a reload can clear it.
+        HydrationStatus::Degraded {
+            loaded: 0, total, ..
+        } => {
+            format!("🧠 recalled {recalled} · {total} entries total · index stopped short")
+        }
         HydrationStatus::Degraded { loaded, total, .. } => {
             format!(
                 "🧠 recalled {recalled} · searched at least {loaded} of {total} entries · index stopped short"
@@ -358,8 +371,9 @@ mod tests {
         // upper bound the same sentence has just left open, and is false: 1436
         // of "the rest" did load. A bound cannot end in an absolute.
         assert!(
-            !text.contains("the rest were not read"),
-            "closes an upper bound the sentence just left open: {text}"
+            text.contains("how much beyond that is unknown"),
+            "the tail must stay a bound; asserting only the absence of the old \
+             literal would pass for any other absolute: {text}"
         );
         // Index-centric wording would be false of this count: 1536 entries
         // loaded, not 100. Only a sentence about the read is true of both.
@@ -384,6 +398,14 @@ mod tests {
             "asserts nothing was read, beside results that were: {text}"
         );
         assert!(text.contains("unknown"), "{text}");
+        // And no prediction about a retry. This arm knows least -- a loader
+        // that fails at zero reaches nothing more, ever -- so it must hedge at
+        // least as hard as the arm that knows the loader is progressing.
+        assert!(
+            text.contains("may reach more"),
+            "promises a retry will help, from the state with the least evidence \
+             that it will: {text}"
+        );
 
         let line = status_line(3, &loading(0));
         assert!(
