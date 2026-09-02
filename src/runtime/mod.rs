@@ -7136,6 +7136,10 @@ fn normalize_iso_datetime(value: &str) -> String {
             parsed.offset()
         );
     }
+    // A space where `T` belongs is not legal `xs:dateTime` and calamine cannot
+    // produce one from a conformant file, so it is deliberately absent here --
+    // though `parse_from_rfc3339` does accept it, which is why an
+    // offset-bearing space form still reaches the branch above.
     for format in [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M",
@@ -7154,6 +7158,13 @@ fn normalize_iso_datetime(value: &str) -> String {
 }
 
 /// `PT13H45M30S` becomes `13:45:30`, matching how a `[h]:mm:ss` cell reads.
+///
+/// calamine maps ODS `office:time-value` to `DurationIso` for a time of day as
+/// well as for elapsed time, and the two are indistinguishable once here. So a
+/// 9:05 AM ODS cell reads "9:05:00" where the XLSX cell of the same value reads
+/// "09:05:00": elapsed hours are not zero-padded, and padding them would be
+/// wrong. That is the same intrinsic ODS ambiguity the offset case carries, and
+/// it is recorded rather than papered over.
 ///
 /// Anything this does not fully recognise is returned untouched. That is the
 /// contract, and the first version broke it in both directions: it accepted
@@ -11115,11 +11126,6 @@ mod tests {
         assert!(
             float(1.0e300).len() < 10,
             "expanded a huge float into the grid"
-        );
-        assert_ne!(
-            float(1.0e300),
-            "9223372036854775807",
-            "the i64 cast saturated"
         );
         // Ordinary spreadsheet numbers are untouched.
         assert_eq!(float(42.5), "42.5");
