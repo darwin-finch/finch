@@ -2074,6 +2074,7 @@ struct OpenAIFunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2153,6 +2154,61 @@ mod tests {
             .with_reasoning_effort(ReasoningEffort::High);
         provider.endpoints.chat_url = format!("{base_url}/v1/chat/completions");
         provider
+    }
+
+    async fn http2_response_server(
+        response_body: Option<&'static str>,
+        empty_data_frames: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP/2 fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("HTTP/2 fixture must expose its bound address");
+        let serving = tokio::spawn(async move {
+            let (socket, _) = listener
+                .accept()
+                .await
+                .expect("HTTP/2 fixture must accept the provider connection");
+            let mut connection = h2::server::handshake(socket)
+                .await
+                .expect("HTTP/2 fixture handshake must complete");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("HTTP/2 fixture connection must remain open")
+                .expect("HTTP/2 fixture must receive a request");
+            assert_eq!(
+                request.uri().path(),
+                "/v1/chat/completions",
+                "provider must send the request to the configured chat endpoint"
+            );
+            let response = axum::http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(())
+                .expect("HTTP/2 fixture response must be valid");
+            let mut stream = respond
+                .send_response(response, false)
+                .expect("HTTP/2 fixture must send response headers");
+            for frame_index in 0..empty_data_frames {
+                stream
+                    .send_data(Bytes::new(), false)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "HTTP/2 fixture failed to send empty DATA frame {frame_index}: {error}"
+                        )
+                    });
+            }
+            if let Some(body) = response_body {
+                stream
+                    .send_data(Bytes::from_static(body.as_bytes()), true)
+                    .expect("HTTP/2 fixture must send its terminal response body");
+            }
+            while connection.accept().await.is_some() {}
+        });
+        (format!("http://{address}"), serving)
     }
 
     async fn stalling_http_server(
@@ -2570,6 +2626,79 @@ mod tests {
             .await
             .expect("transport was not released after receiver drop")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_request_completes_over_http2_prior_knowledge() {
+        let (url, serving) = http2_response_server(
+            Some(
+                r#"{"id":"chat-h2","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            ),
+            0,
+        )
+        .await;
+        let mut provider = canonical_test_provider(url);
+        provider.client = Client::builder()
+            .http2_prior_knowledge()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("HTTP/2 provider client must build");
+
+        let response = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .expect("a normal HTTP/2 response must complete at the provider boundary");
+
+        assert_eq!(
+            response.model, "gpt-5.6-sol",
+            "the provider must preserve the model returned by a normal HTTP/2 response"
+        );
+        drop(provider);
+        tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .expect("the normal HTTP/2 fixture must quiesce after the provider is dropped")
+            .expect("the normal HTTP/2 fixture task must not panic");
+    }
+
+    #[tokio::test]
+    async fn canonical_request_rejects_excess_empty_http2_data_frames() {
+        let (url, serving) = http2_response_server(None, 101).await;
+        let mut provider = canonical_test_provider(url);
+        provider.client = Client::builder()
+            .http2_prior_knowledge()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("HTTP/2 provider client must build");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            provider.send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            ),
+        )
+        .await
+        .expect("excess empty HTTP/2 DATA frames must fail within the bounded request timeout");
+        let error = result.expect_err(
+            "the provider must reject a response that exceeds h2's empty DATA frame budget",
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("Failed to read OpenAI response body"),
+            "the provider must surface the HTTP/2 body failure with request context; got: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("too_many_data_frames"),
+            "the provider must preserve h2's excessive empty-DATA diagnosis; got: {diagnostic}"
+        );
+        drop(provider);
+        tokio::time::timeout(Duration::from_secs(2), serving)
+            .await
+            .expect("the hostile HTTP/2 fixture must quiesce after rejection")
+            .expect("the hostile HTTP/2 fixture task must not panic");
     }
 
     #[tokio::test]
