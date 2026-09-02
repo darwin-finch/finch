@@ -168,26 +168,6 @@ impl MemorySystem {
     }
 
     /// Project the existing Co-Forth library into the registry in one transaction.
-    pub async fn sync_forth_vocabulary(&self, library: &crate::coforth::Library) -> Result<usize> {
-        let definitions: Vec<_> = library
-            .all_entries()
-            .into_iter()
-            .filter_map(|entry| ProgramDefinition::from_forth_entry(entry, ProgramScope::Builtin))
-            .collect();
-        let mut conn = self.db.lock().await;
-        let tx = conn.transaction()?;
-        let mut inserted = 0;
-        for mut definition in definitions {
-            if upsert_definition(&tx, &mut definition)?.1 {
-                inserted += 1;
-            }
-        }
-        if inserted > 0 {
-            bump_generation(&tx)?;
-        }
-        tx.commit()?;
-        Ok(inserted)
-    }
 
     /// Load canonical `.forth` and `.lisp` files and update the searchable index.
     pub async fn sync_program_files(
