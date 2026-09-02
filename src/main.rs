@@ -3249,6 +3249,20 @@ mod tests {
                 line.starts_with('('),
                 "the REPL routes only a bare leading `(` to Lisp: {line}"
             );
+            // And it must demonstrate a workbook word. Without this,
+            // `(file-read (path "grades.xlsx"))` passes every other check --
+            // it links, types, resolves the path and stops at approval -- while
+            // showing nothing about reading a spreadsheet, which is what
+            // `finch samples` exists to introduce.
+            let word = line
+                .trim_start_matches('(')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            assert!(
+                word.starts_with("workbook-"),
+                "a samples instruction must demonstrate a workbook word, not {word:?}: {line}"
+            );
 
             // A sheet name is a runtime value, not a typed one: the broker only
             // discovers it is wrong after approval, so compiling the line
