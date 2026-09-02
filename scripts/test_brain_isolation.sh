@@ -6,10 +6,20 @@ trap 'status=$?; echo "Brain isolation regression failed in phase: $phase (line 
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
-default_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
-[[ -x "$default_supervisor" ]] || default_supervisor="$repo_root/target/debug/finch-test-supervisor"
-supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$default_supervisor}"
-[[ -x "$supervisor" ]] || { echo 'build finch-test-supervisor before running isolation regressions' >&2; exit 69; }
+
+# Direct callers, including the CI workflow, must cross the maintained
+# freshness boundary before this script selects an authority executable. A
+# fixed `-pinned` file can survive a cache restore from an older checkout and
+# is not evidence that its bytes implement the current proof contract. Use a
+# short supervised probe to report the freshly selected content-addressed
+# executable, then retain this harness's original unnested process topology.
+if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
+  supervisor="$("$repo_root/scripts/test_brains.sh" bash -c \
+    'printf "%s\n" "$FINCH_TEST_SUPERVISOR_BIN"')"
+else
+  supervisor="$FINCH_TEST_SUPERVISOR_BIN"
+fi
+[[ -x "$supervisor" ]] || { echo 'inherited test supervisor is not executable' >&2; exit 69; }
 
 scratch="$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/finch-brain-isolation-regression.XXXXXX")"
 sentinel_pid=''
