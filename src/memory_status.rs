@@ -288,6 +288,14 @@ mod tests {
             !text.contains("900"),
             "over-counts what was searched: {text}"
         );
+        // The read is the subject, not the index. "it covered at least N"
+        // makes the index the subject -- the framing the `Degraded` arm's
+        // comment forbids and its own test asserts against. The two arms
+        // drifted apart because only one of them was pinned.
+        assert!(
+            text.contains("this read covered"),
+            "describes the index rather than the read: {text}"
+        );
     }
 
     /// Failure discovered after the query still qualifies the answer.
@@ -377,12 +385,6 @@ mod tests {
             "the tail must stay a bound; asserting only the absence of the old \
              literal would pass for any other absolute: {text}"
         );
-        // Index-centric wording would be false of this count: 1536 entries
-        // loaded, not 100. Only a sentence about the read is true of both.
-        assert!(
-            text.contains("this read covered"),
-            "describes the index rather than the read: {text}"
-        );
     }
 
     /// A zero lower bound must not be stated as an absolute.
@@ -407,9 +409,18 @@ mod tests {
             !text.contains("unknown"),
             "calls unknown a number /memory displays directly above it: {text}"
         );
-        // And no prediction about a retry. This arm knows least -- a loader
-        // that fails at zero reaches nothing more, ever -- so it must hedge at
-        // least as hard as the arm that knows the loader is progressing.
+        // It must still say what it does know. Dropping the clause entirely
+        // would satisfy the negative above while losing the fix.
+        assert!(
+            text.contains("2048"),
+            "says nothing about how much there was to load: {text}"
+        );
+        // And the retry must stay hedged. This arm knows least -- a loader that
+        // fails at zero reaches nothing more, ever -- so it must hedge at least
+        // as hard as the arm that knows the loader is progressing. The
+        // assertion fires when "may" is absent, i.e. when some other prediction
+        // replaced it; the comment used to say "no prediction about a retry",
+        // which is the inverse of what it checks.
         assert!(
             text.contains("may reach more"),
             "promises a retry will help, from the state with the least evidence \
@@ -474,26 +485,32 @@ mod tests {
     /// `"the index is loading"` or `"loading is in progress"` fails too.
     #[test]
     fn test_no_rendering_claims_loading_is_still_under_way() {
-        const PRESENT_TENSE: &[&str] = &[
-            "is still loading",
-            "is loading",
-            "is being loaded",
-            "is in progress",
-            "loading is",
-            "is still being",
-            "currently loading",
-        ];
+        // A property, not a list of strings already removed.
+        //
+        // The first version blocklisted seven whole phrases, so "the index
+        // still loading" (no "is"), "hydration is under way" -- the phrase in
+        // this test's own name -- and "still hydrating" all passed. Matching
+        // fragments instead over-matched, because "was still loading" contains
+        // "still loading" and is exactly the wording that is correct.
+        //
+        // So the rule is the one that actually holds: a rendering may mention
+        // loading however it likes, as long as it anchors that mention to the
+        // past. `observed` returns the earlier sample, so an unanchored
+        // progress claim is falsifiable by the sample being rendered; an
+        // anchored one is true whatever happened since.
+        const PROGRESS: &[&str] = &["loading", "hydrat", "under way", "underway", "in progress"];
+        const PAST_ANCHOR: &[&str] = &["was ", "had ", "did not finish", "stopped"];
         for status in [ready(), loading(0), loading(1), degraded(), failed()] {
             let mut rendered = vec![status_line(1, &status)];
             rendered.extend(caveat(&status));
             rendered.extend(count_qualifier(&status).map(str::to_string));
             for text in rendered {
                 let lowered = text.to_lowercase();
-                for marker in PRESENT_TENSE {
+                if PROGRESS.iter().any(|word| lowered.contains(word)) {
                     assert!(
-                        !lowered.contains(marker),
-                        "{marker:?} is a present-tense progress claim, falsified by the \
-                         sample being rendered: {text}"
+                        PAST_ANCHOR.iter().any(|anchor| lowered.contains(anchor)),
+                        "mentions loading without anchoring it to the past, so the \
+                         sample being rendered can falsify it: {text}"
                     );
                 }
             }
@@ -521,6 +538,20 @@ mod tests {
         assert_ne!(notes[0], notes[1]);
         assert_ne!(notes[1], notes[2]);
         assert_ne!(notes[0], notes[2]);
+
+        // Each must attach to the count it follows. `/model show` renders
+        // "Memory: 512 nodes ({note})", so a note that does not qualify 512 --
+        // "a read error stopped the index short" on its own -- leaves the
+        // number unqualified, which is the entire job of the parenthetical.
+        // Distinctness and non-emptiness both survive that, so nothing pinned
+        // it until now.
+        for status in [loading(1), degraded(), failed()] {
+            let note = count_qualifier(&status).unwrap();
+            assert!(
+                note.starts_with("so far;"),
+                "does not qualify the count it follows: Memory: 512 nodes ({note})"
+            );
+        }
     }
 
     /// A degraded index whose bound is zero bounds nothing, same as `Loading`.
@@ -539,6 +570,12 @@ mod tests {
         assert!(
             !text.contains("unknown"),
             "calls unknown a number /memory displays directly above it: {text}"
+        );
+        // It must still say what it does know. Dropping the clause entirely
+        // would satisfy the negative above while losing the fix.
+        assert!(
+            text.contains("2048"),
+            "says nothing about how much there was to load: {text}"
         );
 
         let line = status_line(3, &zero);
