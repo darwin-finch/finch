@@ -1,26 +1,18 @@
-/// Co-Forth word library — English as Forth.
+/// The Co-Forth lexer, and nothing else.
 ///
-/// English is a very complicated Forth program.  Each word calls other words.
-/// Meaning is computed by execution.  This library gives Co-Forth a base
-/// vocabulary so users never start from nothing.
+/// This module once held an "English as Forth" vocabulary -- a seed lexicon of
+/// 392 words, each with a generated Forth body, plus an interpreter to run
+/// them. The interpreter went in #294 and the unreachable remainder in #298,
+/// both as dead code. The vocabulary itself is now removed too, on the owner's
+/// call that per-word generated snippets were never what the idea needed:
+/// English and Chinese words were meant to *be* the operations, composing into
+/// sentences that evaluate, and a dictionary of one-off demonstrations is a
+/// different thing that resembles it. The data is preserved on
+/// `archive/word-seed-vocabulary`.
 ///
-/// Architecture:
-/// - `WordEntry` — a word, its definition, and its relations to other words.
-/// - `Library` — the full vocabulary, loaded from embedded TOML + optional
-///   user-extended `~/.finch/library.toml`.
-/// - `Library::lookup` — find a word and its neighbours.
-/// - `Library::all_words` / `all_entries` — the whole vocabulary, for `finch library`.
-///
-/// The interpreter this vocabulary was written for is gone (#294). A `Forth`
-/// VM *was* constructed in non-test code, by a `LazyLock` this change removed
-/// along with it, but nothing outside `#[cfg(test)]` ever forced it, and every typed-program entry
-/// point dispatches to `crate::runtime`. Reachable-by-accident is not the same
-/// as unreachable, which is the argument for deleting it rather than
-/// documenting it. What remains is the vocabulary itself, which
-/// is live, and the lexer, whose token stream gives a Forth definition its
-/// identity.
-pub mod library;
+/// What survives is `tokenize`, which has nothing to do with any of that: it
+/// gives a Forth definition its identity, via
+/// `programs::forth_definition_identity`.
 pub mod tokens;
 
-pub use library::{Library, WordEntry};
 pub use tokens::tokenize;
