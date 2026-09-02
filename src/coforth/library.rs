@@ -34,10 +34,6 @@ pub struct WordEntry {
     #[serde(default)]
     pub sense: Option<String>, // disambiguating label e.g. "game", "romantic", "physics"
     #[serde(default)]
-    pub stack_effect: Option<String>, // Forth stack-effect comment e.g. "( n n -- n )"
-    #[serde(default)]
-    pub effect: Option<String>, // Finch effect class: pure, vm_read, workspace_write, ...
-    #[serde(default)]
     pub boot: bool, // if true, Forth code runs at startup (used for boot poetry etc.)
     #[serde(default)]
     pub remote: bool, // if true, peers may call this word via /v1/forth/eval
@@ -83,8 +79,11 @@ pub struct Library {
 impl Library {
     /// Load seed vocabulary + generated English library + user extensions.
     ///
-    /// Load order (later entries override earlier ones for the same word):
-    ///   1. SEED_LIBRARY — the only source a shipped binary has. **392 words.**
+    /// Load order. A later entry replaces an earlier one only when its `sense`
+    /// matches; a differing sense is added alongside, so this is per
+    /// (word, sense) rather than per word:
+    ///   1. SEED_LIBRARY — baked in, and the only source present on a fresh
+    ///      install outside a checkout. **392 words.**
     ///   2. {git_root}/vocabulary/*.toml — project-local modules, versioned in
     ///      the repo, and read from disk rather than from the baked-in copies
     ///      below. Adds 99, for 491 inside a checkout.
@@ -337,9 +336,7 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
 //
 // Kept rather than deleted because they are the obvious material for closing
 // the 99-word gap between a checkout and a shipped binary, and deleting them
-// would quietly remove that option. `WordEntry::stack_effect` and `effect` are
-// in the same position: their last production reader was `from_forth_entry`,
-// removed by this PR, and they are still populated from the TOML. That is a decision worth making
+// would quietly remove that option. That is a decision worth making
 // deliberately rather than as a side effect of a dead-code sweep.
 pub const EN_LIBRARY: &str = include_str!("../../vocabulary/en.toml");
 
@@ -2942,6 +2939,30 @@ mod tests {
         assert!(lib.len() > 50, "seed should have at least 50 words");
     }
 
+    /// The number the load-order doc states, pinned.
+    ///
+    /// `test_seed_loads` above calls `Library::load()`, which reads the real
+    /// `$HOME` -- so it cannot fail from contamination, but it cannot detect it
+    /// either, and its `> 50` bound would pass at any size. That is how the doc
+    /// came to claim 3,144 words for the seed when the true figure is 392: the
+    /// 2,752-word difference was this machine's own `~/.finch/library.toml`,
+    /// and nothing measured the seed alone.
+    ///
+    /// This loads only `SEED_LIBRARY`, so the documented figure and the code
+    /// cannot drift apart silently. If a seed word is added, this fails and the
+    /// doc gets updated with it -- which is the point.
+    #[test]
+    fn test_seed_library_alone_holds_the_documented_word_count() {
+        let mut lib = Library::default();
+        lib.load_toml(SEED_LIBRARY);
+        assert_eq!(
+            lib.len(),
+            392,
+            "SEED_LIBRARY is what a shipped binary has outside a checkout, and \
+             `Library::load`'s doc states this figure"
+        );
+    }
+
     #[test]
     fn test_lookup_forth() {
         let lib = Library::load();
@@ -3041,8 +3062,6 @@ mod completeness_tests {
             related: vec![],
             kind: "task".to_string(),
             sense: None,
-            stack_effect: Some("( n -- n )".to_string()),
-            effect: Some("pure".to_string()),
             boot: false,
             remote: false,
         };
@@ -3061,8 +3080,6 @@ mod completeness_tests {
             related: vec![],
             kind: "task".to_string(),
             sense: None,
-            stack_effect: None,
-            effect: None,
             boot: false,
             remote: false,
         };
@@ -3084,8 +3101,6 @@ mod completeness_tests {
             related: vec![],
             kind: "observation".to_string(),
             sense: None,
-            stack_effect: None,
-            effect: None,
             boot: false,
             remote: false,
         };
@@ -3104,8 +3119,6 @@ mod completeness_tests {
             related: vec![],
             kind: "task".to_string(),
             sense: None,
-            stack_effect: None,
-            effect: None,
             boot: false,
             remote: false,
         };
