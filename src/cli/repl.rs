@@ -4181,8 +4181,18 @@ impl Repl {
 
             let new_name = new_entry.profile_name();
             let memory_info = if let Some(ref memory) = self.memory_system {
+                // Same wrong number as `/memory` printed before #275: during
+                // hydration this counts what has loaded, not what the user
+                // stored. No room for a sentence here, so a parenthetical.
+                let before = memory.hydration_status();
                 let stats = memory.stats().await?;
-                format!(" (💾 {} nodes in memory)", stats.tree_node_count)
+                let index = crate::memory_status::observed(before, memory.hydration_status());
+                match crate::memory_status::count_qualifier(&index) {
+                    None => format!(" (💾 {} nodes in memory)", stats.tree_node_count),
+                    Some(note) => {
+                        format!(" (💾 {} nodes in memory — {note})", stats.tree_node_count)
+                    }
+                }
             } else {
                 String::new()
             };
@@ -4228,8 +4238,13 @@ impl Repl {
 
         // Get memory stats if available
         if let Some(ref memory) = self.memory_system {
+            let before = memory.hydration_status();
             let stats = memory.stats().await?;
-            self.output_status(format!("Memory: {} nodes", stats.tree_node_count));
+            let index = crate::memory_status::observed(before, memory.hydration_status());
+            self.output_status(match crate::memory_status::count_qualifier(&index) {
+                None => format!("Memory: {} nodes", stats.tree_node_count),
+                Some(note) => format!("Memory: {} nodes ({note})", stats.tree_node_count),
+            });
         }
 
         Ok(())
@@ -4238,7 +4253,13 @@ impl Repl {
     /// Phase 4: Handle /memory command (memory statistics)
     async fn handle_memory_stats(&self) -> Result<()> {
         if let Some(memory) = &self.memory_system {
+            // Paired sample, for the same reason the search surfaces use one:
+            // hydration can finish between the read and an after-only sample,
+            // which then reads `Ready` and prints an already-stale count with
+            // no qualification at all (#275).
+            let before = memory.hydration_status();
             let stats = memory.stats().await?;
+            let index = crate::memory_status::observed(before, memory.hydration_status());
 
             self.output_status("📚 Memory System Statistics:\n");
             self.output_status(format!(
@@ -4246,6 +4267,13 @@ impl Repl {
                 stats.conversation_count
             ));
             self.output_status(format!("MemTree nodes: {}", stats.tree_node_count));
+            // `tree_node_count` is the size of the in-memory tree, so during
+            // hydration it is a count of what has loaded, not of what the user
+            // has stored -- a flatly wrong number about their own data, shown
+            // without qualification (#275).
+            if let Some(caveat) = crate::memory_status::caveat(&index) {
+                self.output_status(caveat);
+            }
             self.output_status("");
 
             if stats.conversation_count > 0 {
