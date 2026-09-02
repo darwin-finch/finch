@@ -6965,24 +6965,7 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
     match cell {
         Data::Empty => String::new(),
         Data::String(value) => value.clone(),
-        // The i64 range is checked, not assumed: a float-to-int cast saturates,
-        // so a cell holding 1e300 rendered as 9223372036854775807. Same hazard
-        // as the serial guard below, in the arm above it.
-        Data::Float(value) if value.fract() == 0.0 && value.abs() < 9.0e18 => {
-            format!("{}", *value as i64)
-        }
-        // Past i64, exponent notation rather than the decimal expansion.
-        // The cast used to saturate, so 1e300 rendered as
-        // 9223372036854775807; routing it to `to_string()` instead would have
-        // put a 301-character cell in the grid and the TUI preview.
-        Data::Float(value)
-            if value.is_finite()
-                && *value != 0.0
-                && (value.fract() == 0.0 || value.abs() < 1.0e-10) =>
-        {
-            format!("{value:e}")
-        }
-        Data::Float(value) => value.to_string(),
+        Data::Float(value) => format_cell_number(*value),
         Data::Int(value) => value.to_string(),
         Data::Bool(value) => value.to_string(),
         Data::Error(value) => format!("#ERR:{value:?}"),
@@ -7007,14 +6990,14 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         // never returns `None`, so before this it was dead code that documented
         // a behaviour the function did not have.
         Data::DateTime(value) if !workbook_serial_is_renderable(value.as_f64()) => {
-            value.as_f64().to_string()
+            format_cell_number(value.as_f64())
         }
         Data::DateTime(value) if value.is_duration() => value.as_duration().map_or_else(
-            || value.as_f64().to_string(),
+            || format_cell_number(value.as_f64()),
             |duration| format_elapsed_seconds(duration.num_seconds() as f64),
         ),
         Data::DateTime(value) => value.as_datetime().map_or_else(
-            || value.as_f64().to_string(),
+            || format_cell_number(value.as_f64()),
             |datetime| {
                 // Which shape to print is decided by the serial, because
                 // `is_datetime` is true for a plain date, a date with a time,
@@ -7042,6 +7025,34 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         Data::DateTimeIso(value) => normalize_iso_datetime(value),
         Data::DurationIso(value) => normalize_iso_duration(value),
     }
+}
+
+/// Render a number as a cell, without letting it expand into the grid.
+///
+/// Every number this function produces goes through here, because the last four
+/// review rounds each found a fix applied to one arm and not its twin. The
+/// decimal-expansion blowup was removed from `Data::Float` and left on the
+/// out-of-range `Data::DateTime` fallback three arms above it -- same function,
+/// same match, same 301 characters, reachable from the same `<v>` element.
+///
+/// Rust's `f64` Display never uses exponent notation, so 1e300 is 301
+/// characters and a subnormal is 326. Exponent form round-trips bit-exactly and
+/// is never more than one character longer than the decimal, so nothing is lost
+/// by preferring it once a value is past the range a spreadsheet holds.
+fn format_cell_number(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    // Whole numbers inside i64 read as integers, which is what a spreadsheet
+    // shows. The range is checked, not assumed: a float-to-int cast saturates,
+    // so 1e300 rendered as 9223372036854775807.
+    if value.fract() == 0.0 && value.abs() < 9.0e18 {
+        return format!("{}", value as i64);
+    }
+    if value.abs() >= 9.0e18 || value.abs() < 1.0e-10 {
+        return format!("{value:e}");
+    }
+    value.to_string()
 }
 
 /// Whether a serial can be handed to calamine's chrono conversions at all.
@@ -7074,9 +7085,14 @@ fn format_elapsed_seconds(seconds: f64) -> String {
 ///
 /// A timezone is preserved rather than dropped -- `office:date-value` is
 /// `xs:dateTime`, which permits one, and losing it would be a silent change of
-/// meaning. Midnight loses its time component, matching the serial path: the
-/// two must agree, or the same logical cell reads differently depending on
-/// which format it arrived in, which is the whole complaint behind #281.
+/// meaning. That has a consequence worth stating rather than glossing: an Excel
+/// serial carries no offset, so an offset-bearing ODS cell does *not* read
+/// identically to the XLSX cell of the same instant. Preserving the offset is
+/// the better answer; the claim that every format agrees was too strong.
+///
+/// Midnight loses its time only when there is no offset to strand. With one,
+/// dropping the time glued the offset onto the date and produced
+/// "2026-09-02-05:00", which parses as nothing.
 ///
 /// Anything that does not parse is returned untouched.
 fn normalize_iso_datetime(value: &str) -> String {
@@ -7084,8 +7100,11 @@ fn normalize_iso_datetime(value: &str) -> String {
     // ODF file is entirely likely to carry. RFC 3339 requires seconds, so a
     // minute-precision `...T13:45Z` is rewritten to an explicit offset rather
     // than left as the one `Z` form that slips past.
+    // `['Z', 'z']` because `parse_from_rfc3339` accepts a lowercase `z`, so
+    // stripping only the uppercase one made the two disagree at minute
+    // precision -- a case asymmetry that did not exist before the rewrite.
     let with_offset = value
-        .strip_suffix('Z')
+        .strip_suffix(['Z', 'z'])
         .map_or_else(|| value.to_string(), |rest| format!("{rest}+00:00"));
     let parsed = chrono::DateTime::parse_from_rfc3339(&with_offset)
         .ok()
@@ -11093,6 +11112,51 @@ mod tests {
         assert_eq!(float(-7.0), "-7");
     }
 
+    /// No path through this function can expand a number into the grid.
+    ///
+    /// Asserted as a property over every arm, not as three examples, because
+    /// four consecutive review rounds each found a fix applied to one arm and
+    /// not its twin. The decimal-expansion blowup was removed from
+    /// `Data::Float` and left on the out-of-range `Data::DateTime` fallback
+    /// three arms above it -- same function, same match, same 301 characters,
+    /// reachable from the same `<v>` element and differing only in whether the
+    /// cell carried a date format.
+    #[test]
+    fn test_no_cell_renders_as_an_unbounded_decimal() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        let extremes = [
+            1.0e300,
+            -1.0e300,
+            f64::MAX,
+            f64::MIN,
+            5.0e-324,
+            -5.0e-324,
+            1.0e12,
+            -1.0e12,
+        ];
+        let mut cells: Vec<Data> = extremes.iter().map(|value| Data::Float(*value)).collect();
+        for value in extremes {
+            for kind in [ExcelDateTimeType::DateTime, ExcelDateTimeType::TimeDelta] {
+                for epoch in [false, true] {
+                    cells.push(Data::DateTime(ExcelDateTime::new(value, kind, epoch)));
+                }
+            }
+        }
+
+        for cell in cells {
+            let rendered = workbook_cell_to_string(&cell);
+            assert!(
+                rendered.len() <= 32,
+                "{cell:?} rendered {} characters: {rendered}",
+                rendered.len()
+            );
+        }
+    }
+
+    /// A number too big or small for a decimal uses exponent notation.
+    #[test]
+
     /// A crafted workbook must not take the process down.
     ///
     /// `ExcelDateTime::as_duration` and `as_datetime` both compute
@@ -11189,8 +11253,8 @@ mod tests {
         // `office:date-value` is `xs:dateTime`, which permits a timezone.
         // Preserved rather than dropped -- losing it silently changes what the
         // cell means -- but the `T` still goes, which is the artefact #281 is
-        // about. chrono's `%:z` does not accept a bare `Z`, so RFC 3339 is
-        // tried first.
+        // about. A trailing `Z` is rewritten to an explicit offset before
+        // either parser runs, in both letter cases.
         assert_eq!(iso("2026-09-02T13:45:30Z"), "2026-09-02 13:45:30+00:00");
         assert_eq!(
             iso("2026-09-02T13:45:30+01:00"),
@@ -11200,8 +11264,14 @@ mod tests {
         // that one form slipped past the fallback the comment claimed covered
         // it.
         assert_eq!(iso("2026-09-02T13:45Z"), "2026-09-02 13:45:00+00:00");
-        // Midnight drops its time, as the serial path does. The two must agree,
-        // or the same logical cell reads differently by format.
+        // Both letter cases, because `parse_from_rfc3339` accepts a lowercase
+        // `z` -- so stripping only the uppercase one made second precision and
+        // minute precision disagree, an asymmetry that did not exist before the
+        // rewrite.
+        assert_eq!(iso("2026-09-02T13:45z"), "2026-09-02 13:45:00+00:00");
+        assert_eq!(iso("2026-09-02T13:45:30z"), "2026-09-02 13:45:30+00:00");
+        // Midnight drops its time when there is no offset to strand, as the
+        // serial path does.
         assert_eq!(iso("2026-09-02T00:00:00"), "2026-09-02");
         // But not when an offset is present. Dropping the time glued the
         // offset onto the date and produced "2026-09-02-05:00", which parses
