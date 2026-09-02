@@ -98,6 +98,14 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // error, transient ones included, and a reload can clear the failure
         // within the same process. Stating it as permanent would be the same
         // claim-beyond-evidence as the sentence below.
+        // Reachable through `observed`'s count-carry when a read that began at
+        // zero meets a degrading loader. Vacuous rather than false, but the
+        // `Loading` arm above special-cases exactly this for exactly this
+        // reason: a bound of zero bounds nothing.
+        HydrationStatus::Degraded { loaded: 0, total, .. } => Some(format!(
+            "A read error stopped the memory index short, and how many of its {total} \
+             entries this read covered is unknown."
+        )),
         // Coverage-centric, not index-centric.
         //
         // "{loaded} of {total} entries loaded" was a claim about the index, and
@@ -105,14 +113,6 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // read, `observed` keeps the earlier sample's count, which is a lower
         // bound on what the read saw and lower than what finally loaded. Only a
         // sentence about the read is true of both.
-        // Reachable through `observed`'s count-carry when a read that began at
-        // zero meets a degrading loader. Vacuous rather than false, but the
-        // `Loading` arm above special-cases exactly this for exactly this
-        // reason: a bound of zero bounds nothing.
-        HydrationStatus::Degraded { loaded: 0, total, .. } => Some(format!(
-            "A read error stopped the memory index short, and how much of its {total} \
-             entries this read covered is unknown."
-        )),
         HydrationStatus::Degraded { loaded, total, .. } => Some(format!(
             "A read error stopped the memory index short: this read covered at least \
              {loaded} of {total} entries, and how much beyond that is unknown."
@@ -187,7 +187,7 @@ impl Recall {
 pub(crate) fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> {
     match status {
         HydrationStatus::Ready { .. } => None,
-        HydrationStatus::Loading { .. } => Some("so far; the index is still loading"),
+        HydrationStatus::Loading { .. } => Some("so far; the index was still loading"),
         HydrationStatus::Degraded { .. } => Some("a read error stopped the index short"),
         HydrationStatus::Failed { .. } => Some("the index did not finish loading"),
     }
@@ -206,7 +206,7 @@ pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
         // "searching 0 of 2048" beside a nonzero recall is refuted by its own
         // line, so the zero case names no count.
         HydrationStatus::Loading { loaded: 0, total } => {
-            format!("🧠 recalled {recalled} · index still loading, {total} entries total")
+            format!("🧠 recalled {recalled} · index was still loading, {total} entries total")
         }
         HydrationStatus::Loading { loaded, total } => {
             format!("🧠 recalled {recalled} · searched at least {loaded} of {total} entries")
@@ -445,6 +445,80 @@ mod tests {
             "denies reads that succeeded on the same screen: {text}"
         );
         assert!(text.contains("unknown"), "{text}");
+    }
+
+    /// Nothing here may claim, in the present tense, that loading is under way.
+    ///
+    /// `observed` returns the earlier sample whenever the later one is no
+    /// worse, so a `Loading` value is routinely rendered *after* hydration has
+    /// finished -- and `line_against` holds one deliberately for a whole turn,
+    /// which `test_a_recovered_index_does_not_erase_the_recalls_qualification`
+    /// asserts. A hedge in the present tense is falsified by the very sample
+    /// the renderer is holding. Round 8 fixed one of the three sites and its
+    /// message claimed two; this is why that was invisible.
+    #[test]
+    fn test_no_rendering_claims_loading_is_still_under_way() {
+        let mut rendered = vec![
+            caveat(&loading(0)).unwrap(),
+            caveat(&loading(1)).unwrap(),
+            status_line(1, &loading(0)),
+            status_line(1, &loading(1)),
+        ];
+        rendered.extend(
+            [loading(0), loading(1)]
+                .iter()
+                .filter_map(|status| count_qualifier(status).map(str::to_string)),
+        );
+        for text in rendered {
+            assert!(
+                !text.contains("is still loading"),
+                "present tense is falsified by the sample being rendered: {text}"
+            );
+        }
+    }
+
+    /// `count_qualifier` is what the surfaces with no room for a sentence show.
+    #[test]
+    fn test_count_qualifier_speaks_for_every_partial_state() {
+        assert!(count_qualifier(&ready()).is_none());
+        for status in [loading(0), loading(1), degraded(), failed()] {
+            let note = count_qualifier(&status)
+                .unwrap_or_else(|| panic!("a partial index owes a note: {status:?}"));
+            assert!(
+                note.chars().any(char::is_alphabetic) && note.len() > 6,
+                "{note:?}"
+            );
+        }
+        // The three must be distinguishable, for the same reason the status
+        // line's five must be: a reader gets only this parenthetical.
+        let notes: Vec<_> = [loading(1), degraded(), failed()]
+            .iter()
+            .map(|status| count_qualifier(status).unwrap())
+            .collect();
+        assert_ne!(notes[0], notes[1]);
+        assert_ne!(notes[1], notes[2]);
+        assert_ne!(notes[0], notes[2]);
+    }
+
+    /// A degraded index whose bound is zero bounds nothing, same as `Loading`.
+    #[test]
+    fn test_a_degraded_index_with_a_zero_bound_states_no_count() {
+        let zero = HydrationStatus::Degraded {
+            loaded: 0,
+            total: 2048,
+            reason: "first batch".into(),
+        };
+        let text = caveat(&zero).expect("a partial index owes a caveat");
+        assert!(
+            !text.contains("at least 0"),
+            "a bound of zero bounds nothing: {text}"
+        );
+        assert!(text.contains("unknown"), "{text}");
+
+        let line = status_line(3, &zero);
+        assert!(!line.contains("0 of 2048"), "{line}");
+        assert!(line.contains("stopped short"), "{line}");
+        assert!(line.contains('3'), "{line}");
     }
 
     /// A complete index owes no qualification at all.
