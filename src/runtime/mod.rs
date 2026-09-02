@@ -7421,7 +7421,10 @@ fn summarize_csv(
 /// `TypedHostHandler` are private, and the public submit API performs the hop
 /// itself — a caller on a worker is the case the test exercises and passes.
 /// `AgentVmBinding::block_on` delegates here rather than repeating the shape,
-/// so `agent-await` inherits both the requirement and this explanation (#289).
+/// so `agent-await` inherits both the requirement and this explanation. Both it
+/// and `AgentVmBinding::new` are `pub(crate)`: narrowing only the method would
+/// have left a composed path open, since a binding an external crate can build
+/// and attach to a `Forth` reaches this from a worker with no hop (#289).
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,

@@ -2251,7 +2251,7 @@ mod tests {
         runtime.spawn(async move {
             let program_runtime = Arc::new(ProgramRuntime::new());
             grant_agent_capabilities(&program_runtime);
-            let _scheduler = AgentScheduler::new(
+            let scheduler = AgentScheduler::new(
                 ProviderResolver::new(Arc::new(EchoGenerator)),
                 Arc::clone(&program_runtime),
             );
@@ -2271,11 +2271,13 @@ mod tests {
                 })
                 .await;
             // The scheduler hold is load-bearing: `AgentScheduler::new` stores
-            // only a `Weak` on the runtime, so dropping this `Arc` makes
-            // `agent-spawn` fail with "agent scheduler is unavailable" and the
-            // test would pass without a child task ever existing. Counting the
-            // tasks proves one did, and says so to the next reader.
-            let spawned = _scheduler.tasks.read().await.len();
+            // only a `Weak` on the runtime, so dropping this `Arc` would make
+            // `agent-spawn` fail with "agent scheduler is unavailable". The
+            // status assertion below already catches that, so counting the
+            // tasks is defence in depth and consistency with the two sibling
+            // tests -- not a hole it plugs. It does say to the next reader why
+            // the binding is held.
+            let spawned = scheduler.tasks.read().await.len();
             let _ = done_tx.send(outcome.map(|outcome| (outcome.status, spawned)));
         });
 

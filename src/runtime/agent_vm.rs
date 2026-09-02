@@ -14,7 +14,16 @@ pub struct AgentVmBinding {
 }
 
 impl AgentVmBinding {
-    pub fn new(scheduler: &Arc<AgentScheduler>, parent: Option<AgentIdentity>) -> Self {
+    /// `pub(crate)` for the same reason `block_on` is.
+    ///
+    /// Narrowing only `block_on` left a composed path open: `AgentScheduler::new`,
+    /// `AgentVmBinding::new` and `Forth::set_agent_binding` are all `pub`, so an
+    /// external crate could build a binding, attach it, and evaluate
+    /// `agent-await` from a runtime worker -- reaching `block_on_host` with no
+    /// `spawn_blocking` hop, which is exactly what its doc says cannot happen.
+    /// A binding that cannot be constructed out of tree closes that, rather
+    /// than softening the claim to match.
+    pub(crate) fn new(scheduler: &Arc<AgentScheduler>, parent: Option<AgentIdentity>) -> Self {
         Self {
             scheduler: Arc::downgrade(scheduler),
             parent,
