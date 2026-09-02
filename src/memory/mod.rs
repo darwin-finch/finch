@@ -57,7 +57,7 @@ static HYDRATION_BATCH_PAUSES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[cfg(test)]
-struct HydrationBatchPauseRegistration {
+pub(crate) struct HydrationBatchPauseRegistration {
     path: PathBuf,
     pause: Arc<HydrationBatchPause>,
 }
@@ -77,8 +77,11 @@ impl Drop for HydrationBatchPauseRegistration {
     }
 }
 
+/// Hold the production loader after `after_loaded` nodes so a test can
+/// observe a genuinely `Loading` index. Visible to `src/runtime` so the typed
+/// `mem-index-status` regression can drive the state #295 is about.
 #[cfg(test)]
-fn register_hydration_batch_pause(
+pub(crate) fn register_hydration_batch_pause(
     path: PathBuf,
     after_loaded: usize,
 ) -> (
@@ -362,7 +365,7 @@ enum Failure {
 
 /// Nodes hydrated per batch. Small enough that the tree and database locks are
 /// released frequently, so an interactive turn never waits on one long hold.
-const HYDRATION_BATCH: usize = 512;
+pub(crate) const HYDRATION_BATCH: usize = 512;
 
 /// Memory system with MemTree and SQLite storage
 pub struct MemorySystem {
