@@ -105,9 +105,30 @@ fn signature_algorithms_match(
     all_match && mappings_match
 }
 
+fn cipher_suites_match(
+    left: &[rustls::SupportedCipherSuite],
+    right: &[rustls::SupportedCipherSuite],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (
+                    rustls::SupportedCipherSuite::Tls12(left),
+                    rustls::SupportedCipherSuite::Tls12(right),
+                ) => std::ptr::eq(*left, *right),
+                (
+                    rustls::SupportedCipherSuite::Tls13(left),
+                    rustls::SupportedCipherSuite::Tls13(right),
+                ) => std::ptr::eq(*left, *right),
+                _ => false,
+            })
+}
+
 fn ring_provider_mismatch(provider: &rustls::crypto::CryptoProvider) -> Option<&'static str> {
     let ring = rustls::crypto::ring::default_provider();
-    if provider.cipher_suites != ring.cipher_suites {
+    if !cipher_suites_match(&provider.cipher_suites, &ring.cipher_suites) {
         return Some("its cipher suites differ from Finch's ring provider");
     }
     if provider.kx_groups.len() != ring.kx_groups.len()
@@ -271,6 +292,28 @@ mod tests {
 
         let mut modified = ring.clone();
         modified.cipher_suites.clear();
+        assert_provider_rejected(&modified, "cipher suites");
+
+        let original = ring.cipher_suites[0]
+            .tls13()
+            .expect("ring's first test cipher suite must use TLS 1.3");
+        let same_id_different_implementation = Box::leak(Box::new(rustls::Tls13CipherSuite {
+            common: rustls::crypto::CipherSuiteCommon {
+                suite: original.common.suite,
+                hash_provider: original.common.hash_provider,
+                confidentiality_limit: original.common.confidentiality_limit,
+            },
+            hkdf_provider: original.hkdf_provider,
+            aead_alg: original.aead_alg,
+            quic: original.quic,
+        }));
+        let mut modified = ring.clone();
+        modified.cipher_suites[0] =
+            rustls::SupportedCipherSuite::Tls13(same_id_different_implementation);
+        assert_eq!(
+            modified.cipher_suites, ring.cipher_suites,
+            "the regression fixture must demonstrate that Rustls equality compares only suite IDs"
+        );
         assert_provider_rejected(&modified, "cipher suites");
 
         let mut modified = ring.clone();
