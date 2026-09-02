@@ -10743,6 +10743,18 @@ mod tests {
              as proof the memory does not exist: {:?}",
             outcome.values
         );
+        // Assert the reason, not just the outcome. A denied capability, a
+        // renamed word, a rejected effect or a detached memory binding would
+        // all satisfy `!= Completed`, so without this the test could pass
+        // without ever reaching the hydration check.
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("memory index is unavailable")),
+            "failed for some other reason than the unusable index: {:?}",
+            outcome.diagnostics
+        );
     }
 
     #[cfg(unix)]

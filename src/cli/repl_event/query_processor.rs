@@ -801,7 +801,7 @@ async fn persist_completed_turn_memory(
     }
     status_bar.update_line(
         crate::cli::status_bar::StatusLineType::MemoryContext,
-        memory_recall.line(),
+        memory_recall.line_against(memory_system.hydration_status()),
     );
     refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
@@ -987,7 +987,7 @@ pub(super) async fn dispatch_tool_uses(
     if let Some(ref mem) = memory_system {
         status_bar.update_line(
             crate::cli::status_bar::StatusLineType::MemoryContext,
-            memory_recall.line(),
+            memory_recall.line_against(mem.hydration_status()),
         );
         refresh_context_strip(mem, session_label, cwd, status_bar, context_lines).await;
     }
@@ -2021,7 +2021,6 @@ pub(crate) fn apply_sliding_window(
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

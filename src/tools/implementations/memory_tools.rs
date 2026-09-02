@@ -87,9 +87,7 @@ impl Tool for SearchMemoryTool {
                 // entries read" to speak of -- pairing the two produced the
                 // self-contradicting "No matches among the memories searched.
                 // The memory index is unavailable, so nothing could be read."
-                Some(caveat) if matches!(index, crate::memory::HydrationStatus::Failed { .. }) => {
-                    caveat
-                }
+                Some(caveat) if crate::memory_status::read_nothing(&index) => caveat,
                 // Deliberately not "no memories found": that would assert
                 // absence on the strength of an index that was not read.
                 Some(caveat) => format!("No matches among the entries that were read. {caveat}"),
@@ -185,16 +183,28 @@ impl Tool for InspectMemoryTool {
         let memory_id = params["memory_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: memory_id"))?;
-        // Same false-absence hazard as `search_memory`, and reached the same
-        // way: a `node:<id>` lookup goes through the in-memory tree, so a node
-        // that has not hydrated yet is indistinguishable from one that does not
-        // exist. Reporting the former as the latter tells a model the memory
-        // was never recorded (#275).
+        // Only the `node:<id>` form is answered from the index.
+        //
+        // That form goes through the in-memory tree, so an unhydrated node is
+        // indistinguishable from a nonexistent one and a plain "not found"
+        // tells a model the memory was never recorded (#275). Every other
+        // `memory_id` -- including the conversation ids `query_with_sources`
+        // attaches to attributed memories, which is the common case -- is a
+        // direct SQLite read that hydration cannot affect. Qualifying those
+        // manufactures doubt about a settled negative and sends a model back to
+        // retry a definitive answer: this defect's mirror image, not its fix.
+        //
+        // `trim()` because `inspect_memory` trims before matching the prefix,
+        // and a gate that disagreed with the lookup would caveat the wrong ids.
+        let from_index = memory_id.trim().starts_with("node:");
         let before = self.memory_system.hydration_status();
         let found = self.memory_system.inspect_memory(memory_id).await?;
         let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
         let Some(memory) = found else {
-            return Ok(match crate::memory_status::caveat(&index, false) {
+            let caveat = from_index
+                .then(|| crate::memory_status::caveat(&index, false))
+                .flatten();
+            return Ok(match caveat {
                 None => format!("No memory found for memory_id={memory_id}"),
                 Some(caveat) => {
                     format!("No memory with memory_id={memory_id} is in the loaded index. {caveat}")
@@ -542,9 +552,10 @@ mod tests {
         })?);
         // Pin the path, not just the outcome. `HydrationState::new` seeds
         // `done` only when the store is empty, and this fixture is not, so on
-        // the spawned path the status is necessarily `Loading` the instant
-        // `new` returns -- while the synchronous path has already finished. Cut
-        // the `MultiThread` arm out of `MemorySystem::new` and this assertion
+        // the spawned path the status still reads `Loading` when `new` returns
+        // -- the main thread has a few instructions' head start on the worker
+        // -- while the synchronous path has already finished. Cut the
+        // `MultiThread` arm out of `MemorySystem::new` and this assertion
         // fails, which is what makes the test cover the batched loader rather
         // than merely coexist with it.
         assert!(
@@ -576,6 +587,75 @@ mod tests {
             result.contains("unavailable"),
             "did not tell the caller the index was unreadable: {result}"
         );
+
+        Ok(())
+    }
+
+    /// Only the index-backed lookup form gets an index caveat.
+    ///
+    /// `node:<id>` resolves through the MemTree, so an unhydrated node reads as
+    /// a nonexistent one and a bare "not found" is a false absence claim. Every
+    /// other memory_id -- including the conversation ids attached to attributed
+    /// memories, which is the common case -- is a direct SQLite read that
+    /// hydration cannot affect. Caveating those manufactures doubt about a
+    /// settled negative and sends a model back to retry a definitive answer,
+    /// which is this defect's mirror image rather than its fix (#275).
+    ///
+    /// Both halves are asserted here because the gate was twice described in a
+    /// comment without being present in the code.
+    #[tokio::test]
+    async fn test_inspect_qualifies_only_the_lookups_the_index_answers() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let db_path = temp.path().to_path_buf();
+        {
+            let memory = MemorySystem::new(MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })?;
+            memory
+                .insert_conversation("user", "a memory that will be stranded", Some("t"), None)
+                .await?;
+        }
+        break_hydration(&db_path)?;
+
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path,
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Failed { .. }
+            ),
+            "fixture must break hydration, or neither half of this test can fail"
+        );
+        let tool = InspectMemoryTool::new(memory);
+
+        let from_index = tool
+            .execute(
+                serde_json::json!({ "memory_id": "node:7" }),
+                &test_context(),
+            )
+            .await?;
+        assert!(
+            from_index.contains("index is unavailable"),
+            "a node lookup against an unusable index must not read as absence: {from_index}"
+        );
+
+        let from_sqlite = tool
+            .execute(
+                serde_json::json!({ "memory_id": "a-conversation-id-that-does-not-exist" }),
+                &test_context(),
+            )
+            .await?;
+        assert!(
+            !from_sqlite.contains("index"),
+            "qualified a settled SQLite negative, which sends a model back to \
+             retry an answer that will never change: {from_sqlite}"
+        );
+        assert!(from_sqlite.contains("No memory found"), "{from_sqlite}");
 
         Ok(())
     }

@@ -65,6 +65,13 @@ pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> Hydra
 pub(crate) fn caveat(status: &HydrationStatus, found_any: bool) -> Option<String> {
     match status {
         HydrationStatus::Ready { .. } => None,
+        // Zero read is not "at least 0 read": it is the same nothing-was-read
+        // state as `Failed`, and pairing it with a "no matches among the
+        // entries read" lead sentence made that lead vacuous.
+        HydrationStatus::Loading { loaded: 0, total } => Some(format!(
+            "The memory index is still loading and none of its {total} entries had been \
+             read yet. Retrying shortly may reach some."
+        )),
         HydrationStatus::Loading { loaded, total } => Some(format!(
             "The memory index was still loading: at least {loaded} of {total} entries \
              had been read. Retrying shortly may reach more."
@@ -83,15 +90,30 @@ pub(crate) fn caveat(status: &HydrationStatus, found_any: bool) -> Option<String
             "The memory index is incomplete: {loaded} of {total} entries loaded before a \
              read error stopped it, and the remainder were not read."
         )),
+        // "so nothing could be read" was too broad once these strings were
+        // shared: under `/memory` it sat directly beneath a conversation count
+        // that had just been read from SQLite successfully. What failed is the
+        // loading of entries into the index, and that is what it now says.
         HydrationStatus::Failed { .. } if found_any => Some(
-            "The memory index has since failed: what is reported here came from the part \
-             that had loaded, and the rest of the store was not read."
+            "The memory index has since failed: what is reported here came from the \
+             entries that had loaded, and the rest were not."
                 .to_string(),
         ),
-        HydrationStatus::Failed { .. } => {
-            Some("The memory index is unavailable, so nothing could be read.".to_string())
-        }
+        HydrationStatus::Failed { .. } => Some(
+            "The memory index is unavailable: none of the stored entries could be \
+             loaded into it."
+                .to_string(),
+        ),
     }
+}
+
+/// Whether the index had read nothing at all, so a caller must not prefix its
+/// caveat with a claim about "the entries that were read".
+pub(crate) fn read_nothing(status: &HydrationStatus) -> bool {
+    matches!(
+        status,
+        HydrationStatus::Failed { .. } | HydrationStatus::Loading { loaded: 0, .. }
+    )
 }
 
 /// What a turn recalled, together with the index it recalled from.
@@ -120,6 +142,15 @@ impl Recall {
     pub(crate) fn line(&self) -> String {
         status_line(self.count, &self.index)
     }
+
+    /// The line for a later refresh, which knows the live index too.
+    ///
+    /// Takes the worse of the two, so it can never claim a more complete index
+    /// than the recall actually saw, and still surfaces a failure that happened
+    /// after the recall rather than holding the old state until the next turn.
+    pub(crate) fn line_against(&self, live: HydrationStatus) -> String {
+        status_line(self.count, &observed(self.index.clone(), live))
+    }
 }
 
 /// The TUI status-strip line: what was recalled, and out of how much.
@@ -135,8 +166,10 @@ pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
         HydrationStatus::Loading { loaded, total } => {
             format!("🧠 recalled {recalled} · searching {loaded} of {total} entries")
         }
-        // Terminal, unlike `Loading` — retrying will not improve it, so the
-        // wording must not imply progress.
+        // Distinct from `Loading` because hydration has stopped, so the
+        // wording must not imply progress is under way. It does not say the
+        // state is permanent: `degrade` fires on any batch read error,
+        // transient ones included, and a reload can clear it.
         HydrationStatus::Degraded { loaded, total, .. } => {
             format!("🧠 recalled {recalled} · only {loaded} of {total} entries loaded")
         }
@@ -216,11 +249,11 @@ mod tests {
     fn test_a_failed_index_that_still_returned_hits_does_not_claim_it_searched_nothing() {
         let with_hits = caveat(&failed(), true).expect("failure owes a caveat");
         assert!(
-            !with_hits.contains("nothing could be read"),
+            !with_hits.contains("none of the stored entries"),
             "contradicts the results printed above it: {with_hits}"
         );
         let without_hits = caveat(&failed(), false).expect("failure owes a caveat");
-        assert!(without_hits.contains("nothing could be read"));
+        assert!(without_hits.contains("none of the stored entries could be loaded"));
     }
 
     /// The unread remainder was not read; it was not proven unreadable.
@@ -231,6 +264,42 @@ mod tests {
             !text.contains("unreadable"),
             "asserts a property of data it never read: {text}"
         );
+    }
+
+    /// Zero entries read is the same "nothing was read" state as failure.
+    ///
+    /// Callers prefix the caveat with "No matches among the entries that were
+    /// read", which is vacuous when that set is empty -- so `read_nothing`
+    /// groups the two and the caveat itself must not claim entries were read.
+    #[test]
+    fn test_an_index_that_has_read_nothing_yet_does_not_talk_about_entries_read() {
+        assert!(read_nothing(&loading(0)));
+        assert!(read_nothing(&failed()));
+        assert!(!read_nothing(&loading(1)));
+        assert!(!read_nothing(&degraded()));
+        assert!(!read_nothing(&ready()));
+
+        let text = caveat(&loading(0), false).expect("a partial index owes a caveat");
+        assert!(
+            !text.contains("at least 0"),
+            "reports a count of entries it never read: {text}"
+        );
+    }
+
+    /// The failure sentence must not deny reads that did succeed.
+    ///
+    /// `/memory` prints it directly beneath a conversation count read from
+    /// SQLite, which hydration cannot affect. "Nothing could be read"
+    /// contradicted the line above it; what failed is loading entries into the
+    /// index.
+    #[test]
+    fn test_the_failure_sentence_blames_the_index_not_every_read() {
+        let text = caveat(&failed(), false).expect("failure owes a caveat");
+        assert!(
+            !text.contains("nothing could be read"),
+            "denies reads that succeeded on the same screen: {text}"
+        );
+        assert!(text.contains("index"), "{text}");
     }
 
     /// A complete index owes no qualification at all.
@@ -277,8 +346,7 @@ mod tests {
             .iter()
             .map(|status| {
                 status_line(1, status)
-                    .replace('🧠', "")
-                    .replace('·', "")
+                    .replace(['🧠', '·'], "")
                     .trim()
                     .to_string()
             })
