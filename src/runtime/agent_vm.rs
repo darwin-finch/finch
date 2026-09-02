@@ -14,7 +14,18 @@ pub struct AgentVmBinding {
 }
 
 impl AgentVmBinding {
-    pub fn new(scheduler: &Arc<AgentScheduler>, parent: Option<AgentIdentity>) -> Self {
+    /// `pub(crate)` for the same reason `block_on` is.
+    ///
+    /// Narrowing only `block_on` left a composed path open: an external crate
+    /// could build a binding through the then-`pub` `AgentScheduling::new` and
+    /// `AgentVmBinding::new`, attach it to the Co-Forth interpreter's
+    /// `set_agent_binding`, and evaluate `agent-await` from a runtime worker --
+    /// reaching `block_on_host` with no `spawn_blocking` hop, which is exactly
+    /// what its doc says cannot happen. #294 has since removed that
+    /// interpreter, so that particular third leg is gone; the constructor stays
+    /// `pub(crate)` because the claim should hold on its own terms and not on
+    /// which consumers happen to exist.
+    pub(crate) fn new(scheduler: &Arc<AgentScheduler>, parent: Option<AgentIdentity>) -> Self {
         Self {
             scheduler: Arc::downgrade(scheduler),
             parent,
@@ -63,18 +74,29 @@ impl AgentVmBinding {
         scheduler.cancel(task_id).await
     }
 
-    pub fn block_on<T: Send + 'static>(
+    /// Run an async scheduler effect to completion from synchronous typed code.
+    ///
+    /// **Callers must not be on a runtime worker thread**, for the reason
+    /// `super::block_on_host` documents at length: the join blocks the calling
+    /// thread, and `agent-await` waits on a child task that is `tokio::spawn`ed
+    /// onto the same runtime, so on a single-worker runtime the worker the
+    /// child needs is the one blocking.
+    ///
+    /// This delegates rather than repeating the shape. It was byte-for-byte
+    /// `block_on_host` with none of the explanation, so when #284 established
+    /// and documented the constraint on one of them, the other kept carrying it
+    /// silently (#289). One implementation is one place to state the rule, and
+    /// one place to change if the rule ever stops holding.
+    /// `pub(crate)`, deliberately. `block_on_host`'s doc rests on the claim
+    /// that an out-of-tree caller cannot reach it, and a `pub` wrapper that
+    /// delegates there would have made that claim false -- the delegation would
+    /// have widened the reachable surface rather than only sharing the
+    /// explanation. Every caller is in-crate.
+    pub(crate) fn block_on<T: Send + 'static>(
         &self,
         operation: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| anyhow::anyhow!("agent scheduler requires a Tokio runtime"))?;
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || handle.block_on(operation))
-                .join()
-                .map_err(|_| anyhow::anyhow!("agent scheduler worker panicked"))?
-        })
+        super::block_on_host(operation)
     }
 }
 

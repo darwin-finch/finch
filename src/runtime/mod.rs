@@ -6953,19 +6953,278 @@ fn read_workbook_rows(
     Ok(rows)
 }
 
-fn workbook_cell_to_string(cell: &calamine::Data) -> String {
+/// Render one spreadsheet cell as the text a user or program sees.
+///
+/// `pub(crate)` so the TUI preview shares it. Two converters meant two answers
+/// for the same cell: the preview mapped cells with a bare `to_string()`, which
+/// is calamine's `Display`, which prints a date as its Excel serial -- the
+/// defect this function was fixed for, still live one module over.
+pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
     use calamine::Data;
 
     match cell {
         Data::Empty => String::new(),
         Data::String(value) => value.clone(),
-        Data::Float(value) if value.fract() == 0.0 => format!("{}", *value as i64),
-        Data::Float(value) => value.to_string(),
+        Data::Float(value) => format_cell_number(*value),
         Data::Int(value) => value.to_string(),
         Data::Bool(value) => value.to_string(),
         Data::Error(value) => format!("#ERR:{value:?}"),
-        other => other.to_string(),
+        // Elapsed time is not a point in time.
+        //
+        // A `[h]:mm:ss` cell holding 25 hours is `TimeDelta` with serial
+        // 1.0416..., which looks exactly like a date's -- so choosing the shape
+        // from the serial alone rendered it "1900-01-01 01:00:00", the Excel
+        // epoch leaking into the user's output. `is_duration` is the type, and
+        // here the type is what decides.
+        //
+        // The range guard is not belt-and-braces: `ExcelDateTime::as_duration`
+        // and `as_datetime` both compute `Duration::milliseconds(ms.round() as
+        // i64)` *before* any `Option`, and a float-to-int cast saturates, so a
+        // serial past ~1.07e11 -- or an infinity, which `<v>` parses happily --
+        // reaches chrono as `i64::MIN` and panics. A crafted `<v>-1e12</v>` in
+        // an otherwise ordinary workbook took the process down, through both
+        // `read_workbook_rows` and the TUI preview. Finch has no
+        // `catch_unwind`.
+        //
+        // The fallback below is still dead code: `as_duration` returns `Some`
+        // unconditionally in calamine 0.36.1, so nothing reaches it. It is kept
+        // for uniformity with the arm beneath, whose `None` is real -- but the
+        // previous commit claimed the guard made it reachable, and it does not.
+        Data::DateTime(value) if !workbook_serial_is_renderable(value.as_f64()) => {
+            format_cell_number(value.as_f64())
+        }
+        Data::DateTime(value) if value.is_duration() => value.as_duration().map_or_else(
+            || format_cell_number(value.as_f64()),
+            |duration| format_elapsed_seconds(duration.num_seconds() as f64),
+        ),
+        Data::DateTime(value) => value.as_datetime().map_or_else(
+            || format_cell_number(value.as_f64()),
+            |datetime| {
+                // Which shape to print is decided by the serial, because
+                // `is_datetime` is true for a plain date, a date with a time,
+                // and a bare time alike. Rendering all three the same way gave
+                // "2026-09-02 00:00:00" for a date.
+                //
+                // The range is half-open at zero on purpose: a *negative*
+                // serial is not a time of day, and treating it as one dropped
+                // the sign, so -1.5 read as "12:00:00".
+                //
+                // Known limit: in a 1904-epoch workbook, serial 0 is
+                // 1904-01-01 and prints as "00:00:00". `ExcelDateTime` does not
+                // expose which epoch it carries, so that one day is
+                // indistinguishable from a midnight time-of-day.
+                let serial = value.as_f64();
+                if (0.0..1.0).contains(&serial) {
+                    datetime.format("%H:%M:%S").to_string()
+                } else if serial.fract() == 0.0 {
+                    datetime.format("%Y-%m-%d").to_string()
+                } else {
+                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                }
+            },
+        ),
+        Data::DateTimeIso(value) => normalize_iso_datetime(value),
+        Data::DurationIso(value) => normalize_iso_duration(value),
     }
+}
+
+/// Render a number as a cell, without letting it expand into the grid.
+///
+/// Every number this function produces goes through here, because the last four
+/// review rounds each found a fix applied to one arm and not its twin. The
+/// decimal-expansion blowup was removed from `Data::Float` and left on the
+/// out-of-range `Data::DateTime` fallback three arms above it -- same function,
+/// same match, same 301 characters, reachable from the same `<v>` element.
+///
+/// Rust's `f64` Display never uses exponent notation, so 1e300 is 301
+/// characters and a subnormal is 326. Exponent form round-trips bit-exactly and
+/// is never more than one character longer than the decimal, so nothing is lost
+/// by preferring it once a value is past the range a spreadsheet holds.
+fn format_cell_number(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    // Whole numbers inside i64 read as integers, which is what a spreadsheet
+    // shows. The range is checked, not assumed: a float-to-int cast saturates,
+    // so 1e300 rendered as 9223372036854775807.
+    if value.fract() == 0.0 && value.abs() < 9.0e18 {
+        return format!("{}", value as i64);
+    }
+    if value.abs() >= 9.0e18 || value.abs() < 1.0e-10 {
+        return format!("{value:e}");
+    }
+    value.to_string()
+}
+
+/// Whether a serial can be handed to calamine's chrono conversions at all.
+///
+/// They cast `serial * 86_400_000` to `i64` before any bounds check, and a
+/// saturating cast then hands chrono `i64::MIN`, which panics. The limit is
+/// well past any real spreadsheet -- 1e10 days is some 27 million years -- so
+/// nothing legitimate is refused, and what is refused falls back to the number
+/// the file holds rather than taking the process down.
+fn workbook_serial_is_renderable(serial: f64) -> bool {
+    serial.is_finite() && serial.abs() < 1.0e10
+}
+
+/// `4500` seconds becomes `1:15:00`, carrying minutes and seconds.
+fn format_elapsed_seconds(seconds: f64) -> String {
+    let total = seconds.abs().round() as i64;
+    // After rounding, not before: -0.4 seconds is zero elapsed time, and
+    // "-0:00:00" is not a reading anyone wants.
+    let negative = seconds < 0.0 && total != 0;
+    format!(
+        "{}{}:{:02}:{:02}",
+        if negative { "-" } else { "" },
+        total / 3600,
+        (total % 3600) / 60,
+        total % 60
+    )
+}
+
+/// `2026-09-02T13:45:30` becomes `2026-09-02 13:45:30`.
+///
+/// A timezone is preserved rather than dropped -- `office:date-value` is
+/// `xs:dateTime`, which permits one, and losing it would be a silent change of
+/// meaning. That has a consequence worth stating rather than glossing: an Excel
+/// serial carries no offset, so an offset-bearing ODS cell does *not* read
+/// identically to the XLSX cell of the same instant. Preserving the offset is
+/// the better answer; the claim that every format agrees was too strong.
+///
+/// Midnight loses its time only when there is no offset to strand. With one,
+/// dropping the time glued the offset onto the date and produced
+/// "2026-09-02-05:00", which parses as nothing.
+///
+/// Anything that does not parse is returned untouched.
+fn normalize_iso_datetime(value: &str) -> String {
+    // RFC 3339 first, because chrono's `%:z` does not accept the bare `Z` an
+    // ODF file is entirely likely to carry. RFC 3339 requires seconds, so a
+    // minute-precision `...T13:45Z` is rewritten to an explicit offset rather
+    // than left as the one `Z` form that slips past.
+    // `['Z', 'z']` because `parse_from_rfc3339` accepts a lowercase `z`, so
+    // stripping only the uppercase one made the two disagree at minute
+    // precision -- a case asymmetry that did not exist before the rewrite.
+    let with_offset = value
+        .strip_suffix(['Z', 'z'])
+        .map_or_else(|| value.to_string(), |rest| format!("{rest}+00:00"));
+    let parsed = chrono::DateTime::parse_from_rfc3339(&with_offset)
+        .ok()
+        .or_else(|| {
+            // Both separator cases, for the same reason as `['Z', 'z']` above:
+            // `parse_from_rfc3339` accepts a lowercase `t`, so listing only the
+            // uppercase one made second precision and minute precision
+            // disagree. The previous commit went looking for exactly this class
+            // and fixed one of the two letters.
+            [
+                "%Y-%m-%dT%H:%M:%S%.f%:z",
+                "%Y-%m-%dT%H:%M%:z",
+                "%Y-%m-%dt%H:%M:%S%.f%:z",
+                "%Y-%m-%dt%H:%M%:z",
+            ]
+            .iter()
+            .find_map(|format| chrono::DateTime::parse_from_str(&with_offset, format).ok())
+        });
+    if let Some(parsed) = parsed {
+        // The time is kept whenever an offset is: dropping it glued the offset
+        // straight onto the date and produced "2026-09-02-05:00", which parses
+        // as nothing and reads as a date with garbage after it. The midnight
+        // rule exists to match the serial path, and the serial path has no
+        // offset to dangle.
+        return format!(
+            "{}{}",
+            parsed.naive_local().format("%Y-%m-%d %H:%M:%S"),
+            parsed.offset()
+        );
+    }
+    // A space where `T` belongs is not legal `xs:dateTime` and calamine cannot
+    // produce one from a conformant file, so it is deliberately absent here --
+    // though `parse_from_rfc3339` does accept it, which is why an
+    // offset-bearing space form still reaches the branch above.
+    for format in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dt%H:%M:%S%.f",
+        "%Y-%m-%dt%H:%M",
+    ] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            return if parsed.time() == chrono::NaiveTime::MIN {
+                parsed.format("%Y-%m-%d").to_string()
+            } else {
+                parsed.format("%Y-%m-%d %H:%M:%S").to_string()
+            };
+        }
+    }
+    value.to_string()
+}
+
+/// `PT13H45M30S` becomes `13:45:30`, matching how a `[h]:mm:ss` cell reads.
+///
+/// calamine maps ODS `office:time-value` to `DurationIso` for a time of day as
+/// well as for elapsed time, and the two are indistinguishable once here. So a
+/// 9:05 AM ODS cell reads "9:05:00" where the XLSX cell of the same value reads
+/// "09:05:00": elapsed hours are not zero-padded, and padding them would be
+/// wrong. That is the same intrinsic ODS ambiguity the offset case carries, and
+/// it is recorded rather than papered over.
+///
+/// Anything this does not fully recognise is returned untouched. That is the
+/// contract, and the first version broke it in both directions: it accepted
+/// `PT`, `PT1M1M` and `PT30S45M13H` and produced plausible-looking answers for
+/// all three, and it truncated `PT1.5H` to `1:00:00`. It also printed
+/// components verbatim, so the legal `PT90M` came out as `0:90:00` -- an
+/// impossible clock reading beside the `1:30:00` an XLSX cell of the same value
+/// gives.
+fn normalize_iso_duration(value: &str) -> String {
+    parse_iso_duration_seconds(value).map_or_else(|| value.to_string(), format_elapsed_seconds)
+}
+
+/// Parse an `xs:duration` of hours, minutes and seconds into signed seconds.
+///
+/// Returns `None` for anything outside that shape, including the date
+/// components (`P1DT2H`) this deliberately does not claim to render.
+fn parse_iso_duration_seconds(value: &str) -> Option<f64> {
+    let (negative, rest) = value
+        .strip_prefix('-')
+        .map_or((false, value), |rest| (true, rest));
+    let rest = rest.strip_prefix("PT")?;
+
+    let mut total = 0.0f64;
+    let mut digits = String::new();
+    // Designators must appear at most once and in descending order, which is
+    // what `xs:duration` requires and what stops `PT1M1M` and `PT30S45M13H`
+    // being read as though they meant something.
+    let mut previous_rank = 0u8;
+    for character in rest.chars() {
+        match character {
+            '0'..='9' | '.' => digits.push(character),
+            unit => {
+                let (rank, multiplier) = match unit {
+                    'H' => (1u8, 3600.0),
+                    'M' => (2, 60.0),
+                    'S' => (3, 1.0),
+                    _ => return None,
+                };
+                if rank <= previous_rank || digits.starts_with('.') {
+                    return None;
+                }
+                let amount: f64 = digits.parse().ok()?;
+                if !amount.is_finite() {
+                    return None;
+                }
+                previous_rank = rank;
+                digits.clear();
+                total += amount * multiplier;
+            }
+        }
+    }
+    if !digits.is_empty() || previous_rank == 0 {
+        return None;
+    }
+    // A value this large is not a duration anyone wrote; passing it through
+    // beats printing a saturated `i64`.
+    if !total.is_finite() || total.abs() > 1.0e15 {
+        return None;
+    }
+    Some(if negative { -total } else { total })
 }
 
 /// Materialize only a deliberately small rectangular projection into the VM.
@@ -7422,29 +7681,39 @@ fn summarize_csv(
 /// worker it needs is the one blocking, and on a runtime with a single worker
 /// that is a deadlock.
 ///
-/// Every in-tree caller satisfies this incidentally, through the
+/// Every reachable in-tree caller satisfies this incidentally, through the
 /// `tokio::task::spawn_blocking` hop that wraps both `TypedHostHandler` drive
 /// sites. That hop is load-bearing, not incidental convenience, and is marked
-/// as such at both sites.
+/// as such at both sites. (The Co-Forth interpreter also called in through
+/// `AgentVmBinding` with no hop, reachable only when a binding was attached by
+/// a function that had no callers; #294 removed that subtree, so the two drive
+/// sites are now the whole set.)
 ///
 /// A `tokio::task::block_in_place` here would release the worker and make the
 /// requirement unnecessary — but it panics inside a `LocalSet`, and
 /// `Handle::runtime_flavor()` reports `MultiThread` there, so the panic cannot
 /// be guarded against. `src/main.rs` runs the whole interactive REPL inside
 /// `local.run_until(...)`, so that trade would swap a deadlock no in-tree
-/// caller can reach for a panic one could. `src/coforth/interpreter.rs` records
-/// the same constraint for the same reason.
+/// caller can reach for a panic one could. (`src/coforth/interpreter.rs`
+/// recorded the same constraint independently; #294 removed that file, so this
+/// is the only place the reasoning is written down now.)
 ///
 /// The residual hazard is in-tree, not out of it: a future third drive site
-/// that constructs a `TypedHostHandler` without the hop.
-/// `typed_mem_store_completes_on_a_single_worker_runtime` in this module fails
-/// if that happens on either existing site.
+/// that constructs a `TypedHostHandler` without the hop. Two tests fail if that
+/// happens -- `typed_mem_store_completes_on_a_single_worker_runtime` in this
+/// module, and `typed_agent_await_completes_on_a_single_worker_runtime` in
+/// `runtime::scheduler`, which covers the `agent-await` consumer. Both submit
+/// non-suspending programs, so both exercise `execute_typed_program`'s hop;
+/// neither reaches the one in `resume_typed_program`, which is uncovered.
 ///
 /// An out-of-tree caller cannot reach this. `block_on_host` and
 /// `TypedHostHandler` are private, and the public submit API performs the hop
 /// itself — a caller on a worker is the case the test exercises and passes.
-/// `AgentVmBinding::block_on` has the identical shape without the requirement
-/// written down; that is #289.
+/// `AgentVmBinding::block_on` delegates here rather than repeating the shape,
+/// so `agent-await` inherits both the requirement and this explanation. Both it
+/// and `AgentVmBinding::new` are `pub(crate)`: narrowing only the method would
+/// have left a composed path open, since a binding an external crate can build
+/// and attach to a `Forth` reaches this from a worker with no hop (#289).
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
@@ -10838,6 +11107,382 @@ mod tests {
         let rows = read_workbook_rows(file.as_file(), "charts.xlsx", None)
             .expect("a chart sheet must not fail the read");
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// A number too big or small for a decimal must not become one.
+    ///
+    /// The whole-float arm cast to i64 unchecked, so 1e300 rendered as
+    /// 9223372036854775807 -- and simply removing the cast would have put a
+    /// 301-character cell in the grid and the TUI preview instead. A subnormal
+    /// already did exactly that: 5e-324 expanded to 326 characters.
+    #[test]
+    fn test_extreme_floats_use_exponent_notation_rather_than_expanding() {
+        use calamine::Data;
+
+        let float = |value: f64| workbook_cell_to_string(&Data::Float(value));
+
+        assert_eq!(float(1.0e300), "1e300");
+        assert_eq!(float(5.0e-324), "5e-324");
+        assert!(
+            float(1.0e300).len() < 10,
+            "expanded a huge float into the grid"
+        );
+        // Ordinary spreadsheet numbers are untouched.
+        assert_eq!(float(42.5), "42.5");
+        assert_eq!(float(42.0), "42");
+        assert_eq!(float(0.0), "0");
+        assert_eq!(float(-7.0), "-7");
+    }
+
+    /// No path through this function can expand a number into the grid.
+    ///
+    /// Asserted as a property over every arm, not as three examples, because
+    /// four consecutive review rounds each found a fix applied to one arm and
+    /// not its twin. The decimal-expansion blowup was removed from
+    /// `Data::Float` and left on the out-of-range `Data::DateTime` fallback
+    /// three arms above it -- same function, same match, same 301 characters,
+    /// reachable from the same `<v>` element and differing only in whether the
+    /// cell carried a date format.
+    #[test]
+    fn test_no_cell_renders_as_an_unbounded_decimal() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        let extremes = [
+            1.0e300,
+            -1.0e300,
+            f64::MAX,
+            f64::MIN,
+            5.0e-324,
+            -5.0e-324,
+            1.0e12,
+            -1.0e12,
+        ];
+        let mut cells: Vec<Data> = extremes.iter().map(|value| Data::Float(*value)).collect();
+        for value in extremes {
+            for kind in [ExcelDateTimeType::DateTime, ExcelDateTimeType::TimeDelta] {
+                for epoch in [false, true] {
+                    cells.push(Data::DateTime(ExcelDateTime::new(value, kind, epoch)));
+                }
+            }
+        }
+
+        for cell in cells {
+            let rendered = workbook_cell_to_string(&cell);
+            assert!(
+                rendered.len() <= 32,
+                "{cell:?} rendered {} characters: {rendered}",
+                rendered.len()
+            );
+        }
+    }
+
+    /// A crafted workbook must not take the process down.
+    ///
+    /// `ExcelDateTime::as_duration` and `as_datetime` both compute
+    /// `Duration::milliseconds(ms.round() as i64)` before any `Option`, and a
+    /// float-to-int cast saturates -- so a serial past ~1.07e11, or an
+    /// infinity, which `<v>` parses happily, reaches chrono as `i64::MIN` and
+    /// panics. A `<v>-1e12</v>` cell in an otherwise ordinary `.xlsx` crashed
+    /// both `read_workbook_rows` and the TUI preview, and Finch has no
+    /// `catch_unwind`. This defect was introduced by this PR; `origin/main`
+    /// rendered the arm with a `to_string()` catch-all.
+    #[test]
+    fn test_an_out_of_range_serial_falls_back_instead_of_panicking() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        for kind in [ExcelDateTimeType::TimeDelta, ExcelDateTimeType::DateTime] {
+            for serial in [-1.0e12, 1.0e12, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+                let rendered = workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                    serial, kind, false,
+                )));
+                assert!(
+                    !rendered.is_empty(),
+                    "serial {serial} rendered nothing for {kind:?}"
+                );
+            }
+        }
+        // And a large-but-sane duration still renders, so the guard is not
+        // refusing anything legitimate.
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                1.0e9,
+                ExcelDateTimeType::TimeDelta,
+                false
+            ))),
+            "24000000000:00:00"
+        );
+    }
+
+    /// The ISO duration parser must carry, keep the sign, and refuse the rest.
+    ///
+    /// Its first version printed components verbatim, so the legal `PT90M` came
+    /// out as "0:90:00" -- an impossible clock reading beside the "1:30:00" an
+    /// XLSX cell of the same value gives, which falsifies the whole claim that
+    /// one logical cell reads the same whichever format it arrived in. It also
+    /// dropped the leading sign that `xs:duration` spells out, truncated
+    /// `PT1.5H` to "1:00:00", and accepted `PT`, `PT1M1M` and `PT30S45M13H` --
+    /// producing plausible answers where the documented behaviour is
+    /// passthrough.
+    #[test]
+    fn test_iso_durations_carry_keep_the_sign_and_refuse_what_they_cannot_read() {
+        use calamine::Data;
+
+        let iso = |value: &str| workbook_cell_to_string(&Data::DurationIso(value.into()));
+
+        assert_eq!(iso("PT13H45M30S"), "13:45:30");
+        // Carries, rather than printing an impossible clock.
+        assert_eq!(iso("PT90M"), "1:30:00");
+        assert_eq!(iso("PT13H45M75S"), "13:46:15");
+        // The sign is part of the value here too.
+        assert_eq!(iso("-PT01H00M00S"), "-1:00:00");
+        // Strict `xs:duration` allows a fraction only on seconds; accepting it
+        // on hours and minutes too is deliberate leniency, and better than the
+        // silent truncation to "1:00:00" it replaces.
+        assert_eq!(iso("PT1.5H"), "1:30:00");
+        assert_eq!(iso("PT0.5H"), "0:30:00");
+        // Rounding to zero drops the sign: "-0:00:00" is not a reading anyone
+        // wants.
+        assert_eq!(iso("-PT0.4S"), "0:00:00");
+        assert_eq!(iso("-PT1H"), "-1:00:00");
+
+        // Everything below is returned untouched, which is the contract.
+        for unrecognised in [
+            "PT",                      // no component at all
+            "PT1M1M",                  // repeated designator
+            "PT30S45M13H",             // descending order violated
+            "PT99999999999999999999H", // would print a saturated i64
+            "PT.5S",                   // no digit before the point
+            "P1DT2H",                  // a day component this does not render
+            "PTS",
+            "pt1h",
+            "",
+        ] {
+            assert_eq!(iso(unrecognised), unrecognised, "mangled {unrecognised:?}");
+        }
+    }
+
+    /// An ISO datetime must normalise the way a serial one does.
+    #[test]
+    fn test_iso_datetimes_keep_their_offset_and_agree_at_midnight() {
+        use calamine::Data;
+
+        let iso = |value: &str| workbook_cell_to_string(&Data::DateTimeIso(value.into()));
+
+        assert_eq!(iso("2026-09-02T13:45:30"), "2026-09-02 13:45:30");
+        // `office:date-value` is `xs:dateTime`, which permits a timezone.
+        // Preserved rather than dropped -- losing it silently changes what the
+        // cell means -- but the `T` still goes, which is the artefact #281 is
+        // about. A trailing `Z` is rewritten to an explicit offset before
+        // either parser runs, in both letter cases.
+        assert_eq!(iso("2026-09-02T13:45:30Z"), "2026-09-02 13:45:30+00:00");
+        assert_eq!(
+            iso("2026-09-02T13:45:30+01:00"),
+            "2026-09-02 13:45:30+01:00"
+        );
+        // Minute precision with a bare `Z` too: RFC 3339 requires seconds, so
+        // that one form slipped past the fallback the comment claimed covered
+        // it.
+        assert_eq!(iso("2026-09-02T13:45Z"), "2026-09-02 13:45:00+00:00");
+        // Both letter cases, because `parse_from_rfc3339` accepts a lowercase
+        // `z` -- so stripping only the uppercase one made second precision and
+        // minute precision disagree, an asymmetry that did not exist before the
+        // rewrite.
+        assert_eq!(iso("2026-09-02T13:45z"), "2026-09-02 13:45:00+00:00");
+        assert_eq!(iso("2026-09-02T13:45:30z"), "2026-09-02 13:45:30+00:00");
+        // The separator's case too. Fixing only the offset letter left the
+        // identical asymmetry one line below it -- `parse_from_rfc3339` accepts
+        // a lowercase `t`, the fallback formats listed only `T`, so
+        // "2026-09-02t13:45Z" went untouched while "2026-09-02t13:45:30Z"
+        // normalised. Five review rounds have now found a fix applied to one
+        // side of a pair and not the other, so both are asserted together.
+        assert_eq!(iso("2026-09-02t13:45:30Z"), "2026-09-02 13:45:30+00:00");
+        assert_eq!(iso("2026-09-02t13:45Z"), "2026-09-02 13:45:00+00:00");
+        assert_eq!(iso("2026-09-02t13:45+01:00"), "2026-09-02 13:45:00+01:00");
+        assert_eq!(iso("2026-09-02t00:00:00"), "2026-09-02");
+        // Midnight drops its time when there is no offset to strand, as the
+        // serial path does.
+        assert_eq!(iso("2026-09-02T00:00:00"), "2026-09-02");
+        // But not when an offset is present. Dropping the time glued the
+        // offset onto the date and produced "2026-09-02-05:00", which parses
+        // as nothing and reads as a date with garbage after it -- the exact
+        // intersection of the two rules this function added.
+        assert_eq!(
+            iso("2026-09-02T00:00:00-05:00"),
+            "2026-09-02 00:00:00-05:00"
+        );
+        assert_eq!(iso("2026-09-02T00:00:00Z"), "2026-09-02 00:00:00+00:00");
+        assert_eq!(iso("2026-09-02"), "2026-09-02");
+        assert_eq!(iso("not a date"), "not a date");
+    }
+
+    /// Elapsed time must not become a date in 1900.
+    ///
+    /// A `[h]:mm:ss` cell holding 25 hours has serial 1.0416..., which looks
+    /// exactly like a date's -- so choosing the shape from the serial alone
+    /// rendered it "1900-01-01 01:00:00". That is the Excel epoch leaking into
+    /// the user's output, which is the failure this whole function exists to
+    /// remove, reintroduced by the first fix for it. Timesheets and run
+    /// durations are the ordinary reason to use `[h]:mm` at all.
+    #[test]
+    fn test_duration_cells_render_as_elapsed_time_not_as_dates() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        let duration = |serial| {
+            workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                serial,
+                ExcelDateTimeType::TimeDelta,
+                false,
+            )))
+        };
+        assert_eq!(duration(1.0416666666), "25:00:00");
+        assert_eq!(duration(2.0), "48:00:00");
+        assert_eq!(duration(0.5), "12:00:00");
+        // The sign is part of the value. Treating a negative serial as a time
+        // of day dropped it, so -36 hours read as "12:00:00".
+        assert_eq!(duration(-1.5), "-36:00:00");
+    }
+
+    /// A negative serial is not a time of day.
+    #[test]
+    fn test_a_negative_serial_keeps_its_magnitude() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        let rendered = workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+            -1.5,
+            ExcelDateTimeType::DateTime,
+            false,
+        )));
+        assert_eq!(rendered, "1899-12-29 12:00:00");
+        assert_ne!(
+            rendered, "12:00:00",
+            "dropped the sign and the date with it"
+        );
+    }
+
+    /// Out of chrono's range, the serial is a worse answer than a date and a
+    /// better one than silence.
+    #[test]
+    fn test_an_unrepresentable_serial_falls_back_to_the_number() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                1e9,
+                ExcelDateTimeType::DateTime,
+                false
+            ))),
+            "1000000000"
+        );
+    }
+
+    /// The same logical cell must read the same whichever format it came from.
+    ///
+    /// ODS carries ISO-8601 text rather than a serial, so a time arrived as
+    /// "PT13H45M30S" -- an encoding artefact of exactly the kind #281 is about,
+    /// beside an XLSX cell of the same value reading "13:45:30".
+    #[test]
+    fn test_iso_cells_normalize_to_the_same_shapes_as_serial_cells() {
+        use calamine::Data;
+
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTimeIso("2026-09-02T13:45:30".into())),
+            "2026-09-02 13:45:30"
+        );
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTimeIso("2026-09-02".into())),
+            "2026-09-02"
+        );
+        assert_eq!(
+            workbook_cell_to_string(&Data::DurationIso("PT13H45M30S".into())),
+            "13:45:30"
+        );
+        // Anything the normalisers do not recognise passes through rather than
+        // being mangled or lost: a day component is legal ISO-8601 and is not
+        // a shape this renders.
+        assert_eq!(
+            workbook_cell_to_string(&Data::DurationIso("P1DT2H".into())),
+            "P1DT2H"
+        );
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTimeIso("not a date".into())),
+            "not a date"
+        );
+    }
+
+    /// A date cell must read as a date, not as the serial underneath it.
+    ///
+    /// `Data::DateTime`'s `Display` prints the raw f64, and
+    /// `workbook_cell_to_string`'s catch-all fell through to it -- so every
+    /// date in every spreadsheet Finch read came back as an opaque number.
+    /// 2026-09-02 was "46267", through `workbook-open`, `workbook-range` and
+    /// `workbook-summary` alike (#281).
+    ///
+    /// The three shapes are asserted separately because the first fix rendered
+    /// them all the same way, which produced "2026-09-02 00:00:00" for a date
+    /// and "1899-12-31 13:45:30" for a bare time -- the second leaking the
+    /// Excel epoch into the user's output.
+    #[test]
+    fn read_workbook_rows_renders_dates_times_and_datetimes_as_text() {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("Dates").unwrap();
+        let date_format = Format::new().set_num_format("yyyy-mm-dd");
+        let datetime_format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+        let time_format = Format::new().set_num_format("hh:mm:ss");
+        sheet
+            .write_datetime_with_format(
+                0,
+                0,
+                &ExcelDateTime::from_ymd(2026, 9, 2).unwrap(),
+                &date_format,
+            )
+            .unwrap();
+        sheet
+            .write_datetime_with_format(
+                0,
+                1,
+                &ExcelDateTime::from_ymd(2026, 9, 2)
+                    .unwrap()
+                    .and_hms(13, 45, 30)
+                    .unwrap(),
+                &datetime_format,
+            )
+            .unwrap();
+        sheet
+            .write_datetime_with_format(
+                0,
+                2,
+                &ExcelDateTime::from_hms(13, 45, 30).unwrap(),
+                &time_format,
+            )
+            .unwrap();
+        // A plain number must keep reading as a number: the fix must not
+        // reinterpret every float as a date.
+        sheet.write_number(0, 3, 42.5).unwrap();
+        sheet.write_string(0, 4, "plain").unwrap();
+
+        // `tempfile::tempdir`, not a fixed name in the shared temp dir: two
+        // concurrent `cargo test` runs on one machine would collide on it, and
+        // one run's cleanup could delete the other's fixture mid-read.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dates.xlsx");
+        workbook.save(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let rows = read_workbook_rows(&file, "dates.xlsx", None).expect("must read");
+        assert_eq!(
+            rows,
+            vec![vec![
+                "2026-09-02".to_string(),
+                "2026-09-02 13:45:30".to_string(),
+                "13:45:30".to_string(),
+                "42.5".to_string(),
+                "plain".to_string(),
+            ]],
+            "a date read as its Excel serial, or a time carried the 1899 epoch"
+        );
     }
 
     /// And an ordinary workbook still comes back whole.
