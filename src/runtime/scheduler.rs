@@ -2222,6 +2222,70 @@ mod tests {
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }
 
+    /// `agent-await` must complete on a runtime with a single worker.
+    ///
+    /// `AgentVmBinding::block_on` blocks the calling thread on a child task
+    /// that is `tokio::spawn`ed onto the same runtime, so if the caller were a
+    /// worker, the worker the child needs would be the one blocking. That is
+    /// the same dependency `mem-store` has on the MemTree loader, and it is
+    /// prevented the same way: both `TypedHostHandler` drive sites go through
+    /// `tokio::task::spawn_blocking`, so nothing reaches the binding from a
+    /// worker (#289).
+    ///
+    /// The requirement was documented on `block_on_host` by #284 and not on
+    /// this binding, which carried the identical shape with none of the
+    /// explanation; it delegates now, so there is one place to state the rule.
+    /// This is the `agent-await` counterpart of
+    /// `typed_mem_store_completes_on_a_single_worker_runtime`: remove the
+    /// `spawn_blocking` hop and it fails on a named timeout rather than
+    /// wedging the binary.
+    #[test]
+    fn typed_agent_await_completes_on_a_single_worker_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let program_runtime = Arc::new(ProgramRuntime::new());
+            grant_agent_capabilities(&program_runtime);
+            let _scheduler = AgentScheduler::new(
+                ProviderResolver::new(Arc::new(EchoGenerator)),
+                Arc::clone(&program_runtime),
+            );
+            let outcome = program_runtime
+                .submit(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: None,
+                    source:
+                        r#"(let ((task-id (agent-spawn "inspect the VM"))) (agent-await task-id))"#
+                            .to_string(),
+                    intent: "fork and join on one worker".to_string(),
+                    effect: crate::programs::ExecutionEffect::VmWrite,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: program_runtime.manifest_generation(),
+                    expected_revision: None,
+                    budget: None,
+                })
+                .await;
+            let _ = done_tx.send(outcome.map(|outcome| outcome.status));
+        });
+
+        // Bounded, and the runtime is torn down before asserting: a regression
+        // here wedges the worker, and dropping the runtime would then block the
+        // whole test binary -- an unattributed CI timeout rather than a named
+        // failure.
+        let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+
+        let status = outcome
+            .expect("agent-await deadlocked on a single-worker runtime")
+            .expect("submit");
+        assert_eq!(status, crate::runtime::outcome::ExecutionStatus::Completed);
+    }
+
     #[tokio::test]
     async fn typed_lisp_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());

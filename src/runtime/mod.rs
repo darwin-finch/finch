@@ -7414,8 +7414,8 @@ fn summarize_csv(
 /// An out-of-tree caller cannot reach this. `block_on_host` and
 /// `TypedHostHandler` are private, and the public submit API performs the hop
 /// itself — a caller on a worker is the case the test exercises and passes.
-/// `AgentVmBinding::block_on` has the identical shape without the requirement
-/// written down; that is #289.
+/// `AgentVmBinding::block_on` delegates here rather than repeating the shape,
+/// so `agent-await` inherits both the requirement and this explanation (#289).
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,

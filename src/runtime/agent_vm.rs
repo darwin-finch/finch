@@ -63,18 +63,24 @@ impl AgentVmBinding {
         scheduler.cancel(task_id).await
     }
 
+    /// Run an async scheduler effect to completion from synchronous typed code.
+    ///
+    /// **Callers must not be on a runtime worker thread**, for the reason
+    /// `super::block_on_host` documents at length: the join blocks the calling
+    /// thread, and `agent-await` waits on a child task that is `tokio::spawn`ed
+    /// onto the same runtime, so on a single-worker runtime the worker the
+    /// child needs is the one blocking.
+    ///
+    /// This delegates rather than repeating the shape. It was byte-for-byte
+    /// `block_on_host` with none of the explanation, so when #284 established
+    /// and documented the constraint on one of them, the other kept carrying it
+    /// silently (#289). One implementation is one place to state the rule, and
+    /// one place to change if the rule ever stops holding.
     pub fn block_on<T: Send + 'static>(
         &self,
         operation: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| anyhow::anyhow!("agent scheduler requires a Tokio runtime"))?;
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || handle.block_on(operation))
-                .join()
-                .map_err(|_| anyhow::anyhow!("agent scheduler worker panicked"))?
-        })
+        super::block_on_host(operation)
     }
 }
 
