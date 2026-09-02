@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject vulnerable or unreviewed versions in Finch's resolved HTTP graph."""
+"""Reject vulnerable or unreviewed versions in Finch's resolved HTTP/TLS graph."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 H2_MINIMUM = (0, 4, 16)
+RUSTLS_MINIMUM = (0, 23, 0)
+WEBPKI_MINIMUM = (0, 103, 13)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,16 +70,50 @@ def contract_errors(lock: object) -> list[str]:
                 f"h2 {version} is below the fixed 0.4.16 floor for RUSTSEC-2026-0258"
             )
 
-    for version in sorted(versions.get("rustls", set())):
-        if version_tuple(version)[:2] == (0, 21):
+    websocket_versions = versions.get("tokio-tungstenite", set())
+    if not websocket_versions:
+        errors.append(
+            "no tokio-tungstenite package is resolved; the Brain WebSocket contract would be vacuous"
+        )
+    if len(websocket_versions) > 1:
+        errors.append(
+            "multiple tokio-tungstenite versions are resolved: "
+            + ", ".join(sorted(websocket_versions))
+        )
+    for version in sorted(websocket_versions):
+        if version_tuple(version)[:2] != (0, 24):
             errors.append(
-                f"rustls {version} restores the legacy HTTP-client TLS graph removed by #183"
+                f"tokio-tungstenite {version} is outside the reviewed 0.24 line; "
+                "legacy 0.21 restores the Rustls 0.22 Brain WebSocket graph"
             )
 
-    for version in sorted(versions.get("rustls-webpki", set())):
-        if version_tuple(version)[:2] == (0, 101):
+    rustls_versions = versions.get("rustls", set())
+    if not rustls_versions:
+        errors.append("no rustls package is resolved; the TLS generation check would be vacuous")
+    if len(rustls_versions) > 1:
+        errors.append("multiple rustls versions are resolved: " + ", ".join(sorted(rustls_versions)))
+    for version in sorted(rustls_versions):
+        parsed = version_tuple(version)
+        if parsed[:2] != RUSTLS_MINIMUM[:2]:
             errors.append(
-                f"rustls-webpki {version} is the vulnerable 0.101 line removed by #183"
+                f"rustls {version} is outside Finch's reviewed, consolidated 0.23 TLS generation"
+            )
+
+    webpki_versions = versions.get("rustls-webpki", set())
+    if not webpki_versions:
+        errors.append(
+            "no rustls-webpki package is resolved; the certificate-validation floor would be vacuous"
+        )
+    if len(webpki_versions) > 1:
+        errors.append(
+            "multiple rustls-webpki versions are resolved: " + ", ".join(sorted(webpki_versions))
+        )
+    for version in sorted(webpki_versions):
+        parsed = version_tuple(version)
+        if parsed[:2] != WEBPKI_MINIMUM[:2] or parsed < WEBPKI_MINIMUM:
+            errors.append(
+                f"rustls-webpki {version} is outside the fixed, reviewed 0.103.13+ line for "
+                "RUSTSEC-2026-0049, -0098, -0099, and -0104"
             )
 
     return errors
@@ -100,7 +136,8 @@ def main() -> int:
     packages = {
         package["name"]: set()
         for package in lock["package"]
-        if package["name"] in {"reqwest", "h2", "rustls", "rustls-webpki"}
+        if package["name"]
+        in {"reqwest", "h2", "tokio-tungstenite", "rustls", "rustls-webpki"}
     }
     for package in lock["package"]:
         if package["name"] in packages:
