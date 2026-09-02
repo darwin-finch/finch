@@ -232,9 +232,14 @@ pub(crate) mod fixtures {
     /// Package arbitrary worksheet XML as a single-sheet XLSX.
     ///
     /// Split out from `xlsx` so a fixture can emit XML no writer would produce
-    /// -- thousands of attributes on one element, a namespace declaration per
-    /// row -- which is the shape the quick-xml advisories #185 exists to clear
-    /// were about, and which nothing in the suite currently exercises.
+    /// -- hundreds of thousands of attributes on one element, or a row element
+    /// per byte of budget -- so a parse can be driven against a hostile input
+    /// size.
+    ///
+    /// This is deliberately *not* described as covering the quick-xml
+    /// advisories behind #185. It does not; see
+    /// `test_a_hostile_parse_terminates` for why they are unreachable through
+    /// calamine at all.
     pub(crate) fn xlsx_from_sheet(sheet: &str) -> Vec<u8> {
         let sheet = sheet.to_string();
         let parts: [(&str, String); 5] = [
@@ -288,10 +293,15 @@ pub(crate) mod fixtures {
 
     /// One cell carrying `count` distinct attributes.
     ///
-    /// This pins **calamine's** attribute scanning linear, not quick-xml's. See
-    /// the note on `test_xlsx_attribute_scanning_stays_linear` for why those
-    /// are not the same thing and why the advisories are out of reach from
-    /// here.
+    /// The absent `s` attribute is load-bearing, not an oversight.
+    ///
+    /// calamine reads a cell with `get_attrs!(c, b"r" => r, b"s" => s, b"t" => t)`,
+    /// and that macro stops as soon as every key it wants has been found. The
+    /// cell here carries `r` and `t` but no `s`, so the search never completes
+    /// and calamine walks all `count` attributes. Adding `s="0"` -- an
+    /// innocuous-looking "make the fixture more realistic" edit -- would let it
+    /// break out after the first few and quietly remove calamine's attribute
+    /// iteration from what this fixture measures.
     pub(crate) fn many_distinct_attributes(count: usize) -> Vec<u8> {
         let attrs: String = (0..count).map(|i| format!(" a{i}=\"{i}\"")).collect();
         xlsx_from_sheet(&format!(
@@ -378,110 +388,124 @@ mod tests {
         bounded_worksheet_range(&mut workbook, "Sheet1", MAX_WORKBOOK_CELLS)
     }
 
-    /// Parse the same fixture a few times and keep the fastest.
+    /// A note on what is deliberately *not* here: a wall-clock linearity
+    /// assertion.
     ///
-    /// A single timing on a shared runner measures scheduling as much as
-    /// parsing. The minimum of a few runs is the one least contaminated by
-    /// whatever else the host was doing.
+    /// Two versions of one were written and both were flaky, in opposite
+    /// directions, and the record is kept because the next person to reach for
+    /// this will reach for the same thing.
     ///
-    /// The parse result is checked, not discarded. An earlier version wrote
-    /// `let _ = read(..)`, which would have let a fixture that started
-    /// *failing fast* keep the test green: an error return in microseconds
-    /// gives a perfect ratio and sails under any ceiling. That is not
-    /// hypothetical -- quick-xml 0.41's own namespace fix is exactly such an
-    /// error return.
-    fn fastest_parse(bytes: &[u8], expected_rows: usize) -> std::time::Duration {
-        (0..3)
-            .map(|_| {
-                let started = std::time::Instant::now();
-                let range = read(bytes.to_vec()).expect("hostile fixture must still parse");
-                let elapsed = started.elapsed();
-                assert_eq!(
-                    range.rows().count(),
-                    expected_rows,
-                    "fixture parsed to the wrong shape"
-                );
-                elapsed
-            })
-            .min()
-            .expect("three runs")
+    /// The first compared a 5,000-attribute parse against a 50,000-attribute
+    /// one and required the ratio to stay under 25. It paired a 2.4 ms
+    /// measurement with a 23 ms one, and under CPU contention the long side
+    /// absorbed proportionally far more preemption than the short side: on a
+    /// loaded 10-core host it produced ratios of 44 to 53 and failed while
+    /// accusing the parser of a quadratic scan that was not there.
+    ///
+    /// The second raised both sides into the tens of milliseconds (25,000
+    /// against 250,000) to fix that. It passed under 40 CPU spinners and then
+    /// failed on an *idle* machine -- once in six runs -- because a 3 MB
+    /// document does not scale like a 300 KB one once it stops fitting in
+    /// cache, and that superlinearity has nothing to do with algorithmic
+    /// complexity. It also cost 46 to 76 seconds a run.
+    ///
+    /// So the ratio was removed rather than tuned a third time. It was never
+    /// the only guard against quadratic behaviour, and it was the weakest:
+    /// `test_a_hostile_parse_terminates` already fails a parse that cannot
+    /// finish 250,000 attributes or 50,000 rows in 30 seconds, which a
+    /// quadratic scan cannot do, and `test_the_row_fixture_streams_one_cell_per_row`
+    /// pins the streamed cell count exactly and deterministically. What the
+    /// ratio added over those was the ability to distinguish *degrees* of
+    /// linear -- and it could not do that reliably enough on a shared runner
+    /// to be worth a test that fails for reasons the code did not cause.
+
+    /// The row fixture really does drive `count` cells through the loop.
+    ///
+    /// The timing test above asserts the parsed *shape* (one row), and that
+    /// shape is identical at every size -- so on its own it cannot tell a
+    /// fixture that streams 50,000 cells from one that streams a handful and
+    /// discards the rest. Without this, a calamine change that stopped
+    /// emitting a cell per repeated `<row>` would leave the linearity claim
+    /// green and quietly untested.
+    ///
+    /// The cell-count bound is the cheapest oracle for "how many cells
+    /// actually reached the loop": ask for one fewer than the fixture holds
+    /// and the read must refuse.
+    #[test]
+    fn test_the_row_fixture_streams_one_cell_per_row() {
+        let bytes = fixtures::repeated_rows(50_000);
+        let error = open_workbook_auto_from_rs(Cursor::new(bytes.clone()))
+            .map(|mut wb| bounded_worksheet_range(&mut wb, "Sheet1", 49_999))
+            .expect("fixture opens")
+            .expect_err("50,000 cells must exceed a 49,999-cell limit");
+        assert!(
+            error.contains("even though the rectangle"),
+            "must be refused on the cell count, which is what proves all 50,000 \
+             reached the streaming loop: {error}"
+        );
+        // And the exact count is accepted, so this pins 50,000 rather than
+        // merely "at least 50,000".
+        open_workbook_auto_from_rs(Cursor::new(bytes))
+            .map(|mut wb| bounded_worksheet_range(&mut wb, "Sheet1", 50_000))
+            .expect("fixture opens")
+            .expect("exactly 50,000 cells is within a 50,000-cell limit");
     }
 
-    /// XLSX attribute scanning and the cell-streaming loop stay linear.
+    /// A hostile parse terminates, and does so fast enough to rule out a
+    /// quadratic scan.
     ///
-    /// **What this does not cover, stated first because the obvious reading is
-    /// wrong.** The quick-xml advisories behind #185 -- quadratic duplicate
+    /// This is the surviving complexity guard. 250,000 attributes on one
+    /// element and 50,000 rows in one sheet both finish well inside 30
+    /// seconds when the work is linear; a quadratic scan of 250,000 items is
+    /// 6.25e10 operations and cannot. It is a coarse instrument -- it cannot
+    /// tell 2n from 5n -- but unlike a ratio it does not fail because the
+    /// machine was busy, and the gap it does detect is the one that matters.
+    ///
+    /// **What this does not cover, stated plainly because the obvious reading
+    /// is wrong.** The quick-xml advisories behind #185 -- quadratic duplicate
     /// attribute checking, and namespace-resolver allocation -- live in
     /// `BytesStart::attributes()` and `NsReader`. calamine 0.36.1 calls
-    /// neither: it ships its own `attrs.rs` iterator, whose own doc says it
+    /// neither: it ships its own `attrs.rs` iterator, whose doc says it
     /// replaces "quick_xml's own `Attributes` iterator, avoiding its ...
-    /// namespace bookkeeping", and it uses `quick_xml::Reader` rather than
-    /// `NsReader` with `check_end_names` off. `grep '\.attributes()'` over
-    /// calamine returns nothing. So those two defects are unreachable through
-    /// this dependency graph, and no fixture driven through `read` can detect
-    /// them returning. A test here cannot be the regression test for them, and
-    /// an earlier version of this file claimed it was.
+    /// namespace bookkeeping", and `xlsx/mod.rs` uses `quick_xml::Reader`
+    /// rather than `NsReader`. `grep '\.attributes()'` over calamine returns
+    /// nothing. Those two defects are unreachable through this dependency
+    /// graph, so no fixture driven through `read` can detect them returning,
+    /// and an earlier version of this file claimed it could. Finch is not
+    /// exposed to them by architecture, not merely by version floor. If a
+    /// future calamine dropped `attrs.rs`, the attribute case would begin
+    /// covering the first advisory for real.
     ///
-    /// What it *does* pin is real and worth keeping: calamine's own attribute
-    /// scanning is linear in attribute count, and Finch's `stream_bounded`
-    /// loop is linear in row count. Either going quadratic would hang a read
-    /// on a file small enough to arrive by accident. And if a future calamine
-    /// dropped `attrs.rs` and went back to `BytesStart::attributes()`, the
-    /// attribute case would begin covering the first advisory for real.
-    ///
-    /// Asserted as a ratio rather than a millisecond ceiling: a tenfold input
-    /// costing tenfold time is linear and costing a hundredfold is quadratic,
-    /// and that difference survives any machine speed, where an absolute bound
-    /// on a shared runner mostly measures the runner.
-    #[test]
-    fn test_xlsx_attribute_scanning_stays_linear() {
-        let cases: [(&str, fn(usize) -> Vec<u8>, usize); 2] = [
-            (
-                "attributes on one cell",
-                fixtures::many_distinct_attributes,
-                1,
-            ),
-            ("rows in one sheet", fixtures::repeated_rows, 1),
-        ];
-
-        for (label, make, rows) in cases {
-            let small = fastest_parse(&make(5_000), rows);
-            let large = fastest_parse(&make(50_000), rows);
-            let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::MIN_POSITIVE);
-            // Tenfold input. Linear is ~10x, quadratic ~100x; 25x leaves ample
-            // room for noise while failing long before quadratic.
-            assert!(
-                ratio < 25.0,
-                "{label}: 10x the input cost {ratio:.1}x the time ({small:?} -> {large:?}), \
-                 which is the shape of a quadratic scan rather than a linear one"
-            );
-        }
-    }
-
-    /// And a parse must terminate at all.
-    ///
-    /// The ratio above cannot catch a stall -- two equally slow measurements
-    /// have a fine ratio -- and an assertion placed *after* the parse cannot
-    /// either, because a genuine non-termination never reaches it and
-    /// `cargo test` has no per-test timeout. So the parse runs on its own
-    /// thread and the deadline is on the join. An earlier version asserted on
-    /// elapsed time after the call and described itself as separating
+    /// The deadline is on a join rather than measured after the call: a
+    /// genuine non-termination never reaches a trailing assertion, and
+    /// `cargo test` has no per-test timeout. An earlier version asserted on
+    /// elapsed time after `read` returned and described itself as separating
     /// "finished" from "did not"; it could only ever have caught "finished
     /// slowly".
     #[test]
     fn test_a_hostile_parse_terminates() {
         for (label, bytes) in [
-            ("attributes", fixtures::many_distinct_attributes(50_000)),
+            ("attributes", fixtures::many_distinct_attributes(250_000)),
             ("rows", fixtures::repeated_rows(50_000)),
         ] {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = tx.send(read(bytes).map(|range| range.rows().count()));
             });
-            let rows = rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .unwrap_or_else(|_| panic!("{label}: parse did not terminate within 30s"))
-                .unwrap_or_else(|error| panic!("{label}: parse failed: {error}"));
+            let rows = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(result) => {
+                    result.unwrap_or_else(|error| panic!("{label}: parse failed: {error}"))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("{label}: parse did not terminate within 30s")
+                }
+                // The sender is dropped by a panic unwinding out of the parse.
+                // Folding this into the timeout arm would report a crash as a
+                // hang and send the reader hunting for an infinite loop.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{label}: the parse thread panicked; its own message is above")
+                }
+            };
             assert_eq!(rows, 1);
         }
     }
