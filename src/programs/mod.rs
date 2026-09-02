@@ -736,51 +736,6 @@ impl ProgramDefinition {
         }
     }
 
-    /// Project an existing Co-Forth vocabulary entry into the shared registry.
-    pub fn from_forth_entry(
-        entry: &crate::coforth::WordEntry,
-        scope: ProgramScope,
-    ) -> Option<Self> {
-        let source = entry.forth.clone()?;
-        let sense = entry.sense.as_deref().unwrap_or("default");
-        let identity = format!("{}:{}:{sense}", scope.as_str(), entry.word);
-        Some(Self {
-            reference: ProgramRef {
-                id: Uuid::new_v5(&Uuid::NAMESPACE_OID, identity.as_bytes()),
-                version: 1,
-            },
-            name: entry.word.clone(),
-            language: ProgramLanguage::Forth,
-            source_hash: hash_text(&source),
-            source,
-            documentation: entry.definition.clone(),
-            signature: entry.stack_effect.clone(),
-            effect: entry
-                .effect
-                .as_deref()
-                .and_then(|effect| effect.parse().ok())
-                .unwrap_or(ExecutionEffect::Unclassified),
-            capabilities: Vec::new(),
-            dependencies: Vec::new(),
-            tests: entry
-                .proof
-                .iter()
-                .map(|parts| format!("{} == {}", parts[0], parts[1]))
-                .chain(
-                    entry
-                        .claim
-                        .iter()
-                        .map(|parts| format!("{} ~ {} when {}", parts[0], parts[1], parts[2])),
-                )
-                .collect(),
-            provenance: "forth-library".to_string(),
-            trust: TrustState::Approved,
-            scope,
-            scope_key: None,
-            environment_hash: "forth-library".to_string(),
-        })
-    }
-
     /// Project a persisted top-level Lisp `define` expression into the registry.
     pub fn from_lisp_define(source: &str, scope_key: Option<String>) -> Option<Self> {
         let (name, signature) = lisp_definition_identity(source)?;
