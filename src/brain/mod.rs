@@ -2270,22 +2270,48 @@ mod isolation_tests {
         if !supervisor_contract_present() {
             return;
         }
-        isolated_test_proof().unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
-        let workers = (0..8)
-            .map(|_| {
+        // One validation consumes a shared-offset proof if `read_proof_at`
+        // regresses to an ordinary read. The warm-up plus two validations per
+        // worker therefore exercises the regression repeatedly without doing
+        // 128 full supervisor-image hashes. Those hashes are intentionally
+        // part of production validation and are comparatively expensive on
+        // Linux CI.
+        const WORKER_COUNT: usize = 8;
+        const VALIDATIONS_PER_WORKER: usize = 2;
+
+        isolated_test_proof().expect("warm-up proof validation failed");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKER_COUNT + 1));
+        let workers = (0..WORKER_COUNT)
+            .map(|worker_index| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    for _ in 0..16 {
-                        isolated_test_proof().unwrap();
+                    for validation_index in 0..VALIDATIONS_PER_WORKER {
+                        let started = std::time::Instant::now();
+                        eprintln!(
+                            "proof validation worker {worker_index} iteration {validation_index} started"
+                        );
+                        isolated_test_proof().unwrap_or_else(|error| {
+                            panic!(
+                                "proof validation worker {worker_index} iteration \
+                                 {validation_index} failed: {error:#}"
+                            )
+                        });
+                        eprintln!(
+                            "proof validation worker {worker_index} iteration {validation_index} \
+                             completed in {:?}",
+                            started.elapsed()
+                        );
                     }
                 })
             })
             .collect::<Vec<_>>();
         barrier.wait();
-        for worker in workers {
-            worker.join().unwrap();
+        for (worker_index, worker) in workers.into_iter().enumerate() {
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            eprintln!("proof validation worker {worker_index} joined");
         }
     }
 
