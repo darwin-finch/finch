@@ -3430,17 +3430,31 @@ impl TuiRenderer {
                 match open_workbook_auto(path) {
                     Ok(mut wb) => {
                         let sheet_names = wb.sheet_names().to_vec();
-                        let mut rows = Vec::new();
-                        if let Some(name) = sheet_names.first() {
-                            if let Ok(range) = wb.worksheet_range(name) {
-                                for row in range.rows() {
-                                    let cols: Vec<String> =
-                                        row.iter().map(|c| c.to_string()).collect();
-                                    rows.push(cols);
-                                }
+                        // Bounded, and the error shown rather than swallowed.
+                        // `if let Ok(range)` turned an oversized or unreadable
+                        // sheet into an empty preview, which reads as "this
+                        // spreadsheet has no rows" -- the silent truncation
+                        // #185 explicitly rules out (#282).
+                        let Some(name) = sheet_names.first().cloned() else {
+                            return Ok(());
+                        };
+                        match crate::workbook::bounded_worksheet_range(
+                            &mut wb,
+                            &name,
+                            crate::workbook::MAX_WORKBOOK_CELLS,
+                        ) {
+                            Ok(range) => Some(
+                                range
+                                    .rows()
+                                    .map(|row| {
+                                        row.iter().map(|c| c.to_string()).collect::<Vec<String>>()
+                                    })
+                                    .collect(),
+                            ),
+                            Err(error) => {
+                                Some(vec![vec![format!("cannot preview {path}: {error}")]])
                             }
                         }
-                        Some(rows)
                     }
                     Err(e) => Some(vec![vec![format!("error opening {path}: {e}")]]),
                 }
