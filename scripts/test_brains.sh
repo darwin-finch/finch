@@ -22,9 +22,13 @@ cd "$repo_root"
 # CI has pinned since the isolation workflow was written
 # (.github/workflows/issue-56-brain-isolation.yml installs both the debug and
 # release copies at 0555). Local runs never did, which is why #259 reproduced
-# only locally. This closes that divergence, using `install -m 0555` so the
-# image the authority check trusts is not left owner-writable, and so a local
-# copy is byte-for-byte the same artifact CI produces.
+# only locally. This closes that divergence. On Linux the authority image is
+# stripped before publication because every production-boundary validation
+# hashes it; ELF debug sections otherwise turn daemon startup into several
+# serial hashes of a needlessly large file. Apple's `strip` rewrites Mach-O
+# metadata nondeterministically, so macOS retains the already-small original.
+# The selected image is then made 0555 so the launcher never publishes an
+# owner-writable authority executable.
 #
 if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
   # Cargo's fingerprint is the maintained source/build freshness contract.
@@ -41,9 +45,22 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
   cargo build --quiet --target-dir "$cargo_target_dir" --bin finch-test-supervisor
   cargo_target_dir="$(cd "$cargo_target_dir" && pwd -P)"
   built_supervisor="$cargo_target_dir/debug/finch-test-supervisor"
-  built_digest="$(shasum -a 256 "$built_supervisor" | awk '{print $1}')"
+
+  # Prepare a private complete copy before naming or publishing it. Hashing the
+  # running image remains mandatory and detects replacement or in-place
+  # rewriting exactly as before. Linux strips sections the supervisor never
+  # executes; macOS keeps deterministic byte identity between concurrent
+  # launchers.
+  staging="$cargo_target_dir/debug/.finch-test-supervisor-staging.$$"
+  trap 'rm -f "$staging"' EXIT
+  install -m 0755 "$built_supervisor" "$staging"
+  if [[ "$(uname -s)" == Linux ]]; then
+    strip "$staging"
+  fi
+  chmod 0555 "$staging"
+  built_digest="$(shasum -a 256 "$staging" | awk '{print $1}')"
   if [[ ! "$built_digest" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "could not compute the current supervisor image digest for $built_supervisor" >&2
+    echo "could not compute the selected supervisor image digest for $staging" >&2
     exit 74
   fi
   pinned_supervisor="$cargo_target_dir/debug/finch-test-supervisor-pinned-sha256-$built_digest"
@@ -55,10 +72,6 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
   # image when its child verifies the proof. Hard-link creation is one atomic
   # create-if-absent operation; concurrent launchers either create this exact
   # digest path or verify the already-published identical immutable image.
-  staging="$pinned_supervisor.$$"
-  trap 'rm -f "$staging"' EXIT
-  install -m 0555 "$built_supervisor" "$staging"
-
   # Deterministic production-boundary concurrency probe. It is inert unless
   # the maintained isolation regression supplies both private paths.
   if [[ -n "${FINCH_TEST_SUPERVISOR_PIN_READY_DIR:-}" || \

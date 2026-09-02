@@ -90,7 +90,28 @@ impl TestDaemon {
                 );
             }
             if Instant::now() >= deadline {
-                anyhow::bail!("isolated daemon did not publish its ephemeral address");
+                let stderr = redact_daemon_diagnostic(
+                    bounded_child_stderr(&stderr_file),
+                    &home,
+                    &socket_root,
+                    &brain_address,
+                    &daemon_address,
+                    &brain_password,
+                    api_key,
+                );
+                let daemon_log = redact_daemon_diagnostic(
+                    bounded_path_diagnostic(&finch_dir.join("daemon.log")),
+                    &home,
+                    &socket_root,
+                    &brain_address,
+                    &daemon_address,
+                    &brain_password,
+                    api_key,
+                );
+                anyhow::bail!(
+                    "isolated daemon remained alive but did not publish its ephemeral address \
+                     within 10s; bounded stderr={stderr:?}; bounded daemon log={daemon_log:?}"
+                );
             }
             std::thread::sleep(Duration::from_millis(25));
         };

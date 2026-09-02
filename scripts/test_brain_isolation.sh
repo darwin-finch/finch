@@ -221,12 +221,27 @@ case "$observed_supervisor" in
     exit 1
     ;;
 esac
-if [[ ! -x "$launcher_built" || ! -x "$observed_supervisor" ]] || \
-  ! cmp -s "$launcher_built" "$observed_supervisor"; then
-  echo "maintained launcher did not leave byte-identical executable built and content-addressed supervisor images" >&2
+if [[ ! -x "$launcher_built" || ! -x "$observed_supervisor" ]]; then
+  echo "maintained launcher did not leave executable built and content-addressed supervisor images" >&2
   ls -l "$launcher_built" "$observed_supervisor" >&2 || true
   exit 1
 fi
+built_size="$(wc -c <"$launcher_built" | tr -d ' ')"
+pinned_size="$(wc -c <"$observed_supervisor" | tr -d ' ')"
+case "$(uname -s)" in
+  Linux)
+    if [[ "$pinned_size" -ge "$built_size" ]]; then
+      echo "maintained launcher did not strip its hashed authority image; built=$built_size pinned=$pinned_size" >&2
+      exit 1
+    fi
+    ;;
+  Darwin)
+    if ! cmp -s "$launcher_built" "$observed_supervisor"; then
+      echo "maintained macOS launchers did not preserve deterministic supervisor bytes" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 # The digest in a content-addressed supervisor name is authority, not a label.
 # Run trusted supervisor bytes from a deliberately false digest path and prove
