@@ -169,6 +169,11 @@ fn load_config() -> Result<Config> {
 ### Testing (mandatory)
 
 - **Every bug fix must have a regression test** that fails before and passes after. No exceptions.
+- **Assertion failures must be actionable** — nontrivial assertions must name the behavioral
+  invariant and include the diagnostic or state payload needed to explain a failure. Do not rely on
+  the test name for context because parallel test output can interleave. For execution outcomes,
+  include relevant diagnostics, VM diagnostics, captured output, and identity/timing data as
+  applicable; a bare `left == right` status comparison is insufficient.
 - **Reproduce the reported failure at the production boundary** — a helper-only unit test is
   insufficient when the bug crossed the TUI, provider, persistence, authority, runner, IPC, or
   process-lifecycle boundary. Add a deterministic production-boundary test that exercises the real
