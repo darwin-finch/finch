@@ -67,7 +67,7 @@ pub(crate) fn caveat(status: &HydrationStatus, found_any: bool) -> Option<String
         HydrationStatus::Ready { .. } => None,
         HydrationStatus::Loading { loaded, total } => Some(format!(
             "The memory index was still loading: at least {loaded} of {total} entries \
-             had been read when this search ran. Retrying shortly may find more."
+             had been read. Retrying shortly may reach more."
         )),
         // Deliberately not "the rest are unreadable". Hydration stops at the
         // first failing batch, so of the entries that did not load, only that
@@ -75,19 +75,50 @@ pub(crate) fn caveat(status: &HydrationStatus, found_any: bool) -> Option<String
         // Calling the remainder unreadable would assert something about data
         // that was not read -- structurally the same error as the absence claim
         // this wording replaces.
+        // Nor "retrying will not find more": `degrade` fires on any batch read
+        // error, transient ones included, and a later reload can clear the
+        // failure within the same process. Stating it as permanent would be the
+        // same claim-beyond-evidence as the sentence above.
         HydrationStatus::Degraded { loaded, total, .. } => Some(format!(
             "The memory index is incomplete: {loaded} of {total} entries loaded before a \
-             read error stopped it, and the remainder were not read. Retrying will not \
-             find more."
+             read error stopped it, and the remainder were not read."
         )),
         HydrationStatus::Failed { .. } if found_any => Some(
-            "The memory index then failed: these results come from the part that had \
-             loaded, and the rest of the store was not searched."
+            "The memory index has since failed: what is reported here came from the part \
+             that had loaded, and the rest of the store was not read."
                 .to_string(),
         ),
         HydrationStatus::Failed { .. } => {
-            Some("The memory index is unavailable, so nothing could be searched.".to_string())
+            Some("The memory index is unavailable, so nothing could be read.".to_string())
         }
+    }
+}
+
+/// What a turn recalled, together with the index it recalled from.
+///
+/// The two travel as one value because separating them is what went wrong.
+/// A count taken against a partial index, re-rendered later against a freshly
+/// sampled status, reads as a complete recall — and the end-of-turn refresh is
+/// the *last* writer to the strip, so on the ordinary startup path it replaced
+/// an accurate line with a bare one at the moment the user read it.
+#[derive(Clone, Debug)]
+pub(crate) struct Recall {
+    pub(crate) count: usize,
+    pub(crate) index: HydrationStatus,
+}
+
+impl Recall {
+    /// A turn with no memory system attached: nothing recalled, nothing to
+    /// qualify.
+    pub(crate) fn none() -> Self {
+        Self {
+            count: 0,
+            index: HydrationStatus::Ready { nodes: 0 },
+        }
+    }
+
+    pub(crate) fn line(&self) -> String {
+        status_line(self.count, &self.index)
     }
 }
 
@@ -185,11 +216,11 @@ mod tests {
     fn test_a_failed_index_that_still_returned_hits_does_not_claim_it_searched_nothing() {
         let with_hits = caveat(&failed(), true).expect("failure owes a caveat");
         assert!(
-            !with_hits.contains("nothing could be searched"),
+            !with_hits.contains("nothing could be read"),
             "contradicts the results printed above it: {with_hits}"
         );
         let without_hits = caveat(&failed(), false).expect("failure owes a caveat");
-        assert!(without_hits.contains("nothing could be searched"));
+        assert!(without_hits.contains("nothing could be read"));
     }
 
     /// The unread remainder was not read; it was not proven unreadable.

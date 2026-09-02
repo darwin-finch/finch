@@ -83,9 +83,16 @@ impl Tool for SearchMemoryTool {
         if results.is_empty() {
             return Ok(match caveat {
                 None => "No relevant memories found for this query.".to_string(),
+                // An unusable index searched nothing, so there is no "among the
+                // entries read" to speak of -- pairing the two produced the
+                // self-contradicting "No matches among the memories searched.
+                // The memory index is unavailable, so nothing could be read."
+                Some(caveat) if matches!(index, crate::memory::HydrationStatus::Failed { .. }) => {
+                    caveat
+                }
                 // Deliberately not "no memories found": that would assert
                 // absence on the strength of an index that was not read.
-                Some(caveat) => format!("No matches among the memories searched. {caveat}"),
+                Some(caveat) => format!("No matches among the entries that were read. {caveat}"),
             });
         }
 
@@ -533,6 +540,21 @@ mod tests {
             use_neural_embeddings: false,
             ..Default::default()
         })?);
+        // Pin the path, not just the outcome. `HydrationState::new` seeds
+        // `done` only when the store is empty, and this fixture is not, so on
+        // the spawned path the status is necessarily `Loading` the instant
+        // `new` returns -- while the synchronous path has already finished. Cut
+        // the `MultiThread` arm out of `MemorySystem::new` and this assertion
+        // fails, which is what makes the test cover the batched loader rather
+        // than merely coexist with it.
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Loading { .. }
+            ),
+            "no background loader was spawned, so this is the synchronous path: {:?}",
+            memory.hydration_status()
+        );
         let settled = settled_hydration(&memory).await;
         assert!(
             matches!(settled, crate::memory::HydrationStatus::Failed { .. }),

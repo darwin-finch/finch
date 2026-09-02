@@ -737,7 +737,7 @@ async fn persist_completed_turn_memory(
     cwd: &str,
     status_bar: &StatusBar,
     context_lines: usize,
-    memory_recall_count: usize,
+    memory_recall: crate::memory_status::Recall,
 ) {
     let brain_provenance = query_states
         .get_metadata(query_id)
@@ -801,7 +801,7 @@ async fn persist_completed_turn_memory(
     }
     status_bar.update_line(
         crate::cli::status_bar::StatusLineType::MemoryContext,
-        crate::memory_status::status_line(memory_recall_count, &memory_system.hydration_status()),
+        memory_recall.line(),
     );
     refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
@@ -835,7 +835,7 @@ pub(super) async fn dispatch_tool_uses(
     query_states: &Arc<super::query_state::QueryStateManager>,
     tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
     memory_system: &Option<Arc<crate::memory::MemorySystem>>,
-    memory_recall_count: usize,
+    memory_recall: crate::memory_status::Recall,
     session_label: &str,
     cwd: &str,
     status_bar: &Arc<crate::cli::StatusBar>,
@@ -987,7 +987,7 @@ pub(super) async fn dispatch_tool_uses(
     if let Some(ref mem) = memory_system {
         status_bar.update_line(
             crate::cli::status_bar::StatusLineType::MemoryContext,
-            crate::memory_status::status_line(memory_recall_count, &mem.hydration_status()),
+            memory_recall.line(),
         );
         refresh_context_strip(mem, session_label, cwd, status_bar, context_lines).await;
     }
@@ -1069,7 +1069,7 @@ pub(crate) async fn process_query_with_tools(
     };
 
     // Get conversation context, optionally injecting relevant memories
-    let mut memory_recall_count: usize = 0;
+    let mut memory_recall = crate::memory_status::Recall::none();
     let messages = {
         let all_msgs = conversation.read().await.get_messages();
         // When summarization is enabled and messages have been dropped by the
@@ -1096,10 +1096,10 @@ pub(crate) async fn process_query_with_tools(
             // failing open, in the one direction that matters.
             let before = mem.hydration_status();
             let recalled = mem.query(&query, Some(recall_k)).await;
-            let index = crate::memory_status::observed(before, mem.hydration_status());
+            memory_recall.index = crate::memory_status::observed(before, mem.hydration_status());
             if let Ok(memories) = recalled {
                 if !memories.is_empty() {
-                    memory_recall_count = memories.len();
+                    memory_recall.count = memories.len();
                     let mem_block = memories.join("\n\n---\n\n");
                     // Inject into the last user message so the LLM sees the recalled context
                     if let Some(last_user) = msgs.iter_mut().rev().find(|m| m.role == "user") {
@@ -1120,7 +1120,7 @@ pub(crate) async fn process_query_with_tools(
             // needed to say the memory was unavailable.
             status_bar.update_line(
                 crate::cli::status_bar::StatusLineType::MemoryContext,
-                crate::memory_status::status_line(memory_recall_count, &index),
+                memory_recall.line(),
             );
         }
         // This execution contract is required on *every* provider inference,
@@ -1405,7 +1405,7 @@ pub(crate) async fn process_query_with_tools(
                         &query_states,
                         &tool_coordinator,
                         &memory_system,
-                        memory_recall_count,
+                        memory_recall.clone(),
                         &session_label,
                         &cwd,
                         &status_bar,
@@ -1518,7 +1518,7 @@ pub(crate) async fn process_query_with_tools(
                             &cwd,
                             &status_bar,
                             context_lines,
-                            memory_recall_count,
+                            memory_recall.clone(),
                         )
                         .await;
                     }
@@ -1657,7 +1657,7 @@ pub(crate) async fn process_query_with_tools(
                     &query_states,
                     &tool_coordinator,
                     &memory_system,
-                    memory_recall_count,
+                    memory_recall.clone(),
                     &session_label,
                     &cwd,
                     &status_bar,
@@ -1762,7 +1762,7 @@ pub(crate) async fn process_query_with_tools(
                         &cwd,
                         &status_bar,
                         context_lines,
-                        memory_recall_count,
+                        memory_recall.clone(),
                     )
                     .await;
                 }
@@ -2076,6 +2076,72 @@ mod tests {
             .contains("CUSTOM OVERRIDE CONTENT"));
     }
 
+    /// The end-of-turn refresh must not launder a partial recall into a clean
+    /// one.
+    ///
+    /// `persist_completed_turn_memory` is the *last* writer to the memory
+    /// status line, and it used to re-render the turn's recall count against a
+    /// freshly sampled hydration status. On the ordinary startup path -- which
+    /// #242 made normal -- hydration finishes during the turn, so the fresh
+    /// sample reads `Ready` and the accurate
+    /// "recalled 3 · searching 512 of 2048 entries" was replaced by a bare
+    /// "recalled 3" at the moment the user actually read it. Carrying the
+    /// observed index along with the count is what stops that (#275).
+    #[tokio::test]
+    async fn test_the_end_of_turn_refresh_keeps_a_partial_recall_qualified() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message("a turn that recalled from a partial index".into());
+        let status = StatusBar::new();
+        let query_states = QueryStateManager::new();
+        let query_id = query_states
+            .create_query(conversation.read().await.get_messages())
+            .await;
+
+        // The index this turn's recall actually came from. The live index by
+        // the time this runs is `Ready` -- that is the whole point: resampling
+        // here is what produced the false line.
+        persist_completed_turn_memory(
+            &memory,
+            &conversation,
+            query_id,
+            &query_states,
+            "",
+            &RenderedTurn::for_test("Hello from the partial index test"),
+            "test-model",
+            "test-brain",
+            "/workspace",
+            &status,
+            4,
+            crate::memory_status::Recall {
+                count: 3,
+                index: crate::memory::HydrationStatus::Loading {
+                    loaded: 512,
+                    total: 2048,
+                },
+            },
+        )
+        .await;
+
+        let line = status
+            .get_line(&crate::cli::status_bar::StatusLineType::MemoryContext)
+            .expect("the end-of-turn refresh must write the memory line");
+        assert!(
+            line.contains("512 of 2048"),
+            "resampled a now-complete index and presented a partial recall as whole: {line}"
+        );
+        assert!(line.contains('3'), "lost the recall count: {line}");
+    }
+
     #[tokio::test]
     async fn completed_streaming_turn_populates_session_context_strip() {
         let temp = tempfile::NamedTempFile::new().unwrap();
@@ -2108,7 +2174,10 @@ mod tests {
             "/workspace",
             &status,
             4,
-            2,
+            crate::memory_status::Recall {
+                count: 2,
+                index: crate::memory::HydrationStatus::Ready { nodes: 8 },
+            },
         )
         .await;
 
@@ -2199,7 +2268,10 @@ mod tests {
                 "/workspace",
                 &status,
                 4,
-                2,
+                crate::memory_status::Recall {
+                    count: 2,
+                    index: crate::memory::HydrationStatus::Ready { nodes: 8 },
+                },
             )
             .await;
         }
