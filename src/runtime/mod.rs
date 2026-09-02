@@ -6986,9 +6986,10 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         // `read_workbook_rows` and the TUI preview. Finch has no
         // `catch_unwind`.
         //
-        // Guarding here also makes the fallback below reachable: `as_duration`
-        // never returns `None`, so before this it was dead code that documented
-        // a behaviour the function did not have.
+        // The fallback below is still dead code: `as_duration` returns `Some`
+        // unconditionally in calamine 0.36.1, so nothing reaches it. It is kept
+        // for uniformity with the arm beneath, whose `None` is real -- but the
+        // previous commit claimed the guard made it reachable, and it does not.
         Data::DateTime(value) if !workbook_serial_is_renderable(value.as_f64()) => {
             format_cell_number(value.as_f64())
         }
@@ -7109,9 +7110,19 @@ fn normalize_iso_datetime(value: &str) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(&with_offset)
         .ok()
         .or_else(|| {
-            ["%Y-%m-%dT%H:%M:%S%.f%:z", "%Y-%m-%dT%H:%M%:z"]
-                .iter()
-                .find_map(|format| chrono::DateTime::parse_from_str(&with_offset, format).ok())
+            // Both separator cases, for the same reason as `['Z', 'z']` above:
+            // `parse_from_rfc3339` accepts a lowercase `t`, so listing only the
+            // uppercase one made second precision and minute precision
+            // disagree. The previous commit went looking for exactly this class
+            // and fixed one of the two letters.
+            [
+                "%Y-%m-%dT%H:%M:%S%.f%:z",
+                "%Y-%m-%dT%H:%M%:z",
+                "%Y-%m-%dt%H:%M:%S%.f%:z",
+                "%Y-%m-%dt%H:%M%:z",
+            ]
+            .iter()
+            .find_map(|format| chrono::DateTime::parse_from_str(&with_offset, format).ok())
         });
     if let Some(parsed) = parsed {
         // The time is kept whenever an offset is: dropping it glued the offset
@@ -7125,7 +7136,12 @@ fn normalize_iso_datetime(value: &str) -> String {
             parsed.offset()
         );
     }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+    for format in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dt%H:%M:%S%.f",
+        "%Y-%m-%dt%H:%M",
+    ] {
         if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, format) {
             return if parsed.time() == chrono::NaiveTime::MIN {
                 parsed.format("%Y-%m-%d").to_string()
@@ -11154,9 +11170,6 @@ mod tests {
         }
     }
 
-    /// A number too big or small for a decimal uses exponent notation.
-    #[test]
-
     /// A crafted workbook must not take the process down.
     ///
     /// `ExcelDateTime::as_duration` and `as_datetime` both compute
@@ -11270,6 +11283,16 @@ mod tests {
         // rewrite.
         assert_eq!(iso("2026-09-02T13:45z"), "2026-09-02 13:45:00+00:00");
         assert_eq!(iso("2026-09-02T13:45:30z"), "2026-09-02 13:45:30+00:00");
+        // The separator's case too. Fixing only the offset letter left the
+        // identical asymmetry one line below it -- `parse_from_rfc3339` accepts
+        // a lowercase `t`, the fallback formats listed only `T`, so
+        // "2026-09-02t13:45Z" went untouched while "2026-09-02t13:45:30Z"
+        // normalised. Five review rounds have now found a fix applied to one
+        // side of a pair and not the other, so both are asserted together.
+        assert_eq!(iso("2026-09-02t13:45:30Z"), "2026-09-02 13:45:30+00:00");
+        assert_eq!(iso("2026-09-02t13:45Z"), "2026-09-02 13:45:00+00:00");
+        assert_eq!(iso("2026-09-02t13:45+01:00"), "2026-09-02 13:45:00+01:00");
+        assert_eq!(iso("2026-09-02t00:00:00"), "2026-09-02");
         // Midnight drops its time when there is no offset to strand, as the
         // serial path does.
         assert_eq!(iso("2026-09-02T00:00:00"), "2026-09-02");
