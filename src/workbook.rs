@@ -291,6 +291,24 @@ pub(crate) mod fixtures {
         writer.finish().expect("zip finish").into_inner()
     }
 
+    /// The same cell as `many_distinct_attributes`, with a malformed
+    /// attribute last and `s` optionally present.
+    ///
+    /// A bare key with no `=` makes `RawAttrIter` yield `ExpectedEq` -- but
+    /// only if iteration ever reaches it. That turns "were the attributes
+    /// walked?" into something a test can ask, which the parse result alone
+    /// cannot: a cell is one cell whether calamine read one attribute or a
+    /// quarter of a million.
+    pub(crate) fn attributes_with_a_malformed_last(count: usize, with_s: bool) -> Vec<u8> {
+        let attrs: String = (0..count).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        let s = if with_s { " s=\"0\"" } else { "" };
+        xlsx_from_sheet(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{s}{attrs} malformed><is><t>x</t></is></c></row></sheetData></worksheet>"#
+        ))
+    }
+
     /// One cell carrying `count` distinct attributes.
     ///
     /// The absent `s` attribute is load-bearing, not an oversight.
@@ -388,45 +406,14 @@ mod tests {
         bounded_worksheet_range(&mut workbook, "Sheet1", MAX_WORKBOOK_CELLS)
     }
 
-    /// A note on what is deliberately *not* here: a wall-clock linearity
-    /// assertion.
-    ///
-    /// Two versions of one were written and both were flaky, in opposite
-    /// directions, and the record is kept because the next person to reach for
-    /// this will reach for the same thing.
-    ///
-    /// The first compared a 5,000-attribute parse against a 50,000-attribute
-    /// one and required the ratio to stay under 25. It paired a 2.4 ms
-    /// measurement with a 23 ms one, and under CPU contention the long side
-    /// absorbed proportionally far more preemption than the short side: on a
-    /// loaded 10-core host it produced ratios of 44 to 53 and failed while
-    /// accusing the parser of a quadratic scan that was not there.
-    ///
-    /// The second raised both sides into the tens of milliseconds (25,000
-    /// against 250,000) to fix that. It passed under 40 CPU spinners and then
-    /// failed on an *idle* machine -- once in six runs -- because a 3 MB
-    /// document does not scale like a 300 KB one once it stops fitting in
-    /// cache, and that superlinearity has nothing to do with algorithmic
-    /// complexity. It also cost 46 to 76 seconds a run.
-    ///
-    /// So the ratio was removed rather than tuned a third time. It was never
-    /// the only guard against quadratic behaviour, and it was the weakest:
-    /// `test_a_hostile_parse_terminates` already fails a parse that cannot
-    /// finish 250,000 attributes or 50,000 rows in 30 seconds, which a
-    /// quadratic scan cannot do, and `test_the_row_fixture_streams_one_cell_per_row`
-    /// pins the streamed cell count exactly and deterministically. What the
-    /// ratio added over those was the ability to distinguish *degrees* of
-    /// linear -- and it could not do that reliably enough on a shared runner
-    /// to be worth a test that fails for reasons the code did not cause.
-
     /// The row fixture really does drive `count` cells through the loop.
     ///
-    /// The timing test above asserts the parsed *shape* (one row), and that
-    /// shape is identical at every size -- so on its own it cannot tell a
-    /// fixture that streams 50,000 cells from one that streams a handful and
-    /// discards the rest. Without this, a calamine change that stopped
-    /// emitting a cell per repeated `<row>` would leave the linearity claim
-    /// green and quietly untested.
+    /// `test_a_hostile_parse_terminates` asserts the parsed *shape* (one row),
+    /// and that shape is identical at every size -- so on its own it cannot
+    /// tell a fixture that streams 50,000 cells from one that streams a
+    /// handful and discards the rest. Without this, a calamine change that
+    /// stopped emitting a cell per repeated `<row>` would leave the deadline
+    /// guarding a fixture that had quietly stopped being hostile.
     ///
     /// The cell-count bound is the cheapest oracle for "how many cells
     /// actually reached the loop": ask for one fewer than the fixture holds
@@ -451,15 +438,74 @@ mod tests {
             .expect("exactly 50,000 cells is within a 50,000-cell limit");
     }
 
+    /// The attribute fixture really is walked to its end.
+    ///
+    /// The row fixture has a cell-count oracle; this is the attribute one, and
+    /// without it the whole attribute half rests on a doc comment. The only
+    /// assertion the hostile parse makes about that fixture is that it yields
+    /// one row -- true at 250,000 attributes and equally true at zero -- so if
+    /// calamine ever stopped walking them, the fixture would go green in
+    /// milliseconds and nothing would say it had stopped being hostile.
+    ///
+    /// The mechanism is `get_attrs!(c, b"r" => r, b"s" => s, b"t" => t)`, which
+    /// breaks as soon as every key it wants is found. `many_distinct_attributes`
+    /// omits `s`, so the search never completes and every attribute is visited.
+    /// That omission is load-bearing and looks like an oversight, so this
+    /// asserts it in both directions rather than only describing it: reaching a
+    /// malformed attribute at the end proves the walk, and adding `s` proves
+    /// the early exit is what would hide it.
+    #[test]
+    fn test_the_attribute_fixture_is_walked_to_its_end() {
+        let walked = read(fixtures::attributes_with_a_malformed_last(5_000, false));
+        let error = walked.expect_err(
+            "a malformed attribute at the end must be reached, which is what \
+             proves calamine walks the whole list",
+        );
+        assert!(
+            error.contains("attribute key must be directly followed by"),
+            "must fail on the malformed attribute rather than anything else: {error}"
+        );
+
+        // And with `s` present the search completes early and never reaches it.
+        // If this ever starts erroring, the early exit is gone and the sibling
+        // fixture's omission of `s` has stopped mattering.
+        read(fixtures::attributes_with_a_malformed_last(5_000, true))
+            .expect("with `s` present calamine stops before the malformed attribute");
+    }
+
     /// A hostile parse terminates, and does so fast enough to rule out a
     /// quadratic scan.
     ///
-    /// This is the surviving complexity guard. 250,000 attributes on one
-    /// element and 50,000 rows in one sheet both finish well inside 30
-    /// seconds when the work is linear; a quadratic scan of 250,000 items is
-    /// 6.25e10 operations and cannot. It is a coarse instrument -- it cannot
-    /// tell 2n from 5n -- but unlike a ratio it does not fail because the
-    /// machine was busy, and the gap it does detect is the one that matters.
+    /// This is the surviving complexity guard, and the sizes are chosen so
+    /// that it actually is one. A pairwise rescan costs n(n-1)/2 comparisons,
+    /// and this debug build sustains roughly 1.5e8 of them a second, so the
+    /// deadline only bites where n is large enough:
+    ///
+    /// | case | linear, measured | quadratic, implied |
+    /// |---|---|---|
+    /// | 250,000 attributes | 0.13 s | 3.1e10 pairs, ~200 s |
+    /// | 150,000 rows | ~1.05 s | 1.1e10 pairs, ~73 s |
+    ///
+    /// The row case was 50,000 and did not guard anything: 1.2e9 pairs is
+    /// about 8 seconds, which passes a 30-second deadline green. Break-even
+    /// there is near 96,000 rows, so 150,000 restores the margin at a cost of
+    /// about 0.7 s. This matters more than the attribute case, because the row
+    /// path is Finch's own `stream_bounded` loop rather than calamine's: a
+    /// running min/max replaced by a rescan of the accumulated cells, or a
+    /// duplicate-address check, is exactly the regression that would land
+    /// here.
+    ///
+    /// It stays a coarse instrument -- it cannot tell 2n from 5n -- but the
+    /// headroom runs the other way too: at 85x and 226x, a merely slower
+    /// linear parser cannot trip it, which is the failure mode that killed the
+    /// ratio test this replaced.
+    ///
+    /// That ratio test is worth one line of history, since the next person
+    /// here will reach for it. It was tried at two sizings and was flaky in
+    /// both: the first paired a 2.4 ms measurement against a 23 ms one and
+    /// broke under CPU contention, the second raised both sides and broke once
+    /// in six runs on an idle machine for reasons never established. See #306
+    /// for the measurements.
     ///
     /// **What this does not cover, stated plainly because the obvious reading
     /// is wrong.** The quick-xml advisories behind #185 -- quadratic duplicate
@@ -486,7 +532,7 @@ mod tests {
     fn test_a_hostile_parse_terminates() {
         for (label, bytes) in [
             ("attributes", fixtures::many_distinct_attributes(250_000)),
-            ("rows", fixtures::repeated_rows(50_000)),
+            ("rows", fixtures::repeated_rows(150_000)),
         ] {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
