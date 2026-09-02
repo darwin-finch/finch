@@ -80,11 +80,17 @@ echo
 # ── 5. Chinese vocabulary ─────────────────────────────────────────────────────
 
 echo "${BOLD}chinese vocabulary:${RESET}"
+# `library show` prints word/definition/kind/related/forth. It has never had an
+# `output:` field, so `grep '^output:'` exited 1 and `set -e` killed the script
+# here -- with stderr discarded, sections 5 and 6 and the footer simply never
+# appeared. `|| true` keeps a future field rename from doing the same thing
+# silently, and the definition is what a "chinese vocabulary" section is for.
+#
+# The `forth:` bodies are deliberately not shown as runnable: they use `depth`,
+# `.` and `."`, none of which link in the typed VM.
 for WORD in '你好' '道' '空'; do
-  OUT=$("$BINARY" library show "${WORD}" 2>/dev/null | grep '^output:' | sed 's/^output:[[:space:]]*//')
-  FORTH=$("$BINARY" library show "${WORD}" 2>/dev/null | grep '^forth:' | sed 's/^forth:[[:space:]]*//')
-  echo "  ${CYAN}${WORD}${RESET}  ${DIM}→ ${FORTH}${RESET}"
-  echo "       ${OUT}"
+  MEANING=$("$BINARY" library show "${WORD}" | grep '^definition:' | sed 's/^definition:[[:space:]]*//' || true)
+  echo "  ${CYAN}${WORD}${RESET}  ${DIM}→ ${MEANING}${RESET}"
 done
 echo
 

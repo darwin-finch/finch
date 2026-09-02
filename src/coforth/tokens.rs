@@ -749,18 +749,6 @@ mod tests {
     ///
     /// This pins them. If a change here is deliberate, this test is where the
     /// migration argument gets made.
-    /// A golden token stream, because this output is a program's identity.
-    ///
-    /// `programs::from_source_file` derives a definition's name from the token
-    /// after `:`, so how this function splits anything is load-bearing for every
-    /// stored definition. The branches for `."` and `s"` survived #294 on that
-    /// argument alone, with a doc comment as their only guard -- which means the
-    /// next "tidy the dead literal forms" commit passes CI.
-    ///
-    /// These are recorded from the function, not guessed at: the first draft
-    /// asserted `." x"` split into two tokens, and it emits one sentinel-tagged
-    /// token instead. If a change here is deliberate, this test is where the
-    /// migration argument gets made.
     #[test]
     fn test_tokenize_splits_the_literal_forms_it_always_has() {
         assert_eq!(
@@ -789,6 +777,41 @@ mod tests {
         // a sentence-ending period routes to NL rather than Forth lives a layer
         // above this, in `repl_event::event_loop`.)
         assert_eq!(tokenize("dont. go"), vec!["dont", ".", "go"]);
+    }
+
+    /// The rest of the sentinel-tagged literal forms.
+    ///
+    /// The doc above names `."`, `s"` and `xlsx"` as the forms preserved on the
+    /// identity argument, and the first version of this test covered two of
+    /// them. All follow one shape -- `\0<tag>:<literal>`, one token, the single
+    /// separating space consumed -- so pinning the shape across the family is
+    /// what stops a "tidy the dead literal forms" commit passing CI.
+    #[test]
+    fn test_tokenize_tags_each_literal_form_with_its_own_sentinel() {
+        for (source, expected) in [
+            (r#"xlsx" a.xlsx""#, "\u{0}xlsx:a.xlsx"),
+            (r#"csv" a.csv""#, "\u{0}csv:a.csv"),
+            (r#"tsv" a.tsv""#, "\u{0}tsv:a.tsv"),
+            (r#"read" f""#, "\u{0}read:f"),
+            (r#"confirm" ok?""#, "\u{0}confirm:ok?"),
+            (r#"select" a|b""#, "\u{0}select:a|b"),
+            (r#"exec" ls""#, "\u{0}exec:ls"),
+            (r#"glob" *.rs""#, "\u{0}glob:*.rs"),
+        ] {
+            assert_eq!(tokenize(source), vec![expected], "for {source:?}");
+        }
+    }
+
+    /// Two rules that silently rewrite a token, and so its identity.
+    #[test]
+    fn test_tokenize_elides_apostrophes_but_keeps_an_interior_period() {
+        // A contraction loses its apostrophe, so `that's` and `thats` are the
+        // same token -- and the same definition.
+        assert_eq!(tokenize("that's"), vec!["thats"]);
+        // But a period *inside* a token stays, so a decimal survives whole
+        // while a trailing period splits.
+        assert_eq!(tokenize("3.14"), vec!["3.14"]);
+        assert_eq!(tokenize("3.14."), vec!["3.14", "."]);
     }
 
     /// Whitespace shape must not change identity.

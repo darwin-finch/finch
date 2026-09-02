@@ -170,9 +170,10 @@ impl Library {
     /// also compile a Forth VM; that VM had no caller in the binary and went
     /// with the rest of the interpreter (#294).
     ///
-    /// This function itself has no caller either. It is kept because the
-    /// vocabulary it warms is live and a startup path may well want it; that is
-    /// a different question from the VM's reachability and is not decided here.
+    /// This function has no caller. It is kept because the vocabulary it warms
+    /// is live and a startup path may well want it; whether it should exist at
+    /// all belongs to the wider `library.rs` reachability question, not the
+    /// interpreter's, which is what #294 settles.
     pub fn warmup() {
         let _ = &*BUILTIN_DEFS;
     }
@@ -450,127 +451,6 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
 }
 
 // ── Pure-Rust word generator ───────────────────────────────────────────────────
-
-/// Generate a minimal but meaningful Forth snippet for *any* English word.
-///
-/// This runs entirely in Rust — no AI, no network, no disk I/O.
-/// Used as a fallback in `handle_define_unknown_words` when the cloud generator
-/// is unavailable (offline, no API key, rate-limited).
-///
-/// Guarantees:
-/// - Always returns valid Forth (no panics, no errors).
-/// - The snippet produces at least one line of output (the word speaks its name).
-/// - Stack-neutral for the common case (safe to use mid-expression).
-pub fn generate_forth_for_word(word: &str) -> String {
-    let lo = word.to_lowercase();
-    let w = lo.as_str();
-
-    // ── Pronouns — self-aware via the stack ────────────────────────────────
-    match w {
-        "i" | "me" | "myself" => {
-            return r#"depth . ." items — that's what I have." cr"#.to_string()
-        }
-        "you" | "your" | "yours" => return r#"." you're here." cr"#.to_string(),
-        "we" | "us" | "our" | "ours" => {
-            return r#"depth . ." — we share this stack." cr"#.to_string()
-        }
-        "it" | "this" | "that" => {
-            return r#"depth 0> if ." it's on the stack." cr else ." nothing here." cr then"#
-                .to_string()
-        }
-        "they" | "them" | "their" => {
-            return r#"." they're somewhere on the stack." cr .s cr"#.to_string()
-        }
-        _ => {}
-    }
-
-    // ── Number words ────────────────────────────────────────────────────────
-    let num_opt = match w {
-        "zero" | "null" | "nil" | "none" | "nothing" | "nought" => Some(0i64),
-        "one" | "once" | "single" | "unit" => Some(1),
-        "two" | "twice" | "pair" | "both" => Some(2),
-        "three" | "thrice" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        "ten" => Some(10),
-        "eleven" => Some(11),
-        "twelve" | "dozen" => Some(12),
-        "thirteen" => Some(13),
-        "twenty" => Some(20),
-        "thirty" => Some(30),
-        "forty" => Some(40),
-        "fifty" => Some(50),
-        "hundred" => Some(100),
-        "thousand" => Some(1_000),
-        "million" => Some(1_000_000),
-        "billion" => Some(1_000_000_000),
-        _ => None,
-    };
-    if let Some(n) = num_opt {
-        return format!("{n} . cr");
-    }
-
-    // ── Logic / discourse markers ───────────────────────────────────────────
-    match w {
-        "and" => return "and .bool cr".to_string(),
-        "or" => return "or .bool cr".to_string(),
-        "not" | "negate" | "opposite" => return "not .bool cr".to_string(),
-        "true" | "yes" => return "true .bool cr".to_string(),
-        "false" | "no" => return "false .bool cr".to_string(),
-        "equal" | "equals" | "same" => return "= .bool cr".to_string(),
-        _ => {}
-    }
-
-    // ── Stack-motion words ──────────────────────────────────────────────────
-    match w {
-        "double" | "twice-as-much" => return "2* . cr".to_string(),
-        "half" | "halve" => return "2/ . cr".to_string(),
-        "plus" | "add" => return "+ . cr".to_string(),
-        "minus" | "subtract" => return "- . cr".to_string(),
-        "times" | "multiply" => return "* . cr".to_string(),
-        "divide" | "divided" => return "/ . cr".to_string(),
-        "up" | "above" | "higher" | "more" => return "1+ . cr".to_string(),
-        "down" | "below" | "lower" | "less" => return "1- . cr".to_string(),
-        "swap" | "switch" | "exchange" | "flip" => return "swap .s cr".to_string(),
-        "copy" | "duplicate" => return "dup .s cr".to_string(),
-        "drop" | "discard" | "remove" => return "depth 0> if drop then .s cr".to_string(),
-        _ => {}
-    }
-
-    // ── Time words ──────────────────────────────────────────────────────────
-    match w {
-        "now" | "today" | "present" | "current" => {
-            return r#"time . ." seconds since epoch." cr"#.to_string()
-        }
-        "never" | "eternity" | "forever" => return r#"." forever." cr"#.to_string(),
-        _ => {}
-    }
-
-    // ── Existence words ─────────────────────────────────────────────────────
-    match w {
-        "empty" | "void" | "blank" | "bare" => return r#"depth 0= .bool cr"#.to_string(),
-        "full" | "complete" | "whole" | "all" | "everything" => return r#".s cr"#.to_string(),
-        "something" | "anything" | "some" => return r#"depth 0> .bool cr"#.to_string(),
-        _ => {}
-    }
-
-    // ── Question words — print as open questions ────────────────────────────
-    if matches!(
-        w,
-        "who" | "what" | "where" | "when" | "why" | "how" | "which" | "whose"
-    ) {
-        return format!(r#"." {w}?" cr"#);
-    }
-
-    // ── Suffix patterns — detect word shape ────────────────────────────────
-    //   These just speak the word; the shape tells us it's a valid English word.
-    let safe = word.replace('"', ""); // no English word has quotes, but be safe
-    format!(r#"." {safe}." cr"#)
-}
 
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
@@ -1399,7 +1279,7 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
 \ Words that make sentences like "sort these files" into real programs.
 \ `files` pushes a listing of the current directory as a string.
 \ `these` / `them` / `those` / `all` are pronouns — no-ops that refer back to context.
-\ `sort`, `unique`, `reverse`, `line-count` are native builtins (native builtins).
+\ `sort`, `unique`, `reverse`, `line-count` were interpreter builtins; they do not link in the typed VM.
 \
 \ Example:   sort these files
 \   →  `files` runs first (pushes string-pool idx of dir listing)
@@ -4729,74 +4609,6 @@ forth = ".words"
 #[cfg(test)]
 mod tests {
 
-    /// `generate_forth_for_word` survived the interpreter; its tests did not.
-    ///
-    /// The three that covered it asserted through a VM -- they compiled the
-    /// output and checked what it printed -- so they could not be kept as they
-    /// were when the VM went (#294). The function is still live, and these
-    /// assert the same properties structurally instead of leaving ~150 lines
-    /// uncovered.
-    #[test]
-    fn test_generate_forth_for_a_number_word_pushes_that_number() {
-        assert!(
-            super::generate_forth_for_word("three").contains('3'),
-            "{}",
-            super::generate_forth_for_word("three")
-        );
-        assert!(
-            super::generate_forth_for_word("zero").contains('0'),
-            "{}",
-            super::generate_forth_for_word("zero")
-        );
-    }
-
-    #[test]
-    fn test_generate_forth_for_an_arbitrary_word_speaks_its_name() {
-        let generated = super::generate_forth_for_word("perambulate");
-        assert!(
-            generated.contains("perambulate"),
-            "a word with no special case should say itself: {generated}"
-        );
-    }
-
-    /// Never empty, and never unbalanced.
-    ///
-    /// The deleted version proved this by compiling every entry; without a VM,
-    /// the checkable invariants are that output exists and that its quoting and
-    /// control words pair up -- which is what a compile failure would have
-    /// caught first anyway.
-    #[test]
-    fn test_generate_forth_for_word_is_never_empty_or_unbalanced() {
-        for word in [
-            "i",
-            "you",
-            "we",
-            "it",
-            "they",
-            "zero",
-            "seven",
-            "perambulate",
-            "run",
-            "the",
-            "",
-        ] {
-            let generated = super::generate_forth_for_word(word);
-            assert!(!generated.trim().is_empty(), "empty for {word:?}");
-            assert_eq!(
-                generated.matches('"').count() % 2,
-                0,
-                "unbalanced quotes for {word:?}: {generated}"
-            );
-            assert_eq!(
-                generated.split_whitespace().filter(|t| *t == "if").count(),
-                generated
-                    .split_whitespace()
-                    .filter(|t| *t == "then")
-                    .count(),
-                "unbalanced if/then for {word:?}: {generated}"
-            );
-        }
-    }
     use super::*;
 
     #[test]
@@ -4831,8 +4643,6 @@ mod tests {
         assert!(words.contains(&"join"));
         assert!(words.contains(&"poset"));
     }
-
-    // ── generate_forth_for_word ───────────────────────────────────────────────
 
     #[test]
     fn test_inject_sets_compiled_code() {

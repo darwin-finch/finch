@@ -14,9 +14,9 @@
 // Usage in the REPL, after `finch samples` and copying one file into the
 // workspace (`path` is `./**` -- a relative path inside the workspace root, so
 // an absolute ~/.finch path is rejected before the broker sees it):
-//   /lisp (workbook-sheets (path "grades.xlsx"))
-//   /lisp (workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)
-//   /lisp (workbook-summary (path "grades.xlsx") "Grades" 20)
+//   (workbook-sheets (path "grades.xlsx"))
+//   (workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)
+//   (workbook-summary (path "grades.xlsx") "Grades" 20)
 //
 // The sheets are named "Grades", "Budget", "Contacts" and "Times Table", not
 // "Sheet1". These read through the typed runtime's capability broker; the

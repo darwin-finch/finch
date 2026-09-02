@@ -3118,7 +3118,7 @@ fn run_samples() -> Result<()> {
     // absolute path. Printing an instruction nobody ran is how both happened,
     // so `run_samples_instructions_name_real_sheets_and_arities` now pins these
     // strings against the vocabulary and the generated sheet names.
-    println!("Copy one into your workspace, then try in the REPL:");
+    println!("Copy one into your workspace, then type in the REPL:");
     println!("  cp {}/grades.xlsx .", dir.display());
     for line in sample_repl_instructions() {
         println!("  {line}");
@@ -3126,15 +3126,24 @@ fn run_samples() -> Result<()> {
     Ok(())
 }
 
-/// The `finch samples` REPL instructions, as data so a test can check them.
+/// The `finch samples` REPL instructions, as data so a test can compile them.
 ///
-/// Each names a sheet that `finch::samples` actually creates and passes the
-/// arity `src/vm/vocabulary.rs` declares.
+/// No `/lisp` prefix: there is no such command. `Command::parse`'s catch-all
+/// turns any unrecognised `/word` into `Command::Help`, so the first version of
+/// these lines printed the help screen. The REPL routes a bare leading `(` to
+/// the typed Lisp path -- `src/cli/repl_event/event_loop.rs` states the rule --
+/// so that is what these are.
+///
+/// They reach the capability broker and stop there, awaiting approval, which is
+/// the interactive workflow. `run_samples_instructions_compile_and_reach_the_broker`
+/// submits each through the real runtime, so a wrong word, arity, argument
+/// order, argument type or path form fails as a link, type or path error before
+/// approval is ever asked for.
 fn sample_repl_instructions() -> Vec<String> {
     vec![
-        r#"/lisp (workbook-sheets (path "grades.xlsx"))"#.to_string(),
-        r#"/lisp (workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)"#.to_string(),
-        r#"/lisp (workbook-summary (path "grades.xlsx") "Grades" 20)"#.to_string(),
+        r#"(workbook-sheets (path "grades.xlsx"))"#.to_string(),
+        r#"(workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)"#.to_string(),
+        r#"(workbook-summary (path "grades.xlsx") "Grades" 20)"#.to_string(),
     ]
 }
 
@@ -3208,74 +3217,91 @@ mod tests {
     use clap::Parser;
     use std::sync::Arc;
 
-    /// The printed instructions must name sheets that exist and arities that
-    /// type-check.
+    /// The printed instructions must compile against the real runtime.
     ///
     /// `finch samples` advertised `xlsx@`, a word no user input could reach.
-    /// #294's first replacement for it was wrong three ways at once -- it named
-    /// `Sheet1`, which no sample workbook contains; passed `workbook-summary`
-    /// two of the three arguments `vocabulary.rs` declares; and interpolated an
-    /// absolute `~/.finch` path, which `Type::Path(./**)` rejects before the
-    /// broker sees it. Printing an instruction nobody ran is how both versions
-    /// happened, so this checks them against the vocabulary and against the
-    /// sheet names `finch::samples` actually creates.
-    #[test]
-    fn run_samples_instructions_name_real_sheets_and_arities() {
+    /// The first replacement was wrong three ways -- `Sheet1`, which no sample
+    /// workbook contains; two of `workbook-summary`'s three arguments; and an
+    /// absolute path `Type::Path(./**)` rejects. The second was wrong a fourth
+    /// way: a `/lisp` prefix that is not a command, so the line printed the
+    /// help screen.
+    ///
+    /// The string-matching test that was supposed to prevent the second
+    /// mistake could not see it -- it checked sheet names and a positional
+    /// argument count, and never looked at the prefix. So this submits each
+    /// line through `ProgramRuntime` instead of parsing it. A wrong word,
+    /// arity, argument order, argument type or path form fails as `E-LINK-*`,
+    /// `E-TYPE-*` or `E-PATH-*` long before the broker is reached; reaching
+    /// `AuthorizationRequired` means everything a non-interactive test can
+    /// check has passed, and only the user's approval remains.
+    #[tokio::test]
+    async fn run_samples_instructions_compile_and_reach_the_broker() {
         let dir = tempfile::tempdir().expect("tempdir");
         finch::samples::generate_all(dir.path()).expect("generate");
 
-        let sheets = {
-            use calamine::{open_workbook_auto, Reader};
-            let path = dir.path().join("grades.xlsx");
-            open_workbook_auto(&path)
-                .expect("open")
-                .sheet_names()
-                .to_vec()
-        };
-
-        let vocabulary = finch::vm::vocabulary::core_vocabulary();
-        let arity = |word: &str| {
-            vocabulary
-                .iter()
-                .find(|entry| entry.0 == word)
-                .map(|entry| entry.1.input.values.len())
-                .unwrap_or_else(|| panic!("{word} is not in the core vocabulary"))
-        };
-
         for line in super::sample_repl_instructions() {
             assert!(
-                !line.contains("Sheet1"),
-                "names a sheet no sample workbook has (they are {sheets:?}): {line}"
+                !line.starts_with('/'),
+                "a leading `/` is parsed as a REPL command, and an unrecognised \
+                 one prints the help screen: {line}"
             );
-            for sheet in line.split('"').skip(1).step_by(2) {
-                if sheet.ends_with(".xlsx") {
-                    // The path argument: must be relative, or the type checker
-                    // rejects it before the capability broker is reached.
-                    assert!(
-                        !sheet.starts_with('/') && !sheet.starts_with('~'),
-                        "an absolute path is not a `./**` path: {line}"
-                    );
-                } else {
-                    assert!(
-                        sheets.contains(&sheet.to_string()),
-                        "sheet {sheet:?} is not one of {sheets:?}: {line}"
-                    );
-                }
+            assert!(
+                line.starts_with('('),
+                "the REPL routes only a bare leading `(` to Lisp: {line}"
+            );
+
+            // A sheet name is a runtime value, not a typed one: the broker only
+            // discovers it is wrong after approval, so compiling the line
+            // cannot catch `Sheet1`. Checked separately, against whichever
+            // workbook the line actually names -- the sheets differ per file,
+            // so reading them all from `grades.xlsx` would reject a correct
+            // `budget.xlsx` line.
+            let quoted: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+            let file = quoted
+                .iter()
+                .find(|value| value.ends_with(".xlsx"))
+                .expect("an invocation names a workbook");
+            let sheets = {
+                use calamine::{open_workbook_auto, Reader};
+                open_workbook_auto(dir.path().join(file))
+                    .expect("sample workbook opens")
+                    .sheet_names()
+                    .to_vec()
+            };
+            for sheet in quoted.iter().filter(|value| !value.ends_with(".xlsx")) {
+                assert!(
+                    sheets.contains(&sheet.to_string()),
+                    "{line}\n  names sheet {sheet:?}, but {file} has {sheets:?}"
+                );
             }
-            let word = line
-                .split_once('(')
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-                .expect("an invocation names a word");
-            let supplied = line.matches('"').count() / 2
-                + line
-                    .split_whitespace()
-                    .filter(|token| token.trim_end_matches(')').parse::<i64>().is_ok())
-                    .count();
+
+            let runtime = finch::runtime::ProgramRuntime::new();
+            let outcome = runtime
+                .submit_typed_only(finch::runtime::ProgramSubmission {
+                    language: finch::programs::ProgramLanguage::Lisp,
+                    source_id: Some("samples-instruction.lisp".to_string()),
+                    source: line.clone(),
+                    intent: "check a printed instruction".to_string(),
+                    effect: finch::programs::ExecutionEffect::Unclassified,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: None,
+                    budget: None,
+                })
+                .await
+                .expect("submit");
+
+            let diagnostics = outcome.diagnostics.join("; ");
+            for code in ["E-LINK", "E-TYPE", "E-PATH", "E-FORTH"] {
+                assert!(
+                    !diagnostics.contains(code),
+                    "{line}\n  failed with {code}: {diagnostics}"
+                );
+            }
             assert_eq!(
-                supplied,
-                arity(word),
-                "{word} takes {} arguments, and this passes {supplied}: {line}",
-                arity(word)
+                outcome.status,
+                finch::runtime::outcome::ExecutionStatus::AuthorizationRequired,
+                "{line}\n  diagnostics: {diagnostics}"
             );
         }
     }

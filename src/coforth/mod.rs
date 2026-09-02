@@ -13,8 +13,8 @@
 /// - `Library::inject_into_poset` — seed a poset with a word's neighbourhood.
 ///
 /// The interpreter this vocabulary was written for is gone (#294). A `Forth`
-/// VM *was* constructed in non-test code -- a `LazyLock` in `library.rs` -- but
-/// nothing outside `#[cfg(test)]` ever forced it, and every typed-program entry
+/// VM *was* constructed in non-test code, by a `LazyLock` this change removed
+/// along with it, but nothing outside `#[cfg(test)]` ever forced it, and every typed-program entry
 /// point dispatches to `crate::runtime`. Reachable-by-accident is not the same
 /// as unreachable, which is the argument for deleting it rather than
 /// documenting it. What remains is the vocabulary itself, which
