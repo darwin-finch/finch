@@ -6964,7 +6964,51 @@ fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         Data::Int(value) => value.to_string(),
         Data::Bool(value) => value.to_string(),
         Data::Error(value) => format!("#ERR:{value:?}"),
-        other => other.to_string(),
+        // Dates, not the serial underneath them.
+        //
+        // `Data::DateTime`'s `Display` prints the raw f64, so the catch-all
+        // that used to sit here rendered every date cell in every spreadsheet
+        // Finch reads as an opaque number -- 2026-09-02 came back as "46267"
+        // through `workbook-open`, `workbook-range` and `workbook-summary`
+        // alike (#281).
+        //
+        // `as_datetime` is gated behind calamine's `dates` feature, which pulls
+        // chrono; Finch already depends on chrono, so enabling it adds nothing
+        // to the dependency graph.
+        //
+        // The serial is kept as the fallback rather than an empty string: a
+        // date outside chrono's range, or a duration-typed value, is still
+        // better read as the number the file holds than as nothing. Silence is
+        // the failure mode this fix exists to remove.
+        Data::DateTime(value) => value.as_datetime().map_or_else(
+            || value.as_f64().to_string(),
+            |datetime| {
+                // Which of the three shapes to print is decided by the serial,
+                // not by `is_datetime()` -- that reports the cell's type, and
+                // returns true for a plain date, a date with a time, and a
+                // bare time alike. Rendering all three the same way gave
+                // "2026-09-02 00:00:00" for a date and "1899-12-31 13:45:30"
+                // for a time, the second of which leaks the Excel epoch into
+                // what the user sees.
+                //
+                // A serial below 1.0 has no date part; one with no fractional
+                // part has no time part. A datetime at exactly midnight is
+                // therefore printed as a date, which is the one case this
+                // loses -- and it loses it in the direction of dropping a
+                // "00:00:00" that carries no information.
+                let serial = value.as_f64();
+                if serial < 1.0 {
+                    datetime.format("%H:%M:%S").to_string()
+                } else if serial.fract() == 0.0 {
+                    datetime.format("%Y-%m-%d").to_string()
+                } else {
+                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                }
+            },
+        ),
+        // Already ISO-8601 text in the file; pass it through unchanged rather
+        // than round-tripping it through a parse that could fail.
+        Data::DateTimeIso(value) | Data::DurationIso(value) => value.clone(),
     }
 }
 
@@ -10838,6 +10882,79 @@ mod tests {
         let rows = read_workbook_rows(file.as_file(), "charts.xlsx", None)
             .expect("a chart sheet must not fail the read");
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// A date cell must read as a date, not as the serial underneath it.
+    ///
+    /// `Data::DateTime`'s `Display` prints the raw f64, and
+    /// `workbook_cell_to_string`'s catch-all fell through to it -- so every
+    /// date in every spreadsheet Finch read came back as an opaque number.
+    /// 2026-09-02 was "46267", through `workbook-open`, `workbook-range` and
+    /// `workbook-summary` alike (#281).
+    ///
+    /// The three shapes are asserted separately because the first fix rendered
+    /// them all the same way, which produced "2026-09-02 00:00:00" for a date
+    /// and "1899-12-31 13:45:30" for a bare time -- the second leaking the
+    /// Excel epoch into the user's output.
+    #[test]
+    fn read_workbook_rows_renders_dates_times_and_datetimes_as_text() {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("Dates").unwrap();
+        let date_format = Format::new().set_num_format("yyyy-mm-dd");
+        let datetime_format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+        let time_format = Format::new().set_num_format("hh:mm:ss");
+        sheet
+            .write_datetime_with_format(
+                0,
+                0,
+                &ExcelDateTime::from_ymd(2026, 9, 2).unwrap(),
+                &date_format,
+            )
+            .unwrap();
+        sheet
+            .write_datetime_with_format(
+                0,
+                1,
+                &ExcelDateTime::from_ymd(2026, 9, 2)
+                    .unwrap()
+                    .and_hms(13, 45, 30)
+                    .unwrap(),
+                &datetime_format,
+            )
+            .unwrap();
+        sheet
+            .write_datetime_with_format(
+                0,
+                2,
+                &ExcelDateTime::from_hms(13, 45, 30).unwrap(),
+                &time_format,
+            )
+            .unwrap();
+        // A plain number must keep reading as a number: the fix must not
+        // reinterpret every float as a date.
+        sheet.write_number(0, 3, 42.5).unwrap();
+        sheet.write_string(0, 4, "plain").unwrap();
+
+        let path = std::env::temp_dir().join("finch_workbook_dates_regression.xlsx");
+        workbook.save(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let rows = read_workbook_rows(&file, "dates.xlsx", None).expect("must read");
+        assert_eq!(
+            rows,
+            vec![vec![
+                "2026-09-02".to_string(),
+                "2026-09-02 13:45:30".to_string(),
+                "13:45:30".to_string(),
+                "42.5".to_string(),
+                "plain".to_string(),
+            ]],
+            "a date read as its Excel serial, or a time carried the 1899 epoch"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// And an ordinary workbook still comes back whole.
