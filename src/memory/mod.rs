@@ -587,25 +587,31 @@ impl MemorySystem {
                         .try_lock()
                         .expect("a newly opened connection cannot be contended");
                     if let Err(error) = Self::load_tree_from_db_conn(&conn, &mut guard) {
-                        // Start fresh, and mean it. This used to `fail()` the
-                        // state, which since writes now refuse a failed index
-                        // would have turned "starting fresh" into "this store
-                        // accepts no writes for the rest of the process" — a
-                        // log line saying the opposite of what the code did.
-                        // An unreadable tree is a fresh tree; `next_id` is
-                        // already past the highest stored id, so a write cannot
-                        // collide with a row that did not load.
+                        // Broken, not fresh.
+                        //
+                        // This arm is only entered when `node_count > 0`, so
+                        // reaching the error means there ARE rows and none of
+                        // them could be read — a full store behind an empty
+                        // tree, which is the same `loaded == 0` case the
+                        // batched arm now refuses. "Starting fresh" was the
+                        // wrong framing: an empty tree over a populated store
+                        // is not a new store, and treating it as one opened the
+                        // write gate on nothing but the placeholder root.
+                        // Memories then attached under a childless root and
+                        // `save_all_nodes_to_db` rewrote node 0 with the
+                        // placeholder's text and embedding.
+                        //
+                        // An earlier version of this comment argued the
+                        // opposite, on the grounds that `fail()` then meant a
+                        // permanent refusal. It no longer does: a reload clears
+                        // it, and #288 separates a partial index from an
+                        // unusable one.
                         tracing::warn!(
                             %error,
-                            "Failed to load MemTree; starting with an empty index"
+                            "Failed to load MemTree; refusing writes rather than \
+                             placing them against an empty index"
                         );
-                        hydration
-                            .loaded
-                            .store(0, std::sync::atomic::Ordering::SeqCst);
-                        hydration
-                            .total
-                            .store(0, std::sync::atomic::Ordering::SeqCst);
-                        hydration.complete();
+                        hydration.fail(error.to_string());
                     } else {
                         // `size()` excludes the root; the background arm
                         // counts rows, which include it. Count rows on both so
@@ -2499,6 +2505,63 @@ mod tests {
             error.to_string().contains("ended without finishing"),
             "the write must be refused for the reason the guard recorded, not \
              by the timeout; got {error}"
+        );
+        Ok(())
+    }
+
+    /// The synchronous arm has the same rule: a store it cannot read is
+    /// broken, not fresh.
+    ///
+    /// A current-thread runtime and a caller with no runtime both load
+    /// all-or-nothing, so a failure there is exactly the `loaded == 0` case.
+    /// It used to log "starting with an empty index" and complete cleanly, so
+    /// the gate opened over a full store whose tree held only the placeholder
+    /// root — memories attached under a childless root and
+    /// `save_all_nodes_to_db` rewrote node 0 with the placeholder's text.
+    #[tokio::test]
+    async fn test_an_unreadable_store_on_the_synchronous_arm_refuses_writes() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), 8, &[])?;
+
+        // Break every row's `text`, so the whole load fails rather than one
+        // batch of it.
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE tree_nodes SET text = ?1",
+                params![vec![0xffu8, 0xfe]],
+            )?;
+        }
+
+        // `#[tokio::test]` is current-thread, which loads synchronously.
+        let memory = MemorySystem::new(config)?;
+        assert!(
+            memory.hydration_task.is_none(),
+            "precondition: this arm does not spawn a loader"
+        );
+        assert!(
+            matches!(memory.hydration_status(), HydrationStatus::Failed { .. }),
+            "a store that could not be read is broken, not empty; got {:?}",
+            memory.hydration_status()
+        );
+
+        let refused = memory
+            .insert_conversation(
+                "system",
+                "There is no structure to place this in, so it must be refused.",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an unreadable store must refuse writes");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "got {refused}"
         );
         Ok(())
     }
