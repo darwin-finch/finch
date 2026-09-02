@@ -81,17 +81,70 @@ impl NodeTlsIdentity {
     }
 }
 
-fn provider_is_ring(provider: &rustls::crypto::CryptoProvider) -> bool {
+fn signature_algorithms_match(
+    left: rustls::crypto::WebPkiSupportedAlgorithms,
+    right: rustls::crypto::WebPkiSupportedAlgorithms,
+) -> bool {
+    let all_match = left.all.len() == right.all.len()
+        && left
+            .all
+            .iter()
+            .zip(right.all)
+            .all(|(left, right)| std::ptr::eq(*left, *right));
+    let mappings_match = left.mapping.len() == right.mapping.len()
+        && left.mapping.iter().zip(right.mapping).all(
+            |((left_scheme, left_algorithms), (right_scheme, right_algorithms))| {
+                left_scheme == right_scheme
+                    && left_algorithms.len() == right_algorithms.len()
+                    && left_algorithms
+                        .iter()
+                        .zip(*right_algorithms)
+                        .all(|(left, right)| std::ptr::eq(*left, *right))
+            },
+        );
+    all_match && mappings_match
+}
+
+fn ring_provider_mismatch(provider: &rustls::crypto::CryptoProvider) -> Option<&'static str> {
     let ring = rustls::crypto::ring::default_provider();
-    std::ptr::eq(provider.secure_random, ring.secure_random)
-        && std::ptr::eq(provider.key_provider, ring.key_provider)
+    if provider.cipher_suites != ring.cipher_suites {
+        return Some("its cipher suites differ from Finch's ring provider");
+    }
+    if provider.kx_groups.len() != ring.kx_groups.len()
+        || !provider
+            .kx_groups
+            .iter()
+            .zip(ring.kx_groups)
+            .all(|(left, right)| std::ptr::eq(*left, right))
+    {
+        return Some("its key-exchange groups differ from Finch's ring provider");
+    }
+    if !signature_algorithms_match(
+        provider.signature_verification_algorithms,
+        ring.signature_verification_algorithms,
+    ) {
+        return Some("its signature algorithms differ from Finch's ring provider");
+    }
+    if !std::ptr::eq(provider.secure_random, ring.secure_random) {
+        return Some("its secure-random implementation differs from Finch's ring provider");
+    }
+    if !std::ptr::eq(provider.key_provider, ring.key_provider) {
+        return Some("its key provider differs from Finch's ring provider");
+    }
+    None
+}
+
+#[cfg(test)]
+fn provider_is_ring(provider: &rustls::crypto::CryptoProvider) -> bool {
+    ring_provider_mismatch(provider).is_none()
 }
 
 fn require_ring_provider(provider: &rustls::crypto::CryptoProvider, conflict: &str) -> Result<()> {
-    anyhow::ensure!(
-        provider_is_ring(provider),
-        "Finch requires Rustls's ring crypto provider, but {conflict}"
-    );
+    if let Some(mismatch) = ring_provider_mismatch(provider) {
+        anyhow::bail!(
+            "Finch requires Rustls's exact ring crypto provider, but {conflict}: {mismatch}"
+        );
+    }
     Ok(())
 }
 
@@ -101,6 +154,10 @@ fn require_ring_provider(provider: &rustls::crypto::CryptoProvider, conflict: &s
 /// Finch enables only ring in its resolved TLS graph. Every TLS entry point
 /// calls this before constructing a Rustls client or server config so another
 /// library cannot make initialization order choose a provider implicitly.
+///
+/// This replaces the former `install_server_crypto_provider() -> ()` API.
+/// Callers must propagate this function's result because a provider conflict
+/// makes continued TLS configuration unsafe.
 pub fn install_crypto_provider() -> Result<()> {
     if let Some(installed) = rustls::crypto::CryptoProvider::get_default() {
         return require_ring_provider(installed, "another provider is already installed");
@@ -116,14 +173,6 @@ pub fn install_crypto_provider() -> Result<()> {
     let installed = rustls::crypto::CryptoProvider::get_default()
         .context("Rustls crypto-provider installation raced without selecting a provider")?;
     require_ring_provider(installed, "another provider won initialization")
-}
-
-/// Compatibility entry point for callers that initialized only Finch's TLS
-/// server. New code should install the provider before any Rustls client or
-/// server configuration is built.
-#[deprecated(note = "use install_crypto_provider for every Rustls entry point")]
-pub fn install_server_crypto_provider() -> Result<()> {
-    install_crypto_provider()
 }
 
 #[cfg(test)]
@@ -177,8 +226,18 @@ mod tests {
         );
     }
 
+    fn assert_provider_rejected(provider: &rustls::crypto::CryptoProvider, diagnostic: &str) {
+        let error = require_ring_provider(provider, "the modified test provider was selected")
+            .expect_err("Finch must reject providers that are not its exact ring provider");
+        assert!(
+            error.to_string().contains(diagnostic),
+            "provider conflict diagnostic {:?} must name the mismatched component {diagnostic:?}",
+            error.to_string()
+        );
+    }
+
     #[test]
-    fn crypto_provider_classifier_rejects_non_ring_provider() {
+    fn crypto_provider_classifier_rejects_every_modified_ring_component() {
         #[derive(Debug)]
         struct NonRingRandom;
 
@@ -191,15 +250,49 @@ mod tests {
             }
         }
 
+        #[derive(Debug)]
+        struct NonRingKeyProvider;
+
+        impl rustls::crypto::KeyProvider for NonRingKeyProvider {
+            fn load_private_key(
+                &self,
+                _key_der: rustls::pki_types::PrivateKeyDer<'static>,
+            ) -> std::result::Result<std::sync::Arc<dyn rustls::sign::SigningKey>, rustls::Error>
+            {
+                Err(rustls::Error::General(
+                    "non-ring test key provider".to_string(),
+                ))
+            }
+        }
+
         static NON_RING_RANDOM: NonRingRandom = NonRingRandom;
-        let mut non_ring = rustls::crypto::ring::default_provider();
-        non_ring.secure_random = &NON_RING_RANDOM;
-        let error = require_ring_provider(&non_ring, "the non-ring test provider was selected")
-            .expect_err("Finch must reject providers that are not its exact ring provider");
-        assert_eq!(
-            error.to_string(),
-            "Finch requires Rustls's ring crypto provider, but the non-ring test provider was selected",
-            "provider conflicts must name the required and conflicting providers"
-        );
+        static NON_RING_KEY_PROVIDER: NonRingKeyProvider = NonRingKeyProvider;
+        let ring = rustls::crypto::ring::default_provider();
+
+        let mut modified = ring.clone();
+        modified.cipher_suites.clear();
+        assert_provider_rejected(&modified, "cipher suites");
+
+        let mut modified = ring.clone();
+        modified.kx_groups.clear();
+        assert_provider_rejected(&modified, "key-exchange groups");
+
+        let mut modified = ring.clone();
+        modified.signature_verification_algorithms.all =
+            &ring.signature_verification_algorithms.all[1..];
+        assert_provider_rejected(&modified, "signature algorithms");
+
+        let mut modified = ring.clone();
+        modified.signature_verification_algorithms.mapping =
+            &ring.signature_verification_algorithms.mapping[1..];
+        assert_provider_rejected(&modified, "signature algorithms");
+
+        let mut modified = ring.clone();
+        modified.secure_random = &NON_RING_RANDOM;
+        assert_provider_rejected(&modified, "secure-random implementation");
+
+        let mut modified = ring.clone();
+        modified.key_provider = &NON_RING_KEY_PROVIDER;
+        assert_provider_rejected(&modified, "key provider");
     }
 }

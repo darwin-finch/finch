@@ -156,6 +156,25 @@ class HttpDependencyContractTests(unittest.TestCase):
             "rustls-webpki 0.104.0 is outside the fixed, reviewed 0.103.13+ line",
         )
 
+    def test_rejects_prereleases_for_every_reviewed_dependency(self) -> None:
+        stable = {
+            "reqwest": "0.12.28",
+            "h2": "0.4.19",
+            "tokio-tungstenite": "0.24.0",
+            "rustls": "0.23.43",
+            "rustls-webpki": "0.103.15",
+        }
+        for package, version in stable.items():
+            with self.subTest(package=package):
+                packages = [
+                    (name, f"{resolved}-alpha.1" if name == package else resolved)
+                    for name, resolved in stable.items()
+                ]
+                self.assert_rejected(
+                    lockfile(*packages),
+                    f"{package} {version}-alpha.1 is a prerelease; security floors require stable releases",
+                )
+
     def test_rejects_split_tls_and_websocket_generations(self) -> None:
         self.assert_rejected(
             lockfile(
