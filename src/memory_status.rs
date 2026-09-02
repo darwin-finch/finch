@@ -72,10 +72,10 @@ pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> Hydra
 /// A sentence for a reader whose read did not cover the whole store, or `None`
 /// when the index was complete and no qualification is owed.
 ///
-/// Every string here has to be true in all three contexts that print it -- the
-/// search tool, the inspect tool, and `/memory` -- because a sentence written
-/// for one and reused by the others is how the last two rounds of this change
-/// produced false claims of their own.
+/// Every string here has to be true in all four contexts that print it -- the
+/// search tool, the inspect tool, `/memory`, and `mem-recall`'s warning log --
+/// because a sentence written for one and reused by the others is how several
+/// rounds of this change produced false claims of their own.
 pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
     match status {
         HydrationStatus::Ready { .. } => None,
@@ -87,8 +87,8 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // read" -- and the read may since have matched three memories, printed
         // directly above this sentence. A vacuous bound is worse than no bound.
         HydrationStatus::Loading { loaded: 0, total } => Some(format!(
-            "The memory index was still loading when this began, so how much of its \
-             {total} entries the read covered is unknown. Retrying shortly may reach more."
+            "The memory index was still loading when this began, so how many of its \
+             {total} entries the read covered is unknown. Retrying shortly will reach more."
         )),
         HydrationStatus::Loading { loaded, total } => Some(format!(
             "The memory index is still loading: this read covered at least {loaded} of \
@@ -107,7 +107,7 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // sentence about the read is true of both.
         HydrationStatus::Degraded { loaded, total, .. } => Some(format!(
             "A read error stopped the memory index short: this read covered at least \
-             {loaded} of {total} entries, and the rest were not read."
+             {loaded} of {total} entries, and how much beyond that is unknown."
         )),
         // Deliberately says nothing about *how much* loaded.
         //
@@ -122,8 +122,8 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // none had loaded. The honest sentence is the one that holds either
         // way.
         HydrationStatus::Failed { .. } => Some(
-            "The memory index is unavailable: hydration did not complete, so how much of \
-             the store it holds is unknown."
+            "The memory index did not finish loading, so how much of the store it holds \
+             is unknown."
                 .to_string(),
         ),
     }
@@ -168,6 +168,23 @@ impl Recall {
     }
 }
 
+/// A parenthetical for a surface that prints the loaded node count with no room
+/// for a sentence.
+///
+/// `MemoryStats::tree_node_count` is the size of the in-memory tree, so during
+/// hydration it is a count of what has loaded, not of what the user stored --
+/// a wrong number about their own data. `/memory` has room to say so; the
+/// provider-switch line and `/model show` do not, and printing the number bare
+/// is what this change exists to stop.
+pub(crate) fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> {
+    match status {
+        HydrationStatus::Ready { .. } => None,
+        HydrationStatus::Loading { .. } => Some("so far; the index is still loading"),
+        HydrationStatus::Degraded { .. } => Some("a read error stopped the index short"),
+        HydrationStatus::Failed { .. } => Some("the index did not finish loading"),
+    }
+}
+
 /// The TUI status-strip line: what was recalled, and out of how much.
 ///
 /// `entries` rather than `memories` on purpose. The counts are `tree_nodes`
@@ -181,7 +198,7 @@ pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
         // "searching 0 of 2048" beside a nonzero recall is refuted by its own
         // line, so the zero case names no count.
         HydrationStatus::Loading { loaded: 0, total } => {
-            format!("🧠 recalled {recalled} · index still loading, {total} entries")
+            format!("🧠 recalled {recalled} · index still loading, {total} entries total")
         }
         HydrationStatus::Loading { loaded, total } => {
             format!("🧠 recalled {recalled} · searched at least {loaded} of {total} entries")
@@ -191,13 +208,15 @@ pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
         // state is permanent: `degrade` fires on any batch read error,
         // transient ones included, and a reload can clear it.
         HydrationStatus::Degraded { loaded, total, .. } => {
-            format!("🧠 recalled {recalled} · at least {loaded} of {total} entries, index stopped short")
+            format!(
+                "🧠 recalled {recalled} · searched at least {loaded} of {total} entries · index stopped short"
+            )
         }
         // Keeps `recalled`. Dropping it hid from the user that N memories had
         // in fact been injected into the prompt, which is the opposite of the
         // transparency this line is for.
         HydrationStatus::Failed { .. } => {
-            format!("🧠 recalled {recalled} · memory index unavailable")
+            format!("🧠 recalled {recalled} · index did not finish loading")
         }
     }
 }
@@ -335,6 +354,13 @@ mod tests {
         let text = caveat(&seen).expect("a partial index owes a caveat");
         assert!(text.contains("at least 100"), "{text}");
         assert!(!text.contains("1536"), "{text}");
+        // And nothing about the remainder. "the rest were not read" closes an
+        // upper bound the same sentence has just left open, and is false: 1436
+        // of "the rest" did load. A bound cannot end in an absolute.
+        assert!(
+            !text.contains("the rest were not read"),
+            "closes an upper bound the sentence just left open: {text}"
+        );
         // Index-centric wording would be false of this count: 1536 entries
         // loaded, not 100. Only a sentence about the read is true of both.
         assert!(
@@ -414,7 +440,7 @@ mod tests {
         );
         assert_eq!(
             status_line(3, &degraded()),
-            "🧠 recalled 3 · at least 512 of 2048 entries, index stopped short"
+            "🧠 recalled 3 · searched at least 512 of 2048 entries · index stopped short"
         );
     }
 
@@ -426,7 +452,7 @@ mod tests {
             line.contains('3'),
             "hides that 3 memories reached the prompt: {line}"
         );
-        assert!(line.contains("unavailable"), "{line}");
+        assert!(line.contains("did not finish loading"), "{line}");
     }
 
     /// The states must be distinguishable *after* the glyph is stripped.
@@ -438,7 +464,7 @@ mod tests {
     /// the property; "has words" is a side condition.
     #[test]
     fn test_status_line_is_meaningful_without_the_glyph() {
-        let spoken: Vec<String> = [ready(), loading(1), degraded(), failed()]
+        let spoken: Vec<String> = [ready(), loading(0), loading(1), degraded(), failed()]
             .iter()
             .map(|status| {
                 status_line(1, status)

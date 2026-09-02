@@ -4181,8 +4181,18 @@ impl Repl {
 
             let new_name = new_entry.profile_name();
             let memory_info = if let Some(ref memory) = self.memory_system {
+                // Same wrong number as `/memory` printed before #275: during
+                // hydration this counts what has loaded, not what the user
+                // stored. No room for a sentence here, so a parenthetical.
+                let before = memory.hydration_status();
                 let stats = memory.stats().await?;
-                format!(" (💾 {} nodes in memory)", stats.tree_node_count)
+                let index = crate::memory_status::observed(before, memory.hydration_status());
+                match crate::memory_status::count_qualifier(&index) {
+                    None => format!(" (💾 {} nodes in memory)", stats.tree_node_count),
+                    Some(note) => {
+                        format!(" (💾 {} nodes in memory — {note})", stats.tree_node_count)
+                    }
+                }
             } else {
                 String::new()
             };
@@ -4228,8 +4238,13 @@ impl Repl {
 
         // Get memory stats if available
         if let Some(ref memory) = self.memory_system {
+            let before = memory.hydration_status();
             let stats = memory.stats().await?;
-            self.output_status(format!("Memory: {} nodes", stats.tree_node_count));
+            let index = crate::memory_status::observed(before, memory.hydration_status());
+            self.output_status(match crate::memory_status::count_qualifier(&index) {
+                None => format!("Memory: {} nodes", stats.tree_node_count),
+                Some(note) => format!("Memory: {} nodes ({note})", stats.tree_node_count),
+            });
         }
 
         Ok(())

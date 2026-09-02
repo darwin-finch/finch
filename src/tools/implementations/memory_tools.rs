@@ -519,7 +519,7 @@ mod tests {
             "presupposes reads that never happened: {result}"
         );
         assert!(
-            result.contains("unavailable"),
+            result.contains("did not finish loading"),
             "did not tell the caller the index was unreadable: {result}"
         );
 
@@ -588,7 +588,7 @@ mod tests {
             "asserted absence on an index the batched loader never read: {result}"
         );
         assert!(
-            result.contains("unavailable"),
+            result.contains("did not finish loading"),
             "did not tell the caller the index was unreadable: {result}"
         );
 
@@ -644,7 +644,7 @@ mod tests {
             )
             .await?;
         assert!(
-            from_index.contains("index is unavailable"),
+            from_index.contains("did not finish loading"),
             "a node lookup against an unusable index must not read as absence: {from_index}"
         );
 
