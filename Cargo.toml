@@ -38,10 +38,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 # HTTP server + WebSocket (session transport)
 axum = { version = "0.7", features = ["ws"] }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
-rustls = "0.22"
-rustls23 = { package = "rustls", version = "0.23", default-features = false, features = ["ring", "std"] }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
 # Service discovery (Phase 3: Daemon-Only Mode)
@@ -166,6 +165,7 @@ capnpc = "0.20"
 
 [dev-dependencies]
 h2 = "0.4.16"  # Raw HTTP/2 protocol fixtures for transport-boundary regressions
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }  # Raw WSS protocol fixtures for TLS transport-boundary regressions
 mockito = "1.2"
 tempfile = "3.8"
 tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot() for integration tests

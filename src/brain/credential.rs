@@ -348,6 +348,33 @@ impl BrainCredentialAuthority {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn ephemeral_with_tls_validity(
+        signing_key: [u8; 32],
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) -> Self {
+        let invitation_signer =
+            crate::node::identity::NodeSigningIdentity::from_secret(signing_key);
+        let invitation_tls =
+            crate::node::tls::NodeTlsIdentity::from_signing_identity_with_validity(
+                &invitation_signer,
+                "localhost",
+                not_before,
+                not_after,
+            )
+            .expect("test node identity creates TLS material with custom validity");
+        Self {
+            signing_key: Arc::new(signing_key),
+            invitation_signer: Arc::new(invitation_signer),
+            invitation_tls: Arc::new(invitation_tls),
+            revoked: Arc::new(Mutex::new(BTreeSet::new())),
+            revocations_path: None,
+            consumed_invitations: Arc::new(Mutex::new(ConsumedInvitations::default())),
+            consumed_invitations_path: None,
+        }
+    }
+
     pub fn issue(&self, request: BrainCredentialRequest, now_ms: u64) -> Result<String> {
         if request.ttl_ms == 0 {
             anyhow::bail!("Brain credential lifetime must be greater than zero");
@@ -790,6 +817,10 @@ pub fn invitation_tls_certificate_der(claims: &BrainInvitationClaims) -> Result<
     if certificate.is_empty() {
         anyhow::bail!("Brain invitation TLS certificate is empty");
     }
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(certificate.clone()))
+        .context("Brain invitation TLS certificate DER is malformed")?;
     Ok(certificate)
 }
 
@@ -1257,6 +1288,24 @@ mod tests {
         assert!(authority
             .redeem_invitation(&invitation, "mallory@box.local", 10_200)
             .is_err());
+    }
+
+    #[test]
+    fn signed_invitation_rejects_malformed_tls_certificate_der() {
+        let authority = BrainCredentialAuthority::ephemeral([31; 32]);
+        let (_, mut claims) = authority
+            .issue_invitation(invitation_request(1_000), 10_000)
+            .unwrap();
+        claims.tls_certificate_der =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not a DER certificate");
+        let invitation = authority.sign_invitation(&claims).unwrap();
+
+        let error = verify_portable_invitation(&invitation, 10_100)
+            .expect_err("a correctly signed invitation must not make malformed DER trustworthy");
+        assert!(
+            format!("{error:#}").contains("TLS certificate DER is malformed"),
+            "malformed certificate rejection must identify the invalid invitation field: {error:#}"
+        );
     }
 
     #[test]

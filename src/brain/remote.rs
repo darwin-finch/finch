@@ -429,6 +429,7 @@ impl RemoteBrainClient {
         }
         let certificate_der = super::credential::invitation_tls_certificate_der(&claims)?;
         let (http, websocket_connector) = if target.secure {
+            crate::node::tls::install_crypto_provider()?;
             let certificate = reqwest::Certificate::from_der(&certificate_der)
                 .context("Brain invitation contains an invalid TLS certificate")?;
             let http = Client::builder()
@@ -437,6 +438,9 @@ impl RemoteBrainClient {
                 .tls_built_in_root_certs(false)
                 .add_root_certificate(certificate)
                 .build()?;
+            // Finch does not configure certificate-revocation lists today. The
+            // fixed webpki floor is still required because this pinned root
+            // store performs certificate-chain and DNS-name validation.
             let mut roots = rustls::RootCertStore::empty();
             roots
                 .add(rustls::pki_types::CertificateDer::from(certificate_der))
@@ -2770,7 +2774,7 @@ mod tests {
             crate::node::tls::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::tls::install_server_crypto_provider();
+        crate::node::tls::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![invitation_certificate],
             tls.private_key_der().to_vec(),
@@ -2805,6 +2809,448 @@ mod tests {
             AttachmentRole::Consultant
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn invitation_pinned_wss_handles_fragmented_binary_ping_pong_and_close() {
+        use crate::brain::store::{BrainEvent, ConnectionId};
+        use crate::ipc::brain_codec::BrainRemoteEnvelope;
+        use tokio_tungstenite::tungstenite::{
+            handshake::server::{Request, Response},
+            protocol::frame::{coding::Data, Frame},
+            Message,
+        };
+
+        let secret = [47; 32];
+        let authority = super::super::credential::BrainCredentialAuthority::ephemeral(secret);
+        let store = crate::brain::store::BrainStore::with_root("fixture.local", None);
+        let initial_snapshot = store.snapshot("shared").unwrap();
+        let brain_id = initial_snapshot.brain_id;
+        let (invitation, invitation_claims) = authority
+            .issue_invitation(
+                super::super::credential::BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id,
+                    brain: "shared".into(),
+                    environment_generation: 1,
+                    role: AttachmentRole::Observer,
+                    scopes: super::super::credential::default_participant_scopes(
+                        AttachmentRole::Observer,
+                    ),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        crate::node::tls::install_crypto_provider().unwrap();
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    super::super::credential::invitation_tls_certificate_der(&invitation_claims)
+                        .unwrap(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        authority
+                            .invitation_tls_identity()
+                            .private_key_der()
+                            .to_vec(),
+                    ),
+                ),
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let streamed = BrainEvent {
+            schema_version: 2,
+            brain_id,
+            seq: 1,
+            environment_generation: 1,
+            sender: "fixture.local".into(),
+            created_ms: unix_epoch_millis(),
+            run_id: None,
+            mutation: None,
+            kind: BrainEventKind::ParticipantMessage {
+                text: "fragmented over pinned WSS".into(),
+            },
+        };
+        let expected_event = streamed.clone();
+        let expected_snapshot = initial_snapshot.clone();
+        let fixture = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &Request, response: Response| {
+                    assert_eq!(
+                        request.headers().get("authorization").unwrap(),
+                        "Bearer scoped-wss-token",
+                        "the pinned WSS authority must receive the attachment bearer"
+                    );
+                    assert_eq!(
+                        request.uri().path(),
+                        "/v1/brains/named/shared/ws",
+                        "the bearer must be sent only to the intended Brain WebSocket path"
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let snapshot = BrainRemoteEnvelope::Projection(BrainWireMessage::Snapshot {
+                brain: initial_snapshot,
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&snapshot)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let envelope =
+                BrainRemoteEnvelope::Projection(BrainWireMessage::Event { event: streamed });
+            let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope).unwrap();
+            let midpoint = encoded.len() / 2;
+            socket
+                .send(Message::Frame(Frame::message(
+                    encoded[..midpoint].to_vec(),
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::OpCode::Data(
+                        Data::Binary,
+                    ),
+                    false,
+                )))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Ping(b"wss-liveness".to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                    .await
+                    .expect("the WSS client must answer ping within five seconds")
+                    .expect("the WSS client must not disconnect before pong")
+                    .expect("the WSS pong must be a valid frame"),
+                Message::Pong(b"wss-liveness".to_vec()),
+                "the WSS client must echo the ping payload in its pong"
+            );
+            socket
+                .send(Message::Frame(Frame::message(
+                    encoded[midpoint..].to_vec(),
+                    tokio_tungstenite::tungstenite::protocol::frame::coding::OpCode::Data(
+                        Data::Continue,
+                    ),
+                    true,
+                )))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let attachment = BrainAttachment {
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: "observer@client.local".into(),
+            role: AttachmentRole::Observer,
+            acknowledged_seq: 0,
+            connected: true,
+            connection_id: Some(ConnectionId(uuid::Uuid::new_v4())),
+        };
+        let mut client = RemoteBrainClient::new_with_invitation(
+            RemoteBrainTarget {
+                brain: "shared".into(),
+                machine: "localhost".into(),
+                address: format!("localhost:{}", address.port()),
+                secure: true,
+            },
+            invitation,
+        )
+        .unwrap();
+        client.attachment = Some(attachment.clone());
+        *client.credential.lock().await = Some(RemoteBrainCredential {
+            token: "scoped-wss-token".into(),
+            claims: crate::brain::credential::BrainCredentialClaims {
+                version: 1,
+                credential_id: uuid::Uuid::new_v4(),
+                issuer: "fixture.local".into(),
+                subject: attachment.subject.clone(),
+                brain_id,
+                brain: "shared".into(),
+                environment_generation: 1,
+                role: attachment.role,
+                scopes: super::super::credential::default_participant_scopes(attachment.role),
+                attachment_id: Some(attachment.attachment_id),
+                connection_id: attachment.connection_id,
+                delegation_chain: Vec::new(),
+                issued_ms: 0,
+                expires_ms: u64::MAX,
+            },
+        });
+        let mut events = client.watch().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("pinned WSS snapshot must arrive within five seconds"),
+            Some(BrainWireMessage::Snapshot {
+                brain: expected_snapshot
+            }),
+            "the WSS stream must preserve the initial Brain snapshot"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("fragmented WSS event must arrive within five seconds"),
+            Some(BrainWireMessage::Event {
+                event: expected_event
+            }),
+            "fragment reassembly must preserve the exact binary Brain event"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("WSS close must terminate the event stream within five seconds"),
+            None,
+            "a peer close must end the event stream without a phantom event"
+        );
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invitation_pinned_wss_never_redirects_bearer_to_another_authority() {
+        use crate::brain::store::ConnectionId;
+        use axum::{response::Redirect, routing::get, Router};
+
+        let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_address = attacker_listener.local_addr().unwrap();
+        let redirect_url = format!("ws://{attacker_address}/stolen");
+        let authority = super::super::credential::BrainCredentialAuthority::ephemeral([48; 32]);
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let (invitation, invitation_claims) = authority
+            .issue_invitation(
+                super::super::credential::BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id,
+                    brain: "shared".into(),
+                    environment_generation: 1,
+                    role: AttachmentRole::Observer,
+                    scopes: super::super::credential::default_participant_scopes(
+                        AttachmentRole::Observer,
+                    ),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        crate::node::tls::install_crypto_provider().unwrap();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![
+                super::super::credential::invitation_tls_certificate_der(&invitation_claims)
+                    .unwrap(),
+            ],
+            authority
+                .invitation_tls_identity()
+                .private_key_der()
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+        let app = Router::new().route(
+            "/v1/brains/named/shared/ws",
+            get(move || {
+                let redirect_url = redirect_url.clone();
+                async move { Redirect::temporary(&redirect_url) }
+            }),
+        );
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(
+            axum_server::bind_rustls(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                tls_config,
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service()),
+        );
+        let address = handle.listening().await.unwrap();
+        let attachment = BrainAttachment {
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: "observer@client.local".into(),
+            role: AttachmentRole::Observer,
+            acknowledged_seq: 0,
+            connected: true,
+            connection_id: Some(ConnectionId(uuid::Uuid::new_v4())),
+        };
+        let mut client = RemoteBrainClient::new_with_invitation(
+            RemoteBrainTarget {
+                brain: "shared".into(),
+                machine: "localhost".into(),
+                address: format!("localhost:{}", address.port()),
+                secure: true,
+            },
+            invitation,
+        )
+        .unwrap();
+        client.attachment = Some(attachment.clone());
+        *client.credential.lock().await = Some(RemoteBrainCredential {
+            token: "must-not-cross-authority".into(),
+            claims: crate::brain::credential::BrainCredentialClaims {
+                version: 1,
+                credential_id: uuid::Uuid::new_v4(),
+                issuer: "fixture.local".into(),
+                subject: attachment.subject.clone(),
+                brain_id,
+                brain: "shared".into(),
+                environment_generation: 1,
+                role: attachment.role,
+                scopes: super::super::credential::default_participant_scopes(attachment.role),
+                attachment_id: Some(attachment.attachment_id),
+                connection_id: attachment.connection_id,
+                delegation_chain: Vec::new(),
+                issued_ms: 0,
+                expires_ms: u64::MAX,
+            },
+        });
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), client.watch())
+            .await
+            .expect("a rejected WSS redirect must stay bounded")
+            .expect_err("the WSS client must not follow an authority-changing redirect");
+        assert!(
+            format!("{error:#}").contains("could not open brain event stream"),
+            "WSS redirect rejection must identify the event-stream boundary: {error:#}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                attacker_listener.accept()
+            )
+            .await
+            .is_err(),
+            "the attachment bearer must never open a connection to the redirect authority"
+        );
+        server.abort();
+    }
+
+    async fn assert_invitation_tls_handshake_fails(
+        authority: super::super::credential::BrainCredentialAuthority,
+        target_hostname: &str,
+        expected_diagnostic: &[&str],
+    ) {
+        use axum::{routing::post, Json, Router};
+
+        let (invitation, invitation_claims) = authority
+            .issue_invitation(
+                super::super::credential::BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id: BrainId(uuid::Uuid::new_v4()),
+                    brain: "shared".into(),
+                    environment_generation: 1,
+                    role: AttachmentRole::Observer,
+                    scopes: super::super::credential::default_participant_scopes(
+                        AttachmentRole::Observer,
+                    ),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        let invitation_certificate =
+            super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
+        crate::node::tls::install_crypto_provider().unwrap();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![invitation_certificate],
+            authority
+                .invitation_tls_identity()
+                .private_key_der()
+                .to_vec(),
+        )
+        .await
+        .unwrap();
+        let app = Router::new().route(
+            "/v1/brains/invitations/redeem",
+            post(|| async { Json(serde_json::json!({ "unexpected": true })) }),
+        );
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(
+            axum_server::bind_rustls(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                tls_config,
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service()),
+        );
+        let address = handle.listening().await.unwrap();
+        let client = RemoteBrainClient::new_with_invitation(
+            RemoteBrainTarget {
+                brain: "shared".into(),
+                machine: target_hostname.into(),
+                address: format!("{target_hostname}:{}", address.port()),
+                secure: true,
+            },
+            invitation,
+        )
+        .unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.probe_invitation_endpoint(),
+        )
+        .await
+        .expect("invalid invitation TLS must fail within the handshake timeout")
+        .expect_err("invalid invitation TLS must fail before an HTTP request succeeds");
+        let detail = format!("{error:#}");
+        assert!(
+            expected_diagnostic
+                .iter()
+                .any(|expected| detail.contains(expected)),
+            "TLS rejection must identify {:?}: {detail}",
+            expected_diagnostic
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invitation_tls_rejects_wrong_hostname() {
+        assert_invitation_tls_handshake_fails(
+            super::super::credential::BrainCredentialAuthority::ephemeral([44; 32]),
+            "127.0.0.1",
+            &["not valid for", "NotValidForName", "certificate"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invitation_tls_rejects_expired_certificate() {
+        assert_invitation_tls_handshake_fails(
+            super::super::credential::BrainCredentialAuthority::ephemeral_with_tls_validity(
+                [45; 32],
+                (2000, 1, 1),
+                (2001, 1, 1),
+            ),
+            "localhost",
+            &["expired", "Expired", "not valid"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invitation_tls_rejects_not_yet_valid_certificate() {
+        assert_invitation_tls_handshake_fails(
+            super::super::credential::BrainCredentialAuthority::ephemeral_with_tls_validity(
+                [46; 32],
+                (2099, 1, 1),
+                (2100, 1, 1),
+            ),
+            "localhost",
+            &["not valid yet", "NotValidYet", "not valid"],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2860,7 +3306,7 @@ mod tests {
             crate::node::tls::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
         let invitation_certificate =
             super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
-        crate::node::tls::install_server_crypto_provider();
+        crate::node::tls::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![invitation_certificate],
             tls.private_key_der().to_vec(),
@@ -2903,8 +3349,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invitation_rejects_an_alternate_certificate_for_the_same_hostname() {
+    async fn invitation_rejects_untrusted_alternate_chain_for_the_same_hostname() {
         use axum::{routing::post, Json, Router};
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 
         let invited_secret = [51; 32];
         let authority =
@@ -2928,14 +3375,20 @@ mod tests {
             )
             .unwrap();
 
-        let attacker = crate::node::identity::NodeSigningIdentity::from_secret([52; 32]);
-        let attacker_tls =
-            crate::node::tls::NodeTlsIdentity::from_signing_identity(&attacker, "localhost")
-                .unwrap();
-        crate::node::tls::install_server_crypto_provider();
+        let root_key = KeyPair::generate().unwrap();
+        let mut root_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let root = root_params.self_signed(&root_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &root, &root_key)
+            .unwrap();
+        crate::node::tls::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![attacker_tls.certificate_der().to_vec()],
-            attacker_tls.private_key_der().to_vec(),
+            vec![leaf.der().to_vec(), root.der().to_vec()],
+            leaf_key.serialize_der(),
         )
         .await
         .unwrap();
@@ -2968,7 +3421,7 @@ mod tests {
         let detail = format!("{error:#}");
         assert!(
             detail.contains("certificate") || detail.contains("UnknownIssuer"),
-            "unexpected TLS error: {detail}"
+            "an untrusted alternate chain must fail at the pinned TLS boundary: {detail}"
         );
         server.abort();
     }
@@ -3032,7 +3485,7 @@ mod tests {
             .unwrap();
 
         let tls = authority.invitation_tls_identity();
-        crate::node::tls::install_server_crypto_provider();
+        crate::node::tls::install_crypto_provider().unwrap();
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
             vec![tls.certificate_der().to_vec()],
             tls.private_key_der().to_vec(),
