@@ -1,10 +1,20 @@
 name: Issue 237 ChatGPT protocol version
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/issue-237-chatgpt-protocol-version.yml
+      - src/providers/chatgpt_subscription.rs
+      - docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md
   push:
     branches:
-      - codex/issue-237-chatgpt-protocol-version
-      - codex/issue-237-negative-control
+      - main
+    paths:
+      - .github/workflows/issue-237-chatgpt-protocol-version.yml
+      - src/providers/chatgpt_subscription.rs
+      - docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md
   workflow_dispatch: {}
 
 permissions:

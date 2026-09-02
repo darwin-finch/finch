@@ -51,6 +51,7 @@ const RESPONSES_PATH: &str = "/backend-api/codex/responses";
 const MODELS_PATH: &str = "/backend-api/codex/models";
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
@@ -569,7 +570,7 @@ impl ChatGptSubscriptionProvider {
                     .send() => response.context("Failed to start ChatGPT subscription response")?,
             };
             if response.status() == StatusCode::UNAUTHORIZED && !unauthorized_retry_used {
-                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
+                drop(response);
                 lease = self
                     .source
                     .refresh_after_unauthorized(&lease.generation, &cancel)
@@ -587,7 +588,7 @@ impl ChatGptSubscriptionProvider {
             }
             if !response.status().is_success() {
                 let status = response.status();
-                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
+                drop(response);
                 return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
@@ -600,7 +601,7 @@ impl ChatGptSubscriptionProvider {
             // media types are still rejected before parsing.
             if !content_type.is_empty() && !content_type.starts_with("text/event-stream") {
                 let classification = classify_unexpected_content_type(&content_type);
-                discard_bounded_response_prefix(response, MAX_ERROR_BYTES, &cancel).await?;
+                drop(response);
                 return Err(classification.into());
             }
             return Ok(response);
@@ -633,7 +634,11 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             id: completed.id,
             model: completed.model,
             content: completed.blocks,
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(if completed.end_turn == Some(false) {
+                "tool_use".to_string()
+            } else {
+                "end_turn".to_string()
+            }),
             role: "assistant".to_string(),
             provider: "chatgpt_subscription".to_string(),
             usage: match (completed.input_tokens, completed.output_tokens) {
@@ -674,7 +679,9 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             )
             .await
             {
-                let _ = failure.send(Err(anyhow::anyhow!(error.to_string()))).await;
+                // Never let diagnostic delivery keep the HTTP response task alive. If the
+                // bounded output queue is full, closing it is itself the terminal signal.
+                let _ = failure.try_send(Err(anyhow::anyhow!(error.to_string())));
             }
         });
         Ok(receiver)
@@ -1175,6 +1182,7 @@ struct CompletedResponse {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     allowance: Option<Allowance>,
+    end_turn: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1226,7 +1234,7 @@ async fn consume_sse(
     }
     let mut done_seen = false;
     let mut last_sequence = None;
-    loop {
+    'stream: loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => bail!("ChatGPT subscription stream was cancelled"),
             _ = async { if let Some(sender) = sender.as_ref() { sender.closed().await } else { futures::future::pending().await } } => return Err(anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")),
@@ -1298,14 +1306,22 @@ async fn consume_sse(
                 terminal = Some(completed);
             }
             if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
-                sender
-                    .send(Ok(StreamChunk::TextDelta(delta)))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")
-                    })?;
+                send_stream_chunk(sender, &cancel, StreamChunk::TextDelta(delta)).await?;
             }
             enforce_sse_remainder_bounds(&buffer)?;
+        }
+        if terminal.is_some() {
+            let remainder = buffer
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map(|start| &buffer[start..])
+                .unwrap_or_default();
+            let partial_done = b"data: [DONE]\n\n".starts_with(remainder)
+                || b"data: [DONE]\r\n\r\n".starts_with(remainder);
+            if !remainder.is_empty() && !partial_done {
+                bail!("ChatGPT subscription sent data after its terminal response");
+            }
+            break 'stream;
         }
     }
     if !buffer.iter().all(u8::is_ascii_whitespace) {
@@ -1315,38 +1331,54 @@ async fn consume_sse(
         terminal.context("ChatGPT subscription stream ended before response.completed")?;
     completed.allowance = completed.allowance.or(header_allowance);
     if let Some(sender) = sender {
-        sender
-            .send(Ok(StreamChunk::ResponseMetadata {
+        send_stream_chunk(
+            &sender,
+            &cancel,
+            StreamChunk::ResponseMetadata {
                 model: completed.model.clone(),
-            }))
-            .await
-            .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+            },
+        )
+        .await?;
         if let Some(input_tokens) = completed.input_tokens {
-            sender
-                .send(Ok(StreamChunk::Usage {
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::Usage {
                     input_tokens,
                     output_tokens: completed.output_tokens.unwrap_or_default(),
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+                },
+            )
+            .await?;
         }
         if let Some(allowance) = completed.allowance.as_ref() {
-            sender
-                .send(Ok(StreamChunk::Allowance {
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::Allowance {
                     primary_used_percent: allowance.primary_used_percent,
                     secondary_used_percent: allowance.secondary_used_percent,
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+                },
+            )
+            .await?;
         }
         for block in completed.blocks.iter().cloned() {
-            sender
-                .send(Ok(StreamChunk::ContentBlockComplete(block)))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+            send_stream_chunk(&sender, &cancel, StreamChunk::ContentBlockComplete(block)).await?;
         }
     }
     Ok(completed)
+}
+
+async fn send_stream_chunk(
+    sender: &mpsc::Sender<Result<StreamChunk>>,
+    cancel: &CancellationToken,
+    chunk: StreamChunk,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("ChatGPT subscription stream was cancelled"),
+        result = sender.send(Ok(chunk)) => result
+            .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")),
+    }
 }
 
 fn parse_event(
@@ -1803,6 +1835,15 @@ fn parse_completed(
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
     }
     let (input_tokens, output_tokens) = parse_usage(response.get("usage"))?;
+    let end_turn = response
+        .get("end_turn")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .context("ChatGPT terminal response end_turn was invalid")
+        })
+        .transpose()?;
     Ok(CompletedResponse {
         id,
         model: response_model,
@@ -1810,6 +1851,7 @@ fn parse_completed(
         input_tokens,
         output_tokens,
         allowance: None,
+        end_turn,
     })
 }
 
@@ -2059,17 +2101,19 @@ fn validate_documented_response_metadata(response: &Map<String, Value>) -> Resul
     {
         bail!("ChatGPT terminal response object type was invalid");
     }
-    for (name, expected) in [
-        ("parallel_tool_calls", false),
-        ("store", false),
-        ("end_turn", true),
-    ] {
+    for (name, expected) in [("parallel_tool_calls", false), ("store", false)] {
         if response
             .get(name)
             .is_some_and(|value| !value.is_null() && value.as_bool() != Some(expected))
         {
             bail!("ChatGPT terminal response {name} was invalid");
         }
+    }
+    if response
+        .get("end_turn")
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+    {
+        bail!("ChatGPT terminal response end_turn was invalid");
     }
     for name in ["max_output_tokens", "max_tool_calls"] {
         if response.get(name).is_some_and(|value| {
@@ -2296,6 +2340,7 @@ fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Optio
 }
 
 fn model_is_compatible(requested: &str, actual: &str) -> bool {
+    let actual = actual.strip_suffix("-safety-routed").unwrap_or(actual);
     matches!(requested, DEFAULT_MODEL | MODEL_ALIAS)
         && matches!(actual, DEFAULT_MODEL | MODEL_ALIAS)
 }
@@ -2330,9 +2375,17 @@ fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()>
             "response obfuscation padding",
         )?;
     }
-    let mut event_fields = Vec::with_capacity(allowed.len() + 1);
+    if let Some(safety_buffering) = object.get("safety_buffering") {
+        let encoded = serde_json::to_vec(safety_buffering)
+            .context("ChatGPT subscription safety buffering metadata was invalid")?;
+        if encoded.len() > MAX_SSE_EVENT_BYTES {
+            bail!("ChatGPT subscription safety buffering metadata exceeded the size limit");
+        }
+    }
+    let mut event_fields = Vec::with_capacity(allowed.len() + 2);
     event_fields.extend_from_slice(allowed);
     event_fields.push("obfuscation");
+    event_fields.push("safety_buffering");
     exact_keys(object, &event_fields)?;
     Ok(())
 }
@@ -2413,30 +2466,6 @@ async fn read_bounded(
     Ok(body)
 }
 
-/// Discards at most a bounded prefix of a rejected response without retaining its body.
-///
-/// Once the server has supplied an HTTP rejection status, an oversized or broken body must not
-/// replace that typed status with a body-reading error. Dropping the response after this bounded
-/// prefix closes the remaining stream while keeping cancellation responsive and memory bounded.
-async fn discard_bounded_response_prefix(
-    response: Response,
-    maximum: usize,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    let mut stream = response.bytes_stream();
-    let mut discarded = 0usize;
-    while discarded < maximum {
-        let next = tokio::select! {
-            _ = cancel.cancelled() => bail!("ChatGPT subscription response read was cancelled"),
-            next = stream.next() => next,
-        };
-        let Some(chunk) = next else { break };
-        let Ok(chunk) = chunk else { break };
-        discarded = discarded.saturating_add(chunk.len());
-    }
-    Ok(())
-}
-
 fn find_event_end(bytes: &[u8]) -> Option<(usize, usize)> {
     let lf = bytes
         .windows(2)
@@ -2502,6 +2531,37 @@ mod tests {
     use crate::tools::types::ToolInputSchema;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Bare standard assertions report only `left == right` or the predicate. Keep every
+    // provider-contract failure tied to the invariant that produced it, while allowing tests
+    // with richer sanitized state to supply a more specific message.
+    macro_rules! assert {
+        ($condition:expr $(,)?) => {
+            std::assert!(
+                $condition,
+                "ChatGPT subscription invariant failed: {}",
+                stringify!($condition)
+            )
+        };
+        ($condition:expr, $($message:tt)+) => {
+            std::assert!($condition, $($message)+)
+        };
+    }
+
+    macro_rules! assert_eq {
+        ($left:expr, $right:expr $(,)?) => {
+            std::assert_eq!(
+                $left,
+                $right,
+                "ChatGPT subscription invariant failed: {} == {}",
+                stringify!($left),
+                stringify!($right)
+            )
+        };
+        ($left:expr, $right:expr, $($message:tt)+) => {
+            std::assert_eq!($left, $right, $($message)+)
+        };
+    }
 
     const VALID_PNG_BASE64: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -2772,6 +2832,42 @@ mod tests {
         )
     }
 
+    fn completed_sse_with_terminal_field(model: &str, field: &str, value: Value) -> String {
+        let body = completed_sse(model);
+        let marker = "event: response.completed\ndata: ";
+        let start = body
+            .find(marker)
+            .expect("completed fixture must contain its terminal event")
+            + marker.len();
+        let end = body[start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| start + offset)
+            .expect("completed fixture must contain its terminal marker");
+        let mut terminal: Value = serde_json::from_str(&body[start..end])
+            .expect("completed fixture terminal event must be JSON");
+        terminal["response"][field] = value;
+        format!("{}{terminal}{}", &body[..start], &body[end..])
+    }
+
+    fn completed_sse_with_safety_buffering(model: &str, value: Value) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                event["safety_buffering"] = value.clone();
+                format!("data: {event}\n")
+            })
+            .collect()
+    }
+
     fn tool() -> ToolDefinition {
         named_tool("read")
     }
@@ -2884,6 +2980,86 @@ mod tests {
         format!("http://{address}/backend-api/codex")
     }
 
+    async fn held_open_subscription_server(
+        status: &'static str,
+        content_type: &'static str,
+        header_model: &'static str,
+        body: Option<String>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("held-open fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("held-open fixture must expose its loopback address");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener
+                .accept()
+                .await
+                .expect("held-open fixture must accept the catalog request");
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("held-open fixture must write the catalog response");
+            catalog_socket
+                .flush()
+                .await
+                .expect("held-open fixture must flush the catalog response");
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener
+                .accept()
+                .await
+                .expect("held-open fixture must accept the inference request");
+            let _ = response_socket.read(&mut request).await;
+            response_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\nopenai-model: {header_model}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("held-open fixture must write the inference headers");
+            if let Some(body) = body {
+                response_socket
+                    .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
+                    .await
+                    .expect("held-open fixture must write its incomplete chunked body");
+            }
+            response_socket
+                .flush()
+                .await
+                .expect("held-open fixture must flush its response prefix");
+            let _ = ready_tx.send(());
+
+            let mut byte = [0u8; 1];
+            while matches!(response_socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            ready_rx,
+            closed_rx,
+        )
+    }
+
     async fn subscription_stream_outcome(body: String, header_model: &str) -> Vec<String> {
         let mut server = mockito::Server::new_async().await;
         let _models = server
@@ -2924,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() {
+    fn test_canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() {
         let request = ProviderRequest::new(vec![
             Message::with_content(
                 "user",
@@ -2993,7 +3169,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_uses_non_reserved_wire_names_for_finch_agent_tools() {
+    fn test_responses_lite_uses_non_reserved_wire_names_for_finch_agent_tools() {
         let request = ProviderRequest::new(vec![
             Message::user("delegate"),
             Message::with_content(
@@ -3034,7 +3210,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_wire_alias_is_bound_to_the_advertised_finch_tool() {
+    fn test_function_call_wire_alias_is_bound_to_the_advertised_finch_tool() {
         for (wire_name, local_name) in [
             ("finch_spawn_agent", "spawn_agent"),
             ("finch_await_agent", "await_agent"),
@@ -3200,7 +3376,7 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_namespaced_agent_alias_replays_as_the_advertised_function() {
+    fn test_collaboration_namespaced_agent_alias_replays_as_the_advertised_function() {
         let mut blocks = Vec::new();
         parse_output_item(
             &json!({
@@ -3248,7 +3424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_lite_stream_binds_only_the_advertised_collaboration_alias() {
+    async fn test_responses_lite_stream_binds_only_the_advertised_collaboration_alias() {
         async fn run(name: &str, namespace: &str) -> Vec<Result<StreamChunk, String>> {
             let mut server = mockito::Server::new_async().await;
             let _models = server
@@ -3315,7 +3491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_lite_binds_omitted_namespace_to_advertised_functions_group() {
+    async fn test_responses_lite_binds_omitted_namespace_to_advertised_functions_group() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3362,7 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
+    fn test_responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
         let request = ProviderRequest::new(vec![Message::user("hello")])
             .with_model(DEFAULT_MODEL)
             .with_system("developer instructions")
@@ -3388,7 +3564,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_and_capability_alias_are_pinned_to_responses_lite() {
+    fn test_catalog_and_capability_alias_are_pinned_to_responses_lite() {
         let catalog = parse_catalog(catalog_body().as_bytes()).unwrap();
         assert!(catalog.models.contains_key(DEFAULT_MODEL));
         assert!(catalog.models.contains_key(MODEL_ALIAS));
@@ -3409,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_accepts_and_preserves_authoritative_bounded_context_windows() {
+    fn test_catalog_accepts_and_preserves_authoritative_bounded_context_windows() {
         for (sol, alias) in [(200_000, 262_144), (1_000_000, 1_050_000)] {
             let catalog =
                 parse_catalog(catalog_body_with_context_windows(sol, alias).as_bytes()).unwrap();
@@ -3425,7 +3601,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_rejects_missing_malformed_zero_and_excessive_context_windows() {
+    fn test_catalog_rejects_missing_malformed_zero_and_excessive_context_windows() {
         let assert_invalid = |catalog: Value| {
             let error = parse_catalog(catalog.to_string().as_bytes())
                 .err()
@@ -3459,7 +3635,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
+    fn test_catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
         let mut wrong_slug: Value =
             serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
         wrong_slug["models"][0]["slug"] = json!("gpt-5.6-sol-impostor");
@@ -3495,13 +3671,13 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_version_is_pinned_to_audited_codex_not_finch_package() {
+    fn test_compatibility_version_is_pinned_to_audited_codex_not_finch_package() {
         assert_eq!(CHATGPT_CATALOG_CLIENT_VERSION, "0.151.0");
         assert_ne!(CHATGPT_CATALOG_CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
-    fn chatgpt_user_agent_is_static_bounded_and_has_no_user_identity() {
+    fn test_chatgpt_user_agent_is_static_bounded_and_has_no_user_identity() {
         assert_eq!(
             FINCH_CHATGPT_USER_AGENT,
             concat!(
@@ -3523,7 +3699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_catalog_is_typed_actionable_and_secret_free() {
+    async fn test_empty_catalog_is_typed_actionable_and_secret_free() {
         let access_secret = "empty-catalog-access-secret";
         let account_secret = "empty-catalog-account-secret";
         let mut server = mockito::Server::new_async().await;
@@ -3569,7 +3745,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ignores_unrelated_models_and_accepts_one_pinned_identifier() {
+    fn test_catalog_ignores_unrelated_models_and_accepts_one_pinned_identifier() {
         let mut catalog: Value = serde_json::from_str(&catalog_body()).unwrap();
         catalog["models"].as_array_mut().unwrap().push(json!({
             "slug":"unrelated-account-model",
@@ -3589,7 +3765,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_model_provenance_accepts_agreement_and_rejects_conflict_or_absence() {
+    fn test_actual_model_provenance_accepts_agreement_and_rejects_conflict_or_absence() {
         let allowed = HashSet::new();
         let terminal = json!({
             "id":"resp-1",
@@ -3643,7 +3819,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
+    fn test_malformed_unknown_and_misordered_terminal_events_fail_closed() {
         let mut accumulator = StreamAccumulator::default();
         let unknown = json!({"type":"response.future","sequence_number":1});
         assert!(parse_event(
@@ -3687,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_metadata_events_preserve_top_level_actual_model_and_reject_drift() {
+    fn test_pinned_metadata_events_preserve_top_level_actual_model_and_reject_drift() {
         for kind in ["response.metadata", "codex.response.metadata"] {
             let mut accumulator = StreamAccumulator::default();
             let event = json!({
@@ -3729,7 +3905,7 @@ mod tests {
     }
 
     #[test]
-    fn production_refresh_lock_is_shared_by_named_credential_and_account() {
+    fn test_production_refresh_lock_is_shared_by_named_credential_and_account() {
         let first = shared_refresh_lock("credential-a", "account-a");
         let second = shared_refresh_lock("credential-a", "account-a");
         let other_account = shared_refresh_lock("credential-a", "account-b");
@@ -3740,7 +3916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validated_dispatch_uses_exact_account_routes_and_preserves_terminal_metadata() {
+    async fn test_validated_dispatch_uses_exact_account_routes_and_preserves_terminal_metadata() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3842,7 +4018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_and_nonstream_preserve_equal_terminal_output_and_provenance() {
+    async fn test_stream_and_nonstream_preserve_equal_terminal_output_and_provenance() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3907,7 +4083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_and_streaming_require_the_exact_requested_catalog_entry() {
+    async fn test_buffered_and_streaming_require_the_exact_requested_catalog_entry() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3949,7 +4125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_fragmented_sse_preserves_ordered_opaque_and_tool_items() {
+    async fn test_byte_fragmented_sse_preserves_ordered_opaque_and_tool_items() {
         let base = fragmented_subscription_server(completed_sse(DEFAULT_MODEL)).await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -3974,7 +4150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_pre_stream_unauthorized_refreshes_same_account_once() {
+    async fn test_one_pre_stream_unauthorized_refreshes_same_account_once() {
         let mut server = mockito::Server::new_async().await;
         let initial_catalog = server
             .mock("GET", "/backend-api/codex/models")
@@ -4041,7 +4217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_oversized_unauthorized_is_typed_after_one_refresh() {
+    async fn test_repeated_oversized_unauthorized_is_typed_after_one_refresh() {
         let mut server = mockito::Server::new_async().await;
         let initial_catalog = server
             .mock("GET", "/backend-api/codex/models")
@@ -4121,7 +4297,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_catalog_unauthorized_refreshes_before_inference_only_once() {
+    async fn test_one_catalog_unauthorized_refreshes_before_inference_only_once() {
         let mut server = mockito::Server::new_async().await;
         let rejected_catalog = server
             .mock("GET", "/backend-api/codex/models")
@@ -4177,7 +4353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_receiver_drop_cancels_and_releases_subscription_transport() {
+    async fn test_stream_receiver_drop_cancels_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(true).await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -4197,7 +4373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_cancellation_reaches_and_releases_subscription_transport() {
+    async fn test_caller_cancellation_reaches_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(true).await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -4228,7 +4404,317 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_timeout_is_bounded_and_releases_subscription_transport() {
+    async fn test_backpressured_stream_cancellation_releases_transport_without_terminal_effects() {
+        let mut body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"model":DEFAULT_MODEL}})
+        );
+        for index in 0..40u64 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":index + 2,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"x"
+                })
+            ));
+        }
+        let (base, body_sent, closed) =
+            held_open_subscription_server("200 OK", "text/event-stream", DEFAULT_MODEL, Some(body))
+                .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("backpressure fixture must construct a test provider");
+        let cancel = CancellationToken::new();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")])
+                    .with_cancellation_token(cancel.clone()),
+            )
+            .await
+            .expect("backpressure fixture must start a subscription stream");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("backpressure fixture did not send its response body")
+            .expect("backpressure fixture dropped its body-sent signal");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription output queue never reached the intended backpressure boundary");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("backpressured cancellation did not release the HTTP transport")
+            .expect("backpressure fixture dropped its transport-close signal");
+
+        let mut queued = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                queued.push(chunk);
+            }
+        })
+        .await
+        .expect("backpressured stream channel did not close after cancellation");
+        assert_eq!(
+            queued.len(),
+            32,
+            "cancellation should preserve only the 32 deltas queued before backpressure; queued={queued:?}"
+        );
+        assert!(
+            queued.iter().all(|chunk| matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == "x")),
+            "cancellation projected a post-terminal chunk or diagnostic instead of only pre-cancel deltas: {queued:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_event_completes_with_or_without_done_before_socket_eof() {
+        for include_done in [true, false] {
+            let mut body = completed_sse(DEFAULT_MODEL);
+            if !include_done {
+                body = body
+                    .strip_suffix("data: [DONE]\n\n")
+                    .expect("completed fixture must end in [DONE]")
+                    .to_string();
+            }
+            let (base, body_sent, closed) = held_open_subscription_server(
+                "200 OK",
+                "text/event-stream",
+                DEFAULT_MODEL,
+                Some(body),
+            )
+            .await;
+            let provider = ChatGptSubscriptionProvider::for_test(
+                Arc::new(StaticSource::new()),
+                &base,
+                DEFAULT_MODEL,
+            )
+            .expect("held-open completion fixture must construct a test provider");
+            let request =
+                ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                    "validated terminal event waited for socket EOF; include_done={include_done}"
+                )
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!(
+                    "validated terminal event failed; include_done={include_done}; error={error:#}"
+                )
+                    });
+            body_sent.await.unwrap_or_else(|_| {
+                panic!(
+                    "held-open completion fixture dropped its body-sent signal; include_done={include_done}"
+                )
+            });
+            assert_eq!(
+                response.model, DEFAULT_MODEL,
+                "held-open completion returned unexpected model provenance; include_done={include_done}; response={response:?}"
+            );
+            assert!(
+                response
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == "hello")),
+                "held-open completion omitted its validated text block; include_done={include_done}; response={response:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(2), closed)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "validated completion did not release HTTP transport; include_done={include_done}"
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "held-open fixture dropped its close signal; include_done={include_done}"
+                    )
+                });
+        }
+    }
+
+    #[tokio::test]
+    async fn test_end_turn_false_is_preserved_as_follow_up_stop_reason() {
+        let body = completed_sse_with_terminal_field(DEFAULT_MODEL, "end_turn", json!(false));
+        let (base, body_sent, closed) =
+            held_open_subscription_server("200 OK", "text/event-stream", DEFAULT_MODEL, Some(body))
+                .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("end_turn fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                .await
+                .expect("end_turn=false response waited for socket EOF")
+                .unwrap_or_else(|error| panic!("end_turn=false response was rejected: {error:#}"));
+        body_sent
+            .await
+            .expect("end_turn fixture dropped its body-sent signal");
+        assert_eq!(
+            response.stop_reason.as_deref(),
+            Some("tool_use"),
+            "end_turn=false did not retain follow-up semantics: {response:?}"
+        );
+        assert!(
+            response
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == "read")),
+            "end_turn=false response lost its advertised tool call: {response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("end_turn=false response did not release its HTTP transport")
+            .expect("end_turn fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_safety_routed_actual_model_is_preserved_with_exact_event_consistency() {
+        const SAFETY_MODEL: &str = "gpt-5.6-sol-safety-routed";
+        let body = completed_sse(DEFAULT_MODEL).replace(DEFAULT_MODEL, SAFETY_MODEL);
+        let (base, body_sent, closed) =
+            held_open_subscription_server("200 OK", "text/event-stream", SAFETY_MODEL, Some(body))
+                .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("safety-route fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                .await
+                .expect("safety-routed response waited for socket EOF")
+                .unwrap_or_else(|error| panic!("safety-routed response was rejected: {error:#}"));
+        body_sent
+            .await
+            .expect("safety-route fixture dropped its body-sent signal");
+        assert_eq!(
+            response.model, SAFETY_MODEL,
+            "safety-routed actual-model provenance was not preserved: {response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("safety-routed response did not release its HTTP transport")
+            .expect("safety-route fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_safety_buffering_event_metadata_is_accepted_and_bounded() {
+        let body = completed_sse_with_safety_buffering(
+            DEFAULT_MODEL,
+            json!({"state":"buffered","tokens":3}),
+        );
+        let (base, body_sent, closed) =
+            held_open_subscription_server("200 OK", "text/event-stream", DEFAULT_MODEL, Some(body))
+                .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("safety-buffering fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                .await
+                .expect("bounded safety_buffering response waited for socket EOF")
+                .unwrap_or_else(|error| {
+                    panic!("bounded safety_buffering metadata was rejected: {error:#}")
+                });
+        body_sent
+            .await
+            .expect("safety-buffering fixture dropped its body-sent signal");
+        assert_eq!(
+            response.model, DEFAULT_MODEL,
+            "safety_buffering response changed actual-model provenance: {response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("safety_buffering response did not release its HTTP transport")
+            .expect("safety-buffering fixture dropped its transport-close signal");
+
+        let mut accumulator = StreamAccumulator::default();
+        let oversized = parse_event(
+            json!({
+                "type":"response.created",
+                "sequence_number":1,
+                "response":{"model":DEFAULT_MODEL},
+                "safety_buffering":"x".repeat(MAX_SSE_EVENT_BYTES)
+            }),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .err()
+        .expect("oversized safety_buffering metadata unexpectedly passed validation");
+        assert!(
+            oversized
+                .to_string()
+                .contains("safety buffering metadata exceeded the size limit"),
+            "oversized safety_buffering returned an unhelpful diagnostic: {oversized:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_rejection_returns_typed_status_without_waiting_for_body_eof() {
+        let (base, headers_sent, closed) = held_open_subscription_server(
+            "429 Too Many Requests",
+            "text/plain",
+            DEFAULT_MODEL,
+            None,
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("held-open rejection fixture must construct a test provider");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(&ProviderRequest::new(vec![Message::user("hello")])),
+        )
+        .await
+        .expect("known HTTP rejection waited for body EOF")
+        .expect_err("held-open 429 response unexpectedly succeeded");
+        headers_sent
+            .await
+            .expect("held-open rejection fixture dropped its headers-sent signal");
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("held-open rejection lost its typed HTTP status");
+        assert_eq!(
+            rejection.0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "held-open rejection returned the wrong typed status: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("typed HTTP rejection did not release the stalled body transport")
+            .expect("held-open rejection fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout_is_bounded_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(false).await;
         let mut provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -4254,7 +4740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
+    async fn test_eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
         let created = format!(
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
@@ -4286,7 +4772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actual_model_drift_fails_before_completion_effects() {
+    async fn test_actual_model_drift_fails_before_completion_effects() {
         let body = format!(
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}})
@@ -4297,7 +4783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_etag_is_generation_revalidated_but_never_crosses_accounts() {
+    async fn test_catalog_etag_is_generation_revalidated_but_never_crosses_accounts() {
         let mut server = mockito::Server::new_async().await;
         let first = server
             .mock("GET", "/backend-api/codex/models")
@@ -4384,7 +4870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_success_bodies_are_bounded_and_redacted() {
+    async fn test_non_success_bodies_are_bounded_and_redacted() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -4428,7 +4914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_success_json_is_typed_bounded_and_redacted() {
+    async fn test_oversized_success_json_is_typed_bounded_and_redacted() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -4472,7 +4958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_sse_without_content_type_is_accepted_and_validated() {
+    async fn test_successful_sse_without_content_type_is_accepted_and_validated() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -4511,7 +4997,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_response_field_diagnostic_reflects_neither_key_nor_value() {
+    fn test_unknown_response_field_diagnostic_reflects_neither_key_nor_value() {
         let secret_key = "private-key-that-is-also-a-secret";
         let secret_value = "private-reasoning-and-tool-argument";
         let mut object = Map::new();
@@ -4526,7 +5012,7 @@ mod tests {
     }
 
     #[test]
-    fn response_obfuscation_must_be_a_bounded_string() {
+    fn test_response_obfuscation_must_be_a_bounded_string() {
         let invalid = json!({"known":true,"obfuscation":{"secret":"not padding"}});
         let error = exact_event_keys(invalid.as_object().unwrap(), &["known"])
             .expect_err("structured obfuscation must not bypass response validation");
@@ -4560,7 +5046,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_background_response_is_rejected() {
+    fn test_terminal_background_response_is_rejected() {
         let response = json!({"id":"resp-background","background":true});
         let error = parse_completed(
             response.as_object().unwrap(),
@@ -4575,7 +5061,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_completion_timestamp_must_be_null_or_nonnegative_numeric_seconds() {
+    fn test_terminal_completion_timestamp_must_be_null_or_nonnegative_numeric_seconds() {
         for invalid in [json!(-1), json!("1777777777")] {
             let response = json!({"id":"resp-timestamp","completed_at":invalid});
             let error = parse_completed(
@@ -4594,7 +5080,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_penalties_must_remain_within_documented_bounds() {
+    fn test_terminal_penalties_must_remain_within_documented_bounds() {
         for name in ["frequency_penalty", "presence_penalty"] {
             let mut response = Map::new();
             response.insert("id".to_string(), json!("resp-penalty"));
@@ -4613,7 +5099,7 @@ mod tests {
     }
 
     #[test]
-    fn audited_terminal_tool_usage_is_bounded_but_not_projected() {
+    fn test_audited_terminal_tool_usage_is_bounded_but_not_projected() {
         let mut response = Map::new();
         response.insert("id".to_string(), json!("resp-extension"));
         response.insert("model".to_string(), json!(DEFAULT_MODEL));
@@ -4680,7 +5166,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_may_replace_only_opaque_streamed_state() {
+    fn test_terminal_output_may_replace_only_opaque_streamed_state() {
         let streamed_item = json!({
             "type":"message",
             "role":"assistant",
@@ -4761,7 +5247,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_terminal_output_retains_validated_completed_stream_items() {
+    fn test_empty_terminal_output_retains_validated_completed_stream_items() {
         let streamed_item = json!({
             "id":"msg-streamed",
             "type":"message",
@@ -4802,7 +5288,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_output_may_consolidate_adjacent_streamed_text_items() {
+    fn test_terminal_output_may_consolidate_adjacent_streamed_text_items() {
         let message = |text: &str| {
             json!({
                 "type":"message",
@@ -4854,7 +5340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_lite_reconciles_consolidated_terminal_text_items() {
+    async fn test_responses_lite_reconciles_consolidated_terminal_text_items() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -4893,7 +5379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_lite_retains_done_item_when_terminal_output_is_compact() {
+    async fn test_responses_lite_retains_done_item_when_terminal_output_is_compact() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -4935,7 +5421,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_text_consolidation_cannot_cross_or_mutate_tool_calls() {
+    fn test_terminal_text_consolidation_cannot_cross_or_mutate_tool_calls() {
         let text = |value: &str| ContentBlock::Text {
             text: value.to_string(),
         };
@@ -4992,7 +5478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_terminal_text_drift_emits_no_terminal_projection() {
+    async fn test_streamed_terminal_text_drift_emits_no_terminal_projection() {
         let mut body = completed_sse(DEFAULT_MODEL);
         let completed_marker = "event: response.completed\ndata: ";
         let completed_start = body
@@ -5075,7 +5561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_rejection_is_typed_clear_and_secret_free() {
+    async fn test_response_rejection_is_typed_clear_and_secret_free() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -5123,7 +5609,7 @@ mod tests {
     }
 
     #[test]
-    fn hostile_origin_route_and_request_preflight_fail_before_credentials() {
+    fn test_hostile_origin_route_and_request_preflight_fail_before_credentials() {
         let source = Arc::new(StaticSource::new());
         for endpoint in [
             "https://api.openai.com/backend-api/codex",
@@ -5144,7 +5630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_image_and_history_fail_before_credential_or_network_use() {
+    async fn test_malformed_image_and_history_fail_before_credential_or_network_use() {
         let source = Arc::new(StaticSource::new());
         let provider = ChatGptSubscriptionProvider::for_test(
             source.clone(),
@@ -5166,7 +5652,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_argument_reasoning_and_sse_boundaries_are_enforced() {
+    fn test_tool_argument_reasoning_and_sse_boundaries_are_enforced() {
         let huge = "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1);
         let request = ProviderRequest::new(vec![Message::with_content(
             "assistant",
@@ -5180,43 +5666,5 @@ mod tests {
         assert!(responses_lite_request(&request, ReasoningEffort::High).is_err());
         assert!(enforce_sse_remainder_bounds(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
         assert!(sse_data(b"future: attacker-secret").is_err());
-    }
-
-    /// Opt-in live acceptance uses Finch's own named device credential. It is
-    /// ignored by default and intentionally never prints tokens or bodies.
-    #[tokio::test]
-    #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
-    async fn live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in() -> Result<()> {
-        if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
-            bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
-        }
-        let config = crate::config::load_config()?;
-        let profile = config
-            .providers
-            .iter()
-            .find(|entry| {
-                matches!(
-                    entry,
-                    crate::config::ProviderEntry::Credentialed {
-                        provider: CredentialProvider::ChatgptSubscription,
-                        ..
-                    }
-                )
-            })
-            .context("No Finch ChatGPT subscription profile is configured")?
-            .profile_name();
-        let provider = crate::providers::create_provider_profile_from_config(&config, &profile)?;
-        let response = provider
-            .send_message(
-                &ProviderRequest::new(vec![Message::user(
-                    "Reply with exactly: Finch native subscription transport accepted",
-                )])
-                .with_model(DEFAULT_MODEL),
-            )
-            .await?;
-        if response.model != DEFAULT_MODEL || response.text().is_empty() {
-            bail!("Live ChatGPT subscription acceptance returned incompatible provenance");
-        }
-        Ok::<(), anyhow::Error>(())
     }
 }

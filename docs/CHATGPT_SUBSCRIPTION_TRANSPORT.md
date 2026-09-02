@@ -113,14 +113,19 @@ The SSE parser bounds each line and event and the total response. It validates
 standard `event:` names against JSON event types, requires strictly increasing
 sequence numbers, accumulates completed output items by contiguous output
 index, and reconciles them with any terminal output. Actual-model provenance
-must remain compatible and unchanged. Unknown fields/events, malformed tool
+must remain compatible and unchanged; the audited `-safety-routed` provenance
+suffix is accepted while header and event values must still agree. Bounded
+`safety_buffering` event metadata is validated and intentionally not projected.
+An explicit `end_turn: false` is preserved as a `tool_use` follow-up stop
+reason. Unknown fields/events, malformed tool
 arguments, missing completion, duplicate terminal markers, post-terminal data,
 partial EOF, idle timeout, receiver drop, and payload-limit violations fail
 visibly before terminal chunks are published.
 
-Non-success bodies are consumed only to a small bound and discarded. A
-Responses-Lite rejection retains a typed HTTP status and a compatibility or
-entitlement hint, never the response body. Tokens,
+Non-success bodies are never consumed after their status is known; the response
+is dropped immediately so a hostile or broken body cannot delay the typed
+result. A Responses-Lite rejection retains a typed HTTP status and a
+compatibility or entitlement hint, never the response body. Tokens,
 account identifiers, request bodies, image data, tool arguments, reasoning
 continuations, and response bodies are never placed in provider errors.
 
@@ -128,20 +133,21 @@ Proactive refresh is generation-bound and serialized. A 401 before the stream
 starts permits one shared refresh, a fresh account catalog check, and one retry.
 There is no retry after successful stream headers or any response event.
 
-## Opt-in live acceptance
+## Live acceptance
 
-Live auth and inference are never part of normal tests. After independent
-security review, a user who has explicitly completed Finch's own device login
-can run:
+Live auth and inference are never part of automated tests. After building the
+reviewed branch, a user who has explicitly completed Finch's own device login
+can exercise the production Finch boundary with a disposable Brain name:
 
 ```sh
-FINCH_LIVE_CHATGPT_ACCEPTANCE=1 cargo test --lib \
-  providers::chatgpt_subscription::tests::live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in \
-  -- --ignored --exact
+cargo build --bin finch
+target/debug/finch --brain chatgpt-subscription-live-acceptance
 ```
 
-The test selects a Finch-owned named credential and asserts non-empty Sol model
-provenance. It does not print tokens or response bodies. Until that opt-in test
-is run, live-service acceptance—including current account entitlement and
-server-side compatibility with the pinned revision—remains intentionally
-unverified.
+This uses Finch's normal credential selection and provider path; it does not
+copy credentials into a test HOME. Enter a short prompt and confirm a response
+whose displayed provider/model provenance is the selected ChatGPT subscription
+profile. Manual evidence supplements but never replaces the deterministic
+HTTP/SSE regression suite. Until this production-boundary check is run,
+live-service acceptance—including current account entitlement and server-side
+compatibility with the pinned revision—remains intentionally unverified.
