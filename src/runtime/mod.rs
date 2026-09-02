@@ -5111,8 +5111,36 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 };
                 let query = query.clone();
                 self.mark_host_use();
+                // A typed list has nowhere to put a caveat, so this surface
+                // cannot narrate a partial index the way the tools and the
+                // status strip do -- and an empty `List<String>` reads to the
+                // calling program as "no such memory" (#275).
+                //
+                // So the unusable case fails instead of lying: with a `Failed`
+                // index the answer carries no information either way, and an
+                // error is something a program can branch on. `Loading` and
+                // `Degraded` still return what has loaded, because refusing
+                // during ordinary startup hydration would break working
+                // programs to report a condition that resolves itself; that
+                // residual -- a typed program cannot tell a partial empty
+                // result from a true one -- needs a status word to fix, not a
+                // refusal here.
+                let before = memory.hydration_status();
+                let index = memory.clone();
                 let values = block_on_host(async move { memory.query(&query, None).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let observed = crate::memory_status::observed(before, index.hydration_status());
+                if let crate::memory::HydrationStatus::Failed { reason } = &observed {
+                    return Err(host_binding_error(
+                        origin,
+                        format!(
+                            "memory index is unavailable, so mem-recall cannot answer: {reason}"
+                        ),
+                    ));
+                }
+                if let Some(caveat) = crate::memory_status::caveat(&observed, !values.is_empty()) {
+                    tracing::warn!(%caveat, "mem-recall answered from a partial memory index");
+                }
                 return Ok(vec![TypedValue::List {
                     element_type: Type::String,
                     values: values.into_iter().map(TypedValue::String).collect(),

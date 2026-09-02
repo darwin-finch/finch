@@ -4246,6 +4246,15 @@ impl Repl {
                 stats.conversation_count
             ));
             self.output_status(format!("MemTree nodes: {}", stats.tree_node_count));
+            // `tree_node_count` is the size of the in-memory tree, so during
+            // hydration it is a count of what has loaded, not of what the user
+            // has stored -- a flatly wrong number about their own data, shown
+            // without qualification (#275).
+            if let Some(caveat) =
+                crate::memory_status::caveat(&memory.hydration_status(), stats.tree_node_count > 0)
+            {
+                self.output_status(caveat);
+            }
             self.output_status("");
 
             if stats.conversation_count > 0 {

@@ -801,7 +801,7 @@ async fn persist_completed_turn_memory(
     }
     status_bar.update_line(
         crate::cli::status_bar::StatusLineType::MemoryContext,
-        format!("🧠 recalled {memory_recall_count}"),
+        crate::memory_status::status_line(memory_recall_count, &memory_system.hydration_status()),
     );
     refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
@@ -987,7 +987,7 @@ pub(super) async fn dispatch_tool_uses(
     if let Some(ref mem) = memory_system {
         status_bar.update_line(
             crate::cli::status_bar::StatusLineType::MemoryContext,
-            format!("🧠 recalled {memory_recall_count}"),
+            crate::memory_status::status_line(memory_recall_count, &mem.hydration_status()),
         );
         refresh_context_strip(mem, session_label, cwd, status_bar, context_lines).await;
     }
@@ -1090,7 +1090,14 @@ pub(crate) async fn process_query_with_tools(
             apply_sliding_window(all_msgs, max_verbatim)
         };
         if let Some(ref mem) = memory_system {
-            if let Ok(memories) = mem.query(&query, Some(recall_k)).await {
+            // Sample the index before the query as well as after. Hydration
+            // advances while the query runs, so an after-only sample can read
+            // `Ready` for a search that covered a fraction of the store --
+            // failing open, in the one direction that matters.
+            let before = mem.hydration_status();
+            let recalled = mem.query(&query, Some(recall_k)).await;
+            let index = crate::memory_status::observed(before, mem.hydration_status());
+            if let Ok(memories) = recalled {
                 if !memories.is_empty() {
                     memory_recall_count = memories.len();
                     let mem_block = memories.join("\n\n---\n\n");
@@ -1105,12 +1112,16 @@ pub(crate) async fn process_query_with_tools(
                             );
                         }
                     }
-                    status_bar.update_line(
-                        crate::cli::status_bar::StatusLineType::MemoryContext,
-                        format!("🧠 recalled {}", memory_recall_count),
-                    );
                 }
             }
+            // Outside the emptiness guard on purpose. An unusable index recalls
+            // nothing, so nesting the update inside `!memories.is_empty()` left
+            // the previous turn's line standing at exactly the moment the strip
+            // needed to say the memory was unavailable.
+            status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::MemoryContext,
+                crate::memory_status::status_line(memory_recall_count, &index),
+            );
         }
         // This execution contract is required on *every* provider inference,
         // including internal empty-query continuations after tool results.
@@ -2010,6 +2021,7 @@ pub(crate) fn apply_sliding_window(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

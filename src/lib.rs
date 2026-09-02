@@ -85,6 +85,7 @@ pub mod llms; // Generic LLM abstraction (Phase 1)
 pub mod local; // Local generation system
 pub mod logging; // Conversation logging for LoRA training
 pub mod memory; // Hierarchical memory system (Phase 4)
+pub mod memory_status; // How a memory read describes the index it read (#275)
 pub mod metrics;
 pub mod models; // Phase 2: Neural network models
 pub mod monitoring; // System monitoring (memory, CPU)
