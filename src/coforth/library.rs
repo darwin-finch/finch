@@ -84,15 +84,21 @@ impl Library {
     /// Load seed vocabulary + generated English library + user extensions.
     ///
     /// Load order (later entries override earlier ones for the same word):
-    ///   1. SEED_LIBRARY — the baked-in lexicon. Measured, not estimated: it
-    ///      alone yields 3,144 words, so a binary run outside a checkout still
-    ///      has almost the whole vocabulary. The previous version of this list
-    ///      called it "~80 words" and named an `ENGLISH_LIBRARY` step that has
-    ///      never existed.
+    ///   1. SEED_LIBRARY — the only source a shipped binary has. **392 words.**
     ///   2. {git_root}/vocabulary/*.toml — project-local modules, versioned in
-    ///      the repo. Adds 80 words on top of the seed, so `finch library list`
-    ///      reports 3,224 inside a checkout and 3,144 outside one.
-    ///   3. ~/.finch/library.toml — user-global additions and overrides
+    ///      the repo, and read from disk rather than from the baked-in copies
+    ///      below. Adds 99, for 491 inside a checkout.
+    ///   3. ~/.finch/library.toml — user-global additions and overrides.
+    ///
+    /// Measured with a disposable `HOME`, which matters more than it looks.
+    /// An earlier version of this comment claimed 3,144 and 3,224 and concluded
+    /// that a binary outside a checkout "still has almost the whole
+    /// vocabulary". Both numbers came from the developer's own 604 KB
+    /// `~/.finch/library.toml` -- step 3 -- and were attributed to step 1. The
+    /// version before that guessed "~80 words" and named an `ENGLISH_LIBRARY`
+    /// step that has never existed. So: a shipped binary on a fresh machine has
+    /// 392 words, not 3,144, and the 80-word delta was really 99, reading as 80
+    /// only because the personal library already defined 19 of them.
     pub fn load() -> Self {
         let mut lib = Self::default();
         lib.load_toml(SEED_LIBRARY);
@@ -322,8 +328,6 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{lang}.toml")))
 }
 
-// ── Pure-Rust word generator ───────────────────────────────────────────────────
-
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
 /// Project English vocabulary — baked in at compile time.
@@ -332,8 +336,10 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
 // only reader was the `BUILTIN_DEFS` static removed in #298.
 //
 // Kept rather than deleted because they are the obvious material for closing
-// the 80-word gap between a checkout and a shipped binary, and deleting them
-// would quietly remove that option. That is a decision worth making
+// the 99-word gap between a checkout and a shipped binary, and deleting them
+// would quietly remove that option. `WordEntry::stack_effect` and `effect` are
+// in the same position: their last production reader was `from_forth_entry`,
+// removed by this PR, and they are still populated from the TOML. That is a decision worth making
 // deliberately rather than as a side effect of a dead-code sweep.
 pub const EN_LIBRARY: &str = include_str!("../../vocabulary/en.toml");
 
