@@ -65,13 +65,35 @@ impl Tool for SearchMemoryTool {
 
         tracing::info!("Searching memory: query='{}', limit={}", query, limit);
 
+        // Sample the index before the search as well as after.
+        //
+        // Hydration advances while the query runs, so an after-only sample can
+        // read `Ready` for a search that covered a fraction of the store -- and
+        // then the empty branch below prints plain absence, which is the exact
+        // false claim this block exists to remove. Sampling both ways fails
+        // closed (#275).
+        let before = self.memory_system.hydration_status();
         let results = self
             .memory_system
             .query_with_sources(query, Some(limit))
             .await?;
+        let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
+        let caveat = crate::memory_status::caveat(&index);
 
         if results.is_empty() {
-            return Ok("No relevant memories found for this query.".to_string());
+            return Ok(match caveat {
+                None => "No relevant memories found for this query.".to_string(),
+                // A lead that presupposes nothing.
+                //
+                // "No matches among the entries that were read" quietly asserts
+                // that entries *were* read, which is false for an index that
+                // never loaded -- and an earlier attempt to special-case that
+                // by asking whether the index had "read nothing" could not be
+                // answered, because `HydrationStatus::Failed` carries no count.
+                // Saying only what the search did needs no such answer, and is
+                // true in every state.
+                Some(caveat) => format!("The search returned no matches. {caveat}"),
+            });
         }
 
         let formatted = format!(
@@ -116,7 +138,12 @@ impl Tool for SearchMemoryTool {
                 .join("\n\n")
         );
 
-        Ok(formatted)
+        // The caveat rides with the hits too: "found 3" from a partial index is
+        // a different claim from "found 3" out of everything stored.
+        Ok(match caveat {
+            None => formatted,
+            Some(caveat) => format!("{formatted}\n\n{caveat}"),
+        })
     }
 }
 
@@ -158,8 +185,33 @@ impl Tool for InspectMemoryTool {
         let memory_id = params["memory_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: memory_id"))?;
-        let Some(memory) = self.memory_system.inspect_memory(memory_id).await? else {
-            return Ok(format!("No memory found for memory_id={memory_id}"));
+        // Only the `node:<id>` form is answered from the index.
+        //
+        // That form goes through the in-memory tree, so an unhydrated node is
+        // indistinguishable from a nonexistent one and a plain "not found"
+        // tells a model the memory was never recorded (#275). Every other
+        // `memory_id` -- including the conversation ids `query_with_sources`
+        // attaches to attributed memories, which is the common case -- is a
+        // direct SQLite read that hydration cannot affect. Qualifying those
+        // manufactures doubt about a settled negative and sends a model back to
+        // retry a definitive answer: this defect's mirror image, not its fix.
+        //
+        // `trim()` because `inspect_memory` trims before matching the prefix,
+        // and a gate that disagreed with the lookup would caveat the wrong ids.
+        let from_index = memory_id.trim().starts_with("node:");
+        let before = self.memory_system.hydration_status();
+        let found = self.memory_system.inspect_memory(memory_id).await?;
+        let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
+        let Some(memory) = found else {
+            let caveat = from_index
+                .then(|| crate::memory_status::caveat(&index))
+                .flatten();
+            return Ok(match caveat {
+                None => format!("No memory found for memory_id={memory_id}"),
+                Some(caveat) => {
+                    format!("No memory with memory_id={memory_id} was found in the index. {caveat}")
+                }
+            });
         };
         serde_json::to_string_pretty(&memory).map_err(Into::into)
     }
@@ -316,6 +368,21 @@ mod tests {
     use crate::memory::MemoryConfig;
     use tempfile::NamedTempFile;
 
+    fn test_context<'a>() -> ToolContext<'a> {
+        ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            poset: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_search_memory_tool() -> Result<()> {
         let temp = NamedTempFile::new()?;
@@ -341,18 +408,7 @@ mod tests {
 
         // Create tool and search
         let tool = SearchMemoryTool::new(memory);
-        let context = ToolContext {
-            conversation: None,
-            save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
-            plan_content: None,
-            live_output: None,
-            effect_audit: None,
-            poset: None,
-        };
+        let context = test_context();
         let result = tool
             .execute(
                 serde_json::json!({
@@ -366,6 +422,244 @@ mod tests {
         assert!(result.contains("relevant"));
         assert!(result.contains("Rust") || result.contains("lifetimes"));
         assert!(result.contains("memory_id="));
+
+        Ok(())
+    }
+
+    /// Corrupt a store so hydration cannot read it.
+    ///
+    /// `level` is read as an i64, and TEXT that does not look numeric keeps its
+    /// type under INTEGER affinity, so every row fails to parse. The migrations
+    /// leave it alone: migration A only drops `tree_nodes` when `node_id` is
+    /// absent, and `schema.sql` is `CREATE TABLE IF NOT EXISTS`.
+    fn break_hydration(db_path: &std::path::Path) -> Result<()> {
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.execute("UPDATE tree_nodes SET level = 'unreadable'", [])?;
+        Ok(())
+    }
+
+    /// Wait for the background loader to stop, rather than racing it.
+    async fn settled_hydration(memory: &MemorySystem) -> crate::memory::HydrationStatus {
+        for _ in 0..200 {
+            let status = memory.hydration_status();
+            if !matches!(status, crate::memory::HydrationStatus::Loading { .. }) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("hydration never reached a terminal state");
+    }
+
+    /// A search that read nothing must not report that nothing exists.
+    ///
+    /// The tool is the sharper half of #275. A human sees the status line next
+    /// to the answer; a model sees only the sentence, and
+    /// "No relevant memories found for this query." is a claim about the store,
+    /// not about the search. Made against an index that never loaded, it is
+    /// false, and it is the kind of false a model acts on -- it concludes the
+    /// user never said the thing and moves on.
+    ///
+    /// This covers the synchronous loader: `#[tokio::test]` is a current-thread
+    /// runtime, so `MemorySystem::new` loads in line and never spawns a batched
+    /// loader at all. Production is `#[tokio::main]`, i.e. multi-threaded and
+    /// batched -- covered separately below, because the two failure paths reach
+    /// `Failed` through different code.
+    #[tokio::test]
+    async fn test_search_does_not_report_absence_from_an_index_it_could_not_read() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let db_path = temp.path().to_path_buf();
+
+        {
+            let memory = MemorySystem::new(MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })?;
+            memory
+                .insert_conversation("user", "my deploy key lives in 1Password", Some("t"), None)
+                .await?;
+        }
+
+        // Nothing loads, so the index is Failed -- the memory above is on disk
+        // and unreachable, which is exactly the state where an absence claim
+        // does damage.
+        break_hydration(&db_path)?;
+
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path,
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Failed { .. }
+            ),
+            "fixture must actually break hydration, or this test cannot fail: {:?}",
+            memory.hydration_status()
+        );
+
+        let result = SearchMemoryTool::new(memory)
+            .execute(
+                serde_json::json!({ "query": "deploy key", "limit": 5 }),
+                &test_context(),
+            )
+            .await?;
+
+        assert!(
+            !result.contains("No relevant memories found"),
+            "asserted absence on an index it never read: {result}"
+        );
+        // The lead sentence too, not just the caveat behind it. "No matches
+        // among the entries that were read" quietly asserts that entries were
+        // read, which is false here -- and nothing asserted the lead, so that
+        // regression shipped invisibly once already.
+        assert!(
+            !result.contains("entries that were read"),
+            "presupposes reads that never happened: {result}"
+        );
+        assert!(
+            result.contains("did not finish loading"),
+            "did not tell the caller the index was unreadable: {result}"
+        );
+
+        Ok(())
+    }
+
+    /// The same guarantee on the loader production actually runs.
+    ///
+    /// `MemorySystem::new` only spawns the batched background loader on a
+    /// multi-threaded runtime; a current-thread runtime loads synchronously.
+    /// So the test above, despite its subject, never executes `load_batch` --
+    /// and the batched path is where `Failed` is raised from a different place,
+    /// where hydration is still in flight when `new` returns, and where #242
+    /// made a partial index a normal part of startup rather than an edge case.
+    ///
+    /// Waits for a settled status rather than asserting immediately: `new`
+    /// returns while the loader is still running, so an immediate assert would
+    /// be a race that passes or fails by timing.
+    ///
+    /// The batched path is guaranteed by construction, not by an assertion.
+    /// `MemorySystem::new` dispatches on `Handle::runtime_flavor()`, so
+    /// `flavor = "multi_thread"` is what selects the spawned loader. An earlier
+    /// version asserted the status was `Loading` the instant `new` returned to
+    /// prove it; that is a head start, not a guarantee, and the obvious
+    /// weakening -- asserting the status is not `Ready` -- does not
+    /// discriminate at all, since the synchronous path lands on `Failed` here
+    /// too. Nothing observable from outside `src/memory` separates the two
+    /// without a race, so this says so rather than shipping a knowing flake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_search_qualifies_its_answer_when_the_batched_loader_fails() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let db_path = temp.path().to_path_buf();
+
+        {
+            let memory = MemorySystem::new(MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })?;
+            memory
+                .insert_conversation("user", "my deploy key lives in 1Password", Some("t"), None)
+                .await?;
+        }
+        break_hydration(&db_path)?;
+
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path,
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        let settled = settled_hydration(&memory).await;
+        assert!(
+            matches!(settled, crate::memory::HydrationStatus::Failed { .. }),
+            "the batched loader must actually fail, or this test cannot fail: {settled:?}"
+        );
+
+        let result = SearchMemoryTool::new(memory)
+            .execute(
+                serde_json::json!({ "query": "deploy key", "limit": 5 }),
+                &test_context(),
+            )
+            .await?;
+
+        assert!(
+            !result.contains("No relevant memories found"),
+            "asserted absence on an index the batched loader never read: {result}"
+        );
+        assert!(
+            result.contains("did not finish loading"),
+            "did not tell the caller the index was unreadable: {result}"
+        );
+
+        Ok(())
+    }
+
+    /// Only the index-backed lookup form gets an index caveat.
+    ///
+    /// `node:<id>` resolves through the MemTree, so an unhydrated node reads as
+    /// a nonexistent one and a bare "not found" is a false absence claim. Every
+    /// other memory_id -- including the conversation ids attached to attributed
+    /// memories, which is the common case -- is a direct SQLite read that
+    /// hydration cannot affect. Caveating those manufactures doubt about a
+    /// settled negative and sends a model back to retry a definitive answer,
+    /// which is this defect's mirror image rather than its fix (#275).
+    ///
+    /// Both halves are asserted here because the gate was twice described in a
+    /// comment without being present in the code.
+    #[tokio::test]
+    async fn test_inspect_qualifies_only_the_lookups_the_index_answers() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let db_path = temp.path().to_path_buf();
+        {
+            let memory = MemorySystem::new(MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })?;
+            memory
+                .insert_conversation("user", "a memory that will be stranded", Some("t"), None)
+                .await?;
+        }
+        break_hydration(&db_path)?;
+
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path,
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Failed { .. }
+            ),
+            "fixture must break hydration, or neither half of this test can fail"
+        );
+        let tool = InspectMemoryTool::new(memory);
+
+        let from_index = tool
+            .execute(
+                serde_json::json!({ "memory_id": "node:7" }),
+                &test_context(),
+            )
+            .await?;
+        assert!(
+            from_index.contains("did not finish loading"),
+            "a node lookup against an unusable index must not read as absence: {from_index}"
+        );
+
+        let from_sqlite = tool
+            .execute(
+                serde_json::json!({ "memory_id": "a-conversation-id-that-does-not-exist" }),
+                &test_context(),
+            )
+            .await?;
+        assert!(
+            !from_sqlite.contains("index"),
+            "qualified a settled SQLite negative, which sends a model back to \
+             retry an answer that will never change: {from_sqlite}"
+        );
+        assert!(from_sqlite.contains("No memory found"), "{from_sqlite}");
 
         Ok(())
     }
@@ -391,18 +685,7 @@ mod tests {
             .pop()
             .expect("memory search result");
         let tool = InspectMemoryTool::new(memory);
-        let context = ToolContext {
-            conversation: None,
-            save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
-            plan_content: None,
-            live_output: None,
-            effect_audit: None,
-            poset: None,
-        };
+        let context = test_context();
         let output = tool
             .execute(serde_json::json!({"memory_id": result.memory_id}), &context)
             .await?;
@@ -422,18 +705,7 @@ mod tests {
         let memory = Arc::new(MemorySystem::new(config)?);
         let tool = CreateMemoryTool::new(memory.clone());
 
-        let context = ToolContext {
-            conversation: None,
-            save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
-            plan_content: None,
-            live_output: None,
-            effect_audit: None,
-            poset: None,
-        };
+        let context = test_context();
 
         let result = tool
             .execute(
@@ -472,18 +744,7 @@ mod tests {
         }
 
         let tool = ListRecentTool::new(memory);
-        let context = ToolContext {
-            conversation: None,
-            save_models: None,
-            batch_trainer: None,
-            local_generator: None,
-            tokenizer: None,
-            repl_mode: None,
-            plan_content: None,
-            live_output: None,
-            effect_audit: None,
-            poset: None,
-        };
+        let context = test_context();
         let result = tool
             .execute(serde_json::json!({"limit": 3}), &context)
             .await?;
