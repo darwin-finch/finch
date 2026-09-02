@@ -26,6 +26,11 @@
 //!    goes by the cells. So the cells are streamed and the running box is
 //!    checked after each one, which rejects that file on its second cell.
 //!
+//! The count of populated cells is bounded on the same pass, because the box
+//! does not bound it: a sheet repeating one `<c r="A1">` element is a 1x1
+//! rectangle that passes the box check on every iteration while the cell vector
+//! grows without limit, and XLSX deflates that at roughly 1000:1.
+//!
 //! Only then is `from_sparse` called, on a box already proven small enough.
 //!
 //! XLS and ODS have no streaming reader in calamine's public API, so for those
@@ -36,10 +41,11 @@
 use calamine::{Cell, Data, DataRef, Range, Reader, Sheets};
 use std::io::{Read, Seek};
 
-/// The most cells Finch will let a worksheet's bounding box span.
+/// The most cells Finch will read from one worksheet.
 ///
-/// This bounds the *rectangle*, which is the quantity that gets allocated —
-/// not the count of populated cells, which can be far smaller.
+/// Bounds both the *rectangle*, which is what `from_sparse` allocates, and the
+/// count of *populated cells*, which is normally far smaller but is unbounded
+/// by the rectangle alone when a sheet repeats one address.
 pub(crate) const MAX_WORKBOOK_CELLS: u64 = 10_000_000;
 
 /// Cells in the rectangle spanned by `start..=end`, or 0 if it is empty.
@@ -88,8 +94,8 @@ fn check_box(
 /// Open one worksheet with its bounding box checked before it is allocated.
 ///
 /// For XLSX and XLSB the check happens before the box is allocated, as
-/// described in the module docs. (The reader's own buffers and the vector of
-/// populated cells precede it; both are bounded, the latter explicitly.) For XLS and ODS calamine offers no streaming reader, so the
+/// described in the module docs. The reader's own buffers and the vector of
+/// populated cells precede it; both are bounded, the latter explicitly. For XLS and ODS calamine offers no streaming reader, so the
 /// box is measured only after `worksheet_range()` has built it: those formats
 /// still get the actionable error and still never silently truncate, but they
 /// do not get the allocation bound. XLS is capped by its own format at 65,536
@@ -155,7 +161,7 @@ pub(crate) fn bounded_worksheet_range<RS: Read + Seek>(
 
 /// Accumulate a sheet's cells, refusing as soon as their box grows too large.
 ///
-/// The check is inside the loop and not after it: checking afterwards would
+/// Both checks are inside the loop and not after it: checking afterwards would
 /// mean the cells vector had already grown to hold every cell in the file,
 /// and — more to the point — would not stop `from_sparse` from being reached
 /// with a box nothing had bounded.
@@ -470,8 +476,10 @@ mod tests {
             .expect("fixture opens")
             .expect_err("200 cells exceeds a 100-cell limit even in a 1x1 box");
         assert!(
-            error.contains("populated cells"),
-            "must be refused on the cell count, not the rectangle: {error}"
+            error.contains("even though the rectangle"),
+            "must be refused on the cell count, not the rectangle -- and \
+             `check_box`'s own message also contains \"populated cells\", so \
+             matching that alone would not tell the two apart: {error}"
         );
     }
 

@@ -10699,6 +10699,27 @@ mod tests {
         );
     }
 
+    /// A chart-first workbook reads as empty at the production boundary.
+    ///
+    /// This is the shipped path the regression was about: `sheet_names()`
+    /// lists chartsheets, so a workbook whose first sheet is a chart is the one
+    /// `read_workbook_rows` picks when no sheet is named. Propagating
+    /// calamine's `NotAWorksheet` made `workbook-open` and `workbook-summary`
+    /// fail outright where they used to yield zero rows.
+    #[test]
+    fn read_workbook_rows_reads_a_chart_first_workbook_as_empty() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&crate::workbook::fixtures::chartsheet())
+            .unwrap();
+        file.flush().unwrap();
+
+        let rows = read_workbook_rows(file.as_file(), "charts.xlsx", None)
+            .expect("a chart sheet must not fail the read");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
     /// And an ordinary workbook still comes back whole.
     #[test]
     fn read_workbook_rows_still_reads_an_ordinary_sheet() {
