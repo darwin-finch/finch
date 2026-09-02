@@ -3108,23 +3108,34 @@ fn run_samples() -> Result<()> {
         println!("  {}", dir.join(name).display());
     }
     println!();
-    // These used to advertise `xlsx@`, a word of the Co-Forth interpreter --
-    // which no user input could reach, and which is now gone (#294). The typed
-    // runtime's `workbook-*` words are what `/forth` and `/lisp` actually run.
-    println!("Try in the REPL:");
-    println!(
-        "  /lisp (workbook-sheets (path \"{}/grades.xlsx\"))",
-        dir.display()
-    );
-    println!(
-        "  /lisp (workbook-range (path \"{}/grades.xlsx\") \"Sheet1\" 0 0 5 4)",
-        dir.display()
-    );
-    println!(
-        "  /lisp (workbook-summary (path \"{}/budget.xlsx\") \"Sheet1\")",
-        dir.display()
-    );
+    // `path` is `./**`: a normalized relative path inside the workspace root.
+    // An absolute path under ~/.finch is rejected by the type checker before it
+    // reaches the broker, so the instruction has to start with a copy. The
+    // previous version of these lines advertised `xlsx@`, a word of the
+    // Co-Forth interpreter that no user input could reach and that #294
+    // removed -- and the first replacement for them named `Sheet1`, passed
+    // `workbook-summary` two of its three arguments, and interpolated this
+    // absolute path. Printing an instruction nobody ran is how both happened,
+    // so `run_samples_instructions_name_real_sheets_and_arities` now pins these
+    // strings against the vocabulary and the generated sheet names.
+    println!("Copy one into your workspace, then try in the REPL:");
+    println!("  cp {}/grades.xlsx .", dir.display());
+    for line in sample_repl_instructions() {
+        println!("  {line}");
+    }
     Ok(())
+}
+
+/// The `finch samples` REPL instructions, as data so a test can check them.
+///
+/// Each names a sheet that `finch::samples` actually creates and passes the
+/// arity `src/vm/vocabulary.rs` declares.
+fn sample_repl_instructions() -> Vec<String> {
+    vec![
+        r#"/lisp (workbook-sheets (path "grades.xlsx"))"#.to_string(),
+        r#"/lisp (workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)"#.to_string(),
+        r#"/lisp (workbook-summary (path "grades.xlsx") "Grades" 20)"#.to_string(),
+    ]
 }
 
 /// Handle `finch sessions` subcommands
@@ -3196,6 +3207,78 @@ mod tests {
     use super::{finish_first_run_setup, register_query_vm_tools, Args, AuthCommand, Command};
     use clap::Parser;
     use std::sync::Arc;
+
+    /// The printed instructions must name sheets that exist and arities that
+    /// type-check.
+    ///
+    /// `finch samples` advertised `xlsx@`, a word no user input could reach.
+    /// #294's first replacement for it was wrong three ways at once -- it named
+    /// `Sheet1`, which no sample workbook contains; passed `workbook-summary`
+    /// two of the three arguments `vocabulary.rs` declares; and interpolated an
+    /// absolute `~/.finch` path, which `Type::Path(./**)` rejects before the
+    /// broker sees it. Printing an instruction nobody ran is how both versions
+    /// happened, so this checks them against the vocabulary and against the
+    /// sheet names `finch::samples` actually creates.
+    #[test]
+    fn run_samples_instructions_name_real_sheets_and_arities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        finch::samples::generate_all(dir.path()).expect("generate");
+
+        let sheets = {
+            use calamine::{open_workbook_auto, Reader};
+            let path = dir.path().join("grades.xlsx");
+            open_workbook_auto(&path)
+                .expect("open")
+                .sheet_names()
+                .to_vec()
+        };
+
+        let vocabulary = finch::vm::vocabulary::core_vocabulary();
+        let arity = |word: &str| {
+            vocabulary
+                .iter()
+                .find(|entry| entry.0 == word)
+                .map(|entry| entry.1.input.values.len())
+                .unwrap_or_else(|| panic!("{word} is not in the core vocabulary"))
+        };
+
+        for line in super::sample_repl_instructions() {
+            assert!(
+                !line.contains("Sheet1"),
+                "names a sheet no sample workbook has (they are {sheets:?}): {line}"
+            );
+            for sheet in line.split('"').skip(1).step_by(2) {
+                if sheet.ends_with(".xlsx") {
+                    // The path argument: must be relative, or the type checker
+                    // rejects it before the capability broker is reached.
+                    assert!(
+                        !sheet.starts_with('/') && !sheet.starts_with('~'),
+                        "an absolute path is not a `./**` path: {line}"
+                    );
+                } else {
+                    assert!(
+                        sheets.contains(&sheet.to_string()),
+                        "sheet {sheet:?} is not one of {sheets:?}: {line}"
+                    );
+                }
+            }
+            let word = line
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .expect("an invocation names a word");
+            let supplied = line.matches('"').count() / 2
+                + line
+                    .split_whitespace()
+                    .filter(|token| token.trim_end_matches(')').parse::<i64>().is_ok())
+                    .count();
+            assert_eq!(
+                supplied,
+                arity(word),
+                "{word} takes {} arguments, and this passes {supplied}: {line}",
+                arity(word)
+            );
+        }
+    }
 
     #[test]
     fn legacy_coforth_and_exchange_subcommands_are_not_public() {

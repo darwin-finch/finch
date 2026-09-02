@@ -169,6 +169,10 @@ impl Library {
     /// the TOML parsing is done before the user's first keystroke. It used to
     /// also compile a Forth VM; that VM had no caller in the binary and went
     /// with the rest of the interpreter (#294).
+    ///
+    /// This function itself has no caller either. It is kept because the
+    /// vocabulary it warms is live and a startup path may well want it; that is
+    /// a different question from the VM's reachability and is not decided here.
     pub fn warmup() {
         let _ = &*BUILTIN_DEFS;
     }
@@ -346,60 +350,6 @@ impl Library {
         out.sort_unstable();
         out
     }
-}
-
-/// Extract the `N/M passed` token emitted by the legacy proof runner without
-/// letting ANSI SGR parameters become part of the count.  The prior parser
-/// retained every digit in a rendered line, so e.g. `\x1b[32m120/120\x1b[0m`
-/// could be misread as a much larger, impossible fraction.
-fn parse_prove_all_summary(output: &str) -> Option<(usize, usize)> {
-    let plain = strip_ansi_csi(output);
-    let tokens = plain.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        // A diagnostic can contain arbitrary slash-separated values.  Only
-        // accept the runner's actual `N/M passed` summary, never the first
-        // fraction that happens to appear in an error message.
-        if tokens.get(index + 1) != Some(&"passed") {
-            continue;
-        }
-        let Some((passed, total)) = token.split_once('/') else {
-            continue;
-        };
-        if !passed.is_empty()
-            && !total.is_empty()
-            && passed.bytes().all(|byte| byte.is_ascii_digit())
-            && total.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            let (Ok(passed), Ok(total)) = (passed.parse(), total.parse()) else {
-                continue;
-            };
-            if total > 0 {
-                return Some((passed, total));
-            }
-        }
-    }
-    None
-}
-
-/// Strip terminal CSI sequences from a status line.  This deliberately does
-/// not interpret general terminal control language; it only removes the
-/// escape form used by the proof runner's color/style rendering.
-fn strip_ansi_csi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            while let Some(next) = chars.next() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        } else {
-            output.push(character);
-        }
-    }
-    output
 }
 
 fn user_library_path() -> Option<std::path::PathBuf> {
@@ -1449,7 +1399,7 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
 \ Words that make sentences like "sort these files" into real programs.
 \ `files` pushes a listing of the current directory as a string.
 \ `these` / `them` / `those` / `all` are pronouns — no-ops that refer back to context.
-\ `sort`, `unique`, `reverse`, `line-count` are native builtins (see interpreter.rs).
+\ `sort`, `unique`, `reverse`, `line-count` are native builtins (native builtins).
 \
 \ Example:   sort these files
 \   →  `files` runs first (pushes string-pool idx of dir listing)
@@ -4778,6 +4728,75 @@ forth = ".words"
 
 #[cfg(test)]
 mod tests {
+
+    /// `generate_forth_for_word` survived the interpreter; its tests did not.
+    ///
+    /// The three that covered it asserted through a VM -- they compiled the
+    /// output and checked what it printed -- so they could not be kept as they
+    /// were when the VM went (#294). The function is still live, and these
+    /// assert the same properties structurally instead of leaving ~150 lines
+    /// uncovered.
+    #[test]
+    fn test_generate_forth_for_a_number_word_pushes_that_number() {
+        assert!(
+            super::generate_forth_for_word("three").contains('3'),
+            "{}",
+            super::generate_forth_for_word("three")
+        );
+        assert!(
+            super::generate_forth_for_word("zero").contains('0'),
+            "{}",
+            super::generate_forth_for_word("zero")
+        );
+    }
+
+    #[test]
+    fn test_generate_forth_for_an_arbitrary_word_speaks_its_name() {
+        let generated = super::generate_forth_for_word("perambulate");
+        assert!(
+            generated.contains("perambulate"),
+            "a word with no special case should say itself: {generated}"
+        );
+    }
+
+    /// Never empty, and never unbalanced.
+    ///
+    /// The deleted version proved this by compiling every entry; without a VM,
+    /// the checkable invariants are that output exists and that its quoting and
+    /// control words pair up -- which is what a compile failure would have
+    /// caught first anyway.
+    #[test]
+    fn test_generate_forth_for_word_is_never_empty_or_unbalanced() {
+        for word in [
+            "i",
+            "you",
+            "we",
+            "it",
+            "they",
+            "zero",
+            "seven",
+            "perambulate",
+            "run",
+            "the",
+            "",
+        ] {
+            let generated = super::generate_forth_for_word(word);
+            assert!(!generated.trim().is_empty(), "empty for {word:?}");
+            assert_eq!(
+                generated.matches('"').count() % 2,
+                0,
+                "unbalanced quotes for {word:?}: {generated}"
+            );
+            assert_eq!(
+                generated.split_whitespace().filter(|t| *t == "if").count(),
+                generated
+                    .split_whitespace()
+                    .filter(|t| *t == "then")
+                    .count(),
+                "unbalanced if/then for {word:?}: {generated}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -4829,9 +4848,6 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod born_test {}
 
 #[cfg(test)]
 mod detect_lang_tests {

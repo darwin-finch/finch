@@ -11,14 +11,18 @@
 //   contacts.xlsx   — address book: name, email, phone, city
 //   times_table.xlsx — multiplication table 1–12 (good for verifying cell reads)
 //
-// Usage in the REPL after running `finch samples`:
-//   /lisp (workbook-sheets (path "~/.finch/samples/xlsx/grades.xlsx"))
-//   /lisp (workbook-range (path "~/.finch/samples/xlsx/grades.xlsx") "Sheet1" 0 0 5 4)
-//   /lisp (workbook-summary (path "~/.finch/samples/xlsx/budget.xlsx") "Sheet1")
+// Usage in the REPL, after `finch samples` and copying one file into the
+// workspace (`path` is `./**` -- a relative path inside the workspace root, so
+// an absolute ~/.finch path is rejected before the broker sees it):
+//   /lisp (workbook-sheets (path "grades.xlsx"))
+//   /lisp (workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)
+//   /lisp (workbook-summary (path "grades.xlsx") "Grades" 20)
 //
-// These read through the typed runtime's capability broker. The `xlsx@` and
-// `xlsx-sheets` words they used to name belonged to the Co-Forth interpreter,
-// which no user input could reach and which was removed in #294.
+// The sheets are named "Grades", "Budget", "Contacts" and "Times Table", not
+// "Sheet1". These read through the typed runtime's capability broker; the
+// `xlsx@` and `xlsx-sheets` words this comment used to name belonged to the
+// Co-Forth interpreter, which no user input could reach and which #294
+// removed.
 
 use anyhow::{Context, Result};
 use rust_xlsxwriter::Workbook;

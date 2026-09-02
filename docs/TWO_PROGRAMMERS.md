@@ -106,7 +106,7 @@ The stack is the arbiter. No appeals.
 
 ## Stack-Effect Proofs
 
-Built-in words (dup, swap, +, etc.) are implemented as `enum Builtin` in the interpreter — **direct Rust dispatch, no dictionary lookup at runtime**. Their contracts are machine-checked in `src/coforth/interpreter.rs` under `mod stack_effects`:
+Built-in words (dup, swap, +, etc.) are implemented as `enum Builtin` in the interpreter — **direct Rust dispatch, no dictionary lookup at runtime**. Their contracts are machine-checked by the typed VM's stack-effect signatures (`src/vm`); the `enum Builtin` interpreter this described was removed in #294 as unreachable:
 
 ```rust
 #[test]

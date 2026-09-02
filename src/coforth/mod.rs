@@ -12,9 +12,12 @@
 /// - `Library::related` — walk the graph N hops from a seed word.
 /// - `Library::inject_into_poset` — seed a poset with a word's neighbourhood.
 ///
-/// The interpreter this vocabulary was written for is gone (#294). No `Forth`
-/// VM was ever constructed in the binary: every typed-program entry point
-/// dispatches to `crate::runtime`. What remains is the vocabulary itself, which
+/// The interpreter this vocabulary was written for is gone (#294). A `Forth`
+/// VM *was* constructed in non-test code -- a `LazyLock` in `library.rs` -- but
+/// nothing outside `#[cfg(test)]` ever forced it, and every typed-program entry
+/// point dispatches to `crate::runtime`. Reachable-by-accident is not the same
+/// as unreachable, which is the argument for deleting it rather than
+/// documenting it. What remains is the vocabulary itself, which
 /// is live, and the lexer, whose token stream gives a Forth definition its
 /// identity.
 pub mod library;

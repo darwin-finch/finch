@@ -1,9 +1,9 @@
 //! The Co-Forth lexer.
 //!
-//! All that survives of `interpreter.rs`. The VM it fed was never constructed
-//! anywhere in the binary -- `--forth`, `--lisp`, `--exec` and `/forth` all
-//! dispatch to the typed runtime -- so the interpreter, its builtins and its
-//! word table were removed under #294. This function had the one live caller:
+//! All that survives of `interpreter.rs`. Nothing outside `#[cfg(test)]` ever
+//! ran the VM it fed -- `--forth`, `--lisp`, `--exec` and `/forth` all dispatch
+//! to the typed runtime -- so the interpreter, its builtins and its word table
+//! were removed under #294. This function had the one live caller:
 //! `programs::forth_definition_identity`, which hashes the token stream to give
 //! a Forth definition a stable identity.
 //!
@@ -733,4 +733,68 @@ pub fn tokenize(src: &str) -> Vec<String> {
     }
     flush!();
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokenize;
+
+    /// A golden token stream, because this output is a program's identity.
+    ///
+    /// `programs::from_source_file` derives a definition's name from the token
+    /// after `:`, so how this function splits anything is load-bearing for every
+    /// stored definition. The branches for `."`, `s"` and the rest survived
+    /// #294 on that argument alone, with a doc comment as their only guard --
+    /// which means the next "tidy the dead literal forms" commit passes CI.
+    ///
+    /// This pins them. If a change here is deliberate, this test is where the
+    /// migration argument gets made.
+    /// A golden token stream, because this output is a program's identity.
+    ///
+    /// `programs::from_source_file` derives a definition's name from the token
+    /// after `:`, so how this function splits anything is load-bearing for every
+    /// stored definition. The branches for `."` and `s"` survived #294 on that
+    /// argument alone, with a doc comment as their only guard -- which means the
+    /// next "tidy the dead literal forms" commit passes CI.
+    ///
+    /// These are recorded from the function, not guessed at: the first draft
+    /// asserted `." x"` split into two tokens, and it emits one sentinel-tagged
+    /// token instead. If a change here is deliberate, this test is where the
+    /// migration argument gets made.
+    #[test]
+    fn test_tokenize_splits_the_literal_forms_it_always_has() {
+        assert_eq!(
+            tokenize(": double dup + ;"),
+            vec![":", "double", "dup", "+", ";"]
+        );
+
+        // `."` and `s"` each collapse to one sentinel-tagged token carrying the
+        // literal, with the single separating space consumed. The `\0` prefix is
+        // what kept the literal from colliding with a word of the same text.
+        assert_eq!(
+            tokenize(r#"." hello there" cr"#),
+            vec!["\0str:hello there", "cr"]
+        );
+        assert_eq!(tokenize(r#"s" a b c""#), vec!["\0push-str:a b c"]);
+
+        // A standalone backslash opens a line comment; one inside a token does
+        // not, so `str:\` survives as itself.
+        assert_eq!(tokenize("1 \\ ignored\n2"), vec!["1", "2"]);
+        assert_eq!(tokenize("str:\\ 1"), vec!["str:\\", "1"]);
+
+        // A standalone `(` opens a paren comment and nests.
+        assert_eq!(tokenize("1 ( a ( b ) c ) 2"), vec!["1", "2"]);
+
+        // A trailing period splits off as its own token. (The REPL's rule that
+        // a sentence-ending period routes to NL rather than Forth lives a layer
+        // above this, in `repl_event::event_loop`.)
+        assert_eq!(tokenize("dont. go"), vec!["dont", ".", "go"]);
+    }
+
+    /// Whitespace shape must not change identity.
+    #[test]
+    fn test_tokenize_is_insensitive_to_surrounding_whitespace() {
+        assert_eq!(tokenize("  : a b ;  "), tokenize(": a b ;"));
+        assert_eq!(tokenize(": a\n  b\t;"), tokenize(": a b ;"));
+    }
 }

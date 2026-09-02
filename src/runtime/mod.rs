@@ -7403,8 +7403,9 @@ fn summarize_csv(
 /// `Handle::runtime_flavor()` reports `MultiThread` there, so the panic cannot
 /// be guarded against. `src/main.rs` runs the whole interactive REPL inside
 /// `local.run_until(...)`, so that trade would swap a deadlock no in-tree
-/// caller can reach for a panic one could. `src/coforth/interpreter.rs` records
-/// the same constraint for the same reason.
+/// caller can reach for a panic one could. (`src/coforth/interpreter.rs`
+/// recorded the same constraint independently; #294 removed that file, so this
+/// is now the only place the reasoning is written down.)
 ///
 /// The residual hazard is in-tree, not out of it: a future third drive site
 /// that constructs a `TypedHostHandler` without the hop.
