@@ -3108,13 +3108,20 @@ fn run_samples() -> Result<()> {
         println!("  {}", dir.join(name).display());
     }
     println!();
+    // These used to advertise `xlsx@`, a word of the Co-Forth interpreter --
+    // which no user input could reach, and which is now gone (#294). The typed
+    // runtime's `workbook-*` words are what `/forth` and `/lisp` actually run.
     println!("Try in the REPL:");
     println!(
-        "  s\" {}/grades.xlsx\" s\" A2\" xlsx@ type cr",
+        "  /lisp (workbook-sheets (path \"{}/grades.xlsx\"))",
         dir.display()
     );
     println!(
-        "  s\" {}/times_table.xlsx\" s\" H8\" xlsx@ type cr",
+        "  /lisp (workbook-range (path \"{}/grades.xlsx\") \"Sheet1\" 0 0 5 4)",
+        dir.display()
+    );
+    println!(
+        "  /lisp (workbook-summary (path \"{}/budget.xlsx\") \"Sheet1\")",
         dir.display()
     );
     Ok(())

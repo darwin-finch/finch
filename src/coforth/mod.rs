@@ -1,4 +1,4 @@
-/// Co-Forth English library — every word in the English language as a Forth word.
+/// Co-Forth word library — English as Forth.
 ///
 /// English is a very complicated Forth program.  Each word calls other words.
 /// Meaning is computed by execution.  This library gives Co-Forth a base
@@ -11,10 +11,14 @@
 /// - `Library::lookup` — find a word and its neighbours.
 /// - `Library::related` — walk the graph N hops from a seed word.
 /// - `Library::inject_into_poset` — seed a poset with a word's neighbourhood.
-pub mod arm_vm;
-pub mod interpreter;
+///
+/// The interpreter this vocabulary was written for is gone (#294). No `Forth`
+/// VM was ever constructed in the binary: every typed-program entry point
+/// dispatches to `crate::runtime`. What remains is the vocabulary itself, which
+/// is live, and the lexer, whose token stream gives a Forth definition its
+/// identity.
 pub mod library;
-pub mod scatter;
+pub mod tokens;
 
-pub use interpreter::{extract_comments, tokenize, DictionarySnapshot, Forth, StackEffect};
 pub use library::{Library, WordEntry};
+pub use tokens::tokenize;
