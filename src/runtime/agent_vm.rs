@@ -16,13 +16,15 @@ pub struct AgentVmBinding {
 impl AgentVmBinding {
     /// `pub(crate)` for the same reason `block_on` is.
     ///
-    /// Narrowing only `block_on` left a composed path open: `AgentScheduler::new`,
-    /// `AgentVmBinding::new` and `Forth::set_agent_binding` are all `pub`, so an
-    /// external crate could build a binding, attach it, and evaluate
-    /// `agent-await` from a runtime worker -- reaching `block_on_host` with no
-    /// `spawn_blocking` hop, which is exactly what its doc says cannot happen.
-    /// A binding that cannot be constructed out of tree closes that, rather
-    /// than softening the claim to match.
+    /// Narrowing only `block_on` left a composed path open: an external crate
+    /// could build a binding through the then-`pub` `AgentScheduling::new` and
+    /// `AgentVmBinding::new`, attach it to the Co-Forth interpreter's
+    /// `set_agent_binding`, and evaluate `agent-await` from a runtime worker --
+    /// reaching `block_on_host` with no `spawn_blocking` hop, which is exactly
+    /// what its doc says cannot happen. #294 has since removed that
+    /// interpreter, so that particular third leg is gone; the constructor stays
+    /// `pub(crate)` because the claim should hold on its own terms and not on
+    /// which consumers happen to exist.
     pub(crate) fn new(scheduler: &Arc<AgentScheduler>, parent: Option<AgentIdentity>) -> Self {
         Self {
             scheduler: Arc::downgrade(scheduler),

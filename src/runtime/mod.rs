@@ -7425,10 +7425,10 @@ fn summarize_csv(
 /// Every reachable in-tree caller satisfies this incidentally, through the
 /// `tokio::task::spawn_blocking` hop that wraps both `TypedHostHandler` drive
 /// sites. That hop is load-bearing, not incidental convenience, and is marked
-/// as such at both sites. (`src/coforth/interpreter.rs` also calls in, through
-/// `AgentVmBinding`, with no hop -- but only when a binding is attached, and
-/// the attaching function has no callers, so those sites short-circuit. #294
-/// removes that subtree.)
+/// as such at both sites. (The Co-Forth interpreter also called in through
+/// `AgentVmBinding` with no hop, reachable only when a binding was attached by
+/// a function that had no callers; #294 removed that subtree, so the two drive
+/// sites are now the whole set.)
 ///
 /// A `tokio::task::block_in_place` here would release the worker and make the
 /// requirement unnecessary — but it panics inside a `LocalSet`, and
@@ -7437,7 +7437,7 @@ fn summarize_csv(
 /// `local.run_until(...)`, so that trade would swap a deadlock no in-tree
 /// caller can reach for a panic one could. (`src/coforth/interpreter.rs`
 /// recorded the same constraint independently; #294 removed that file, so this
-/// is now the only place the reasoning is written down.)
+/// is the only place the reasoning is written down now.)
 ///
 /// The residual hazard is in-tree, not out of it: a future third drive site
 /// that constructs a `TypedHostHandler` without the hop. Two tests fail if that
