@@ -240,8 +240,8 @@ pub(crate) mod fixtures {
     /// advisories behind #185. It does not; see
     /// `test_a_hostile_parse_terminates` for why they are unreachable through
     /// calamine at all.
-    pub(crate) fn xlsx_from_sheet(sheet: &str) -> Vec<u8> {
-        let sheet = sheet.to_string();
+    pub(crate) fn xlsx_from_sheet(sheet: impl Into<String>) -> Vec<u8> {
+        let sheet = sheet.into();
         let parts: [(&str, String); 5] = [
             (
                 "[Content_Types].xml",
@@ -291,42 +291,61 @@ pub(crate) mod fixtures {
         writer.finish().expect("zip finish").into_inner()
     }
 
-    /// The same cell as `many_distinct_attributes`, with a malformed
-    /// attribute last and `s` optionally present.
+    /// Whether the hostile attribute cell carries an `s` attribute.
     ///
-    /// A bare key with no `=` makes `RawAttrIter` yield `ExpectedEq` -- but
-    /// only if iteration ever reaches it. That turns "were the attributes
-    /// walked?" into something a test can ask, which the parse result alone
-    /// cannot: a cell is one cell whether calamine read one attribute or a
-    /// quarter of a million.
-    pub(crate) fn attributes_with_a_malformed_last(count: usize, with_s: bool) -> Vec<u8> {
+    /// Load-bearing, and the single place it is decided. calamine reads a cell
+    /// with `get_attrs!(c, b"r" => r, b"s" => s, b"t" => t)`, and that macro
+    /// stops as soon as every key it wants has been found. The cell carries
+    /// `r` and `t` but not `s`, so the search never completes and calamine
+    /// walks every attribute. Setting this to `true` -- the innocuous-looking
+    /// "make the fixture more realistic" edit -- ends the walk, and
+    /// `test_the_attribute_fixture_is_walked_to_its_end` fails, because both
+    /// the hostile fixture and that test's control are built from here.
+    ///
+    /// An earlier version wrote the two fixtures as separate XML literals.
+    /// Nothing coupled them, so adding `s` to the one the deadline parses left
+    /// the oracle green while it guarded a fixture nobody used.
+    const HOSTILE_CELL_CARRIES_S: bool = false;
+
+    /// The hostile attribute cell: `count` distinct attributes on one `<c>`,
+    /// optionally with `s`, optionally with a malformed attribute last.
+    fn attribute_cell(count: usize, with_s: bool, malformed_last: bool) -> Vec<u8> {
         let attrs: String = (0..count).map(|i| format!(" a{i}=\"{i}\"")).collect();
         let s = if with_s { " s=\"0\"" } else { "" };
+        // A bare key with no `=` makes `RawAttrIter` yield `ExpectedEq`, but
+        // only if iteration reaches it. It must be last: the iterator scans
+        // forward to the next `=`, so a malformed token anywhere earlier is
+        // absorbed into the following attribute's key rather than rejected.
+        let malformed = if malformed_last { " malformed" } else { "" };
         xlsx_from_sheet(&format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{s}{attrs} malformed><is><t>x</t></is></c></row></sheetData></worksheet>"#
+<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{s}{attrs}{malformed}><is><t>x</t></is></c></row></sheetData></worksheet>"#
         ))
+    }
+
+    /// The hostile cell the deadline test parses, plus a malformed attribute
+    /// last. Same `s` decision as the fixture it stands in for, by
+    /// construction.
+    pub(crate) fn attributes_with_a_malformed_last(count: usize) -> Vec<u8> {
+        attribute_cell(count, HOSTILE_CELL_CARRIES_S, true)
+    }
+
+    /// The same, but with `s` present so `get_attrs!` completes and exits
+    /// early. This is the control: it shows the early exit is what would hide
+    /// a fixture that had stopped being walked.
+    pub(crate) fn attributes_that_exit_before_the_end(count: usize) -> Vec<u8> {
+        attribute_cell(count, true, true)
     }
 
     /// One cell carrying `count` distinct attributes.
     ///
-    /// The absent `s` attribute is load-bearing, not an oversight.
-    ///
-    /// calamine reads a cell with `get_attrs!(c, b"r" => r, b"s" => s, b"t" => t)`,
-    /// and that macro stops as soon as every key it wants has been found. The
-    /// cell here carries `r` and `t` but no `s`, so the search never completes
-    /// and calamine walks all `count` attributes. Adding `s="0"` -- an
-    /// innocuous-looking "make the fixture more realistic" edit -- would let it
-    /// break out after the first few and quietly remove calamine's attribute
-    /// iteration from what this fixture measures.
+    /// This is what the deadline test parses. It differs from
+    /// `attributes_with_a_malformed_last` in exactly one token -- the trailing
+    /// malformed attribute -- so the oracle that walks the latter is walking
+    /// this shape too.
     pub(crate) fn many_distinct_attributes(count: usize) -> Vec<u8> {
-        let attrs: String = (0..count).map(|i| format!(" a{i}=\"{i}\"")).collect();
-        xlsx_from_sheet(&format!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{attrs}><is><t>x</t></is></c></row></sheetData></worksheet>"#
-        ))
+        attribute_cell(count, HOSTILE_CELL_CARRIES_S, false)
     }
 
     /// `count` rows all claiming to be row 1, each with one cell.
@@ -456,8 +475,8 @@ mod tests {
     /// the early exit is what would hide it.
     #[test]
     fn test_the_attribute_fixture_is_walked_to_its_end() {
-        let walked = read(fixtures::attributes_with_a_malformed_last(5_000, false));
-        let error = walked.expect_err(
+        const COUNT: usize = 5_000;
+        let error = read(fixtures::attributes_with_a_malformed_last(COUNT)).expect_err(
             "a malformed attribute at the end must be reached, which is what \
              proves calamine walks the whole list",
         );
@@ -466,10 +485,29 @@ mod tests {
             "must fail on the malformed attribute rather than anything else: {error}"
         );
 
-        // And with `s` present the search completes early and never reaches it.
-        // If this ever starts erroring, the early exit is gone and the sibling
-        // fixture's omission of `s` has stopped mattering.
-        read(fixtures::attributes_with_a_malformed_last(5_000, true))
+        // Where it failed, not merely that it failed. quick-xml reports the
+        // byte offset, and the malformed token is last, so a large offset is
+        // the direct evidence that iteration walked the whole list rather than
+        // tripping on something near the start. `<row>` is attribute-iterated
+        // too, so without this a future fixture edit could raise the same error
+        // from the wrong element and still pass.
+        let position: usize = error
+            .split("position ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|digits| digits.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no byte position in {error}"));
+        assert!(
+            position > COUNT * 8,
+            "iteration stopped at byte {position}, too early to have walked \
+             {COUNT} attributes: {error}"
+        );
+
+        // The control: with `s` present, `get_attrs!` has found every key it
+        // wants and stops before the malformed token. That is the mechanism
+        // that would silently end the walk, and it is why
+        // `HOSTILE_CELL_CARRIES_S` is false.
+        read(fixtures::attributes_that_exit_before_the_end(COUNT))
             .expect("with `s` present calamine stops before the malformed attribute");
     }
 
@@ -496,9 +534,19 @@ mod tests {
     /// here.
     ///
     /// It stays a coarse instrument -- it cannot tell 2n from 5n -- but the
-    /// headroom runs the other way too: at 85x and 226x, a merely slower
-    /// linear parser cannot trip it, which is the failure mode that killed the
-    /// ratio test this replaced.
+    /// headroom runs the other way too: 29x on the rows and 226x on the
+    /// attributes, so a merely slower linear parser does not trip it, which is
+    /// the failure mode that killed the ratio test this replaced. Under 4x CPU
+    /// oversubscription the whole test measures about 22 s of wall clock
+    /// against parses that cost 1.2 s idle, so the margin is real but not the
+    /// headline number.
+    ///
+    /// **This is a debug-build guard only.** The rates above are a `cargo
+    /// test` profile with debug assertions on. Optimised, this host sustains
+    /// on the order of 1e9 pair-comparisons a second, where a quadratic
+    /// 150,000-row rescan finishes in about two seconds and passes the
+    /// deadline green. Nothing here would catch a complexity regression in a
+    /// release-mode test run.
     ///
     /// That ratio test is worth one line of history, since the next person
     /// here will reach for it. It was tried at two sizings and was flaky in
