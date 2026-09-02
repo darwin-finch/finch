@@ -3924,9 +3924,10 @@ fn typed_agent_task_result(
 /// fabricated number, not to a contradiction.)
 ///
 /// `complete` is true only for `Ready`. `Degraded` is deliberately not
-/// complete even though it will never load more: what loaded is coherent, but
-/// it is not everything, so a program asking "did I see the whole index"
-/// must get no.
+/// complete even though it will not load more on its own: what loaded is
+/// coherent, but it is not everything, so a program asking "did I see the
+/// whole index" must get no. (`reload_tree_from_db` can still upgrade it to
+/// `Ready` via `clear_failure`; "will never load more" would be too strong.)
 ///
 /// **Call it before the recall it qualifies, not after.** This takes one
 /// sample, where `mem-recall` brackets its query with
@@ -3935,10 +3936,12 @@ fn typed_agent_task_result(
 /// hydration can finish between the two instructions, so a recall that saw 100
 /// of 2048 nodes is followed by `ready, complete, 2048 of 2048`, and the
 /// program concludes a partial answer was total. Sampling first is
-/// conservative instead -- in-process hydration only improves
-/// (`Loading -> Ready`, and `clear_failure` only ever upgrades), so a status
-/// taken before the recall can understate completeness but never overstate
-/// it.
+/// conservative instead. Not because hydration only ever improves -- it does
+/// not, `Loading` can reach `Degraded` or `Failed`, and this file's own
+/// fixture drives exactly that -- but because `complete` is true only for
+/// `Ready`, and nothing leaves `Ready` for a worse state in-process. So a
+/// status taken before the recall can understate completeness but never
+/// overstate it.
 fn typed_memory_index_status(
     status: crate::memory::HydrationStatus,
     origin: &SourceOrigin,
@@ -11355,10 +11358,14 @@ mod tests {
         };
         drop(crate::memory::MemorySystem::new(config.clone()).unwrap());
 
+        // Invalid UTF-8 in a node belonging to the *second* batch, so the first
+        // has already committed when the read fails. That ordering is what
+        // separates `Degraded` from `Failed`, and writing the id relative to
+        // the batch size keeps it true if the batch size changes.
         seed_nodes(
             &db_path,
             2 * crate::memory::HYDRATION_BATCH as i64,
-            Some(516),
+            Some(crate::memory::HYDRATION_BATCH as i64 + 4),
         );
 
         let memory = Arc::new(crate::memory::MemorySystem::new(config).unwrap());
@@ -11540,9 +11547,11 @@ mod tests {
     ///
     /// `HydrationStatus::Failed` deliberately carries no totals: hydration
     /// ended without a trustworthy number. Projecting that as `0 of 0` would
-    /// tell a program the index is complete and empty, which is a worse answer
-    /// than the empty list #295 was filed about -- it is the same lie with a
-    /// number attached. `none` is the only honest projection.
+    /// publish a measurement nobody took. The record would still carry
+    /// `state: failed` and `complete: false` beside it, so it is not that the
+    /// record contradicts itself -- it is that one field would be invented,
+    /// and an invented count is exactly what a program reading `loaded` would
+    /// act on. `none` is the only honest projection.
     #[tokio::test]
     async fn typed_mem_index_status_reports_a_failed_index_without_inventing_counts() {
         let database = tempfile::NamedTempFile::new().unwrap();
@@ -11614,7 +11623,7 @@ mod tests {
         assert_eq!(
             status_field(status, "total"),
             &ProgramValue::Option(None),
-            "reporting `0 of 0` would read as a complete empty index: {status:?}"
+            "a count here would be invented, not measured: {status:?}"
         );
         assert!(
             matches!(

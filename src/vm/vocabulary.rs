@@ -161,7 +161,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "some" | "none" | "is-some" | "unwrap" => CoreWordDocumentation { summary: "Construct, test, or project typed option values. Prefer exhaustive match-option/if-some over unwrap when none is expected control flow.", lisp: "(some value), (none), (is-some option), (unwrap option)", forth: "value some; none; option is-some; option unwrap", example: "(match-option (some 42) (some n (say (int-to-string n))) (none (say \"missing\")))" },
         "ok" | "err" | "is-ok" | "result-unwrap" | "result-error" => CoreWordDocumentation { summary: "Construct, test, or project typed result values. Prefer exhaustive match-result/if-ok over projecting an unknown branch.", lisp: "(ok value), (err error), (is-ok result), (result-unwrap result)", forth: "value ok; error err; result is-ok; result result-unwrap", example: "(match-result (ok 42) (ok n (say (int-to-string n))) (err e (say e)))" },
         "network-connect" | "network-send" => CoreWordDocumentation { summary: "Open an approved network connection or send bytes over an existing opaque socket. The socket is not forgeable and calls remain capability-checked.", lisp: "(network-connect host port), (network-send socket bytes)", forth: "host port network-connect; socket bytes network-send", example: "(network-connect \"example.com\" 443)" },
-        "mem-index-status" => CoreWordDocumentation { summary: "Report the state of the session memory index so an empty mem-recall result is interpretable. Returns record{state:string,complete:bool,loaded:option<int>,total:option<int>,reason:option<string>}; state is ready, loading, degraded or failed, and the counts are none when hydration failed and no trustworthy total exists.", lisp: "(mem-index-status)", forth: "mem-index-status", example: "(unwrap (record-get (mem-index-status) \"complete\"))" },
+        "mem-index-status" => CoreWordDocumentation { summary: "Report the state of the session memory index, so a mem-recall answer can be qualified by how much of the index it saw. Call it BEFORE the recall it qualifies: it takes one sample, and a sample taken afterwards can report a hydration that finished in between, making a partial answer look total. Returns record{state:string,complete:bool,loaded:option<int>,total:option<int>,reason:option<string>}; state is ready, loading, degraded or failed, complete is true only for ready, and the counts are none when hydration failed and no trustworthy total exists.", lisp: "(mem-index-status)", forth: "mem-index-status", example: "(unwrap (record-get (mem-index-status) \"complete\"))" },
         "schedule-create" => CoreWordDocumentation { summary: "Create a capability-bound scheduled event using a callback descriptor and time. Scheduled work never gains new authority when it fires.", lisp: "(schedule-create callback when)", forth: "callback when schedule-create", example: "(schedule-create \"daily-summary\" 1770000000)" },
         "schedule-get" => CoreWordDocumentation { summary: "Inspect one opaque schedule handle. Returns some(json) while the host still knows the schedule, or none; callback authority remains redacted inside its host-owned context.", lisp: "(schedule-get schedule)", forth: "schedule schedule-get", example: "(schedule-get (schedule-create \"daily-summary\" 1770000000))" },
         "schedule-cancel" => CoreWordDocumentation { summary: "Cancel one pending opaque schedule handle without deleting its durable record. Returns false if it was unknown or no longer pending.", lisp: "(schedule-cancel schedule)", forth: "schedule schedule-cancel", example: "(schedule-cancel schedule)" },
@@ -355,10 +355,13 @@ pub fn agent_task_snapshot_type() -> Type {
 ///
 /// `loaded` and `total` are options rather than plain integers because a
 /// `Failed` index carries no counts at all: hydration ended without a
-/// trustworthy total, so there is no honest number to report. Reporting `0`
-/// of `0` there would read to a calling program as "an index that is fine and
-/// happens to be empty", which is the exact confusion this word exists to
-/// remove (#295). `reason` is present only for the two states that carry one.
+/// trustworthy total, so there is no honest number to report. Reporting `0` of
+/// `0` would be publishing a measurement nobody took -- wrong on its own terms,
+/// independently of whether a reader is misled by it. (`state` and `complete`
+/// would still say `failed` and `false` beside it, so the record as a whole
+/// would not claim the index is fine; the objection is to the fabricated
+/// number, not to a contradiction.) `reason` is present only for the two
+/// states that carry one.
 pub fn memory_index_status_type() -> Type {
     Type::Record(vec![
         ("state".into(), Type::String),
