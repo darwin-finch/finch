@@ -512,6 +512,16 @@ fn create_proof(
         supervisor_metadata.dev(),
         supervisor_metadata.ino()
     )?;
+    // The inode pair alone cannot tell a rebuild from a substitution. Cargo
+    // replaces a binary by writing a new file and renaming it into place, so a
+    // legitimate relink of a workspace target allocates a new inode and looks
+    // exactly like someone swapping the program. Recording what the image
+    // *contains* separates the two (#259).
+    writeln!(
+        contents,
+        "{}",
+        hex::encode(Sha256::digest(fs::read(&supervisor_executable)?))
+    )?;
     let signature = signing_key.sign(contents.as_bytes());
     writeln!(contents, "{}", hex::encode(signature.to_bytes()))?;
 
@@ -1133,10 +1143,35 @@ fn run_child_stubborn_probe() -> anyhow::Result<()> {
     set_descriptor_flag(pipes[1], libc::F_SETFL, libc::O_NONBLOCK)?;
     install_signal_handlers(pipes[1])?;
     fs::write(ready, b"ready\n")?;
+    let pause_after_first = std::env::var_os("FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE");
+    let mut publications = 0_u64;
     loop {
         wait_for_event(pipes[0], 1000)?;
         if PENDING_SIGNAL.swap(0, Ordering::Relaxed) != 0 {
-            fs::write(&terminated, b"term\n")?;
+            // Repeated SIGTERM is intentional during bounded group teardown.
+            // `fs::write` opened with truncate semantics, so SIGKILL between a
+            // later truncate and write could erase evidence already observed
+            // by the parent (#283). Opening append-only makes every successful
+            // publication monotonic; an interrupted later write can add
+            // nothing (or a prefix), but cannot remove the first record.
+            let mut marker = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&terminated)?;
+            if let (true, Some(ready_path)) = (publications > 0, pause_after_first.as_ref()) {
+                // Production-boundary fault injection at the historical
+                // destructive window: the old create/truncate happened
+                // before this pause. The real supervisor must reach its
+                // SIGKILL bound while this fixture remains parked.
+                fs::write(ready_path, b"later publication paused\n")?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                anyhow::bail!("stubborn marker pause outlived supervisor teardown bound");
+            }
+            marker.write_all(b"term\n")?;
+            publications += 1;
         }
     }
 }

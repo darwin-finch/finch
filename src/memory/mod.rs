@@ -26,6 +26,97 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+#[derive(Debug)]
+struct HydrationBatchPause {
+    after_loaded: usize,
+    reached: watch::Sender<bool>,
+    release: watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+impl HydrationBatchPause {
+    async fn after_batch(&self, loaded: usize) {
+        if loaded < self.after_loaded {
+            return;
+        }
+
+        self.reached.send_replace(true);
+        let mut release = self.release.clone();
+        while !*release.borrow_and_update() {
+            if release.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+static HYDRATION_BATCH_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<HydrationBatchPause>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+struct HydrationBatchPauseRegistration {
+    path: PathBuf,
+    pause: Arc<HydrationBatchPause>,
+}
+
+#[cfg(test)]
+impl Drop for HydrationBatchPauseRegistration {
+    fn drop(&mut self) {
+        let mut pauses = HYDRATION_BATCH_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pauses
+            .get(&self.path)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.pause))
+        {
+            pauses.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+fn register_hydration_batch_pause(
+    path: PathBuf,
+    after_loaded: usize,
+) -> (
+    HydrationBatchPauseRegistration,
+    watch::Receiver<bool>,
+    watch::Sender<bool>,
+) {
+    let (reached, reached_rx) = watch::channel(false);
+    let (release, release_rx) = watch::channel(false);
+    let pause = Arc::new(HydrationBatchPause {
+        after_loaded,
+        reached,
+        release: release_rx,
+    });
+    let mut pauses = HYDRATION_BATCH_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses.insert(path.clone(), Arc::clone(&pause)).is_none(),
+        "a hydration pause is already registered for {}",
+        path.display()
+    );
+    drop(pauses);
+    (
+        HydrationBatchPauseRegistration { path, pause },
+        reached_rx,
+        release,
+    )
+}
+
+#[cfg(test)]
+fn take_hydration_batch_pause(path: &std::path::Path) -> Option<Arc<HydrationBatchPause>> {
+    HYDRATION_BATCH_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path)
+}
+
 /// Configuration for memory system
 #[derive(Debug, Clone)]
 pub struct MemoryConfig {
@@ -103,6 +194,8 @@ struct HydrationState {
     /// removes the window rather than narrowing it.
     done: watch::Sender<bool>,
     failure: std::sync::Mutex<Option<Failure>>,
+    #[cfg(test)]
+    batch_pause: std::sync::Mutex<Option<Arc<HydrationBatchPause>>>,
 }
 
 /// Opens the write gate if the loader ends without finishing.
@@ -139,6 +232,28 @@ impl HydrationState {
             total: AtomicUsize::new(total),
             done: watch::channel(total == 0).0,
             failure: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            batch_pause: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn install_batch_pause(&self, pause: Option<Arc<HydrationBatchPause>>) {
+        *self
+            .batch_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
+    }
+
+    #[cfg(test)]
+    async fn pause_after_batch(&self, loaded: usize) {
+        let pause = self
+            .batch_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pause) = pause {
+            pause.after_batch(loaded).await;
         }
     }
 
@@ -532,6 +647,8 @@ impl MemorySystem {
         tree.set_next_id(max_node_id as u64 + 1);
 
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
+        #[cfg(test)]
+        hydration.install_batch_pause(take_hydration_batch_pause(&config.db_path));
         let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
         let mut hydration_task = None;
@@ -1273,7 +1390,9 @@ impl MemorySystem {
                     nodes.insert(node.id, node);
                 }
             }
-            state.loaded.fetch_add(count, Ordering::SeqCst);
+            let loaded = state.loaded.fetch_add(count, Ordering::SeqCst) + count;
+            #[cfg(test)]
+            state.pause_after_batch(loaded).await;
 
             // Yield so a turn submitted mid-hydration is served promptly.
             tokio::task::yield_now().await;
@@ -2886,48 +3005,55 @@ mod tests {
         // and both are in the first batch.
         seed_tree_nodes(temp.path(), NODES, &[(2, 1)])?;
 
+        let (_pause_registration, mut batch_reached, release_batch) =
+            register_hydration_batch_pause(temp.path().to_path_buf(), HYDRATION_BATCH);
         let memory = MemorySystem::new(config)?;
 
-        // Poll for the state this test needs — at least one batch landed, not
-        // all of them — rather than for a status the loader passes through.
-        // The old loop broke as soon as `loaded` left zero and then took the
-        // tree lock separately, which under the multi-threaded flavor is a
-        // different instant.
-        let mut window = None;
-        for _ in 0..5_000 {
-            {
-                let tree = memory.tree.lock().await;
-                let loaded = tree.all_nodes().len();
-                if tree.all_nodes().contains_key(&2) && loaded < NODES as usize {
-                    window = Some(loaded);
-                    break;
-                }
-                if loaded >= NODES as usize {
-                    panic!(
-                        "the whole store loaded before the read; this test is \
-                         only meaningful mid-hydration"
+        // The production loader itself announces that it has committed the
+        // first batch, then waits for this test to release it. Polling tree
+        // size cannot establish this window: on a fast runner the loader can
+        // commit all four batches before the polling task is scheduled once.
+        if !*batch_reached.borrow_and_update() {
+            let reached = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    batch_reached.changed().await.expect(
+                        "the hydration pause sender disappeared before the first batch landed",
                     );
+                    if *batch_reached.borrow_and_update() {
+                        break;
+                    }
                 }
-            }
-            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+            })
+            .await;
+            assert!(
+                reached.is_ok(),
+                "the production loader did not reach its first batch within 2s; status={:?}",
+                memory.hydration_status()
+            );
         }
-        let loaded_when_observed =
-            window.expect("the loader never reached a partially loaded state");
+        assert_eq!(
+            memory.hydration_status(),
+            HydrationStatus::Loading {
+                loaded: HYDRATION_BATCH,
+                total: NODES as usize,
+            },
+            "the pause must hold the real loader after exactly one batch"
+        );
 
-        // Re-taken and held across every assertion below, so they all see one
-        // state rather than three.
+        // Held across every assertion below, so the structure and the query
+        // observe the same causally paused production state.
         {
             let tree = memory.tree.lock().await;
-            assert!(
-                tree.all_nodes().len() >= loaded_when_observed,
-                "hydration must only ever add nodes"
+            assert_eq!(
+                tree.all_nodes().len(),
+                HYDRATION_BATCH,
+                "the test pause must prevent a later batch from racing the read"
             );
-
             assert!(
                 !tree
                     .all_nodes()
                     .get(&1)
-                    .expect("node 1 is in the first batch")
+                    .expect("node 1 must be present in the paused first batch")
                     .children
                     .is_empty(),
                 "an internal node must not look like a leaf before its children \
@@ -2935,17 +3061,39 @@ mod tests {
             );
         }
 
-        // And the production boundary: the query itself must not return it.
+        // The production read boundary must not return the internal aggregate
+        // while later hydration batches are provably unable to run.
         let results = memory.query("seeded node", Some(NODES as usize)).await?;
         assert!(
             !results.is_empty(),
-            "the read must return the memories that have loaded"
+            "the paused read must return memories from the first loaded batch"
         );
         assert!(
             !results.iter().any(|text| text == "seeded node 1"),
             "node 1 is an internal aggregate: its text is a label duplicated \
              from a child and its embedding is a mean, so it must never be a \
              query result"
+        );
+
+        release_batch.send_replace(true);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), memory.ensure_hydrated())
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("hydration failed after the test released it: {error:#}"),
+            Err(_) => {
+                panic!(
+                    "hydration did not complete within 5s after release; status={:?}",
+                    memory.hydration_status()
+                );
+            }
+        }
+        assert_eq!(
+            memory.hydration_status(),
+            HydrationStatus::Ready {
+                nodes: NODES as usize,
+            },
+            "the released loader must finish and publish its terminal state"
         );
         Ok(())
     }

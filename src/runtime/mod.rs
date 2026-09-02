@@ -5111,8 +5111,37 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 };
                 let query = query.clone();
                 self.mark_host_use();
+                // A typed list has nowhere to put a caveat, so this surface
+                // cannot narrate a partial index the way the tools and the
+                // status strip do -- and an empty `List<String>` reads to the
+                // calling program as "no such memory" (#275).
+                //
+                // So the unusable case fails instead of lying: with a `Failed`
+                // index the answer carries no information either way, and an
+                // error is something a program can branch on. `Loading` and
+                // `Degraded` still return what has loaded, because refusing
+                // during ordinary startup hydration would break working
+                // programs to report a condition that resolves itself; that
+                // residual -- a typed program cannot tell a partial empty
+                // result from a true one -- needs a status word to fix, not a
+                // refusal here.
+                let before = memory.hydration_status();
+                let for_status = memory.clone();
                 let values = block_on_host(async move { memory.query(&query, None).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let observed =
+                    crate::memory_status::observed(before, for_status.hydration_status());
+                if let crate::memory::HydrationStatus::Failed { reason } = &observed {
+                    return Err(host_binding_error(
+                        origin,
+                        format!(
+                            "memory index is unavailable, so mem-recall cannot answer: {reason}"
+                        ),
+                    ));
+                }
+                if let Some(caveat) = crate::memory_status::caveat(&observed) {
+                    tracing::warn!(%caveat, "mem-recall answered from a partial memory index");
+                }
                 return Ok(vec![TypedValue::List {
                     element_type: Type::String,
                     values: values.into_iter().map(TypedValue::String).collect(),
@@ -10635,6 +10664,97 @@ mod tests {
         ));
     }
 
+    /// `mem-recall` must refuse an unusable index rather than answer "nothing".
+    ///
+    /// The typed surface returns a `List<String>`, which has nowhere to put a
+    /// caveat, so an empty list from an index that never loaded reads to the
+    /// calling program -- and to the model that wrote it -- as "no such
+    /// memory". With a `Failed` index the answer carries no information either
+    /// way, so an error is the only honest result and is something a program
+    /// can branch on (#275).
+    #[tokio::test]
+    async fn typed_mem_recall_refuses_an_unusable_index_instead_of_reporting_absence() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let db_path = database.path().to_path_buf();
+        {
+            let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .unwrap();
+            memory
+                .insert_conversation("user", "the deploy key lives in 1Password", None, None)
+                .await
+                .unwrap();
+        }
+        // `level` is read as an i64, and non-numeric TEXT keeps its type under
+        // INTEGER affinity, so no row parses and the index reaches `Failed`
+        // with the memory still on disk.
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("UPDATE tree_nodes SET level = 'unreadable'", [])
+            .unwrap();
+
+        let memory = Arc::new(
+            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path,
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Failed { .. }
+            ),
+            "fixture must actually break hydration, or this test cannot fail: {:?}",
+            memory.hydration_status()
+        );
+
+        let runtime = ProgramRuntime::new();
+        runtime.attach_memory(memory);
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::MemoryRead,
+                selector: crate::vm::ResourceSelector::Memory {
+                    tree: "session".into(),
+                    path: "**".into(),
+                },
+            })
+            .unwrap();
+
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(mem-recall \"deploy key\")",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "returned a list from an index it never read, which a program reads \
+             as proof the memory does not exist: {:?}",
+            outcome.values
+        );
+        // Assert the reason, not just the outcome. A denied capability, a
+        // renamed word, a rejected effect or a detached memory binding would
+        // all satisfy `!= Completed`, so without this the test could pass
+        // without ever reaching the hydration check.
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("memory index is unavailable")),
+            "failed for some other reason than the unusable index: {:?}",
+            outcome.diagnostics
+        );
+    }
+
     /// The production entry point refuses the sheet, not just the helper.
     ///
     /// `read_workbook_rows` backs `workbook-open`, `workbook-sheet-open`,
@@ -10955,7 +11075,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             ExecutionEffect::ExternalWrite,
         );
         let pending = runtime.submit(request.clone()).await.unwrap();
-        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        assert_eq!(
+            pending.status,
+            ExecutionStatus::AuthorizationRequired,
+            "an unapproved typed process must stop at its capability boundary; outcome={pending:#?}"
+        );
         let ResourceSelector::Process { executables } = &pending.required_capabilities[0].selector
         else {
             panic!("process approval must expose a stable executable identity");
@@ -10966,7 +11090,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .grant_typed_capability(pending.required_capabilities[0].clone())
             .unwrap();
         let approved = runtime.submit(request).await.unwrap();
-        assert_eq!(approved.status, ExecutionStatus::Completed);
+        assert_eq!(
+            approved.status,
+            ExecutionStatus::Completed,
+            "the approved typed process must execute the authorized object without a shell; approved_identity={approved_identity:?}; outcome={approved:#?}"
+        );
         assert_eq!(approved.values, vec![ProgramValue::String("ok".into())]);
     }
 
