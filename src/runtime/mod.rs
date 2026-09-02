@@ -6965,7 +6965,12 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
     match cell {
         Data::Empty => String::new(),
         Data::String(value) => value.clone(),
-        Data::Float(value) if value.fract() == 0.0 => format!("{}", *value as i64),
+        // The i64 range is checked, not assumed: a float-to-int cast saturates,
+        // so a cell holding 1e300 rendered as 9223372036854775807. Same hazard
+        // as the serial guard below, in the arm above it.
+        Data::Float(value) if value.fract() == 0.0 && value.abs() < 9.0e18 => {
+            format!("{}", *value as i64)
+        }
         Data::Float(value) => value.to_string(),
         Data::Int(value) => value.to_string(),
         Data::Bool(value) => value.to_string(),
@@ -6973,26 +6978,29 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         // Elapsed time is not a point in time.
         //
         // A `[h]:mm:ss` cell holding 25 hours is `TimeDelta` with serial
-        // 1.0416…, and running that through `as_datetime` gives
-        // "1900-01-01 01:00:00" -- the Excel epoch leaking into the user's
-        // output, which is the exact failure this function was rewritten to
-        // remove. It leaked back in because the shape was chosen from the
-        // serial alone, and a duration's serial looks like a date's.
+        // 1.0416..., which looks exactly like a date's -- so choosing the shape
+        // from the serial alone rendered it "1900-01-01 01:00:00", the Excel
+        // epoch leaking into the user's output. `is_duration` is the type, and
+        // here the type is what decides.
         //
-        // `is_duration` is the type, and here the type is what decides.
+        // The range guard is not belt-and-braces: `ExcelDateTime::as_duration`
+        // and `as_datetime` both compute `Duration::milliseconds(ms.round() as
+        // i64)` *before* any `Option`, and a float-to-int cast saturates, so a
+        // serial past ~1.07e11 -- or an infinity, which `<v>` parses happily --
+        // reaches chrono as `i64::MIN` and panics. A crafted `<v>-1e12</v>` in
+        // an otherwise ordinary workbook took the process down, through both
+        // `read_workbook_rows` and the TUI preview. Finch has no
+        // `catch_unwind`.
+        //
+        // Guarding here also makes the fallback below reachable: `as_duration`
+        // never returns `None`, so before this it was dead code that documented
+        // a behaviour the function did not have.
+        Data::DateTime(value) if !workbook_serial_is_renderable(value.as_f64()) => {
+            value.as_f64().to_string()
+        }
         Data::DateTime(value) if value.is_duration() => value.as_duration().map_or_else(
             || value.as_f64().to_string(),
-            |duration| {
-                let seconds = duration.num_seconds();
-                let sign = if seconds < 0 { "-" } else { "" };
-                let seconds = seconds.unsigned_abs();
-                format!(
-                    "{sign}{}:{:02}:{:02}",
-                    seconds / 3600,
-                    (seconds % 3600) / 60,
-                    seconds % 60
-                )
-            },
+            |duration| format_elapsed_seconds(duration.num_seconds() as f64),
         ),
         Data::DateTime(value) => value.as_datetime().map_or_else(
             || value.as_f64().to_string(),
@@ -7004,9 +7012,7 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
                 //
                 // The range is half-open at zero on purpose: a *negative*
                 // serial is not a time of day, and treating it as one dropped
-                // the sign, so -1.5 read as "12:00:00". Excel itself shows
-                // "####" for these; a pre-epoch date is at least derived from
-                // the value.
+                // the sign, so -1.5 read as "12:00:00".
                 //
                 // Known limit: in a 1904-epoch workbook, serial 0 is
                 // 1904-01-01 and prints as "00:00:00". `ExcelDateTime` does not
@@ -7022,55 +7028,138 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
                 }
             },
         ),
-        // ODS and `t="d"` cells carry ISO-8601 text rather than a serial.
-        // Normalised to the same shapes, so one logical cell reads the same
-        // whichever format it arrived in -- an ODS time came through as
-        // "PT13H45M30S", which is the encoding artefact this issue is about.
-        // Anything that does not match falls through unchanged rather than
-        // being lost.
         Data::DateTimeIso(value) => normalize_iso_datetime(value),
         Data::DurationIso(value) => normalize_iso_duration(value),
     }
 }
 
-/// `2026-09-02T13:45:30` becomes `2026-09-02 13:45:30`; a bare date stays one.
+/// Whether a serial can be handed to calamine's chrono conversions at all.
+///
+/// They cast `serial * 86_400_000` to `i64` before any bounds check, and a
+/// saturating cast then hands chrono `i64::MIN`, which panics. The limit is
+/// well past any real spreadsheet -- 1e10 days is some 27 million years -- so
+/// nothing legitimate is refused, and what is refused falls back to the number
+/// the file holds rather than taking the process down.
+fn workbook_serial_is_renderable(serial: f64) -> bool {
+    serial.is_finite() && serial.abs() < 1.0e10
+}
+
+/// `4500` seconds becomes `1:15:00`, carrying minutes and seconds.
+fn format_elapsed_seconds(seconds: f64) -> String {
+    let negative = seconds < 0.0;
+    let total = seconds.abs().round() as i64;
+    format!(
+        "{}{}:{:02}:{:02}",
+        if negative { "-" } else { "" },
+        total / 3600,
+        (total % 3600) / 60,
+        total % 60
+    )
+}
+
+/// `2026-09-02T13:45:30` becomes `2026-09-02 13:45:30`.
+///
+/// A timezone is preserved rather than dropped -- `office:date-value` is
+/// `xs:dateTime`, which permits one, and losing it would be a silent change of
+/// meaning. Midnight loses its time component, matching the serial path: the
+/// two must agree, or the same logical cell reads differently depending on
+/// which format it arrived in, which is the whole complaint behind #281.
+///
+/// Anything that does not parse is returned untouched.
 fn normalize_iso_datetime(value: &str) -> String {
+    // RFC 3339 first, because chrono's `%:z` does not accept the bare `Z` that
+    // an ODF file is entirely likely to carry.
+    let offset_parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .or_else(|| {
+            ["%Y-%m-%dT%H:%M:%S%.f%:z", "%Y-%m-%dT%H:%M%:z"]
+                .iter()
+                .find_map(|format| chrono::DateTime::parse_from_str(value, format).ok())
+        });
+    for parsed in offset_parsed {
+        {
+            let naive = parsed.naive_local();
+            let offset = parsed.offset().to_string();
+            return if naive.time() == chrono::NaiveTime::MIN {
+                format!("{}{offset}", naive.format("%Y-%m-%d"))
+            } else {
+                format!("{}{offset}", naive.format("%Y-%m-%d %H:%M:%S"))
+            };
+        }
+    }
     for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
         if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, format) {
-            return parsed.format("%Y-%m-%d %H:%M:%S").to_string();
+            return if parsed.time() == chrono::NaiveTime::MIN {
+                parsed.format("%Y-%m-%d").to_string()
+            } else {
+                parsed.format("%Y-%m-%d %H:%M:%S").to_string()
+            };
         }
     }
     value.to_string()
 }
 
 /// `PT13H45M30S` becomes `13:45:30`, matching how a `[h]:mm:ss` cell reads.
+///
+/// Anything this does not fully recognise is returned untouched. That is the
+/// contract, and the first version broke it in both directions: it accepted
+/// `PT`, `PT1M1M` and `PT30S45M13H` and produced plausible-looking answers for
+/// all three, and it truncated `PT1.5H` to `1:00:00`. It also printed
+/// components verbatim, so the legal `PT90M` came out as `0:90:00` -- an
+/// impossible clock reading beside the `1:30:00` an XLSX cell of the same value
+/// gives.
 fn normalize_iso_duration(value: &str) -> String {
-    let Some(rest) = value.strip_prefix("PT") else {
-        return value.to_string();
-    };
-    let (mut hours, mut minutes, mut seconds, mut digits) = (0i64, 0i64, 0i64, String::new());
+    parse_iso_duration_seconds(value).map_or_else(|| value.to_string(), format_elapsed_seconds)
+}
+
+/// Parse an `xs:duration` of hours, minutes and seconds into signed seconds.
+///
+/// Returns `None` for anything outside that shape, including the date
+/// components (`P1DT2H`) this deliberately does not claim to render.
+fn parse_iso_duration_seconds(value: &str) -> Option<f64> {
+    let (negative, rest) = value
+        .strip_prefix('-')
+        .map_or((false, value), |rest| (true, rest));
+    let rest = rest.strip_prefix("PT")?;
+
+    let mut total = 0.0f64;
+    let mut digits = String::new();
+    // Designators must appear at most once and in descending order, which is
+    // what `xs:duration` requires and what stops `PT1M1M` and `PT30S45M13H`
+    // being read as though they meant something.
+    let mut previous_rank = 0u8;
     for character in rest.chars() {
         match character {
-            '0'..='9' => digits.push(character),
-            '.' => digits.push(character),
+            '0'..='9' | '.' => digits.push(character),
             unit => {
-                let Ok(amount) = digits.parse::<f64>() else {
-                    return value.to_string();
+                let (rank, multiplier) = match unit {
+                    'H' => (1u8, 3600.0),
+                    'M' => (2, 60.0),
+                    'S' => (3, 1.0),
+                    _ => return None,
                 };
-                digits.clear();
-                match unit {
-                    'H' => hours = amount as i64,
-                    'M' => minutes = amount as i64,
-                    'S' => seconds = amount as i64,
-                    _ => return value.to_string(),
+                if rank <= previous_rank || digits.starts_with('.') {
+                    return None;
                 }
+                let amount: f64 = digits.parse().ok()?;
+                if !amount.is_finite() {
+                    return None;
+                }
+                previous_rank = rank;
+                digits.clear();
+                total += amount * multiplier;
             }
         }
     }
-    if !digits.is_empty() {
-        return value.to_string();
+    if !digits.is_empty() || previous_rank == 0 {
+        return None;
     }
-    format!("{}:{minutes:02}:{seconds:02}", hours)
+    // A value this large is not a duration anyone wrote; passing it through
+    // beats printing a saturated `i64`.
+    if !total.is_finite() || total.abs() > 1.0e15 {
+        return None;
+    }
+    Some(if negative { -total } else { total })
 }
 
 /// Materialize only a deliberately small rectangular projection into the VM.
@@ -10953,6 +11042,111 @@ mod tests {
         let rows = read_workbook_rows(file.as_file(), "charts.xlsx", None)
             .expect("a chart sheet must not fail the read");
         assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// A crafted workbook must not take the process down.
+    ///
+    /// `ExcelDateTime::as_duration` and `as_datetime` both compute
+    /// `Duration::milliseconds(ms.round() as i64)` before any `Option`, and a
+    /// float-to-int cast saturates -- so a serial past ~1.07e11, or an
+    /// infinity, which `<v>` parses happily, reaches chrono as `i64::MIN` and
+    /// panics. A `<v>-1e12</v>` cell in an otherwise ordinary `.xlsx` crashed
+    /// both `read_workbook_rows` and the TUI preview, and Finch has no
+    /// `catch_unwind`. This defect was introduced by this PR; `origin/main`
+    /// rendered the arm with a `to_string()` catch-all.
+    #[test]
+    fn test_an_out_of_range_serial_falls_back_instead_of_panicking() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        for kind in [ExcelDateTimeType::TimeDelta, ExcelDateTimeType::DateTime] {
+            for serial in [-1.0e12, 1.0e12, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+                let rendered = workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                    serial, kind, false,
+                )));
+                assert!(
+                    !rendered.is_empty(),
+                    "serial {serial} rendered nothing for {kind:?}"
+                );
+            }
+        }
+        // And a large-but-sane duration still renders, so the guard is not
+        // refusing anything legitimate.
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                1.0e9,
+                ExcelDateTimeType::TimeDelta,
+                false
+            ))),
+            "24000000000:00:00"
+        );
+    }
+
+    /// The ISO duration parser must carry, keep the sign, and refuse the rest.
+    ///
+    /// Its first version printed components verbatim, so the legal `PT90M` came
+    /// out as "0:90:00" -- an impossible clock reading beside the "1:30:00" an
+    /// XLSX cell of the same value gives, which falsifies the whole claim that
+    /// one logical cell reads the same whichever format it arrived in. It also
+    /// dropped the leading sign that `xs:duration` spells out, truncated
+    /// `PT1.5H` to "1:00:00", and accepted `PT`, `PT1M1M` and `PT30S45M13H` --
+    /// producing plausible answers where the documented behaviour is
+    /// passthrough.
+    #[test]
+    fn test_iso_durations_carry_keep_the_sign_and_refuse_what_they_cannot_read() {
+        use calamine::Data;
+
+        let iso = |value: &str| workbook_cell_to_string(&Data::DurationIso(value.into()));
+
+        assert_eq!(iso("PT13H45M30S"), "13:45:30");
+        // Carries, rather than printing an impossible clock.
+        assert_eq!(iso("PT90M"), "1:30:00");
+        assert_eq!(iso("PT13H45M75S"), "13:46:15");
+        // The sign is part of the value here too.
+        assert_eq!(iso("-PT01H00M00S"), "-1:00:00");
+        // A fraction on the lowest component is legal and is not truncation
+        // bait.
+        assert_eq!(iso("PT1.5H"), "1:30:00");
+        assert_eq!(iso("PT0.5H"), "0:30:00");
+
+        // Everything below is returned untouched, which is the contract.
+        for unrecognised in [
+            "PT",                      // no component at all
+            "PT1M1M",                  // repeated designator
+            "PT30S45M13H",             // descending order violated
+            "PT99999999999999999999H", // would print a saturated i64
+            "PT.5S",                   // no digit before the point
+            "P1DT2H",                  // a day component this does not render
+            "PTS",
+            "pt1h",
+            "",
+        ] {
+            assert_eq!(iso(unrecognised), unrecognised, "mangled {unrecognised:?}");
+        }
+    }
+
+    /// An ISO datetime must normalise the way a serial one does.
+    #[test]
+    fn test_iso_datetimes_keep_their_offset_and_agree_at_midnight() {
+        use calamine::Data;
+
+        let iso = |value: &str| workbook_cell_to_string(&Data::DateTimeIso(value.into()));
+
+        assert_eq!(iso("2026-09-02T13:45:30"), "2026-09-02 13:45:30");
+        // `office:date-value` is `xs:dateTime`, which permits a timezone.
+        // Preserved rather than dropped -- losing it silently changes what the
+        // cell means -- but the `T` still goes, which is the artefact #281 is
+        // about. chrono's `%:z` does not accept a bare `Z`, so RFC 3339 is
+        // tried first.
+        assert_eq!(iso("2026-09-02T13:45:30Z"), "2026-09-02 13:45:30+00:00");
+        assert_eq!(
+            iso("2026-09-02T13:45:30+01:00"),
+            "2026-09-02 13:45:30+01:00"
+        );
+        // Midnight drops its time, as the serial path does. The two must agree,
+        // or the same logical cell reads differently by format.
+        assert_eq!(iso("2026-09-02T00:00:00"), "2026-09-02");
+        assert_eq!(iso("2026-09-02"), "2026-09-02");
+        assert_eq!(iso("not a date"), "not a date");
     }
 
     /// Elapsed time must not become a date in 1900.

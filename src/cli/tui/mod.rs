@@ -3386,6 +3386,56 @@ impl TuiRenderer {
     /// CSV, TSV, and XLSX files are shown as a scrollable grid table.
     /// All other files are shown as scrollable text.
     /// `q`, `Esc`, or `Ctrl-D` closes the viewer.
+    /// The rows a spreadsheet preview shows, as a free function so it can be tested.
+    ///
+    /// It used to be inline in `show_file_viewer`, which enters the alternate
+    /// screen and so cannot be driven from a test -- and the cell rendering inside
+    /// it carried #281 (dates as raw Excel serials) for as long as that was true.
+    /// CLAUDE.md asks for a production-boundary test when a bug crosses the TUI
+    /// boundary; this is the boundary, pulled out to where one can reach it.
+    pub(crate) fn spreadsheet_preview_rows(path: &str) -> Option<Vec<Vec<String>>> {
+        use calamine::{open_workbook_auto, Reader};
+
+        match open_workbook_auto(path) {
+            Ok(mut workbook) => {
+                let sheet_names = workbook.sheet_names().to_vec();
+                // Bounded, and the error shown rather than swallowed. `if let
+                // Ok(range)` turned an oversized or unreadable sheet into an empty
+                // preview, which reads as "this spreadsheet has no rows" -- the
+                // silent truncation #185 rules out (#282).
+                //
+                // A workbook with no sheets still opens the viewer on an empty
+                // grid, as it did before: returning early skipped
+                // `EnterAlternateScreen` and gave the user no output at all.
+                match sheet_names.first() {
+                    None => Some(Vec::new()),
+                    Some(name) => match crate::workbook::bounded_worksheet_range(
+                        &mut workbook,
+                        name,
+                        crate::workbook::MAX_WORKBOOK_CELLS,
+                    ) {
+                        Ok(range) => Some(
+                            range
+                                .rows()
+                                .map(|row| {
+                                    // Shared with the typed runtime, not
+                                    // `to_string()` -- that is calamine's
+                                    // `Display`, which prints a date as its Excel
+                                    // serial (#281).
+                                    row.iter()
+                                        .map(crate::runtime::workbook_cell_to_string)
+                                        .collect::<Vec<String>>()
+                                })
+                                .collect(),
+                        ),
+                        Err(error) => Some(vec![vec![format!("cannot preview {path}: {error}")]]),
+                    },
+                }
+            }
+            Err(error) => Some(vec![vec![format!("error opening {path}: {error}")]]),
+        }
+    }
+
     pub fn show_file_viewer(&mut self, path: &str) -> Result<()> {
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
         use ratatui::backend::CrosstermBackend;
@@ -3425,53 +3475,7 @@ impl TuiRenderer {
                 }
                 Some(rows)
             }
-            "xlsx" | "xls" | "ods" => {
-                use calamine::{open_workbook_auto, Reader};
-                match open_workbook_auto(path) {
-                    Ok(mut wb) => {
-                        let sheet_names = wb.sheet_names().to_vec();
-                        // Bounded, and the error shown rather than swallowed.
-                        // `if let Ok(range)` turned an oversized or unreadable
-                        // sheet into an empty preview, which reads as "this
-                        // spreadsheet has no rows" -- the silent truncation
-                        // #185 explicitly rules out (#282).
-                        // A workbook with no sheets still opens the viewer on
-                        // an empty grid, as it did before. Returning early here
-                        // skipped `EnterAlternateScreen` and gave the user no
-                        // output at all -- the silent no-op this change is
-                        // meant to remove, not introduce.
-                        match sheet_names.first() {
-                            None => Some(Vec::new()),
-                            Some(name) => match crate::workbook::bounded_worksheet_range(
-                                &mut wb,
-                                name,
-                                crate::workbook::MAX_WORKBOOK_CELLS,
-                            ) {
-                                Ok(range) => Some(
-                                    range
-                                        .rows()
-                                        .map(|row| {
-                                            // Shared with the typed runtime,
-                                            // not `to_string()`. That is
-                                            // calamine's `Display`, which
-                                            // prints a date as its Excel
-                                            // serial -- the #281 defect, live
-                                            // here too.
-                                            row.iter()
-                                                .map(crate::runtime::workbook_cell_to_string)
-                                                .collect::<Vec<String>>()
-                                        })
-                                        .collect(),
-                                ),
-                                Err(error) => {
-                                    Some(vec![vec![format!("cannot preview {path}: {error}")]])
-                                }
-                            },
-                        }
-                    }
-                    Err(e) => Some(vec![vec![format!("error opening {path}: {e}")]]),
-                }
-            }
+            "xlsx" | "xls" | "ods" => Self::spreadsheet_preview_rows(path),
             _ => None,
         };
 
@@ -5891,6 +5895,42 @@ mod tests {
 
 #[cfg(test)]
 mod draw_dialog_tests {
+
+    /// The preview must render a date as a date, like every other read surface.
+    ///
+    /// It mapped cells with a bare `to_string()` -- calamine's `Display`, which
+    /// prints the Excel serial -- so #281 was live here after being fixed in
+    /// the typed runtime. Two converters meant two answers for the same cell.
+    /// The row computation was inline in `show_file_viewer`, which enters the
+    /// alternate screen and cannot be driven from a test; it is a free function
+    /// now so this can reach it.
+    #[test]
+    fn test_spreadsheet_preview_renders_dates_not_serials() {
+        use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preview.xlsx");
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet
+            .write_datetime_with_format(
+                0,
+                0,
+                &ExcelDateTime::from_ymd(2026, 9, 2).unwrap(),
+                &Format::new().set_num_format("yyyy-mm-dd"),
+            )
+            .unwrap();
+        sheet.write_string(0, 1, "label").unwrap();
+        workbook.save(&path).unwrap();
+
+        let rows = super::TuiRenderer::spreadsheet_preview_rows(path.to_str().unwrap())
+            .expect("a spreadsheet must preview");
+        assert_eq!(
+            rows,
+            vec![vec!["2026-09-02".to_string(), "label".to_string()]],
+            "the preview rendered the Excel serial instead of the date"
+        );
+    }
     use super::*;
     use crate::cli::tui::dialog::{Dialog, DialogOption};
 
