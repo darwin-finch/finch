@@ -11074,7 +11074,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             ExecutionEffect::ExternalWrite,
         );
         let pending = runtime.submit(request.clone()).await.unwrap();
-        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        assert_eq!(
+            pending.status,
+            ExecutionStatus::AuthorizationRequired,
+            "an unapproved typed process must stop at its capability boundary; outcome={pending:#?}"
+        );
         let ResourceSelector::Process { executables } = &pending.required_capabilities[0].selector
         else {
             panic!("process approval must expose a stable executable identity");
@@ -11085,7 +11089,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .grant_typed_capability(pending.required_capabilities[0].clone())
             .unwrap();
         let approved = runtime.submit(request).await.unwrap();
-        assert_eq!(approved.status, ExecutionStatus::Completed);
+        assert_eq!(
+            approved.status,
+            ExecutionStatus::Completed,
+            "the approved typed process must execute the authorized object without a shell; approved_identity={approved_identity:?}; outcome={approved:#?}"
+        );
         assert_eq!(approved.values, vec![ProgramValue::String("ok".into())]);
     }
 
