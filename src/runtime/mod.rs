@@ -7393,10 +7393,13 @@ fn summarize_csv(
 /// worker it needs is the one blocking, and on a runtime with a single worker
 /// that is a deadlock.
 ///
-/// Every in-tree caller satisfies this incidentally, through the
+/// Every reachable in-tree caller satisfies this incidentally, through the
 /// `tokio::task::spawn_blocking` hop that wraps both `TypedHostHandler` drive
 /// sites. That hop is load-bearing, not incidental convenience, and is marked
-/// as such at both sites.
+/// as such at both sites. (`src/coforth/interpreter.rs` also calls in, through
+/// `AgentVmBinding`, with no hop -- but only when a binding is attached, and
+/// the attaching function has no callers, so those sites short-circuit. #294
+/// removes that subtree.)
 ///
 /// A `tokio::task::block_in_place` here would release the worker and make the
 /// requirement unnecessary — but it panics inside a `LocalSet`, and
@@ -7407,9 +7410,12 @@ fn summarize_csv(
 /// the same constraint for the same reason.
 ///
 /// The residual hazard is in-tree, not out of it: a future third drive site
-/// that constructs a `TypedHostHandler` without the hop.
-/// `typed_mem_store_completes_on_a_single_worker_runtime` in this module fails
-/// if that happens on either existing site.
+/// that constructs a `TypedHostHandler` without the hop. Two tests fail if that
+/// happens -- `typed_mem_store_completes_on_a_single_worker_runtime` in this
+/// module, and `typed_agent_await_completes_on_a_single_worker_runtime` in
+/// `runtime::scheduler`, which covers the `agent-await` consumer. Both submit
+/// non-suspending programs, so both exercise `execute_typed_program`'s hop;
+/// neither reaches the one in `resume_typed_program`, which is uncovered.
 ///
 /// An out-of-tree caller cannot reach this. `block_on_host` and
 /// `TypedHostHandler` are private, and the public submit API performs the hop

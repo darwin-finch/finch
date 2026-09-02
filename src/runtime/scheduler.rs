@@ -2270,7 +2270,13 @@ mod tests {
                     budget: None,
                 })
                 .await;
-            let _ = done_tx.send(outcome.map(|outcome| outcome.status));
+            // The scheduler hold is load-bearing: `AgentScheduler::new` stores
+            // only a `Weak` on the runtime, so dropping this `Arc` makes
+            // `agent-spawn` fail with "agent scheduler is unavailable" and the
+            // test would pass without a child task ever existing. Counting the
+            // tasks proves one did, and says so to the next reader.
+            let spawned = _scheduler.tasks.read().await.len();
+            let _ = done_tx.send(outcome.map(|outcome| (outcome.status, spawned)));
         });
 
         // Bounded, and the runtime is torn down before asserting: a regression
@@ -2280,10 +2286,11 @@ mod tests {
         let outcome = done_rx.recv_timeout(std::time::Duration::from_secs(30));
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 
-        let status = outcome
+        let (status, spawned) = outcome
             .expect("agent-await deadlocked on a single-worker runtime")
             .expect("submit");
         assert_eq!(status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert_eq!(spawned, 1, "no child task was ever scheduled");
     }
 
     #[tokio::test]

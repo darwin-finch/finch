@@ -76,7 +76,12 @@ impl AgentVmBinding {
     /// and documented the constraint on one of them, the other kept carrying it
     /// silently (#289). One implementation is one place to state the rule, and
     /// one place to change if the rule ever stops holding.
-    pub fn block_on<T: Send + 'static>(
+    /// `pub(crate)`, deliberately. `block_on_host`'s doc rests on the claim
+    /// that an out-of-tree caller cannot reach it, and a `pub` wrapper that
+    /// delegates there would have made that claim false -- the delegation would
+    /// have widened the reachable surface rather than only sharing the
+    /// explanation. Every caller is in-crate.
+    pub(crate) fn block_on<T: Send + 'static>(
         &self,
         operation: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<T> {
