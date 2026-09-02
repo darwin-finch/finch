@@ -2823,7 +2823,9 @@ mod tests {
 
         let secret = [47; 32];
         let authority = super::super::credential::BrainCredentialAuthority::ephemeral(secret);
-        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let store = crate::brain::store::BrainStore::with_root("fixture.local", None);
+        let initial_snapshot = store.snapshot("shared").unwrap();
+        let brain_id = initial_snapshot.brain_id;
         let (invitation, invitation_claims) = authority
             .issue_invitation(
                 super::super::credential::BrainInvitationRequest {
@@ -2875,6 +2877,7 @@ mod tests {
             },
         };
         let expected_event = streamed.clone();
+        let expected_snapshot = initial_snapshot.clone();
         let fixture = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let stream = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config))
@@ -2899,6 +2902,17 @@ mod tests {
             )
             .await
             .unwrap();
+            let snapshot = BrainRemoteEnvelope::Projection(BrainWireMessage::Snapshot {
+                brain: initial_snapshot,
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&snapshot)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
             let envelope =
                 BrainRemoteEnvelope::Projection(BrainWireMessage::Event { event: streamed });
             let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope).unwrap();
@@ -2978,6 +2992,15 @@ mod tests {
             },
         });
         let mut events = client.watch().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("pinned WSS snapshot must arrive within five seconds"),
+            Some(BrainWireMessage::Snapshot {
+                brain: expected_snapshot
+            }),
+            "the WSS stream must preserve the initial Brain snapshot"
+        );
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
                 .await
