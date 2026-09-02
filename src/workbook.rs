@@ -226,7 +226,17 @@ pub(crate) mod fixtures {
             ));
         }
         sheet.push_str("</sheetData></worksheet>");
+        xlsx_from_sheet(&sheet)
+    }
 
+    /// Package arbitrary worksheet XML as a single-sheet XLSX.
+    ///
+    /// Split out from `xlsx` so a fixture can emit XML no writer would produce
+    /// -- thousands of attributes on one element, a namespace declaration per
+    /// row -- which is the shape the quick-xml advisories #185 exists to clear
+    /// were about, and which nothing in the suite currently exercises.
+    pub(crate) fn xlsx_from_sheet(sheet: &str) -> Vec<u8> {
+        let sheet = sheet.to_string();
         let parts: [(&str, String); 5] = [
             (
                 "[Content_Types].xml",
@@ -274,6 +284,68 @@ pub(crate) mod fixtures {
             writer.write_all(body.as_bytes()).expect("zip write");
         }
         writer.finish().expect("zip finish").into_inner()
+    }
+
+    /// One cell carrying `count` distinct attributes.
+    ///
+    /// The shape behind the quick-xml advisories: attribute handling that is
+    /// quadratic in count turns a small file into a hang. Distinct names defeat
+    /// any dedup-by-name shortcut.
+    pub(crate) fn many_distinct_attributes(count: usize) -> Vec<u8> {
+        let attrs: String = (0..count).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        xlsx_from_sheet(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{attrs}><is><t>x</t></is></c></row></sheetData></worksheet>"#
+        ))
+    }
+
+    /// One cell carrying `count` copies of the same attribute name.
+    ///
+    /// The duplicate case is the one a name-keyed map makes cheap and a linear
+    /// scan makes quadratic, so it exercises a different path from the distinct
+    /// case above and is worth having both.
+    pub(crate) fn many_duplicate_attributes(count: usize) -> Vec<u8> {
+        let attrs: String = (0..count).map(|i| format!(" dup=\"{i}\"")).collect();
+        xlsx_from_sheet(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{attrs}><is><t>x</t></is></c></row></sheetData></worksheet>"#
+        ))
+    }
+
+    /// `count` namespace declarations, which a parser must keep in scope.
+    ///
+    /// Namespace resolution walks the in-scope set, so a file that declares
+    /// thousands is the allocation-and-lookup counterpart to the attribute
+    /// case.
+    pub(crate) fn many_namespace_declarations(count: usize) -> Vec<u8> {
+        let decls: String = (0..count)
+            .map(|i| format!(" xmlns:n{i}=\"urn:finch:test:{i}\""))
+            .collect();
+        xlsx_from_sheet(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"{decls}>
+<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row></sheetData></worksheet>"#
+        ))
+    }
+
+    /// `count` rows all claiming to be row 1, each with one cell.
+    ///
+    /// A well-formed sheet has one element per row. Repeating an index is the
+    /// cheapest way to make a small file describe a great deal of work, and it
+    /// is the shape that made the cell-count bound necessary in #282.
+    pub(crate) fn repeated_rows(count: usize) -> Vec<u8> {
+        let rows: String = (0..count)
+            .map(|_| {
+                r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#.to_string()
+            })
+            .collect();
+        xlsx_from_sheet(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:A1"/><sheetData>{rows}</sheetData></worksheet>"#
+        ))
     }
 
     /// Two cells in opposite corners of the sheet's full address space.
@@ -333,6 +405,121 @@ mod tests {
         let mut workbook =
             open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| e.to_string())?;
         bounded_worksheet_range(&mut workbook, "Sheet1", MAX_WORKBOOK_CELLS)
+    }
+
+    /// Parse the same fixture a few times and keep the fastest.
+    ///
+    /// A single timing on a shared CI runner measures scheduling as much as
+    /// parsing. The minimum of a few runs is the one least contaminated by
+    /// whatever else the host was doing.
+    fn fastest_parse(bytes: &[u8]) -> std::time::Duration {
+        (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let _ = read(bytes.to_vec());
+                started.elapsed()
+            })
+            .min()
+            .expect("three runs")
+    }
+
+    /// Hostile XML must stay linear in its input, not quadratic.
+    ///
+    /// This is what #185 was actually about. The quick-xml advisories were
+    /// quadratic attribute handling and an allocation defect, and the calamine
+    /// 0.36.1 upgrade cleared them -- but a dependency floor is not a
+    /// regression test. Nothing here would have noticed either defect coming
+    /// back, and a future bump could reintroduce one silently.
+    ///
+    /// Asserted as a *ratio*, not a millisecond ceiling. Absolute timings on a
+    /// shared runner measure the runner; a fivefold input that costs fivefold
+    /// time is linear and a fivefold input that costs twenty-five-fold time is
+    /// quadratic, and that difference survives any machine speed. Measured on
+    /// this host at 10k and 50k: distinct attributes 4.3ms -> 21.2ms, duplicate
+    /// 3.4 -> 16.8, namespaces 4.8 -> 24.2 -- all almost exactly 5x. The bound
+    /// below is 12x, which leaves generous room for noise while still failing
+    /// well before 25x.
+    #[test]
+    fn test_hostile_xml_parsing_stays_linear_in_its_input() {
+        let cases: [(&str, fn(usize) -> Vec<u8>); 4] = [
+            ("distinct attributes", fixtures::many_distinct_attributes),
+            ("duplicate attributes", fixtures::many_duplicate_attributes),
+            (
+                "namespace declarations",
+                fixtures::many_namespace_declarations,
+            ),
+            ("repeated rows", fixtures::repeated_rows),
+        ];
+
+        for (label, make) in cases {
+            let small = fastest_parse(&make(10_000));
+            let large = fastest_parse(&make(50_000));
+            let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::MIN_POSITIVE);
+            assert!(
+                ratio < 12.0,
+                "{label}: 5x the input cost {ratio:.1}x the time ({small:?} -> {large:?}). \
+                 Linear is ~5x and quadratic is ~25x, so this is the shape the \
+                 quick-xml advisories had."
+            );
+        }
+    }
+
+    /// And none of them may hang outright.
+    ///
+    /// The ratio above catches a change in shape; this catches a stall, which a
+    /// ratio cannot -- two equally slow measurements have a fine ratio. The
+    /// ceiling is deliberately far above the ~270ms the slowest of these takes
+    /// here, because its job is to separate "finished" from "did not".
+    #[test]
+    fn test_hostile_xml_completes_rather_than_hanging() {
+        for (label, bytes) in [
+            (
+                "distinct attributes",
+                fixtures::many_distinct_attributes(50_000),
+            ),
+            (
+                "duplicate attributes",
+                fixtures::many_duplicate_attributes(50_000),
+            ),
+            (
+                "namespace declarations",
+                fixtures::many_namespace_declarations(50_000),
+            ),
+            ("repeated rows", fixtures::repeated_rows(50_000)),
+        ] {
+            let started = std::time::Instant::now();
+            let _ = read(bytes);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(30),
+                "{label} took {elapsed:?}"
+            );
+        }
+    }
+
+    /// Concurrent parses of the same hostile file must not panic or exhaust
+    /// memory.
+    ///
+    /// #185 asks for this specifically. The parse path holds no shared state,
+    /// so the property should hold trivially -- which is the point of pinning
+    /// it, since a future cache or interner is exactly the change that would
+    /// break it quietly.
+    #[test]
+    fn test_concurrent_parses_of_one_hostile_file_all_succeed() {
+        let bytes = std::sync::Arc::new(fixtures::many_distinct_attributes(10_000));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let bytes = std::sync::Arc::clone(&bytes);
+                std::thread::spawn(move || read(bytes.as_ref().clone()).map(|r| r.rows().count()))
+            })
+            .collect();
+        for handle in handles {
+            let rows = handle
+                .join()
+                .expect("a concurrent parse panicked")
+                .expect("a concurrent parse failed");
+            assert_eq!(rows, 1);
+        }
     }
 
     /// The reported defect: two cells, hundreds of gigabytes.
