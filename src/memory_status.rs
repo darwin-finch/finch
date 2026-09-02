@@ -87,12 +87,12 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // read" -- and the read may since have matched three memories, printed
         // directly above this sentence. A vacuous bound is worse than no bound.
         HydrationStatus::Loading { loaded: 0, total } => Some(format!(
-            "The memory index was still loading when this began, so how many of its \
-             {total} entries the read covered is unknown. Retrying shortly may reach more."
+            "The memory index was still loading when this read began, with {total} \
+             entries to load. Retrying shortly may reach more."
         )),
         HydrationStatus::Loading { loaded, total } => Some(format!(
-            "The memory index was still loading when this read began: it covered at least {loaded} of \
-             {total} entries. Retrying shortly may reach more."
+            "The memory index was still loading when this read began: this read covered \
+             at least {loaded} of {total} entries. Retrying shortly may reach more."
         )),
         // Not "retrying will not find more": `degrade` fires on any batch read
         // error, transient ones included, and a reload can clear the failure
@@ -102,9 +102,11 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // zero meets a degrading loader. Vacuous rather than false, but the
         // `Loading` arm above special-cases exactly this for exactly this
         // reason: a bound of zero bounds nothing.
-        HydrationStatus::Degraded { loaded: 0, total, .. } => Some(format!(
-            "A read error stopped the memory index short, and how many of its {total} \
-             entries this read covered is unknown."
+        HydrationStatus::Degraded {
+            loaded: 0, total, ..
+        } => Some(format!(
+            "A read error stopped the memory index short, which had {total} entries \
+             to load."
         )),
         // Coverage-centric, not index-centric.
         //
@@ -188,8 +190,8 @@ pub(crate) fn count_qualifier(status: &HydrationStatus) -> Option<&'static str> 
     match status {
         HydrationStatus::Ready { .. } => None,
         HydrationStatus::Loading { .. } => Some("so far; the index was still loading"),
-        HydrationStatus::Degraded { .. } => Some("a read error stopped the index short"),
-        HydrationStatus::Failed { .. } => Some("the index did not finish loading"),
+        HydrationStatus::Degraded { .. } => Some("so far; a read error stopped the index short"),
+        HydrationStatus::Failed { .. } => Some("so far; the index did not finish loading"),
     }
 }
 
@@ -397,7 +399,14 @@ mod tests {
             !text.contains("none of"),
             "asserts nothing was read, beside results that were: {text}"
         );
-        assert!(text.contains("unknown"), "{text}");
+        // Nor a claim that the coverage is unknown. `/memory` prints the
+        // covered count one line above this sentence, so "how many … is
+        // unknown" is contradicted by the screen it appears on -- the same
+        // shape as the zero bound it replaced, in the other direction.
+        assert!(
+            !text.contains("unknown"),
+            "calls unknown a number /memory displays directly above it: {text}"
+        );
         // And no prediction about a retry. This arm knows least -- a loader
         // that fails at zero reaches nothing more, ever -- so it must hedge at
         // least as hard as the arm that knows the loader is progressing.
@@ -450,30 +459,44 @@ mod tests {
     /// Nothing here may claim, in the present tense, that loading is under way.
     ///
     /// `observed` returns the earlier sample whenever the later one is no
-    /// worse, so a `Loading` value is routinely rendered *after* hydration has
+    /// worse, so a partial status is routinely rendered *after* hydration has
     /// finished -- and `line_against` holds one deliberately for a whole turn,
     /// which `test_a_recovered_index_does_not_erase_the_recalls_qualification`
-    /// asserts. A hedge in the present tense is falsified by the very sample
-    /// the renderer is holding. Round 8 fixed one of the three sites and its
-    /// message claimed two; this is why that was invisible.
+    /// asserts. A progress claim in the present tense is falsified by the very
+    /// sample the renderer is holding.
+    ///
+    /// The first version of this test asserted the absence of one literal,
+    /// `"is still loading"`. That is a regression test for the string round 8
+    /// removed, not for the property in its name: of the three arms round 9
+    /// changed, only one contained that literal, so the sweep would have caught
+    /// one of them and the commit message claimed it covered all three. This
+    /// version checks the property across every renderer and every state, so
+    /// `"the index is loading"` or `"loading is in progress"` fails too.
     #[test]
     fn test_no_rendering_claims_loading_is_still_under_way() {
-        let mut rendered = vec![
-            caveat(&loading(0)).unwrap(),
-            caveat(&loading(1)).unwrap(),
-            status_line(1, &loading(0)),
-            status_line(1, &loading(1)),
+        const PRESENT_TENSE: &[&str] = &[
+            "is still loading",
+            "is loading",
+            "is being loaded",
+            "is in progress",
+            "loading is",
+            "is still being",
+            "currently loading",
         ];
-        rendered.extend(
-            [loading(0), loading(1)]
-                .iter()
-                .filter_map(|status| count_qualifier(status).map(str::to_string)),
-        );
-        for text in rendered {
-            assert!(
-                !text.contains("is still loading"),
-                "present tense is falsified by the sample being rendered: {text}"
-            );
+        for status in [ready(), loading(0), loading(1), degraded(), failed()] {
+            let mut rendered = vec![status_line(1, &status)];
+            rendered.extend(caveat(&status));
+            rendered.extend(count_qualifier(&status).map(str::to_string));
+            for text in rendered {
+                let lowered = text.to_lowercase();
+                for marker in PRESENT_TENSE {
+                    assert!(
+                        !lowered.contains(marker),
+                        "{marker:?} is a present-tense progress claim, falsified by the \
+                         sample being rendered: {text}"
+                    );
+                }
+            }
         }
     }
 
@@ -513,7 +536,10 @@ mod tests {
             !text.contains("at least 0"),
             "a bound of zero bounds nothing: {text}"
         );
-        assert!(text.contains("unknown"), "{text}");
+        assert!(
+            !text.contains("unknown"),
+            "calls unknown a number /memory displays directly above it: {text}"
+        );
 
         let line = status_line(3, &zero);
         assert!(!line.contains("0 of 2048"), "{line}");
