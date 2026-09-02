@@ -8,7 +8,6 @@ src/cli/repl_event/query_processor.rs
 src/cli/repl_event/query_state.rs
 src/cli/repl_event/tool_execution.rs
 src/cli/setup_wizard.rs
-src/coforth/interpreter.rs
 src/config/colors.rs
 src/config/persona.rs
 src/daemon/upgrade.rs

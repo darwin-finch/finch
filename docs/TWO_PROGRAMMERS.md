@@ -106,16 +106,21 @@ The stack is the arbiter. No appeals.
 
 ## Stack-Effect Proofs
 
-Built-in words (dup, swap, +, etc.) are implemented as `enum Builtin` in the interpreter — **direct Rust dispatch, no dictionary lookup at runtime**. Their contracts are machine-checked in `src/coforth/interpreter.rs` under `mod stack_effects`:
+Built-in word contracts are machine-checked by the typed VM's stack-effect
+signatures in `src/vm`. A definition declares its effect and the verifier
+enforces it:
 
-```rust
-#[test]
-fn test_dup_stack_effect() {
-    assert_eq!(run(&[5], "dup"), vec![5, 5]);  // ( a -- a a )
-}
+```forth
+: square ( S int -- S int ) dup * ;
 ```
 
-These tests are the proofs. If a test passes, the stack contract holds.
+The signature is the proof. A definition whose body does not match it is
+rejected before it runs, rather than tested after.
+
+This section previously described an `enum Builtin` in `src/coforth/interpreter.rs`
+with a `mod stack_effects` test module. No user input could reach that
+interpreter and #294 removed it; the typed VM is what runs `--forth`, `--lisp`,
+`--exec` and `/forth`.
 
 ---
 
