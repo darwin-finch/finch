@@ -7466,29 +7466,39 @@ fn summarize_csv(
 /// worker it needs is the one blocking, and on a runtime with a single worker
 /// that is a deadlock.
 ///
-/// Every in-tree caller satisfies this incidentally, through the
+/// Every reachable in-tree caller satisfies this incidentally, through the
 /// `tokio::task::spawn_blocking` hop that wraps both `TypedHostHandler` drive
 /// sites. That hop is load-bearing, not incidental convenience, and is marked
-/// as such at both sites.
+/// as such at both sites. (The Co-Forth interpreter also called in through
+/// `AgentVmBinding` with no hop, reachable only when a binding was attached by
+/// a function that had no callers; #294 removed that subtree, so the two drive
+/// sites are now the whole set.)
 ///
 /// A `tokio::task::block_in_place` here would release the worker and make the
 /// requirement unnecessary — but it panics inside a `LocalSet`, and
 /// `Handle::runtime_flavor()` reports `MultiThread` there, so the panic cannot
 /// be guarded against. `src/main.rs` runs the whole interactive REPL inside
 /// `local.run_until(...)`, so that trade would swap a deadlock no in-tree
-/// caller can reach for a panic one could. `src/coforth/interpreter.rs` records
-/// the same constraint for the same reason.
+/// caller can reach for a panic one could. (`src/coforth/interpreter.rs`
+/// recorded the same constraint independently; #294 removed that file, so this
+/// is the only place the reasoning is written down now.)
 ///
 /// The residual hazard is in-tree, not out of it: a future third drive site
-/// that constructs a `TypedHostHandler` without the hop.
-/// `typed_mem_store_completes_on_a_single_worker_runtime` in this module fails
-/// if that happens on either existing site.
+/// that constructs a `TypedHostHandler` without the hop. Two tests fail if that
+/// happens -- `typed_mem_store_completes_on_a_single_worker_runtime` in this
+/// module, and `typed_agent_await_completes_on_a_single_worker_runtime` in
+/// `runtime::scheduler`, which covers the `agent-await` consumer. Both submit
+/// non-suspending programs, so both exercise `execute_typed_program`'s hop;
+/// neither reaches the one in `resume_typed_program`, which is uncovered.
 ///
 /// An out-of-tree caller cannot reach this. `block_on_host` and
 /// `TypedHostHandler` are private, and the public submit API performs the hop
 /// itself — a caller on a worker is the case the test exercises and passes.
-/// `AgentVmBinding::block_on` has the identical shape without the requirement
-/// written down; that is #289.
+/// `AgentVmBinding::block_on` delegates here rather than repeating the shape,
+/// so `agent-await` inherits both the requirement and this explanation. Both it
+/// and `AgentVmBinding::new` are `pub(crate)`: narrowing only the method would
+/// have left a composed path open, since a binding an external crate can build
+/// and attach to a `Forth` reaches this from a worker with no hop (#289).
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
