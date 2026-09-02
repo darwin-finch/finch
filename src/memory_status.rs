@@ -29,26 +29,43 @@ fn severity(status: &HydrationStatus) -> u8 {
     }
 }
 
-/// The status that describes what a query could actually have seen, given a
+/// The status that describes what a read could actually have seen, given a
 /// sample taken before it ran and one taken after.
 ///
 /// Sampling only afterwards fails *open*, which is the dangerous direction: if
-/// hydration finishes between the query and the sample, the status reads
-/// `Ready` and the caller reports "no memories found" about a search that
-/// covered a fraction of the store — reintroducing the exact false claim this
-/// module exists to remove. Hydration also advances during the query itself
-/// (it yields between batches, and `query_with_sources` contends for the same
-/// locks), so an after-sample's `loaded` is a strict over-count of what was
-/// searched.
+/// hydration finishes between the read and the sample, the status reads `Ready`
+/// and the caller reports "no memories found" about a search that covered a
+/// fraction of the store. Hydration also advances during the read -- it yields
+/// between batches, and `query_with_sources` contends for the same locks -- so
+/// an after-sample's `loaded` is a strict over-count of what was read.
 ///
-/// Taking the worse of the two fails closed. When both are `Loading` the
-/// earlier sample wins, because its count is a genuine lower bound on what the
-/// search read — hence "at least" in the wording below.
+/// So the later sample contributes only its *kind*, never its counts. Taking
+/// the whole later sample was a subtler form of the same over-claim: with
+/// `before = Loading { loaded: 100 }` and the loader degrading at 1536 during
+/// the read, it rendered "recalled 3 · at least 1536 of 2048 entries searched"
+/// for a read whose true coverage was somewhere in [100, 1536]. The earlier
+/// count is the only honest figure, and every string that prints it says "at
+/// least" for that reason.
 pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> HydrationStatus {
-    if severity(&after) > severity(&before) {
-        after
-    } else {
-        before
+    if severity(&after) <= severity(&before) {
+        return before;
+    }
+    match (before, after) {
+        (HydrationStatus::Loading { loaded, total }, HydrationStatus::Degraded { reason, .. }) => {
+            HydrationStatus::Degraded {
+                loaded,
+                total,
+                reason,
+            }
+        }
+        // `Failed` carries no counts, so the later status stands. So does a
+        // worse status behind a `Ready` sample: that pair would render the later
+        // counts as though they described the read, which *understates* a
+        // complete read rather than inflating a partial one. It is unreachable
+        // today -- `done` is monotone, so nothing leaves `Ready` for a worse
+        // state in-process -- and understating is the safe direction if it ever
+        // becomes reachable.
+        (_, after) => after,
     }
 }
 
@@ -62,22 +79,35 @@ pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> Hydra
 pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
     match status {
         HydrationStatus::Ready { .. } => None,
-        // Zero read is not "at least 0 read".
+        // No count at all when the bound is zero.
+        //
+        // Every other wording here is a lower bound, which survives the fact
+        // that the earlier sample under-counts what the read actually covered.
+        // At zero that framing collapses into an absolute -- "none have been
+        // read" -- and the read may since have matched three memories, printed
+        // directly above this sentence. A vacuous bound is worse than no bound.
         HydrationStatus::Loading { loaded: 0, total } => Some(format!(
-            "The memory index is still loading and none of its {total} entries have been \
-             read yet. Retrying shortly may reach some."
+            "The memory index was still loading when this began, so how much of its \
+             {total} entries the read covered is unknown. Retrying shortly may reach more."
         )),
         HydrationStatus::Loading { loaded, total } => Some(format!(
-            "The memory index is still loading: at least {loaded} of {total} entries have \
-             been read. Retrying shortly may reach more."
+            "The memory index is still loading: this read covered at least {loaded} of \
+             {total} entries. Retrying shortly may reach more."
         )),
         // Not "retrying will not find more": `degrade` fires on any batch read
         // error, transient ones included, and a reload can clear the failure
         // within the same process. Stating it as permanent would be the same
         // claim-beyond-evidence as the sentence below.
+        // Coverage-centric, not index-centric.
+        //
+        // "{loaded} of {total} entries loaded" was a claim about the index, and
+        // the count here is not the index's: when hydration degrades *during* a
+        // read, `observed` keeps the earlier sample's count, which is a lower
+        // bound on what the read saw and lower than what finally loaded. Only a
+        // sentence about the read is true of both.
         HydrationStatus::Degraded { loaded, total, .. } => Some(format!(
-            "The memory index is incomplete: {loaded} of {total} entries loaded before a \
-             read error stopped it, and the remainder were not read."
+            "A read error stopped the memory index short: this read covered at least \
+             {loaded} of {total} entries, and the rest were not read."
         )),
         // Deliberately says nothing about *how much* loaded.
         //
@@ -134,45 +164,7 @@ impl Recall {
     /// failure that happened after the recall rather than holding the old state
     /// until the next turn.
     pub(crate) fn line_against(&self, live: HydrationStatus) -> String {
-        status_line(self.count, &no_more_complete_than(&self.index, live))
-    }
-}
-
-/// Escalate the *kind* of a later status onto a recall, never its counts.
-///
-/// Not `observed`. That function compares two samples taken around a single
-/// query, where the earlier sample's `loaded` is a genuine lower bound on what
-/// the query read. Across a turn boundary that invariant does not hold, and
-/// because `observed` picks a winner by severity and then renders *that*
-/// sample's numbers, a recall taken at `Loading { loaded: 100 }` that later saw
-/// the loader `Degraded { loaded: 1536 }` rendered as
-/// "recalled 3 · only 1536 of 2048 entries loaded" -- advertising an index
-/// fifteen times more complete than the one the three memories came from. That
-/// is the over-claim this module exists to prevent, reintroduced by reusing a
-/// function outside the invariant it was written for.
-///
-/// So a worse live status contributes its kind, and the recall keeps its own
-/// counts. `Failed` carries no counts to keep.
-fn no_more_complete_than(recall: &HydrationStatus, live: HydrationStatus) -> HydrationStatus {
-    if severity(&live) <= severity(recall) {
-        return recall.clone();
-    }
-    match (recall, live) {
-        (HydrationStatus::Loading { loaded, total }, HydrationStatus::Degraded { reason, .. }) => {
-            HydrationStatus::Degraded {
-                loaded: *loaded,
-                total: *total,
-                reason,
-            }
-        }
-        // `Failed` carries no counts, so the live status stands. So does a
-        // worse status behind a `Ready` recall: that pair would render the live
-        // sample's counts as though they described the recall, which
-        // *understates* a complete recall rather than inflating a partial one.
-        // It is unreachable today -- `done` is monotone, so nothing leaves
-        // `Ready` for a worse state in-process -- and understating is the safe
-        // direction if it ever becomes reachable.
-        (_, live) => live,
+        status_line(self.count, &observed(self.index.clone(), live))
     }
 }
 
@@ -186,15 +178,20 @@ pub(crate) fn status_line(recalled: usize, status: &HydrationStatus) -> String {
         HydrationStatus::Ready { .. } => format!("🧠 recalled {recalled}"),
         // Say what fraction was searched, not just that something is happening:
         // "512 of 2048" tells a user whether to retry, and a spinner does not.
+        // "searching 0 of 2048" beside a nonzero recall is refuted by its own
+        // line, so the zero case names no count.
+        HydrationStatus::Loading { loaded: 0, total } => {
+            format!("🧠 recalled {recalled} · index still loading, {total} entries")
+        }
         HydrationStatus::Loading { loaded, total } => {
-            format!("🧠 recalled {recalled} · searching {loaded} of {total} entries")
+            format!("🧠 recalled {recalled} · searched at least {loaded} of {total} entries")
         }
         // Distinct from `Loading` because hydration has stopped, so the
         // wording must not imply progress is under way. It does not say the
         // state is permanent: `degrade` fires on any batch read error,
         // transient ones included, and a reload can clear it.
         HydrationStatus::Degraded { loaded, total, .. } => {
-            format!("🧠 recalled {recalled} · only {loaded} of {total} entries loaded")
+            format!("🧠 recalled {recalled} · at least {loaded} of {total} entries, index stopped short")
         }
         // Keeps `recalled`. Dropping it hid from the user that N memories had
         // in fact been injected into the prompt, which is the opposite of the
@@ -293,7 +290,7 @@ mod tests {
         // The escalation itself still happens: the line must not read as though
         // loading were merely still under way.
         assert!(
-            line.contains("only"),
+            line.contains("stopped short"),
             "did not adopt the worse kind: {line}"
         );
     }
@@ -306,6 +303,68 @@ mod tests {
             index: loading(100),
         };
         assert_eq!(recall.line_against(ready()), recall.line());
+    }
+
+    /// The recall site must not inflate either, not just the later refresh.
+    ///
+    /// Round 4 fixed the refresh; the same over-claim survived at the recall,
+    /// because `observed` returned the whole later sample when the kinds
+    /// differed, so an inflated status was baked into `Recall.index` before any
+    /// refresh could correct it. With `before = Loading { loaded: 100 }` and the
+    /// loader degrading at 1536 mid-read, the strip advertised an index fifteen
+    /// times more complete than the one the recall saw.
+    #[test]
+    fn test_a_degradation_during_the_read_keeps_the_earlier_count() {
+        let seen = observed(
+            loading(100),
+            HydrationStatus::Degraded {
+                loaded: 1536,
+                total: 2048,
+                reason: "late batch".into(),
+            },
+        );
+        assert_eq!(
+            seen,
+            HydrationStatus::Degraded {
+                loaded: 100,
+                total: 2048,
+                reason: "late batch".into()
+            },
+            "took the later sample's count for a read that could not have seen it"
+        );
+        let text = caveat(&seen).expect("a partial index owes a caveat");
+        assert!(text.contains("at least 100"), "{text}");
+        assert!(!text.contains("1536"), "{text}");
+        // Index-centric wording would be false of this count: 1536 entries
+        // loaded, not 100. Only a sentence about the read is true of both.
+        assert!(
+            text.contains("this read covered"),
+            "describes the index rather than the read: {text}"
+        );
+    }
+
+    /// A zero lower bound must not be stated as an absolute.
+    ///
+    /// `observed` returns the earlier sample, so "none have been read" is
+    /// emitted from a sample taken before the read ran -- and the read may have
+    /// matched three memories printed directly above it. Every other wording
+    /// here is a bound, which survives being stale; at zero that framing
+    /// collapses into a claim its own output refutes.
+    #[test]
+    fn test_a_zero_lower_bound_is_not_stated_as_an_absolute() {
+        let text = caveat(&loading(0)).expect("a partial index owes a caveat");
+        assert!(
+            !text.contains("none of"),
+            "asserts nothing was read, beside results that were: {text}"
+        );
+        assert!(text.contains("unknown"), "{text}");
+
+        let line = status_line(3, &loading(0));
+        assert!(
+            !line.contains("0 of 2048"),
+            "a line refuted by its own recall count: {line}"
+        );
+        assert!(line.contains('3'), "{line}");
     }
 
     /// Zero entries read is not reported as "at least 0 read".
@@ -351,11 +410,11 @@ mod tests {
         assert_eq!(status_line(3, &ready()), "🧠 recalled 3");
         assert_eq!(
             status_line(3, &loading(512)),
-            "🧠 recalled 3 · searching 512 of 2048 entries"
+            "🧠 recalled 3 · searched at least 512 of 2048 entries"
         );
         assert_eq!(
             status_line(3, &degraded()),
-            "🧠 recalled 3 · only 512 of 2048 entries loaded"
+            "🧠 recalled 3 · at least 512 of 2048 entries, index stopped short"
         );
     }
 
