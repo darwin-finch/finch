@@ -83,14 +83,16 @@ impl Tool for SearchMemoryTool {
         if results.is_empty() {
             return Ok(match caveat {
                 None => "No relevant memories found for this query.".to_string(),
-                // An unusable index searched nothing, so there is no "among the
-                // entries read" to speak of -- pairing the two produced the
-                // self-contradicting "No matches among the memories searched.
-                // The memory index is unavailable, so nothing could be read."
-                Some(caveat) if crate::memory_status::read_nothing(&index) => caveat,
-                // Deliberately not "no memories found": that would assert
-                // absence on the strength of an index that was not read.
-                Some(caveat) => format!("No matches among the entries that were read. {caveat}"),
+                // A lead that presupposes nothing.
+                //
+                // "No matches among the entries that were read" quietly asserts
+                // that entries *were* read, which is false for an index that
+                // never loaded -- and an earlier attempt to special-case that
+                // by asking whether the index had "read nothing" could not be
+                // answered, because `HydrationStatus::Failed` carries no count.
+                // Saying only what the search did needs no such answer, and is
+                // true in every state.
+                Some(caveat) => format!("The search returned no matches. {caveat}"),
             });
         }
 
@@ -507,6 +509,14 @@ mod tests {
         assert!(
             !result.contains("No relevant memories found"),
             "asserted absence on an index it never read: {result}"
+        );
+        // The lead sentence too, not just the caveat behind it. "No matches
+        // among the entries that were read" quietly asserts that entries were
+        // read, which is false here -- and nothing asserted the lead, so that
+        // regression shipped invisibly once already.
+        assert!(
+            !result.contains("entries that were read"),
+            "presupposes reads that never happened: {result}"
         );
         assert!(
             result.contains("unavailable"),

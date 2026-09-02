@@ -62,9 +62,7 @@ pub(crate) fn observed(before: HydrationStatus, after: HydrationStatus) -> Hydra
 pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
     match status {
         HydrationStatus::Ready { .. } => None,
-        // Zero read is not "at least 0 read": it is a nothing-was-read state,
-        // and pairing it with a "no matches among the entries read" lead made
-        // that lead vacuous.
+        // Zero read is not "at least 0 read".
         HydrationStatus::Loading { loaded: 0, total } => Some(format!(
             "The memory index is still loading and none of its {total} entries have been \
              read yet. Retrying shortly may reach some."
@@ -94,20 +92,11 @@ pub(crate) fn caveat(status: &HydrationStatus) -> Option<String> {
         // none had loaded. The honest sentence is the one that holds either
         // way.
         HydrationStatus::Failed { .. } => Some(
-            "The memory index is unavailable: hydration did not complete, so an unknown \
-             part of the store is missing from it."
+            "The memory index is unavailable: hydration did not complete, so how much of \
+             the store it holds is unknown."
                 .to_string(),
         ),
     }
-}
-
-/// Whether the index had read nothing at all, so a caller must not prefix its
-/// caveat with a claim about "the entries that were read".
-pub(crate) fn read_nothing(status: &HydrationStatus) -> bool {
-    // `Failed` is deliberately not here. Its `loaded` count is unknown, so
-    // claiming nothing was read would be a guess -- the same guess that made
-    // `found_any` wrong.
-    matches!(status, HydrationStatus::Loading { loaded: 0, .. })
 }
 
 /// What a turn recalled, together with the index it recalled from.
@@ -139,9 +128,11 @@ impl Recall {
 
     /// The line for a later refresh, which knows the live index too.
     ///
-    /// Takes the worse of the two, so it can never claim a more complete index
-    /// than the recall actually saw, and still surfaces a failure that happened
-    /// after the recall rather than holding the old state until the next turn.
+    /// Takes the worse *kind* and the recall's own *counts* -- not simply "the
+    /// worse of the two", which is what round 4 got wrong. So it can never
+    /// claim a more complete index than the recall saw, and still surfaces a
+    /// failure that happened after the recall rather than holding the old state
+    /// until the next turn.
     pub(crate) fn line_against(&self, live: HydrationStatus) -> String {
         status_line(self.count, &no_more_complete_than(&self.index, live))
     }
@@ -174,8 +165,13 @@ fn no_more_complete_than(recall: &HydrationStatus, live: HydrationStatus) -> Hyd
                 reason,
             }
         }
-        // A `Ready` recall has no smaller count to preserve, and `Failed` has
-        // no count at all; in both the live status stands.
+        // `Failed` carries no counts, so the live status stands. So does a
+        // worse status behind a `Ready` recall: that pair would render the live
+        // sample's counts as though they described the recall, which
+        // *understates* a complete recall rather than inflating a partial one.
+        // It is unreachable today -- `done` is monotone, so nothing leaves
+        // `Ready` for a worse state in-process -- and understating is the safe
+        // direction if it ever becomes reachable.
         (_, live) => live,
     }
 }
@@ -312,14 +308,9 @@ mod tests {
         assert_eq!(recall.line_against(ready()), recall.line());
     }
 
-    /// Zero entries read is not "at least 0 read".
+    /// Zero entries read is not reported as "at least 0 read".
     #[test]
     fn test_an_index_that_has_read_nothing_yet_does_not_talk_about_entries_read() {
-        assert!(read_nothing(&loading(0)));
-        assert!(!read_nothing(&loading(1)));
-        assert!(!read_nothing(&degraded()));
-        assert!(!read_nothing(&ready()));
-
         let text = caveat(&loading(0)).expect("a partial index owes a caveat");
         assert!(
             !text.contains("at least 0"),
@@ -345,10 +336,6 @@ mod tests {
         assert!(
             !text.contains("nothing could be read"),
             "denies reads that succeeded on the same screen: {text}"
-        );
-        assert!(
-            !read_nothing(&failed()),
-            "an unknown loaded count is not a known zero"
         );
         assert!(text.contains("unknown"), "{text}");
     }

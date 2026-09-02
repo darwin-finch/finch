@@ -107,3 +107,4 @@ pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2) // Offline Ed25519 commercial license key validation
 pub mod vm; // Typed stack IR, verifier, capabilities, and language contracts
+pub(crate) mod workbook; // Bounding a worksheet before calamine materialises it (#282)
