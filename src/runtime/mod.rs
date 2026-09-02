@@ -6953,7 +6953,13 @@ fn read_workbook_rows(
     Ok(rows)
 }
 
-fn workbook_cell_to_string(cell: &calamine::Data) -> String {
+/// Render one spreadsheet cell as the text a user or program sees.
+///
+/// `pub(crate)` so the TUI preview shares it. Two converters meant two answers
+/// for the same cell: the preview mapped cells with a bare `to_string()`, which
+/// is calamine's `Display`, which prints a date as its Excel serial -- the
+/// defect this function was fixed for, still live one module over.
+pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
     use calamine::Data;
 
     match cell {
@@ -6964,40 +6970,50 @@ fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         Data::Int(value) => value.to_string(),
         Data::Bool(value) => value.to_string(),
         Data::Error(value) => format!("#ERR:{value:?}"),
-        // Dates, not the serial underneath them.
+        // Elapsed time is not a point in time.
         //
-        // `Data::DateTime`'s `Display` prints the raw f64, so the catch-all
-        // that used to sit here rendered every date cell in every spreadsheet
-        // Finch reads as an opaque number -- 2026-09-02 came back as "46267"
-        // through `workbook-open`, `workbook-range` and `workbook-summary`
-        // alike (#281).
+        // A `[h]:mm:ss` cell holding 25 hours is `TimeDelta` with serial
+        // 1.0416…, and running that through `as_datetime` gives
+        // "1900-01-01 01:00:00" -- the Excel epoch leaking into the user's
+        // output, which is the exact failure this function was rewritten to
+        // remove. It leaked back in because the shape was chosen from the
+        // serial alone, and a duration's serial looks like a date's.
         //
-        // `as_datetime` is gated behind calamine's `dates` feature, which pulls
-        // chrono; Finch already depends on chrono, so enabling it adds nothing
-        // to the dependency graph.
-        //
-        // The serial is kept as the fallback rather than an empty string: a
-        // date outside chrono's range, or a duration-typed value, is still
-        // better read as the number the file holds than as nothing. Silence is
-        // the failure mode this fix exists to remove.
+        // `is_duration` is the type, and here the type is what decides.
+        Data::DateTime(value) if value.is_duration() => value.as_duration().map_or_else(
+            || value.as_f64().to_string(),
+            |duration| {
+                let seconds = duration.num_seconds();
+                let sign = if seconds < 0 { "-" } else { "" };
+                let seconds = seconds.unsigned_abs();
+                format!(
+                    "{sign}{}:{:02}:{:02}",
+                    seconds / 3600,
+                    (seconds % 3600) / 60,
+                    seconds % 60
+                )
+            },
+        ),
         Data::DateTime(value) => value.as_datetime().map_or_else(
             || value.as_f64().to_string(),
             |datetime| {
-                // Which of the three shapes to print is decided by the serial,
-                // not by `is_datetime()` -- that reports the cell's type, and
-                // returns true for a plain date, a date with a time, and a
-                // bare time alike. Rendering all three the same way gave
-                // "2026-09-02 00:00:00" for a date and "1899-12-31 13:45:30"
-                // for a time, the second of which leaks the Excel epoch into
-                // what the user sees.
+                // Which shape to print is decided by the serial, because
+                // `is_datetime` is true for a plain date, a date with a time,
+                // and a bare time alike. Rendering all three the same way gave
+                // "2026-09-02 00:00:00" for a date.
                 //
-                // A serial below 1.0 has no date part; one with no fractional
-                // part has no time part. A datetime at exactly midnight is
-                // therefore printed as a date, which is the one case this
-                // loses -- and it loses it in the direction of dropping a
-                // "00:00:00" that carries no information.
+                // The range is half-open at zero on purpose: a *negative*
+                // serial is not a time of day, and treating it as one dropped
+                // the sign, so -1.5 read as "12:00:00". Excel itself shows
+                // "####" for these; a pre-epoch date is at least derived from
+                // the value.
+                //
+                // Known limit: in a 1904-epoch workbook, serial 0 is
+                // 1904-01-01 and prints as "00:00:00". `ExcelDateTime` does not
+                // expose which epoch it carries, so that one day is
+                // indistinguishable from a midnight time-of-day.
                 let serial = value.as_f64();
-                if serial < 1.0 {
+                if (0.0..1.0).contains(&serial) {
                     datetime.format("%H:%M:%S").to_string()
                 } else if serial.fract() == 0.0 {
                     datetime.format("%Y-%m-%d").to_string()
@@ -7006,10 +7022,55 @@ fn workbook_cell_to_string(cell: &calamine::Data) -> String {
                 }
             },
         ),
-        // Already ISO-8601 text in the file; pass it through unchanged rather
-        // than round-tripping it through a parse that could fail.
-        Data::DateTimeIso(value) | Data::DurationIso(value) => value.clone(),
+        // ODS and `t="d"` cells carry ISO-8601 text rather than a serial.
+        // Normalised to the same shapes, so one logical cell reads the same
+        // whichever format it arrived in -- an ODS time came through as
+        // "PT13H45M30S", which is the encoding artefact this issue is about.
+        // Anything that does not match falls through unchanged rather than
+        // being lost.
+        Data::DateTimeIso(value) => normalize_iso_datetime(value),
+        Data::DurationIso(value) => normalize_iso_duration(value),
     }
+}
+
+/// `2026-09-02T13:45:30` becomes `2026-09-02 13:45:30`; a bare date stays one.
+fn normalize_iso_datetime(value: &str) -> String {
+    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            return parsed.format("%Y-%m-%d %H:%M:%S").to_string();
+        }
+    }
+    value.to_string()
+}
+
+/// `PT13H45M30S` becomes `13:45:30`, matching how a `[h]:mm:ss` cell reads.
+fn normalize_iso_duration(value: &str) -> String {
+    let Some(rest) = value.strip_prefix("PT") else {
+        return value.to_string();
+    };
+    let (mut hours, mut minutes, mut seconds, mut digits) = (0i64, 0i64, 0i64, String::new());
+    for character in rest.chars() {
+        match character {
+            '0'..='9' => digits.push(character),
+            '.' => digits.push(character),
+            unit => {
+                let Ok(amount) = digits.parse::<f64>() else {
+                    return value.to_string();
+                };
+                digits.clear();
+                match unit {
+                    'H' => hours = amount as i64,
+                    'M' => minutes = amount as i64,
+                    'S' => seconds = amount as i64,
+                    _ => return value.to_string(),
+                }
+            }
+        }
+    }
+    if !digits.is_empty() {
+        return value.to_string();
+    }
+    format!("{}:{minutes:02}:{seconds:02}", hours)
 }
 
 /// Materialize only a deliberately small rectangular projection into the VM.
@@ -10894,6 +10955,100 @@ mod tests {
         assert!(rows.is_empty(), "{rows:?}");
     }
 
+    /// Elapsed time must not become a date in 1900.
+    ///
+    /// A `[h]:mm:ss` cell holding 25 hours has serial 1.0416..., which looks
+    /// exactly like a date's -- so choosing the shape from the serial alone
+    /// rendered it "1900-01-01 01:00:00". That is the Excel epoch leaking into
+    /// the user's output, which is the failure this whole function exists to
+    /// remove, reintroduced by the first fix for it. Timesheets and run
+    /// durations are the ordinary reason to use `[h]:mm` at all.
+    #[test]
+    fn test_duration_cells_render_as_elapsed_time_not_as_dates() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        let duration = |serial| {
+            workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                serial,
+                ExcelDateTimeType::TimeDelta,
+                false,
+            )))
+        };
+        assert_eq!(duration(1.0416666666), "25:00:00");
+        assert_eq!(duration(2.0), "48:00:00");
+        assert_eq!(duration(0.5), "12:00:00");
+        // The sign is part of the value. Treating a negative serial as a time
+        // of day dropped it, so -36 hours read as "12:00:00".
+        assert_eq!(duration(-1.5), "-36:00:00");
+    }
+
+    /// A negative serial is not a time of day.
+    #[test]
+    fn test_a_negative_serial_keeps_its_magnitude() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        let rendered = workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+            -1.5,
+            ExcelDateTimeType::DateTime,
+            false,
+        )));
+        assert_eq!(rendered, "1899-12-29 12:00:00");
+        assert_ne!(
+            rendered, "12:00:00",
+            "dropped the sign and the date with it"
+        );
+    }
+
+    /// Out of chrono's range, the serial is a worse answer than a date and a
+    /// better one than silence.
+    #[test]
+    fn test_an_unrepresentable_serial_falls_back_to_the_number() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTime(ExcelDateTime::new(
+                1e9,
+                ExcelDateTimeType::DateTime,
+                false
+            ))),
+            "1000000000"
+        );
+    }
+
+    /// The same logical cell must read the same whichever format it came from.
+    ///
+    /// ODS carries ISO-8601 text rather than a serial, so a time arrived as
+    /// "PT13H45M30S" -- an encoding artefact of exactly the kind #281 is about,
+    /// beside an XLSX cell of the same value reading "13:45:30".
+    #[test]
+    fn test_iso_cells_normalize_to_the_same_shapes_as_serial_cells() {
+        use calamine::Data;
+
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTimeIso("2026-09-02T13:45:30".into())),
+            "2026-09-02 13:45:30"
+        );
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTimeIso("2026-09-02".into())),
+            "2026-09-02"
+        );
+        assert_eq!(
+            workbook_cell_to_string(&Data::DurationIso("PT13H45M30S".into())),
+            "13:45:30"
+        );
+        // Anything the normalisers do not recognise passes through rather than
+        // being mangled or lost: a day component is legal ISO-8601 and is not
+        // a shape this renders.
+        assert_eq!(
+            workbook_cell_to_string(&Data::DurationIso("P1DT2H".into())),
+            "P1DT2H"
+        );
+        assert_eq!(
+            workbook_cell_to_string(&Data::DateTimeIso("not a date".into())),
+            "not a date"
+        );
+    }
+
     /// A date cell must read as a date, not as the serial underneath it.
     ///
     /// `Data::DateTime`'s `Display` prints the raw f64, and
@@ -10948,7 +11103,11 @@ mod tests {
         sheet.write_number(0, 3, 42.5).unwrap();
         sheet.write_string(0, 4, "plain").unwrap();
 
-        let path = std::env::temp_dir().join("finch_workbook_dates_regression.xlsx");
+        // `tempfile::tempdir`, not a fixed name in the shared temp dir: two
+        // concurrent `cargo test` runs on one machine would collide on it, and
+        // one run's cleanup could delete the other's fixture mid-read.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dates.xlsx");
         workbook.save(&path).unwrap();
         let file = std::fs::File::open(&path).unwrap();
 
@@ -10964,7 +11123,6 @@ mod tests {
             ]],
             "a date read as its Excel serial, or a time carried the 1899 epoch"
         );
-        std::fs::remove_file(&path).ok();
     }
 
     /// And an ordinary workbook still comes back whole.

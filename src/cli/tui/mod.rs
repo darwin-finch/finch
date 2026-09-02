@@ -3451,8 +3451,14 @@ impl TuiRenderer {
                                     range
                                         .rows()
                                         .map(|row| {
+                                            // Shared with the typed runtime,
+                                            // not `to_string()`. That is
+                                            // calamine's `Display`, which
+                                            // prints a date as its Excel
+                                            // serial -- the #281 defect, live
+                                            // here too.
                                             row.iter()
-                                                .map(|c| c.to_string())
+                                                .map(crate::runtime::workbook_cell_to_string)
                                                 .collect::<Vec<String>>()
                                         })
                                         .collect(),
