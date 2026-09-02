@@ -1135,35 +1135,64 @@ impl MemorySystem {
         })
     }
 
-    /// Persist all MemTree nodes to the tree_nodes table in a single transaction.
+    /// Persist the MemTree nodes that changed, in a single transaction.
     ///
-    /// Nodes are written sorted by node_id (root first) so that the self-referential
-    /// FK constraint `parent_id → node_id` is satisfied for each INSERT.
+    /// Nodes are written in ascending node_id order (root first) so that the
+    /// self-referential FK `parent_id → node_id` is satisfied for each INSERT.
+    /// SQLite enforces it immediately, and a new node always takes a higher id
+    /// than the parent it attaches to, so ascending order is sufficient.
     ///
-    /// This replaces the old `save_node_to_db(leaf_id)` approach which only persisted
-    /// the newly inserted leaf.  That missed two things:
-    ///   1. The root node (id=0) was never written, causing FK violations because
-    ///      libsqlite3-sys bundles SQLite compiled with SQLITE_DEFAULT_FOREIGN_KEYS=1.
-    ///   2. Parent embeddings updated by `update_parent_aggregation` were never
-    ///      persisted, so embeddings went stale across process restarts.
+    /// Two guarantees this must keep, both of which an earlier
+    /// `save_node_to_db(leaf_id)` missed and which were the reason it was
+    /// widened to write everything:
+    ///   1. The root node (id=0) reaches the table, or children violate the FK
+    ///      (libsqlite3-sys bundles SQLite with SQLITE_DEFAULT_FOREIGN_KEYS=1).
+    ///      `MemTree::new_with_dim` marks the root dirty for exactly this.
+    ///   2. Parent embeddings updated by `update_parent_aggregation` are
+    ///      persisted, or they go stale across restarts. That walk marks every
+    ///      node whose embedding it rewrites.
+    ///
+    /// Writing *everything* kept both guarantees at a cost proportional to the
+    /// whole store: on the dogfood host, 16,782 rows and 131 MiB of embeddings
+    /// rewritten per turn, which is why its write-ahead log matched its
+    /// database at 142 MiB (#250).
     async fn save_all_nodes_to_db(
         &self,
         source: Option<(NodeId, &str, i64)>,
         promotion: Option<(NodeId, NodeId)>,
     ) -> Result<()> {
-        let mut nodes: Vec<TreeNode> = {
-            let tree = self.tree.lock().await;
-            tree.all_nodes().values().cloned().collect()
+        let (changed, nodes): (Vec<NodeId>, Vec<TreeNode>) = {
+            let mut tree = self.tree.lock().await;
+            let changed = tree.take_dirty();
+            let nodes = changed
+                .iter()
+                .filter_map(|id| tree.all_nodes().get(id).cloned())
+                .collect();
+            (changed, nodes)
         };
 
-        // Sort by node_id ascending so root (id=0) is written before its children.
-        // SQLite enforces the self-referential FK immediately (IMMEDIATE mode),
-        // so parent rows must exist before child rows within the transaction.
-        nodes.sort_by_key(|n| n.id);
+        // A failure below leaves the transaction uncommitted, so the drained
+        // ids have to go back; otherwise the tree believes it was persisted and
+        // the next successful save skips those nodes for good. Writing the
+        // whole tree every time made this impossible to get wrong, which is
+        // part of why it survived.
+        let written = self.write_nodes(&nodes, source, promotion).await;
+        if written.is_err() {
+            self.tree.lock().await.restore_dirty(changed);
+        }
+        written
+    }
 
+    /// Upsert exactly `nodes`, plus the provenance rows for this insert.
+    async fn write_nodes(
+        &self,
+        nodes: &[TreeNode],
+        source: Option<(NodeId, &str, i64)>,
+        promotion: Option<(NodeId, NodeId)>,
+    ) -> Result<()> {
         let conn = self.db.lock().await;
         let tx = conn.unchecked_transaction()?;
-        for node in &nodes {
+        for node in nodes {
             let embedding_bytes: Vec<u8> = node
                 .embedding
                 .iter()
@@ -1173,9 +1202,13 @@ impl MemorySystem {
             // row before reinserting it, and `memory_sources.node_id` is
             // declared `ON DELETE CASCADE` — so a plain REPLACE here silently
             // cascades away the provenance of every node it rewrites. Since
-            // this function rewrites the whole tree on every insert, that
-            // destroyed every source row except the one written later in the
-            // same transaction.
+            // this function used to rewrite the whole tree on every insert,
+            // that destroyed every source row except the one written later in
+            // the same transaction.
+            //
+            // (That rewrite is now scoped to the nodes that changed, so the
+            // blast radius is smaller -- but REPLACE would still cascade away
+            // the provenance of every node it did touch.)
             //
             // The dogfood store held 9 rows against 896 conversations. The
             // cascade alone accounts for all but one of those; the likely
@@ -1238,6 +1271,10 @@ impl MemorySystem {
             Self::load_tree_from_db_conn(&conn, &mut restored)?;
         }
         let nodes = restored.all_nodes().len();
+        // The tree was just built from the durable rows, so nothing in it is
+        // pending. `new_with_dim` marks the root dirty for the fresh-store
+        // case; here that row already exists.
+        restored.clear_dirty();
         *self.tree.lock().await = restored;
         // The tree now matches the durable snapshot, so whatever the loader
         // recorded no longer describes it. Leaving the failure set meant a
@@ -1908,6 +1945,184 @@ pub struct MemoryStats {
 
 #[cfg(test)]
 mod tests {
+
+    /// Count writes to `tree_nodes` made by one closure.
+    ///
+    /// A trigger rather than `Connection::total_changes`, because the store
+    /// keeps its connection private: triggers belong to the database, so a
+    /// probe installed from a second connection sees writes made through the
+    /// first. `ON CONFLICT DO UPDATE` fires the update trigger even when every
+    /// column is rewritten to the value it already held, which is exactly the
+    /// work this measures.
+    fn tree_node_writes(db_path: &std::path::Path) -> Result<i64> {
+        let conn = Connection::open(db_path)?;
+        conn.query_row("SELECT COUNT(*) FROM write_probe", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    fn install_write_probe(db_path: &std::path::Path) -> Result<()> {
+        Connection::open(db_path)?.execute_batch(
+            "CREATE TABLE IF NOT EXISTS write_probe (n INTEGER);
+             DROP TRIGGER IF EXISTS probe_tree_insert;
+             DROP TRIGGER IF EXISTS probe_tree_update;
+             CREATE TRIGGER probe_tree_insert AFTER INSERT ON tree_nodes
+                 BEGIN INSERT INTO write_probe VALUES (1); END;
+             CREATE TRIGGER probe_tree_update AFTER UPDATE ON tree_nodes
+                 BEGIN INSERT INTO write_probe VALUES (1); END;
+             DELETE FROM write_probe;",
+        )?;
+        Ok(())
+    }
+
+    /// Build a store holding `turns` distinct memories and report how many
+    /// `tree_nodes` rows one further insert writes.
+    async fn writes_for_one_more_insert(turns: usize) -> Result<(i64, usize)> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        for i in 0..turns {
+            memory
+                .insert_conversation(
+                    "user",
+                    &format!("a distinct memory numbered {i}"),
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        let nodes = memory.stats().await?.tree_node_count;
+
+        install_write_probe(temp.path())?;
+        memory
+            .insert_conversation("user", "one more entirely distinct memory", None, None)
+            .await?;
+        Ok((tree_node_writes(temp.path())?, nodes))
+    }
+
+    /// Everything the tree holds reaches disk, across promotions and dedup.
+    ///
+    /// This is the guard the incremental save needs and the old whole-tree
+    /// write did not. Writing every node on every insert made a forgotten
+    /// write impossible; writing only the marked ones makes a forgotten *mark*
+    /// silent data loss. So this reloads the store from disk in a fresh
+    /// process-equivalent and requires the durable rows to carry every text
+    /// the in-memory tree has.
+    ///
+    /// The inputs are chosen to exercise all three mutation paths: distinct
+    /// texts attach children, near-duplicates promote leaves into parents, and
+    /// exact repeats take the dedup path that only bumps importance.
+    #[tokio::test]
+    async fn test_every_inserted_memory_survives_a_reload() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+
+        let expected: Vec<String> = {
+            let memory = MemorySystem::new(config.clone())?;
+            for i in 0..40 {
+                memory
+                    .insert_conversation(
+                        "user",
+                        &format!("a distinct memory numbered {i}"),
+                        None,
+                        None,
+                    )
+                    .await?;
+                // Near-duplicate: close enough to descend to the same leaf and
+                // promote it rather than attach beside it.
+                memory
+                    .insert_conversation(
+                        "user",
+                        &format!("a distinct memory numbered {i} indeed"),
+                        None,
+                        None,
+                    )
+                    .await?;
+                // Exact repeat: the dedup path, which creates no node.
+                memory
+                    .insert_conversation(
+                        "user",
+                        &format!("a distinct memory numbered {i}"),
+                        None,
+                        None,
+                    )
+                    .await?;
+            }
+            let tree = memory.tree.lock().await;
+            let mut texts: Vec<String> =
+                tree.all_nodes().values().map(|n| n.text.clone()).collect();
+            texts.sort();
+            texts
+        };
+
+        // Reopen from the same file. `MemorySystem::new` hydrates from disk, so
+        // this is the restart path.
+        let reopened = MemorySystem::new(config)?;
+        reopened.ensure_hydrated().await?;
+        let restored: Vec<String> = {
+            let tree = reopened.tree.lock().await;
+            let mut texts: Vec<String> =
+                tree.all_nodes().values().map(|n| n.text.clone()).collect();
+            texts.sort();
+            texts
+        };
+
+        assert_eq!(
+            restored, expected,
+            "the durable rows must carry every text the tree held; a node whose \
+             mutation forgot to mark it dirty is lost here and nowhere else"
+        );
+        Ok(())
+    }
+
+    /// One new memory must not rewrite every node in the tree.
+    ///
+    /// `save_all_nodes_to_db` collects `tree.all_nodes()` and upserts each one
+    /// on every insert, so the cost of storing one memory is proportional to
+    /// everything stored before it. #250 measured the consequence on the
+    /// dogfood host: a 142 MiB store with a 142 MiB write-ahead log, because
+    /// each save rewrote all 16,782 rows and 131 MiB of embeddings.
+    ///
+    /// Asserted as size-independence rather than a fixed ceiling. What a
+    /// correct save writes is the new leaf and the ancestors whose aggregate
+    /// embedding it changed -- bounded by depth, which grows with the log of
+    /// the content, not with the row count. So the test grows the tree
+    /// fourfold and requires the per-insert write count not to follow. A fixed
+    /// ceiling would either be loose enough to pass the defect at small sizes
+    /// or tight enough to break when the aggregation path legitimately
+    /// lengthens.
+    #[tokio::test]
+    async fn test_one_new_memory_does_not_rewrite_the_whole_tree() -> Result<()> {
+        let (small_writes, small_nodes) = writes_for_one_more_insert(30).await?;
+        let (large_writes, large_nodes) = writes_for_one_more_insert(120).await?;
+
+        assert!(
+            large_nodes >= small_nodes * 3,
+            "the fixture must actually grow the tree, or this test cannot fail \
+             for the reason it exists: {small_nodes} -> {large_nodes}"
+        );
+        assert!(
+            small_writes > 0,
+            "the probe must observe the save at all, or the comparison below \
+             is between two zeroes"
+        );
+        assert!(
+            large_writes <= small_writes + 8,
+            "storing one memory wrote {small_writes} rows into a {small_nodes}-node \
+             tree and {large_writes} into a {large_nodes}-node one, so the cost of \
+             remembering something is proportional to everything remembered before \
+             it -- which is what filled the dogfood store's write-ahead log (#250)"
+        );
+        Ok(())
+    }
+
     use super::*;
     use tempfile::NamedTempFile;
 

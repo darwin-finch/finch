@@ -11,7 +11,7 @@
 
 use super::embeddings::{average_embeddings, cosine_similarity};
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Node ID in the tree
 pub type NodeId = u64;
@@ -92,6 +92,20 @@ pub struct TreeNode {
 
 /// MemTree - Hierarchical semantic memory structure
 pub struct MemTree {
+    /// Nodes whose persisted columns have changed since the last save.
+    ///
+    /// Persistence used to write every node on every insert, so the cost of
+    /// storing one memory was proportional to everything stored before it --
+    /// 16,782 rows and 131 MiB of embeddings rewritten per turn on the dogfood
+    /// host, which is what filled a 142 MiB write-ahead log (#250).
+    ///
+    /// Only the tree's own mutators record here. `all_nodes_mut` deliberately
+    /// does not: its callers are the hydration paths, which are reconstructing
+    /// the tree *from* the durable rows and must not mark them for rewriting.
+    /// The cost of that choice is that a future mutator which forgets to mark
+    /// loses data rather than merely writing too much, so
+    /// `test_every_inserted_memory_survives_a_reload` exists to catch it.
+    dirty: HashSet<NodeId>,
     root: NodeId,
     nodes: HashMap<NodeId, TreeNode>,
     next_id: NodeId,
@@ -129,6 +143,10 @@ impl MemTree {
             root: root_id,
             nodes,
             next_id: 1,
+            // The root is synthetic and never inserted, but it has to reach
+            // the table before any child does: `parent_id` is a
+            // self-referential foreign key and SQLite enforces it immediately.
+            dirty: HashSet::from([root_id]),
         }
     }
 
@@ -206,6 +224,7 @@ impl MemTree {
             if let Some(node) = self.nodes.get_mut(&existing) {
                 if importance > node.importance {
                     node.importance = importance;
+                    self.dirty.insert(existing);
                 }
             }
             return Ok(InsertEffect {
@@ -342,10 +361,15 @@ impl MemTree {
             },
         );
 
+        self.dirty.insert(new_id);
+
         let parent = self
             .nodes
             .get_mut(&parent_id)
             .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found", parent_id))?;
+        // `children` is rebuilt from `parent_id` at load, so the parent needs
+        // no row of its own for this -- but `update_parent_aggregation` is
+        // about to rewrite its embedding, and that marks it.
         parent.children.push(new_id);
 
         self.update_parent_aggregation(parent_id)?;
@@ -416,6 +440,9 @@ impl MemTree {
                 importance,
             },
         );
+
+        self.dirty.insert(moved_id);
+        self.dirty.insert(inserted_id);
 
         let promoted = self
             .nodes
@@ -502,6 +529,7 @@ impl MemTree {
                 anyhow::anyhow!("memtree: node {id} disappeared before its embedding update")
             })?;
             node.embedding = aggregated;
+            self.dirty.insert(id);
         }
 
         Ok(())
@@ -561,6 +589,38 @@ impl MemTree {
     /// Mutable access to nodes map (used by persistence layer to reconstruct tree).
     pub fn all_nodes_mut(&mut self) -> &mut HashMap<NodeId, TreeNode> {
         &mut self.nodes
+    }
+
+    /// Take the set of nodes whose persisted columns changed, clearing it.
+    ///
+    /// The caller is committing them; anything it does not write is lost, so
+    /// this drains rather than copies only because the write happens in the
+    /// same transaction. A failed save must put them back -- see
+    /// `restore_dirty`.
+    pub fn take_dirty(&mut self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self.dirty.drain().collect();
+        // Ascending, so a parent row lands before the child that references
+        // it. New nodes always take a higher id than the parent they attach
+        // to, and the root is 0.
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Put drained ids back after a save that did not commit.
+    ///
+    /// Without this a failed transaction would leave the tree believing it had
+    /// been persisted, and the next successful save would skip those nodes
+    /// permanently.
+    pub fn restore_dirty(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        self.dirty.extend(ids);
+    }
+
+    /// Forget pending changes, because the tree now matches the durable rows.
+    ///
+    /// Only for the hydration paths, which replace the tree wholesale from
+    /// disk.
+    pub fn clear_dirty(&mut self) {
+        self.dirty.clear();
     }
 
     /// Set the next_id counter (used after loading from disk to avoid ID collisions).
