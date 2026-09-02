@@ -6971,6 +6971,17 @@ pub(crate) fn workbook_cell_to_string(cell: &calamine::Data) -> String {
         Data::Float(value) if value.fract() == 0.0 && value.abs() < 9.0e18 => {
             format!("{}", *value as i64)
         }
+        // Past i64, exponent notation rather than the decimal expansion.
+        // The cast used to saturate, so 1e300 rendered as
+        // 9223372036854775807; routing it to `to_string()` instead would have
+        // put a 301-character cell in the grid and the TUI preview.
+        Data::Float(value)
+            if value.is_finite()
+                && *value != 0.0
+                && (value.fract() == 0.0 || value.abs() < 1.0e-10) =>
+        {
+            format!("{value:e}")
+        }
         Data::Float(value) => value.to_string(),
         Data::Int(value) => value.to_string(),
         Data::Bool(value) => value.to_string(),
@@ -7046,8 +7057,10 @@ fn workbook_serial_is_renderable(serial: f64) -> bool {
 
 /// `4500` seconds becomes `1:15:00`, carrying minutes and seconds.
 fn format_elapsed_seconds(seconds: f64) -> String {
-    let negative = seconds < 0.0;
     let total = seconds.abs().round() as i64;
+    // After rounding, not before: -0.4 seconds is zero elapsed time, and
+    // "-0:00:00" is not a reading anyone wants.
+    let negative = seconds < 0.0 && total != 0;
     format!(
         "{}{}:{:02}:{:02}",
         if negative { "-" } else { "" },
@@ -7067,25 +7080,31 @@ fn format_elapsed_seconds(seconds: f64) -> String {
 ///
 /// Anything that does not parse is returned untouched.
 fn normalize_iso_datetime(value: &str) -> String {
-    // RFC 3339 first, because chrono's `%:z` does not accept the bare `Z` that
-    // an ODF file is entirely likely to carry.
-    let offset_parsed = chrono::DateTime::parse_from_rfc3339(value)
+    // RFC 3339 first, because chrono's `%:z` does not accept the bare `Z` an
+    // ODF file is entirely likely to carry. RFC 3339 requires seconds, so a
+    // minute-precision `...T13:45Z` is rewritten to an explicit offset rather
+    // than left as the one `Z` form that slips past.
+    let with_offset = value
+        .strip_suffix('Z')
+        .map_or_else(|| value.to_string(), |rest| format!("{rest}+00:00"));
+    let parsed = chrono::DateTime::parse_from_rfc3339(&with_offset)
         .ok()
         .or_else(|| {
             ["%Y-%m-%dT%H:%M:%S%.f%:z", "%Y-%m-%dT%H:%M%:z"]
                 .iter()
-                .find_map(|format| chrono::DateTime::parse_from_str(value, format).ok())
+                .find_map(|format| chrono::DateTime::parse_from_str(&with_offset, format).ok())
         });
-    for parsed in offset_parsed {
-        {
-            let naive = parsed.naive_local();
-            let offset = parsed.offset().to_string();
-            return if naive.time() == chrono::NaiveTime::MIN {
-                format!("{}{offset}", naive.format("%Y-%m-%d"))
-            } else {
-                format!("{}{offset}", naive.format("%Y-%m-%d %H:%M:%S"))
-            };
-        }
+    if let Some(parsed) = parsed {
+        // The time is kept whenever an offset is: dropping it glued the offset
+        // straight onto the date and produced "2026-09-02-05:00", which parses
+        // as nothing and reads as a date with garbage after it. The midnight
+        // rule exists to match the serial path, and the serial path has no
+        // offset to dangle.
+        return format!(
+            "{}{}",
+            parsed.naive_local().format("%Y-%m-%d %H:%M:%S"),
+            parsed.offset()
+        );
     }
     for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"] {
         if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, format) {
@@ -11044,6 +11063,36 @@ mod tests {
         assert!(rows.is_empty(), "{rows:?}");
     }
 
+    /// A number too big or small for a decimal must not become one.
+    ///
+    /// The whole-float arm cast to i64 unchecked, so 1e300 rendered as
+    /// 9223372036854775807 -- and simply removing the cast would have put a
+    /// 301-character cell in the grid and the TUI preview instead. A subnormal
+    /// already did exactly that: 5e-324 expanded to 326 characters.
+    #[test]
+    fn test_extreme_floats_use_exponent_notation_rather_than_expanding() {
+        use calamine::Data;
+
+        let float = |value: f64| workbook_cell_to_string(&Data::Float(value));
+
+        assert_eq!(float(1.0e300), "1e300");
+        assert_eq!(float(5.0e-324), "5e-324");
+        assert!(
+            float(1.0e300).len() < 10,
+            "expanded a huge float into the grid"
+        );
+        assert_ne!(
+            float(1.0e300),
+            "9223372036854775807",
+            "the i64 cast saturated"
+        );
+        // Ordinary spreadsheet numbers are untouched.
+        assert_eq!(float(42.5), "42.5");
+        assert_eq!(float(42.0), "42");
+        assert_eq!(float(0.0), "0");
+        assert_eq!(float(-7.0), "-7");
+    }
+
     /// A crafted workbook must not take the process down.
     ///
     /// `ExcelDateTime::as_duration` and `as_datetime` both compute
@@ -11103,10 +11152,15 @@ mod tests {
         assert_eq!(iso("PT13H45M75S"), "13:46:15");
         // The sign is part of the value here too.
         assert_eq!(iso("-PT01H00M00S"), "-1:00:00");
-        // A fraction on the lowest component is legal and is not truncation
-        // bait.
+        // Strict `xs:duration` allows a fraction only on seconds; accepting it
+        // on hours and minutes too is deliberate leniency, and better than the
+        // silent truncation to "1:00:00" it replaces.
         assert_eq!(iso("PT1.5H"), "1:30:00");
         assert_eq!(iso("PT0.5H"), "0:30:00");
+        // Rounding to zero drops the sign: "-0:00:00" is not a reading anyone
+        // wants.
+        assert_eq!(iso("-PT0.4S"), "0:00:00");
+        assert_eq!(iso("-PT1H"), "-1:00:00");
 
         // Everything below is returned untouched, which is the contract.
         for unrecognised in [
@@ -11142,9 +11196,22 @@ mod tests {
             iso("2026-09-02T13:45:30+01:00"),
             "2026-09-02 13:45:30+01:00"
         );
+        // Minute precision with a bare `Z` too: RFC 3339 requires seconds, so
+        // that one form slipped past the fallback the comment claimed covered
+        // it.
+        assert_eq!(iso("2026-09-02T13:45Z"), "2026-09-02 13:45:00+00:00");
         // Midnight drops its time, as the serial path does. The two must agree,
         // or the same logical cell reads differently by format.
         assert_eq!(iso("2026-09-02T00:00:00"), "2026-09-02");
+        // But not when an offset is present. Dropping the time glued the
+        // offset onto the date and produced "2026-09-02-05:00", which parses
+        // as nothing and reads as a date with garbage after it -- the exact
+        // intersection of the two rules this function added.
+        assert_eq!(
+            iso("2026-09-02T00:00:00-05:00"),
+            "2026-09-02 00:00:00-05:00"
+        );
+        assert_eq!(iso("2026-09-02T00:00:00Z"), "2026-09-02 00:00:00+00:00");
         assert_eq!(iso("2026-09-02"), "2026-09-02");
         assert_eq!(iso("not a date"), "not a date");
     }
