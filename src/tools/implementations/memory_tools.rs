@@ -78,7 +78,7 @@ impl Tool for SearchMemoryTool {
             .query_with_sources(query, Some(limit))
             .await?;
         let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
-        let caveat = crate::memory_status::caveat(&index, !results.is_empty());
+        let caveat = crate::memory_status::caveat(&index);
 
         if results.is_empty() {
             return Ok(match caveat {
@@ -202,12 +202,12 @@ impl Tool for InspectMemoryTool {
         let index = crate::memory_status::observed(before, self.memory_system.hydration_status());
         let Some(memory) = found else {
             let caveat = from_index
-                .then(|| crate::memory_status::caveat(&index, false))
+                .then(|| crate::memory_status::caveat(&index))
                 .flatten();
             return Ok(match caveat {
                 None => format!("No memory found for memory_id={memory_id}"),
                 Some(caveat) => {
-                    format!("No memory with memory_id={memory_id} is in the loaded index. {caveat}")
+                    format!("No memory with memory_id={memory_id} was found in the index. {caveat}")
                 }
             });
         };
@@ -528,6 +528,16 @@ mod tests {
     /// Waits for a settled status rather than asserting immediately: `new`
     /// returns while the loader is still running, so an immediate assert would
     /// be a race that passes or fails by timing.
+    ///
+    /// The batched path is guaranteed by construction, not by an assertion.
+    /// `MemorySystem::new` dispatches on `Handle::runtime_flavor()`, so
+    /// `flavor = "multi_thread"` is what selects the spawned loader. An earlier
+    /// version asserted the status was `Loading` the instant `new` returned to
+    /// prove it; that is a head start, not a guarantee, and the obvious
+    /// weakening -- asserting the status is not `Ready` -- does not
+    /// discriminate at all, since the synchronous path lands on `Failed` here
+    /// too. Nothing observable from outside `src/memory` separates the two
+    /// without a race, so this says so rather than shipping a knowing flake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_search_qualifies_its_answer_when_the_batched_loader_fails() -> Result<()> {
         let temp = NamedTempFile::new()?;
@@ -550,22 +560,6 @@ mod tests {
             use_neural_embeddings: false,
             ..Default::default()
         })?);
-        // Pin the path, not just the outcome. `HydrationState::new` seeds
-        // `done` only when the store is empty, and this fixture is not, so on
-        // the spawned path the status still reads `Loading` when `new` returns
-        // -- the main thread has a few instructions' head start on the worker
-        // -- while the synchronous path has already finished. Cut the
-        // `MultiThread` arm out of `MemorySystem::new` and this assertion
-        // fails, which is what makes the test cover the batched loader rather
-        // than merely coexist with it.
-        assert!(
-            matches!(
-                memory.hydration_status(),
-                crate::memory::HydrationStatus::Loading { .. }
-            ),
-            "no background loader was spawned, so this is the synchronous path: {:?}",
-            memory.hydration_status()
-        );
         let settled = settled_hydration(&memory).await;
         assert!(
             matches!(settled, crate::memory::HydrationStatus::Failed { .. }),

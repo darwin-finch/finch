@@ -5139,7 +5139,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         ),
                     ));
                 }
-                if let Some(caveat) = crate::memory_status::caveat(&observed, !values.is_empty()) {
+                if let Some(caveat) = crate::memory_status::caveat(&observed) {
                     tracing::warn!(%caveat, "mem-recall answered from a partial memory index");
                 }
                 return Ok(vec![TypedValue::List {
