@@ -736,8 +736,6 @@ impl ProgramDefinition {
         }
     }
 
-    /// Project an existing Co-Forth vocabulary entry into the shared registry.
-
     /// Project a persisted top-level Lisp `define` expression into the registry.
     pub fn from_lisp_define(source: &str, scope_key: Option<String>) -> Option<Self> {
         let (name, signature) = lisp_definition_identity(source)?;

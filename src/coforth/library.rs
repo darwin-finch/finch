@@ -48,15 +48,6 @@ fn default_kind() -> String {
 }
 
 impl WordEntry {
-    pub fn poset_kind(&self) -> crate::poset::NodeKind {
-        match self.kind.as_str() {
-            "task" => crate::poset::NodeKind::Task,
-            "constraint" => crate::poset::NodeKind::Constraint,
-            "question" => crate::poset::NodeKind::Question,
-            _ => crate::poset::NodeKind::Observation,
-        }
-    }
-
     /// A word is complete when its English and code agree.
     /// A word with Forth code but no proof is incomplete — the English and the
     /// machine have not been shown to say the same thing.
@@ -93,10 +84,15 @@ impl Library {
     /// Load seed vocabulary + generated English library + user extensions.
     ///
     /// Load order (later entries override earlier ones for the same word):
-    ///   1. SEED_LIBRARY        — philosophical/abstract primitives (~80 words)
-    ///   2. ENGLISH_LIBRARY     — generated comprehensive lexicon (baked in at compile time)
-    ///   3. {git_root}/vocabulary/*.toml — project-local per-language modules (versioned in repo)
-    ///   4. ~/.finch/library.toml — user-global additions and overrides
+    ///   1. SEED_LIBRARY — the baked-in lexicon. Measured, not estimated: it
+    ///      alone yields 3,144 words, so a binary run outside a checkout still
+    ///      has almost the whole vocabulary. The previous version of this list
+    ///      called it "~80 words" and named an `ENGLISH_LIBRARY` step that has
+    ///      never existed.
+    ///   2. {git_root}/vocabulary/*.toml — project-local modules, versioned in
+    ///      the repo. Adds 80 words on top of the seed, so `finch library list`
+    ///      reports 3,224 inside a checkout and 3,144 outside one.
+    ///   3. ~/.finch/library.toml — user-global additions and overrides
     pub fn load() -> Self {
         let mut lib = Self::default();
         lib.load_toml(SEED_LIBRARY);
@@ -331,6 +327,14 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
 /// Project English vocabulary — baked in at compile time.
+// Unread. `load` takes these two files from disk under `{git_root}/vocabulary`,
+// not from the baked-in copy, so nothing consumes either const today -- their
+// only reader was the `BUILTIN_DEFS` static removed in #298.
+//
+// Kept rather than deleted because they are the obvious material for closing
+// the 80-word gap between a checkout and a shipped binary, and deleting them
+// would quietly remove that option. That is a decision worth making
+// deliberately rather than as a side effect of a dead-code sweep.
 pub const EN_LIBRARY: &str = include_str!("../../vocabulary/en.toml");
 
 /// Project Chinese vocabulary — baked in at compile time.

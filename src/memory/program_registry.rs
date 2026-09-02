@@ -167,8 +167,6 @@ impl MemorySystem {
         })
     }
 
-    /// Project the existing Co-Forth library into the registry in one transaction.
-
     /// Load canonical `.forth` and `.lisp` files and update the searchable index.
     pub async fn sync_program_files(
         &self,

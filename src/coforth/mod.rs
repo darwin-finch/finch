@@ -9,8 +9,7 @@
 /// - `Library` — the full vocabulary, loaded from embedded TOML + optional
 ///   user-extended `~/.finch/library.toml`.
 /// - `Library::lookup` — find a word and its neighbours.
-/// - `Library::related` — walk the graph N hops from a seed word.
-/// - `Library::inject_into_poset` — seed a poset with a word's neighbourhood.
+/// - `Library::all_words` / `all_entries` — the whole vocabulary, for `finch library`.
 ///
 /// The interpreter this vocabulary was written for is gone (#294). A `Forth`
 /// VM *was* constructed in non-test code, by a `LazyLock` this change removed
