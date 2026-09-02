@@ -4196,6 +4196,8 @@ mod tests {
 
     #[test]
     fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation() {
+        const IPC_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4203,8 +4205,14 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async {
             let temp = tempfile::tempdir().unwrap();
-            let socket_path = temp.path().join("finch.sock");
-            let _socket_path = crate::ipc::transport::set_test_sock_path(socket_path.clone());
+            let supervised_proof = crate::brain::isolated_test_proof_if_present().unwrap();
+            let socket_path = supervised_proof
+                .as_ref()
+                .map(|proof| proof.ipc_socket.clone())
+                .unwrap_or_else(|| temp.path().join("finch.sock"));
+            let _socket_path = supervised_proof.is_none().then(|| {
+                crate::ipc::transport::set_test_sock_path(socket_path.clone())
+            });
             let store = crate::brain::store::BrainStore::with_root(
                 "box.local",
                 Some(temp.path().join("brains")),
@@ -4221,13 +4229,22 @@ mod tests {
             let shutdown = tokio_util::sync::CancellationToken::new();
             let server_task =
                 tokio::task::spawn_local(super::start_ipc_server(server.clone(), shutdown.clone()));
-            tokio::time::timeout(std::time::Duration::from_millis(250), async {
-                while !socket_path.exists() {
-                    tokio::task::yield_now().await;
+            if supervised_proof.is_none() {
+                if tokio::time::timeout(IPC_TEST_BOUND, async {
+                    while !socket_path.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_err()
+                {
+                    panic!(
+                        "IPC server did not publish socket {} within {IPC_TEST_BOUND:?}; server_task_finished={}",
+                        socket_path.display(),
+                        server_task.is_finished()
+                    );
                 }
-            })
-            .await
-            .unwrap();
+            }
 
             let participant = crate::ipc::IpcClient::connect_path(socket_path.clone())
                 .await
@@ -4279,7 +4296,7 @@ mod tests {
                 .brain_start_speculative("shared", &attachment, "request approval".into())
                 .await
                 .unwrap();
-            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            if tokio::time::timeout(IPC_TEST_BOUND, async {
                 loop {
                     let current = store.snapshot("shared").unwrap();
                     if current.events.iter().any(|event| {
@@ -4300,17 +4317,44 @@ mod tests {
                 }
             })
             .await
-            .expect("reverse approval did not become durable");
+            .is_err()
+            {
+                let snapshot = store.snapshot("shared").unwrap();
+                let run_status = store.inspect_run("shared", run.run_id).unwrap().status;
+                panic!(
+                    "reverse approval did not become durable within {IPC_TEST_BOUND:?}; run_id={:?}; run_status={run_status:?}; event_count={}",
+                    run.run_id,
+                    snapshot.events.len()
+                );
+            }
 
             let old_connection = attachment.connection_id.unwrap();
             drop(participant_events);
             drop(participant);
-            let error = tokio::time::timeout(std::time::Duration::from_millis(250), failed_rx)
-                .await
-                .expect("physical IPC loss did not fail approval promptly")
-                .unwrap();
+            let error = match tokio::time::timeout(IPC_TEST_BOUND, failed_rx).await {
+                Ok(Ok(error)) => error,
+                Ok(Err(error)) => panic!(
+                    "reverse approval callback closed without reporting the disconnect; run_id={:?}; channel_error={error}",
+                    run.run_id
+                ),
+                Err(_) => {
+                    let run_status = store.inspect_run("shared", run.run_id).unwrap().status;
+                    let connection_still_live = store
+                        .require_connection(
+                            "shared",
+                            attachment.attachment_id,
+                            old_connection,
+                        )
+                        .is_ok();
+                    panic!(
+                        "physical IPC loss did not fail approval within {IPC_TEST_BOUND:?}; run_id={:?}; run_status={run_status:?}; attachment_id={:?}; connection_id={old_connection:?}; connection_still_live={connection_still_live}",
+                        run.run_id,
+                        attachment.attachment_id
+                    );
+                }
+            };
             assert!(error.contains("approval audience disconnected"), "{error}");
-            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            if tokio::time::timeout(IPC_TEST_BOUND, async {
                 while store
                     .require_connection("shared", attachment.attachment_id, old_connection)
                     .is_ok()
@@ -4319,7 +4363,15 @@ mod tests {
                 }
             })
             .await
-            .expect("physical IPC loss did not detach exact generation");
+            .is_err()
+            {
+                let run_status = store.inspect_run("shared", run.run_id).unwrap().status;
+                panic!(
+                    "physical IPC loss did not detach the exact generation within {IPC_TEST_BOUND:?}; run_id={:?}; run_status={run_status:?}; attachment_id={:?}; connection_id={old_connection:?}",
+                    run.run_id,
+                    attachment.attachment_id
+                );
+            }
 
             let replacement = crate::ipc::IpcClient::connect_path(socket_path)
                 .await
