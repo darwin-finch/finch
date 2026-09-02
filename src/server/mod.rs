@@ -1207,6 +1207,112 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
+    async fn serve_http2_test_router(
+        app: axum::Router,
+    ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP/2 server fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("HTTP/2 server fixture must expose its bound address");
+        let serving = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        (address, serving)
+    }
+
+    #[tokio::test]
+    async fn production_router_health_completes_over_http2_prior_knowledge() {
+        let (_state, server) = isolated_http_server();
+        let (address, serving) = serve_http2_test_router(isolated_http_router(server)).await;
+        let socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("HTTP/2 client fixture must connect to Finch's production router");
+        let (mut client, connection) = h2::client::handshake(socket)
+            .await
+            .expect("HTTP/2 client fixture handshake must complete");
+        let connection = tokio::spawn(connection);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("http://{address}/health"))
+            .version(axum::http::Version::HTTP_2)
+            .body(())
+            .expect("HTTP/2 health request must be valid");
+        let (response, _) = client
+            .send_request(request, true)
+            .expect("HTTP/2 health request headers must send");
+
+        let response = tokio::time::timeout(tokio::time::Duration::from_secs(2), response)
+            .await
+            .expect("Finch's normal HTTP/2 health response must be bounded")
+            .expect("Finch's normal HTTP/2 health response must complete");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "Finch's production health route must succeed over HTTP/2"
+        );
+
+        serving.abort();
+        connection.abort();
+        let _ = serving.await;
+        let _ = connection.await;
+    }
+
+    #[tokio::test]
+    async fn production_router_rejects_excess_undrained_empty_http2_data_frames() {
+        let (_state, server) = isolated_http_server();
+        let app = isolated_http_router(server).route(
+            "/_test/undrained-body",
+            axum::routing::post(|request: axum::extract::Request| async move {
+                let _undrained_request = request;
+                std::future::pending::<axum::http::StatusCode>().await
+            }),
+        );
+        let (address, serving) = serve_http2_test_router(app).await;
+        let socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("HTTP/2 client fixture must connect to Finch's production router");
+        let (mut client, connection) = h2::client::handshake(socket)
+            .await
+            .expect("HTTP/2 client fixture handshake must complete");
+        let connection = tokio::spawn(connection);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{address}/_test/undrained-body"))
+            .version(axum::http::Version::HTTP_2)
+            .body(())
+            .expect("HTTP/2 undrained-body request must be valid");
+        let (response, mut body) = client
+            .send_request(request, false)
+            .expect("HTTP/2 undrained-body request headers must send");
+        for frame_index in 0..101 {
+            body.send_data(axum::body::Bytes::new(), false)
+                .unwrap_or_else(|error| {
+                    panic!("HTTP/2 client failed to queue empty DATA frame {frame_index}: {error}")
+                });
+        }
+
+        let error = tokio::time::timeout(tokio::time::Duration::from_secs(2), response)
+            .await
+            .expect("Finch must reject excess undrained empty DATA frames within two seconds")
+            .expect_err("Finch must close an HTTP/2 stream that exceeds the empty DATA budget");
+        let diagnostic = format!("{error:?}");
+        assert!(
+            error.reason() == Some(h2::Reason::ENHANCE_YOUR_CALM) || error.is_io(),
+            "Finch must close the abusive HTTP/2 connection with a protocol or I/O error; got: {diagnostic}"
+        );
+
+        serving.abort();
+        connection.abort();
+        let _ = serving.await;
+        let _ = connection.await;
+    }
+
     #[tokio::test]
     async fn production_router_rejects_malformed_and_oversized_messages() {
         use tower::ServiceExt as _;
