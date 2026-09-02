@@ -66,7 +66,23 @@ pub enum HydrationStatus {
     Ready { nodes: usize },
     /// Still loading. Retrieval sees `loaded` of `total` nodes.
     Loading { loaded: usize, total: usize },
-    /// Hydration failed; the tree holds whatever loaded before the error.
+    /// Hydration stopped early, but what loaded is coherent: children are
+    /// linked, so the index is incomplete rather than wrong.
+    ///
+    /// Distinct from `Failed` because the consequences differ. A batch that
+    /// could not be read leaves a smaller tree, which is the same situation as
+    /// a read taken mid-hydration — reads already serve it, and a write placed
+    /// into it is no worse than a write during hydration. Refusing every write
+    /// for the rest of the process over one unreadable row was a far larger
+    /// punishment than the defect warranted (#288).
+    Degraded {
+        loaded: usize,
+        total: usize,
+        reason: String,
+    },
+    /// Hydration ended without finishing and the tree may be structurally
+    /// incomplete — children unlinked, so `MemTree::insert` cannot place
+    /// anything safely. Writes are refused.
     Failed { reason: String },
 }
 
@@ -86,7 +102,7 @@ struct HydrationState {
     /// interleaving is reachable. A `watch` channel retains the value, which
     /// removes the window rather than narrowing it.
     done: watch::Sender<bool>,
-    failure: std::sync::Mutex<Option<String>>,
+    failure: std::sync::Mutex<Option<Failure>>,
 }
 
 /// Opens the write gate if the loader ends without finishing.
@@ -139,22 +155,74 @@ impl HydrationState {
         self.done.send_replace(true);
     }
 
+    /// Record a failure that leaves the tree unusable for placement.
     fn fail(&self, reason: String) {
-        if let Ok(mut slot) = self.failure.lock() {
-            *slot = Some(reason);
-        }
+        self.record(Failure::Broken(reason));
+    }
+
+    /// Record a failure that stopped the load early but left what loaded
+    /// coherent — the caller has linked children.
+    fn degrade(&self, reason: String) {
+        self.record(Failure::Degraded(reason));
+    }
+
+    fn record(&self, failure: Failure) {
+        // `unwrap_or_else(PoisonError::into_inner)`, not a silent skip. The
+        // critical section is one `Option` assignment, so poisoning is remote —
+        // but swallowing it meant `complete()` still ran with no reason
+        // recorded, `status` then reported `Ready` over a partial tree, and the
+        // write the gate exists to stop went through. Liveness code has to fail
+        // toward refusing.
+        let mut slot = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(failure);
+        drop(slot);
         self.complete();
     }
 
+    /// Forget a recorded failure.
+    ///
+    /// Without this a single unreadable row refused every memory write for the
+    /// life of the process, and a restart re-read the same row and failed the
+    /// same way — so it was permanent in practice, not merely for the session
+    /// (#288). A store that has been reloaded successfully is working again and
+    /// must be able to say so.
+    fn clear_failure(&self, nodes: usize) {
+        let mut slot = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = None;
+        drop(slot);
+        // The counters describe the aborted loader, not the tree that replaced
+        // it, so clearing only the reason would leave `status` reporting
+        // `Ready { nodes: 0 }` over a fully restored store. Nothing reads it
+        // outside this module yet (#275); it would be wrong the moment
+        // something did.
+        self.loaded.store(nodes, Ordering::SeqCst);
+        self.total.store(nodes, Ordering::SeqCst);
+    }
+
     fn status(&self) -> HydrationStatus {
-        if let Ok(slot) = self.failure.lock() {
-            if let Some(reason) = slot.as_ref() {
-                return HydrationStatus::Failed {
-                    reason: reason.clone(),
-                };
-            }
-        }
+        let recorded = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let loaded = self.loaded.load(Ordering::SeqCst);
+        match recorded {
+            Some(Failure::Broken(reason)) => return HydrationStatus::Failed { reason },
+            Some(Failure::Degraded(reason)) => {
+                return HydrationStatus::Degraded {
+                    loaded,
+                    total: self.total.load(Ordering::SeqCst),
+                    reason,
+                }
+            }
+            None => {}
+        }
         if *self.done.borrow() {
             HydrationStatus::Ready { nodes: loaded }
         } else {
@@ -164,6 +232,17 @@ impl HydrationState {
             }
         }
     }
+}
+
+/// How a hydration ended badly.
+///
+/// Two kinds, because they warrant different answers. See `HydrationStatus`.
+#[derive(Debug, Clone)]
+enum Failure {
+    /// Stopped early with what loaded left coherent.
+    Degraded(String),
+    /// Ended without finishing; the tree may be unusable for placement.
+    Broken(String),
 }
 
 /// Nodes hydrated per batch. Small enough that the tree and database locks are
@@ -508,25 +587,31 @@ impl MemorySystem {
                         .try_lock()
                         .expect("a newly opened connection cannot be contended");
                     if let Err(error) = Self::load_tree_from_db_conn(&conn, &mut guard) {
-                        // Start fresh, and mean it. This used to `fail()` the
-                        // state, which since writes now refuse a failed index
-                        // would have turned "starting fresh" into "this store
-                        // accepts no writes for the rest of the process" — a
-                        // log line saying the opposite of what the code did.
-                        // An unreadable tree is a fresh tree; `next_id` is
-                        // already past the highest stored id, so a write cannot
-                        // collide with a row that did not load.
+                        // Broken, not fresh.
+                        //
+                        // This arm is only entered when `node_count > 0`, so
+                        // reaching the error means there ARE rows and none of
+                        // them could be read — a full store behind an empty
+                        // tree, which is the same `loaded == 0` case the
+                        // batched arm now refuses. "Starting fresh" was the
+                        // wrong framing: an empty tree over a populated store
+                        // is not a new store, and treating it as one opened the
+                        // write gate on nothing but the placeholder root.
+                        // Memories then attached under a childless root and
+                        // `save_all_nodes_to_db` rewrote node 0 with the
+                        // placeholder's text and embedding.
+                        //
+                        // An earlier version of this comment argued the
+                        // opposite, on the grounds that `fail()` then meant a
+                        // permanent refusal. It no longer does: a reload clears
+                        // it, and #288 separates a partial index from an
+                        // unusable one.
                         tracing::warn!(
                             %error,
-                            "Failed to load MemTree; starting with an empty index"
+                            "Failed to load MemTree; refusing writes rather than \
+                             placing them against an empty index"
                         );
-                        hydration
-                            .loaded
-                            .store(0, std::sync::atomic::Ordering::SeqCst);
-                        hydration
-                            .total
-                            .store(0, std::sync::atomic::Ordering::SeqCst);
-                        hydration.complete();
+                        hydration.fail(error.to_string());
                     } else {
                         // `size()` excludes the root; the background arm
                         // counts rows, which include it. Count rows on both so
@@ -1032,7 +1117,14 @@ impl MemorySystem {
             let conn = self.db.lock().await;
             Self::load_tree_from_db_conn(&conn, &mut restored)?;
         }
+        let nodes = restored.all_nodes().len();
         *self.tree.lock().await = restored;
+        // The tree now matches the durable snapshot, so whatever the loader
+        // recorded no longer describes it. Leaving the failure set meant a
+        // store that had been rebuilt successfully still refused every write,
+        // with no way back short of a restart that would re-read the same rows
+        // and fail again (#288).
+        self.hydration.clear_failure(nodes);
         Ok(())
     }
 
@@ -1140,8 +1232,28 @@ impl MemorySystem {
                     // later memory directly under it, and
                     // `save_all_nodes_to_db` persisted that flattening — the
                     // exact durable misplacement the gate exists to prevent.
+                    // `degrade` only if something actually loaded.
+                    //
+                    // Linking is what makes a partial index coherent, and that
+                    // argument is vacuous when the FIRST batch fails: linking
+                    // an empty node set leaves the tree holding nothing but the
+                    // placeholder root `MemTree::new_with_dim` created. Calling
+                    // that `Degraded` opened the write gate on it, so every
+                    // memory for the session attached directly under a
+                    // childless root and `save_all_nodes_to_db` persisted the
+                    // flattening — the exact harm the paragraph above says the
+                    // gate exists to prevent, reintroduced by the very
+                    // reclassification meant to be safe. It also upserts node 0,
+                    // overwriting the stored root row with the placeholder's.
+                    //
+                    // Nothing loaded is not a smaller index; it is no index.
+                    let loaded = state.loaded.load(Ordering::SeqCst);
                     Self::link_loaded_children(&tree).await;
-                    state.fail(error.to_string());
+                    if loaded == 0 {
+                        state.fail(error.to_string());
+                    } else {
+                        state.degrade(error.to_string());
+                    }
                     return;
                 }
             };
@@ -1326,6 +1438,20 @@ impl MemorySystem {
         // remains is a multi-threaded loader that ends without finishing, and
         // `HydrationGuard` covers that by construction rather than by waiting
         // a guessed interval.
+        // Only `Failed`.
+        //
+        // A `Degraded` index holds a prefix of the store with its children
+        // linked, so `MemTree::insert` can descend and place a memory in a real
+        // part of the structure — just a smaller one than a complete load would
+        // have offered. That is a worse placement than the store deserves, and
+        // it is the trade this makes: refusing every write for the rest of the
+        // process over one unreadable row is a larger harm than an
+        // imperfectly-placed memory (#288).
+        //
+        // Not "no worse than a write during hydration" — an earlier version of
+        // this comment said that, and it is false. Writes during hydration are
+        // not allowed; `ensure_hydrated` blocks them until the loader
+        // finishes. There is no such precedent to appeal to.
         if let HydrationStatus::Failed { reason } = self.hydration.status() {
             anyhow::bail!("MemTree hydration failed, so this write cannot be placed: {reason}");
         }
@@ -1892,6 +2018,9 @@ mod tests {
                 HydrationStatus::Loading { loaded, total } if total > 0 && loaded >= total => break,
                 HydrationStatus::Loading { .. } => {}
                 HydrationStatus::Failed { reason } => panic!("hydration failed: {reason}"),
+                HydrationStatus::Degraded { reason, .. } => {
+                    panic!("hydration stopped early: {reason}")
+                }
             }
             assert!(i < 2_499, "hydration never counted every node");
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -2380,6 +2509,244 @@ mod tests {
         Ok(())
     }
 
+    /// The synchronous arm has the same rule: a store it cannot read is
+    /// broken, not fresh.
+    ///
+    /// A current-thread runtime and a caller with no runtime both load
+    /// all-or-nothing, so a failure there is exactly the `loaded == 0` case.
+    /// It used to log "starting with an empty index" and complete cleanly, so
+    /// the gate opened over a full store whose tree held only the placeholder
+    /// root — memories attached under a childless root and
+    /// `save_all_nodes_to_db` rewrote node 0 with the placeholder's text.
+    #[tokio::test]
+    async fn test_an_unreadable_store_on_the_synchronous_arm_refuses_writes() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), 8, &[])?;
+
+        // Break every row's `text`, so the whole load fails rather than one
+        // batch of it.
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE tree_nodes SET text = ?1",
+                params![vec![0xffu8, 0xfe]],
+            )?;
+        }
+
+        // `#[tokio::test]` is current-thread, which loads synchronously.
+        let memory = MemorySystem::new(config)?;
+        assert!(
+            memory.hydration_task.is_none(),
+            "precondition: this arm does not spawn a loader"
+        );
+        assert!(
+            matches!(memory.hydration_status(), HydrationStatus::Failed { .. }),
+            "a store that could not be read is broken, not empty; got {:?}",
+            memory.hydration_status()
+        );
+
+        let refused = memory
+            .insert_conversation(
+                "system",
+                "There is no structure to place this in, so it must be refused.",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an unreadable store must refuse writes");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "got {refused}"
+        );
+        Ok(())
+    }
+
+    /// A first-batch failure loads nothing, so it is broken rather than
+    /// degraded — and writes must stay refused.
+    ///
+    /// `Degraded` is justified by `link_loaded_children` having made what
+    /// loaded coherent. That argument is vacuous when nothing loaded: linking
+    /// an empty node set leaves only the placeholder root, and calling it
+    /// degraded opened the gate on a tree with no real structure, so every
+    /// memory attached directly under a childless root and was persisted that
+    /// way. Removing the `loaded == 0` check makes this fail with the write
+    /// accepted and a two-node tree — root plus the memory just written —
+    /// against a store of 1024.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_first_batch_failure_is_broken_not_degraded() -> Result<()> {
+        const NODES: u64 = 2 * HYDRATION_BATCH as u64;
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), NODES, &[])?;
+
+        // Break a row in the FIRST batch, so the loader stops before anything
+        // lands.
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
+                params![vec![0xffu8, 0xfe], 4i64],
+            )?;
+        }
+
+        let memory = MemorySystem::new(config)?;
+        let refused = memory
+            .insert_conversation(
+                "system",
+                "Nothing loaded, so there is no structure to place this in.",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an index that loaded nothing must refuse writes");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "got {refused}"
+        );
+        assert!(
+            matches!(memory.hydration_status(), HydrationStatus::Failed { .. }),
+            "nothing loaded is not a smaller index, it is no index; got {:?}",
+            memory.hydration_status()
+        );
+
+        // And the tree really is empty of stored nodes, so the refusal is not
+        // incidental.
+        let tree = memory.tree.lock().await;
+        assert_eq!(
+            tree.all_nodes().len(),
+            1,
+            "only the placeholder root should be present"
+        );
+        Ok(())
+    }
+
+    /// The two failure kinds must lead to different answers.
+    ///
+    /// Before #288 both were `Failed`, so a batch that could not be read
+    /// refused every memory write for the rest of the process — the same
+    /// verdict as a loader that died and may have left the tree unlinked. One
+    /// unreadable row out of a 16,782-node store is not a reason to stop
+    /// recording memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_degraded_index_accepts_writes_and_a_broken_one_does_not() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        // Reached through the loader, not by calling `degrade` directly.
+        //
+        // Calling it directly is what the first version of this test did, and
+        // it made the test blind to the production call site: collapsing
+        // `degrade` into `fail` at the batch-error arm left it passing. A test
+        // that cannot observe the decision it names is not a regression for it.
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), 2 * HYDRATION_BATCH as u64, &[])?;
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute(
+                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
+                params![vec![0xffu8, 0xfe], HYDRATION_BATCH as i64 + 4],
+            )?;
+        }
+        let degraded = MemorySystem::new(config.clone())?;
+        degraded.ensure_hydrated().await?;
+        assert!(
+            matches!(
+                degraded.hydration_status(),
+                HydrationStatus::Degraded { .. }
+            ),
+            "a batch error after a batch loaded must degrade; got {:?}",
+            degraded.hydration_status()
+        );
+        degraded
+            .insert_conversation(
+                "system",
+                "An index that stopped loading early is smaller than the store, \
+                 not incoherent, so this must land.",
+                None,
+                None,
+            )
+            .await
+            .expect("a degraded index must accept writes");
+
+        // The broken half stays direct: the guard path fires when a loader is
+        // dropped, which a test cannot induce through the batch loop.
+        let clean = NamedTempFile::new()?;
+        let broken = MemorySystem::new(MemoryConfig {
+            db_path: clean.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        broken
+            .hydration
+            .fail("the loader ended without finishing".to_string());
+        let refused = broken
+            .insert_conversation(
+                "system",
+                "A tree that may be unlinked cannot place this safely.",
+                None,
+                None,
+            )
+            .await
+            .expect_err("a broken index must still refuse writes");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "got {refused}"
+        );
+        Ok(())
+    }
+
+    /// A store that has been rebuilt is working again, and must be able to say
+    /// so without a restart.
+    ///
+    /// `failure` was write-once, so the refusal outlived whatever caused it —
+    /// and a restart re-read the same rows and recorded it again, making it
+    /// permanent in practice rather than merely for the session.
+    #[tokio::test]
+    async fn test_a_successful_reload_clears_a_recorded_failure() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        memory
+            .hydration
+            .fail("the loader ended without finishing".to_string());
+        memory
+            .insert_conversation("system", "Refused while the index is broken.", None, None)
+            .await
+            .expect_err("precondition: writes are refused");
+
+        memory.reload_tree_from_db().await?;
+
+        assert!(
+            !matches!(memory.hydration_status(), HydrationStatus::Failed { .. }),
+            "a rebuilt tree must not still be reported as failed; got {:?}",
+            memory.hydration_status()
+        );
+        memory
+            .insert_conversation(
+                "system",
+                "And a write must land once the index has been rebuilt.",
+                None,
+                None,
+            )
+            .await
+            .expect("a reloaded store must accept writes again");
+        Ok(())
+    }
+
     /// A refused index write must still keep the raw turn.
     ///
     /// The gate used to sit at the top of `insert_conversation_record`, ahead
@@ -2615,29 +2982,47 @@ mod tests {
         }
 
         let memory = MemorySystem::new(config)?;
-        // Returns an error, not `Ok`: a hydration that failed cannot place a
-        // write, so #276 refuses one rather than letting it land in whatever
-        // loaded. What matters for *this* test is that it returns at all — the
-        // gate opened — which is the ordering pinned below.
-        let refused = memory
+        // Returns `Ok`, and that is the point of #288.
+        //
+        // #276 made a failed hydration refuse writes, which was right for a
+        // tree that might be unusable — but it collapsed this case into the
+        // same verdict, so one unreadable row refused every write for the rest
+        // of the process. Linking below is exactly what makes this case
+        // different: the index is smaller than the store, not incoherent.
+        //
+        // What matters for the ordering pinned below is that it returns at all,
+        // which it can only do after the loader recorded and completed.
+        memory
             .ensure_hydrated()
             .await
-            .expect_err("a failed hydration must refuse writes, not accept them");
-        assert!(
-            refused.to_string().contains("cannot be placed"),
-            "got {refused}"
-        );
+            .expect("a degraded index must still accept writes");
 
         match memory.hydration_status() {
-            HydrationStatus::Failed { .. } => {}
-            other => panic!("a broken row must surface as Failed; got {other:?}"),
+            HydrationStatus::Degraded { loaded, total, .. } => {
+                assert!(
+                    loaded < total,
+                    "a degraded index must report how much of the store it \
+                     actually holds; got {loaded} of {total}"
+                );
+            }
+            other => panic!("a broken row must surface as Degraded; got {other:?}"),
         }
 
+        // And a write genuinely lands, rather than merely being permitted.
+        memory
+            .insert_conversation(
+                "system",
+                "A memory written into an index that stopped loading early.",
+                None,
+                None,
+            )
+            .await?;
+
         // The assertion below pins linking; it pins the *ordering* only because
-        // `ensure_hydrated` returned above, and it can only return after
-        // `fail()`. Moving `fail()` ahead of `link_loaded_children` would make
+        // `ensure_hydrated` returned above, and it can only return after the
+        // loader recorded. Recording ahead of `link_loaded_children` would make
         // this a race with the hydration task for the tree lock rather than a
-        // clean failure, so the ordering is stated here as well as relied on.
+        // clean result, so the ordering is stated here as well as relied on.
 
         let tree = memory.tree.lock().await;
         let loaded = tree.all_nodes().len();
