@@ -11,10 +11,18 @@
 //   contacts.xlsx   — address book: name, email, phone, city
 //   times_table.xlsx — multiplication table 1–12 (good for verifying cell reads)
 //
-// Usage in the REPL after running `finch samples`:
-//   s" ~/.finch/samples/xlsx/grades.xlsx" s" B2" xlsx@ type cr
-//   s" ~/.finch/samples/xlsx/grades.xlsx" xlsx-sheets type cr
-//   s" ~/.finch/samples/xlsx/budget.xlsx" s" C3" xlsx@ type cr
+// Usage in the REPL, after `finch samples` and copying one file into the
+// workspace (`path` is `./**` -- a relative path inside the workspace root, so
+// an absolute ~/.finch path is rejected before the broker sees it):
+//   (workbook-sheets (path "grades.xlsx"))
+//   (workbook-range (path "grades.xlsx") "Grades" 0 0 5 4)
+//   (workbook-summary (path "grades.xlsx") "Grades" 20)
+//
+// The sheets are named "Grades", "Budget", "Contacts" and "Times Table", not
+// "Sheet1". These read through the typed runtime's capability broker; the
+// `xlsx@` and `xlsx-sheets` words this comment used to name belonged to the
+// Co-Forth interpreter, which no user input could reach and which #294
+// removed.
 
 use anyhow::{Context, Result};
 use rust_xlsxwriter::Workbook;
@@ -297,6 +305,35 @@ mod tests {
         }
     }
 
+    /// Read one cell by its A1 reference.
+    ///
+    /// Replaces `coforth::interpreter::xlsx_read_cell`, which went with the
+    /// interpreter (#294). These assertions are about the sample workbooks
+    /// this module generates, not about the reader, so they move to calamine
+    /// directly rather than being deleted with the code they happened to call.
+    fn read_cell(path: &str, reference: &str) -> String {
+        use calamine::{open_workbook_auto, Reader};
+
+        let letters: String = reference
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect();
+        let digits: String = reference.chars().skip(letters.len()).collect();
+        let col = letters.bytes().fold(0u32, |acc, b| {
+            acc * 26 + u32::from(b.to_ascii_uppercase() - b'A' + 1)
+        }) - 1;
+        let row: u32 = digits.parse::<u32>().expect("A1 reference has a row") - 1;
+
+        let mut workbook = open_workbook_auto(path).expect("sample workbook opens");
+        let sheet = workbook.sheet_names().first().expect("a sheet").clone();
+        workbook
+            .worksheet_range(&sheet)
+            .expect("sheet reads")
+            .get_value((row, col))
+            .expect("cell is populated")
+            .to_string()
+    }
+
     #[test]
     fn test_grades_cell_readable() {
         let dir = tempfile::tempdir().unwrap();
@@ -308,11 +345,11 @@ mod tests {
             .into_owned();
 
         // A2 should be first student name
-        let val = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "A2").unwrap();
+        let val = read_cell(&path, "A2");
         assert_eq!(val, "Alice Johnson");
 
         // G2 should be their grade (all 90s → A)
-        let grade = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "G2").unwrap();
+        let grade = read_cell(&path, "G2");
         assert_eq!(grade, "A");
     }
 
@@ -327,10 +364,10 @@ mod tests {
             .into_owned();
 
         // Row 7 (×7), col 8 (×8) = 56 → cell I8 (col A=row-header, B=×1, …, I=×8; row 8 = ×7)
-        let val = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "I8").unwrap();
+        let val = read_cell(&path, "I8");
         assert_eq!(val, "56");
         // Also verify a simple corner: B2 = 1×1 = 1
-        let one = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "B2").unwrap();
+        let one = read_cell(&path, "B2");
         assert_eq!(one, "1");
     }
 
@@ -345,7 +382,7 @@ mod tests {
             .into_owned();
 
         // A12 = "TOTAL"
-        let label = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "A12").unwrap();
+        let label = read_cell(&path, "A12");
         assert_eq!(label, "TOTAL");
     }
 }

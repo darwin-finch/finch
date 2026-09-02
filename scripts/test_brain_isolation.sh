@@ -6,27 +6,42 @@ trap 'status=$?; echo "Brain isolation regression failed in phase: $phase (line 
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
-default_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
-[[ -x "$default_supervisor" ]] || default_supervisor="$repo_root/target/debug/finch-test-supervisor"
-supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$default_supervisor}"
-[[ -x "$supervisor" ]] || { echo 'build finch-test-supervisor before running isolation regressions' >&2; exit 69; }
+
+# Direct callers, including the CI workflow, must cross the maintained
+# freshness boundary before this script selects an authority executable. A
+# fixed `-pinned` file can survive a cache restore from an older checkout and
+# is not evidence that its bytes implement the current proof contract. Use a
+# short supervised probe to report the freshly selected content-addressed
+# executable, then retain this harness's original unnested process topology.
+if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
+  supervisor="$("$repo_root/scripts/test_brains.sh" bash -c \
+    'printf "%s\n" "$FINCH_TEST_SUPERVISOR_BIN"')"
+else
+  supervisor="$FINCH_TEST_SUPERVISOR_BIN"
+fi
+[[ -x "$supervisor" ]] || { echo 'inherited test supervisor is not executable' >&2; exit 69; }
 
 scratch="$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/finch-brain-isolation-regression.XXXXXX")"
 sentinel_pid=''
 signaler_pid=''
 substitution_pid=''
 supervisor_backup=''
+supervisor_backup_target=''
 substitution_restored=''
+shell_wrong_digest_supervisor=''
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
-  if [[ -n "$supervisor_backup" && -e "$supervisor_backup" ]]; then
-    mv -f -- "$supervisor_backup" "$supervisor"
+  if [[ -n "$supervisor_backup" && -e "$supervisor_backup" && -n "$supervisor_backup_target" ]]; then
+    mv -f -- "$supervisor_backup" "$supervisor_backup_target"
   fi
   if [[ -n "$substitution_restored" ]]; then : >"$substitution_restored"; fi
   if [[ -n "$substitution_pid" ]]; then
     kill "$substitution_pid" 2>/dev/null || true
     wait "$substitution_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$shell_wrong_digest_supervisor" ]]; then
+    rm -f -- "$shell_wrong_digest_supervisor"
   fi
   exec 7>&- 2>/dev/null || true
   rm -rf -- "$scratch"
@@ -50,6 +65,63 @@ expect_supervisor_70() {
   else
     test "$?" -eq 70
   fi
+}
+
+exercise_supervisor_substitution() {
+  local candidate="$1" label="$2" candidate_identity
+  local substitution_ready="$scratch/substitution-$label.ready"
+  local substitution_continue="$scratch/substitution-$label.continue"
+  local substitution_rejected="$scratch/substitution-$label.rejected"
+
+  phase="supervisor-substitution-rejected-$label"
+  substitution_restored="$scratch/substitution-$label.restored"
+  supervisor_backup="$scratch/supervisor-$label.original"
+  supervisor_backup_target="$candidate"
+  candidate_identity="$(brain_isolation_file_identity "$candidate")"
+  FINCH_SUBSTITUTION_READY="$substitution_ready" \
+  FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
+  FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
+  FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
+    FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" "$candidate" bash -c '
+      : >"$FINCH_SUBSTITUTION_READY"
+      for _ in {1..400}; do
+        [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
+        sleep 0.01
+      done
+      [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
+      if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
+        exit 1
+      fi
+      : >"$FINCH_SUBSTITUTION_REJECTED"
+      for _ in {1..400}; do
+        [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
+        sleep 0.01
+      done
+      exit 1
+    ' & substitution_pid=$!
+  for _ in {1..400}; do
+    [[ -e "$substitution_ready" ]] && break
+    sleep 0.01
+  done
+  test -e "$substitution_ready"
+  mv -- "$candidate" "$supervisor_backup"
+  install -m 0555 "$supervisor_backup" "$candidate"
+  test "$(brain_isolation_file_identity "$candidate")" != "$candidate_identity"
+  : >"$substitution_continue"
+  for _ in {1..400}; do
+    [[ -e "$substitution_rejected" ]] && break
+    sleep 0.01
+  done
+  test -e "$substitution_rejected"
+  mv -f -- "$supervisor_backup" "$candidate"
+  supervisor_backup=''
+  supervisor_backup_target=''
+  test "$(brain_isolation_file_identity "$candidate")" = "$candidate_identity"
+  : >"$substitution_restored"
+  wait "$substitution_pid"
+  substitution_pid=''
+  substitution_restored=''
+  test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 }
 
 # Canonical path validation fails before a child is launched or a disposable
@@ -98,57 +170,10 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 # original inode must leave the chosen artifact unchanged for later tests.
 case "$supervisor" in
   "$repo_root"/target/debug/finch-test-supervisor-pinned|\
-  "$repo_root"/target/release/finch-test-supervisor-pinned)
-    phase=supervisor-substitution-rejected
-    substitution_ready="$scratch/substitution.ready"
-    substitution_continue="$scratch/substitution.continue"
-    substitution_rejected="$scratch/substitution.rejected"
-    substitution_restored="$scratch/substitution.restored"
-    supervisor_backup="$scratch/supervisor.original"
-    supervisor_identity="$(brain_isolation_file_identity "$supervisor")"
-    FINCH_SUBSTITUTION_READY="$substitution_ready" \
-    FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
-    FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
-    FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
-      run_isolated bash -c '
-        : >"$FINCH_SUBSTITUTION_READY"
-        for _ in {1..400}; do
-          [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
-          sleep 0.01
-        done
-        [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
-        if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
-          exit 1
-        fi
-        : >"$FINCH_SUBSTITUTION_REJECTED"
-        for _ in {1..400}; do
-          [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
-          sleep 0.01
-        done
-        exit 1
-      ' & substitution_pid=$!
-    for _ in {1..400}; do
-      [[ -e "$substitution_ready" ]] && break
-      sleep 0.01
-    done
-    test -e "$substitution_ready"
-    mv -- "$supervisor" "$supervisor_backup"
-    install -m 0555 "$supervisor_backup" "$supervisor"
-    test "$(brain_isolation_file_identity "$supervisor")" != "$supervisor_identity"
-    : >"$substitution_continue"
-    for _ in {1..400}; do
-      [[ -e "$substitution_rejected" ]] && break
-      sleep 0.01
-    done
-    test -e "$substitution_rejected"
-    mv -f -- "$supervisor_backup" "$supervisor"
-    supervisor_backup=''
-    test "$(brain_isolation_file_identity "$supervisor")" = "$supervisor_identity"
-    : >"$substitution_restored"
-    wait "$substitution_pid"
-    substitution_pid=''
-    substitution_restored=''
-    test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+  "$repo_root"/target/release/finch-test-supervisor-pinned|\
+  "$repo_root"/target/debug/finch-test-supervisor-pinned-sha256-*|\
+  "$repo_root"/target/release/finch-test-supervisor-pinned-sha256-*)
+    exercise_supervisor_substitution "$supervisor" selected
     ;;
 esac
 
@@ -158,6 +183,192 @@ phase=launcher-canonicalizes-default-temp-parent
 env -u FINCH_TEST_TMP_PARENT FINCH_TEST_REAL_HOME="$fake_home" TMPDIR="$temp_parent/" \
   "$repo_root/scripts/test_brains.sh" true
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+# A cached supervisor from a previous checkout is not test authority for the
+# current source. Seed both maintained default names in an isolated target with
+# an executable that records if it is ever launched, then cross the public
+# launcher boundary. Before #259's freshness repair, existence alone selected
+# the stale pinned image. The maintained launcher must ask Cargo to reproduce
+# the checked-out target and execute its immutable content-addressed pin. This
+# target is wholly private: the regression never moves workspace artifacts or
+# rewrites source mtimes/Cargo fingerprints, even if interrupted.
+phase=launcher-rebuilds-stale-cached-supervisor
+launcher_target="$scratch/stale-supervisor-target"
+launcher_built="$launcher_target/debug/finch-test-supervisor"
+launcher_pinned="$launcher_target/debug/finch-test-supervisor-pinned"
+stale_supervisor_ran="$scratch/stale-supervisor-ran"
+stale_launcher_diagnostic="$scratch/stale-launcher-diagnostic"
+observed_stale_launcher="$scratch/stale-launcher-observed"
+mkdir -p "$launcher_target/debug"
+printf '%s\n' '#!/bin/sh' \
+  'printf "stale cached supervisor executed\n" >"$FINCH_STALE_SUPERVISOR_RAN"' \
+  'exit 88' >"$launcher_pinned"
+chmod 0555 "$launcher_pinned"
+install -m 0555 "$launcher_pinned" "$launcher_built"
+stale_launcher_status=0
+env -u FINCH_TEST_SUPERVISOR_BIN \
+  FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
+  FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_STALE_SUPERVISOR_RAN="$stale_supervisor_ran" FINCH_LAUNCHER_OBSERVED="$observed_stale_launcher" \
+  "$repo_root/scripts/test_brains.sh" bash -c \
+  'printf "%s\n" "$FINCH_TEST_SUPERVISOR_BIN" >"$FINCH_LAUNCHER_OBSERVED"' \
+  2>"$stale_launcher_diagnostic" || \
+  stale_launcher_status=$?
+if [[ "$stale_launcher_status" -ne 0 ]]; then
+  echo "maintained launcher returned $stale_launcher_status instead of rebuilding its stale cached supervisor" >&2
+  sed 's/^/launcher diagnostic: /' "$stale_launcher_diagnostic" >&2
+  exit 1
+fi
+if [[ -e "$stale_supervisor_ran" ]]; then
+  echo "maintained launcher executed stale cached supervisor; marker: $(cat "$stale_supervisor_ran")" >&2
+  exit 1
+fi
+observed_supervisor="$(cat "$observed_stale_launcher" 2>/dev/null || true)"
+case "$observed_supervisor" in
+  "$launcher_target/debug/finch-test-supervisor-pinned-sha256-"*) ;;
+  *)
+    echo "maintained launcher did not execute an isolated content-addressed supervisor; observed ${observed_supervisor:-<none>}" >&2
+    exit 1
+    ;;
+esac
+if [[ ! -x "$launcher_built" || ! -x "$observed_supervisor" ]]; then
+  echo "maintained launcher did not leave executable built and content-addressed supervisor images" >&2
+  ls -l "$launcher_built" "$observed_supervisor" >&2 || true
+  exit 1
+fi
+built_size="$(wc -c <"$launcher_built" | tr -d ' ')"
+pinned_size="$(wc -c <"$observed_supervisor" | tr -d ' ')"
+case "$(uname -s)" in
+  Linux)
+    if [[ "$pinned_size" -ge "$built_size" ]]; then
+      echo "maintained launcher did not strip its hashed authority image; built=$built_size pinned=$pinned_size" >&2
+      exit 1
+    fi
+    ;;
+  Darwin)
+    if ! cmp -s "$launcher_built" "$observed_supervisor"; then
+      echo "maintained macOS launchers did not preserve deterministic supervisor bytes" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+# The digest in a content-addressed supervisor name is authority, not a label.
+# Run trusted supervisor bytes from a deliberately false digest path and prove
+# that both independent validators reject the inherited proof.
+false_supervisor_digest="$(printf '%s' "$scratch" | shasum -a 256 | awk '{print $1}')"
+actual_observed_digest="$(shasum -a 256 "$observed_supervisor" | awk '{print $1}')"
+if [[ "$false_supervisor_digest" == "$actual_observed_digest" ]]; then
+  false_supervisor_digest="$(printf '%s-different' "$scratch" | shasum -a 256 | awk '{print $1}')"
+fi
+wrong_digest_supervisor="$launcher_target/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
+install -m 0555 "$observed_supervisor" "$wrong_digest_supervisor"
+phase=rust-rejects-wrong-content-addressed-supervisor-name
+rust_wrong_digest_diagnostic="$scratch/rust-wrong-digest-diagnostic"
+if FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_TEST_PROOF_DIAGNOSTICS=1 \
+  "$wrong_digest_supervisor" "$wrong_digest_supervisor" --verify-inherited-proof \
+  >/dev/null 2>"$rust_wrong_digest_diagnostic"; then
+  echo "Rust proof validation accepted supervisor bytes under a false digest name" >&2
+  exit 1
+fi
+if ! grep -q 'does not contain the image named by its path' "$rust_wrong_digest_diagnostic"; then
+  echo "Rust proof validation rejected the false digest name for an unrelated reason" >&2
+  sed 's/^/Rust diagnostic: /' "$rust_wrong_digest_diagnostic" >&2
+  exit 1
+fi
+phase=shell-rejects-wrong-content-addressed-supervisor-name
+shell_wrong_digest_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
+shell_wrong_digest_diagnostic="$scratch/shell-wrong-digest-diagnostic"
+install -m 0555 "$observed_supervisor" "$shell_wrong_digest_supervisor"
+shell_wrong_digest_status=0
+FINCH_TEST_PROOF_DIAGNOSTICS=1 \
+  brain_isolation_supervisor_digest_for_profile "$repo_root" "$shell_wrong_digest_supervisor" \
+  >/dev/null 2>"$shell_wrong_digest_diagnostic" || shell_wrong_digest_status=$?
+if [[ "$shell_wrong_digest_status" -eq 0 ]]; then
+  echo "shell supervisor-profile validation accepted bytes under a false digest name" >&2
+  exit 1
+fi
+if [[ "$(cat "$shell_wrong_digest_diagnostic")" != \
+  'Brain test shell authority rejected: supervisor-content-path-binding' ]]; then
+  echo "shell supervisor-profile validation rejected the false digest name for an unrelated reason" >&2
+  sed 's/^/shell diagnostic: /' "$shell_wrong_digest_diagnostic" >&2
+  exit 1
+fi
+rm -f -- "$wrong_digest_supervisor" "$shell_wrong_digest_supervisor"
+shell_wrong_digest_supervisor=''
+
+# Exercise the same live-inode substitution boundary against the exact
+# content-addressed image produced above, even when CI selected a legacy pin
+# for the outer isolation run.
+exercise_supervisor_substitution "$observed_supervisor" content-addressed
+
+if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
+  echo "stale-cache launcher regression left an isolated test HOME under $temp_parent" >&2
+  find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
+  exit 1
+fi
+
+# Two launchers that publish the same freshly built image concurrently must
+# converge on one immutable inode. The maintained hook pauses both after their
+# complete private staging copy exists and before atomic publication; the old
+# compare/rename design let both decide to replace the fixed path, so the later
+# rename unlinked the executable already running in the first supervisor.
+phase=concurrent-launchers-share-immutable-supervisor-image
+rm -f -- "$observed_supervisor"
+pin_ready_dir="$scratch/pin-publication-ready"
+pin_continue_file="$scratch/pin-publication-continue"
+pin_result_one="$scratch/pin-result-one"
+pin_result_two="$scratch/pin-result-two"
+pin_diagnostic_one="$scratch/pin-diagnostic-one"
+pin_diagnostic_two="$scratch/pin-diagnostic-two"
+mkdir "$pin_ready_dir"
+run_concurrent_launcher() {
+  local result_file="$1" diagnostic_file="$2"
+  env -u FINCH_TEST_SUPERVISOR_BIN \
+    FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
+    FINCH_TEST_SUPERVISOR_PIN_READY_DIR="$pin_ready_dir" \
+    FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE="$pin_continue_file" \
+    FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+    FINCH_PIN_RESULT="$result_file" "$repo_root/scripts/test_brains.sh" bash -c '
+      case "$(uname -s)" in
+        Darwin) identity="$(stat -f "%d:%i" "$FINCH_TEST_SUPERVISOR_BIN")" ;;
+        Linux) identity="$(stat -c "%d:%i" "$FINCH_TEST_SUPERVISOR_BIN")" ;;
+        *) exit 64 ;;
+      esac
+      printf "%s|%s\n" "$FINCH_TEST_SUPERVISOR_BIN" "$identity" >"$FINCH_PIN_RESULT"
+    ' 2>"$diagnostic_file"
+}
+run_concurrent_launcher "$pin_result_one" "$pin_diagnostic_one" & pin_pid_one=$!
+run_concurrent_launcher "$pin_result_two" "$pin_diagnostic_two" & pin_pid_two=$!
+for _ in {1..1000}; do
+  ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
+  [[ "$ready_count" -eq 2 ]] && break
+  sleep 0.01
+done
+if [[ "${ready_count:-0}" -ne 2 ]]; then
+  echo "concurrent maintained launchers did not both reach immutable publication; ready=${ready_count:-0}" >&2
+  sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
+  sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
+  exit 1
+fi
+: >"$pin_continue_file"
+pin_status_one=0
+pin_status_two=0
+wait "$pin_pid_one" || pin_status_one=$?
+wait "$pin_pid_two" || pin_status_two=$?
+if [[ "$pin_status_one" -ne 0 || "$pin_status_two" -ne 0 ]]; then
+  echo "concurrent maintained launchers failed after publication: one=$pin_status_one two=$pin_status_two" >&2
+  sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
+  sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
+  exit 1
+fi
+pin_observation_one="$(cat "$pin_result_one")"
+pin_observation_two="$(cat "$pin_result_two")"
+if [[ "$pin_observation_one" != "$pin_observation_two" ]]; then
+  echo "concurrent maintained launchers executed different supervisor path/inodes: one=$pin_observation_one two=$pin_observation_two" >&2
+  exit 1
+fi
 
 hostile_home="$scratch/hostile-home"
 hostile_target="$scratch/effective-production-finch"
@@ -608,6 +819,7 @@ stubborn_ready_file="$scratch/stubborn.ready"
 stubborn_term_file="$scratch/stubborn.term"
 stubborn_target_file="$scratch/stubborn.target"
 stubborn_home_file="$scratch/stubborn.home"
+stubborn_later_pause_file="$scratch/stubborn.later-paused"
 late_signal_file="$scratch/late-signal.observed"
 phase=signal-during-teardown
 (
@@ -625,7 +837,8 @@ phase=signal-during-teardown
 signal_status=0
 FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" FINCH_STUBBORN_READY_FILE="$stubborn_ready_file" \
 FINCH_STUBBORN_TERM_FILE="$stubborn_term_file" FINCH_STUBBORN_TARGET_FILE="$stubborn_target_file" \
-FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
+FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" \
+FINCH_STUBBORN_TERM_PAUSE_AFTER_FIRST_FILE="$stubborn_later_pause_file" run_isolated bash -c '
   leader_pid=$BASHPID
   "$FINCH_TEST_SUPERVISOR_BIN" --child-stubborn-probe &
   while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
@@ -637,13 +850,46 @@ FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
 signaler_status=0
 wait "$signaler_pid" || signaler_status=$?
 signaler_pid=''
-test "$signaler_status" -eq 0
-test "$signal_status" -eq 143
-test -s "$late_signal_file" && test -s "$stubborn_term_file"
+if [[ "$signaler_status" -ne 0 ]]; then
+  echo "late teardown signaler returned $signaler_status before observing the first stubborn-child TERM marker" >&2
+  ls -l "$stubborn_target_file" "$stubborn_term_file" "$late_signal_file" >&2 || true
+  exit 1
+fi
+if [[ "$signal_status" -ne 143 ]]; then
+  echo "real supervisor returned $signal_status, expected conventional externally observed SIGTERM status 143" >&2
+  ls -l "$stubborn_term_file" "$stubborn_later_pause_file" >&2 || true
+  exit 1
+fi
+if [[ ! -s "$late_signal_file" ]]; then
+  echo "late signaler did not record the retained-zombie leader it signaled" >&2
+  exit 1
+fi
+if [[ ! -s "$stubborn_later_pause_file" ]]; then
+  echo "stubborn child never paused a later TERM publication before the supervisor's SIGKILL bound" >&2
+  ls -l "$stubborn_term_file" "$stubborn_later_pause_file" >&2 || true
+  exit 1
+fi
+if [[ ! -s "$stubborn_term_file" ]]; then
+  echo "repeated TERM plus SIGKILL erased the first stubborn-child termination marker" >&2
+  ls -l "$stubborn_term_file" "$stubborn_later_pause_file" >&2 || true
+  exit 1
+fi
 stubborn_group="$(cat "$stubborn_pid_file")"
-! kill -0 -- "-$stubborn_group" 2>/dev/null
-test ! -e "$(cat "$stubborn_home_file")"
-test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+if kill -0 -- "-$stubborn_group" 2>/dev/null; then
+  echo "real supervisor returned before stubborn process group $stubborn_group became quiescent" >&2
+  /bin/ps -o pid=,ppid=,pgid=,stat=,command= -g "$stubborn_group" >&2 || true
+  exit 1
+fi
+stubborn_home="$(cat "$stubborn_home_file")"
+if [[ -e "$stubborn_home" ]]; then
+  echo "real supervisor returned before removing stubborn-child isolated HOME $stubborn_home" >&2
+  exit 1
+fi
+if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
+  echo "real supervisor left isolated teardown state under $temp_parent" >&2
+  find "$temp_parent" -mindepth 1 -maxdepth 2 -print >&2
+  exit 1
+fi
 
 launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tool_passthrough.sh test_tui_debug.sh)
 phase=launcher-probe-closure

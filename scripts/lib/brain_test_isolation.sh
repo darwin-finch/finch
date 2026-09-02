@@ -45,12 +45,57 @@ brain_isolation_proof_rejected() {
   return 1
 }
 
+# Validate the supervisor profile and bind a content-addressed filename to the
+# bytes it names. Kept as a separate predicate so the shell layer can be tested
+# independently of the Rust proof verifier that normally runs before it.
+brain_isolation_supervisor_digest_for_profile() {
+  local library_root="$1" supervisor_executable="$2"
+  local actual_supervisor_digest supervisor_name supervisor_path_digest=''
+  case "$supervisor_executable" in
+    "$library_root/target/debug/finch-test-supervisor"|\
+    "$library_root/target/debug/finch-test-supervisor-pinned"|\
+    "$library_root/target/release/finch-test-supervisor"|\
+    "$library_root/target/release/finch-test-supervisor-pinned") ;;
+    "$library_root/target/debug/finch-test-supervisor-pinned-sha256-"*|\
+    "$library_root/target/release/finch-test-supervisor-pinned-sha256-"*)
+      supervisor_name="$(basename "$supervisor_executable")"
+      supervisor_path_digest="${supervisor_name#finch-test-supervisor-pinned-sha256-}"
+      if [[ ! "$supervisor_path_digest" =~ ^[0-9a-f]{64}$ ]]; then
+        brain_isolation_proof_rejected supervisor-content-path-shape
+        return 1
+      fi
+      ;;
+    *)
+      brain_isolation_proof_rejected supervisor-profile
+      return 1
+      ;;
+  esac
+  if [[ ! -x "$supervisor_executable" ]]; then
+    brain_isolation_proof_rejected supervisor-not-executable
+    return 1
+  fi
+  actual_supervisor_digest="$(set -o pipefail; shasum -a 256 "$supervisor_executable" | awk '{print $1}')" || {
+    brain_isolation_proof_rejected supervisor-digest-tool
+    return 1
+  }
+  if [[ ! "$actual_supervisor_digest" =~ ^[0-9a-f]{64}$ ]]; then
+    brain_isolation_proof_rejected supervisor-digest-tool
+    return 1
+  fi
+  if [[ -n "$supervisor_path_digest" && "$actual_supervisor_digest" != "$supervisor_path_digest" ]]; then
+    brain_isolation_proof_rejected supervisor-content-path-binding
+    return 1
+  fi
+  printf '%s\n' "$actual_supervisor_digest"
+}
+
 brain_test_isolation_is_active() {
   local proof token home root home_identity root_identity brain_addr daemon_addr
   local password_digest socket socket_root socket_root_identity ipc_listener_identity
-  local supervisor_pid supervisor_executable supervisor_identity signature
+  local supervisor_pid supervisor_executable supervisor_identity supervisor_digest signature
+  local actual_supervisor_digest
   local links proof_uid proof_mode proof_type actual_password_digest ancestor actual_supervisor_executable
-  local library_root expected_supervisor
+  local library_root
   [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || brain_isolation_proof_rejected isolated-marker
   [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || brain_isolation_proof_rejected proof-target-fd
   [[ "${FINCH_BRAIN_TEST_PROOF_BACKUP_FD:-}" == 108 ]] || brain_isolation_proof_rejected proof-backup-fd
@@ -75,9 +120,11 @@ brain_test_isolation_is_active() {
   supervisor_pid="$(printf '%s\n' "$proof" | sed -n '13p')"
   supervisor_executable="$(printf '%s\n' "$proof" | sed -n '14p')"
   supervisor_identity="$(printf '%s\n' "$proof" | sed -n '15p')"
-  signature="$(printf '%s\n' "$proof" | sed -n '16p')"
+  supervisor_digest="$(printf '%s\n' "$proof" | sed -n '16p')"
+  signature="$(printf '%s\n' "$proof" | sed -n '17p')"
+  [[ "$supervisor_digest" =~ ^[0-9a-f]{64}$ ]] || brain_isolation_proof_rejected supervisor-digest-shape
   [[ "$signature" =~ ^[0-9a-f]{128}$ ]] || brain_isolation_proof_rejected signature-shape
-  [[ "$(printf '%s\n' "$proof" | sed -n '17p')" == '' ]] || brain_isolation_proof_rejected trailing-proof-fields
+  [[ "$(printf '%s\n' "$proof" | sed -n '18p')" == '' ]] || brain_isolation_proof_rejected trailing-proof-fields
   [[ "$token" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || brain_isolation_proof_rejected token-binding
   [[ "$home" == "${HOME:-}" && "$home" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || brain_isolation_proof_rejected home-binding
   [[ "$root" == "$home/.finch/brains" && "$root" == "${FINCH_BRAIN_TEST_ROOT:-}" ]] || brain_isolation_proof_rejected root-binding
@@ -145,17 +192,13 @@ brain_test_isolation_is_active() {
     *) brain_isolation_proof_rejected unsupported-platform ;;
   esac
   library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || return 1
-  case "$supervisor_executable" in
-    "$library_root/target/debug/finch-test-supervisor"|\
-    "$library_root/target/debug/finch-test-supervisor-pinned"|\
-    "$library_root/target/release/finch-test-supervisor"|\
-    "$library_root/target/release/finch-test-supervisor-pinned")
-      expected_supervisor="$supervisor_executable" ;;
-    *) brain_isolation_proof_rejected supervisor-profile ;;
-  esac
-  [[ -x "$expected_supervisor" ]] || brain_isolation_proof_rejected supervisor-not-executable
   [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || brain_isolation_proof_rejected supervisor-executable-binding
-  [[ "$(brain_isolation_file_identity "$supervisor_executable")" == "$supervisor_identity" ]] || brain_isolation_proof_rejected supervisor-file-identity
+  # Same rule as `verify_supervisor_image` in src/brain/mod.rs: the image digest
+  # is checked always, not only when the inode differs, because an in-place
+  # overwrite keeps the inode. A byte-identical relink is accepted; anything
+  # else is refused (#259).
+  actual_supervisor_digest="$(brain_isolation_supervisor_digest_for_profile "$library_root" "$supervisor_executable")" || return 1
+  [[ "$actual_supervisor_digest" == "$supervisor_digest" ]] || brain_isolation_proof_rejected supervisor-executable-substituted
   if [[ "$(uname -s)" == Darwin ]]; then
     links="$(stat -f '%l' /dev/fd/108)" || return 1
     proof_uid="$(stat -f '%u' /dev/fd/108)" || return 1

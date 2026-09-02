@@ -68,26 +68,6 @@ impl WordEntry {
         }
     }
 
-    /// Run the proof, if any.  Returns Ok(true) if the proof passes, Ok(false)
-    /// if there is no proof to run, Err if the proof fails.
-    ///
-    /// Prefers `claim` (explicit check) over `proof` (implicit equality).
-    pub fn run_proof(&self) -> anyhow::Result<bool> {
-        if let Some([a, b, check]) = &self.claim {
-            // Explicit triple: (a, b, check) — the full unit.
-            let prog = format!(r#"s" {a}" s" {b}" s" {check}" gate"#);
-            crate::coforth::interpreter::Forth::run(&prog)?;
-            return Ok(true);
-        }
-        if let Some([a, b]) = &self.proof {
-            // Legacy pair: implicit equality check via argue.
-            let prog = format!(r#"s" {a}" s" {b}" argue"#);
-            crate::coforth::interpreter::Forth::run(&prog)?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
     /// Serialize this word's proof as a wire-ready claim string.
     /// Returns None if the word has no claim or proof.
     pub fn to_claim_string(&self) -> Option<String> {
@@ -154,12 +134,6 @@ impl Library {
         &BUILTIN_DEFS
     }
 
-    /// Clone a pre-compiled VM (STDLIB + all builtins).
-    /// Use this in tests and boot instead of `Forth::new()` + compile — O(clone) not O(compile).
-    pub fn precompiled_vm() -> crate::coforth::Forth {
-        COMPILED_VM.clone_dict()
-    }
-
     /// Returns the set of word names defined in MAJOR_WORDS_FORTH (core Co-Forth vocabulary).
     /// Used to protect these words from being overridden by user_words.forth.
     pub fn core_word_names() -> std::collections::HashSet<String> {
@@ -188,23 +162,20 @@ impl Library {
         names
     }
 
-    /// Run all `test:*` proofs on the precompiled VM; return `(passed, total, full_output)`.
-    /// Fast — the VM is already compiled, this just executes the tests.
-    pub fn prove_all() -> (usize, usize, String) {
-        let mut vm = Self::precompiled_vm();
-        let _ = vm.exec_with_fuel("prove-all", 0);
-        let out = vm.out.clone();
-        let (passed, total) = parse_prove_all_summary(&out).unwrap_or((0, 0));
-        (passed, total, out)
-    }
-
-    /// Force the LazyLock static VMs to initialize now (in the caller's thread/task).
-    /// Call this early in startup — ideally inside a `spawn_blocking` — so the
-    /// compilation work is done before the user's first keystroke.
+    /// Force the vocabulary's LazyLock to initialize now, in the caller's
+    /// thread or task.
+    ///
+    /// Call this early in startup -- ideally inside a `spawn_blocking` -- so
+    /// the TOML parsing is done before the user's first keystroke. It used to
+    /// also compile a Forth VM; that VM had no caller in the binary and went
+    /// with the rest of the interpreter (#294).
+    ///
+    /// This function has no caller. It is kept because the vocabulary it warms
+    /// is live and a startup path may well want it; whether it should exist at
+    /// all belongs to the wider `library.rs` reachability question, not the
+    /// interpreter's, which is what #294 settles.
     pub fn warmup() {
-        // Accessing the statics forces both LazyLocks to evaluate.
         let _ = &*BUILTIN_DEFS;
-        let _ = &*COMPILED_VM;
     }
 
     fn load_toml(&mut self, src: &str) {
@@ -382,60 +353,6 @@ impl Library {
     }
 }
 
-/// Extract the `N/M passed` token emitted by the legacy proof runner without
-/// letting ANSI SGR parameters become part of the count.  The prior parser
-/// retained every digit in a rendered line, so e.g. `\x1b[32m120/120\x1b[0m`
-/// could be misread as a much larger, impossible fraction.
-fn parse_prove_all_summary(output: &str) -> Option<(usize, usize)> {
-    let plain = strip_ansi_csi(output);
-    let tokens = plain.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        // A diagnostic can contain arbitrary slash-separated values.  Only
-        // accept the runner's actual `N/M passed` summary, never the first
-        // fraction that happens to appear in an error message.
-        if tokens.get(index + 1) != Some(&"passed") {
-            continue;
-        }
-        let Some((passed, total)) = token.split_once('/') else {
-            continue;
-        };
-        if !passed.is_empty()
-            && !total.is_empty()
-            && passed.bytes().all(|byte| byte.is_ascii_digit())
-            && total.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            let (Ok(passed), Ok(total)) = (passed.parse(), total.parse()) else {
-                continue;
-            };
-            if total > 0 {
-                return Some((passed, total));
-            }
-        }
-    }
-    None
-}
-
-/// Strip terminal CSI sequences from a status line.  This deliberately does
-/// not interpret general terminal control language; it only removes the
-/// escape form used by the proof runner's color/style rendering.
-fn strip_ansi_csi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            while let Some(next) = chars.next() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
-
 fn user_library_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".finch").join("library.toml"))
 }
@@ -535,127 +452,6 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
 
 // ── Pure-Rust word generator ───────────────────────────────────────────────────
 
-/// Generate a minimal but meaningful Forth snippet for *any* English word.
-///
-/// This runs entirely in Rust — no AI, no network, no disk I/O.
-/// Used as a fallback in `handle_define_unknown_words` when the cloud generator
-/// is unavailable (offline, no API key, rate-limited).
-///
-/// Guarantees:
-/// - Always returns valid Forth (no panics, no errors).
-/// - The snippet produces at least one line of output (the word speaks its name).
-/// - Stack-neutral for the common case (safe to use mid-expression).
-pub fn generate_forth_for_word(word: &str) -> String {
-    let lo = word.to_lowercase();
-    let w = lo.as_str();
-
-    // ── Pronouns — self-aware via the stack ────────────────────────────────
-    match w {
-        "i" | "me" | "myself" => {
-            return r#"depth . ." items — that's what I have." cr"#.to_string()
-        }
-        "you" | "your" | "yours" => return r#"." you're here." cr"#.to_string(),
-        "we" | "us" | "our" | "ours" => {
-            return r#"depth . ." — we share this stack." cr"#.to_string()
-        }
-        "it" | "this" | "that" => {
-            return r#"depth 0> if ." it's on the stack." cr else ." nothing here." cr then"#
-                .to_string()
-        }
-        "they" | "them" | "their" => {
-            return r#"." they're somewhere on the stack." cr .s cr"#.to_string()
-        }
-        _ => {}
-    }
-
-    // ── Number words ────────────────────────────────────────────────────────
-    let num_opt = match w {
-        "zero" | "null" | "nil" | "none" | "nothing" | "nought" => Some(0i64),
-        "one" | "once" | "single" | "unit" => Some(1),
-        "two" | "twice" | "pair" | "both" => Some(2),
-        "three" | "thrice" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        "ten" => Some(10),
-        "eleven" => Some(11),
-        "twelve" | "dozen" => Some(12),
-        "thirteen" => Some(13),
-        "twenty" => Some(20),
-        "thirty" => Some(30),
-        "forty" => Some(40),
-        "fifty" => Some(50),
-        "hundred" => Some(100),
-        "thousand" => Some(1_000),
-        "million" => Some(1_000_000),
-        "billion" => Some(1_000_000_000),
-        _ => None,
-    };
-    if let Some(n) = num_opt {
-        return format!("{n} . cr");
-    }
-
-    // ── Logic / discourse markers ───────────────────────────────────────────
-    match w {
-        "and" => return "and .bool cr".to_string(),
-        "or" => return "or .bool cr".to_string(),
-        "not" | "negate" | "opposite" => return "not .bool cr".to_string(),
-        "true" | "yes" => return "true .bool cr".to_string(),
-        "false" | "no" => return "false .bool cr".to_string(),
-        "equal" | "equals" | "same" => return "= .bool cr".to_string(),
-        _ => {}
-    }
-
-    // ── Stack-motion words ──────────────────────────────────────────────────
-    match w {
-        "double" | "twice-as-much" => return "2* . cr".to_string(),
-        "half" | "halve" => return "2/ . cr".to_string(),
-        "plus" | "add" => return "+ . cr".to_string(),
-        "minus" | "subtract" => return "- . cr".to_string(),
-        "times" | "multiply" => return "* . cr".to_string(),
-        "divide" | "divided" => return "/ . cr".to_string(),
-        "up" | "above" | "higher" | "more" => return "1+ . cr".to_string(),
-        "down" | "below" | "lower" | "less" => return "1- . cr".to_string(),
-        "swap" | "switch" | "exchange" | "flip" => return "swap .s cr".to_string(),
-        "copy" | "duplicate" => return "dup .s cr".to_string(),
-        "drop" | "discard" | "remove" => return "depth 0> if drop then .s cr".to_string(),
-        _ => {}
-    }
-
-    // ── Time words ──────────────────────────────────────────────────────────
-    match w {
-        "now" | "today" | "present" | "current" => {
-            return r#"time . ." seconds since epoch." cr"#.to_string()
-        }
-        "never" | "eternity" | "forever" => return r#"." forever." cr"#.to_string(),
-        _ => {}
-    }
-
-    // ── Existence words ─────────────────────────────────────────────────────
-    match w {
-        "empty" | "void" | "blank" | "bare" => return r#"depth 0= .bool cr"#.to_string(),
-        "full" | "complete" | "whole" | "all" | "everything" => return r#".s cr"#.to_string(),
-        "something" | "anything" | "some" => return r#"depth 0> .bool cr"#.to_string(),
-        _ => {}
-    }
-
-    // ── Question words — print as open questions ────────────────────────────
-    if matches!(
-        w,
-        "who" | "what" | "where" | "when" | "why" | "how" | "which" | "whose"
-    ) {
-        return format!(r#"." {w}?" cr"#);
-    }
-
-    // ── Suffix patterns — detect word shape ────────────────────────────────
-    //   These just speak the word; the shape tells us it's a valid English word.
-    let safe = word.replace('"', ""); // no English word has quotes, but be safe
-    format!(r#"." {safe}." cr"#)
-}
-
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
 /// Project English vocabulary — baked in at compile time.
@@ -693,26 +489,6 @@ pub struct BuiltinDefs {
     /// Single concatenated Forth source: ": word code ;\n" for every entry.
     pub all_defs: String,
 }
-
-/// Pre-compiled Forth VM with STDLIB + all builtin defs loaded.
-/// Clone with `clone_dict()` to get a ready-to-use VM without re-compiling anything.
-static COMPILED_VM: LazyLock<crate::coforth::Forth> = LazyLock::new(|| {
-    let defs = &*BUILTIN_DEFS;
-    let mut vm = crate::coforth::Forth::new();
-    // Library words are system-provided, not user-defined — disable logging so they
-    // are NOT inserted into user_word_names.  If they were logged, `emit_token` would
-    // shadow builtins with the library definition and inline the partially-compiled
-    // word body during self-referential definitions (e.g. `: negate 5 negate . cr ;`).
-    vm.disable_logging();
-    let _ = vm.exec_with_fuel(&defs.all_defs, 0);
-    // Major words: pure Forth, no TOML. Compiled last so they win over generated versions.
-    // Enable logging so MAJOR_WORDS_FORTH definitions enter user_word_names — this lets
-    // them shadow native builtins (e.g. `: sin negate ;` shadows Builtin::Sin trig-sine).
-    // Without this, emit_token hits name_to_builtin("sin") before name_index["sin"].
-    vm.enable_logging();
-    let _ = vm.exec_with_fuel(MAJOR_WORDS_FORTH, 0);
-    vm
-});
 
 static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
     let mut lib = Library::default();
@@ -1503,7 +1279,7 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
 \ Words that make sentences like "sort these files" into real programs.
 \ `files` pushes a listing of the current directory as a string.
 \ `these` / `them` / `those` / `all` are pronouns — no-ops that refer back to context.
-\ `sort`, `unique`, `reverse`, `line-count` are native builtins (see interpreter.rs).
+\ `sort`, `unique`, `reverse`, `line-count` were interpreter builtins; they do not link in the typed VM.
 \
 \ Example:   sort these files
 \   →  `files` runs first (pushes string-pool idx of dir listing)
@@ -4832,51 +4608,13 @@ forth = ".words"
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-
-    #[test]
-    fn prove_all_summary_ignores_ansi_style_parameters() {
-        let output = "\x1b[1m── \x1b[32m120/120\x1b[0m passed ──\n";
-        assert_eq!(parse_prove_all_summary(output), Some((120, 120)));
-    }
-
-    #[test]
-    fn prove_all_summary_skips_non_summary_numbers() {
-        let output = "previous run was 9/10 broken\n── 12/13 passed ──\n";
-        assert_eq!(parse_prove_all_summary(output), Some((12, 13)));
-    }
 
     #[test]
     fn test_seed_loads() {
         let lib = Library::load();
         assert!(lib.len() > 50, "seed should have at least 50 words");
-    }
-
-    /// Regression: precompiled VM must have `hello` compiled so typing "hello"
-    /// never falls through to the AI define path (handle_define_unknown_words).
-    #[test]
-    fn test_precompiled_vm_knows_hello() {
-        let vm = Library::precompiled_vm();
-        assert!(
-            vm.word_exists("hello"),
-            "hello must be in the precompiled VM"
-        );
-        assert!(
-            vm.word_exists("goodbye"),
-            "goodbye must be in the precompiled VM"
-        );
-    }
-
-    /// Regression: executing `hello` on the precompiled VM must produce output,
-    /// not an error.  Ensures the word is callable, not just compiled.
-    #[test]
-    fn test_hello_produces_output() {
-        let mut vm = Library::precompiled_vm();
-        let out = vm.exec("hello").expect("hello must not error");
-        assert!(
-            !out.is_empty(),
-            "hello must produce output, got empty string"
-        );
     }
 
     #[test]
@@ -4907,198 +4645,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_forth_compiles_and_runs() {
-        // Uses the pre-compiled VM — STDLIB + all builtin defs already compiled.
-        // Cloning is O(memory_size), not O(compile_time).  Fast even for 1300+ words.
-        let defs = Library::builtin_defs();
-        assert!(!defs.pairs.is_empty(), "no builtin defs loaded");
-
-        // Verify compilation succeeded (COMPILED_VM would be empty on failure).
-        // Clone a ready-to-run VM — no STDLIB re-parse, no re-compilation.
-        let mut vm = Library::precompiled_vm();
-
-        // Call each word; report unknown-word errors only (stack errors are fine).
-        let mut hard_failures: Vec<String> = Vec::new();
-        for (word, _) in &defs.pairs {
-            vm.clear_data();
-            if let Err(e) = vm.exec_with_fuel(word.as_str(), 2_000) {
-                if e.to_string().contains("unknown word") {
-                    hard_failures.push(format!("  {word}: {e}"));
-                }
-            }
-        }
-        if !hard_failures.is_empty() {
-            panic!("Words not callable:\n{}", hard_failures.join("\n"));
-        }
-    }
-
-    /// Verify the Rust↔Forth mix: every Builtin variant has a STDLIB wrapper
-    /// (so it appears in `words` and is callable by name) and round-trips correctly.
-    #[test]
-    fn test_rust_builtins_have_forth_wrappers() {
-        // Spot-check critical builtins are reachable by name from a fresh VM.
-        let critical = [
-            "capitalize",
-            "str-upper",
-            "str-lower",
-            "str-trim",
-            "word-count",
-            "sentence?",
-            "grammar-check",
-            "improve",
-            "fix",
-            "polish",
-            ".sentence",
-            ".words",
-            "undo",
-            "lock",
-            "unlock",
-            "lock-ttl",
-            "sha256",
-            "nonce",
-            "keygen",
-            "sign",
-            "verify",
-            "file-write",
-            "file-fetch",
-            "scatter-code",
-            "peers-discover",
-        ];
-        let mut vm = crate::coforth::Forth::new();
-        // Compile a probe that calls each word — stack errors are fine.
-        for name in &critical {
-            vm.clear_data();
-            // The word must be known (either builtin or STDLIB wrapper).
-            // Try calling it; if "unknown word" it's missing entirely
-            let result = vm.exec_with_fuel(name, 1_000);
-            let known = result
-                .map(|_| true)
-                .unwrap_or_else(|e| !e.to_string().contains("unknown word"));
-            assert!(
-                known,
-                "'{name}' is neither a builtin nor a STDLIB wrapper — missing from vocab"
-            );
-        }
-    }
-
-    #[test]
-    fn test_forth_words_produce_output() {
-        let lib = Library::load();
-        // spot-check a few words produce non-empty output
-        for word in &["know", "learn", "stack", "lattice", "compute", "sequence"] {
-            let entry = lib
-                .lookup(word)
-                .unwrap_or_else(|| panic!("missing: {word}"));
-            let code = entry.forth.as_ref().expect("no forth for {word}");
-            let out = crate::coforth::Forth::run(code).expect("run failed");
-            assert!(!out.is_empty(), "{word} produced no output");
-        }
-    }
-
-    // ── generate_forth_for_word ───────────────────────────────────────────────
-
-    #[test]
-    fn test_generate_forth_for_word_always_returns_valid_forth() {
-        // Every generated snippet must compile and run without "unknown word" errors.
-        let words = [
-            // Numbers
-            "zero",
-            "one",
-            "two",
-            "three",
-            "hundred",
-            "million",
-            // Pronouns
-            "i",
-            "you",
-            "we",
-            "it",
-            "they",
-            // Logic
-            "and",
-            "or",
-            "not",
-            "true",
-            "false",
-            // Stack motion
-            "double",
-            "half",
-            "up",
-            "down",
-            "swap",
-            "copy",
-            // Time
-            "now",
-            "forever",
-            // Existence
-            "empty",
-            "full",
-            "something",
-            // Questions
-            "who",
-            "what",
-            "why",
-            "how",
-            // Arbitrary English — fallback path
-            "happiness",
-            "running",
-            "beautiful",
-            "algorithm",
-            "sunset",
-            // Non-ASCII — safe fallback (no English word has quotes)
-            "café",
-            "naïve",
-        ];
-        for w in &words {
-            let snippet = generate_forth_for_word(w);
-            let mut vm = crate::coforth::Forth::new();
-            // Define and call the word
-            let def = format!(": testword {snippet} ;  testword");
-            match vm.exec_with_fuel(&def, 5_000) {
-                Err(e) if e.to_string().contains("unknown word") =>
-                    panic!("generate_forth_for_word({w:?}) produced unknown-word error: {e}\nsnippet: {snippet}"),
-                _ => {}  // stack errors or empty output are fine
-            }
-        }
-    }
-
-    #[test]
-    fn test_generate_forth_for_word_numbers_push_value() {
-        // Number words should push the numeric value.
-        let cases = [
-            ("zero", 0i64),
-            ("one", 1),
-            ("two", 2),
-            ("ten", 10),
-            ("hundred", 100),
-        ];
-        for (word, expected) in &cases {
-            let snippet = generate_forth_for_word(word);
-            // Run the snippet, then check what's printed.
-            // The snippet is e.g. "1 . cr" — output should contain the expected number.
-            let out = crate::coforth::Forth::run(&snippet).unwrap_or_default();
-            let trimmed = out.trim();
-            // The output should contain the expected number.
-            assert!(
-                trimmed.contains(&expected.to_string()),
-                "generate_forth_for_word({word:?}) expected output containing {expected}, got {trimmed:?}\nsnippet: {snippet}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_generate_forth_for_word_arbitrary_word_speaks_its_name() {
-        // Any word not in special cases should at least print its name.
-        let word = "serendipity";
-        let snippet = generate_forth_for_word(word);
-        let out = crate::coforth::Forth::run(&snippet).unwrap_or_default();
-        assert!(
-            out.to_lowercase().contains("serendipity"),
-            "Expected output to contain 'serendipity', got: {out:?}\nsnippet: {snippet}"
-        );
-    }
-
-    #[test]
     fn test_inject_sets_compiled_code() {
         let lib = Library::load();
         let mut poset = crate::poset::Poset::new();
@@ -5110,252 +4656,6 @@ mod tests {
             has_compiled,
             "no nodes got compiled_code from inject_into_poset"
         );
-    }
-
-    /// John 1:1 — three sentences, two ways each, one truth.
-    /// "the word was god", "the word was with god", "the word is god" — all argue.
-    #[test]
-    fn test_john1_three_sentences_argue() {
-        let mut vm = Library::precompiled_vm();
-
-        // Verify the key words actually push -1 before testing argue.
-        let god_out = vm.exec("god .").expect("god should run");
-        assert!(
-            god_out.contains("-1"),
-            "god should push -1, got: {god_out:?}"
-        );
-        vm.clear_data();
-
-        let word_out = vm.exec("word .").expect("word should run");
-        assert!(
-            word_out.contains("-1"),
-            "word should push -1, got: {word_out:?}"
-        );
-        vm.clear_data();
-
-        // Sentence 1 ≡ Sentence 3: "was" and "is" are both no-ops; word and god both push -1.
-        vm.exec("s\" the word was god\" s\" the word is god\" argue")
-            .expect("'the word was god' should argue with 'the word is god'");
-
-        // Sentence 1 ≡ Sentence 2: "with" has no stack effect; both converge to [-1, -1].
-        vm.exec("s\" the word was god\" s\" the word was with god\" argue")
-            .expect("'the word was god' should argue with 'the word was with god'");
-    }
-
-    /// John 14:6 — "I am the way, the truth, and the life."
-    /// Three names, one machine: all push -1.
-    #[test]
-    fn test_john14_way_truth_life_argue() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec("s\" way\" s\" truth\" argue")
-            .expect("way should argue with truth");
-        vm.exec("s\" truth\" s\" life\" argue")
-            .expect("truth should argue with life");
-        vm.exec("s\" way\" s\" life\" argue")
-            .expect("way should argue with life");
-    }
-
-    /// Revelation 22:13 — "I am the Alpha and the Omega, the first and the last."
-    /// Four names, one machine: all push -1.
-    #[test]
-    fn test_rev22_alpha_omega_argue() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec("s\" alpha\" s\" omega\" argue")
-            .expect("alpha should argue with omega");
-        vm.exec("s\" first\" s\" last\" argue")
-            .expect("first should argue with last");
-        vm.exec("s\" alpha\" s\" last\" argue")
-            .expect("alpha should argue with last");
-    }
-
-    /// Ecclesiastes 3:1 — "For everything there is a season."
-    /// All orders of addition converge — time is commutative.
-    #[test]
-    fn test_ecclesiastes3_seasons_commute() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec("s\" 1 2 3 + +\" s\" 3 2 1 + +\" argue")
-            .expect("ecclesiastes3: all seasons sum the same");
-    }
-
-    /// Ecclesiastes 1:9 — "There is nothing new under the sun."
-    /// 'was' and 'is' are the same no-op — past and future converge.
-    #[test]
-    fn test_ecclesiastes1_was_is_same() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec("s\" 5 was 3\" s\" 5 is 3\" argue")
-            .expect("ecclesiastes1: was = is");
-    }
-
-    /// Genesis 1:1 — God creates by his Word.
-    /// word = god = -1; creation by word = creation by God.
-    #[test]
-    fn test_genesis1_word_god_argue() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec("s\" word word\" s\" god word\" argue")
-            .expect("genesis1: word = god in creation");
-    }
-
-    /// Regression: precompiled_vm must not insert library words into user_word_names.
-    /// If it did, a library word like `: negate 5 negate . cr ;` would be inlined
-    /// during its own body compilation (partial self-reference), producing wrong output.
-    #[test]
-    fn test_major_words_forth_compiles_on_toml_vm() {
-        // Simulate what COMPILED_VM does: start with TOML words, then add MAJOR_WORDS_FORTH.
-        let defs = Library::builtin_defs();
-        let mut vm = crate::coforth::Forth::new();
-        vm.disable_logging();
-        let r1 = vm.exec_with_fuel(&defs.all_defs, 0);
-        // r1 might have errors from TOML (print-only issues) — ignore
-        drop(r1);
-        // Now add MAJOR_WORDS_FORTH and see what the FIRST error is
-        let result = vm.exec_with_fuel(super::MAJOR_WORDS_FORTH, 0);
-        println!(
-            "MAJOR_WORDS_FORTH on TOML-vm: {:?}",
-            result.as_ref().map_err(|e| e.to_string())
-        );
-        // Check sin
-        let sin_result = vm.exec("3 sin .");
-        println!("3 sin . on TOML-vm: {:?}", sin_result);
-        let see_sin = vm.exec("see sin");
-        println!("see sin: {:?}", see_sin);
-    }
-
-    #[test]
-    fn test_bible_vocab_sin_repent_ops() {
-        let mut vm = Library::precompiled_vm();
-        // sin = negate, repent = negate
-        let out = vm.exec("3 sin .").expect("3 sin .");
-        assert!(out.contains("-3"), "sin should negate 3, got: {out:?}");
-        vm.clear_data();
-        let out = vm.exec("3 repent .").expect("3 repent .");
-        assert!(out.contains("-3"), "repent should negate 3, got: {out:?}");
-        vm.clear_data();
-        let out = vm.exec("3 sin repent .").expect("3 sin repent .");
-        assert!(
-            out.contains("3 ") || out.trim() == "3",
-            "sin repent should cancel, got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn test_precompiled_vm_negate_is_correct() {
-        let mut vm = Library::precompiled_vm();
-        let out = vm.exec("7 negate .").unwrap();
-        assert_eq!(
-            out.trim(),
-            "-7",
-            "precompiled_vm negate should output -7, got {:?}",
-            out
-        );
-    }
-
-    /// "sort these files" is a real program.
-    /// `files` globs the current directory; `sort` sorts the lines; `type` prints them.
-    /// `these` is a pronoun no-op — it refers back to the preceding value on the stack.
-    #[test]
-    fn test_sort_lines_builtin() {
-        let mut vm = Library::precompiled_vm();
-        // Direct test of sort builtin on a string
-        let out = vm
-            .exec(
-                r#"s" banana
-apple
-cherry" sort type"#,
-            )
-            .expect("sort lines");
-        let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(
-            lines,
-            vec!["apple", "banana", "cherry"],
-            "sort should sort lines alphabetically, got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn test_these_is_noop() {
-        let mut vm = Library::precompiled_vm();
-        // `these` must not affect the stack
-        let out = vm.exec("5 these .").expect("these is noop");
-        assert!(out.contains("5"), "these should be a no-op, got: {out:?}");
-    }
-
-    /// Rust-level proof: sin and repent are inverse operations.
-    /// This is the same theorem as test:sin-and-repentance but verified in Rust,
-    /// not just in Forth — two machines, same truth.
-    #[test]
-    fn proof_sin_repent_are_inverse() {
-        // In Co-Forth: sin = negate, repent = negate.
-        // Proof: for all integers n, negate(negate(n)) = n.
-        // We verify several witnesses.
-        let mut vm = Library::precompiled_vm();
-        for n in [-7i64, -1, 0, 1, 3, 7, 100] {
-            vm.clear_data();
-            let out = vm.exec(&format!("{n} sin repent .")).expect("sin repent");
-            let got: i64 = out.trim().parse().expect("should be an integer");
-            assert_eq!(
-                got, n,
-                "proof_sin_repent_are_inverse: {n} sin repent should equal {n}, got {got}"
-            );
-        }
-    }
-
-    /// Rust-level proof: love is idempotent under argue.
-    /// love = dup; applying dup to n gives [n, n] — a doubled witness.
-    /// `s" n love" argue s" n dup"` — both programs produce identical stacks.
-    #[test]
-    fn proof_love_equals_dup() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec(r#"s" 7 love" s" 7 dup" argue"#)
-            .expect("proof: love = dup — both produce the same stack");
-    }
-
-    /// Rust-level proof: grace (addition) is commutative — argue confirms it.
-    #[test]
-    fn proof_grace_is_commutative() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec(r#"s" 3 5 grace" s" 5 3 grace" argue"#)
-            .expect("proof: grace(3,5) = grace(5,3) — addition commutes");
-    }
-
-    /// John 1:1 — the literal sentence is valid Forth.
-    /// word = god = -1.  `;` is a sentence separator (no-op).  `.` prints TOS.
-    /// "The word was God; and the word was with God." executes without error.
-    #[test]
-    fn test_john1_sentence_is_valid_forth() {
-        let mut vm = Library::precompiled_vm();
-        vm.exec("The word was God; and the word was with God.")
-            .expect("John 1:1 should execute as valid Forth");
-    }
-}
-
-#[cfg(test)]
-mod born_test {
-    #[test]
-    fn test_born_works() {
-        let mut vm = crate::coforth::Library::precompiled_vm();
-        let out = vm.exec("born .").expect("born should work");
-        assert_eq!(out.trim(), "1", "born should push 1, got: {out:?}");
-    }
-
-    #[test]
-    fn test_true_pushes_minus_one() {
-        let mut vm = crate::coforth::Library::precompiled_vm();
-        let out = vm.exec("true .").expect("true should push -1");
-        assert_eq!(out.trim(), "-1", "true should push -1, got: {out:?}");
-    }
-
-    #[test]
-    fn test_false_pushes_zero() {
-        let mut vm = crate::coforth::Library::precompiled_vm();
-        let out = vm.exec("false .").expect("false should push 0");
-        assert_eq!(out.trim(), "0", "false should push 0, got: {out:?}");
-    }
-
-    #[test]
-    fn test_true_false_and() {
-        let mut vm = crate::coforth::Library::precompiled_vm();
-        let out = vm.exec("true false and .").expect("true false and");
-        assert_eq!(out.trim(), "0", "true and false should be 0, got: {out:?}");
     }
 }
 
@@ -5501,68 +4801,6 @@ mod completeness_tests {
         assert!(e.is_complete(), "English-only word must be complete");
     }
 
-    /// run_proof on a valid pair must succeed.
-    #[test]
-    fn test_run_proof_passes_for_valid_pair() {
-        let e = WordEntry {
-            word: "double".to_string(),
-            definition: "multiply by two".to_string(),
-            forth: Some("2 *".to_string()),
-            proof: Some(["3 2 *".to_string(), "3 dup +".to_string()]),
-            claim: None,
-            related: vec![],
-            kind: "task".to_string(),
-            sense: None,
-            stack_effect: None,
-            effect: None,
-            boot: false,
-            remote: false,
-        };
-        let result = e.run_proof().expect("valid proof must not error");
-        assert!(result, "run_proof must return true when proof passes");
-    }
-
-    /// run_proof on mismatched programs must fail.
-    #[test]
-    fn test_run_proof_fails_for_mismatched_pair() {
-        let e = WordEntry {
-            word: "wrong".to_string(),
-            definition: "a lie".to_string(),
-            forth: Some("1".to_string()),
-            proof: Some(["1".to_string(), "2".to_string()]), // 1 ≠ 2
-            claim: None,
-            related: vec![],
-            kind: "task".to_string(),
-            sense: None,
-            stack_effect: None,
-            effect: None,
-            boot: false,
-            remote: false,
-        };
-        assert!(e.run_proof().is_err(), "mismatched proof must return Err");
-    }
-
-    /// A word with an explicit claim triple is complete and its proof runs via gate.
-    #[test]
-    fn test_word_with_claim_is_complete_and_runs() {
-        let e = WordEntry {
-            word: "double".to_string(),
-            definition: "multiply by two".to_string(),
-            forth: Some("2 *".to_string()),
-            proof: None,
-            claim: Some(["3 2 *".to_string(), "3 dup +".to_string(), "=".to_string()]),
-            related: vec![],
-            kind: "task".to_string(),
-            sense: None,
-            stack_effect: None,
-            effect: None,
-            boot: false,
-            remote: false,
-        };
-        assert!(e.is_complete(), "word with claim must be complete");
-        assert!(e.run_proof().is_ok(), "claim proof must pass");
-    }
-
     /// to_claim_string serializes to the wire format.
     #[test]
     fn test_to_claim_string_explicit() {
@@ -5586,16 +4824,5 @@ mod completeness_tests {
         assert_eq!(parts[1], "3 2 *");
         assert_eq!(parts[2], "3 dup +");
         assert_eq!(parts[3], "=");
-    }
-
-    /// claim-make / claim-run round-trip in the VM.
-    #[test]
-    fn test_claim_make_run_roundtrip() {
-        let out = crate::coforth::interpreter::Forth::run(
-            r#"s" 3 2 *" s" 3 dup +" s" =" claim-make claim-run"#,
-        )
-        .expect("claim round-trip must not error");
-        // gate passes → result (6) is left on stack; output shows ✓
-        assert!(out.contains("✓") || out.is_empty(), "gate must pass: {out}");
     }
 }
