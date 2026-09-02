@@ -6882,7 +6882,7 @@ fn read_workbook_rows(
 ) -> std::result::Result<Vec<Vec<String>>, String> {
     use calamine::{open_workbook_auto_from_rs, Reader};
 
-    const MAX_WORKBOOK_CELLS: usize = 10_000_000;
+    use crate::workbook::MAX_WORKBOOK_CELLS;
     const MAX_WORKBOOK_BYTES: u64 = 512 * 1024 * 1024;
     let size = file.metadata().map_err(|error| error.to_string())?.len();
     if size > MAX_WORKBOOK_BYTES {
@@ -6905,25 +6905,22 @@ fn read_workbook_rows(
         .map(str::to_owned)
         .or_else(|| workbook.sheet_names().first().cloned())
         .ok_or_else(|| format!("workbook '{label}' has no sheets"))?;
-    let range = workbook.worksheet_range(&sheet).map_err(|error| {
-        format!(
-            "cannot read workbook sheet '{}' from '{}': {error}",
-            sheet, label
-        )
-    })?;
-    let mut cell_count = 0usize;
-    let mut rows = Vec::new();
-    for row in range.rows() {
-        cell_count = cell_count
-            .checked_add(row.len())
-            .ok_or_else(|| "workbook cell count overflowed".to_string())?;
-        if cell_count > MAX_WORKBOOK_CELLS {
-            return Err(format!(
-                "workbook sheet exceeds the {MAX_WORKBOOK_CELLS}-cell host cursor limit"
-            ));
-        }
-        rows.push(row.iter().map(workbook_cell_to_string).collect());
-    }
+    // Bounded before the box is allocated, not after. The cell check that used
+    // to sit further down bounded what Finch would iterate; it never bounded
+    // what calamine would allocate, so a two-cell sheet spanning A1 to
+    // XFD1048576 exhausted memory inside `worksheet_range` and never reached
+    // it (#282).
+    let range = crate::workbook::bounded_worksheet_range(&mut workbook, &sheet, MAX_WORKBOOK_CELLS)
+        .map_err(|error| format!("reading workbook '{label}': {error}"))?;
+    // No second cell count here. `range.rows()` walks exactly the bounding box
+    // that `bounded_worksheet_range` already refused to exceed, so a running
+    // total could not reach the limit -- keeping the check would leave code
+    // that reads like the bound but can never fire, which is how the real
+    // bound came to be applied one step too late in the first place.
+    let rows = range
+        .rows()
+        .map(|row| row.iter().map(workbook_cell_to_string).collect())
+        .collect();
     Ok(rows)
 }
 
@@ -10635,6 +10632,120 @@ mod tests {
             stored.values.first(),
             Some(ProgramValue::Resource { kind, .. }) if kind == "memory-node"
         ));
+    }
+
+    /// The production entry point refuses the sheet, not just the helper.
+    ///
+    /// `read_workbook_rows` backs `workbook-open`, `workbook-sheet-open`,
+    /// `workbook-range` and `workbook-summary` -- every typed spreadsheet word
+    /// -- and it is where the bound used to sit one step too late: the
+    /// `MAX_WORKBOOK_CELLS` check ran on the `Range` that `worksheet_range()`
+    /// had already allocated, so it bounded what Finch would iterate and never
+    /// what calamine would allocate (#282).
+    #[test]
+    fn read_workbook_rows_refuses_a_sheet_whose_box_cannot_be_allocated() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&crate::workbook::fixtures::two_cells_spanning_the_whole_sheet())
+            .unwrap();
+        file.flush().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = read_workbook_rows(file.as_file(), "hostile.xlsx", None)
+            .expect_err("a 1.7e10-cell bounding box must be refused");
+        let elapsed = started.elapsed();
+
+        // Wall clock, not "it did not crash": filling 1.7e10 `Data` slots
+        // cannot finish in a second on any host, so a fast refusal is positive
+        // evidence the box was never built -- where a bare `is_err()` would
+        // also pass if the allocation happened and something later complained.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}, long enough to have allocated the box"
+        );
+        assert!(
+            error.contains("1048576 rows") && error.contains("16384 columns"),
+            "the error must name the dimensions that made it too big: {error}"
+        );
+    }
+
+    /// And the same at the boundary when the header lies.
+    ///
+    /// The test above is caught by the constant-time check on the declared
+    /// extent, so it never exercises the streamed bound at the production
+    /// boundary. A file that declares `A1:B2` and holds a cell at
+    /// `XFD1048576` defeats a declared-only check entirely, and that is the
+    /// path this drives.
+    #[test]
+    fn read_workbook_rows_refuses_a_sheet_that_under_declares_its_extent() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&crate::workbook::fixtures::a_sheet_that_under_declares_its_extent())
+            .unwrap();
+        file.flush().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = read_workbook_rows(file.as_file(), "lying.xlsx", None)
+            .expect_err("the declared extent is not evidence about the cells");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "slow enough to have allocated the box"
+        );
+        assert!(
+            error.contains("actual extent"),
+            "must be refused on the streamed cells, not the header it lied in: {error}"
+        );
+    }
+
+    /// A chart-first workbook reads as empty at the production boundary.
+    ///
+    /// This is the shipped path the regression was about: `sheet_names()`
+    /// lists chartsheets, so a workbook whose first sheet is a chart is the one
+    /// `read_workbook_rows` picks when no sheet is named. Propagating
+    /// calamine's `NotAWorksheet` made `workbook-open` and `workbook-summary`
+    /// fail outright where they used to yield zero rows.
+    #[test]
+    fn read_workbook_rows_reads_a_chart_first_workbook_as_empty() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&crate::workbook::fixtures::chartsheet())
+            .unwrap();
+        file.flush().unwrap();
+
+        let rows = read_workbook_rows(file.as_file(), "charts.xlsx", None)
+            .expect("a chart sheet must not fail the read");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// And an ordinary workbook still comes back whole.
+    #[test]
+    fn read_workbook_rows_still_reads_an_ordinary_sheet() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&crate::workbook::fixtures::xlsx(
+            "A1:B2",
+            &[
+                ("A1", "one"),
+                ("B1", "two"),
+                ("A2", "three"),
+                ("B2", "four"),
+            ],
+        ))
+        .unwrap();
+        file.flush().unwrap();
+
+        let rows = read_workbook_rows(file.as_file(), "ordinary.xlsx", None).expect("must read");
+        assert_eq!(
+            rows,
+            vec![
+                vec!["one".to_string(), "two".to_string()],
+                vec!["three".to_string(), "four".to_string()],
+            ]
+        );
     }
 
     #[cfg(unix)]
