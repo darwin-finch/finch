@@ -157,13 +157,14 @@ core-foundation = "0.10"  # Foundation types (required by core-graphics)
 nix = { version = "0.29", features = ["dir", "fs", "process", "signal", "user"] }
 
 # Cap'n Proto IPC (CLI ↔ daemon over Unix socket)
-capnp = "0.20"
-capnp-rpc = "0.20"
+capnp = "0.24"
+capnp-rpc = "0.24"
 
 [build-dependencies]
-capnpc = "0.20"
+capnpc = "0.24"
 
 [dev-dependencies]
+semver = "1"
 h2 = "0.4.16"  # Raw HTTP/2 protocol fixtures for transport-boundary regressions
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }  # Raw WSS protocol fixtures for TLS transport-boundary regressions
 mockito = "1.2"
