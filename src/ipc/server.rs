@@ -6934,6 +6934,35 @@ mod tests {
                     replacement_run_id,
                     "replacement submission completed a different run than the fresh callback observed"
                 );
+                let replacement_terminal = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    async {
+                        loop {
+                            let current = store.inspect_run("shared", replacement_run_id).unwrap_or_else(|error| {
+                                panic!(
+                                    "fresh-process replacement run {replacement_run_id:?} disappeared while awaiting its durable terminal boundary: {error}"
+                                )
+                            });
+                            if current.status.is_terminal() {
+                                break current;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    },
+                )
+                .await
+                {
+                    Ok(run) => run,
+                    Err(_) => panic!(
+                        "fresh-process replacement callback started but did not durably terminalize within 2s; run_id={replacement_run_id:?}, snapshot={:#?}",
+                        store.snapshot("shared")
+                    ),
+                };
+                assert_eq!(
+                    replacement_terminal.status,
+                    crate::brain::store::BrainRunStatus::Completed,
+                    "fresh-process replacement reached the wrong durable terminal state after old physical quiescence: {replacement_terminal:#?}"
+                );
 
                 let snapshot = store.snapshot("shared").unwrap();
                 let old_run = snapshot
