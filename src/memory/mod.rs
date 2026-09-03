@@ -1185,6 +1185,14 @@ impl MemorySystem {
         let conn = self.db.lock().await;
         let mut tree = self.tree.lock().await;
 
+        // One cost worth naming: the tree guard now spans `tx.commit()`. The
+        // store is a single well-known file and rusqlite defaults to a 5s busy
+        // timeout, so a second process writing the same store (a daemon beside
+        // an interactive REPL) can park this commit and stall every in-memory
+        // read behind it. Against that, both critical sections shrank by three
+        // orders of magnitude: the old shape cloned *every* node under the tree
+        // guard -- 131 MiB at dogfood scale -- and wrote every row under the db
+        // guard, where this clones and writes the handful that changed.
         let changed = tree.dirty_nodes();
         let mut nodes = Vec::with_capacity(changed.len());
         for id in &changed {
@@ -1386,11 +1394,16 @@ impl MemorySystem {
         loop {
             // The database guard is scoped to the read and nothing else, so
             // it is not held across `link_loaded_children().await` on the
-            // failure path below. (An earlier version of this comment claimed a
-            // db -> tree lock ordering that the module does not actually have:
-            // `stats` nests exactly that way, and nothing nests tree -> db, so
-            // there was no deadlock either before or after. Not holding a tokio
-            // guard across an await is the whole of the reason.)
+            // failure path below.
+            //
+            // The module DOES have a db -> tree lock ordering, and an earlier
+            // version of this comment said it did not. `stats` nests that way
+            // and now so does `save_all_nodes_to_db`, which holds db and then
+            // waits for tree across a whole transaction on the write path --
+            // so a reader that took tree and then wanted db would hang, where
+            // before this ordering only had `stats` to collide with. Every
+            // site that touches both must take db first or scope one guard so
+            // they never overlap. See `save_all_nodes_to_db`.
             let batch = {
                 let conn = db.lock().await;
                 Self::load_batch(&conn, cursor, HYDRATION_BATCH)
@@ -2027,6 +2040,83 @@ mod tests {
         Ok((tree_node_writes(temp.path())?, nodes))
     }
 
+    /// A save and a concurrent reader both finish; neither waits on the other
+    /// forever.
+    ///
+    /// This module has a db -> tree lock ordering. `stats` has always nested
+    /// that way, and `save_all_nodes_to_db` now does too -- holding db and
+    /// waiting for tree across a whole transaction, on the write path, every
+    /// turn. A reader that took tree and then wanted db would deadlock against
+    /// it.
+    ///
+    /// Nothing enforced that. Review of #313 showed the hazard is one deleted
+    /// pair of braces away: hoisting `query_with_sources`'s tree guard out of
+    /// its block so it is still held when the db lock is taken hangs both
+    /// tasks. Before this branch that inversion collided only with `stats`;
+    /// now it collides with every insert.
+    ///
+    /// A deadlock cannot be asserted directly, so this asserts its observable
+    /// consequence: with writes and reads interleaved, everything completes
+    /// well inside a deadline. An inversion fails it by timing out rather than
+    /// by hanging the suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_a_save_and_a_concurrent_read_both_finish() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        for i in 0..20 {
+            memory
+                .insert_conversation("user", &format!("a seeded memory numbered {i}"), None, None)
+                .await?;
+        }
+
+        let writer = {
+            let memory = Arc::clone(&memory);
+            tokio::spawn(async move {
+                for i in 0..20 {
+                    memory
+                        .insert_conversation(
+                            "user",
+                            &format!("a concurrently written memory numbered {i}"),
+                            None,
+                            None,
+                        )
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+        };
+        let reader = {
+            let memory = Arc::clone(&memory);
+            tokio::spawn(async move {
+                for _ in 0..20 {
+                    // Both orderings of interest: `stats` nests db -> tree,
+                    // `query` takes tree alone and then db.
+                    let _ = memory.stats().await?;
+                    let _ = memory.query("a seeded memory", None).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+        };
+
+        let deadline = std::time::Duration::from_secs(30);
+        let both = tokio::time::timeout(deadline, async { tokio::try_join!(writer, reader) })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "a save and a concurrent read did not both finish within 30s, which is \
+                     what a tree -> db lock inversion looks like from outside"
+                )
+            })?;
+        let (wrote, read) = both?;
+        wrote?;
+        read?;
+        Ok(())
+    }
+
     /// Every persisted column of every node reaches disk.
     ///
     /// This is the guard the incremental save needs and the old whole-tree
@@ -2119,10 +2209,36 @@ mod tests {
             "a node was lost entirely between memory and disk"
         );
         for (before, after) in expected.iter().zip(restored.iter()) {
-            assert_eq!(
-                before, after,
-                "a persisted column did not survive the reload; a mutation that \
-                 forgot to mark its node dirty is lost here and nowhere else"
+            if before == after {
+                continue;
+            }
+            // Name the column rather than dumping two 2048-float embeddings,
+            // which buries the message it is attached to.
+            let column = if before.1 != after.1 {
+                format!("parent {:?} != {:?}", before.1, after.1)
+            } else if before.2 != after.2 {
+                format!("text {:?} != {:?}", before.2, after.2)
+            } else if before.3 != after.3 {
+                format!("level {} != {}", before.3, after.3)
+            } else if before.4 != after.4 {
+                format!("importance {} != {}", before.4, after.4)
+            } else if before.5 != after.5 {
+                format!("created_at {} != {}", before.5, after.5)
+            } else {
+                format!(
+                    "embedding differs ({} floats; first divergence at {:?})",
+                    before.6.len(),
+                    before
+                        .6
+                        .iter()
+                        .zip(after.6.iter())
+                        .position(|(a, b)| a != b)
+                )
+            };
+            panic!(
+                "node {} did not survive the reload: {column}. A mutation that \
+                 forgot to mark its node dirty is lost here and nowhere else.",
+                before.0
             );
         }
         Ok(())
@@ -2154,9 +2270,9 @@ mod tests {
 
     /// One new memory must not rewrite every node in the tree.
     ///
-    /// `save_all_nodes_to_db` collects `tree.all_nodes()` and upserts each one
-    /// on every insert, so the cost of storing one memory is proportional to
-    /// everything stored before it. #250 measured the consequence on the
+    /// `save_all_nodes_to_db` used to collect `tree.all_nodes()` and upsert
+    /// each one on every insert, so the cost of storing one memory was
+    /// proportional to everything stored before it. #250 measured the consequence on the
     /// dogfood host: a 142 MiB store with a 142 MiB write-ahead log, because
     /// each save rewrote all 16,782 rows and 131 MiB of embeddings.
     ///
