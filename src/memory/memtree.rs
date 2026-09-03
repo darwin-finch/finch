@@ -601,19 +601,21 @@ impl MemTree {
 
     /// The nodes whose persisted columns have changed, ascending.
     ///
-    /// A **copy**, not a drain. An earlier version drained here and put the
-    /// ids back if the transaction failed, which left two holes: a future
-    /// cancelled between the drain and the commit dropped them with no error
-    /// and no restore, and a concurrent save could drain a node the other save
-    /// then referenced before it was committed. Copying closes both -- nothing
-    /// is forgotten until `mark_persisted` is told it reached disk -- at the
-    /// cost of writing a node twice when two saves overlap, which an upsert
-    /// makes harmless.
+    /// A copy, not a drain, so a save that fails, panics, or is cancelled
+    /// before committing leaves the marks set and the next save writes them.
+    ///
+    /// Copying is **not** what makes overlapping saves safe, and an earlier
+    /// version of this comment claimed it was. `mark_persisted` clears ids,
+    /// not (id, version) pairs, so a mutation landing between this call and
+    /// the commit is marked and then unmarked by a transaction that never
+    /// contained it -- silent loss, which review of #313 reproduced. Safety
+    /// comes from `save_all_nodes_to_db` holding the tree guard across the
+    /// whole read-write-clear; see the comment there.
     ///
     /// Ascending, so a parent row lands before the child that references it.
     /// New nodes always take a higher id than the parent they attach to, and
     /// the root is 0.
-    pub fn dirty_nodes(&self) -> Vec<NodeId> {
+    pub(crate) fn dirty_nodes(&self) -> Vec<NodeId> {
         let mut ids: Vec<NodeId> = self.dirty.iter().copied().collect();
         ids.sort_unstable();
         ids
@@ -623,7 +625,7 @@ impl MemTree {
     ///
     /// Only these, never the whole set: another task may have marked more
     /// nodes while this save was writing, and those still need persisting.
-    pub fn mark_persisted(&mut self, ids: &[NodeId]) {
+    pub(crate) fn mark_persisted(&mut self, ids: &[NodeId]) {
         for id in ids {
             self.dirty.remove(id);
         }
@@ -639,7 +641,7 @@ impl MemTree {
     /// the root only stayed durable because `update_parent_aggregation`
     /// happened to re-mark it on every insert -- the incidental guarantee this
     /// change was supposed to replace with a deliberate one.
-    pub fn clear_dirty(&mut self) {
+    pub(crate) fn clear_dirty(&mut self) {
         self.dirty.clear();
         self.dirty.insert(self.root);
     }

@@ -1161,44 +1161,60 @@ impl MemorySystem {
         source: Option<(NodeId, &str, i64)>,
         promotion: Option<(NodeId, NodeId)>,
     ) -> Result<()> {
-        let (changed, nodes): (Vec<NodeId>, Vec<TreeNode>) = {
-            let tree = self.tree.lock().await;
-            let changed = tree.dirty_nodes();
-            let mut nodes = Vec::with_capacity(changed.len());
-            for id in &changed {
-                let node = tree.all_nodes().get(id).ok_or_else(|| {
-                    // Unreachable while nothing removes nodes, and an error
-                    // rather than a skip precisely because this change exists
-                    // to bound silent loss: dropping a marked id here would be
-                    // the failure it is trying to prevent.
-                    anyhow::anyhow!(
-                        "memory: node {id} was marked for persistence but is not in the tree"
-                    )
-                })?;
-                nodes.push(node.clone());
-            }
-            (changed, nodes)
-        };
+        // Both locks, held across the whole read-write-clear, and taken
+        // **db before tree** because `stats` nests them in that order --
+        // inverting here would deadlock against a concurrent `stats`.
+        //
+        // Holding the tree guard across the write is what makes the sequence
+        // atomic, and two earlier shapes were unsound without it, in opposite
+        // directions. Draining the marks first and restoring them on error
+        // lost them to cancellation, which returns no error to restore on.
+        // Copying them and clearing after the commit lost *data*: a mutation
+        // landing between the copy and the commit is marked, then unmarked by
+        // `mark_persisted`, which clears ids rather than (id, version) pairs
+        // and so cannot tell the new mark from the one it copied. Review of
+        // #313 reproduced that as a stale row with its mark already gone.
+        //
+        // `insert_conversation_record` happens to serialize every caller on
+        // `insert_lock` today, so neither hole was reachable -- but that is a
+        // lock in a different function that nothing here mentions, and a
+        // second saver (a periodic flush, a shutdown flush, a compaction pass)
+        // would have found it. There is no await between the copy and the
+        // commit now, and the guard is held throughout, so correctness does
+        // not depend on that.
+        let conn = self.db.lock().await;
+        let mut tree = self.tree.lock().await;
 
-        // The marks are *copied* above, not drained, and are cleared only once
-        // the transaction has committed. So a save that fails, panics, or is
-        // cancelled between here and the commit leaves them set, and the next
-        // save writes them. Draining first and restoring on error -- the
-        // obvious shape -- silently lost them to cancellation, which returns no
-        // error to restore on.
-        self.write_nodes(&nodes, source, promotion).await?;
-        self.tree.lock().await.mark_persisted(&changed);
+        let changed = tree.dirty_nodes();
+        let mut nodes = Vec::with_capacity(changed.len());
+        for id in &changed {
+            let node = tree.all_nodes().get(id).ok_or_else(|| {
+                // An error rather than a skip, precisely because this change
+                // exists to bound silent loss: dropping a marked id here would
+                // be the failure it is trying to prevent.
+                anyhow::anyhow!(
+                    "memory: node {id} was marked for persistence but is not in the tree"
+                )
+            })?;
+            nodes.push(node.clone());
+        }
+
+        Self::write_nodes(&conn, &nodes, source, promotion)?;
+        tree.mark_persisted(&changed);
         Ok(())
     }
 
     /// Upsert exactly `nodes`, plus the provenance rows for this insert.
-    async fn write_nodes(
-        &self,
+    ///
+    /// Takes the connection rather than locking it, so the caller can hold the
+    /// tree guard across the write. Synchronous for the same reason: an await
+    /// in here would reopen the window it exists to close.
+    fn write_nodes(
+        conn: &rusqlite::Connection,
         nodes: &[TreeNode],
         source: Option<(NodeId, &str, i64)>,
         promotion: Option<(NodeId, NodeId)>,
     ) -> Result<()> {
-        let conn = self.db.lock().await;
         let tx = conn.unchecked_transaction()?;
         for node in nodes {
             let embedding_bytes: Vec<u8> = node
@@ -2037,7 +2053,7 @@ mod tests {
             ..Default::default()
         };
 
-        let expected: Vec<(NodeId, Option<NodeId>, String, usize, u8, Vec<f32>)> = {
+        let expected: Vec<(NodeId, Option<NodeId>, String, usize, u8, i64, Vec<f32>)> = {
             let memory = MemorySystem::new(config.clone())?;
             for i in 0..40 {
                 memory
@@ -2115,7 +2131,7 @@ mod tests {
     /// Every node's persisted columns, ordered by id.
     async fn snapshot(
         memory: &MemorySystem,
-    ) -> Vec<(NodeId, Option<NodeId>, String, usize, u8, Vec<f32>)> {
+    ) -> Vec<(NodeId, Option<NodeId>, String, usize, u8, i64, Vec<f32>)> {
         let tree = memory.tree.lock().await;
         let mut rows: Vec<_> = tree
             .all_nodes()
@@ -2127,6 +2143,7 @@ mod tests {
                     n.text.clone(),
                     n.level,
                     n.importance,
+                    n.created_at,
                     n.embedding.clone(),
                 )
             })
