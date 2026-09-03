@@ -501,14 +501,16 @@ impl ChatGptSubscriptionProvider {
             return Ok(entry.catalog.clone());
         }
         let status = response.status();
-        let response_etag = bounded_header(response.headers(), reqwest::header::ETAG.as_str())?;
-        let body = read_bounded(response, MAX_CATALOG_BYTES, cancel).await?;
         if status == StatusCode::UNAUTHORIZED {
+            drop(response);
             return Err(SubscriptionUnauthorized.into());
         }
         if !status.is_success() {
+            drop(response);
             bail!("ChatGPT subscription model discovery failed (HTTP {status})");
         }
+        let response_etag = bounded_header(response.headers(), reqwest::header::ETAG.as_str())?;
+        let body = read_bounded(response, MAX_CATALOG_BYTES, cancel).await?;
         let catalog = parse_catalog(&body)?;
         *cache = Some(CatalogCache {
             generation: lease.generation.clone(),
@@ -619,17 +621,9 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let request = request.into_request_for(self)?;
         let expected_model = request.model.clone();
         let allowed_tools = advertised_tool_names(&request);
-        let response = self
-            .start_response(request, CancellationToken::new())
-            .await?;
-        let completed = consume_sse(
-            response,
-            None,
-            CancellationToken::new(),
-            expected_model,
-            allowed_tools,
-        )
-        .await?;
+        let cancel = request.cancellation_token.clone().unwrap_or_default();
+        let response = self.start_response(request, cancel.clone()).await?;
+        let completed = consume_sse(response, None, cancel, expected_model, allowed_tools).await?;
         Ok(ProviderResponse {
             id: completed.id,
             model: completed.model,
@@ -670,6 +664,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
             let failure = sender.clone();
+            let failure_cancel = cancel.clone();
             if let Err(error) = consume_sse(
                 response,
                 Some(sender),
@@ -679,9 +674,21 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             )
             .await
             {
-                // Never let diagnostic delivery keep the HTTP response task alive. If the
-                // bounded output queue is full, closing it is itself the terminal signal.
-                let _ = failure.try_send(Err(anyhow::anyhow!(error.to_string())));
+                let diagnostic = Err(anyhow::anyhow!(error.to_string()));
+                match failure.try_send(diagnostic) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(diagnostic)) => {
+                        // `consume_sse` has returned, so its HTTP response is already dropped.
+                        // Preserve a protocol failure until the live consumer makes room, but
+                        // never retain this task after caller cancellation or receiver drop.
+                        tokio::select! {
+                            biased;
+                            _ = failure_cancel.cancelled() => {}
+                            _ = failure.closed() => {}
+                            _ = failure.send(diagnostic) => {}
+                        }
+                    }
+                }
             }
         });
         Ok(receiver)
@@ -1318,10 +1325,13 @@ async fn consume_sse(
                 .unwrap_or_default();
             let partial_done = b"data: [DONE]\n\n".starts_with(remainder)
                 || b"data: [DONE]\r\n\r\n".starts_with(remainder);
-            if !remainder.is_empty() && !partial_done {
-                bail!("ChatGPT subscription sent data after its terminal response");
+            if remainder.is_empty() {
+                break 'stream;
             }
-            break 'stream;
+            if partial_done {
+                continue 'stream;
+            }
+            bail!("ChatGPT subscription sent data after its terminal response");
         }
     }
     if !buffer.iter().all(u8::is_ascii_whitespace) {
@@ -1844,6 +1854,13 @@ fn parse_completed(
                 .context("ChatGPT terminal response end_turn was invalid")
         })
         .transpose()?;
+    if end_turn == Some(false)
+        && !blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+    {
+        bail!("ChatGPT requested a follow-up response without an executable tool call");
+    }
     Ok(CompletedResponse {
         id,
         model: response_model,
@@ -2536,6 +2553,33 @@ mod tests {
     // provider-contract failure tied to the invariant that produced it, while allowing tests
     // with richer sanitized state to supply a more specific message.
     macro_rules! assert {
+        (!$value:ident.contains($needle:expr) $(,)?) => {
+            std::assert!(
+                !$value.contains($needle),
+                "ChatGPT subscription invariant failed: !{}.contains({}); value={:?}",
+                stringify!($value),
+                stringify!($needle),
+                $value
+            )
+        };
+        ($value:ident.contains($needle:expr) $(,)?) => {
+            std::assert!(
+                $value.contains($needle),
+                "ChatGPT subscription invariant failed: {}.contains({}); value={:?}",
+                stringify!($value),
+                stringify!($needle),
+                $value
+            )
+        };
+        ($value:ident.to_string().contains($needle:expr) $(,)?) => {
+            std::assert!(
+                $value.to_string().contains($needle),
+                "ChatGPT subscription invariant failed: {}.to_string().contains({}); value={:#}",
+                stringify!($value),
+                stringify!($needle),
+                $value
+            )
+        };
         ($condition:expr $(,)?) => {
             std::assert!(
                 $condition,
@@ -2560,6 +2604,21 @@ mod tests {
         };
         ($left:expr, $right:expr, $($message:tt)+) => {
             std::assert_eq!($left, $right, $($message)+)
+        };
+    }
+
+    macro_rules! assert_ne {
+        ($left:expr, $right:expr $(,)?) => {
+            std::assert_ne!(
+                $left,
+                $right,
+                "ChatGPT subscription invariant failed: {} != {}",
+                stringify!($left),
+                stringify!($right)
+            )
+        };
+        ($left:expr, $right:expr, $($message:tt)+) => {
+            std::assert_ne!($left, $right, $($message)+)
         };
     }
 
@@ -2832,8 +2891,7 @@ mod tests {
         )
     }
 
-    fn completed_sse_with_terminal_field(model: &str, field: &str, value: Value) -> String {
-        let body = completed_sse(model);
+    fn sse_with_terminal_field(body: String, field: &str, value: Value) -> String {
         let marker = "event: response.completed\ndata: ";
         let start = body
             .find(marker)
@@ -2847,6 +2905,10 @@ mod tests {
             .expect("completed fixture terminal event must be JSON");
         terminal["response"][field] = value;
         format!("{}{terminal}{}", &body[..start], &body[end..])
+    }
+
+    fn completed_sse_with_terminal_field(model: &str, field: &str, value: Value) -> String {
+        sse_with_terminal_field(completed_sse(model), field, value)
     }
 
     fn completed_sse_with_safety_buffering(model: &str, value: Value) -> String {
@@ -2984,7 +3046,7 @@ mod tests {
         status: &'static str,
         content_type: &'static str,
         header_model: &'static str,
-        body: Option<String>,
+        body_chunks: Option<Vec<String>>,
     ) -> (
         String,
         tokio::sync::oneshot::Receiver<()>,
@@ -3037,11 +3099,18 @@ mod tests {
                 )
                 .await
                 .expect("held-open fixture must write the inference headers");
-            if let Some(body) = body {
-                response_socket
-                    .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
-                    .await
-                    .expect("held-open fixture must write its incomplete chunked body");
+            if let Some(body_chunks) = body_chunks {
+                for body in body_chunks {
+                    response_socket
+                        .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
+                        .await
+                        .expect("held-open fixture must write its incomplete chunked body");
+                    response_socket
+                        .flush()
+                        .await
+                        .expect("held-open fixture must flush each body fragment");
+                    tokio::task::yield_now().await;
+                }
             }
             response_socket
                 .flush()
@@ -3056,6 +3125,54 @@ mod tests {
         (
             format!("http://{address}/backend-api/codex"),
             ready_rx,
+            closed_rx,
+        )
+    }
+
+    async fn held_open_catalog_rejection_server() -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("catalog rejection fixture must bind a loopback port");
+        let address = listener
+            .local_addr()
+            .expect("catalog rejection fixture must expose its loopback address");
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("catalog rejection fixture must accept discovery");
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 429 Too Many Requests\r\n",
+                        "content-type: text/plain\r\n",
+                        "transfer-encoding: chunked\r\n",
+                        "connection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("catalog rejection fixture must write status headers");
+            socket
+                .flush()
+                .await
+                .expect("catalog rejection fixture must flush status headers");
+            let _ = headers_tx.send(());
+            let mut byte = [0u8; 1];
+            while matches!(socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            headers_rx,
             closed_rx,
         )
     }
@@ -3466,12 +3583,18 @@ mod tests {
         }
 
         let accepted = run("finch_spawn_agent", "collaboration").await;
-        assert!(accepted.iter().any(|chunk| matches!(
-            chunk,
-            Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { name, .. }))
-                if name == "spawn_agent"
-        )));
-        assert!(!accepted.iter().any(Result::is_err));
+        assert!(
+            accepted.iter().any(|chunk| matches!(
+                chunk,
+                Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { name, .. }))
+                    if name == "spawn_agent"
+            )),
+            "advertised collaboration alias did not project the local tool; accepted={accepted:?}"
+        );
+        assert!(
+            !accepted.iter().any(Result::is_err),
+            "advertised collaboration alias produced an error; accepted={accepted:?}"
+        );
 
         for (name, namespace) in [
             ("spawn_agent", "collaboration"),
@@ -3479,14 +3602,17 @@ mod tests {
             ("finch_spawn_agent", "other"),
         ] {
             let rejected = run(name, namespace).await;
-            assert!(rejected.iter().any(Result::is_err));
+            assert!(
+                rejected.iter().any(Result::is_err),
+                "invalid collaboration alias was not rejected; name={name:?}; namespace={namespace:?}; chunks={rejected:?}"
+            );
             assert!(!rejected.iter().any(|chunk| matches!(
                 chunk,
                 Ok(StreamChunk::ContentBlockComplete(_)
                     | StreamChunk::ResponseMetadata { .. }
                     | StreamChunk::Usage { .. }
                     | StreamChunk::Allowance { .. })
-            )));
+            )), "invalid collaboration alias emitted terminal effects; name={name:?}; namespace={namespace:?}; chunks={rejected:?}");
         }
     }
 
@@ -4404,6 +4530,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_buffered_cancellation_reaches_and_releases_subscription_transport() {
+        let (base, headers_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(Vec::new()),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("buffered-cancellation fixture must construct a test provider");
+        let cancel = CancellationToken::new();
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_cancellation_token(cancel.clone());
+        let task = tokio::spawn(async move { provider.send_message(&request).await });
+        tokio::time::timeout(Duration::from_secs(2), headers_sent)
+            .await
+            .expect("buffered-cancellation fixture did not send response headers")
+            .expect("buffered-cancellation fixture dropped its headers-sent signal");
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("buffered request ignored caller cancellation")
+            .expect("buffered cancellation task panicked")
+            .expect_err("cancelled buffered request unexpectedly succeeded");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "buffered cancellation returned the wrong diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("buffered cancellation did not release the HTTP transport")
+            .expect("buffered-cancellation fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
     async fn test_backpressured_stream_cancellation_releases_transport_without_terminal_effects() {
         let mut body = format!(
             "event: response.created\ndata: {}\n\n",
@@ -4422,9 +4587,13 @@ mod tests {
                 })
             ));
         }
-        let (base, body_sent, closed) =
-            held_open_subscription_server("200 OK", "text/event-stream", DEFAULT_MODEL, Some(body))
-                .await;
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
             &base,
@@ -4477,6 +4646,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_backpressured_protocol_failure_is_delivered_after_transport_release() {
+        let mut body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"model":DEFAULT_MODEL}})
+        );
+        for index in 0..32u64 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":index + 2,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"x"
+                })
+            ));
+        }
+        body.push_str(&format!(
+            "event: response.output_text.delta\ndata: {}\n\n",
+            json!({
+                "type":"response.output_text.delta",
+                "sequence_number":33,
+                "item_id":"message-1",
+                "output_index":0,
+                "content_index":0,
+                "delta":"must-not-project"
+            })
+        ));
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("backpressured-error fixture must construct a test provider");
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("backpressured-error fixture must start a subscription stream");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("backpressured-error fixture did not send its body")
+            .expect("backpressured-error fixture dropped its body-sent signal");
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("protocol failure did not release its HTTP transport before delivery")
+            .expect("backpressured-error fixture dropped its transport-close signal");
+
+        let mut chunks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                chunks.push(chunk.map_err(|error| error.to_string()));
+            }
+        })
+        .await
+        .expect("backpressured protocol failure did not close its output channel");
+        assert_eq!(
+            chunks.len(),
+            33,
+            "expected 32 queued deltas followed by one terminal error; chunks={chunks:?}"
+        );
+        assert!(
+            chunks[..32]
+                .iter()
+                .all(|chunk| matches!(chunk, Ok(delta) if matches!(delta, StreamChunk::TextDelta(text) if text == "x"))),
+            "backpressured failure changed pre-error deltas: {chunks:?}"
+        );
+        assert!(
+            matches!(chunks.last(), Some(Err(error)) if error.contains("strictly increasing")),
+            "backpressured parse failure was lost or changed: {chunks:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_terminal_event_completes_with_or_without_done_before_socket_eof() {
         for include_done in [true, false] {
             let mut body = completed_sse(DEFAULT_MODEL);
@@ -4490,7 +4740,7 @@ mod tests {
                 "200 OK",
                 "text/event-stream",
                 DEFAULT_MODEL,
-                Some(body),
+                Some(vec![body]),
             )
             .await;
             let provider = ChatGptSubscriptionProvider::for_test(
@@ -4546,11 +4796,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_optional_done_marker_accepts_every_lf_and_crlf_fragment_boundary() {
+        let terminal = completed_sse(DEFAULT_MODEL)
+            .strip_suffix("data: [DONE]\n\n")
+            .expect("completed fixture must contain its optional terminal marker")
+            .to_string();
+        for sentinel in ["data: [DONE]\n\n", "data: [DONE]\r\n\r\n"] {
+            for split in 1..sentinel.len() {
+                let chunks = vec![
+                    format!("{}{}", terminal, &sentinel[..split]),
+                    sentinel[split..].to_string(),
+                ];
+                let (base, body_sent, closed) = held_open_subscription_server(
+                    "200 OK",
+                    "text/event-stream",
+                    DEFAULT_MODEL,
+                    Some(chunks),
+                )
+                .await;
+                let provider = ChatGptSubscriptionProvider::for_test(
+                    Arc::new(StaticSource::new()),
+                    &base,
+                    DEFAULT_MODEL,
+                )
+                .expect("fragmented-DONE fixture must construct a test provider");
+                let request =
+                    ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+                let response = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    provider.send_message(&request),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "optional marker stalled at split {split}; sentinel={sentinel:?}"
+                    )
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "optional marker failed at split {split}; sentinel={sentinel:?}; error={error:#}"
+                    )
+                });
+                body_sent.await.unwrap_or_else(|_| {
+                    panic!(
+                        "fragmented-DONE fixture dropped body signal at split {split}; sentinel={sentinel:?}"
+                    )
+                });
+                assert_eq!(
+                    response.model, DEFAULT_MODEL,
+                    "fragmented optional marker changed model at split {split}; sentinel={sentinel:?}; response={response:?}"
+                );
+                tokio::time::timeout(Duration::from_secs(2), closed)
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "fragmented optional marker retained transport at split {split}; sentinel={sentinel:?}"
+                        )
+                    })
+                    .expect("fragmented-DONE fixture dropped its transport-close signal");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_end_turn_false_is_preserved_as_follow_up_stop_reason() {
         let body = completed_sse_with_terminal_field(DEFAULT_MODEL, "end_turn", json!(false));
-        let (base, body_sent, closed) =
-            held_open_subscription_server("200 OK", "text/event-stream", DEFAULT_MODEL, Some(body))
-                .await;
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
             &base,
@@ -4585,12 +4902,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_end_turn_false_without_executable_tool_fails_closed() {
+        let body = sse_with_terminal_field(
+            compact_terminal_text_sse(DEFAULT_MODEL),
+            "end_turn",
+            json!(false),
+        );
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("text-only follow-up fixture must construct a test provider");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(&ProviderRequest::new(vec![Message::user("hello")])),
+        )
+        .await
+        .expect("text-only end_turn=false response waited for socket EOF")
+        .expect_err("text-only end_turn=false response was silently finalized");
+        body_sent
+            .await
+            .expect("text-only follow-up fixture dropped its body-sent signal");
+        assert!(
+            error
+                .to_string()
+                .contains("follow-up response without an executable tool call"),
+            "text-only end_turn=false returned an unhelpful diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("rejected text-only follow-up did not release its HTTP transport")
+            .expect("text-only follow-up fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
     async fn test_safety_routed_actual_model_is_preserved_with_exact_event_consistency() {
         const SAFETY_MODEL: &str = "gpt-5.6-sol-safety-routed";
         let body = completed_sse(DEFAULT_MODEL).replace(DEFAULT_MODEL, SAFETY_MODEL);
-        let (base, body_sent, closed) =
-            held_open_subscription_server("200 OK", "text/event-stream", SAFETY_MODEL, Some(body))
-                .await;
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            SAFETY_MODEL,
+            Some(vec![body]),
+        )
+        .await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
             &base,
@@ -4622,9 +4985,13 @@ mod tests {
             DEFAULT_MODEL,
             json!({"state":"buffered","tokens":3}),
         );
-        let (base, body_sent, closed) =
-            held_open_subscription_server("200 OK", "text/event-stream", DEFAULT_MODEL, Some(body))
-                .await;
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
             &base,
@@ -4714,6 +5081,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_catalog_rejection_returns_status_without_waiting_for_body_eof() {
+        let (base, headers_sent, closed) = held_open_catalog_rejection_server().await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("catalog rejection fixture must construct a test provider");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(&ProviderRequest::new(vec![Message::user("hello")])),
+        )
+        .await
+        .expect("known catalog rejection waited for body EOF")
+        .expect_err("held-open catalog 429 unexpectedly reached inference");
+        headers_sent
+            .await
+            .expect("catalog rejection fixture dropped its headers-sent signal");
+        let display = error.to_string();
+        assert!(
+            display.contains("model discovery failed (HTTP 429 Too Many Requests)"),
+            "held-open catalog rejection lost its HTTP status: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("catalog rejection did not release the stalled body transport")
+            .expect("catalog rejection fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
     async fn test_request_timeout_is_bounded_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(false).await;
         let mut provider = ChatGptSubscriptionProvider::for_test(
@@ -4746,8 +5143,15 @@ mod tests {
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
         );
         let eof = subscription_stream_outcome(created.clone(), DEFAULT_MODEL).await;
-        assert_eq!(eof.len(), 1);
-        assert!(eof[0].contains("before response.completed"));
+        assert_eq!(
+            eof.len(),
+            1,
+            "premature EOF should produce exactly one error; errors={eof:?}"
+        );
+        assert!(
+            eof[0].contains("before response.completed"),
+            "premature EOF returned the wrong diagnostic; errors={eof:?}"
+        );
 
         let terminal = format!(
             "{}event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
@@ -4756,8 +5160,15 @@ mod tests {
         );
         let duplicate =
             subscription_stream_outcome(format!("{terminal}data: [DONE]\n\n"), DEFAULT_MODEL).await;
-        assert_eq!(duplicate.len(), 1);
-        assert!(duplicate[0].contains("terminal marker was invalid"));
+        assert_eq!(
+            duplicate.len(),
+            1,
+            "duplicate DONE should produce exactly one error; errors={duplicate:?}"
+        );
+        assert!(
+            duplicate[0].contains("terminal marker was invalid"),
+            "duplicate DONE returned the wrong diagnostic; errors={duplicate:?}"
+        );
 
         let late = subscription_stream_outcome(
             format!(
@@ -4767,8 +5178,15 @@ mod tests {
             DEFAULT_MODEL,
         )
         .await;
-        assert_eq!(late.len(), 1);
-        assert!(late[0].contains("data after its terminal response"));
+        assert_eq!(
+            late.len(),
+            1,
+            "post-terminal data should produce exactly one error; errors={late:?}"
+        );
+        assert!(
+            late[0].contains("data after its terminal response"),
+            "post-terminal data returned the wrong diagnostic; errors={late:?}"
+        );
     }
 
     #[tokio::test]
@@ -4778,8 +5196,15 @@ mod tests {
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}})
         );
         let errors = subscription_stream_outcome(body, DEFAULT_MODEL).await;
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("incompatible actual model"));
+        assert_eq!(
+            errors.len(),
+            1,
+            "model drift should produce exactly one error; errors={errors:?}"
+        );
+        assert!(
+            errors[0].contains("incompatible actual model"),
+            "model drift returned the wrong diagnostic; errors={errors:?}"
+        );
     }
 
     #[tokio::test]

@@ -116,8 +116,10 @@ index, and reconciles them with any terminal output. Actual-model provenance
 must remain compatible and unchanged; the audited `-safety-routed` provenance
 suffix is accepted while header and event values must still agree. Bounded
 `safety_buffering` event metadata is validated and intentionally not projected.
-An explicit `end_turn: false` is preserved as a `tool_use` follow-up stop
-reason. Unknown fields/events, malformed tool
+An explicit `end_turn: false` accompanying an executable tool call is preserved
+as a `tool_use` follow-up stop reason. Finch currently has no provider-neutral
+follow-up signal for a text-only response, so that combination fails visibly
+instead of being silently finalized. Unknown fields/events, malformed tool
 arguments, missing completion, duplicate terminal markers, post-terminal data,
 partial EOF, idle timeout, receiver drop, and payload-limit violations fail
 visibly before terminal chunks are published.
