@@ -624,15 +624,20 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let cancel = request.cancellation_token.clone().unwrap_or_default();
         let response = self.start_response(request, cancel.clone()).await?;
         let completed = consume_sse(response, None, cancel, expected_model, allowed_tools).await?;
+        let stop_reason = if completed
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
         Ok(ProviderResponse {
             id: completed.id,
             model: completed.model,
             content: completed.blocks,
-            stop_reason: Some(if completed.end_turn == Some(false) {
-                "tool_use".to_string()
-            } else {
-                "end_turn".to_string()
-            }),
+            stop_reason: Some(stop_reason.to_string()),
             role: "assistant".to_string(),
             provider: "chatgpt_subscription".to_string(),
             usage: match (completed.input_tokens, completed.output_tokens) {
@@ -1189,7 +1194,6 @@ struct CompletedResponse {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     allowance: Option<Allowance>,
-    end_turn: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1201,6 +1205,8 @@ struct Allowance {
 #[derive(Default)]
 struct StreamAccumulator {
     output_items: BTreeMap<u64, Value>,
+    text_deltas: BTreeMap<(u64, u64), String>,
+    text_done: BTreeMap<(u64, u64), String>,
     actual_model: Option<String>,
 }
 
@@ -1243,6 +1249,7 @@ async fn consume_sse(
     let mut last_sequence = None;
     'stream: loop {
         let next = tokio::select! {
+            biased;
             _ = cancel.cancelled() => bail!("ChatGPT subscription stream was cancelled"),
             _ = async { if let Some(sender) = sender.as_ref() { sender.closed().await } else { futures::future::pending().await } } => return Err(anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")),
             next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()) => next.context("ChatGPT subscription stream timed out")?,
@@ -1311,31 +1318,19 @@ async fn consume_sse(
                 &mut accumulator,
             )? {
                 terminal = Some(completed);
+                break 'stream;
             }
             if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
                 send_stream_chunk(sender, &cancel, StreamChunk::TextDelta(delta)).await?;
             }
             enforce_sse_remainder_bounds(&buffer)?;
         }
-        if terminal.is_some() {
-            let remainder = buffer
-                .iter()
-                .position(|byte| !byte.is_ascii_whitespace())
-                .map(|start| &buffer[start..])
-                .unwrap_or_default();
-            let partial_done = b"data: [DONE]\n\n".starts_with(remainder)
-                || b"data: [DONE]\r\n\r\n".starts_with(remainder);
-            if remainder.is_empty() {
-                break 'stream;
-            }
-            if partial_done {
-                continue 'stream;
-            }
-            bail!("ChatGPT subscription sent data after its terminal response");
-        }
     }
-    if !buffer.iter().all(u8::is_ascii_whitespace) {
+    if terminal.is_none() && !buffer.iter().all(u8::is_ascii_whitespace) {
         bail!("ChatGPT subscription stream ended with a partial event");
+    }
+    if cancel.is_cancelled() {
+        bail!("ChatGPT subscription stream was cancelled");
     }
     let mut completed =
         terminal.context("ChatGPT subscription stream ended before response.completed")?;
@@ -1456,6 +1451,9 @@ fn parse_event(
                 .get("item")
                 .context("ChatGPT output item event omitted item")?;
             validate_output_item_shape(item)?;
+            if kind == "response.output_item.done" {
+                validate_streamed_text_for_item(accumulator, output_index, item)?;
+            }
             if kind == "response.output_item.done"
                 && accumulator
                     .output_items
@@ -1490,10 +1488,39 @@ fn parse_event(
         }
         "response.output_text.delta" => {
             validate_text_event(object, "delta", true)?;
+            let key = text_event_key(object)?;
+            let delta = object
+                .get("delta")
+                .and_then(Value::as_str)
+                .context("ChatGPT stream delta omitted its text")?;
+            let accumulated = accumulator.text_deltas.entry(key).or_default();
+            if accumulated.len().saturating_add(delta.len()) > MAX_RESPONSE_BYTES {
+                bail!("ChatGPT subscription streamed text exceeded the size limit");
+            }
+            accumulated.push_str(delta);
             Ok(None)
         }
         "response.output_text.done" => {
             validate_text_event(object, "text", true)?;
+            let key = text_event_key(object)?;
+            let text = object
+                .get("text")
+                .and_then(Value::as_str)
+                .context("ChatGPT completed text event omitted its text")?;
+            if accumulator
+                .text_done
+                .insert(key.clone(), text.to_string())
+                .is_some()
+            {
+                bail!("ChatGPT subscription repeated a completed text event");
+            }
+            if accumulator
+                .text_deltas
+                .get(&key)
+                .is_some_and(|deltas| deltas != text)
+            {
+                bail!("ChatGPT completed text did not match streamed text deltas");
+            }
             Ok(None)
         }
         "response.function_call_arguments.delta" => {
@@ -1666,6 +1693,76 @@ fn validate_text_event(
         .and_then(Value::as_str)
         .context("ChatGPT stream delta omitted its text")?;
     validate_bounded_text(value, MAX_TOOL_ARGUMENT_BYTES, "stream delta")
+}
+
+fn text_event_key(object: &Map<String, Value>) -> Result<(u64, u64)> {
+    Ok((
+        required_index(object, "output_index")?,
+        required_index(object, "content_index")?,
+    ))
+}
+
+fn validate_streamed_text_for_item(
+    accumulator: &StreamAccumulator,
+    output_index: u64,
+    item: &Value,
+) -> Result<()> {
+    let Some(content) = item
+        .as_object()
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("message"))
+        .and_then(|object| object.get("content"))
+        .and_then(Value::as_array)
+    else {
+        if accumulator
+            .text_deltas
+            .keys()
+            .chain(accumulator.text_done.keys())
+            .any(|(index, _)| *index == output_index)
+        {
+            bail!("ChatGPT streamed text referred to a non-message output item");
+        }
+        return Ok(());
+    };
+    for ((index, content_index), deltas) in &accumulator.text_deltas {
+        if *index != output_index {
+            continue;
+        }
+        let terminal = content
+            .get(*content_index as usize)
+            .and_then(Value::as_object)
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .context("ChatGPT streamed text omitted its completed content part")?;
+        if terminal != deltas {
+            bail!("ChatGPT completed output item did not match streamed text deltas");
+        }
+        if accumulator
+            .text_done
+            .get(&(*index, *content_index))
+            .is_some_and(|done| done != terminal)
+        {
+            bail!("ChatGPT completed output item did not match its text completion event");
+        }
+    }
+    for ((index, content_index), done) in &accumulator.text_done {
+        if *index != output_index
+            || accumulator
+                .text_deltas
+                .contains_key(&(*index, *content_index))
+        {
+            continue;
+        }
+        let terminal = content
+            .get(*content_index as usize)
+            .and_then(Value::as_object)
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .context("ChatGPT completed text event omitted its completed content part")?;
+        if terminal != done {
+            bail!("ChatGPT completed output item did not match its text completion event");
+        }
+    }
+    Ok(())
 }
 
 fn validate_reasoning_text_event(
@@ -1844,6 +1941,17 @@ fn parse_completed(
     for item in accumulator.output_items.values() {
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
     }
+    for (output_index, item) in &accumulator.output_items {
+        validate_streamed_text_for_item(accumulator, *output_index, item)?;
+    }
+    if accumulator
+        .text_deltas
+        .keys()
+        .chain(accumulator.text_done.keys())
+        .any(|(output_index, _)| !accumulator.output_items.contains_key(output_index))
+    {
+        bail!("ChatGPT streamed text referred to a missing completed output item");
+    }
     let (input_tokens, output_tokens) = parse_usage(response.get("usage"))?;
     let end_turn = response
         .get("end_turn")
@@ -1854,12 +1962,14 @@ fn parse_completed(
                 .context("ChatGPT terminal response end_turn was invalid")
         })
         .transpose()?;
-    if end_turn == Some(false)
-        && !blocks
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-    {
+    let has_tool_use = blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    if end_turn == Some(false) && !has_tool_use {
         bail!("ChatGPT requested a follow-up response without an executable tool call");
+    }
+    if end_turn == Some(true) && has_tool_use {
+        bail!("ChatGPT ended a response that still contained an executable tool call");
     }
     Ok(CompletedResponse {
         id,
@@ -1868,7 +1978,6 @@ fn parse_completed(
         input_tokens,
         output_tokens,
         allowance: None,
-        end_turn,
     })
 }
 
@@ -2556,29 +2665,32 @@ mod tests {
         (!$value:ident.contains($needle:expr) $(,)?) => {
             std::assert!(
                 !$value.contains($needle),
-                "ChatGPT subscription invariant failed: !{}.contains({}); value={:?}",
+                "ChatGPT subscription invariant failed: !{}.contains({}); value_len={}",
                 stringify!($value),
                 stringify!($needle),
-                $value
+                $value.len()
             )
         };
         ($value:ident.contains($needle:expr) $(,)?) => {
             std::assert!(
                 $value.contains($needle),
-                "ChatGPT subscription invariant failed: {}.contains({}); value={:?}",
+                "ChatGPT subscription invariant failed: {}.contains({}); value_len={}",
                 stringify!($value),
                 stringify!($needle),
-                $value
+                $value.len()
             )
         };
         ($value:ident.to_string().contains($needle:expr) $(,)?) => {
-            std::assert!(
-                $value.to_string().contains($needle),
-                "ChatGPT subscription invariant failed: {}.to_string().contains({}); value={:#}",
+            {
+                let rendered = $value.to_string();
+                std::assert!(
+                rendered.contains($needle),
+                "ChatGPT subscription invariant failed: {}.to_string().contains({}); rendered_len={}",
                 stringify!($value),
                 stringify!($needle),
-                $value
-            )
+                rendered.len()
+                )
+            }
         };
         ($condition:expr $(,)?) => {
             std::assert!(
@@ -3129,6 +3241,79 @@ mod tests {
         )
     }
 
+    async fn gated_completed_subscription_server(
+        body: String,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gated completion fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("gated completion fixture must expose its loopback address");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener
+                .accept()
+                .await
+                .expect("gated completion fixture must accept the catalog request");
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("gated completion fixture must write the catalog response");
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener
+                .accept()
+                .await
+                .expect("gated completion fixture must accept the inference request");
+            let _ = response_socket.read(&mut request).await;
+            response_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nopenai-model: {DEFAULT_MODEL}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("gated completion fixture must write inference headers");
+            response_socket
+                .flush()
+                .await
+                .expect("gated completion fixture must flush inference headers");
+            let _ = ready_tx.send(());
+            let _ = release_rx.await;
+            let encoded = format!("{:X}\r\n{}\r\n", body.len(), body);
+            let _ = response_socket.write_all(encoded.as_bytes()).await;
+            let _ = response_socket.flush().await;
+            let mut byte = [0u8; 1];
+            while matches!(response_socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            ready_rx,
+            release_tx,
+            closed_rx,
+        )
+    }
+
     async fn held_open_catalog_rejection_server() -> (
         String,
         tokio::sync::oneshot::Receiver<()>,
@@ -3177,7 +3362,10 @@ mod tests {
         )
     }
 
-    async fn subscription_stream_outcome(body: String, header_model: &str) -> Vec<String> {
+    async fn subscription_stream_outcome(
+        body: String,
+        header_model: &str,
+    ) -> Vec<std::result::Result<StreamChunk, String>> {
         let mut server = mockito::Server::new_async().await;
         let _models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3207,13 +3395,11 @@ mod tests {
             .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
             .await
             .unwrap();
-        let mut errors = Vec::new();
+        let mut chunks = Vec::new();
         while let Some(chunk) = receiver.recv().await {
-            if let Err(error) = chunk {
-                errors.push(error.to_string());
-            }
+            chunks.push(chunk.map_err(|error| error.to_string()));
         }
-        errors
+        chunks
     }
 
     #[test]
@@ -4128,8 +4314,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.model, DEFAULT_MODEL);
-        assert_eq!(response.usage.unwrap().output_tokens, 7);
-        assert_eq!(response.allowance.unwrap().primary_used_percent, Some(25.5));
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .expect("validated response must preserve usage metadata")
+                .output_tokens,
+            7
+        );
+        assert_eq!(
+            response
+                .allowance
+                .as_ref()
+                .expect("validated response must preserve allowance metadata")
+                .primary_used_percent,
+            Some(25.5)
+        );
         assert!(matches!(
             response.content.first(),
             Some(ContentBlock::OpaqueReasoning { encrypted_content }) if encrypted_content == "opaque-1"
@@ -4138,6 +4338,11 @@ mod tests {
             response.content.last(),
             Some(ContentBlock::ToolUse { id, .. }) if id == "call-2"
         ));
+        assert_eq!(
+            response.stop_reason.as_deref(),
+            Some("tool_use"),
+            "tool output with omitted end_turn did not report tool_use; response={response:?}"
+        );
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 0);
         models.assert_async().await;
         inference.assert_async().await;
@@ -4569,6 +4774,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_buffered_cancellation_wins_over_released_completed_response() {
+        let (base, response_ready, release_body, closed) =
+            gated_completed_subscription_server(completed_sse(DEFAULT_MODEL)).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("gated cancellation fixture must construct a test provider");
+        let cancel = CancellationToken::new();
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_tools(vec![tool()])
+            .with_cancellation_token(cancel.clone());
+        let task = tokio::spawn(async move { provider.send_message(&request).await });
+        tokio::time::timeout(Duration::from_secs(2), response_ready)
+            .await
+            .expect("gated cancellation fixture did not send response headers")
+            .expect("gated cancellation fixture dropped its ready signal");
+        cancel.cancel();
+        release_body
+            .send(())
+            .expect("gated cancellation fixture dropped its body gate");
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("buffered completion won over caller cancellation")
+            .expect("gated cancellation task panicked")
+            .expect_err("cancelled buffered request published a completed response");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "completion/cancellation race returned the wrong diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("completion/cancellation race retained the HTTP transport")
+            .expect("gated cancellation fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
     async fn test_backpressured_stream_cancellation_releases_transport_without_terminal_effects() {
         let mut body = format!(
             "event: response.created\ndata: {}\n\n",
@@ -4796,17 +5039,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optional_done_marker_accepts_every_lf_and_crlf_fragment_boundary() {
+    async fn test_completed_response_ignores_every_held_open_optional_done_prefix() {
         let terminal = completed_sse(DEFAULT_MODEL)
             .strip_suffix("data: [DONE]\n\n")
             .expect("completed fixture must contain its optional terminal marker")
             .to_string();
         for sentinel in ["data: [DONE]\n\n", "data: [DONE]\r\n\r\n"] {
             for split in 1..sentinel.len() {
-                let chunks = vec![
-                    format!("{}{}", terminal, &sentinel[..split]),
-                    sentinel[split..].to_string(),
-                ];
+                let chunks = vec![format!("{}{}", terminal, &sentinel[..split])];
                 let (base, body_sent, closed) = held_open_subscription_server(
                     "200 OK",
                     "text/event-stream",
@@ -4829,31 +5069,31 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
-                        "optional marker stalled at split {split}; sentinel={sentinel:?}"
+                        "held-open optional marker prefix stalled at split {split}; sentinel={sentinel:?}"
                     )
                 })
                 .unwrap_or_else(|error| {
                     panic!(
-                        "optional marker failed at split {split}; sentinel={sentinel:?}; error={error:#}"
+                        "held-open optional marker prefix failed at split {split}; sentinel={sentinel:?}; error={error:#}"
                     )
                 });
                 body_sent.await.unwrap_or_else(|_| {
                     panic!(
-                        "fragmented-DONE fixture dropped body signal at split {split}; sentinel={sentinel:?}"
+                        "optional-prefix fixture dropped body signal at split {split}; sentinel={sentinel:?}"
                     )
                 });
                 assert_eq!(
                     response.model, DEFAULT_MODEL,
-                    "fragmented optional marker changed model at split {split}; sentinel={sentinel:?}; response={response:?}"
+                    "held-open optional marker prefix changed model at split {split}; sentinel={sentinel:?}; response={response:?}"
                 );
                 tokio::time::timeout(Duration::from_secs(2), closed)
                     .await
                     .unwrap_or_else(|_| {
                         panic!(
-                            "fragmented optional marker retained transport at split {split}; sentinel={sentinel:?}"
+                            "held-open optional marker prefix retained transport at split {split}; sentinel={sentinel:?}"
                         )
                     })
-                    .expect("fragmented-DONE fixture dropped its transport-close signal");
+                    .expect("optional-prefix fixture dropped its transport-close signal");
             }
         }
     }
@@ -4941,6 +5181,42 @@ mod tests {
             .await
             .expect("rejected text-only follow-up did not release its HTTP transport")
             .expect("text-only follow-up fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_end_turn_true_with_executable_tool_fails_closed() {
+        let body = completed_sse_with_terminal_field(DEFAULT_MODEL, "end_turn", json!(true));
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("inconsistent end_turn fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let error = tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+            .await
+            .expect("inconsistent end_turn response waited for socket EOF")
+            .expect_err("end_turn=true with an executable tool was accepted");
+        body_sent
+            .await
+            .expect("inconsistent end_turn fixture dropped its body-sent signal");
+        assert!(
+            error
+                .to_string()
+                .contains("ended a response that still contained an executable tool call"),
+            "inconsistent end_turn response returned the wrong diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("inconsistent end_turn response retained the HTTP transport")
+            .expect("inconsistent end_turn fixture dropped its transport-close signal");
     }
 
     #[tokio::test]
@@ -5137,7 +5413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
+    async fn test_premature_stream_termination_fails_before_completion_effects() {
         let created = format!(
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
@@ -5146,46 +5422,32 @@ mod tests {
         assert_eq!(
             eof.len(),
             1,
-            "premature EOF should produce exactly one error; errors={eof:?}"
+            "premature EOF should produce exactly one terminal error and no successful effects; chunks={eof:?}"
         );
         assert!(
-            eof[0].contains("before response.completed"),
-            "premature EOF returned the wrong diagnostic; errors={eof:?}"
+            matches!(&eof[0], Err(error) if error.contains("before response.completed")),
+            "premature EOF returned the wrong outcome; chunks={eof:?}"
         );
 
-        let terminal = format!(
-            "{}event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
-            created,
-            json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp"}})
-        );
-        let duplicate =
-            subscription_stream_outcome(format!("{terminal}data: [DONE]\n\n"), DEFAULT_MODEL).await;
+        let premature_done =
+            subscription_stream_outcome(format!("{created}data: [DONE]\n\n"), DEFAULT_MODEL).await;
         assert_eq!(
-            duplicate.len(),
+            premature_done.len(),
             1,
-            "duplicate DONE should produce exactly one error; errors={duplicate:?}"
+            "premature DONE should produce exactly one terminal error and no successful effects; chunks={premature_done:?}"
         );
         assert!(
-            duplicate[0].contains("terminal marker was invalid"),
-            "duplicate DONE returned the wrong diagnostic; errors={duplicate:?}"
+            matches!(&premature_done[0], Err(error) if error.contains("terminal marker was invalid")),
+            "premature DONE returned the wrong outcome; chunks={premature_done:?}"
         );
 
-        let late = subscription_stream_outcome(
-            format!(
-                "{terminal}event: response.in_progress\ndata: {}\n\n",
-                json!({"type":"response.in_progress","sequence_number":3,"response":{}})
-            ),
-            DEFAULT_MODEL,
-        )
-        .await;
-        assert_eq!(
-            late.len(),
-            1,
-            "post-terminal data should produce exactly one error; errors={late:?}"
+        assert!(
+            eof.iter().all(Result::is_err),
+            "premature EOF leaked a successful stream effect; chunks={eof:?}"
         );
         assert!(
-            late[0].contains("data after its terminal response"),
-            "post-terminal data returned the wrong diagnostic; errors={late:?}"
+            premature_done.iter().all(Result::is_err),
+            "premature DONE leaked a successful stream effect; chunks={premature_done:?}"
         );
     }
 
@@ -5195,15 +5457,15 @@ mod tests {
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}})
         );
-        let errors = subscription_stream_outcome(body, DEFAULT_MODEL).await;
+        let chunks = subscription_stream_outcome(body, DEFAULT_MODEL).await;
         assert_eq!(
-            errors.len(),
+            chunks.len(),
             1,
-            "model drift should produce exactly one error; errors={errors:?}"
+            "model drift should produce exactly one terminal error and no successful effects; chunks={chunks:?}"
         );
         assert!(
-            errors[0].contains("incompatible actual model"),
-            "model drift returned the wrong diagnostic; errors={errors:?}"
+            matches!(&chunks[0], Err(error) if error.contains("incompatible actual model")),
+            "model drift returned the wrong outcome; chunks={chunks:?}"
         );
     }
 
@@ -5903,25 +6165,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_streamed_terminal_text_drift_emits_no_terminal_projection() {
-        let mut body = completed_sse(DEFAULT_MODEL);
-        let completed_marker = "event: response.completed\ndata: ";
-        let completed_start = body
-            .find(completed_marker)
-            .expect("fixture must contain a completed event")
-            + completed_marker.len();
-        let completed_end = body[completed_start..]
-            .find("\n\ndata: [DONE]")
-            .map(|offset| completed_start + offset)
-            .expect("fixture must terminate the completed event");
-        let mut completed_event: Value =
-            serde_json::from_str(&body[completed_start..completed_end]).unwrap();
-        completed_event["response"]["output"] = json!([{
-            "type":"message",
-            "role":"assistant",
-            "content":[{"type":"output_text","text":"different"}]
-        }]);
-        body.replace_range(completed_start..completed_end, &completed_event.to_string());
+    async fn test_streamed_text_delta_drift_emits_no_terminal_projection() {
+        let body = completed_sse(DEFAULT_MODEL).replace(
+            "\"delta\":\"hello\"",
+            "\"delta\":\"unsafe-progressive-text\"",
+        );
 
         let mut server = mockito::Server::new_async().await;
         let models = server
@@ -5961,7 +6209,7 @@ mod tests {
         while let Some(chunk) = receiver.recv().await {
             match chunk {
                 Ok(StreamChunk::TextDelta(delta)) => {
-                    saw_delta |= delta == "hello";
+                    saw_delta |= delta == "unsafe-progressive-text";
                 }
                 Ok(StreamChunk::ResponseMetadata { .. })
                 | Ok(StreamChunk::Usage { .. })
@@ -5974,13 +6222,18 @@ mod tests {
         }
         assert!(
             saw_delta,
-            "the test must cross the progressive streaming boundary"
+            "the test must observe the deliberately inconsistent progressive text"
         );
         assert!(
             !saw_terminal_projection,
             "a rejected terminal snapshot must not emit metadata or completed blocks"
         );
-        assert!(error.is_some_and(|error| error.contains("did not match")));
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("did not match")),
+            "streamed text drift returned the wrong sanitized diagnostic; error={error:?}"
+        );
         models.assert_async().await;
         inference.assert_async().await;
     }

@@ -112,17 +112,22 @@ stream work.
 The SSE parser bounds each line and event and the total response. It validates
 standard `event:` names against JSON event types, requires strictly increasing
 sequence numbers, accumulates completed output items by contiguous output
-index, and reconciles them with any terminal output. Actual-model provenance
+index, and reconciles text deltas, text-completion events, completed items, and
+any terminal output. Actual-model provenance
 must remain compatible and unchanged; the audited `-safety-routed` provenance
 suffix is accepted while header and event values must still agree. Bounded
 `safety_buffering` event metadata is validated and intentionally not projected.
-An explicit `end_turn: false` accompanying an executable tool call is preserved
-as a `tool_use` follow-up stop reason. Finch currently has no provider-neutral
+Executable tool output produces a `tool_use` stop reason. An explicit
+`end_turn` value that contradicts the presence of executable tool output fails
+closed. Finch currently has no provider-neutral
 follow-up signal for a text-only response, so that combination fails visibly
 instead of being silently finalized. Unknown fields/events, malformed tool
-arguments, missing completion, duplicate terminal markers, post-terminal data,
-partial EOF, idle timeout, receiver drop, and payload-limit violations fail
-visibly before terminal chunks are published.
+arguments, a terminal marker before completion, missing completion, partial EOF
+before completion, idle timeout, receiver drop, and payload-limit violations
+fail visibly before terminal chunks are published. A validated
+`response.completed` event is authoritative and returns immediately, matching
+the pinned Codex client; unread suffix data, including the optional `[DONE]`
+marker, is discarded independently of HTTP chunk boundaries.
 
 Non-success bodies are never consumed after their status is known; the response
 is dropped immediately so a hostile or broken body cannot delay the typed
