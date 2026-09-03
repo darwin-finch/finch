@@ -70,7 +70,6 @@ pub mod brain; // Background context-gathering agent (spawned when user starts t
 pub mod claude;
 pub mod cli;
 pub mod client; // HTTP client for daemon communication (Phase 8)
-pub mod coforth; // Co-Forth English library — every word as a Forth word
 pub mod config;
 pub mod context; // Project context (CLAUDE.md / FINCH.md auto-loading)
 pub mod daemon; // Daemon lifecycle and auto-spawn (Phase 8)

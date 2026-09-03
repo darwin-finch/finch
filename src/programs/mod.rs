@@ -4,6 +4,8 @@
 //! definitions a shared identity, metadata model, and discovery manifest; it
 //! must never select a legacy evaluator as an alternate invocation ABI.
 
+pub mod forth_tokens;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1010,7 +1012,7 @@ fn lisp_definition_documentation(source: &str) -> Option<String> {
 }
 
 fn forth_definition_identity(source: &str) -> Option<(String, Option<String>)> {
-    let tokens = crate::coforth::tokenize(source);
+    let tokens = forth_tokens::tokenize(source);
     let colon = tokens.iter().position(|token| token == ":")?;
     let name = tokens.get(colon + 1)?.clone();
     let signature = source.lines().find_map(|line| {
