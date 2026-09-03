@@ -113,9 +113,10 @@ The SSE parser bounds each line and event and the total response. It validates
 standard `event:` names against JSON event types, requires strictly increasing
 sequence numbers, accumulates completed output items by contiguous output
 index, and reconciles text deltas, text-completion events, completed items, and
-any terminal output. Actual-model provenance
-must remain compatible and unchanged; the audited `-safety-routed` provenance
-suffix is accepted while header and event values must still agree. Bounded
+any terminal output. Actual-model provenance must remain compatible. Effective
+model headers take precedence over the response-model fallback, and the audited
+transition to a `-safety-routed` provenance suffix is accepted; contradictory
+effective headers still fail closed. Bounded
 `safety_buffering` event metadata is validated and intentionally not projected.
 Executable tool output produces a `tool_use` stop reason. An explicit
 `end_turn` value that contradicts the presence of executable tool output fails

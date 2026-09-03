@@ -57,6 +57,7 @@ const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const SSE_INGEST_FRAGMENT_BYTES: usize = 8 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_OPAQUE_REASONING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 1024;
@@ -228,6 +229,17 @@ fn shared_refresh_lock(reference: &str, account: &str) -> Arc<Mutex<()>> {
     lock
 }
 
+async fn acquire_refresh_lock<'a>(
+    lock: &'a Mutex<()>,
+    cancel: &CancellationToken,
+) -> Result<tokio::sync::MutexGuard<'a, ()>> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("ChatGPT subscription credential refresh was cancelled"),
+        guard = lock.lock() => Ok(guard),
+    }
+}
+
 impl ProductionCredentialSource {
     fn new(credential: &ProviderCredential) -> Result<Self> {
         validate_configured_credential(credential)?;
@@ -280,11 +292,14 @@ impl ProductionCredentialSource {
         rejected_generation: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<ChatGptCredentialLease> {
-        let _guard = tokio::select! {
-            _ = cancel.cancelled() => bail!("ChatGPT subscription credential refresh was cancelled"),
-            guard = self.refresh_lock.lock() => guard,
-        };
+        let _guard = acquire_refresh_lock(&self.refresh_lock, cancel).await?;
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription credential refresh was cancelled");
+        }
         let current = self.load_bound()?;
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription credential refresh was cancelled");
+        }
         let needs_refresh = rejected_generation
             .map(|generation| generation == current.generation)
             .unwrap_or_else(|| current.expires_at <= Utc::now() + REFRESH_SKEW);
@@ -293,6 +308,9 @@ impl ProductionCredentialSource {
                 .refresh(&self.reference, cancel.clone())
                 .await
                 .context("ChatGPT subscription credential refresh failed")?;
+        }
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription credential refresh was cancelled");
         }
         let refreshed = self.load_bound()?;
         self.oauth.validate_active_reuse(&refreshed)?;
@@ -303,7 +321,13 @@ impl ProductionCredentialSource {
 #[async_trait]
 impl ChatGptCredentialSource for ProductionCredentialSource {
     async fn lease(&self, cancel: &CancellationToken) -> Result<ChatGptCredentialLease> {
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription credential lease was cancelled");
+        }
         let record = self.load_bound()?;
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription credential lease was cancelled");
+        }
         if record.expires_at <= Utc::now() + REFRESH_SKEW {
             return self.refresh_generation(None, cancel).await;
         }
@@ -451,14 +475,21 @@ impl ChatGptSubscriptionProvider {
         cancel: &CancellationToken,
     ) -> Result<Catalog> {
         let mut cache = tokio::select! {
+            biased;
             _ = cancel.cancelled() => bail!("ChatGPT subscription model discovery was cancelled"),
             cache = self.catalog.lock() => cache,
         };
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription model discovery was cancelled");
+        }
         if let Some(entry) = cache.as_ref() {
             if entry.generation == lease.generation
                 && entry.account == lease.account
                 && entry.fetched_at.elapsed() <= CATALOG_TTL
             {
+                if cancel.is_cancelled() {
+                    bail!("ChatGPT subscription model discovery was cancelled");
+                }
                 return Ok(entry.catalog.clone());
             }
         }
@@ -486,9 +517,14 @@ impl ChatGptSubscriptionProvider {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
         let response = tokio::select! {
+            biased;
             _ = cancel.cancelled() => bail!("ChatGPT subscription model discovery was cancelled"),
             response = request.send() => response.context("ChatGPT subscription model discovery failed")?,
         };
+        if cancel.is_cancelled() {
+            drop(response);
+            bail!("ChatGPT subscription model discovery was cancelled");
+        }
         if response.status() == StatusCode::NOT_MODIFIED {
             let entry = cache
                 .as_mut()
@@ -511,7 +547,13 @@ impl ChatGptSubscriptionProvider {
         }
         let response_etag = bounded_header(response.headers(), reqwest::header::ETAG.as_str())?;
         let body = read_bounded(response, MAX_CATALOG_BYTES, cancel).await?;
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription model discovery was cancelled");
+        }
         let catalog = parse_catalog(&body)?;
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription model discovery was cancelled");
+        }
         *cache = Some(CatalogCache {
             generation: lease.generation.clone(),
             account: lease.account.clone(),
@@ -533,15 +575,26 @@ impl ChatGptSubscriptionProvider {
         if body.len() > MAX_REQUEST_BYTES {
             bail!("ChatGPT subscription request exceeded the size limit");
         }
-        let mut lease = self.source.lease(&cancel).await?;
+        let mut lease = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("ChatGPT subscription credential lease was cancelled"),
+            lease = self.source.lease(&cancel) => lease?,
+        };
+        if cancel.is_cancelled() {
+            bail!("ChatGPT subscription credential lease was cancelled");
+        }
         let mut unauthorized_retry_used = false;
         let mut catalog = match self.account_catalog(&lease, &cancel).await {
             Ok(catalog) => catalog,
             Err(error) if error.downcast_ref::<SubscriptionUnauthorized>().is_some() => {
-                lease = self
-                    .source
-                    .refresh_after_unauthorized(&lease.generation, &cancel)
-                    .await?;
+                lease = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => bail!("ChatGPT subscription credential refresh was cancelled"),
+                    lease = self.source.refresh_after_unauthorized(&lease.generation, &cancel) => lease?,
+                };
+                if cancel.is_cancelled() {
+                    bail!("ChatGPT subscription credential refresh was cancelled");
+                }
                 unauthorized_retry_used = true;
                 self.account_catalog(&lease, &cancel).await?
             }
@@ -556,7 +609,11 @@ impl ChatGptSubscriptionProvider {
         }
         let url = self.route(RESPONSES_PATH, None)?;
         for _ in 0..2 {
+            if cancel.is_cancelled() {
+                bail!("ChatGPT subscription request was cancelled");
+            }
             let response = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => bail!("ChatGPT subscription request was cancelled"),
                 response = self.client.post(url.clone())
                     .bearer_auth(&lease.access_token)
@@ -571,12 +628,20 @@ impl ChatGptSubscriptionProvider {
                     .body(body.clone())
                     .send() => response.context("Failed to start ChatGPT subscription response")?,
             };
+            if cancel.is_cancelled() {
+                drop(response);
+                bail!("ChatGPT subscription request was cancelled");
+            }
             if response.status() == StatusCode::UNAUTHORIZED && !unauthorized_retry_used {
                 drop(response);
-                lease = self
-                    .source
-                    .refresh_after_unauthorized(&lease.generation, &cancel)
-                    .await?;
+                lease = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => bail!("ChatGPT subscription credential refresh was cancelled"),
+                    lease = self.source.refresh_after_unauthorized(&lease.generation, &cancel) => lease?,
+                };
+                if cancel.is_cancelled() {
+                    bail!("ChatGPT subscription credential refresh was cancelled");
+                }
                 catalog = self.account_catalog(&lease, &cancel).await?;
                 let refreshed_model = catalog
                     .models
@@ -601,7 +666,8 @@ impl ChatGptSubscriptionProvider {
             // to reject the response: consume_sse remains the authoritative,
             // bounded validator for the wire body. Explicitly contradictory
             // media types are still rejected before parsing.
-            if !content_type.is_empty() && !content_type.starts_with("text/event-stream") {
+            let media_type = content_type.split(';').next().unwrap_or_default().trim();
+            if !media_type.is_empty() && !media_type.eq_ignore_ascii_case("text/event-stream") {
                 let classification = classify_unexpected_content_type(&content_type);
                 drop(response);
                 return Err(classification.into());
@@ -1186,7 +1252,7 @@ fn parse_catalog_context_window(object: &Map<String, Value>) -> Result<usize> {
         .map_err(|_| SubscriptionCatalogContextWindowInvalid::OutOfBounds(value).into())
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CompletedResponse {
     id: String,
     model: String,
@@ -1208,22 +1274,42 @@ struct StreamAccumulator {
     text_deltas: BTreeMap<(u64, u64), String>,
     text_done: BTreeMap<(u64, u64), String>,
     actual_model: Option<String>,
+    actual_model_from_header: bool,
 }
 
 impl StreamAccumulator {
-    fn observe_model(&mut self, model: &str, expected_model: &str) -> Result<()> {
+    fn validate_model(model: &str, expected_model: &str) -> Result<()> {
         validate_identifier(model, 256, "actual model")?;
         if !model_is_compatible(expected_model, model) {
             bail!("ChatGPT subscription returned an incompatible actual model");
         }
-        if self
-            .actual_model
-            .as_deref()
-            .is_some_and(|observed| observed != model)
+        Ok(())
+    }
+
+    fn observe_fallback_model(&mut self, model: &str, expected_model: &str) -> Result<()> {
+        Self::validate_model(model, expected_model)?;
+        if self.actual_model.is_none() {
+            self.actual_model = Some(model.to_string());
+        }
+        Ok(())
+    }
+
+    fn observe_header_model(&mut self, model: &str, expected_model: &str) -> Result<()> {
+        Self::validate_model(model, expected_model)?;
+        let transition_to_safety_route = self.actual_model.as_deref().is_some_and(|observed| {
+            !observed.ends_with("-safety-routed") && model == format!("{observed}-safety-routed")
+        });
+        if self.actual_model_from_header
+            && self
+                .actual_model
+                .as_deref()
+                .is_some_and(|observed| observed != model)
+            && !transition_to_safety_route
         {
             bail!("ChatGPT subscription actual model changed during the response");
         }
         self.actual_model = Some(model.to_string());
+        self.actual_model_from_header = true;
         Ok(())
     }
 }
@@ -1243,7 +1329,7 @@ async fn consume_sse(
     let mut terminal: Option<CompletedResponse> = None;
     let mut accumulator = StreamAccumulator::default();
     if let Some(model) = header_model.as_deref() {
-        accumulator.observe_model(model, &expected_model)?;
+        accumulator.observe_header_model(model, &expected_model)?;
     }
     let mut done_seen = false;
     let mut last_sequence = None;
@@ -1256,72 +1342,76 @@ async fn consume_sse(
         };
         let Some(chunk) = next else { break };
         let chunk = chunk.context("ChatGPT subscription stream failed")?;
-        total = total.saturating_add(chunk.len());
-        if total > MAX_RESPONSE_BYTES {
-            bail!("ChatGPT subscription stream exceeded the size limit");
-        }
-        buffer.extend_from_slice(&chunk);
-        enforce_sse_remainder_bounds(&buffer)?;
-        while let Some((end, separator)) = find_event_end(&buffer) {
-            if end > MAX_SSE_EVENT_BYTES {
-                bail!("ChatGPT subscription stream event exceeded the size limit");
-            }
-            let event = buffer.drain(..end).collect::<Vec<_>>();
-            buffer.drain(..separator);
-            let (event_name, data) = sse_data(&event)?;
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                if terminal.is_none() || done_seen {
-                    bail!("ChatGPT subscription stream terminal marker was invalid");
+        for fragment in chunk.chunks(SSE_INGEST_FRAGMENT_BYTES) {
+            buffer.extend_from_slice(fragment);
+            while let Some((end, separator)) = find_event_end(&buffer) {
+                if end > MAX_SSE_EVENT_BYTES {
+                    bail!("ChatGPT subscription stream event exceeded the size limit");
                 }
-                done_seen = true;
-                continue;
+                total = total.saturating_add(end).saturating_add(separator);
+                if total > MAX_RESPONSE_BYTES {
+                    bail!("ChatGPT subscription stream exceeded the size limit");
+                }
+                let event = buffer.drain(..end).collect::<Vec<_>>();
+                buffer.drain(..separator);
+                let (event_name, data) = sse_data(&event)?;
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    if terminal.is_none() || done_seen {
+                        bail!("ChatGPT subscription stream terminal marker was invalid");
+                    }
+                    done_seen = true;
+                    continue;
+                }
+                if terminal.is_some() || done_seen {
+                    bail!("ChatGPT subscription sent data after its terminal response");
+                }
+                let event: Value = serde_json::from_str(&data)
+                    .context("ChatGPT subscription stream event was malformed")?;
+                let event_kind = event
+                    .as_object()
+                    .and_then(|object| object.get("type"))
+                    .and_then(Value::as_str)
+                    .context("ChatGPT subscription stream event omitted type")?;
+                let text_delta = (event_kind == "response.output_text.delta")
+                    .then(|| {
+                        event
+                            .as_object()
+                            .and_then(|object| object.get("delta"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .flatten();
+                if event_name.as_deref().is_some_and(|name| name != event_kind) {
+                    bail!("ChatGPT subscription SSE event name did not match its payload");
+                }
+                let sequence = event
+                    .as_object()
+                    .and_then(|object| object.get("sequence_number"))
+                    .and_then(Value::as_u64)
+                    .context("ChatGPT subscription stream event omitted sequence_number")?;
+                if last_sequence.is_some_and(|previous| sequence <= previous) {
+                    bail!("ChatGPT subscription stream sequence was not strictly increasing");
+                }
+                last_sequence = Some(sequence);
+                if let Some(completed) = parse_event(
+                    event,
+                    &expected_model,
+                    header_model.as_deref(),
+                    &allowed_tools,
+                    &mut accumulator,
+                )? {
+                    terminal = Some(completed);
+                    break 'stream;
+                }
+                if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
+                    send_stream_chunk(sender, &cancel, StreamChunk::TextDelta(delta)).await?;
+                }
             }
-            if terminal.is_some() || done_seen {
-                bail!("ChatGPT subscription sent data after its terminal response");
-            }
-            let event: Value = serde_json::from_str(&data)
-                .context("ChatGPT subscription stream event was malformed")?;
-            let event_kind = event
-                .as_object()
-                .and_then(|object| object.get("type"))
-                .and_then(Value::as_str)
-                .context("ChatGPT subscription stream event omitted type")?;
-            let text_delta = (event_kind == "response.output_text.delta")
-                .then(|| {
-                    event
-                        .as_object()
-                        .and_then(|object| object.get("delta"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .flatten();
-            if event_name.as_deref().is_some_and(|name| name != event_kind) {
-                bail!("ChatGPT subscription SSE event name did not match its payload");
-            }
-            let sequence = event
-                .as_object()
-                .and_then(|object| object.get("sequence_number"))
-                .and_then(Value::as_u64)
-                .context("ChatGPT subscription stream event omitted sequence_number")?;
-            if last_sequence.is_some_and(|previous| sequence <= previous) {
-                bail!("ChatGPT subscription stream sequence was not strictly increasing");
-            }
-            last_sequence = Some(sequence);
-            if let Some(completed) = parse_event(
-                event,
-                &expected_model,
-                header_model.as_deref(),
-                &allowed_tools,
-                &mut accumulator,
-            )? {
-                terminal = Some(completed);
-                break 'stream;
-            }
-            if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
-                send_stream_chunk(sender, &cancel, StreamChunk::TextDelta(delta)).await?;
+            if total.saturating_add(buffer.len()) > MAX_RESPONSE_BYTES {
+                bail!("ChatGPT subscription stream exceeded the size limit");
             }
             enforce_sse_remainder_bounds(&buffer)?;
         }
@@ -1336,18 +1426,20 @@ async fn consume_sse(
         terminal.context("ChatGPT subscription stream ended before response.completed")?;
     completed.allowance = completed.allowance.or(header_allowance);
     if let Some(sender) = sender {
-        send_stream_chunk(
+        // Cancellation wins until the terminal response has been fully validated. Once
+        // terminal publication begins, completion wins: emitting only a prefix of the
+        // terminal projection would leave provider-neutral consumers with an impossible
+        // half-completed response. Receiver drop still releases the task immediately.
+        send_terminal_chunk(
             &sender,
-            &cancel,
             StreamChunk::ResponseMetadata {
                 model: completed.model.clone(),
             },
         )
         .await?;
         if let Some(input_tokens) = completed.input_tokens {
-            send_stream_chunk(
+            send_terminal_chunk(
                 &sender,
-                &cancel,
                 StreamChunk::Usage {
                     input_tokens,
                     output_tokens: completed.output_tokens.unwrap_or_default(),
@@ -1356,9 +1448,8 @@ async fn consume_sse(
             .await?;
         }
         if let Some(allowance) = completed.allowance.as_ref() {
-            send_stream_chunk(
+            send_terminal_chunk(
                 &sender,
-                &cancel,
                 StreamChunk::Allowance {
                     primary_used_percent: allowance.primary_used_percent,
                     secondary_used_percent: allowance.secondary_used_percent,
@@ -1367,10 +1458,20 @@ async fn consume_sse(
             .await?;
         }
         for block in completed.blocks.iter().cloned() {
-            send_stream_chunk(&sender, &cancel, StreamChunk::ContentBlockComplete(block)).await?;
+            send_terminal_chunk(&sender, StreamChunk::ContentBlockComplete(block)).await?;
         }
     }
     Ok(completed)
+}
+
+async fn send_terminal_chunk(
+    sender: &mpsc::Sender<Result<StreamChunk>>,
+    chunk: StreamChunk,
+) -> Result<()> {
+    sender
+        .send(Ok(chunk))
+        .await
+        .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))
 }
 
 async fn send_stream_chunk(
@@ -1408,8 +1509,10 @@ fn parse_event(
                 .get("response")
                 .and_then(Value::as_object)
                 .context("ChatGPT response lifecycle event omitted response")?;
-            observe_response_model(response, expected_model, accumulator)?;
-            observe_event_headers(object, expected_model, accumulator)?;
+            let nested_model = observe_response_model(response, expected_model, accumulator)?;
+            if !nested_model {
+                observe_event_headers(object, expected_model, accumulator)?;
+            }
             Ok(None)
         }
         "response.metadata" | "codex.response.metadata" => {
@@ -1602,13 +1705,16 @@ fn observe_response_model(
     response: &Map<String, Value>,
     expected_model: &str,
     accumulator: &mut StreamAccumulator,
-) -> Result<()> {
-    if let Some(model) = response.get("model") {
-        let model = model
-            .as_str()
-            .context("ChatGPT response model field was invalid")?;
-        accumulator.observe_model(model, expected_model)?;
-    }
+) -> Result<bool> {
+    let fallback_model = response
+        .get("model")
+        .map(|model| {
+            model
+                .as_str()
+                .context("ChatGPT response model field was invalid")
+        })
+        .transpose()?;
+    let mut observed_header = false;
     if let Some(headers) = response.get("headers") {
         let headers = headers
             .as_object()
@@ -1624,11 +1730,17 @@ fn observe_response_model(
                         .context("ChatGPT response model header was invalid")?,
                     _ => bail!("ChatGPT response model header was invalid"),
                 };
-                accumulator.observe_model(model, expected_model)?;
+                accumulator.observe_header_model(model, expected_model)?;
+                observed_header = true;
             }
         }
     }
-    Ok(())
+    if !observed_header {
+        if let Some(model) = fallback_model {
+            accumulator.observe_fallback_model(model, expected_model)?;
+        }
+    }
+    Ok(observed_header)
 }
 
 fn observe_event_headers(
@@ -1652,7 +1764,7 @@ fn observe_event_headers(
                     .context("ChatGPT response model header was invalid")?,
                 _ => bail!("ChatGPT response model header was invalid"),
             };
-            accumulator.observe_model(model, expected_model)?;
+            accumulator.observe_header_model(model, expected_model)?;
         }
     }
     Ok(())
@@ -1871,14 +1983,30 @@ fn parse_completed(
         bail!("ChatGPT terminal response status was invalid");
     }
     let id = required_identifier(response, "id", 256)?;
-    observe_response_model(response, expected_model, accumulator)?;
-    if let Some(header_model) = header_model {
-        accumulator.observe_model(header_model, expected_model)?;
+    if !accumulator.actual_model_from_header {
+        if let Some(header_model) = header_model {
+            accumulator.observe_header_model(header_model, expected_model)?;
+        }
     }
+    observe_response_model(response, expected_model, accumulator)?;
     let response_model = accumulator
         .actual_model
         .clone()
         .context("ChatGPT subscription response omitted actual model provenance")?;
+    // Delta indices describe the streamed output_item.done snapshot. Validate them
+    // before a semantically equivalent terminal snapshot is allowed to consolidate or
+    // reindex those items.
+    for (output_index, item) in &accumulator.output_items {
+        validate_streamed_text_for_item(accumulator, *output_index, item)?;
+    }
+    if accumulator
+        .text_deltas
+        .keys()
+        .chain(accumulator.text_done.keys())
+        .any(|(output_index, _)| !accumulator.output_items.contains_key(output_index))
+    {
+        bail!("ChatGPT streamed text referred to a missing completed output item");
+    }
     let terminal_output = response
         .get("output")
         .map(|output| {
@@ -1940,17 +2068,6 @@ fn parse_completed(
     let mut call_ids = HashSet::new();
     for item in accumulator.output_items.values() {
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
-    }
-    for (output_index, item) in &accumulator.output_items {
-        validate_streamed_text_for_item(accumulator, *output_index, item)?;
-    }
-    if accumulator
-        .text_deltas
-        .keys()
-        .chain(accumulator.text_done.keys())
-        .any(|(output_index, _)| !accumulator.output_items.contains_key(output_index))
-    {
-        bail!("ChatGPT streamed text referred to a missing completed output item");
     }
     let (input_tokens, output_tokens) = parse_usage(response.get("usage"))?;
     let end_turn = response
@@ -2579,6 +2696,7 @@ async fn read_bounded(
     let mut body = Vec::new();
     loop {
         let next = tokio::select! {
+            biased;
             _ = cancel.cancelled() => bail!("ChatGPT subscription response read was cancelled"),
             next = stream.next() => next,
         };
@@ -2588,6 +2706,9 @@ async fn read_bounded(
             bail!("ChatGPT subscription response exceeded the size limit");
         }
         body.extend_from_slice(&chunk);
+    }
+    if cancel.is_cancelled() {
+        bail!("ChatGPT subscription response read was cancelled");
     }
     Ok(body)
 }
@@ -2743,6 +2864,71 @@ mod tests {
         refreshes: AtomicUsize,
     }
 
+    struct CoordinatedRefreshState {
+        generation: AtomicUsize,
+        refreshes: AtomicUsize,
+        lease_barrier: tokio::sync::Barrier,
+    }
+
+    struct CoordinatedRefreshSource {
+        state: Arc<CoordinatedRefreshState>,
+        refresh_lock: Arc<Mutex<()>>,
+    }
+
+    impl CoordinatedRefreshSource {
+        fn new(state: Arc<CoordinatedRefreshState>, reference: &str) -> Self {
+            Self {
+                state,
+                refresh_lock: shared_refresh_lock(reference, "account-1"),
+            }
+        }
+
+        fn credential(generation: usize) -> ChatGptCredentialLease {
+            ChatGptCredentialLease {
+                access_token: if generation == 1 {
+                    "subscription-secret"
+                } else {
+                    "refreshed-subscription-secret"
+                }
+                .to_string(),
+                account: "account-1".to_string(),
+                generation: format!("generation-{generation}"),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChatGptCredentialSource for CoordinatedRefreshSource {
+        async fn lease(&self, cancel: &CancellationToken) -> Result<ChatGptCredentialLease> {
+            let generation = self.state.generation.load(Ordering::SeqCst);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("coordinated credential lease was cancelled"),
+                _ = self.state.lease_barrier.wait() => {}
+            }
+            Ok(Self::credential(generation))
+        }
+
+        async fn refresh_after_unauthorized(
+            &self,
+            rejected_generation: &str,
+            cancel: &CancellationToken,
+        ) -> Result<ChatGptCredentialLease> {
+            let _guard = acquire_refresh_lock(&self.refresh_lock, cancel).await?;
+            let generation = self.state.generation.load(Ordering::SeqCst);
+            if rejected_generation == format!("generation-{generation}") {
+                self.state.refreshes.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                self.state
+                    .generation
+                    .store(generation + 1, Ordering::SeqCst);
+            }
+            Ok(Self::credential(
+                self.state.generation.load(Ordering::SeqCst),
+            ))
+        }
+    }
+
     impl StaticSource {
         fn new() -> Self {
             Self {
@@ -2773,9 +2959,9 @@ mod tests {
             rejected_generation: &str,
             _cancel: &CancellationToken,
         ) -> Result<ChatGptCredentialLease> {
-            self.refreshes.fetch_add(1, Ordering::SeqCst);
             let mut generation = self.generation.lock().await;
             if generation.as_str() == rejected_generation {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
                 *generation = "generation-2".to_string();
             }
             Ok(ChatGptCredentialLease {
@@ -2899,6 +3085,33 @@ mod tests {
         )
     }
 
+    fn many_terminal_blocks_sse(model: &str, count: usize) -> String {
+        let output = (0..count)
+            .map(|index| {
+                json!({
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":format!("block-{index}")}]
+                })
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
+            json!({
+                "type":"response.completed",
+                "sequence_number":2,
+                "response":{
+                    "id":"resp-many-blocks",
+                    "status":"completed",
+                    "model":model,
+                    "output":output,
+                    "usage":{"input_tokens":1,"output_tokens":count,"total_tokens":count + 1}
+                }
+            })
+        )
+    }
+
     fn completed_sse_with_tool(model: &str, name: &str, namespace: &str) -> String {
         completed_sse(model)
             .split_inclusive('\n')
@@ -2958,7 +3171,7 @@ mod tests {
             .map(|offset| start + offset)
             .unwrap();
         let mut completed: Value = serde_json::from_str(&body[start..end]).unwrap();
-        completed["sequence_number"] = json!(4);
+        completed["sequence_number"] = json!(9);
         completed["response"]["output"] = json!([{
             "type":"message",
             "role":"assistant",
@@ -2967,16 +3180,86 @@ mod tests {
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_text.done\ndata: {}\n\n",
                 "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_text.done\ndata: {}\n\n",
                 "event: response.output_item.done\ndata: {}\n\n",
                 "event: response.completed\ndata: {}\n\n",
                 "data: [DONE]\n\n"
             ),
             json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
-            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
-            json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":" there"}]}}),
+            json!({"type":"response.output_text.delta","sequence_number":2,"item_id":"message-1","output_index":0,"content_index":0,"delta":"hel"}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":0,"content_index":0,"delta":"lo"}),
+            json!({"type":"response.output_text.done","sequence_number":4,"item_id":"message-1","output_index":0,"content_index":0,"text":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_text.delta","sequence_number":6,"item_id":"message-2","output_index":1,"content_index":0,"delta":" there"}),
+            json!({"type":"response.output_text.done","sequence_number":7,"item_id":"message-2","output_index":1,"content_index":0,"text":" there"}),
+            json!({"type":"response.output_item.done","sequence_number":8,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":" there"}]}}),
             completed
         )
+    }
+
+    fn completed_sse_with_text_done_events(model: &str, texts: &[&str]) -> String {
+        let mut body = completed_sse(model);
+        let delta_start = body
+            .find("event: response.output_text.delta\n")
+            .expect("completed fixture must contain a text delta");
+        let insert_at = body[delta_start..]
+            .find("\n\n")
+            .map(|offset| delta_start + offset + 2)
+            .expect("completed fixture text delta must end its SSE frame");
+        let events = texts
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| {
+                format!(
+                    "event: response.output_text.done\ndata: {}\n\n",
+                    json!({
+                        "type":"response.output_text.done",
+                        "sequence_number":4 + offset,
+                        "item_id":"message-1",
+                        "output_index":1,
+                        "content_index":0,
+                        "text":text
+                    })
+                )
+            })
+            .collect::<String>();
+        let suffix = offset_sse_sequence_numbers(&body.split_off(insert_at), texts.len() as u64);
+        body.push_str(&events);
+        body.push_str(&suffix);
+        body
+    }
+
+    fn offset_sse_sequence_numbers(body: &str, offset: u64) -> String {
+        body.split_inclusive("\n\n")
+            .map(|frame| {
+                let Some(data_prefix) = frame.find("data: ") else {
+                    return frame.to_string();
+                };
+                let json_start = data_prefix + "data: ".len();
+                let Some(json_length) = frame[json_start..].find('\n') else {
+                    return frame.to_string();
+                };
+                let json_end = json_start + json_length;
+                let payload = &frame[json_start..json_end];
+                if payload == "[DONE]" {
+                    return frame.to_string();
+                }
+                let mut event = serde_json::from_str::<Value>(payload).unwrap_or_else(|error| {
+                    panic!("SSE fixture after the insertion point contained invalid JSON; payload={payload}; error={error}")
+                });
+                let sequence = event
+                    .get_mut("sequence_number")
+                    .and_then(Value::as_u64)
+                    .expect("JSON SSE fixture after the insertion point must have a sequence_number");
+                event["sequence_number"] = json!(sequence + offset);
+                format!("{}{}{}", &frame[..json_start], event, &frame[json_end..])
+            })
+            .collect()
     }
 
     fn compact_terminal_text_sse(model: &str) -> String {
@@ -3311,6 +3594,57 @@ mod tests {
             ready_rx,
             release_tx,
             closed_rx,
+        )
+    }
+
+    async fn gated_catalog_completion_server() -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gated catalog fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("gated catalog fixture must expose its loopback address");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (inference_tx, inference_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener
+                .accept()
+                .await
+                .expect("gated catalog fixture must accept model discovery");
+            let _ = catalog_socket.read(&mut request).await;
+            let _ = ready_tx.send(());
+            let _ = release_rx.await;
+            let catalog = catalog_body();
+            let _ = catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = catalog_socket.flush().await;
+            drop(catalog_socket);
+            let inference_seen =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok();
+            let _ = inference_tx.send(inference_seen);
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            ready_rx,
+            release_tx,
+            inference_rx,
         )
     }
 
@@ -4097,24 +4431,49 @@ mod tests {
         .unwrap();
         assert_eq!(completed.model, DEFAULT_MODEL);
 
-        let conflicting = json!({
-            "id":"resp-conflict",
+        let safety_routed = json!({
+            "id":"resp-safety-routed",
             "status":"completed",
-            "model":MODEL_ALIAS,
+            "model":DEFAULT_MODEL,
+            "headers":{"openai-model":format!("{DEFAULT_MODEL}-safety-routed")},
             "output":[]
         });
         let mut accumulator = StreamAccumulator::default();
-        let error = parse_completed(
-            conflicting.as_object().unwrap(),
+        let completed = parse_completed(
+            safety_routed.as_object().unwrap(),
             DEFAULT_MODEL,
             Some(DEFAULT_MODEL),
             &allowed,
             &mut accumulator,
         )
-        .err()
-        .expect("conflicting payload and header provenance must fail")
+        .expect("effective safety-route header must override the response model fallback");
+        assert_eq!(
+            completed.model,
+            format!("{DEFAULT_MODEL}-safety-routed"),
+            "effective safety-route provenance was not preserved: actual={:?}",
+            completed.model
+        );
+
+        let incompatible = json!({
+            "id":"resp-incompatible",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "headers":{"openai-model":"gpt-4o"},
+            "output":[]
+        });
+        let error = parse_completed(
+            incompatible.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &allowed,
+            &mut StreamAccumulator::default(),
+        )
+        .expect_err("incompatible effective model header must fail closed")
         .to_string();
-        assert!(error.contains("actual model changed"));
+        assert!(
+            error.contains("incompatible actual model"),
+            "incompatible model returned the wrong diagnostic; error={error}"
+        );
 
         let missing = json!({"id":"resp-missing","status":"completed","output":[]});
         let error = parse_completed(
@@ -4134,14 +4493,17 @@ mod tests {
     fn test_malformed_unknown_and_misordered_terminal_events_fail_closed() {
         let mut accumulator = StreamAccumulator::default();
         let unknown = json!({"type":"response.future","sequence_number":1});
-        assert!(parse_event(
-            unknown,
+        let unknown_outcome = parse_event(
+            unknown.clone(),
             DEFAULT_MODEL,
             None,
             &HashSet::new(),
             &mut accumulator,
-        )
-        .is_err());
+        );
+        assert!(
+            unknown_outcome.is_err(),
+            "unknown event was accepted; event={unknown}; outcome={unknown_outcome:?}"
+        );
         let malformed = json!({
             "type":"response.output_text.delta",
             "sequence_number":1,
@@ -4150,28 +4512,35 @@ mod tests {
             "content_index":0,
             "unexpected":"secret"
         });
-        assert!(parse_event(
-            malformed,
+        let malformed_outcome = parse_event(
+            malformed.clone(),
             DEFAULT_MODEL,
             None,
             &HashSet::new(),
             &mut accumulator,
-        )
-        .is_err());
+        );
+        assert!(
+            malformed_outcome.is_err(),
+            "malformed delta with missing text was accepted; outcome={malformed_outcome:?}"
+        );
         let terminal = json!({
             "id":"resp",
             "status":"in_progress",
             "model":DEFAULT_MODEL,
             "output":[]
         });
-        assert!(parse_completed(
+        let terminal_outcome = parse_completed(
             terminal.as_object().unwrap(),
             DEFAULT_MODEL,
             None,
             &HashSet::new(),
             &mut accumulator,
-        )
-        .is_err());
+        );
+        assert!(
+            terminal_outcome.is_err(),
+            "non-completed terminal state was accepted; status={:?}; outcome={terminal_outcome:?}",
+            terminal.get("status")
+        );
     }
 
     #[test]
@@ -4548,6 +4917,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_concurrent_unauthorized_requests_share_one_credential_refresh() {
+        let mut server = mockito::Server::new_async().await;
+        let initial_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(2)
+            .create_async()
+            .await;
+        let initial_inference = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(401)
+            .expect(2)
+            .create_async()
+            .await;
+        let refreshed_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(2)
+            .create_async()
+            .await;
+        let refreshed_inference = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let state = Arc::new(CoordinatedRefreshState {
+            generation: AtomicUsize::new(1),
+            refreshes: AtomicUsize::new(0),
+            lease_barrier: tokio::sync::Barrier::new(2),
+        });
+        let base = format!("{}/backend-api/codex", server.url());
+        let first_provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(CoordinatedRefreshSource::new(
+                state.clone(),
+                "concurrent-exact-once-refresh",
+            )),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("first concurrent-refresh provider must construct");
+        let second_provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(CoordinatedRefreshSource::new(
+                state.clone(),
+                "concurrent-exact-once-refresh",
+            )),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("second concurrent-refresh provider must construct");
+        let first_request =
+            ProviderRequest::new(vec![Message::user("first")]).with_tools(vec![tool()]);
+        let second_request =
+            ProviderRequest::new(vec![Message::user("second")]).with_tools(vec![tool()]);
+        let (first, second) = tokio::join!(
+            first_provider.send_message(&first_request),
+            second_provider.send_message(&second_request)
+        );
+        let first = first.unwrap_or_else(|error| {
+            panic!("first concurrent request failed after shared refresh: {error:#}")
+        });
+        let second = second.unwrap_or_else(|error| {
+            panic!("second concurrent request failed after shared refresh: {error:#}")
+        });
+        assert_eq!(
+            state.refreshes.load(Ordering::SeqCst),
+            1,
+            "concurrent 401 responses refreshed the same credential generation more than once; first={first:?}; second={second:?}"
+        );
+        assert_eq!(
+            state.generation.load(Ordering::SeqCst),
+            2,
+            "concurrent refresh did not settle on exactly the next credential generation; first={first:?}; second={second:?}"
+        );
+        initial_catalog.assert_async().await;
+        initial_inference.assert_async().await;
+        refreshed_catalog.assert_async().await;
+        refreshed_inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_refresh_waiter_starts_no_refreshed_provider_work() {
+        let mut server = mockito::Server::new_async().await;
+        let initial_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let initial_inference = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let refreshed_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(500)
+            .expect(0)
+            .create_async()
+            .await;
+        let refreshed_inference = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(500)
+            .expect(0)
+            .create_async()
+            .await;
+        let state = Arc::new(CoordinatedRefreshState {
+            generation: AtomicUsize::new(1),
+            refreshes: AtomicUsize::new(0),
+            lease_barrier: tokio::sync::Barrier::new(1),
+        });
+        let held_lock = shared_refresh_lock("cancelled-refresh-waiter", "account-1");
+        let held_guard = held_lock.lock().await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(CoordinatedRefreshSource::new(
+                state.clone(),
+                "cancelled-refresh-waiter",
+            )),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("cancelled-refresh provider must construct");
+        let cancel = CancellationToken::new();
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_cancellation_token(cancel.clone());
+        let task = tokio::spawn(async move { provider.send_message(&request).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !initial_inference.matched_async().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh-waiter fixture never reached its initial 401");
+        cancel.cancel();
+        drop(held_guard);
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled refresh waiter did not terminate")
+            .expect("cancelled refresh waiter task panicked")
+            .expect_err("cancelled refresh waiter resumed provider work");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "refresh waiter returned the wrong cancellation diagnostic: {error:#}"
+        );
+        assert_eq!(
+            state.refreshes.load(Ordering::SeqCst),
+            0,
+            "cancelled refresh waiter mutated credential state"
+        );
+        initial_catalog.assert_async().await;
+        initial_inference.assert_async().await;
+        refreshed_catalog.assert_async().await;
+        refreshed_inference.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_repeated_oversized_unauthorized_is_typed_after_one_refresh() {
         let mut server = mockito::Server::new_async().await;
         let initial_catalog = server
@@ -4735,6 +5287,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pre_cancelled_request_performs_no_credential_or_network_work() {
+        let source = Arc::new(StaticSource::new());
+        let provider = ChatGptSubscriptionProvider::for_test(
+            source.clone(),
+            "http://127.0.0.1:9/backend-api/codex",
+            DEFAULT_MODEL,
+        )
+        .expect("pre-cancellation fixture must construct a provider");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_cancellation_token(cancel),
+            )
+            .await
+            .expect_err("pre-cancelled request unexpectedly performed provider work");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "pre-cancelled request returned the wrong diagnostic: {error:#}"
+        );
+        assert_eq!(
+            source.leases.load(Ordering::SeqCst),
+            0,
+            "pre-cancelled request accessed its credential source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_completion_cancellation_starts_no_inference_request() {
+        let (base, catalog_ready, release_catalog, inference_seen) =
+            gated_catalog_completion_server().await;
+        let source = Arc::new(StaticSource::new());
+        let provider = ChatGptSubscriptionProvider::for_test(source, &base, DEFAULT_MODEL)
+            .expect("catalog-cancellation fixture must construct a provider");
+        let cancel = CancellationToken::new();
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_cancellation_token(cancel.clone());
+        let task = tokio::spawn(async move { provider.send_message(&request).await });
+        tokio::time::timeout(Duration::from_secs(2), catalog_ready)
+            .await
+            .expect("catalog-cancellation fixture did not receive model discovery")
+            .expect("catalog-cancellation fixture dropped its ready signal");
+        cancel.cancel();
+        release_catalog
+            .send(())
+            .expect("catalog-cancellation fixture dropped its response gate");
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("catalog completion won over cancellation")
+            .expect("catalog-cancellation task panicked")
+            .expect_err("cancelled catalog completion proceeded to inference");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "catalog completion race returned the wrong diagnostic: {error:#}"
+        );
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), inference_seen)
+                .await
+                .expect("catalog fixture did not report inference observation")
+                .expect("catalog fixture dropped its inference observation"),
+            "catalog completion started an inference request after cancellation"
+        );
+    }
+
+    #[tokio::test]
     async fn test_buffered_cancellation_reaches_and_releases_subscription_transport() {
         let (base, headers_sent, closed) = held_open_subscription_server(
             "200 OK",
@@ -4886,6 +5503,84 @@ mod tests {
             queued.iter().all(|chunk| matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == "x")),
             "cancellation projected a post-terminal chunk or diagnostic instead of only pre-cancel deltas: {queued:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_during_terminal_projection_delivers_complete_terminal_batch() {
+        const BLOCK_COUNT: usize = 40;
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(many_terminal_blocks_sse(DEFAULT_MODEL, BLOCK_COUNT))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("terminal-projection fixture must construct a provider");
+        let cancel = CancellationToken::new();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")])
+                    .with_cancellation_token(cancel.clone()),
+            )
+            .await
+            .expect("terminal-projection fixture must start a stream");
+        let first = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("terminal projection did not publish metadata")
+            .expect("terminal projection channel closed before metadata")
+            .expect("terminal projection failed before metadata");
+        assert!(
+            matches!(first, StreamChunk::ResponseMetadata { .. }),
+            "terminal projection began with the wrong chunk; first={first:?}"
+        );
+        cancel.cancel();
+
+        let mut usage = 0usize;
+        let mut blocks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                match chunk {
+                    Ok(StreamChunk::Usage { .. }) => usage += 1,
+                    Ok(StreamChunk::ContentBlockComplete(block)) => blocks.push(block),
+                    Ok(other) => panic!(
+                        "terminal projection emitted an unexpected chunk after cancellation: {other:?}"
+                    ),
+                    Err(error) => panic!(
+                        "terminal projection became partial after cancellation: {error:#}"
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("terminal projection did not finish after cancellation");
+        assert_eq!(
+            usage, 1,
+            "terminal projection omitted or duplicated usage; usage_count={usage}; blocks={blocks:?}"
+        );
+        assert_eq!(
+            blocks.len(),
+            BLOCK_COUNT,
+            "terminal projection was partial after cancellation; blocks={blocks:?}"
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
     }
 
     #[tokio::test]
@@ -5099,6 +5794,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_completed_response_ignores_oversized_suffix_in_same_http_chunk() {
+        let completed = completed_sse(DEFAULT_MODEL);
+        let terminal = completed
+            .strip_suffix("data: [DONE]\n\n")
+            .expect("completed fixture must contain its optional terminal marker");
+        let body = format!("{terminal}data: {}", "x".repeat(MAX_SSE_LINE_BYTES + 1));
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("oversized-suffix fixture must construct a provider");
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            ),
+        )
+        .await
+        .expect("same-chunk unread suffix stalled completed response")
+        .unwrap_or_else(|error| {
+            panic!("same-chunk unread suffix changed completion outcome: {error:#}")
+        });
+        body_sent
+            .await
+            .expect("oversized-suffix fixture dropped its body signal");
+        assert_eq!(
+            response.model, DEFAULT_MODEL,
+            "ignored same-chunk suffix changed terminal response; response={response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("ignored same-chunk suffix retained its HTTP transport")
+            .expect("oversized-suffix fixture dropped its close signal");
+    }
+
+    #[tokio::test]
     async fn test_end_turn_false_is_preserved_as_follow_up_stop_reason() {
         let body = completed_sse_with_terminal_field(DEFAULT_MODEL, "end_turn", json!(false));
         let (base, body_sent, closed) = held_open_subscription_server(
@@ -5220,13 +5959,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_safety_routed_actual_model_is_preserved_with_exact_event_consistency() {
+    async fn test_nested_safety_route_header_overrides_base_http_and_response_models() {
         const SAFETY_MODEL: &str = "gpt-5.6-sol-safety-routed";
-        let body = completed_sse(DEFAULT_MODEL).replace(DEFAULT_MODEL, SAFETY_MODEL);
+        let body = sse_with_terminal_field(
+            completed_sse(DEFAULT_MODEL),
+            "headers",
+            json!({"openai-model":SAFETY_MODEL}),
+        );
         let (base, body_sent, closed) = held_open_subscription_server(
             "200 OK",
             "text/event-stream",
-            SAFETY_MODEL,
+            DEFAULT_MODEL,
             Some(vec![body]),
         )
         .await;
@@ -5247,7 +5990,7 @@ mod tests {
             .expect("safety-route fixture dropped its body-sent signal");
         assert_eq!(
             response.model, SAFETY_MODEL,
-            "safety-routed actual-model provenance was not preserved: {response:?}"
+            "effective nested safety-route provenance did not override base HTTP and response-model fallbacks: {response:?}"
         );
         tokio::time::timeout(Duration::from_secs(2), closed)
             .await
@@ -5681,6 +6424,71 @@ mod tests {
         assert_eq!(response.usage.unwrap().output_tokens, 7);
         models.assert_async().await;
         inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_sse_content_type_is_case_insensitive_but_not_prefix_matched() {
+        let (valid_base, valid_body_sent, valid_closed) = held_open_subscription_server(
+            "200 OK",
+            "Text/Event-Stream; charset=utf-8",
+            DEFAULT_MODEL,
+            Some(vec![completed_sse(DEFAULT_MODEL)]),
+        )
+        .await;
+        let valid_provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &valid_base,
+            DEFAULT_MODEL,
+        )
+        .expect("case-insensitive media-type fixture must construct a provider");
+        let valid = valid_provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .expect("standards-valid case-variant SSE media type was rejected");
+        valid_body_sent
+            .await
+            .expect("case-insensitive media-type fixture dropped its body signal");
+        assert_eq!(
+            valid.model, DEFAULT_MODEL,
+            "case-variant SSE response changed model provenance; response={valid:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), valid_closed)
+            .await
+            .expect("case-variant SSE response retained its HTTP transport")
+            .expect("case-insensitive media-type fixture dropped its close signal");
+
+        let (invalid_base, invalid_body_sent, invalid_closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-streaming",
+            DEFAULT_MODEL,
+            Some(vec![completed_sse(DEFAULT_MODEL)]),
+        )
+        .await;
+        let invalid_provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &invalid_base,
+            DEFAULT_MODEL,
+        )
+        .expect("prefix-lookalike media-type fixture must construct a provider");
+        let error = invalid_provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect_err("text/event-streaming prefix lookalike was accepted as SSE");
+        invalid_body_sent
+            .await
+            .expect("prefix-lookalike media-type fixture dropped its body signal");
+        assert!(
+            error
+                .downcast_ref::<SubscriptionUnexpectedContentType>()
+                .is_some_and(|kind| kind == &SubscriptionUnexpectedContentType::Other),
+            "prefix-lookalike returned the wrong typed classification; error={error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), invalid_closed)
+            .await
+            .expect("rejected prefix-lookalike retained its HTTP transport")
+            .expect("prefix-lookalike media-type fixture dropped its close signal");
     }
 
     #[test]
@@ -6239,6 +7047,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mismatched_output_text_done_emits_no_terminal_projection() {
+        let chunks = subscription_stream_outcome(
+            completed_sse_with_text_done_events(DEFAULT_MODEL, &["not-the-streamed-text"]),
+            DEFAULT_MODEL,
+        )
+        .await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "mismatched output_text.done should preserve one progressive delta and one terminal error only; chunks={chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[0], Ok(StreamChunk::TextDelta(delta)) if delta == "hello"),
+            "mismatched output_text.done lost or changed its preceding progressive delta; chunks={chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[1], Err(error) if error.contains("did not match streamed text deltas")),
+            "mismatched output_text.done returned the wrong sanitized terminal outcome; chunks={chunks:?}"
+        );
+        assert!(
+            chunks.iter().all(|chunk| !matches!(
+                chunk,
+                Ok(StreamChunk::ResponseMetadata { .. }
+                    | StreamChunk::Usage { .. }
+                    | StreamChunk::Allowance { .. }
+                    | StreamChunk::ContentBlockComplete(_))
+            )),
+            "mismatched output_text.done leaked terminal projection; chunks={chunks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_output_text_done_emits_no_terminal_projection() {
+        let chunks = subscription_stream_outcome(
+            completed_sse_with_text_done_events(DEFAULT_MODEL, &["hello", "hello"]),
+            DEFAULT_MODEL,
+        )
+        .await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "duplicate output_text.done should preserve one progressive delta and one terminal error only; chunks={chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[0], Ok(StreamChunk::TextDelta(delta)) if delta == "hello"),
+            "duplicate output_text.done lost or changed its preceding progressive delta; chunks={chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[1], Err(error) if error.contains("repeated a completed text event")),
+            "duplicate output_text.done returned the wrong sanitized terminal outcome; chunks={chunks:?}"
+        );
+        assert!(
+            chunks.iter().all(|chunk| !matches!(
+                chunk,
+                Ok(StreamChunk::ResponseMetadata { .. }
+                    | StreamChunk::Usage { .. }
+                    | StreamChunk::Allowance { .. }
+                    | StreamChunk::ContentBlockComplete(_))
+            )),
+            "duplicate output_text.done leaked terminal projection; chunks={chunks:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_response_rejection_is_typed_clear_and_secret_free() {
         let mut server = mockito::Server::new_async().await;
         let models = server
@@ -6295,14 +7167,17 @@ mod tests {
             "https://user@chatgpt.com/backend-api/codex",
             "https://chatgpt.com/backend-api/codex?redirect=evil",
         ] {
-            assert!(ChatGptSubscriptionProvider::new(
+            let outcome = ChatGptSubscriptionProvider::new(
                 source.clone(),
                 endpoint,
                 DEFAULT_MODEL,
                 ReasoningEffort::High,
                 false,
-            )
-            .is_err());
+            );
+            assert!(
+                outcome.is_err(),
+                "hostile production endpoint was accepted; endpoint={endpoint}; outcome={outcome:?}"
+            );
         }
         assert_eq!(source.leases.load(Ordering::SeqCst), 0);
     }
@@ -6320,12 +7195,20 @@ mod tests {
             "user",
             vec![ContentBlock::image("image/png", "iVBORw0KGgo=")],
         )]);
-        assert!(provider.send_message(&invalid_image).await.is_err());
+        let invalid_image_outcome = provider.send_message(&invalid_image).await;
+        assert!(
+            invalid_image_outcome.is_err(),
+            "malformed image crossed provider preflight; outcome={invalid_image_outcome:?}"
+        );
         let invalid_role = ProviderRequest::new(vec![Message::with_content(
             "developer",
             vec![ContentBlock::text("attacker-controlled")],
         )]);
-        assert!(provider.send_message(&invalid_role).await.is_err());
+        let invalid_role_outcome = provider.send_message(&invalid_role).await;
+        assert!(
+            invalid_role_outcome.is_err(),
+            "unsupported history role crossed provider preflight; role=developer; outcome={invalid_role_outcome:?}"
+        );
         assert_eq!(source.leases.load(Ordering::SeqCst), 0);
     }
 
@@ -6341,8 +7224,20 @@ mod tests {
             }],
         )])
         .with_model(DEFAULT_MODEL);
-        assert!(responses_lite_request(&request, ReasoningEffort::High).is_err());
-        assert!(enforce_sse_remainder_bounds(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
-        assert!(sse_data(b"future: attacker-secret").is_err());
+        let oversized_arguments = responses_lite_request(&request, ReasoningEffort::High);
+        assert!(
+            oversized_arguments.is_err(),
+            "oversized tool arguments crossed request preflight; outcome={oversized_arguments:?}"
+        );
+        let oversized_line = enforce_sse_remainder_bounds(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]);
+        assert!(
+            oversized_line.is_err(),
+            "oversized unterminated SSE line crossed remainder validation; outcome={oversized_line:?}"
+        );
+        let unknown_field = sse_data(b"future: attacker-secret");
+        assert!(
+            unknown_field.is_err(),
+            "unknown SSE field crossed strict parsing; field=future; outcome={unknown_field:?}"
+        );
     }
 }
