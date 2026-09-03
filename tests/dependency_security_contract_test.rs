@@ -197,3 +197,33 @@ fn test_capnp_security_requirement_lower_bound_covers_complete_affected_range() 
         );
     }
 }
+
+#[test]
+fn test_resolved_graph_excludes_unmaintained_fxhash() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let lock_path = manifest_path.with_file_name("Cargo.lock");
+    let lock_text = std::fs::read_to_string(&lock_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read resolved dependency security contract from {}: {error}",
+            lock_path.display()
+        )
+    });
+    let lock: toml::Value = lock_text.parse().unwrap_or_else(|error| {
+        panic!(
+            "failed to parse resolved dependency security contract from {}: {error}",
+            lock_path.display()
+        )
+    });
+    let resolved_fxhash = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock must contain a package array for dependency security auditing")
+        .iter()
+        .filter_map(|package| package.get("name").and_then(toml::Value::as_str))
+        .filter(|name| *name == "fxhash")
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        resolved_fxhash.is_empty(),
+        "Cargo.lock still resolves unmaintained fxhash under RUSTSEC-2025-0057 via {resolved_fxhash:?}; remove or upgrade every dependency path instead of silently allowing the advisory"
+    );
+}
