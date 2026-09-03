@@ -145,13 +145,13 @@ impl BrainEffectAuditRpcAuthority {
 struct BrainEffectReservationImpl {
     authority: BrainEffectAuditRpcAuthority,
     identity: crate::runtime::effect_log::EffectAuditIdentity,
-    begun: bool,
+    begun: std::cell::Cell<bool>,
 }
 
 struct BrainHostEffectPermitImpl {
     authority: BrainEffectAuditRpcAuthority,
     permit: std::sync::Arc<crate::runtime::effect_log::HostEffectPermit>,
-    finished: Option<crate::runtime::effect_log::EffectAuditTerminalOutcome>,
+    finished: std::cell::RefCell<Option<crate::runtime::effect_log::EffectAuditTerminalOutcome>>,
 }
 
 fn require_approval_connection(
@@ -293,10 +293,10 @@ impl BrainRunnerControlImpl {
 
 impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
     fn start_subagent(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_runner_control::StartSubagentParams,
         mut results: finch_ipc_capnp::brain_runner_control::StartSubagentResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let _dispatch = match self.admit() {
             Ok(dispatch) => dispatch,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -346,10 +346,10 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
     }
 
     fn finish_subagent(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_runner_control::FinishSubagentParams,
         mut results: finch_ipc_capnp::brain_runner_control::FinishSubagentResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let _dispatch = match self.admit() {
             Ok(dispatch) => dispatch,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -452,10 +452,10 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
 
 impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl {
     fn create_schedule(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_program_control::CreateScheduleParams,
         mut results: finch_ipc_capnp::brain_program_control::CreateScheduleResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.validate_callback_active() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -505,10 +505,10 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
     }
 
     fn inspect_schedule(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_program_control::InspectScheduleParams,
         mut results: finch_ipc_capnp::brain_program_control::InspectScheduleResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let schedule_id = match params
             .get()
             .and_then(|params| params.get_schedule_id())
@@ -537,10 +537,10 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
     }
 
     fn cancel_schedule(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_program_control::CancelScheduleParams,
         mut results: finch_ipc_capnp::brain_program_control::CancelScheduleResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.validate_callback_active() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -569,10 +569,10 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
     }
 
     fn reserve_effect(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_program_control::ReserveEffectParams,
         mut results: finch_ipc_capnp::brain_program_control::ReserveEffectResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let Some(authority) = &self.effect_audit else {
             return Promise::err(capnp::Error::failed(
                 "effect audit authority is unavailable".into(),
@@ -609,7 +609,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
                     capnp_rpc::new_client(BrainEffectReservationImpl {
                         authority: authority.clone(),
                         identity,
-                        begun: false,
+                        begun: std::cell::Cell::new(false),
                     });
                 results.get().set_reservation(reservation);
                 return Promise::ok(());
@@ -629,7 +629,7 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
                     capnp_rpc::new_client(BrainEffectReservationImpl {
                         authority: authority.clone(),
                         identity,
-                        begun: false,
+                        begun: std::cell::Cell::new(false),
                     });
                 results.get().set_reservation(reservation);
                 Promise::ok(())
@@ -641,11 +641,11 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
 
 impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservationImpl {
     fn begin(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         _params: finch_ipc_capnp::brain_effect_reservation::BeginParams,
         mut results: finch_ipc_capnp::brain_effect_reservation::BeginResults,
-    ) -> Promise<(), capnp::Error> {
-        if self.begun {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        if self.begun.get() {
             return Promise::err(capnp::Error::failed(
                 "effect audit reservation was already begun".into(),
             ));
@@ -659,12 +659,12 @@ impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservatio
             .begin_effect_audit(&self.authority.grant, self.identity)
         {
             Ok(permit) => {
-                self.begun = true;
+                self.begun.set(true);
                 let permit: finch_ipc_capnp::brain_host_effect_permit::Client =
                     capnp_rpc::new_client(BrainHostEffectPermitImpl {
                         authority: self.authority.clone(),
                         permit: std::sync::Arc::new(permit),
-                        finished: None,
+                        finished: std::cell::RefCell::new(None),
                     });
                 results.get().set_permit(permit);
                 Promise::ok(())
@@ -674,11 +674,11 @@ impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservatio
     }
 
     fn not_applied(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_effect_reservation::NotAppliedParams,
         _results: finch_ipc_capnp::brain_effect_reservation::NotAppliedResults,
-    ) -> Promise<(), capnp::Error> {
-        if self.begun {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
+        if self.begun.get() {
             return Promise::err(capnp::Error::failed(
                 "begun effect outcome requires its host permit".into(),
             ));
@@ -708,10 +708,10 @@ impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservatio
 
 impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermitImpl {
     fn finish(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_host_effect_permit::FinishParams,
         _results: finch_ipc_capnp::brain_host_effect_permit::FinishResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let outcome = match params.get().and_then(|params| params.get_outcome()) {
             Ok(outcome) => outcome,
             Err(error) => return Promise::err(error),
@@ -747,7 +747,7 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
             }
             Err(error) => return Promise::err(error.into()),
         };
-        if let Some(existing) = &self.finished {
+        if let Some(existing) = self.finished.borrow().as_ref() {
             if existing == &outcome {
                 return Promise::ok(());
             }
@@ -762,7 +762,7 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
             outcome.clone(),
         ) {
             Ok(()) => {
-                self.finished = Some(outcome);
+                *self.finished.borrow_mut() = Some(outcome);
                 Promise::ok(())
             }
             Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
@@ -772,10 +772,10 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
 
 impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
     fn request_approval(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_turn_control::RequestApprovalParams,
         mut results: finch_ipc_capnp::brain_turn_control::RequestApprovalResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.validate_callback_active() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -866,10 +866,10 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
     }
 
     fn reserve_effect(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_ipc_capnp::brain_turn_control::ReserveEffectParams,
         mut results: finch_ipc_capnp::brain_turn_control::ReserveEffectResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let Some(authority) = &self.effect_audit else {
             return Promise::err(capnp::Error::failed(
                 "effect audit authority is unavailable".into(),
@@ -908,7 +908,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                     capnp_rpc::new_client(BrainEffectReservationImpl {
                         authority: authority.clone(),
                         identity,
-                        begun: false,
+                        begun: std::cell::Cell::new(false),
                     });
                 results.get().set_reservation(reservation);
                 Promise::ok(())
@@ -920,10 +920,10 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
 
 impl brain_service::Server for BrainRpcService {
     fn snapshot(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::SnapshotParams,
         mut results: brain_service::SnapshotResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if self.runner_process_identity.is_some() {
             if let Err(error) = self.require_runner_process_admitted() {
                 return Promise::err(capnp::Error::failed(error.to_string()));
@@ -946,10 +946,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn attach(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::AttachParams,
         mut results: brain_service::AttachResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let subject = pry!(params.get_subject())
@@ -991,10 +991,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn acknowledge(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::AcknowledgeParams,
         mut results: brain_service::AcknowledgeResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1026,10 +1026,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn detach(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::DetachParams,
         _results: brain_service::DetachResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1061,10 +1061,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn submit(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::SubmitParams,
         mut results: brain_service::SubmitResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1109,10 +1109,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn watch(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::WatchParams,
         _results: brain_service::WatchResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1188,10 +1188,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn acquire_runner(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::AcquireRunnerParams,
         mut results: brain_service::AcquireRunnerResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.require_runner_process_admitted() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1236,10 +1236,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn release_runner(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::ReleaseRunnerParams,
         _results: brain_service::ReleaseRunnerResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.require_runner_process_admitted() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1266,10 +1266,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn request_runner_handoff(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::RequestRunnerHandoffParams,
         mut results: brain_service::RequestRunnerHandoffResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.require_runner_process_admitted() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1311,10 +1311,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn accept_runner_handoff(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::AcceptRunnerHandoffParams,
         mut results: brain_service::AcceptRunnerHandoffResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.require_runner_process_admitted() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1364,10 +1364,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn cancel_runner_handoff(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::CancelRunnerHandoffParams,
         _results: brain_service::CancelRunnerHandoffResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.require_runner_process_admitted() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1388,10 +1388,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn inspect_run(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::InspectRunParams,
         mut results: brain_service::InspectRunResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let run_id = match parse_run_id(params.get_run_id()) {
@@ -1407,10 +1407,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn cancel_run(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::CancelRunParams,
         mut results: brain_service::CancelRunResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1445,10 +1445,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn create_schedule(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::CreateScheduleParams,
         mut results: brain_service::CreateScheduleResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1508,10 +1508,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn inspect_schedule(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::InspectScheduleParams,
         mut results: brain_service::InspectScheduleResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let schedule_id = match parse_schedule_id(params.get_schedule_id()) {
@@ -1530,10 +1530,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn cancel_schedule(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::CancelScheduleParams,
         mut results: brain_service::CancelScheduleResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1569,10 +1569,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn schedule_initialization(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::ScheduleInitializationParams,
         mut results: brain_service::ScheduleInitializationResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let params = pry!(params.get());
         let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
         let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
@@ -1606,10 +1606,10 @@ impl brain_service::Server for BrainRpcService {
     }
 
     fn claim_runner_identity(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: brain_service::ClaimRunnerIdentityParams,
         _results: brain_service::ClaimRunnerIdentityResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self.require_runner_process_admitted() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -1787,10 +1787,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     // ---- query (non-streaming) -------------------------------------------
 
     fn query(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_daemon::QueryParams,
         mut results: finch_daemon::QueryResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let p = pry!(params.get());
         let messages = pry!(super::brain_codec::decode_messages(pry!(p.get_messages()))
             .map_err(|error| capnp::Error::failed(error.to_string())));
@@ -1829,10 +1829,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     // ---- query_stream (streaming) ----------------------------------------
 
     fn query_stream(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_daemon::QueryStreamParams,
         _results: finch_daemon::QueryStreamResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let p = pry!(params.get());
         let messages = pry!(super::brain_codec::decode_messages(pry!(p.get_messages()))
             .map_err(|error| capnp::Error::failed(error.to_string())));
@@ -1973,10 +1973,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     // ---- Typed Co-Forth --------------------------------------------------
 
     fn eval_forth(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_daemon::EvalForthParams,
         mut results: finch_daemon::EvalForthResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let program = pry!(pry!(params.get()).get_program())
             .to_str()
             .unwrap_or("")
@@ -1998,10 +1998,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     }
 
     fn register_brain_runner(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         params: finch_daemon::RegisterBrainRunnerParams,
         mut results: finch_daemon::RegisterBrainRunnerResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         // This kernel-derived durable-ledger check must precede request
         // parsing, snapshot/checkpoint reads, lease inspection, or callback
         // construction. A lost eject notification therefore cannot let a
@@ -2184,10 +2184,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     }
 
     fn brain_service(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         _params: finch_daemon::BrainServiceParams,
         mut results: finch_daemon::BrainServiceResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         let service: brain_service::Client = capnp_rpc::new_client(BrainRpcService {
             lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
             runners: self.server.brain_runners().clone(),
@@ -2199,10 +2199,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     }
 
     fn runner_brain_service(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         _params: finch_daemon::RunnerBrainServiceParams,
         mut results: finch_daemon::RunnerBrainServiceResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         if let Err(error) = self
             .server
             .brain_runners()
@@ -2223,10 +2223,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
     // ---- health ----------------------------------------------------------
 
     fn ping(
-        &mut self,
+        self: capnp::capability::Rc<Self>,
         _params: finch_daemon::PingParams,
         mut results: finch_daemon::PingResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static {
         results.get().set_version(env!("CARGO_PKG_VERSION"));
         results
             .get()
@@ -3922,10 +3922,11 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let request = match params.get().and_then(|params| params.get_request()) {
                 Ok(request) => request,
                 Err(error) => return capnp::capability::Promise::err(error),
@@ -3975,26 +3976,29 @@ mod tests {
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
     }
@@ -4002,19 +4006,22 @@ mod tests {
     struct EffectNormalRunner {
         begin: bool,
         remote_disconnect_error: bool,
-        permit_tx: Option<
-            tokio::sync::oneshot::Sender<
-                Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
+        permit_tx: std::cell::RefCell<
+            Option<
+                tokio::sync::oneshot::Sender<
+                    Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
+                >,
             >,
         >,
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for EffectNormalRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             mut results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let control = match params
                 .get()
                 .and_then(|params| params.get_request())
@@ -4025,7 +4032,11 @@ mod tests {
             };
             let begin = self.begin;
             let remote_disconnect_error = self.remote_disconnect_error;
-            let permit_tx = self.permit_tx.take().expect("normal runner called twice");
+            let permit_tx = self
+                .permit_tx
+                .borrow_mut()
+                .take()
+                .expect("normal runner called twice");
             capnp::capability::Promise::from_future(async move {
                 let mut reserve = control.reserve_effect_request();
                 reserve
@@ -4077,32 +4088,36 @@ mod tests {
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
     }
 
     struct CancelObservedProgramRunner {
-        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        started:
+            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
         cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
         stop: std::sync::Arc<tokio::sync::Notify>,
         settle_release: std::sync::Arc<tokio::sync::Notify>,
@@ -4111,10 +4126,11 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for CancelObservedProgramRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let run_id = match params
                 .get()
                 .and_then(|params| params.get_request())
@@ -4128,7 +4144,11 @@ mod tests {
                 Ok(run_id) => run_id,
                 Err(error) => return capnp::capability::Promise::err(error),
             };
-            let started = self.started.take().expect("program callback called twice");
+            let started = self
+                .started
+                .borrow_mut()
+                .take()
+                .expect("program callback called twice");
             let stop = std::sync::Arc::clone(&self.stop);
             let settle_release = std::sync::Arc::clone(&self.settle_release);
             let finished = self.finished.clone();
@@ -4144,18 +4164,20 @@ mod tests {
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let run_id = params
                 .get()
                 .and_then(|params| params.get_run_id())
@@ -4188,16 +4210,18 @@ mod tests {
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
     }
 
     struct DelayedMemoryCancellationRunner {
-        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        started:
+            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
         cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
         cancel: tokio_util::sync::CancellationToken,
         release: std::sync::Arc<tokio::sync::Notify>,
@@ -4210,36 +4234,40 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for MalformedErrorRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("wire errors only".into()))
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("wire errors only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             results.get().set_cancelled(true);
             results.get().set_error(capnp::text::Reader(&[0xff, 0xfe]));
             capnp::capability::Promise::ok(())
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             mut results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             results.get().set_inserted(7);
             results.get().set_error(capnp::text::Reader(&[0xff, 0xfe]));
             capnp::capability::Promise::ok(())
@@ -4252,37 +4280,41 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for CountingRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             capnp::capability::Promise::err(capnp::Error::failed("unexpected callback".into()))
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             capnp::capability::Promise::err(capnp::Error::failed("unexpected callback".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             capnp::capability::Promise::err(capnp::Error::failed("unexpected callback".into()))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             capnp::capability::Promise::err(capnp::Error::failed("unexpected callback".into()))
         }
@@ -4290,34 +4322,38 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for DelayedMemoryCancellationRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             mut results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let run_id = params
                 .get()
                 .and_then(|params| params.get_request())
@@ -4332,7 +4368,11 @@ mod tests {
                 Ok(run_id) => run_id,
                 Err(error) => return capnp::capability::Promise::err(error),
             };
-            let started = self.started.take().expect("memory callback called twice");
+            let started = self
+                .started
+                .borrow_mut()
+                .take()
+                .expect("memory callback called twice");
             let cancel = self.cancel.clone();
             let release = std::sync::Arc::clone(&self.release);
             let finished = self.finished.clone();
@@ -4360,10 +4400,11 @@ mod tests {
         }
 
         fn cancel_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::CancelMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let run_id = params
                 .get()
                 .and_then(|params| params.get_run_id())
@@ -4395,17 +4436,19 @@ mod tests {
     }
 
     struct NonQuiescentExpiredProgramRunner {
-        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        started:
+            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
         cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
-        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for NonQuiescentExpiredProgramRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let request = match params.get().and_then(|params| params.get_request()) {
                 Ok(request) => request,
                 Err(error) => return capnp::capability::Promise::err(error),
@@ -4423,9 +4466,10 @@ mod tests {
             };
             let started = self
                 .started
+                .borrow_mut()
                 .take()
                 .expect("expired callback received more than one program");
-            let proof = CallbackDropProof(self.dropped.take());
+            let proof = CallbackDropProof(self.dropped.borrow_mut().take());
             capnp::capability::Promise::from_future(async move {
                 let _proof = proof;
                 let _ = started.send(run_id);
@@ -4434,18 +4478,20 @@ mod tests {
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let run_id = params
                 .get()
                 .and_then(|params| params.get_run_id())
@@ -4467,25 +4513,28 @@ mod tests {
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
     }
 
     struct ImmediateProgramRunner {
-        started: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        started:
+            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
         checkpoint: crate::vm::TypedRuntimeCheckpoint,
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for ImmediateProgramRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             mut results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let run_id = match params
                 .get()
                 .and_then(|params| params.get_request())
@@ -4501,6 +4550,7 @@ mod tests {
             };
             let started = self
                 .started
+                .borrow_mut()
                 .take()
                 .expect("replacement callback received more than one program");
             let _ = started.send(run_id);
@@ -4517,26 +4567,29 @@ mod tests {
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
         }
     }
@@ -4608,7 +4661,7 @@ mod tests {
         let settle_release = std::sync::Arc::new(tokio::sync::Notify::new());
         let runner: super::finch_ipc_capnp::brain_runner::Client =
             capnp_rpc::new_client(CancelObservedProgramRunner {
-                started: Some(started_tx),
+                started: std::cell::RefCell::new(Some(started_tx)),
                 cancelled: cancelled_tx,
                 stop: std::sync::Arc::new(tokio::sync::Notify::new()),
                 settle_release: std::sync::Arc::clone(&settle_release),
@@ -4711,7 +4764,7 @@ mod tests {
                 let (finished_tx, finished_rx) = tokio::sync::watch::channel(false);
                 let runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(CancelObservedProgramRunner {
-                        started: Some(started_tx),
+                        started: std::cell::RefCell::new(Some(started_tx)),
                         cancelled: cancelled_tx,
                         stop: std::sync::Arc::new(tokio::sync::Notify::new()),
                         settle_release: std::sync::Arc::clone(&settle_release),
@@ -4851,7 +4904,7 @@ mod tests {
         );
         let runner: super::finch_ipc_capnp::brain_runner::Client =
             capnp_rpc::new_client(DelayedMemoryCancellationRunner {
-                started: Some(started_tx),
+                started: std::cell::RefCell::new(Some(started_tx)),
                 cancelled: cancelled_tx,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 release: std::sync::Arc::clone(&release),
@@ -5214,8 +5267,8 @@ mod tests {
     }
 
     struct HostileNeverSettlingMemoryRunner {
-        started: Option<tokio::sync::oneshot::Sender<()>>,
-        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+        started: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+        dropped: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
         process: std::sync::Arc<crate::ipc::client::RunnerProcessIdentity>,
     }
 
@@ -5231,36 +5284,44 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for HostileNeverSettlingMemoryRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("memory only".into()))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
-            let started = self.started.take().expect("memory callback called twice");
-            let proof = CallbackDropProof(self.dropped.take());
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
+            let started = self
+                .started
+                .borrow_mut()
+                .take()
+                .expect("memory callback called twice");
+            let proof = CallbackDropProof(self.dropped.borrow_mut().take());
             capnp::capability::Promise::from_future(async move {
                 let _proof = proof;
                 let _ = started.send(());
@@ -5269,18 +5330,20 @@ mod tests {
         }
 
         fn cancel_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::from_future(std::future::pending())
         }
 
         fn eject_process(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::EjectProcessParams,
             _results: super::finch_ipc_capnp::brain_runner::EjectProcessResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.process
                 .poisoned
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -5292,36 +5355,40 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_runner::Server for SuccessfulCancelRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("cancel only".into()))
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("cancel only".into()))
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             results.get().set_cancelled(true);
             results.get().set_error("");
             capnp::capability::Promise::ok(())
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented("cancel only".into()))
         }
     }
@@ -5374,8 +5441,8 @@ mod tests {
                 let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
                 let hostile: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(HostileNeverSettlingMemoryRunner {
-                        started: Some(started_tx),
-                        dropped: Some(dropped_tx),
+                        started: std::cell::RefCell::new(Some(started_tx)),
+                        dropped: std::cell::RefCell::new(Some(dropped_tx)),
                         process: old_client.test_runner_process_identity(),
                     });
                 old_client
@@ -5763,10 +5830,11 @@ mod tests {
 
     impl super::finch_ipc_capnp::brain_service::Server for CountingRunnerRestoreBrainService {
         fn claim_runner_identity(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_service::ClaimRunnerIdentityParams,
             _results: super::finch_ipc_capnp::brain_service::ClaimRunnerIdentityResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .claim
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5774,10 +5842,11 @@ mod tests {
         }
 
         fn snapshot(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_service::SnapshotParams,
             mut results: super::finch_ipc_capnp::brain_service::SnapshotResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .snapshot
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5792,10 +5861,11 @@ mod tests {
         }
 
         fn acquire_runner(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_service::AcquireRunnerParams,
             mut results: super::finch_ipc_capnp::brain_service::AcquireRunnerResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .acquire_or_renew
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5810,10 +5880,11 @@ mod tests {
         }
 
         fn release_runner(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_service::ReleaseRunnerParams,
             _results: super::finch_ipc_capnp::brain_service::ReleaseRunnerResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .release
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5838,10 +5909,11 @@ mod tests {
 
     impl super::finch_ipc_capnp::finch_daemon::Server for CountingRunnerRestoreDaemon {
         fn ping(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::finch_daemon::PingParams,
             mut results: super::finch_ipc_capnp::finch_daemon::PingResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .ping
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5852,10 +5924,11 @@ mod tests {
         }
 
         fn brain_service(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::finch_daemon::BrainServiceParams,
             mut results: super::finch_ipc_capnp::finch_daemon::BrainServiceResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .brain_service
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5869,10 +5942,11 @@ mod tests {
         }
 
         fn runner_brain_service(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::finch_daemon::RunnerBrainServiceParams,
             mut results: super::finch_ipc_capnp::finch_daemon::RunnerBrainServiceResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .brain_service
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5886,10 +5960,11 @@ mod tests {
         }
 
         fn register_brain_runner(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::finch_daemon::RegisterBrainRunnerParams,
             _results: super::finch_ipc_capnp::finch_daemon::RegisterBrainRunnerResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             self.counts
                 .register
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -6726,9 +6801,9 @@ mod tests {
                 let (old_dropped_tx, mut old_dropped_rx) = tokio::sync::oneshot::channel();
                 let old_runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(NonQuiescentExpiredProgramRunner {
-                        started: Some(old_started_tx),
+                        started: std::cell::RefCell::new(Some(old_started_tx)),
                         cancelled: old_cancelled_tx,
-                        dropped: Some(old_dropped_tx),
+                        dropped: std::cell::RefCell::new(Some(old_dropped_tx)),
                     });
                 old_client
                     .register_test_brain_runner_client("shared", expired_lease_id, old_runner)
@@ -6806,7 +6881,7 @@ mod tests {
                     tokio::sync::oneshot::channel();
                 let replacement_runner: super::finch_ipc_capnp::brain_runner::Client =
                     capnp_rpc::new_client(ImmediateProgramRunner {
-                        started: Some(replacement_started_tx),
+                        started: std::cell::RefCell::new(Some(replacement_started_tx)),
                         checkpoint,
                     });
                 let replacement_connection_id = uuid::Uuid::new_v4();
@@ -7690,7 +7765,7 @@ mod tests {
             capnp_rpc::new_client(EffectNormalRunner {
                 begin,
                 remote_disconnect_error,
-                permit_tx: Some(permit_tx),
+                permit_tx: std::cell::RefCell::new(Some(permit_tx)),
             });
         super::forward_test_runner_request(
             runner,
@@ -8045,25 +8120,27 @@ mod tests {
     }
 
     struct SocketApprovalRunner {
-        failed_tx: Option<tokio::sync::oneshot::Sender<String>>,
+        failed_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<String>>>,
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for SocketApprovalRunner {
         fn run_program(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
             _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented(
                 "socket approval runner accepts only turns".into(),
             ))
         }
 
         fn run_turn(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
             _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let request = match params.get().and_then(|params| params.get_request()) {
                 Ok(request) => request,
                 Err(error) => return capnp::capability::Promise::err(error),
@@ -8085,6 +8162,7 @@ mod tests {
             };
             let failed_tx = self
                 .failed_tx
+                .borrow_mut()
                 .take()
                 .expect("runner received more than one turn");
             capnp::capability::Promise::from_future(async move {
@@ -8111,20 +8189,22 @@ mod tests {
         }
 
         fn cancel_run(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
             _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented(
                 "socket approval runner does not cancel".into(),
             ))
         }
 
         fn project_memory(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
             _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             capnp::capability::Promise::err(capnp::Error::unimplemented(
                 "socket approval runner does not project memory".into(),
             ))
@@ -8214,7 +8294,7 @@ mod tests {
             let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
             let callback: super::finch_ipc_capnp::brain_runner::Client =
                 capnp_rpc::new_client(SocketApprovalRunner {
-                    failed_tx: Some(failed_tx),
+                    failed_tx: std::cell::RefCell::new(Some(failed_tx)),
                 });
             runner
                 .register_test_brain_runner_client("shared", lease.lease_id, callback)
@@ -8336,10 +8416,11 @@ mod tests {
 
     impl super::finch_ipc_capnp::finch_daemon::Server for BrainTestDaemon {
         fn brain_service(
-            &mut self,
+            self: capnp::capability::Rc<Self>,
             _params: super::finch_ipc_capnp::finch_daemon::BrainServiceParams,
             mut results: super::finch_ipc_capnp::finch_daemon::BrainServiceResults,
-        ) -> capnp::capability::Promise<(), capnp::Error> {
+        ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+        {
             let service: super::finch_ipc_capnp::brain_service::Client =
                 capnp_rpc::new_client(BrainRpcService {
                     lifecycle: self.lifecycle.clone(),

@@ -4137,26 +4137,32 @@ mod handler_tests {
         use crate::server::BrainLifecycleService;
 
         struct RetainingTurnRunner {
-            control_tx: Option<
-                tokio::sync::oneshot::Sender<crate::finch_ipc_capnp::brain_turn_control::Client>,
+            control_tx: std::cell::RefCell<
+                Option<
+                    tokio::sync::oneshot::Sender<
+                        crate::finch_ipc_capnp::brain_turn_control::Client,
+                    >,
+                >,
             >,
-            release_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+            release_rx: std::cell::RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
         }
         impl crate::finch_ipc_capnp::brain_runner::Server for RetainingTurnRunner {
             fn run_program(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _params: crate::finch_ipc_capnp::brain_runner::RunProgramParams,
                 _results: crate::finch_ipc_capnp::brain_runner::RunProgramResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::unimplemented(
                     "test runner accepts only turns".into(),
                 ))
             }
             fn run_turn(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 params: crate::finch_ipc_capnp::brain_runner::RunTurnParams,
                 _results: crate::finch_ipc_capnp::brain_runner::RunTurnResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 let control = match params
                     .get()
                     .and_then(|params| params.get_request())
@@ -4165,31 +4171,40 @@ mod handler_tests {
                     Ok(control) => control,
                     Err(error) => return capnp::capability::Promise::err(error),
                 };
-                if self.control_tx.take().unwrap().send(control).is_err() {
+                if self
+                    .control_tx
+                    .borrow_mut()
+                    .take()
+                    .unwrap()
+                    .send(control)
+                    .is_err()
+                {
                     return capnp::capability::Promise::err(capnp::Error::failed(
                         "test control receiver closed".into(),
                     ));
                 }
-                let release = self.release_rx.take().unwrap();
+                let release = self.release_rx.borrow_mut().take().unwrap();
                 capnp::capability::Promise::from_future(async move {
                     let _ = release.await;
                     Err(capnp::Error::disconnected("test runner released".into()))
                 })
             }
             fn cancel_run(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _params: crate::finch_ipc_capnp::brain_runner::CancelRunParams,
                 _results: crate::finch_ipc_capnp::brain_runner::CancelRunResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::unimplemented(
                     "test runner does not accept cancellation".into(),
                 ))
             }
             fn project_memory(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _params: crate::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
                 _results: crate::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::unimplemented(
                     "test runner does not project memory".into(),
                 ))
@@ -4320,8 +4335,8 @@ mod handler_tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let runner: crate::finch_ipc_capnp::brain_runner::Client =
             capnp_rpc::new_client(RetainingTurnRunner {
-                control_tx: Some(control_tx),
-                release_rx: Some(release_rx),
+                control_tx: std::cell::RefCell::new(Some(control_tx)),
+                release_rx: std::cell::RefCell::new(Some(release_rx)),
             });
         let mut forwarding = Box::pin(crate::ipc::server::forward_test_runner_request(
             runner,
@@ -4680,30 +4695,36 @@ mod handler_tests {
         use futures::SinkExt;
 
         struct DisconnectRunner {
-            control: Option<
-                tokio::sync::oneshot::Sender<crate::finch_ipc_capnp::brain_turn_control::Client>,
+            control: std::cell::RefCell<
+                Option<
+                    tokio::sync::oneshot::Sender<
+                        crate::finch_ipc_capnp::brain_turn_control::Client,
+                    >,
+                >,
             >,
             cancelled: tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
             stop: Arc<tokio::sync::Notify>,
         }
         impl crate::finch_ipc_capnp::brain_runner::Server for DisconnectRunner {
             fn run_program(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _: crate::finch_ipc_capnp::brain_runner::RunProgramParams,
                 _: crate::finch_ipc_capnp::brain_runner::RunProgramResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::unimplemented("turn only".into()))
             }
             fn run_turn(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 params: crate::finch_ipc_capnp::brain_runner::RunTurnParams,
                 _: crate::finch_ipc_capnp::brain_runner::RunTurnResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 let control = params
                     .get()
                     .and_then(|value| value.get_request())
                     .and_then(|value| value.get_control());
-                if let (Some(sender), Ok(control)) = (self.control.take(), control) {
+                if let (Some(sender), Ok(control)) = (self.control.borrow_mut().take(), control) {
                     let _ = sender.send(control);
                 }
                 let stop = self.stop.clone();
@@ -4713,10 +4734,11 @@ mod handler_tests {
                 })
             }
             fn cancel_run(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 params: crate::finch_ipc_capnp::brain_runner::CancelRunParams,
                 mut results: crate::finch_ipc_capnp::brain_runner::CancelRunResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 let parsed = params
                     .get()
                     .and_then(|value| value.get_run_id())
@@ -4736,10 +4758,11 @@ mod handler_tests {
                 }
             }
             fn project_memory(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _: crate::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
                 _: crate::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::unimplemented("unused".into()))
             }
         }
@@ -4812,7 +4835,7 @@ mod handler_tests {
         let stop = Arc::new(tokio::sync::Notify::new());
         let runner: crate::finch_ipc_capnp::brain_runner::Client =
             capnp_rpc::new_client(DisconnectRunner {
-                control: Some(control_tx),
+                control: std::cell::RefCell::new(Some(control_tx)),
                 cancelled: cancelled_tx,
                 stop,
             });
@@ -5109,28 +5132,31 @@ mod handler_tests {
         );
         impl crate::finch_ipc_capnp::brain_runner::Server for CancelBeforeTurnRunner {
             fn run_program(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _: crate::finch_ipc_capnp::brain_runner::RunProgramParams,
                 _: crate::finch_ipc_capnp::brain_runner::RunProgramResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::failed(
                     "Turn must stay fenced".into(),
                 ))
             }
             fn run_turn(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _: crate::finch_ipc_capnp::brain_runner::RunTurnParams,
                 _: crate::finch_ipc_capnp::brain_runner::RunTurnResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::failed(
                     "stale Turn reached runner".into(),
                 ))
             }
             fn cancel_run(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 params: crate::finch_ipc_capnp::brain_runner::CancelRunParams,
                 mut results: crate::finch_ipc_capnp::brain_runner::CancelRunResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 let parsed = params
                     .get()
                     .and_then(|value| value.get_run_id())
@@ -5150,10 +5176,11 @@ mod handler_tests {
                 }
             }
             fn project_memory(
-                &mut self,
+                self: capnp::capability::Rc<Self>,
                 _: crate::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
                 _: crate::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
-            ) -> capnp::capability::Promise<(), capnp::Error> {
+            ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> + 'static
+            {
                 capnp::capability::Promise::err(capnp::Error::unimplemented("unused".into()))
             }
         }
