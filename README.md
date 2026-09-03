@@ -1,12 +1,47 @@
 # Finch
 
-Finch is an experimental terminal coding assistant written in Rust. It provides an interactive
-REPL, provider-backed chat, code and shell tools with an approval boundary, local persistence, an
-MCP client, a typed Lisp/Co-Forth runtime, and named shared Brain sessions.
+Finch is an experimental terminal agent runtime and coding assistant written in Rust. It provides
+an interactive REPL, provider-backed chat, code and shell tools with an approval boundary, local
+persistence, an MCP client, a typed Lisp/Co-Forth runtime, and named shared Brain sessions.
 
 Finch is under active development. This README describes the current `main` branch, not a promise
 that every configured provider, local model, or experimental collaboration path is production
 ready. See [Current limitations](#current-limitations) before relying on it.
+
+## Direction
+
+Finch aims to bring capabilities that are currently split across terminal coding agents and
+always-on personal-agent systems under one user-controlled runtime. The intended problem space
+includes tools built around Codex, Claude, Grok, Muse, and OpenCode, as well as OpenClaw-style
+assistants that can remain available on a spare computer. Finch is not yet a drop-in replacement
+for those products.
+
+The long-term design combines:
+
+- provider-independent coding and general agent workflows;
+- named, durable Brains that can survive frontend disconnects and machine restarts;
+- cloud providers, supported subscription authentication, local models, and explicit fallbacks;
+- repository skills and MCP integrations behind the same typed capability boundary;
+- semantic, accessible desktop automation instead of coordinate-driven GUI control;
+- local or hosted perception for voice, images, documents, and bounded text summaries;
+- attached terminal, editor, remote, and lightweight always-on frontends over one auditable event
+  history.
+
+### Why Finch
+
+| Differentiator | What it is intended to provide | Current status |
+| --- | --- | --- |
+| Typed Lisp and Co-Forth programs | Agents can express multi-step computation and effects as programs that the runtime can validate and execute, instead of relying only on opaque one-tool-at-a-time calls. | The typed runtimes and direct `--lisp`, `--forth`, and `--exec` interfaces exist; provider wire conformance and broader agent use are still evolving. |
+| Durable named Brains | One named conversation, event history, and persistent typed VM can survive frontend disconnects and daemon restarts. | Implemented foundations with experimental reconnect, background-work, and collaboration workflows. |
+| One capability boundary | Code tools, MCP tools, future skills, remote peers, and desktop automation are meant to share typed authority, approval, audit, and revocation rules. | Tool approval and MCP client paths exist; skills and wider automation integration remain planned work. |
+| Provider and account portability | Use cloud APIs, supported subscriptions, remote Finch nodes, or local models without changing the surrounding workflow or concealing which backend ran it. | Multiple profiles exist; subscription support, model-level conformance, and explicit fallback behavior remain active work. |
+| Local models and perception | Keep suitable generation, speech transcription, OCR, image description, and context compression on user-controlled hardware, with explicit cloud fallback when requested. | ONNX Runtime and Candle loaders exist experimentally; the compatible model matrix and local media pipeline are not yet established. |
+| Accessibility-native automation | Operate applications through semantic roles, labels, and domain identifiers so automation remains usable and auditable without pixel coordinates. | A design invariant and long-term integration target, not a complete personal-assistant feature today. |
+
+This direction is incremental. Current interfaces are described below; planned work belongs in the
+[issue tracker](https://github.com/darwin-finch/finch/issues) and the dated
+[development roadmap](docs/ROADMAP.md). Configuration types and design documents are not evidence
+that an integration works end to end.
 
 ## Quick start from source
 

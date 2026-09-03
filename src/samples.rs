@@ -307,10 +307,9 @@ mod tests {
 
     /// Read one cell by its A1 reference.
     ///
-    /// Replaces `coforth::interpreter::xlsx_read_cell`, which went with the
-    /// interpreter (#294). These assertions are about the sample workbooks
-    /// this module generates, not about the reader, so they move to calamine
-    /// directly rather than being deleted with the code they happened to call.
+    /// These assertions are about the sample workbooks this module generates,
+    /// not about the reader, so they read through calamine directly. They used
+    /// to call a helper on the Co-Forth interpreter, which #294 removed.
     fn read_cell(path: &str, reference: &str) -> String {
         use calamine::{open_workbook_auto, Reader};
 

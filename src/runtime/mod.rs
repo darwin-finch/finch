@@ -3913,6 +3913,99 @@ fn typed_agent_task_result(
     Ok(value)
 }
 
+/// Project a hydration status onto the record `mem-index-status` returns.
+///
+/// The counts are options because `Failed` carries none: hydration ended
+/// without a trustworthy total, so there is no number to report. Substituting
+/// zero would be reporting a measurement that was never taken, which is wrong
+/// on its own terms whether or not a reader is misled by it. (`state` and
+/// `complete` would still say `failed` and `false` alongside it, so the record
+/// as a whole would not claim the index is fine -- the objection is to the
+/// fabricated number, not to a contradiction.)
+///
+/// `complete` is true only for `Ready`. `Degraded` is deliberately not
+/// complete even though it will not load more on its own: what loaded is
+/// coherent, but it is not everything, so a program asking "did I see the
+/// whole index" must get no. (`reload_tree_from_db` can still upgrade it to
+/// `Ready` via `clear_failure`; "will never load more" would be too strong.)
+///
+/// **Call it before the recall it qualifies, not after.** This takes one
+/// sample, where `mem-recall` brackets its query with
+/// `memory_status::observed(before, after)` and keeps the worse of two. A
+/// status read *after* a recall fails open, which is the dangerous direction:
+/// hydration can finish between the two instructions, so a recall that saw 100
+/// of 2048 nodes is followed by `ready, complete, 2048 of 2048`, and the
+/// program concludes a partial answer was total. Sampling first is
+/// conservative instead. Not because hydration only ever improves -- it does
+/// not, `Loading` can reach `Degraded` or `Failed`, and this file's own
+/// fixture drives exactly that -- but because `complete` is true only for
+/// `Ready`, and nothing leaves `Ready` for a worse state in-process. So a
+/// status taken before the recall can understate completeness but never
+/// overstate it.
+fn typed_memory_index_status(
+    status: crate::memory::HydrationStatus,
+    origin: &SourceOrigin,
+) -> std::result::Result<TypedValue, VmDiagnostic> {
+    use crate::memory::HydrationStatus;
+
+    let count = |value: usize| -> std::result::Result<TypedValue, VmDiagnostic> {
+        let value = i64::try_from(value).map_err(|_| {
+            host_binding_error(origin, "memory node count exceeds the VM integer range")
+        })?;
+        Ok(TypedValue::Option {
+            inner_type: Type::Int,
+            value: Some(Box::new(TypedValue::Int(value))),
+        })
+    };
+    let no_count = TypedValue::Option {
+        inner_type: Type::Int,
+        value: None,
+    };
+    let reason_of = |reason: Option<String>| TypedValue::Option {
+        inner_type: Type::String,
+        value: reason.map(|reason| Box::new(TypedValue::String(reason))),
+    };
+
+    let (state, complete, loaded, total, reason) = match status {
+        HydrationStatus::Ready { nodes } => {
+            ("ready", true, count(nodes)?, count(nodes)?, reason_of(None))
+        }
+        HydrationStatus::Loading { loaded, total } => (
+            "loading",
+            false,
+            count(loaded)?,
+            count(total)?,
+            reason_of(None),
+        ),
+        HydrationStatus::Degraded {
+            loaded,
+            total,
+            reason,
+        } => (
+            "degraded",
+            false,
+            count(loaded)?,
+            count(total)?,
+            reason_of(Some(reason)),
+        ),
+        HydrationStatus::Failed { reason } => (
+            "failed",
+            false,
+            no_count.clone(),
+            no_count,
+            reason_of(Some(reason)),
+        ),
+    };
+
+    Ok(TypedValue::Record(vec![
+        ("state".into(), TypedValue::String(state.into())),
+        ("complete".into(), TypedValue::Bool(complete)),
+        ("loaded".into(), loaded),
+        ("total".into(), total),
+        ("reason".into(), reason),
+    ]))
+}
+
 fn typed_agent_task_snapshot(
     snapshot: scheduler::AgentTaskSnapshot,
     origin: &SourceOrigin,
@@ -5103,6 +5196,22 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 return Ok(vec![TypedValue::Unit]);
             }
             crate::vm::CapabilityKind::MemoryRead => {
+                // `mem-index-status` shares `mem-recall`'s authority: both read
+                // the session index, and neither should be reachable without
+                // memory access. So this arm is entered by capability and split
+                // by registered host binding. Branching on the binding rather
+                // than `origin.word` keeps a renamed source word from selecting
+                // a different host effect.
+                if binding == Some(CoreHostBinding::MemoryIndexStatus) {
+                    let Some(memory) = self.memory.clone() else {
+                        return Err(host_binding_error(origin, "memory service is unavailable"));
+                    };
+                    self.mark_host_use();
+                    return Ok(vec![typed_memory_index_status(
+                        memory.hydration_status(),
+                        origin,
+                    )?]);
+                }
                 let [TypedValue::String(query)] = arguments.as_slice() else {
                     return Err(host_binding_error(origin, "mem-recall requires one query"));
                 };
@@ -5765,6 +5874,7 @@ fn validate_core_host_request(
         CoreHostBinding::MemoryRecall | CoreHostBinding::MemoryStore => {
             matches!(arguments, [value] if string(value))
         }
+        CoreHostBinding::MemoryIndexStatus => arguments.is_empty(),
         CoreHostBinding::ScheduleCreate => {
             matches!(arguments, [source, interval] if string(source) && integer(interval))
         }
@@ -7694,9 +7804,9 @@ fn summarize_csv(
 /// `Handle::runtime_flavor()` reports `MultiThread` there, so the panic cannot
 /// be guarded against. `src/main.rs` runs the whole interactive REPL inside
 /// `local.run_until(...)`, so that trade would swap a deadlock no in-tree
-/// caller can reach for a panic one could. (`src/coforth/interpreter.rs`
-/// recorded the same constraint independently; #294 removed that file, so this
-/// is the only place the reasoning is written down now.)
+/// caller can reach for a panic one could. (The Co-Forth interpreter recorded
+/// the same constraint independently; #294 removed it, so this is the only
+/// place the reasoning is written down now.)
 ///
 /// The residual hazard is in-tree, not out of it: a future third drive site
 /// that constructs a `TypedHostHandler` without the hop. Two tests fail if that
@@ -11020,6 +11130,507 @@ mod tests {
                 .any(|line| line.contains("memory index is unavailable")),
             "failed for some other reason than the unusable index: {:?}",
             outcome.diagnostics
+        );
+    }
+
+    /// Every hydration state projects to the record it claims.
+    ///
+    /// The two `submit` tests cover `Degraded` and `Failed`. Review of #308
+    /// mutation-tested the rest and found a hole: replacing the `Loading` arm
+    /// with `("ready", true, ..)` -- so a half-loaded index reports itself
+    /// complete -- left both of them green, as did blanking `Ready`'s counts.
+    /// `Loading` is the state #295 is actually about, and the one every
+    /// startup passes through, so that mutation is the exact lie this word
+    /// exists to prevent.
+    ///
+    /// A table over all four states is the cheap fix. The `submit` tests stay
+    /// because they pin the production path end to end; this pins the
+    /// projection, which is where the states are enumerated.
+    #[test]
+    fn test_memory_index_status_projects_every_hydration_state() {
+        use crate::memory::HydrationStatus;
+        let origin = crate::vm::SourceOrigin::generated("mem-index-status");
+        let int = |value: i64| ProgramValue::Option(Some(Box::new(ProgramValue::Int(value))));
+        let text =
+            |value: &str| ProgramValue::Option(Some(Box::new(ProgramValue::String(value.into()))));
+
+        let cases = [
+            (
+                HydrationStatus::Ready { nodes: 7 },
+                "ready",
+                true,
+                int(7),
+                int(7),
+                ProgramValue::Option(None),
+            ),
+            (
+                HydrationStatus::Loading {
+                    loaded: 3,
+                    total: 9,
+                },
+                "loading",
+                false,
+                int(3),
+                int(9),
+                ProgramValue::Option(None),
+            ),
+            (
+                HydrationStatus::Degraded {
+                    loaded: 4,
+                    total: 11,
+                    reason: "a batch would not read".into(),
+                },
+                "degraded",
+                false,
+                int(4),
+                int(11),
+                text("a batch would not read"),
+            ),
+            (
+                HydrationStatus::Failed {
+                    reason: "the loader died".into(),
+                },
+                "failed",
+                false,
+                ProgramValue::Option(None),
+                ProgramValue::Option(None),
+                text("the loader died"),
+            ),
+        ];
+
+        for (status, state, complete, loaded, total, reason) in cases {
+            let value = typed_memory_index_status(status.clone(), &origin)
+                .unwrap_or_else(|error| panic!("{status:?} must project: {error:?}"));
+            let record = typed_value(value).expect("the record converts");
+            assert_eq!(
+                record,
+                ProgramValue::Record(vec![
+                    ("state".into(), ProgramValue::String(state.into())),
+                    ("complete".into(), ProgramValue::Bool(complete)),
+                    ("loaded".into(), loaded),
+                    ("total".into(), total),
+                    ("reason".into(), reason),
+                ]),
+                "{status:?} projected wrongly"
+            );
+        }
+    }
+
+    /// A still-hydrating index reports itself incomplete, through `submit`.
+    ///
+    /// This is the literal case #295 names -- "during startup it can run
+    /// against a fraction of the MemTree" -- and it is reached by holding the
+    /// production loader mid-hydration rather than by constructing a status,
+    /// so a change that stopped deriving `Loading` from the loader would fail
+    /// here rather than pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typed_mem_index_status_reports_a_still_loading_index_as_incomplete() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = temp.path().to_path_buf();
+        let config = crate::memory::MemoryConfig {
+            db_path: db_path.clone(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        drop(crate::memory::MemorySystem::new(config.clone()).unwrap());
+        seed_nodes(&db_path, 4 * crate::memory::HYDRATION_BATCH as i64, None);
+
+        // The loader itself announces that it has committed the first batch
+        // and then waits. Polling the tree size cannot establish this window:
+        // on a fast runner every batch can land before a polling task is
+        // scheduled once.
+        let (_registration, mut batch_reached, release) =
+            crate::memory::register_hydration_batch_pause(
+                db_path.clone(),
+                crate::memory::HYDRATION_BATCH,
+            );
+        let memory = Arc::new(crate::memory::MemorySystem::new(config).unwrap());
+        let hydrating = {
+            let memory = Arc::clone(&memory);
+            tokio::spawn(async move { memory.ensure_hydrated().await })
+        };
+
+        if !*batch_reached.borrow_and_update() {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    batch_reached
+                        .changed()
+                        .await
+                        .expect("the hydration pause sender disappeared");
+                    if *batch_reached.borrow_and_update() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the loader never reached the first batch");
+        }
+
+        let status = ask(&runtime_reading(Arc::clone(&memory)), "(mem-index-status)").await;
+        assert_eq!(
+            status_field(&status, "state"),
+            &ProgramValue::String("loading".into()),
+            "the loader is held mid-hydration: {status:?}"
+        );
+        assert_eq!(
+            status_field(&status, "complete"),
+            &ProgramValue::Bool(false),
+            "a still-loading index must not report itself complete -- this is \
+             the state #295 is about: {status:?}"
+        );
+        let (ProgramValue::Option(Some(loaded)), ProgramValue::Option(Some(total))) = (
+            status_field(&status, "loaded"),
+            status_field(&status, "total"),
+        ) else {
+            panic!("a loading index knows its counts: {status:?}");
+        };
+        let (ProgramValue::Int(loaded), ProgramValue::Int(total)) =
+            (loaded.as_ref(), total.as_ref())
+        else {
+            panic!("counts must be integers: {status:?}");
+        };
+        assert!(
+            *loaded > 0 && loaded < total,
+            "held after one batch, so some but not all of {total} is loaded, got {loaded}"
+        );
+
+        let _ = release.send(true);
+        let _ = hydrating.await;
+    }
+
+    /// Read one field out of the `mem-index-status` record.
+    fn status_field<'a>(record: &'a ProgramValue, name: &str) -> &'a ProgramValue {
+        let ProgramValue::Record(fields) = record else {
+            panic!("mem-index-status must return a record, got {record:?}");
+        };
+        fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("no `{name}` field in mem-index-status: {fields:?}"))
+    }
+
+    /// Write `count` linked nodes straight into the store, optionally leaving
+    /// invalid UTF-8 in one of them so its batch fails to read.
+    fn seed_nodes(db_path: &std::path::Path, count: i64, corrupt: Option<i64>) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
+        let tx = conn.unchecked_transaction().unwrap();
+        for id in 0..count {
+            tx.execute(
+                "INSERT OR REPLACE INTO tree_nodes
+                 (node_id, parent_id, text, embedding, level, created_at, importance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                rusqlite::params![
+                    id,
+                    if id == 0 { None } else { Some(0i64) },
+                    format!("seeded node {id}"),
+                    embedding,
+                    if id == 0 { 0i64 } else { 1i64 },
+                    id,
+                ],
+            )
+            .unwrap();
+        }
+        if let Some(id) = corrupt {
+            tx.execute(
+                "UPDATE tree_nodes SET text = ?1 WHERE node_id = ?2",
+                rusqlite::params![vec![0xffu8, 0xfeu8], id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    /// Build a memory whose hydration stops early but leaves what loaded
+    /// coherent, by way of the loader rather than by setting the flag.
+    ///
+    /// An unreadable text blob in the second batch is the production route to
+    /// `Degraded`: the first batch lands, the second errors, and the tree that
+    /// remains is linked but incomplete. Reaching in and marking the status
+    /// directly would let a collapse of `Degraded` into `Ready` at the batch
+    /// arm keep this passing.
+    async fn degraded_memory(db_path: std::path::PathBuf) -> Arc<crate::memory::MemorySystem> {
+        let config = crate::memory::MemoryConfig {
+            db_path: db_path.clone(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        drop(crate::memory::MemorySystem::new(config.clone()).unwrap());
+
+        // Invalid UTF-8 in a node belonging to the *second* batch, so the first
+        // has already committed when the read fails. That ordering is what
+        // separates `Degraded` from `Failed`, and writing the id relative to
+        // the batch size keeps it true if the batch size changes.
+        seed_nodes(
+            &db_path,
+            2 * crate::memory::HYDRATION_BATCH as i64,
+            Some(crate::memory::HYDRATION_BATCH as i64 + 4),
+        );
+
+        let memory = Arc::new(crate::memory::MemorySystem::new(config).unwrap());
+        memory.ensure_hydrated().await.ok();
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Degraded { .. }
+            ),
+            "fixture must actually reach a partial index, or this test cannot \
+             fail for the reason it exists: {:?}",
+            memory.hydration_status()
+        );
+        memory
+    }
+
+    /// Run one Lisp source through `submit` and return its single value.
+    async fn ask(runtime: &ProgramRuntime, source: &str) -> ProgramValue {
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                source,
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "{source} did not complete: {:?}",
+            outcome.diagnostics
+        );
+        // `values` is the VM stack, and it persists across submissions on the
+        // same runtime: a second program's result is pushed onto the first's
+        // rather than replacing it. Taking `first()` here silently returned
+        // the *previous* program's value, which is how an earlier version of
+        // this test read a `mem-recall` list where it expected a status
+        // record.
+        outcome.values.last().cloned().unwrap_or(ProgramValue::Nil)
+    }
+
+    /// Attach a memory to a runtime that may read it.
+    fn runtime_reading(memory: Arc<crate::memory::MemorySystem>) -> ProgramRuntime {
+        let runtime = ProgramRuntime::new();
+        runtime.attach_memory(memory);
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::MemoryRead,
+                selector: crate::vm::ResourceSelector::Memory {
+                    tree: "session".into(),
+                    path: "**".into(),
+                },
+            })
+            .unwrap();
+        runtime
+    }
+
+    /// The residual #275 could not remove: an empty `mem-recall` from an index
+    /// that was only partly read, and an empty one from a complete index, are
+    /// the same value.
+    ///
+    /// So the test first pins what the recall does *not* carry: the partial
+    /// index answers with a bare list, completing exactly as the complete
+    /// index does, with no error and no caveat anywhere in the value. Then it
+    /// asserts `mem-index-status` supplies the missing bit. Asserting only the
+    /// second half would leave the test passing if `mem-recall` started
+    /// refusing partial indexes outright, which would fix the ambiguity by
+    /// breaking working programs -- the outcome #295 explicitly declined, and
+    /// `ask`'s completion assertion is what catches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typed_mem_index_status_tells_a_partial_recall_from_a_complete_one() {
+        let absent = "(mem-recall \"a phrase that was never stored\")";
+
+        // A complete index with nothing in it, so its empty recall is a
+        // genuine absence rather than an artifact of hydration.
+        let whole_db = tempfile::NamedTempFile::new().unwrap();
+        let whole = Arc::new(
+            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path: whole_db.path().to_path_buf(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        whole.ensure_hydrated().await.unwrap();
+        assert!(
+            matches!(
+                whole.hydration_status(),
+                crate::memory::HydrationStatus::Ready { .. }
+            ),
+            "control must be a complete index: {:?}",
+            whole.hydration_status()
+        );
+        let whole_runtime = runtime_reading(whole);
+
+        // An index that stopped early.
+        let partial_db = tempfile::NamedTempFile::new().unwrap();
+        let partial_runtime =
+            runtime_reading(degraded_memory(partial_db.path().to_path_buf()).await);
+
+        // The defect, stated as what is actually observable: the recall from a
+        // partial index completes and hands back a bare `List<String>`, with
+        // no error, no caveat and nothing in the value to say the index was
+        // only fractionally read. It is the same kind of answer a complete
+        // index gives.
+        //
+        // Note what this deliberately does *not* assert. An earlier version
+        // claimed both recalls return an identical empty list; that is false,
+        // and the test failed on it. Retrieval is nearest-neighbour, so a
+        // query for a phrase that was never stored still returns the closest
+        // nodes -- an empty list arises only from a genuinely empty tree, not
+        // from a missing phrase. The ambiguity #295 names is real but it is
+        // "this list was computed against a fraction of the index", not "empty
+        // means absent".
+        let from_partial = ask(&partial_runtime, absent).await;
+        assert!(
+            matches!(from_partial, ProgramValue::List(_)),
+            "a partial index answers with a bare list carrying no caveat: {from_partial:?}"
+        );
+        let from_whole = ask(&whole_runtime, absent).await;
+        assert_eq!(
+            from_whole,
+            ProgramValue::List(Vec::new()),
+            "the control tree is empty, so this recall is a genuine absence"
+        );
+        // The fix: the status word separates them.
+        let whole_status = ask(&whole_runtime, "(mem-index-status)").await;
+        let partial_status = ask(&partial_runtime, "(mem-index-status)").await;
+
+        assert_eq!(
+            status_field(&whole_status, "state"),
+            &ProgramValue::String("ready".into())
+        );
+        assert_eq!(
+            status_field(&whole_status, "complete"),
+            &ProgramValue::Bool(true),
+            "a fully hydrated index must report complete, or an empty recall \
+             stays unfalsifiable: {whole_status:?}"
+        );
+
+        assert_eq!(
+            status_field(&partial_status, "state"),
+            &ProgramValue::String("degraded".into())
+        );
+        assert_eq!(
+            status_field(&partial_status, "complete"),
+            &ProgramValue::Bool(false),
+            "a partial index must not claim completeness: {partial_status:?}"
+        );
+
+        // The counts are the actionable part: a program that sees `false` still
+        // needs to know how much was missed.
+        let loaded = status_field(&partial_status, "loaded");
+        let total = status_field(&partial_status, "total");
+        let (ProgramValue::Option(Some(loaded)), ProgramValue::Option(Some(total))) =
+            (loaded, total)
+        else {
+            panic!("a partial index knows its counts: {partial_status:?}");
+        };
+        let (ProgramValue::Int(loaded), ProgramValue::Int(total)) =
+            (loaded.as_ref(), total.as_ref())
+        else {
+            panic!("counts must be integers: {partial_status:?}");
+        };
+        assert!(
+            *loaded > 0 && loaded < total,
+            "a degraded index read some but not all of {total}, got {loaded}"
+        );
+        assert!(
+            matches!(
+                status_field(&partial_status, "reason"),
+                ProgramValue::Option(Some(_))
+            ),
+            "a degraded index carries why it stopped: {partial_status:?}"
+        );
+    }
+
+    /// A failed index reports no counts rather than zero.
+    ///
+    /// `HydrationStatus::Failed` deliberately carries no totals: hydration
+    /// ended without a trustworthy number. Projecting that as `0 of 0` would
+    /// publish a measurement nobody took. The record would still carry
+    /// `state: failed` and `complete: false` beside it, so it is not that the
+    /// record contradicts itself -- it is that one field would be invented,
+    /// and an invented count is exactly what a program reading `loaded` would
+    /// act on. `none` is the only honest projection.
+    #[tokio::test]
+    async fn typed_mem_index_status_reports_a_failed_index_without_inventing_counts() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let db_path = database.path().to_path_buf();
+        {
+            let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path: db_path.clone(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .unwrap();
+            memory
+                .insert_conversation("user", "the deploy key lives in 1Password", None, None)
+                .await
+                .unwrap();
+        }
+        // Same route as the `mem-recall` refusal test: `level` is read as an
+        // i64 and non-numeric TEXT keeps its type under INTEGER affinity, so
+        // no row parses and the index reaches `Failed`.
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("UPDATE tree_nodes SET level = 'unreadable'", [])
+            .unwrap();
+
+        let memory = Arc::new(
+            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path,
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert!(
+            matches!(
+                memory.hydration_status(),
+                crate::memory::HydrationStatus::Failed { .. }
+            ),
+            "fixture must actually break hydration: {:?}",
+            memory.hydration_status()
+        );
+
+        let outcome = runtime_reading(memory)
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(mem-index-status)",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "the status word must answer for an index mem-recall refuses -- \
+             that is the case it exists for: {:?}",
+            outcome.diagnostics
+        );
+
+        let status = outcome.values.last().expect("one record");
+        assert_eq!(
+            status_field(status, "state"),
+            &ProgramValue::String("failed".into())
+        );
+        assert_eq!(status_field(status, "complete"), &ProgramValue::Bool(false));
+        assert_eq!(
+            status_field(status, "loaded"),
+            &ProgramValue::Option(None),
+            "a failed index must not report a count it does not have: {status:?}"
+        );
+        assert_eq!(
+            status_field(status, "total"),
+            &ProgramValue::Option(None),
+            "a count here would be invented, not measured: {status:?}"
+        );
+        assert!(
+            matches!(
+                status_field(status, "reason"),
+                ProgramValue::Option(Some(_))
+            ),
+            "a failed index carries why: {status:?}"
         );
     }
 

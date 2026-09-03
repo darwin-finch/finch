@@ -1,17 +1,17 @@
 //! The Co-Forth lexer.
 //!
-//! All that survives of `interpreter.rs`. Nothing outside `#[cfg(test)]` ever
-//! ran the VM it fed -- `--forth`, `--lisp`, `--exec` and `/forth` all dispatch
-//! to the typed runtime -- so the interpreter, its builtins and its word table
-//! were removed under #294. This function had the one live caller:
-//! `programs::forth_definition_identity`, which hashes the token stream to give
-//! a Forth definition a stable identity.
+//! Lives here because `forth_definition_identity` below is its only caller:
+//! the token stream is what gives a stored Forth definition its name, so
+//! changing how this splits anything silently re-identifies every definition
+//! already on disk.
 //!
-//! Moved verbatim, including branches that recognise literal forms (`."`,
-//! `s"`, `xlsx"`) whose consuming builtins are gone. They are not dead here:
-//! this function's output *is* a program's identity, so changing how it splits
-//! anything silently re-identifies every stored definition. Trimming them is a
-//! deliberate decision with a migration, not tidying.
+//! It was the lexer of an interpreter for an "English as Forth" experiment --
+//! a vocabulary where each English and Chinese word carried a Forth body. That
+//! did not work: of 43 vocabulary bodies none defined a word, and of 476 real
+//! definitions none linked against the typed VM. The interpreter went in #294,
+//! its vocabulary in #304, and its `coforth` namespace with this move. Co-Forth
+//! itself is not legacy -- it is Finch's typed Forth dialect, still served by
+//! `--forth` and `/forth`.
 
 pub fn tokenize(src: &str) -> Vec<String> {
     let mut tokens = Vec::new();

@@ -146,11 +146,6 @@ enum Command {
         #[command(subcommand)]
         license_command: Option<LicenseCommand>,
     },
-    /// English word library: build, list, and inspect
-    Library {
-        #[command(subcommand)]
-        library_command: LibraryCommand,
-    },
     /// Capture/replay evidence for the Finch provider wire protocol
     WireCorpus {
         #[command(subcommand)]
@@ -259,23 +254,6 @@ enum NetworkCommand {
 enum TrainCommand {
     /// Install Python dependencies for LoRA training
     Setup,
-}
-
-#[derive(Parser, Debug)]
-enum LibraryCommand {
-    /// List all words in the library
-    List,
-    /// Show a word's definition and Forth code
-    Show {
-        /// Word to look up
-        word: String,
-    },
-    /// Compile stored Co-Forth through the typed frontend without executing it
-    AuditTyped {
-        /// Show each accepted, missing, and rejected source
-        #[arg(long)]
-        verbose: bool,
-    },
 }
 
 #[derive(Parser, Debug)]
@@ -863,9 +841,6 @@ async fn main() -> Result<()> {
         }
         Some(Command::License { license_command }) => {
             return run_license_command(license_command).await;
-        }
-        Some(Command::Library { library_command }) => {
-            return run_library_command(library_command).await;
         }
         Some(Command::WireCorpus {
             wire_corpus_command,
@@ -2673,90 +2648,6 @@ async fn run_node_info() -> Result<()> {
     println!("    finch worker");
     println!("  To accept queries from other machines:");
     println!("    finch worker --bind 0.0.0.0:8000");
-
-    Ok(())
-}
-
-// ── finch library ─────────────────────────────────────────────────────────────
-
-async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
-    use finch::coforth::Library;
-
-    match cmd {
-        LibraryCommand::List => {
-            let lib = Library::load();
-            let words = lib.all_words();
-            println!("{} words in library:", words.len());
-            for w in &words {
-                print!("{w}  ");
-            }
-            println!();
-        }
-
-        LibraryCommand::Show { word } => {
-            let lib = Library::load();
-            match lib.lookup(&word) {
-                Some(e) => {
-                    println!("word:       {}", e.word);
-                    println!("definition: {}", e.definition);
-                    println!("kind:       {}", e.kind);
-                    println!("related:    {}", e.related.join(", "));
-                    if let Some(ref forth) = e.forth {
-                        println!("forth:      {forth}");
-                    }
-                }
-                None => {
-                    eprintln!("'{}' not found in library", word);
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        LibraryCommand::AuditTyped { verbose } => {
-            let lib = Library::load();
-            let entries = lib.all_entries();
-            let sources: Vec<(String, Option<&str>)> = entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let sense = entry.sense.as_deref().unwrap_or("default");
-                    (
-                        format!("library:{}:{sense}:{index}", entry.word),
-                        entry.forth.as_deref(),
-                    )
-                })
-                .collect();
-            let audit = finch::vm::migration::audit_forth_sources(
-                sources
-                    .iter()
-                    .map(|(source_id, source)| (source_id.as_str(), *source)),
-                &finch::vm::core_vocabulary(),
-            );
-
-            println!("Typed Co-Forth migration audit");
-            println!("  report only: nothing executed or persisted");
-            println!("  total:       {}", audit.total);
-            println!("  accepted:    {}", audit.accepted);
-            println!("  missing:     {}", audit.missing);
-            println!("  rejected:    {}", audit.rejected.len());
-
-            if !audit.rejection_codes.is_empty() {
-                println!();
-                println!("Rejections by diagnostic code:");
-                for (code, count) in &audit.rejection_codes {
-                    println!("  {code}: {count}");
-                }
-            }
-
-            if verbose {
-                println!();
-                println!("Rejected sources:");
-                for rejection in &audit.rejected {
-                    println!("  {}: {}", rejection.source_id, rejection.diagnostic);
-                }
-            }
-        }
-    }
 
     Ok(())
 }

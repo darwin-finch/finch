@@ -45,19 +45,12 @@ VERSION=$("$BINARY" --version 2>/dev/null)
 echo "${GREEN}✓ ${VERSION} — ready${RESET}"
 echo
 
-# ── 2. Vocabulary ─────────────────────────────────────────────────────────────
-
-echo "${BOLD}vocabulary loaded:${RESET}"
-WORD_COUNT=$("$BINARY" library list 2>/dev/null | head -1 | grep -oE '[0-9]+')
-echo "  ${WORD_COUNT} words  (english · 中文 · more in vocabulary/)"
-echo
-
 # Pull the first returned value out of the typed runtime's JSON envelope.
 typed_value() {
   sed -n 's/.*"values":\[{"type":"[a-z]*","value":\([^}]*\)}.*/\1/p' | tr -d '"'
 }
 
-# ── 3. Stack machine ──────────────────────────────────────────────────────────
+# ── 2. Stack machine ──────────────────────────────────────────────────────────
 
 echo "${BOLD}stack machine:${RESET}"
 for EXPR in '2 3 +' '10 4 -' '6 7 *'; do
@@ -69,7 +62,7 @@ for EXPR in '2 3 +' '10 4 -' '6 7 *'; do
 done
 echo
 
-# ── 4. Define a word ──────────────────────────────────────────────────────────
+# ── 3. Define a word ──────────────────────────────────────────────────────────
 
 echo "${BOLD}define a word:${RESET}"
 echo "  ${DIM}: square ( S int -- S int ) dup * ;${RESET}"
@@ -77,24 +70,7 @@ RESULT=$("$BINARY" --forth ': square ( S int -- S int ) dup * ; 7 square' --json
 echo "  7 square .  →  ${CYAN}${RESULT}${RESET}"
 echo
 
-# ── 5. Chinese vocabulary ─────────────────────────────────────────────────────
-
-echo "${BOLD}chinese vocabulary:${RESET}"
-# `library show` prints word/definition/kind/related/forth. It has never had an
-# `output:` field, so `grep '^output:'` exited 1 and `set -e` killed the script
-# here -- with stderr discarded, sections 5 and 6 and the footer simply never
-# appeared. `|| true` keeps a future field rename from doing the same thing
-# silently, and the definition is what a "chinese vocabulary" section is for.
-#
-# The `forth:` bodies are deliberately not shown as runnable: they use `depth`,
-# `.` and `."`, none of which link in the typed VM.
-for WORD in '你好' '道' '空'; do
-  MEANING=$("$BINARY" library show "${WORD}" | grep '^definition:' | sed 's/^definition:[[:space:]]*//' || true)
-  echo "  ${CYAN}${WORD}${RESET}  ${DIM}→ ${MEANING}${RESET}"
-done
-echo
-
-# ── 6. Distributed ────────────────────────────────────────────────────────────
+# ── 4. Distributed ────────────────────────────────────────────────────────────
 
 echo "${BOLD}distributed:${RESET}"
 echo "  ${DIM}registry-list${RESET}       list live peers with cpu / ram / bench score"
