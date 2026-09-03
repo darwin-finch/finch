@@ -2770,7 +2770,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_buffered_dispatch_uses_the_pinned_compatibility_version() {
+    async fn test_catalog_dispatch_uses_the_pinned_compatibility_version() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .match_header("authorization", "Bearer subscription-secret")
+            .match_header("chatgpt-account-id", "account-1")
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("catalog-version fixture must construct its provider");
+        let outcome = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await;
+        models.assert_async().await;
+        inference.assert_async().await;
+        let response = outcome.unwrap_or_else(|error| {
+            panic!("catalog request with pinned compatibility version failed: {error:#}")
+        });
+        assert_eq!(
+            response.model, DEFAULT_MODEL,
+            "catalog-version boundary changed terminal model provenance; response={response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_inference_uses_the_pinned_compatibility_version() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2782,7 +2830,6 @@ mod tests {
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
             .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
-            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_header("etag", "account-etag")
@@ -2846,14 +2893,18 @@ mod tests {
             DEFAULT_MODEL,
         )
         .unwrap();
-        let response = provider
+        let outcome = provider
             .send_message(
                 &ProviderRequest::new(vec![Message::user("hello")])
                     .with_model(DEFAULT_MODEL)
                     .with_tools(vec![tool()]),
             )
-            .await
-            .unwrap();
+            .await;
+        models.assert_async().await;
+        inference.assert_async().await;
+        let response = outcome.unwrap_or_else(|error| {
+            panic!("buffered inference with pinned compatibility version failed: {error:#}")
+        });
         assert_eq!(response.model, DEFAULT_MODEL);
         assert_eq!(response.usage.unwrap().output_tokens, 7);
         assert_eq!(response.allowance.unwrap().primary_used_percent, Some(25.5));
@@ -2866,12 +2917,10 @@ mod tests {
             Some(ContentBlock::ToolUse { id, .. }) if id == "call-2"
         ));
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 0);
-        models.assert_async().await;
-        inference.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_streaming_dispatch_uses_the_pinned_compatibility_version() {
+    async fn test_streaming_inference_uses_the_pinned_compatibility_version() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2879,7 +2928,6 @@ mod tests {
                 "client_version".into(),
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
-            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_body(single_model_catalog_body(DEFAULT_MODEL, 1_000_000))
             .expect(1)
@@ -2902,8 +2950,18 @@ mod tests {
         )
         .unwrap();
         let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
-        let nonstream = provider.send_message(&request).await.unwrap();
-        let mut receiver = provider.send_message_stream(&request).await.unwrap();
+        let (nonstream, stream) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
+        let nonstream = nonstream.unwrap_or_else(|error| {
+            panic!("buffered half of streaming parity dispatch failed: {error:#}")
+        });
+        let mut receiver = stream.unwrap_or_else(|error| {
+            panic!("streaming inference with pinned compatibility version failed: {error:#}")
+        });
         let mut streamed_blocks = Vec::new();
         let mut streamed_model = None;
         let mut streamed_usage = None;
@@ -2927,8 +2985,6 @@ mod tests {
         assert_eq!(streamed_model.as_deref(), Some(nonstream.model.as_str()));
         assert_eq!(streamed_usage, Some((12, 7)));
         assert_eq!(streamed_text, "hello");
-        models.assert_async().await;
-        inference.assert_async().await;
     }
 
     #[tokio::test]
