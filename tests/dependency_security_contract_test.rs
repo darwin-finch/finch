@@ -25,17 +25,52 @@ fn dependency_version<'a>(
         })
 }
 
-fn assert_requirement_excludes_affected(dependency: &str, requirement: &str) {
-    let requirement = semver::VersionReq::parse(requirement).unwrap_or_else(|error| {
-        panic!("Cap'n Proto dependency {dependency} has invalid version requirement '{requirement}': {error}")
+fn requirement_lower_bound(requirement: &semver::VersionReq) -> Option<semver::Version> {
+    requirement
+        .comparators
+        .iter()
+        .filter_map(|comparator| {
+            let (major, minor, patch) = match comparator.op {
+                semver::Op::Greater if comparator.minor.is_none() => {
+                    (comparator.major.checked_add(1)?, 0, 0)
+                }
+                semver::Op::Greater if comparator.patch.is_none() => {
+                    (comparator.major, comparator.minor?.checked_add(1)?, 0)
+                }
+                semver::Op::Exact
+                | semver::Op::Greater
+                | semver::Op::GreaterEq
+                | semver::Op::Tilde
+                | semver::Op::Caret
+                | semver::Op::Wildcard => (
+                    comparator.major,
+                    comparator.minor.unwrap_or(0),
+                    comparator.patch.unwrap_or(0),
+                ),
+                semver::Op::Less | semver::Op::LessEq => return None,
+                _ => return None,
+            };
+            let mut lower_bound = semver::Version::new(major, minor, patch);
+            lower_bound.pre = comparator.pre.clone();
+            Some(lower_bound)
+        })
+        .max()
+}
+
+fn assert_requirement_excludes_affected(dependency: &str, raw_requirement: &str) {
+    let requirement = semver::VersionReq::parse(raw_requirement).unwrap_or_else(|error| {
+        panic!("Cap'n Proto dependency {dependency} has invalid version requirement '{raw_requirement}': {error}")
     });
-    for affected in ["0.20.6", "0.24.0-alpha.1"] {
-        let affected = semver::Version::parse(affected).unwrap();
-        assert!(
-            !requirement.matches(&affected),
-            "Cap'n Proto dependency {dependency} requirement '{requirement}' permits affected version {affected} under RUSTSEC-2025-0143; require stable 0.24.0 or newer"
-        );
-    }
+    let lower_bound = requirement_lower_bound(&requirement).unwrap_or_else(|| {
+        panic!(
+            "Cap'n Proto dependency {dependency} requirement '{raw_requirement}' has no lower bound; RUSTSEC-2025-0143 requires stable 0.24.0 or newer"
+        )
+    });
+    let fixed = semver::Version::new(0, 24, 0);
+    assert!(
+        lower_bound >= fixed,
+        "Cap'n Proto dependency {dependency} requirement '{raw_requirement}' has lower bound {lower_bound}, which permits versions affected by RUSTSEC-2025-0143; require stable 0.24.0 or newer"
+    );
 }
 
 fn assert_resolved_capnp_family_is_fixed(manifest_path: &Path) {
@@ -133,4 +168,34 @@ fn test_capnp_dependency_family_excludes_rustsec_2025_0143() {
     assert_requirement_excludes_affected("capnp-rpc", capnp_rpc);
     assert_requirement_excludes_affected("capnpc", capnpc);
     assert_resolved_capnp_family_is_fixed(&manifest_path);
+}
+
+#[test]
+fn test_capnp_security_requirement_lower_bound_covers_complete_affected_range() {
+    for safe in ["0.24", "^0.24", ">=0.24.0", ">0.23", "0.25"] {
+        let requirement = semver::VersionReq::parse(safe).unwrap();
+        let lower_bound = requirement_lower_bound(&requirement).unwrap();
+        assert!(
+            lower_bound >= semver::Version::new(0, 24, 0),
+            "safe Cap'n Proto requirement '{safe}' unexpectedly computed affected lower bound {lower_bound}"
+        );
+    }
+
+    for affected in [
+        "0.20.6",
+        ">=0.23",
+        "=0.23.99",
+        "~0.23",
+        "0.24.0-alpha.1",
+        "<0.25",
+    ] {
+        let requirement = semver::VersionReq::parse(affected).unwrap();
+        let lower_bound = requirement_lower_bound(&requirement);
+        assert!(
+            lower_bound
+                .as_ref()
+                .is_none_or(|version| version < &semver::Version::new(0, 24, 0)),
+            "affected Cap'n Proto requirement '{affected}' unexpectedly computed safe lower bound {lower_bound:?}"
+        );
+    }
 }
