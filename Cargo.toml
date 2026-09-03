@@ -121,9 +121,6 @@ indicatif = "0.17"  # Progress bars for download tracking
 rand = { version = "0.8", features = ["small_rng"] }  # Random number generation for sampling
 safetensors = "0.4"  # Model weight loading (used by Candle)
 
-# For web tools (Phase 3)
-scraper = "0.18"
-
 # Spreadsheet / tabular data
 calamine = { version = "0.36.1", features = ["dates"] } # xlsx / xls / ods reading; `dates` turns Data::DateTime into a real date rather than an Excel serial (#281)
 rust_xlsxwriter = "0.80"    # xlsx writing (pure Rust, no Excel needed)
