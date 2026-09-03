@@ -226,7 +226,22 @@ pub(crate) mod fixtures {
             ));
         }
         sheet.push_str("</sheetData></worksheet>");
+        xlsx_from_sheet(sheet)
+    }
 
+    /// Package arbitrary worksheet XML as a single-sheet XLSX.
+    ///
+    /// Split out from `xlsx` so a fixture can emit XML no writer would produce
+    /// -- hundreds of thousands of attributes on one element, or a row element
+    /// per byte of budget -- so a parse can be driven against a hostile input
+    /// size.
+    ///
+    /// This is deliberately *not* described as covering the quick-xml
+    /// advisories behind #185. It does not; see
+    /// `test_a_hostile_parse_terminates` for why they are unreachable through
+    /// calamine at all.
+    pub(crate) fn xlsx_from_sheet(sheet: impl Into<String>) -> Vec<u8> {
+        let sheet = sheet.into();
         let parts: [(&str, String); 5] = [
             (
                 "[Content_Types].xml",
@@ -274,6 +289,94 @@ pub(crate) mod fixtures {
             writer.write_all(body.as_bytes()).expect("zip write");
         }
         writer.finish().expect("zip finish").into_inner()
+    }
+
+    /// Whether the hostile attribute cell carries an `s` attribute.
+    ///
+    /// Load-bearing, and the single place it is decided. calamine reads a cell
+    /// with `get_attrs!(c, b"r" => r, b"s" => s, b"t" => t)`, and that macro
+    /// stops as soon as every key it wants has been found. The cell carries
+    /// `r` and `t` but not `s`, so the search never completes and calamine
+    /// walks every attribute. Setting this to `true` -- the innocuous-looking
+    /// "make the fixture more realistic" edit -- ends the walk, and
+    /// `test_the_attribute_fixture_is_walked_to_its_end` fails, because both
+    /// the hostile fixture and that test's control are built from here.
+    ///
+    /// An earlier version wrote the two fixtures as separate XML literals.
+    /// Nothing coupled them, so adding `s` to the one the deadline parses left
+    /// the oracle green while it guarded a fixture nobody used.
+    const HOSTILE_CELL_CARRIES_S: bool = false;
+
+    /// The hostile attribute cell: `count` distinct attributes on one `<c>`,
+    /// optionally with a malformed attribute last.
+    ///
+    /// There is deliberately **no `with_s` parameter**. An earlier version had
+    /// one, defaulted from `HOSTILE_CELL_CARRIES_S` at each call site, and
+    /// review of #306 showed the coupling was one boolean literal wide:
+    /// writing `attribute_cell(count, true, false)` for the deadline's fixture
+    /// -- cued by a parameter named `with_s`, and plausible as "make it look
+    /// like a real styled cell" -- defanged it while the oracle, which read
+    /// the constant, stayed green. All 13 tests passed with the walk removed.
+    /// A parameter no caller can pass cannot be passed wrongly.
+    fn hostile_attribute_cell(count: usize, malformed_last: bool) -> Vec<u8> {
+        // A bare key with no `=` makes `RawAttrIter` yield `ExpectedEq`, but
+        // only if iteration reaches it. It must be last: the iterator scans
+        // forward to the next `=`, so a malformed token anywhere earlier is
+        // absorbed into the following attribute's key rather than rejected.
+        attribute_cell_xml(count, HOSTILE_CELL_CARRIES_S, malformed_last)
+    }
+
+    /// The same cell with `s` present, so `get_attrs!` completes and stops
+    /// early. The control, and the only thing that passes `true`.
+    fn attribute_cell_that_exits_early(count: usize) -> Vec<u8> {
+        attribute_cell_xml(count, true, true)
+    }
+
+    fn attribute_cell_xml(count: usize, with_s: bool, malformed_last: bool) -> Vec<u8> {
+        let attrs: String = (0..count).map(|i| format!(" a{i}=\"{i}\"")).collect();
+        let s = if with_s { " s=\"0\"" } else { "" };
+        let malformed = if malformed_last { " malformed" } else { "" };
+        xlsx_from_sheet(format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"{s}{attrs}{malformed}><is><t>x</t></is></c></row></sheetData></worksheet>"#
+        ))
+    }
+
+    /// The hostile cell the deadline test parses, plus a malformed attribute
+    /// last. Identical to it but for that one token.
+    pub(crate) fn attributes_with_a_malformed_last(count: usize) -> Vec<u8> {
+        hostile_attribute_cell(count, true)
+    }
+
+    /// The same with `s` present, so `get_attrs!` completes and exits early.
+    /// The control: it shows the early exit is what would hide a fixture that
+    /// had stopped being walked.
+    pub(crate) fn attributes_that_exit_before_the_end(count: usize) -> Vec<u8> {
+        attribute_cell_that_exits_early(count)
+    }
+
+    /// One cell carrying `count` distinct attributes. What the deadline parses.
+    pub(crate) fn many_distinct_attributes(count: usize) -> Vec<u8> {
+        hostile_attribute_cell(count, false)
+    }
+
+    /// `count` rows all claiming to be row 1, each with one cell.
+    ///
+    /// A well-formed sheet has one element per row. Repeating an index is the
+    /// cheapest way to make a small file describe a great deal of work, and it
+    /// is the shape that made the cell-count bound necessary in #282.
+    pub(crate) fn repeated_rows(count: usize) -> Vec<u8> {
+        let rows: String = (0..count)
+            .map(|_| {
+                r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#.to_string()
+            })
+            .collect();
+        xlsx_from_sheet(format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<dimension ref="A1:A1"/><sheetData>{rows}</sheetData></worksheet>"#
+        ))
     }
 
     /// Two cells in opposite corners of the sheet's full address space.
@@ -333,6 +436,223 @@ mod tests {
         let mut workbook =
             open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| e.to_string())?;
         bounded_worksheet_range(&mut workbook, "Sheet1", MAX_WORKBOOK_CELLS)
+    }
+
+    /// The row fixture really does drive `count` cells through the loop.
+    ///
+    /// `test_a_hostile_parse_terminates` asserts the parsed *shape* (one row),
+    /// and that shape is identical at every size -- so on its own it cannot
+    /// tell a fixture that streams 50,000 cells from one that streams a
+    /// handful and discards the rest. Without this, a calamine change that
+    /// stopped emitting a cell per repeated `<row>` would leave the deadline
+    /// guarding a fixture that had quietly stopped being hostile.
+    ///
+    /// The cell-count bound is the cheapest oracle for "how many cells
+    /// actually reached the loop": ask for one fewer than the fixture holds
+    /// and the read must refuse.
+    #[test]
+    fn test_the_row_fixture_streams_one_cell_per_row() {
+        let bytes = fixtures::repeated_rows(50_000);
+        let error = open_workbook_auto_from_rs(Cursor::new(bytes.clone()))
+            .map(|mut wb| bounded_worksheet_range(&mut wb, "Sheet1", 49_999))
+            .expect("fixture opens")
+            .expect_err("50,000 cells must exceed a 49,999-cell limit");
+        assert!(
+            error.contains("even though the rectangle"),
+            "must be refused on the cell count, which is what proves all 50,000 \
+             reached the streaming loop: {error}"
+        );
+        // And the exact count is accepted, so this pins 50,000 rather than
+        // merely "at least 50,000".
+        open_workbook_auto_from_rs(Cursor::new(bytes))
+            .map(|mut wb| bounded_worksheet_range(&mut wb, "Sheet1", 50_000))
+            .expect("fixture opens")
+            .expect("exactly 50,000 cells is within a 50,000-cell limit");
+    }
+
+    /// The attribute fixture really is walked to its end.
+    ///
+    /// The row fixture has a cell-count oracle; this is the attribute one, and
+    /// without it the whole attribute half rests on a doc comment. The only
+    /// assertion the hostile parse makes about that fixture is that it yields
+    /// one row -- true at 250,000 attributes and equally true at zero -- so if
+    /// calamine ever stopped walking them, the fixture would go green in
+    /// milliseconds and nothing would say it had stopped being hostile.
+    ///
+    /// The mechanism is `get_attrs!(c, b"r" => r, b"s" => s, b"t" => t)`, which
+    /// breaks as soon as every key it wants is found. `many_distinct_attributes`
+    /// omits `s`, so the search never completes and every attribute is visited.
+    /// That omission is load-bearing and looks like an oversight, so this
+    /// asserts it in both directions rather than only describing it: reaching a
+    /// malformed attribute at the end proves the walk, and adding `s` proves
+    /// the early exit is what would hide it.
+    #[test]
+    fn test_the_attribute_fixture_is_walked_to_its_end() {
+        const COUNT: usize = 5_000;
+        let error = read(fixtures::attributes_with_a_malformed_last(COUNT)).expect_err(
+            "a malformed attribute at the end must be reached, which is what \
+             proves calamine walks the whole list",
+        );
+        assert!(
+            error.contains("attribute key must be directly followed by"),
+            "must fail on the malformed attribute rather than anything else: {error}"
+        );
+
+        // Where it failed, not merely that it failed.
+        //
+        // Be exact about what each half proves, because it is tempting to
+        // credit the offset with more than it carries. Completeness comes from
+        // the error *kind*: `ExpectedEq` can only come from the trailing
+        // malformed token, so reaching it at all means the walk ran to the
+        // end. The offset adds a different thing -- which element it came
+        // from. `<row r="1">` is attribute-iterated too, and its attribute
+        // region is 7 bytes, so an offset in the tens of thousands rules out a
+        // future fixture edit raising the same error from the wrong element.
+        //
+        // The number is an index into *this element's* attribute region
+        // (`AttrError::ExpectedEq` carries an offset into
+        // `BytesStart::attributes_raw()`), not into the document. That is the
+        // right quantity here, but it is not a document position and the
+        // bound below is a lower one, not the full walk.
+        let position: usize = error
+            .split("position ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|digits| digits.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no byte position in {error}"));
+        assert!(
+            position > COUNT * 8,
+            "iteration stopped at byte {position}, too early to have walked \
+             {COUNT} attributes: {error}"
+        );
+
+        // The control: with `s` present, `get_attrs!` has found every key it
+        // wants and stops before the malformed token. That is the mechanism
+        // that would silently end the walk, and it is why
+        // `HOSTILE_CELL_CARRIES_S` is false.
+        read(fixtures::attributes_that_exit_before_the_end(COUNT))
+            .expect("with `s` present calamine stops before the malformed attribute");
+    }
+
+    /// A hostile parse terminates, and does so fast enough to rule out a
+    /// quadratic scan.
+    ///
+    /// This is the surviving complexity guard, and the sizes are chosen so
+    /// that it actually is one. A pairwise rescan costs n(n-1)/2 comparisons.
+    /// A `cargo test` profile sustains 5.5e7 to 1.3e8 of them a second here,
+    /// depending on the element type being compared -- a range rather than a
+    /// figure, because the rate varies by more than 2x across the shapes a
+    /// real regression could take:
+    ///
+    /// | case | linear, measured | quadratic pairs | implied |
+    /// |---|---|---|---|
+    /// | 250,000 attributes | 0.13 s | 3.1e10 | 240-570 s |
+    /// | 150,000 rows | ~1.03 s | 1.1e10 | 87-205 s |
+    ///
+    /// The row case was 50,000 and did not guard anything: 1.2e9 pairs is 10
+    /// to 23 seconds, which passes a 30-second deadline green. Break-even
+    /// there is somewhere near 65,000 to 87,000 rows, so 150,000 restores the
+    /// margin at a cost of about 0.7 s. This matters more than the attribute
+    /// case, because the row path is Finch's own `stream_bounded` loop rather
+    /// than calamine's: a running min/max replaced by a rescan of the
+    /// accumulated cells, or a duplicate-address check, is exactly the
+    /// regression that would land here.
+    ///
+    /// It stays a coarse instrument -- it cannot tell 2n from 5n -- but the
+    /// headroom runs the other way too: 29x on the rows and 231x on the
+    /// attributes, so a merely slower linear parser does not trip it, which is
+    /// the failure mode that killed the ratio test this replaced. Under CPU
+    /// oversubscription the *whole test* takes about 22 s, but the deadline
+    /// guards one parse at a time and fixture generation sits outside it: the
+    /// worst single parse measured 9.1 s against its 30 s, a 3.3x margin.
+    ///
+    /// **This is a debug-build guard only.** Optimised, the same shapes run at
+    /// 1.0e9 to 4.3e9 pair-comparisons a second, where a quadratic
+    /// 150,000-row rescan finishes in roughly 3 to 11 seconds and passes the
+    /// deadline green. Nothing here would catch a complexity regression in a
+    /// release-mode test run. (The repo runs these tests only on the dev
+    /// profile; the single `cargo test --release` job is scoped to
+    /// `cli::conversation::tests`.)
+    ///
+    /// That ratio test is worth one line of history, since the next person
+    /// here will reach for it. It was tried at two sizings and was flaky in
+    /// both: the first paired a 2.4 ms measurement against a 23 ms one and
+    /// broke under CPU contention, the second raised both sides and broke once
+    /// in six runs on an idle machine for reasons never established. See #306
+    /// for the measurements.
+    ///
+    /// **What this does not cover, stated plainly because the obvious reading
+    /// is wrong.** The quick-xml advisories behind #185 -- quadratic duplicate
+    /// attribute checking, and namespace-resolver allocation -- live in
+    /// `BytesStart::attributes()` and `NsReader`. calamine 0.36.1 calls
+    /// neither: it ships its own `attrs.rs` iterator, whose doc says it
+    /// replaces "quick_xml's own `Attributes` iterator, avoiding its ...
+    /// namespace bookkeeping", and `xlsx/mod.rs` uses `quick_xml::Reader`
+    /// rather than `NsReader`. `grep '\.attributes()'` over calamine returns
+    /// nothing. Those two defects are unreachable through this dependency
+    /// graph, so no fixture driven through `read` can detect them returning,
+    /// and an earlier version of this file claimed it could. Finch is not
+    /// exposed to them by architecture, not merely by version floor. If a
+    /// future calamine dropped `attrs.rs`, the attribute case would begin
+    /// covering the first advisory for real.
+    ///
+    /// The deadline is on a join rather than measured after the call: a
+    /// genuine non-termination never reaches a trailing assertion, and
+    /// `cargo test` has no per-test timeout. An earlier version asserted on
+    /// elapsed time after `read` returned and described itself as separating
+    /// "finished" from "did not"; it could only ever have caught "finished
+    /// slowly".
+    #[test]
+    fn test_a_hostile_parse_terminates() {
+        for (label, bytes) in [
+            ("attributes", fixtures::many_distinct_attributes(250_000)),
+            ("rows", fixtures::repeated_rows(150_000)),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(read(bytes).map(|range| range.rows().count()));
+            });
+            let rows = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(result) => {
+                    result.unwrap_or_else(|error| panic!("{label}: parse failed: {error}"))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("{label}: parse did not terminate within 30s")
+                }
+                // The sender is dropped by a panic unwinding out of the parse.
+                // Folding this into the timeout arm would report a crash as a
+                // hang and send the reader hunting for an infinite loop.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{label}: the parse thread panicked; its own message is above")
+                }
+            };
+            assert_eq!(rows, 1);
+        }
+    }
+
+    /// Concurrent parses of one hostile file all succeed.
+    ///
+    /// #185 asks for this. Worth being plain about its strength: the parse path
+    /// holds no shared state, so this passes trivially today and would catch a
+    /// future cache or interner only by luck of timing. It is kept because it
+    /// is cheap and because that future change is a real one, not because it is
+    /// strong coverage. Memory is not measured.
+    #[test]
+    fn test_concurrent_parses_of_one_hostile_file_all_succeed() {
+        let bytes = std::sync::Arc::new(fixtures::many_distinct_attributes(10_000));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let bytes = std::sync::Arc::clone(&bytes);
+                std::thread::spawn(move || read(bytes.as_ref().clone()).map(|r| r.rows().count()))
+            })
+            .collect();
+        for handle in handles {
+            let rows = handle
+                .join()
+                .expect("a concurrent parse panicked")
+                .expect("a concurrent parse failed");
+            assert_eq!(rows, 1);
+        }
     }
 
     /// The reported defect: two cells, hundreds of gigabytes.
