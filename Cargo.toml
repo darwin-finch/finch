@@ -162,6 +162,7 @@ capnpc = "0.24"
 
 [dev-dependencies]
 mockito = "1.2"
+semver = "1"
 tempfile = "3.8"
 tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot() for integration tests
 http-body-util = "0.1"  # axum::body::to_bytes helper

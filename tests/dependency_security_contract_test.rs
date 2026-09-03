@@ -25,18 +25,64 @@ fn dependency_version<'a>(
         })
 }
 
-fn capnp_series(version: &str) -> (u64, u64) {
-    let normalized = version.trim_start_matches(['=', '^', '~']);
-    let mut components = normalized.split('.');
-    let major = components
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| panic!("Cap'n Proto version '{version}' has no numeric major version"));
-    let minor = components
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| panic!("Cap'n Proto version '{version}' has no numeric minor version"));
-    (major, minor)
+fn assert_requirement_excludes_affected(dependency: &str, requirement: &str) {
+    let requirement = semver::VersionReq::parse(requirement).unwrap_or_else(|error| {
+        panic!("Cap'n Proto dependency {dependency} has invalid version requirement '{requirement}': {error}")
+    });
+    for affected in ["0.20.6", "0.24.0-alpha.1"] {
+        let affected = semver::Version::parse(affected).unwrap();
+        assert!(
+            !requirement.matches(&affected),
+            "Cap'n Proto dependency {dependency} requirement '{requirement}' permits affected version {affected} under RUSTSEC-2025-0143; require stable 0.24.0 or newer"
+        );
+    }
+}
+
+fn assert_resolved_capnp_family_is_fixed(manifest_path: &Path) {
+    let lock_path = manifest_path.with_file_name("Cargo.lock");
+    let lock_text = std::fs::read_to_string(&lock_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read resolved dependency security contract from {}: {error}",
+            lock_path.display()
+        )
+    });
+    let lock: toml::Value = lock_text.parse().unwrap_or_else(|error| {
+        panic!(
+            "failed to parse resolved dependency security contract from {}: {error}",
+            lock_path.display()
+        )
+    });
+    let fixed = semver::Version::new(0, 24, 0);
+    let mut found = std::collections::BTreeSet::new();
+    for package in lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock must contain a package array for dependency security auditing")
+    {
+        let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if !matches!(name, "capnp" | "capnp-rpc" | "capnpc") {
+            continue;
+        }
+        let raw_version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("Cargo.lock package {name} has no string version"));
+        let version = semver::Version::parse(raw_version).unwrap_or_else(|error| {
+            panic!("Cargo.lock package {name} has invalid version '{raw_version}': {error}")
+        });
+        assert!(
+            version >= fixed,
+            "Cargo.lock resolves {name} to vulnerable version {version} under RUSTSEC-2025-0143; resolve capnp, capnp-rpc, and capnpc to stable 0.24.0 or newer"
+        );
+        found.insert(name);
+    }
+    assert_eq!(
+        found,
+        std::collections::BTreeSet::from(["capnp", "capnp-rpc", "capnpc"]),
+        "Cargo.lock must resolve the complete Cap'n Proto dependency family; found {found:?}"
+    );
 }
 
 #[test]
@@ -83,9 +129,8 @@ fn test_capnp_dependency_family_excludes_rustsec_2025_0143() {
         "Cap'n Proto runtime and schema compiler must remain on one compatible release series: capnp={capnp}, capnpc={capnpc}"
     );
 
-    let (major, minor) = capnp_series(capnp);
-    assert!(
-        major > 0 || minor >= 24,
-        "Cap'n Proto {capnp} is vulnerable to RUSTSEC-2025-0143; declare capnp, capnp-rpc, and capnpc at version 0.24 or newer"
-    );
+    assert_requirement_excludes_affected("capnp", capnp);
+    assert_requirement_excludes_affected("capnp-rpc", capnp_rpc);
+    assert_requirement_excludes_affected("capnpc", capnpc);
+    assert_resolved_capnp_family_is_fixed(&manifest_path);
 }
