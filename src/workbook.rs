@@ -372,7 +372,7 @@ pub(crate) mod fixtures {
                 r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#.to_string()
             })
             .collect();
-        xlsx_from_sheet(&format!(
+        xlsx_from_sheet(format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <dimension ref="A1:A1"/><sheetData>{rows}</sheetData></worksheet>"#
