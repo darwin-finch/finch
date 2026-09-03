@@ -1,12 +1,36 @@
 # Finch
 
-Finch is an experimental terminal coding assistant written in Rust. It provides an interactive
-REPL, provider-backed chat, code and shell tools with an approval boundary, local persistence, an
-MCP client, a typed Lisp/Co-Forth runtime, and named shared Brain sessions.
+Finch is an experimental terminal agent runtime and coding assistant written in Rust. It provides
+an interactive REPL, provider-backed chat, code and shell tools with an approval boundary, local
+persistence, an MCP client, a typed Lisp/Co-Forth runtime, and named shared Brain sessions.
 
 Finch is under active development. This README describes the current `main` branch, not a promise
 that every configured provider, local model, or experimental collaboration path is production
 ready. See [Current limitations](#current-limitations) before relying on it.
+
+## Direction
+
+Finch aims to bring capabilities that are currently split across terminal coding agents and
+always-on personal-agent systems under one user-controlled runtime. The intended problem space
+includes tools built around Codex, Claude, Grok, Muse, and OpenCode, as well as OpenClaw-style
+assistants that can remain available on a spare computer. Finch is not yet a drop-in replacement
+for those products.
+
+The long-term design combines:
+
+- provider-independent coding and general agent workflows;
+- named, durable Brains that can survive frontend disconnects and machine restarts;
+- cloud providers, supported subscription authentication, local models, and explicit fallbacks;
+- repository skills and MCP integrations behind the same typed capability boundary;
+- semantic, accessible desktop automation instead of coordinate-driven GUI control;
+- local or hosted perception for voice, images, documents, and bounded text summaries;
+- attached terminal, editor, remote, and lightweight always-on frontends over one auditable event
+  history.
+
+This direction is incremental. Current interfaces are described below; planned work belongs in the
+[issue tracker](https://github.com/darwin-finch/finch/issues) and the dated
+[development roadmap](docs/ROADMAP.md). Configuration types and design documents are not evidence
+that an integration works end to end.
 
 ## Quick start from source
 

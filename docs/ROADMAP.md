@@ -1,114 +1,117 @@
-# Shammah Development Roadmap
+# Finch development roadmap
 
-**Last Updated:** 2026-02-22
-**Current Version:** v0.6.0
+**Last updated:** 2026-09-02
 
-This document is a forward-looking guide. Completed work is summarised in the "Current" section and detailed in CHANGELOG.md. Open issues are tracked at https://github.com/darwin-finch/finch/issues.
+This is a forward-looking guide to Finch's intended direction. It is not a release schedule or
+proof that a feature works. The [GitHub issue tracker](https://github.com/darwin-finch/finch/issues)
+is authoritative for work status and dependencies; the README, current source, and tests describe
+the checked-out revision. Historical release details belong in the changelog and archive.
 
----
+## Product direction
 
-## Current: v0.6.0 (Feb 2026)
+Finch is intended to become one user-controlled agent runtime spanning two workloads that are
+usually separate:
 
-Core infrastructure is complete and production-ready.
+1. A terminal coding agent in the problem space of Codex, Claude, Grok, Muse, and OpenCode.
+2. A persistent personal assistant in the problem space of OpenClaw-style systems, capable of
+   running on a spare computer with attached terminal, remote, voice, and automation frontends.
 
-**What shipped through v0.6.0:**
-- ONNX Runtime inference (CoreML on Apple Silicon, CPU elsewhere) — 6 model families
-- Multi-provider cloud fallback (Claude, GPT-4, Gemini, Grok, Mistral, Groq)
-- Unified `[[providers]]` config with transparent `[[teachers]]` migration
-- 6 tools — Read, Glob, Grep, WebFetch, Bash, Restart — with permission system
-- Auto-spawning daemon with OpenAI-compatible API and mDNS/Bonjour discovery
-- Professional TUI — scrollback, streaming, ghost text, plan mode, Ctrl+G/B feedback
-- IMPCPD iterative planning loop (`/plan <task>`) with 7 adversarial personas
-- Universal alignment prompt — JSON normalization across all 6 providers
-- Live LLM test suite (`./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`)
-- Private explicit feedback collection (automatic training and adapter loading disabled)
-- Progressive bootstrap — instant REPL startup, background model load
-- CLAUDE.md / FINCH.md context injection (matches Claude Code behaviour)
+The differentiating goal is not a longer provider list. Finch should preserve one durable,
+auditable workflow while changing models, frontends, and execution environments. Cloud APIs,
+supported subscription accounts, local models, skills, MCP tools, desktop applications, and remote
+Brains must all remain subject to explicit capability and privacy boundaries.
 
----
+## Current foundation
 
-## Near-term: v0.6.1 – v0.7.0
+The current source includes an interactive TUI and raw REPL, provider-backed chat, a bounded HTTP
+daemon, named Brain persistence, a typed Lisp/Co-Forth runtime, approval-aware tools, an MCP client,
+explicit feedback storage, and experimental ONNX Runtime and Candle model loaders.
 
-### [#1] LoRA adapter loading at ONNX runtime
-**Effort:** 40–80h  **Priority:** High
-Explicit feedback collection is complete, but training and adapter loading remain blocked.
-Any future implementation must first establish a supported native non-Python path through
-Issues #7 and #74. Historical options included:
-- Option A (simpler): Python training → merge weights → re-export ONNX model
-- Option B (preferred): Runtime adapter injection via weight merging in Rust
+Those components have uneven end-to-end maturity. In particular, configuration variants do not
+prove provider conformance, configured local models do not prove local routing, and implemented
+Brain primitives do not make unattended personal automation release-ready. See the README's
+current limitations and the issues below.
 
-Blocked on verified native feasibility and resource/privacy controls.
+## Immediate: reliable daily dogfooding
 
-### [#2] Mistral ONNX support
-**Effort:** 4–8h  **Priority:** Medium
-`onnx-community` has not yet published Mistral ONNX models. Once available, test with
-the existing `LlamaAdapter` (same architecture) and document.
+- Finish direct provider and supported subscription authentication without borrowing another
+  application's credentials ([#51](https://github.com/darwin-finch/finch/issues/51)).
+- Publish repeatable provider/model wire conformance rather than provider-family claims
+  ([#98](https://github.com/darwin-finch/finch/issues/98)).
+- Make provider/model selection durable per Brain and cheap to change
+  ([#217](https://github.com/darwin-finch/finch/issues/217)).
+- Complete accessible file-context selection
+  ([#310](https://github.com/darwin-finch/finch/issues/310)).
+- Replace legacy UUID-session output with named-Brain attach and resume UX
+  ([#314](https://github.com/darwin-finch/finch/issues/314)).
+- Stream truthful Brain progress and converge work on typed task handles
+  ([#57](https://github.com/darwin-finch/finch/issues/57),
+  [#60](https://github.com/darwin-finch/finch/issues/60)).
 
-### [#3] Additional model adapters
-**Effort:** 4–8h per model  **Priority:** Medium
-- CodeLlama (Meta) — code-specialized Llama variant
-- Yi (01.ai) — strong multilingual/code models
-- StarCoder (BigCode) — open code-focused model
+## Next: one extensible agent environment
 
-### [#5] Integration tests — daemon, LoRA, multi-provider, tool pass-through
-**Effort:** 8–16h  **Priority:** Medium
-Fill gaps in test coverage for cross-module workflows. The live test suite (`tests/live/`)
-covers provider parity; this issue tracks daemon lifecycle, tool pass-through, and
-multi-session concurrency tests.
+### Skills and tools
 
----
+Finch should discover and invoke repository Agent Skills with progressive disclosure, provenance,
+and no implicit authority escalation ([#213](https://github.com/darwin-finch/finch/issues/213)).
+Skills and MCP tools should use the same typed capability broker and appear in the same event and
+approval history.
 
-## Medium-term
+### Local models and explicit fallback
 
-### [#7] LoRA training memory efficiency
-Current Python-based training loads the full base model for adapter training, using 2×
-the model's memory. Optimise with gradient checkpointing, 4-bit quantization of the
-frozen base, or a pure-Rust training path (burn.rs / custom).
+Refresh the model catalog using dated artifact/runtime/hardware evidence
+([#74](https://github.com/darwin-finch/finch/issues/74)). Provider selection and fallback must be
+visible, preserve the actual model identity, and never silently turn a requested local operation
+into a cloud request. Hosted Muse support and its announced open-weight path are tracked separately
+([#317](https://github.com/darwin-finch/finch/issues/317)).
 
-### Additional model adapters (continued)
-Expand the ONNX model catalogue as onnx-community publishes more families. Phi-4,
-DeepSeek-R1-Distill, and Qwen-2.5-Coder are strong candidates.
+### Multimodal input and local perception
 
-### MCP plugin system
-The configuration layer and module structure (`src/tools/mcp/`) are in place. The
-connection layer needs a direct JSON-RPC 2.0 over STDIO implementation (the `rust-mcp-sdk`
-has private types that block the current approach). Once complete:
-- Tool discovery from MCP servers
-- Integration with `ToolExecutor`
-- Setup wizard section for managing MCP servers
-- REPL commands: `/mcp list`, `/mcp enable <name>`, `/mcp reload`
+Complete typed image attachment transport without replacing dropped media with text markers
+([#135](https://github.com/darwin-finch/finch/issues/135)). Investigate local speech recognition,
+OCR, image description, and bounded media-to-text summaries for both users and authorized agents
+([#318](https://github.com/darwin-finch/finch/issues/318)). Derived text must retain provenance and
+remain untrusted input.
 
----
+### Durable work and collaboration
 
-## Long-term
+Finish background BrainRuns and make their state reconnectable
+([#106](https://github.com/darwin-finch/finch/issues/106)). Add authenticated threaded channels and
+durable Brain-to-Brain messaging
+([#112](https://github.com/darwin-finch/finch/issues/112),
+[#175](https://github.com/darwin-finch/finch/issues/175)). Schedule only bounded,
+content-addressed work with explicit policy, ownership, retry, and cancellation semantics
+([#125](https://github.com/darwin-finch/finch/issues/125)).
 
-### Distributed inference
-Allow multiple machines to collaborate on a single inference request. Useful for
-splitting large models (70B+) across a home network.
+## Later: an accessible always-on personal assistant
 
-### Multi-machine model sharing
-Extend the mDNS daemon so any finch client on the LAN can transparently use the
-most powerful model available on the network — not just its own.
+The intended personal-agent deployment is a Finch daemon and named Brain running continuously on a
+user-controlled machine, with one or more lightweight frontends attached. It may receive explicit
+messages or scheduled work, use skills and local/cloud models, and interact with applications
+through semantic accessibility elements.
 
-### Quantization
-INT4/INT8 quantization for lower memory usage and faster inference on Apple Neural
-Engine. Trade-off: slight quality reduction for ~4× memory savings.
+The implementation must follow the
+[VM-native agent runtime plan](VM_NATIVE_AGENT_RUNTIME_PLAN.md): inspect and act by application,
+role, label, and stable domain identifiers wherever possible. Raw screen coordinates are an
+internal last resort, not a public user or model interface. Background, remote, and scheduled work
+starts without desktop mutation authority and requires a narrow unattended-action policy.
 
-### Multi-GPU / multi-ANE support
-Distribute tensor operations across all available compute (multiple GPUs on Linux,
-multi-ANE chips on future Apple Silicon).
+This phase also includes reproducible frontend self-hosting
+([#102](https://github.com/darwin-finch/finch/issues/102)), resource-aware work distribution, remote
+presence, emergency stop, and clear notification/audit UX. It is complete only when restart,
+replay, cancellation, revocation, and hostile-input cases pass at production boundaries.
 
----
+## Non-goals and evidence rules
 
-## Contribution Guidelines
+- Do not reproduce another product's private authentication or credential store.
+- Do not describe configuration, compilation, or a model download as end-to-end support.
+- Do not silently fall back across provider, account, local/cloud, or capability boundaries.
+- Do not grant a skill, model, remote peer, or scheduled run ambient machine authority.
+- Do not make automatic training or data contribution a consequence of feedback.
+- Do not call Finch production-ready until the relevant release and live acceptance gates pass.
 
-1. **Check GitHub Issues** before starting — claim or open an issue
-2. **Every bug fix must have a regression test** (see CLAUDE.md testing philosophy)
-3. **Follow the early-exit pattern** and Rust best practices documented in CLAUDE.md
-4. **Surgical git staging** — `git add <explicit paths>`, no `git add .`
-5. **Update CHANGELOG.md** and relevant docs with your change
+## Contributing
 
----
-
-**Maintained By:** Shammah contributors
-**Issue Tracker:** https://github.com/darwin-finch/finch/issues
+Check the issue tracker and [contribution guide](../CONTRIBUTING.md) before starting. Every bug fix
+requires a regression test at the production boundary where the failure occurred. Design documents
+describe intent; dated tests and live acceptance evidence establish behavior.
