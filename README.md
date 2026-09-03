@@ -27,6 +27,17 @@ The long-term design combines:
 - attached terminal, editor, remote, and lightweight always-on frontends over one auditable event
   history.
 
+### Why Finch
+
+| Differentiator | What it is intended to provide | Current status |
+| --- | --- | --- |
+| Typed Lisp and Co-Forth programs | Agents can express multi-step computation and effects as programs that the runtime can validate and execute, instead of relying only on opaque one-tool-at-a-time calls. | The typed runtimes and direct `--lisp`, `--forth`, and `--exec` interfaces exist; provider wire conformance and broader agent use are still evolving. |
+| Durable named Brains | One named conversation, event history, and persistent typed VM can survive frontend disconnects and daemon restarts. | Implemented foundations with experimental reconnect, background-work, and collaboration workflows. |
+| One capability boundary | Code tools, MCP tools, future skills, remote peers, and desktop automation are meant to share typed authority, approval, audit, and revocation rules. | Tool approval and MCP client paths exist; skills and wider automation integration remain planned work. |
+| Provider and account portability | Use cloud APIs, supported subscriptions, remote Finch nodes, or local models without changing the surrounding workflow or concealing which backend ran it. | Multiple profiles exist; subscription support, model-level conformance, and explicit fallback behavior remain active work. |
+| Local models and perception | Keep suitable generation, speech transcription, OCR, image description, and context compression on user-controlled hardware, with explicit cloud fallback when requested. | ONNX Runtime and Candle loaders exist experimentally; the compatible model matrix and local media pipeline are not yet established. |
+| Accessibility-native automation | Operate applications through semantic roles, labels, and domain identifiers so automation remains usable and auditable without pixel coordinates. | A design invariant and long-term integration target, not a complete personal-assistant feature today. |
+
 This direction is incremental. Current interfaces are described below; planned work belongs in the
 [issue tracker](https://github.com/darwin-finch/finch/issues) and the dated
 [development roadmap](docs/ROADMAP.md). Configuration types and design documents are not evidence
