@@ -27,12 +27,13 @@ public OpenAI Codex source at commit
 Finch records that pin as
 `openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4`.
 Protocol drift fails closed; it is not silently treated as Platform behavior.
-Catalog discovery separately sends `client_version=0.151.0`, the released
-Codex compatibility version associated with that audited source revision. It
-must not use Finch's unrelated package version. Updating either compatibility
-pin requires auditing the newer public Codex catalog and Responses-Lite
-contracts, updating both pins together, and rerunning the focused tests plus
-the explicit live acceptance test.
+Catalog discovery sends `client_version=0.151.0`, and both catalog and
+inference requests send `version: 0.151.0`. This is the released Codex
+compatibility version associated with that audited source revision, not
+Finch's application version or a claim that Finch is Codex. Updating either
+compatibility pin requires auditing the newer public Codex catalog and
+Responses-Lite contracts, updating both pins together, and rerunning the
+focused tests plus the explicit live acceptance test.
 
 ## Identity and routing
 
@@ -46,13 +47,15 @@ The production origin is exactly `https://chatgpt.com` with these routes:
 - `POST /backend-api/codex/responses`
 
 Requests use bearer authorization, `ChatGPT-Account-ID`, honest
-`originator: finch`, Finch's version, and the pinned protocol revision. Both
-routes use the bounded static client identifier
+`originator: finch`, the pinned compatibility `version`, and the pinned
+protocol revision. Application identity remains separate: both routes use the
+bounded static client identifier
 `finch/<version> (+https://darwin-finch.github.io/)` as their
-`User-Agent`; it contains no username, hostname, Brain/session, account, or
-credential identifier. This provides honest client identification and project
-discoverability only; it does not guarantee that OpenAI exposes telemetry or
-metrics to Finch. Sol requests additionally send
+`User-Agent`, where `<version>` is Finch's package version. It contains no
+username, hostname, Brain/session, account, or credential identifier. This
+provides honest client identification and project discoverability only; it
+does not guarantee that OpenAI exposes telemetry or metrics to Finch. Sol
+requests additionally send
 `x-openai-internal-codex-responses-lite: true`.
 Redirects, custom endpoints, userinfo, fragments, FedRAMP, Platform fallback,
 and model fallback are rejected.
@@ -109,15 +112,27 @@ stream work.
 The SSE parser bounds each line and event and the total response. It validates
 standard `event:` names against JSON event types, requires strictly increasing
 sequence numbers, accumulates completed output items by contiguous output
-index, and reconciles them with any terminal output. Actual-model provenance
-must remain compatible and unchanged. Unknown fields/events, malformed tool
-arguments, missing completion, duplicate terminal markers, post-terminal data,
-partial EOF, idle timeout, receiver drop, and payload-limit violations fail
-visibly before terminal chunks are published.
+index, and reconciles text deltas, text-completion events, completed items, and
+any terminal output. Actual-model provenance
+must remain compatible and unchanged; the audited `-safety-routed` provenance
+suffix is accepted while header and event values must still agree. Bounded
+`safety_buffering` event metadata is validated and intentionally not projected.
+Executable tool output produces a `tool_use` stop reason. An explicit
+`end_turn` value that contradicts the presence of executable tool output fails
+closed. Finch currently has no provider-neutral
+follow-up signal for a text-only response, so that combination fails visibly
+instead of being silently finalized. Unknown fields/events, malformed tool
+arguments, a terminal marker before completion, missing completion, partial EOF
+before completion, idle timeout, receiver drop, and payload-limit violations
+fail visibly before terminal chunks are published. A validated
+`response.completed` event is authoritative and returns immediately, matching
+the pinned Codex client; unread suffix data, including the optional `[DONE]`
+marker, is discarded independently of HTTP chunk boundaries.
 
-Non-success bodies are consumed only to a small bound and discarded. A
-Responses-Lite rejection retains a typed HTTP status and a compatibility or
-entitlement hint, never the response body. Tokens,
+Non-success bodies are never consumed after their status is known; the response
+is dropped immediately so a hostile or broken body cannot delay the typed
+result. A Responses-Lite rejection retains a typed HTTP status and a
+compatibility or entitlement hint, never the response body. Tokens,
 account identifiers, request bodies, image data, tool arguments, reasoning
 continuations, and response bodies are never placed in provider errors.
 
@@ -125,20 +140,21 @@ Proactive refresh is generation-bound and serialized. A 401 before the stream
 starts permits one shared refresh, a fresh account catalog check, and one retry.
 There is no retry after successful stream headers or any response event.
 
-## Opt-in live acceptance
+## Live acceptance
 
-Live auth and inference are never part of normal tests. After independent
-security review, a user who has explicitly completed Finch's own device login
-can run:
+Live auth and inference are never part of automated tests. After building the
+reviewed branch, a user who has explicitly completed Finch's own device login
+can exercise the production Finch boundary with a disposable Brain name:
 
 ```sh
-FINCH_LIVE_CHATGPT_ACCEPTANCE=1 cargo test --lib \
-  providers::chatgpt_subscription::tests::live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in \
-  -- --ignored --exact
+cargo build --bin finch
+target/debug/finch --brain chatgpt-subscription-live-acceptance
 ```
 
-The test selects a Finch-owned named credential and asserts non-empty Sol model
-provenance. It does not print tokens or response bodies. Until that opt-in test
-is run, live-service acceptance—including current account entitlement and
-server-side compatibility with the pinned revision—remains intentionally
-unverified.
+This uses Finch's normal credential selection and provider path; it does not
+copy credentials into a test HOME. Enter a short prompt and confirm a response
+whose displayed provider/model provenance is the selected ChatGPT subscription
+profile. Manual evidence supplements but never replaces the deterministic
+HTTP/SSE regression suite. Until this production-boundary check is run,
+live-service acceptance—including current account entitlement and server-side
+compatibility with the pinned revision—remains intentionally unverified.

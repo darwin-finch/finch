@@ -51,6 +51,7 @@ const RESPONSES_PATH: &str = "/backend-api/codex/responses";
 const MODELS_PATH: &str = "/backend-api/codex/models";
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
@@ -149,6 +150,31 @@ impl fmt::Display for SubscriptionResponseRejected {
 }
 
 impl std::error::Error for SubscriptionResponseRejected {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionUnexpectedContentType {
+    Missing,
+    Json,
+    Html,
+    Other,
+}
+
+impl fmt::Display for SubscriptionUnexpectedContentType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let media_type = match self {
+            Self::Missing => "a missing Content-Type",
+            Self::Json => "application/json",
+            Self::Html => "text/html",
+            Self::Other => "an unexpected Content-Type",
+        };
+        write!(
+            formatter,
+            "ChatGPT subscription returned HTTP success with {media_type} instead of text/event-stream"
+        )
+    }
+}
+
+impl std::error::Error for SubscriptionUnexpectedContentType {}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChatGptCredentialLease {
@@ -451,7 +477,7 @@ impl ChatGptSubscriptionProvider {
             .header("ChatGPT-Account-ID", &lease.account)
             .header("originator", "finch")
             .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
-            .header("version", env!("CARGO_PKG_VERSION"))
+            .header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .header(
                 "x-finch-chatgpt-protocol",
                 CHATGPT_INFERENCE_PROTOCOL_REVISION,
@@ -475,14 +501,16 @@ impl ChatGptSubscriptionProvider {
             return Ok(entry.catalog.clone());
         }
         let status = response.status();
-        let response_etag = bounded_header(response.headers(), reqwest::header::ETAG.as_str())?;
-        let body = read_bounded(response, MAX_CATALOG_BYTES, cancel).await?;
         if status == StatusCode::UNAUTHORIZED {
+            drop(response);
             return Err(SubscriptionUnauthorized.into());
         }
         if !status.is_success() {
+            drop(response);
             bail!("ChatGPT subscription model discovery failed (HTTP {status})");
         }
+        let response_etag = bounded_header(response.headers(), reqwest::header::ETAG.as_str())?;
+        let body = read_bounded(response, MAX_CATALOG_BYTES, cancel).await?;
         let catalog = parse_catalog(&body)?;
         *cache = Some(CatalogCache {
             generation: lease.generation.clone(),
@@ -535,7 +563,7 @@ impl ChatGptSubscriptionProvider {
                     .header("ChatGPT-Account-ID", &lease.account)
                     .header("originator", "finch")
                     .header(reqwest::header::USER_AGENT, FINCH_CHATGPT_USER_AGENT)
-                    .header("version", env!("CARGO_PKG_VERSION"))
+                    .header("version", CHATGPT_CATALOG_CLIENT_VERSION)
                     .header("x-finch-chatgpt-protocol", CHATGPT_INFERENCE_PROTOCOL_REVISION)
                     .header("x-openai-internal-codex-responses-lite", "true")
                     .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -544,7 +572,7 @@ impl ChatGptSubscriptionProvider {
                     .send() => response.context("Failed to start ChatGPT subscription response")?,
             };
             if response.status() == StatusCode::UNAUTHORIZED && !unauthorized_retry_used {
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
+                drop(response);
                 lease = self
                     .source
                     .refresh_after_unauthorized(&lease.generation, &cancel)
@@ -562,15 +590,21 @@ impl ChatGptSubscriptionProvider {
             }
             if !response.status().is_success() {
                 let status = response.status();
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
+                drop(response);
                 return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
                 bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?
                     .unwrap_or_default();
-            if !content_type.starts_with("text/event-stream") {
-                let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
-                bail!("ChatGPT subscription response was not an event stream");
+            // The ChatGPT Codex backend currently omits Content-Type on a
+            // successful streaming response. A missing header is not enough
+            // to reject the response: consume_sse remains the authoritative,
+            // bounded validator for the wire body. Explicitly contradictory
+            // media types are still rejected before parsing.
+            if !content_type.is_empty() && !content_type.starts_with("text/event-stream") {
+                let classification = classify_unexpected_content_type(&content_type);
+                drop(response);
+                return Err(classification.into());
             }
             return Ok(response);
         }
@@ -587,22 +621,23 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let request = request.into_request_for(self)?;
         let expected_model = request.model.clone();
         let allowed_tools = advertised_tool_names(&request);
-        let response = self
-            .start_response(request, CancellationToken::new())
-            .await?;
-        let completed = consume_sse(
-            response,
-            None,
-            CancellationToken::new(),
-            expected_model,
-            allowed_tools,
-        )
-        .await?;
+        let cancel = request.cancellation_token.clone().unwrap_or_default();
+        let response = self.start_response(request, cancel.clone()).await?;
+        let completed = consume_sse(response, None, cancel, expected_model, allowed_tools).await?;
+        let stop_reason = if completed
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
         Ok(ProviderResponse {
             id: completed.id,
             model: completed.model,
             content: completed.blocks,
-            stop_reason: Some("end_turn".to_string()),
+            stop_reason: Some(stop_reason.to_string()),
             role: "assistant".to_string(),
             provider: "chatgpt_subscription".to_string(),
             usage: match (completed.input_tokens, completed.output_tokens) {
@@ -634,6 +669,7 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(async move {
             let failure = sender.clone();
+            let failure_cancel = cancel.clone();
             if let Err(error) = consume_sse(
                 response,
                 Some(sender),
@@ -643,7 +679,21 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             )
             .await
             {
-                let _ = failure.send(Err(anyhow::anyhow!(error.to_string()))).await;
+                let diagnostic = Err(anyhow::anyhow!(error.to_string()));
+                match failure.try_send(diagnostic) {
+                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(diagnostic)) => {
+                        // `consume_sse` has returned, so its HTTP response is already dropped.
+                        // Preserve a protocol failure until the live consumer makes room, but
+                        // never retain this task after caller cancellation or receiver drop.
+                        tokio::select! {
+                            biased;
+                            _ = failure_cancel.cancelled() => {}
+                            _ = failure.closed() => {}
+                            _ = failure.send(diagnostic) => {}
+                        }
+                    }
+                }
             }
         });
         Ok(receiver)
@@ -840,6 +890,7 @@ fn responses_lite_request(request: &ProviderRequest, effort: ReasoningEffort) ->
         "reasoning": {"effort":effort.as_str(),"context":"all_turns"},
         "store": false,
         "stream": true,
+        "stream_options": {"include_obfuscation": false},
         "include": ["reasoning.encrypted_content"]
     });
     Ok(body)
@@ -862,9 +913,13 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
         bail!("ChatGPT subscription request advertised too many tools");
     }
     let mut names = BTreeSet::new();
+    let mut wire_names = BTreeSet::new();
     let mut functions = Vec::with_capacity(tools.len());
     for tool in tools {
         validate_identifier(&tool.name, 128, "tool name")?;
+        if is_chatgpt_agent_wire_alias(&tool.name) {
+            bail!("ChatGPT subscription request used a reserved wire tool name");
+        }
         validate_bounded_text(
             &tool.description,
             MAX_TOOL_ARGUMENT_BYTES,
@@ -873,9 +928,14 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
         if !names.insert(tool.name.clone()) {
             bail!("ChatGPT subscription request repeated a tool name");
         }
+        let wire_name = chatgpt_wire_tool_name(&tool.name);
+        validate_identifier(wire_name, 128, "ChatGPT wire tool name")?;
+        if !wire_names.insert(wire_name.to_string()) {
+            bail!("ChatGPT subscription request repeated a wire tool name");
+        }
         functions.push(json!({
             "type":"function",
-            "name":tool.name,
+            "name":wire_name,
             "description":tool.description,
             "strict":false,
             "parameters": {
@@ -891,6 +951,47 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
     } else {
         vec![json!({"type":"namespace","name":"functions","description":"","tools":functions})]
     })
+}
+
+fn chatgpt_wire_tool_name(name: &str) -> &str {
+    match name {
+        "spawn_agent" => "finch_spawn_agent",
+        "await_agent" => "finch_await_agent",
+        "poll_agent" => "finch_poll_agent",
+        "cancel_agent" => "finch_cancel_agent",
+        _ => name,
+    }
+}
+
+fn is_chatgpt_agent_wire_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "finch_spawn_agent" | "finch_await_agent" | "finch_poll_agent" | "finch_cancel_agent"
+    )
+}
+
+fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
+    match name {
+        "finch_spawn_agent" => Some("spawn_agent"),
+        "finch_await_agent" => Some("await_agent"),
+        "finch_poll_agent" => Some("poll_agent"),
+        "finch_cancel_agent" => Some("cancel_agent"),
+        // These names have a distinct first-party Codex collaboration contract.
+        "spawn_agent" | "await_agent" | "poll_agent" | "cancel_agent" => None,
+        _ => Some(name),
+    }
+}
+
+fn chatgpt_wire_namespace_is_valid(name: &str, namespace: Option<&str>) -> bool {
+    match namespace {
+        // Tools in this dialect are advertised inside the `functions`
+        // namespace object. Responses-Lite may omit the field on a returned
+        // custom function call; omission therefore denotes that advertised
+        // namespace, not an arbitrary provider-native namespace.
+        None | Some("functions") => true,
+        Some("collaboration") => is_chatgpt_agent_wire_alias(name),
+        Some(_) => false,
+    }
 }
 
 fn advertised_tool_names(request: &ProviderRequest) -> HashSet<String> {
@@ -973,7 +1074,7 @@ fn map_message(
                     .context("Failed to serialize ChatGPT function arguments")?;
                 validate_bounded_text(&arguments, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
                 input.push(json!({
-                    "type":"function_call","call_id":id,"name":name,
+                    "type":"function_call","call_id":id,"name":chatgpt_wire_tool_name(name),
                     "namespace":"functions","arguments":arguments
                 }));
             }
@@ -1104,6 +1205,8 @@ struct Allowance {
 #[derive(Default)]
 struct StreamAccumulator {
     output_items: BTreeMap<u64, Value>,
+    text_deltas: BTreeMap<(u64, u64), String>,
+    text_done: BTreeMap<(u64, u64), String>,
     actual_model: Option<String>,
 }
 
@@ -1144,8 +1247,9 @@ async fn consume_sse(
     }
     let mut done_seen = false;
     let mut last_sequence = None;
-    loop {
+    'stream: loop {
         let next = tokio::select! {
+            biased;
             _ = cancel.cancelled() => bail!("ChatGPT subscription stream was cancelled"),
             _ = async { if let Some(sender) = sender.as_ref() { sender.closed().await } else { futures::future::pending().await } } => return Err(anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")),
             next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()) => next.context("ChatGPT subscription stream timed out")?,
@@ -1214,57 +1318,72 @@ async fn consume_sse(
                 &mut accumulator,
             )? {
                 terminal = Some(completed);
+                break 'stream;
             }
             if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
-                sender
-                    .send(Ok(StreamChunk::TextDelta(delta)))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")
-                    })?;
+                send_stream_chunk(sender, &cancel, StreamChunk::TextDelta(delta)).await?;
             }
             enforce_sse_remainder_bounds(&buffer)?;
         }
     }
-    if !buffer.iter().all(u8::is_ascii_whitespace) {
+    if terminal.is_none() && !buffer.iter().all(u8::is_ascii_whitespace) {
         bail!("ChatGPT subscription stream ended with a partial event");
+    }
+    if cancel.is_cancelled() {
+        bail!("ChatGPT subscription stream was cancelled");
     }
     let mut completed =
         terminal.context("ChatGPT subscription stream ended before response.completed")?;
     completed.allowance = completed.allowance.or(header_allowance);
     if let Some(sender) = sender {
-        sender
-            .send(Ok(StreamChunk::ResponseMetadata {
+        send_stream_chunk(
+            &sender,
+            &cancel,
+            StreamChunk::ResponseMetadata {
                 model: completed.model.clone(),
-            }))
-            .await
-            .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+            },
+        )
+        .await?;
         if let Some(input_tokens) = completed.input_tokens {
-            sender
-                .send(Ok(StreamChunk::Usage {
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::Usage {
                     input_tokens,
                     output_tokens: completed.output_tokens.unwrap_or_default(),
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+                },
+            )
+            .await?;
         }
         if let Some(allowance) = completed.allowance.as_ref() {
-            sender
-                .send(Ok(StreamChunk::Allowance {
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::Allowance {
                     primary_used_percent: allowance.primary_used_percent,
                     secondary_used_percent: allowance.secondary_used_percent,
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+                },
+            )
+            .await?;
         }
         for block in completed.blocks.iter().cloned() {
-            sender
-                .send(Ok(StreamChunk::ContentBlockComplete(block)))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+            send_stream_chunk(&sender, &cancel, StreamChunk::ContentBlockComplete(block)).await?;
         }
     }
     Ok(completed)
+}
+
+async fn send_stream_chunk(
+    sender: &mpsc::Sender<Result<StreamChunk>>,
+    cancel: &CancellationToken,
+    chunk: StreamChunk,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("ChatGPT subscription stream was cancelled"),
+        result = sender.send(Ok(chunk)) => result
+            .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")),
+    }
 }
 
 fn parse_event(
@@ -1283,7 +1402,7 @@ fn parse_event(
         .context("ChatGPT subscription stream event omitted type")?;
     match kind {
         "response.created" | "response.in_progress" => {
-            exact_keys(object, &["type", "sequence_number", "response", "headers"])?;
+            exact_event_keys(object, &["type", "sequence_number", "response", "headers"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1294,7 +1413,7 @@ fn parse_event(
             Ok(None)
         }
         "response.metadata" | "codex.response.metadata" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1325,13 +1444,16 @@ fn parse_event(
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
-            exact_keys(object, &["type", "sequence_number", "output_index", "item"])?;
+            exact_event_keys(object, &["type", "sequence_number", "output_index", "item"])?;
             required_sequence(object)?;
             let output_index = required_index(object, "output_index")?;
             let item = object
                 .get("item")
                 .context("ChatGPT output item event omitted item")?;
             validate_output_item_shape(item)?;
+            if kind == "response.output_item.done" {
+                validate_streamed_text_for_item(accumulator, output_index, item)?;
+            }
             if kind == "response.output_item.done"
                 && accumulator
                     .output_items
@@ -1343,7 +1465,7 @@ fn parse_event(
             Ok(None)
         }
         "response.content_part.added" | "response.content_part.done" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1366,10 +1488,39 @@ fn parse_event(
         }
         "response.output_text.delta" => {
             validate_text_event(object, "delta", true)?;
+            let key = text_event_key(object)?;
+            let delta = object
+                .get("delta")
+                .and_then(Value::as_str)
+                .context("ChatGPT stream delta omitted its text")?;
+            let accumulated = accumulator.text_deltas.entry(key).or_default();
+            if accumulated.len().saturating_add(delta.len()) > MAX_RESPONSE_BYTES {
+                bail!("ChatGPT subscription streamed text exceeded the size limit");
+            }
+            accumulated.push_str(delta);
             Ok(None)
         }
         "response.output_text.done" => {
             validate_text_event(object, "text", true)?;
+            let key = text_event_key(object)?;
+            let text = object
+                .get("text")
+                .and_then(Value::as_str)
+                .context("ChatGPT completed text event omitted its text")?;
+            if accumulator
+                .text_done
+                .insert(key.clone(), text.to_string())
+                .is_some()
+            {
+                bail!("ChatGPT subscription repeated a completed text event");
+            }
+            if accumulator
+                .text_deltas
+                .get(&key)
+                .is_some_and(|deltas| deltas != text)
+            {
+                bail!("ChatGPT completed text did not match streamed text deltas");
+            }
             Ok(None)
         }
         "response.function_call_arguments.delta" => {
@@ -1393,7 +1544,7 @@ fn parse_event(
             Ok(None)
         }
         "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1415,7 +1566,7 @@ fn parse_event(
             Ok(None)
         }
         "response.completed" => {
-            exact_keys(object, &["type", "sequence_number", "response"])?;
+            exact_event_keys(object, &["type", "sequence_number", "response"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1452,6 +1603,12 @@ fn observe_response_model(
     expected_model: &str,
     accumulator: &mut StreamAccumulator,
 ) -> Result<()> {
+    if let Some(model) = response.get("model") {
+        let model = model
+            .as_str()
+            .context("ChatGPT response model field was invalid")?;
+        accumulator.observe_model(model, expected_model)?;
+    }
     if let Some(headers) = response.get("headers") {
         let headers = headers
             .as_object()
@@ -1524,7 +1681,7 @@ fn validate_text_event(
     if has_content_index {
         keys.extend(["content_index", "logprobs"]);
     }
-    exact_keys(object, &keys)?;
+    exact_event_keys(object, &keys)?;
     required_sequence(object)?;
     required_identifier(object, "item_id", 256)?;
     required_index(object, "output_index")?;
@@ -1538,12 +1695,82 @@ fn validate_text_event(
     validate_bounded_text(value, MAX_TOOL_ARGUMENT_BYTES, "stream delta")
 }
 
+fn text_event_key(object: &Map<String, Value>) -> Result<(u64, u64)> {
+    Ok((
+        required_index(object, "output_index")?,
+        required_index(object, "content_index")?,
+    ))
+}
+
+fn validate_streamed_text_for_item(
+    accumulator: &StreamAccumulator,
+    output_index: u64,
+    item: &Value,
+) -> Result<()> {
+    let Some(content) = item
+        .as_object()
+        .filter(|object| object.get("type").and_then(Value::as_str) == Some("message"))
+        .and_then(|object| object.get("content"))
+        .and_then(Value::as_array)
+    else {
+        if accumulator
+            .text_deltas
+            .keys()
+            .chain(accumulator.text_done.keys())
+            .any(|(index, _)| *index == output_index)
+        {
+            bail!("ChatGPT streamed text referred to a non-message output item");
+        }
+        return Ok(());
+    };
+    for ((index, content_index), deltas) in &accumulator.text_deltas {
+        if *index != output_index {
+            continue;
+        }
+        let terminal = content
+            .get(*content_index as usize)
+            .and_then(Value::as_object)
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .context("ChatGPT streamed text omitted its completed content part")?;
+        if terminal != deltas {
+            bail!("ChatGPT completed output item did not match streamed text deltas");
+        }
+        if accumulator
+            .text_done
+            .get(&(*index, *content_index))
+            .is_some_and(|done| done != terminal)
+        {
+            bail!("ChatGPT completed output item did not match its text completion event");
+        }
+    }
+    for ((index, content_index), done) in &accumulator.text_done {
+        if *index != output_index
+            || accumulator
+                .text_deltas
+                .contains_key(&(*index, *content_index))
+        {
+            continue;
+        }
+        let terminal = content
+            .get(*content_index as usize)
+            .and_then(Value::as_object)
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .context("ChatGPT completed text event omitted its completed content part")?;
+        if terminal != done {
+            bail!("ChatGPT completed output item did not match its text completion event");
+        }
+    }
+    Ok(())
+}
+
 fn validate_reasoning_text_event(
     object: &Map<String, Value>,
     field: &str,
     index_field: &str,
 ) -> Result<()> {
-    exact_keys(
+    exact_event_keys(
         object,
         &[
             "type",
@@ -1604,8 +1831,39 @@ fn parse_completed(
             "headers",
             "usage_metadata",
             "end_turn",
+            "background",
+            "completed_at",
+            "conversation",
+            "max_tool_calls",
+            "moderation",
+            "prompt",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "top_logprobs",
+            "frequency_penalty",
+            "presence_penalty",
+            // Audited passive accounting extension observed on the live
+            // Responses-Lite terminal object. It cannot cause execution and
+            // is bounded below before being ignored.
+            "tool_usage",
         ],
     )?;
+    if let Some(tool_usage) = response.get("tool_usage") {
+        if serde_json::to_vec(tool_usage)
+            .context("ChatGPT terminal response tool usage metadata was invalid")?
+            .len()
+            > MAX_TOOL_ARGUMENT_BYTES
+        {
+            bail!("ChatGPT terminal response tool usage metadata exceeded the size limit");
+        }
+    }
+    validate_documented_response_metadata(response)?;
+    if response
+        .get("background")
+        .is_some_and(|background| background.as_bool() != Some(false))
+    {
+        bail!("ChatGPT terminal response background state was invalid");
+    }
     if response
         .get("status")
         .is_some_and(|status| status.as_str() != Some("completed"))
@@ -1635,15 +1893,33 @@ fn parse_completed(
         bail!("ChatGPT completion returned too many output items");
     }
     if let Some(output) = terminal_output {
-        if !accumulator.output_items.is_empty()
-            && (output.len() != accumulator.output_items.len()
-                || output.iter().enumerate().any(|(index, item)| {
-                    accumulator.output_items.get(&(index as u64)) != Some(item)
-                }))
-        {
-            bail!("ChatGPT terminal output did not match streamed output items");
+        if output.is_empty() && !accumulator.output_items.is_empty() {
+            // Responses-Lite may use response.completed as a compact terminal
+            // marker and leave its output array empty after delivering the
+            // authoritative completed items through output_item.done events.
+            // Those items have already passed the same strict parser below;
+            // retaining them avoids turning a valid response into an empty one.
+        } else if !accumulator.output_items.is_empty() {
+            // A completed response is the provider's authoritative snapshot.  The
+            // preceding output_item.done events are useful for progressive UI, but
+            // OpenAI may consolidate, replace, or enrich those snapshots before
+            // response.completed (notably opaque reasoning continuations).  Fully
+            // validate both representations and require identical user-visible
+            // text and executable tool calls. Opaque reasoning continuations may
+            // legitimately be replaced, so retain their terminal snapshot.
+            let streamed = project_output_items(accumulator.output_items.values(), allowed_tools)?;
+            let terminal = project_output_items(output.iter(), allowed_tools)?;
+            if observable_blocks(&streamed) != observable_blocks(&terminal) {
+                bail!(
+                    "ChatGPT terminal output did not match streamed output items (streamed {}; terminal {})",
+                    observable_shape(&streamed),
+                    observable_shape(&terminal)
+                );
+            }
+        } else {
+            project_output_items(output.iter(), allowed_tools)?;
         }
-        if accumulator.output_items.is_empty() {
+        if !output.is_empty() || accumulator.output_items.is_empty() {
             accumulator.output_items = output
                 .iter()
                 .cloned()
@@ -1665,7 +1941,36 @@ fn parse_completed(
     for item in accumulator.output_items.values() {
         parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
     }
+    for (output_index, item) in &accumulator.output_items {
+        validate_streamed_text_for_item(accumulator, *output_index, item)?;
+    }
+    if accumulator
+        .text_deltas
+        .keys()
+        .chain(accumulator.text_done.keys())
+        .any(|(output_index, _)| !accumulator.output_items.contains_key(output_index))
+    {
+        bail!("ChatGPT streamed text referred to a missing completed output item");
+    }
     let (input_tokens, output_tokens) = parse_usage(response.get("usage"))?;
+    let end_turn = response
+        .get("end_turn")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .context("ChatGPT terminal response end_turn was invalid")
+        })
+        .transpose()?;
+    let has_tool_use = blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    if end_turn == Some(false) && !has_tool_use {
+        bail!("ChatGPT requested a follow-up response without an executable tool call");
+    }
+    if end_turn == Some(true) && has_tool_use {
+        bail!("ChatGPT ended a response that still contained an executable tool call");
+    }
     Ok(CompletedResponse {
         id,
         model: response_model,
@@ -1674,6 +1979,50 @@ fn parse_completed(
         output_tokens,
         allowance: None,
     })
+}
+
+fn project_output_items<'a>(
+    items: impl IntoIterator<Item = &'a Value>,
+    allowed_tools: &HashSet<String>,
+) -> Result<Vec<ContentBlock>> {
+    let mut blocks = Vec::new();
+    let mut call_ids = HashSet::new();
+    for item in items {
+        parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
+    }
+    Ok(blocks)
+}
+
+fn observable_shape(blocks: &[ContentBlock]) -> String {
+    observable_blocks(blocks)
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => format!("text:{}", text.len()),
+            ContentBlock::ToolUse { name, .. } => format!("tool:{name}"),
+            ContentBlock::ToolResult { .. } => "tool-result".to_string(),
+            ContentBlock::Image { .. } => "image".to_string(),
+            ContentBlock::OpaqueReasoning { .. } => "reasoning".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn observable_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+    let mut observable = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match block {
+            ContentBlock::OpaqueReasoning { .. } => {}
+            ContentBlock::Text { text } => {
+                if let Some(ContentBlock::Text { text: previous }) = observable.last_mut() {
+                    previous.push_str(text);
+                } else {
+                    observable.push(block.clone());
+                }
+            }
+            _ => observable.push(block.clone()),
+        }
+    }
+    observable
 }
 
 fn parse_output_item(
@@ -1721,7 +2070,7 @@ fn parse_output_item(
                 let part = part
                     .as_object()
                     .context("ChatGPT response content was invalid")?;
-                exact_keys(part, &["type", "text"])?;
+                exact_keys(part, &["type", "text", "annotations", "logprobs"])?;
                 if part.get("type").and_then(Value::as_str) != Some("output_text") {
                     bail!("ChatGPT response contained an unknown message content type");
                 }
@@ -1730,6 +2079,21 @@ fn parse_output_item(
                     .and_then(Value::as_str)
                     .context("ChatGPT output text was invalid")?;
                 validate_bounded_text(text, MAX_RESPONSE_BYTES, "output text")?;
+                for field in ["annotations", "logprobs"] {
+                    if let Some(value) = part.get(field) {
+                        let values = value
+                            .as_array()
+                            .context("ChatGPT output text metadata was invalid")?;
+                        if values.len() > 256
+                            || serde_json::to_vec(values)
+                                .context("ChatGPT output text metadata was invalid")?
+                                .len()
+                                > MAX_TOOL_ARGUMENT_BYTES
+                        {
+                            bail!("ChatGPT output text metadata exceeded the size limit");
+                        }
+                    }
+                }
                 blocks.push(ContentBlock::Text {
                     text: text.to_string(),
                 });
@@ -1775,11 +2139,21 @@ fn parse_output_item(
             )?;
             validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
-            let name = required_identifier(object, "name", 128)?;
-            if object.get("namespace").and_then(Value::as_str) != Some("functions") {
+            let wire_name = required_identifier(object, "name", 128)?;
+            let namespace = object
+                .get("namespace")
+                .map(|namespace| {
+                    namespace
+                        .as_str()
+                        .context("ChatGPT function call namespace was invalid")
+                })
+                .transpose()?;
+            if !chatgpt_wire_namespace_is_valid(&wire_name, namespace) {
                 bail!("ChatGPT function call namespace was invalid");
             }
-            if !allowed_tools.contains(&name) {
+            let name = chatgpt_local_tool_name(&wire_name)
+                .context("ChatGPT requested a reserved native function name")?;
+            if !allowed_tools.contains(name) {
                 bail!("ChatGPT requested a function Finch did not advertise");
             }
             let arguments = object
@@ -1815,11 +2189,154 @@ fn parse_output_item(
             }
             blocks.push(ContentBlock::ToolUse {
                 id: call_id,
-                name,
+                name: name.to_string(),
                 input,
             });
         }
         _ => bail!("ChatGPT response contained an unknown output item type"),
+    }
+    Ok(())
+}
+
+fn validate_documented_response_metadata(response: &Map<String, Value>) -> Result<()> {
+    let optional_number = |name: &str, minimum: f64, maximum: f64| -> Result<()> {
+        let Some(value) = response.get(name) else {
+            return Ok(());
+        };
+        if value.is_null() {
+            return Ok(());
+        }
+        let value = value
+            .as_f64()
+            .filter(|value| value.is_finite() && (*value >= minimum) && (*value <= maximum))
+            .with_context(|| format!("ChatGPT terminal response {name} was invalid"))?;
+        let _ = value;
+        Ok(())
+    };
+    optional_number("created_at", 0.0, u64::MAX as f64)?;
+    optional_number("completed_at", 0.0, u64::MAX as f64)
+        .context("ChatGPT terminal response completion timestamp was invalid")?;
+    optional_number("temperature", 0.0, 2.0)?;
+    optional_number("top_p", 0.0, 1.0)?;
+    optional_number("frequency_penalty", -2.0, 2.0)?;
+    optional_number("presence_penalty", -2.0, 2.0)?;
+
+    if response
+        .get("object")
+        .is_some_and(|value| value.as_str() != Some("response"))
+    {
+        bail!("ChatGPT terminal response object type was invalid");
+    }
+    for (name, expected) in [("parallel_tool_calls", false), ("store", false)] {
+        if response
+            .get(name)
+            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(expected))
+        {
+            bail!("ChatGPT terminal response {name} was invalid");
+        }
+    }
+    if response
+        .get("end_turn")
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+    {
+        bail!("ChatGPT terminal response end_turn was invalid");
+    }
+    for name in ["max_output_tokens", "max_tool_calls"] {
+        if response.get(name).is_some_and(|value| {
+            !value.is_null() && value.as_u64().is_none_or(|value| value > u32::MAX as u64)
+        }) {
+            bail!("ChatGPT terminal response {name} was invalid");
+        }
+    }
+    if response
+        .get("top_logprobs")
+        .is_some_and(|value| !value.is_null() && value.as_u64().is_none_or(|value| value > 20))
+    {
+        bail!("ChatGPT terminal response top_logprobs was invalid");
+    }
+    if let Some(value) = response
+        .get("conversation")
+        .filter(|value| !value.is_null())
+    {
+        let conversation = value
+            .as_object()
+            .context("ChatGPT terminal response conversation was invalid")?;
+        exact_keys(conversation, &["id"])?;
+        required_identifier(conversation, "id", 256)?;
+    }
+    if let Some(value) = response
+        .get("prompt_cache_options")
+        .filter(|value| !value.is_null())
+    {
+        let options = value
+            .as_object()
+            .context("ChatGPT terminal response prompt cache options were invalid")?;
+        exact_keys(options, &["mode", "ttl"])?;
+        if !matches!(
+            options.get("mode").and_then(Value::as_str),
+            Some("implicit" | "explicit")
+        ) || options.get("ttl").and_then(Value::as_str) != Some("30m")
+        {
+            bail!("ChatGPT terminal response prompt cache options were invalid");
+        }
+    }
+    if response.get("prompt_cache_retention").is_some_and(|value| {
+        !value.is_null() && !matches!(value.as_str(), Some("in_memory" | "24h"))
+    }) {
+        bail!("ChatGPT terminal response prompt cache retention was invalid");
+    }
+    if response.get("service_tier").is_some_and(|value| {
+        !value.is_null()
+            && !matches!(
+                value.as_str(),
+                Some("auto" | "default" | "flex" | "scale" | "priority" | "fast" | "ultrafast")
+            )
+    }) {
+        bail!("ChatGPT terminal response service tier was invalid");
+    }
+    for (name, maximum) in [
+        ("prompt_cache_key", 256usize),
+        ("safety_identifier", 64usize),
+        ("user", 256usize),
+    ] {
+        if let Some(value) = response.get(name).filter(|value| !value.is_null()) {
+            let value = value
+                .as_str()
+                .with_context(|| format!("ChatGPT terminal response {name} was invalid"))?;
+            validate_bounded_text(value, maximum, name)?;
+        }
+    }
+    if let Some(value) = response.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = value
+            .as_object()
+            .context("ChatGPT terminal response metadata was invalid")?;
+        if metadata.len() > 16 {
+            bail!("ChatGPT terminal response metadata was excessive");
+        }
+        for (key, value) in metadata {
+            if key.len() > 64 || value.as_str().is_none_or(|value| value.len() > 512) {
+                bail!("ChatGPT terminal response metadata was invalid");
+            }
+        }
+    }
+    for name in [
+        "moderation",
+        "prompt",
+        "reasoning",
+        "text",
+        "headers",
+        "usage_metadata",
+    ] {
+        if let Some(value) = response.get(name).filter(|value| !value.is_null()) {
+            if !value.is_object()
+                || serde_json::to_vec(value)
+                    .context("ChatGPT terminal response metadata was invalid")?
+                    .len()
+                    > MAX_TOOL_ARGUMENT_BYTES
+            {
+                bail!("ChatGPT terminal response {name} was invalid");
+            }
+        }
     }
     Ok(())
 }
@@ -1949,14 +2466,53 @@ fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Optio
 }
 
 fn model_is_compatible(requested: &str, actual: &str) -> bool {
+    let actual = actual.strip_suffix("-safety-routed").unwrap_or(actual);
     matches!(requested, DEFAULT_MODEL | MODEL_ALIAS)
         && matches!(actual, DEFAULT_MODEL | MODEL_ALIAS)
 }
 
 fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            bail!("ChatGPT subscription response metadata key was invalid");
+        }
+        // Both JSON keys and values are untrusted response-body data. Never
+        // reflect either one into diagnostics: an adversarial key can contain
+        // credentials, private reasoning, or tool arguments just as easily as
+        // a value can.
         bail!("ChatGPT subscription response contained an unknown field");
     }
+    Ok(())
+}
+
+/// Validate the outer envelope of one audited SSE event.
+///
+/// OpenAI may add bounded `obfuscation` padding to event envelopes even when
+/// the request disables it. That compatibility exception must not leak into
+/// nested response or output-item objects, where every field is semantic.
+fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
+    if let Some(obfuscation) = object.get("obfuscation") {
+        let obfuscation = obfuscation
+            .as_str()
+            .context("ChatGPT subscription response obfuscation padding was invalid")?;
+        validate_bounded_text(
+            obfuscation,
+            MAX_SSE_LINE_BYTES,
+            "response obfuscation padding",
+        )?;
+    }
+    if let Some(safety_buffering) = object.get("safety_buffering") {
+        let encoded = serde_json::to_vec(safety_buffering)
+            .context("ChatGPT subscription safety buffering metadata was invalid")?;
+        if encoded.len() > MAX_SSE_EVENT_BYTES {
+            bail!("ChatGPT subscription safety buffering metadata exceeded the size limit");
+        }
+    }
+    let mut event_fields = Vec::with_capacity(allowed.len() + 2);
+    event_fields.extend_from_slice(allowed);
+    event_fields.push("obfuscation");
+    event_fields.push("safety_buffering");
+    exact_keys(object, &event_fields)?;
     Ok(())
 }
 
@@ -1997,6 +2553,21 @@ fn bounded_header(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Op
             Ok(value.to_string())
         })
         .transpose()
+}
+
+fn classify_unexpected_content_type(value: &str) -> SubscriptionUnexpectedContentType {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "" => SubscriptionUnexpectedContentType::Missing,
+        "application/json" => SubscriptionUnexpectedContentType::Json,
+        "text/html" => SubscriptionUnexpectedContentType::Html,
+        _ => SubscriptionUnexpectedContentType::Other,
+    }
 }
 
 async fn read_bounded(
@@ -2086,6 +2657,82 @@ mod tests {
     use crate::tools::types::ToolInputSchema;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Bare standard assertions report only `left == right` or the predicate. Keep every
+    // provider-contract failure tied to the invariant that produced it, while allowing tests
+    // with richer sanitized state to supply a more specific message.
+    macro_rules! assert {
+        (!$value:ident.contains($needle:expr) $(,)?) => {
+            std::assert!(
+                !$value.contains($needle),
+                "ChatGPT subscription invariant failed: !{}.contains({}); value_len={}",
+                stringify!($value),
+                stringify!($needle),
+                $value.len()
+            )
+        };
+        ($value:ident.contains($needle:expr) $(,)?) => {
+            std::assert!(
+                $value.contains($needle),
+                "ChatGPT subscription invariant failed: {}.contains({}); value_len={}",
+                stringify!($value),
+                stringify!($needle),
+                $value.len()
+            )
+        };
+        ($value:ident.to_string().contains($needle:expr) $(,)?) => {
+            {
+                let rendered = $value.to_string();
+                std::assert!(
+                rendered.contains($needle),
+                "ChatGPT subscription invariant failed: {}.to_string().contains({}); rendered_len={}",
+                stringify!($value),
+                stringify!($needle),
+                rendered.len()
+                )
+            }
+        };
+        ($condition:expr $(,)?) => {
+            std::assert!(
+                $condition,
+                "ChatGPT subscription invariant failed: {}",
+                stringify!($condition)
+            )
+        };
+        ($condition:expr, $($message:tt)+) => {
+            std::assert!($condition, $($message)+)
+        };
+    }
+
+    macro_rules! assert_eq {
+        ($left:expr, $right:expr $(,)?) => {
+            std::assert_eq!(
+                $left,
+                $right,
+                "ChatGPT subscription invariant failed: {} == {}",
+                stringify!($left),
+                stringify!($right)
+            )
+        };
+        ($left:expr, $right:expr, $($message:tt)+) => {
+            std::assert_eq!($left, $right, $($message)+)
+        };
+    }
+
+    macro_rules! assert_ne {
+        ($left:expr, $right:expr $(,)?) => {
+            std::assert_ne!(
+                $left,
+                $right,
+                "ChatGPT subscription invariant failed: {} != {}",
+                stringify!($left),
+                stringify!($right)
+            )
+        };
+        ($left:expr, $right:expr, $($message:tt)+) => {
+            std::assert_ne!($left, $right, $($message)+)
+        };
+    }
 
     const VALID_PNG_BASE64: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -2179,6 +2826,60 @@ mod tests {
     }
 
     fn completed_sse(model: &str) -> String {
+        let mut completed_response = json!({
+            "id":"resp-1",
+            "object":"response",
+            "created_at":1_777_777_776.5,
+            "status":"completed",
+            "error":null,
+            "incomplete_details":null,
+            "instructions":null,
+            "metadata":{"fixture":"documented"},
+            "model":model,
+            "parallel_tool_calls":false,
+            "temperature":1.0,
+            "frequency_penalty":0.0,
+            "presence_penalty":0.0,
+            "tool_choice":"auto",
+            "tools":[],
+            "tool_usage":{"read":1},
+            "top_p":1.0,
+            "background":false,
+            "completed_at":1_777_777_777.5,
+            "conversation":{"id":"conv-fixture"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        completed_response.extend(
+            json!({
+                "max_output_tokens":null,
+                "max_tool_calls":null,
+                "moderation":null,
+                "previous_response_id":null,
+                "prompt":null,
+                "prompt_cache_key":null,
+                "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
+                "prompt_cache_retention":"24h",
+                "reasoning":{},
+                "safety_identifier":null,
+                "service_tier":"default",
+                "store":false,
+                "text":{},
+                "top_logprobs":0,
+                "truncation":"disabled",
+                "usage":{"input_tokens":12,"output_tokens":7},
+                "user":null
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let completed = json!({
+            "type":"response.completed",
+            "sequence_number":6,
+            "response":completed_response
+        });
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
@@ -2189,19 +2890,170 @@ mod tests {
                 "event: response.completed\ndata: {}\n\n",
                 "data: [DONE]\n\n"
             ),
-            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model},"obfuscation":"padding-created"}),
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
-            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
-            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello","obfuscation":"padding-delta"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]}}),
             json!({"type":"response.output_item.done","sequence_number":5,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
-            json!({"type":"response.completed","sequence_number":6,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
+            completed
         )
     }
 
+    fn completed_sse_with_tool(model: &str, name: &str, namespace: &str) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                if event["item"]["type"] == "function_call" {
+                    event["item"]["name"] = json!(name);
+                    event["item"]["namespace"] = json!(namespace);
+                    event["item"]["arguments"] = json!("{\"path\":\"README.md\"}");
+                    format!("data: {event}\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+
+    fn completed_sse_with_unnamespaced_tool(model: &str, name: &str) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                if event["item"]["type"] == "function_call" {
+                    event["item"]["name"] = json!(name);
+                    event["item"].as_object_mut().unwrap().remove("namespace");
+                    event["item"]["arguments"] = json!("{\"path\":\"README.md\"}");
+                    format!("data: {event}\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
+
+    fn consolidated_text_sse(model: &str) -> String {
+        let body = completed_sse(model);
+        let marker = "event: response.completed\ndata: ";
+        let start = body.find(marker).unwrap() + marker.len();
+        let end = body[start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| start + offset)
+            .unwrap();
+        let mut completed: Value = serde_json::from_str(&body[start..end]).unwrap();
+        completed["sequence_number"] = json!(4);
+        completed["response"]["output"] = json!([{
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"hello there"}]
+        }]);
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_item.done","sequence_number":3,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":" there"}]}}),
+            completed
+        )
+    }
+
+    fn compact_terminal_text_sse(model: &str) -> String {
+        let body = completed_sse(model);
+        let marker = "event: response.completed\ndata: ";
+        let start = body.find(marker).unwrap() + marker.len();
+        let end = body[start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| start + offset)
+            .unwrap();
+        let mut completed: Value = serde_json::from_str(&body[start..end]).unwrap();
+        completed["sequence_number"] = json!(3);
+        completed["response"]["output"] = json!([]);
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"model":model}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Finch native subscription transport accepted"}]}}),
+            completed
+        )
+    }
+
+    fn sse_with_terminal_field(body: String, field: &str, value: Value) -> String {
+        let marker = "event: response.completed\ndata: ";
+        let start = body
+            .find(marker)
+            .expect("completed fixture must contain its terminal event")
+            + marker.len();
+        let end = body[start..]
+            .find("\n\ndata: [DONE]")
+            .map(|offset| start + offset)
+            .expect("completed fixture must contain its terminal marker");
+        let mut terminal: Value = serde_json::from_str(&body[start..end])
+            .expect("completed fixture terminal event must be JSON");
+        terminal["response"][field] = value;
+        format!("{}{terminal}{}", &body[..start], &body[end..])
+    }
+
+    fn completed_sse_with_terminal_field(model: &str, field: &str, value: Value) -> String {
+        sse_with_terminal_field(completed_sse(model), field, value)
+    }
+
+    fn completed_sse_with_safety_buffering(model: &str, value: Value) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                event["safety_buffering"] = value.clone();
+                format!("data: {event}\n")
+            })
+            .collect()
+    }
+
     fn tool() -> ToolDefinition {
+        named_tool("read")
+    }
+
+    fn named_tool(name: &str) -> ToolDefinition {
         ToolDefinition {
-            name: "read".to_string(),
-            description: "Read a file".to_string(),
+            name: name.to_string(),
+            description: if name == "read" {
+                "Read a file".to_string()
+            } else {
+                format!("Test {name}")
+            },
             input_schema: ToolInputSchema {
                 schema_type: "object".to_string(),
                 properties: json!({"path":{"type":"string"}}),
@@ -2302,7 +3154,218 @@ mod tests {
         format!("http://{address}/backend-api/codex")
     }
 
-    async fn subscription_stream_outcome(body: String, header_model: &str) -> Vec<String> {
+    async fn held_open_subscription_server(
+        status: &'static str,
+        content_type: &'static str,
+        header_model: &'static str,
+        body_chunks: Option<Vec<String>>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("held-open fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("held-open fixture must expose its loopback address");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener
+                .accept()
+                .await
+                .expect("held-open fixture must accept the catalog request");
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("held-open fixture must write the catalog response");
+            catalog_socket
+                .flush()
+                .await
+                .expect("held-open fixture must flush the catalog response");
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener
+                .accept()
+                .await
+                .expect("held-open fixture must accept the inference request");
+            let _ = response_socket.read(&mut request).await;
+            response_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\nopenai-model: {header_model}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("held-open fixture must write the inference headers");
+            if let Some(body_chunks) = body_chunks {
+                for body in body_chunks {
+                    response_socket
+                        .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
+                        .await
+                        .expect("held-open fixture must write its incomplete chunked body");
+                    response_socket
+                        .flush()
+                        .await
+                        .expect("held-open fixture must flush each body fragment");
+                    tokio::task::yield_now().await;
+                }
+            }
+            response_socket
+                .flush()
+                .await
+                .expect("held-open fixture must flush its response prefix");
+            let _ = ready_tx.send(());
+
+            let mut byte = [0u8; 1];
+            while matches!(response_socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            ready_rx,
+            closed_rx,
+        )
+    }
+
+    async fn gated_completed_subscription_server(
+        body: String,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("gated completion fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("gated completion fixture must expose its loopback address");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener
+                .accept()
+                .await
+                .expect("gated completion fixture must accept the catalog request");
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("gated completion fixture must write the catalog response");
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener
+                .accept()
+                .await
+                .expect("gated completion fixture must accept the inference request");
+            let _ = response_socket.read(&mut request).await;
+            response_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nopenai-model: {DEFAULT_MODEL}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("gated completion fixture must write inference headers");
+            response_socket
+                .flush()
+                .await
+                .expect("gated completion fixture must flush inference headers");
+            let _ = ready_tx.send(());
+            let _ = release_rx.await;
+            let encoded = format!("{:X}\r\n{}\r\n", body.len(), body);
+            let _ = response_socket.write_all(encoded.as_bytes()).await;
+            let _ = response_socket.flush().await;
+            let mut byte = [0u8; 1];
+            while matches!(response_socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            ready_rx,
+            release_tx,
+            closed_rx,
+        )
+    }
+
+    async fn held_open_catalog_rejection_server() -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("catalog rejection fixture must bind a loopback port");
+        let address = listener
+            .local_addr()
+            .expect("catalog rejection fixture must expose its loopback address");
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("catalog rejection fixture must accept discovery");
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 429 Too Many Requests\r\n",
+                        "content-type: text/plain\r\n",
+                        "transfer-encoding: chunked\r\n",
+                        "connection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("catalog rejection fixture must write status headers");
+            socket
+                .flush()
+                .await
+                .expect("catalog rejection fixture must flush status headers");
+            let _ = headers_tx.send(());
+            let mut byte = [0u8; 1];
+            while matches!(socket.read(&mut byte).await, Ok(1)) {}
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            headers_rx,
+            closed_rx,
+        )
+    }
+
+    async fn subscription_stream_outcome(
+        body: String,
+        header_model: &str,
+    ) -> Vec<std::result::Result<StreamChunk, String>> {
         let mut server = mockito::Server::new_async().await;
         let _models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2332,17 +3395,15 @@ mod tests {
             .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
             .await
             .unwrap();
-        let mut errors = Vec::new();
+        let mut chunks = Vec::new();
         while let Some(chunk) = receiver.recv().await {
-            if let Err(error) = chunk {
-                errors.push(error.to_string());
-            }
+            chunks.push(chunk.map_err(|error| error.to_string()));
         }
-        errors
+        chunks
     }
 
     #[test]
-    fn canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() {
+    fn test_canonical_request_preserves_ordered_reasoning_tools_results_and_lite_shape() {
         let request = ProviderRequest::new(vec![
             Message::with_content(
                 "user",
@@ -2411,7 +3472,385 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
+    fn test_responses_lite_uses_non_reserved_wire_names_for_finch_agent_tools() {
+        let request = ProviderRequest::new(vec![
+            Message::user("delegate"),
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call-agent".to_string(),
+                    name: "spawn_agent".to_string(),
+                    input: json!({"task":"inspect"}),
+                }],
+            ),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-agent".to_string(),
+                    content: "queued".to_string(),
+                    is_error: None,
+                }],
+            ),
+        ])
+        .with_model(DEFAULT_MODEL)
+        .with_tools(vec![tool(), named_tool("spawn_agent")]);
+
+        let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        let namespaces = body["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(namespaces.len(), 1);
+        assert_eq!(namespaces[0]["name"], "functions");
+        assert_eq!(namespaces[0]["tools"][0]["name"], "read");
+        assert_eq!(namespaces[0]["tools"][1]["name"], "finch_spawn_agent");
+
+        let replayed_call = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(replayed_call["name"], "finch_spawn_agent");
+        assert_eq!(replayed_call["namespace"], "functions");
+    }
+
+    #[test]
+    fn test_function_call_wire_alias_is_bound_to_the_advertised_finch_tool() {
+        for (wire_name, local_name) in [
+            ("finch_spawn_agent", "spawn_agent"),
+            ("finch_await_agent", "await_agent"),
+            ("finch_poll_agent", "poll_agent"),
+            ("finch_cancel_agent", "cancel_agent"),
+        ] {
+            for namespace in ["functions", "collaboration"] {
+                let allowed = HashSet::from([local_name.to_string()]);
+                let mut blocks = Vec::new();
+                parse_output_item(
+                    &json!({
+                        "type":"function_call",
+                        "call_id":format!("call-{wire_name}-{namespace}"),
+                        "name":wire_name,
+                        "namespace":namespace,
+                        "arguments":"{\"path\":\"README.md\"}"
+                    }),
+                    &mut blocks,
+                    &mut HashSet::new(),
+                    &allowed,
+                )
+                .unwrap();
+                assert!(matches!(
+                    blocks.as_slice(),
+                    [ContentBlock::ToolUse { name, .. }] if name == local_name
+                ));
+
+                let error = parse_output_item(
+                    &json!({
+                        "type":"function_call",
+                        "call_id":format!("unadvertised-{wire_name}-{namespace}"),
+                        "name":wire_name,
+                        "namespace":namespace,
+                        "arguments":"{}"
+                    }),
+                    &mut Vec::new(),
+                    &mut HashSet::new(),
+                    &HashSet::new(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "ChatGPT requested a function Finch did not advertise"
+                );
+            }
+
+            let mut blocks = Vec::new();
+            parse_output_item(
+                &json!({
+                    "type":"function_call",
+                    "call_id":format!("call-{wire_name}-default"),
+                    "name":wire_name,
+                    "arguments":"{\"path\":\"README.md\"}"
+                }),
+                &mut blocks,
+                &mut HashSet::new(),
+                &HashSet::from([local_name.to_string()]),
+            )
+            .expect("an omitted namespace must bind to the advertised functions group");
+            assert!(matches!(
+                blocks.as_slice(),
+                [ContentBlock::ToolUse { name, .. }] if name == local_name
+            ));
+        }
+
+        for (name, namespace) in [("finch_spawn_agent", "other"), ("read", "collaboration")] {
+            let error = parse_output_item(
+                &json!({
+                    "type":"function_call",
+                    "call_id":format!("call-{name}-{namespace}"),
+                    "name":name,
+                    "namespace":namespace,
+                    "arguments":"{}"
+                }),
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &HashSet::from(["spawn_agent".to_string(), "read".to_string()]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "ChatGPT function call namespace was invalid"
+            );
+        }
+
+        for namespace in ["functions", "collaboration"] {
+            let error = parse_output_item(
+                &json!({
+                    "type":"function_call",
+                    "call_id":format!("reserved-{namespace}"),
+                    "name":"spawn_agent",
+                    "namespace":namespace,
+                    "arguments":"{\"task_name\":\"worker\"}"
+                }),
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &HashSet::from(["spawn_agent".to_string()]),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.to_string().as_str(),
+                "ChatGPT requested a reserved native function name"
+                    | "ChatGPT function call namespace was invalid"
+            ));
+        }
+
+        let reserved_without_namespace = parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"reserved-default",
+                "name":"spawn_agent",
+                "arguments":"{}"
+            }),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &HashSet::from(["spawn_agent".to_string()]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            reserved_without_namespace.to_string(),
+            "ChatGPT requested a reserved native function name"
+        );
+
+        let malformed_namespace = parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"malformed-namespace",
+                "name":"read",
+                "namespace":false,
+                "arguments":"{}"
+            }),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &HashSet::from(["read".to_string()]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            malformed_namespace.to_string(),
+            "ChatGPT function call namespace was invalid"
+        );
+
+        for alias in [
+            "finch_spawn_agent",
+            "finch_await_agent",
+            "finch_poll_agent",
+            "finch_cancel_agent",
+        ] {
+            for tools in [
+                vec![named_tool(alias)],
+                vec![named_tool("spawn_agent"), named_tool(alias)],
+            ] {
+                let collision = ProviderRequest::new(vec![Message::user("delegate")])
+                    .with_model(DEFAULT_MODEL)
+                    .with_tools(tools);
+                assert_eq!(
+                    responses_lite_request(&collision, ReasoningEffort::High)
+                        .unwrap_err()
+                        .to_string(),
+                    "ChatGPT subscription request used a reserved wire tool name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_collaboration_namespaced_agent_alias_replays_as_the_advertised_function() {
+        let mut blocks = Vec::new();
+        parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"call-agent",
+                "name":"finch_spawn_agent",
+                "namespace":"collaboration",
+                "arguments":"{\"path\":\"README.md\"}"
+            }),
+            &mut blocks,
+            &mut HashSet::new(),
+            &HashSet::from(["spawn_agent".to_string()]),
+        )
+        .unwrap();
+        let request = ProviderRequest::new(vec![
+            Message::user("delegate"),
+            Message::with_content("assistant", blocks),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-agent".to_string(),
+                    content: "queued".to_string(),
+                    is_error: None,
+                }],
+            ),
+        ])
+        .with_model(DEFAULT_MODEL)
+        .with_tools(vec![named_tool("spawn_agent")]);
+        let body = responses_lite_request(&request, ReasoningEffort::High).unwrap();
+        let replayed = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(replayed["call_id"], "call-agent");
+        assert_eq!(replayed["name"], "finch_spawn_agent");
+        assert_eq!(replayed["namespace"], "functions");
+        assert_eq!(replayed["arguments"], "{\"path\":\"README.md\"}");
+        assert!(body["input"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "call-agent"
+                && item["output"] == "queued"
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_responses_lite_stream_binds_only_the_advertised_collaboration_alias() {
+        async fn run(name: &str, namespace: &str) -> Vec<Result<StreamChunk, String>> {
+            let mut server = mockito::Server::new_async().await;
+            let _models = server
+                .mock("GET", "/backend-api/codex/models")
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "client_version".into(),
+                    CHATGPT_CATALOG_CLIENT_VERSION.into(),
+                ))
+                .with_status(200)
+                .with_body(catalog_body())
+                .create_async()
+                .await;
+            let _inference = server
+                .mock("POST", RESPONSES_PATH)
+                .with_status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_header("openai-model", DEFAULT_MODEL)
+                .with_body(completed_sse_with_tool(DEFAULT_MODEL, name, namespace))
+                .create_async()
+                .await;
+            let provider = ChatGptSubscriptionProvider::for_test(
+                Arc::new(StaticSource::new()),
+                &format!("{}/backend-api/codex", server.url()),
+                DEFAULT_MODEL,
+            )
+            .unwrap();
+            let mut receiver = provider
+                .send_message_stream(
+                    &ProviderRequest::new(vec![Message::user("delegate")])
+                        .with_tools(vec![named_tool("spawn_agent"), tool()]),
+                )
+                .await
+                .unwrap();
+            let mut chunks = Vec::new();
+            while let Some(chunk) = receiver.recv().await {
+                chunks.push(chunk.map_err(|error| error.to_string()));
+            }
+            chunks
+        }
+
+        let accepted = run("finch_spawn_agent", "collaboration").await;
+        assert!(
+            accepted.iter().any(|chunk| matches!(
+                chunk,
+                Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { name, .. }))
+                    if name == "spawn_agent"
+            )),
+            "advertised collaboration alias did not project the local tool; accepted={accepted:?}"
+        );
+        assert!(
+            !accepted.iter().any(Result::is_err),
+            "advertised collaboration alias produced an error; accepted={accepted:?}"
+        );
+
+        for (name, namespace) in [
+            ("spawn_agent", "collaboration"),
+            ("read", "collaboration"),
+            ("finch_spawn_agent", "other"),
+        ] {
+            let rejected = run(name, namespace).await;
+            assert!(
+                rejected.iter().any(Result::is_err),
+                "invalid collaboration alias was not rejected; name={name:?}; namespace={namespace:?}; chunks={rejected:?}"
+            );
+            assert!(!rejected.iter().any(|chunk| matches!(
+                chunk,
+                Ok(StreamChunk::ContentBlockComplete(_)
+                    | StreamChunk::ResponseMetadata { .. }
+                    | StreamChunk::Usage { .. }
+                    | StreamChunk::Allowance { .. })
+            )), "invalid collaboration alias emitted terminal effects; name={name:?}; namespace={namespace:?}; chunks={rejected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_responses_lite_binds_omitted_namespace_to_advertised_functions_group() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_unnamespaced_tool(
+                DEFAULT_MODEL,
+                "finch_spawn_agent",
+            ))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+
+        let response = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("delegate")])
+                    .with_tools(vec![named_tool("spawn_agent"), tool()]),
+            )
+            .await
+            .expect("an omitted namespace must bind to the request's functions group");
+
+        assert!(response.content.iter().any(|block| matches!(
+            block,
+            ContentBlock::ToolUse { name, .. } if name == "spawn_agent"
+        )));
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[test]
+    fn test_responses_lite_prompt_item_ids_are_stable_and_payload_bound() {
         let request = ProviderRequest::new(vec![Message::user("hello")])
             .with_model(DEFAULT_MODEL)
             .with_system("developer instructions")
@@ -2437,7 +3876,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_and_capability_alias_are_pinned_to_responses_lite() {
+    fn test_catalog_and_capability_alias_are_pinned_to_responses_lite() {
         let catalog = parse_catalog(catalog_body().as_bytes()).unwrap();
         assert!(catalog.models.contains_key(DEFAULT_MODEL));
         assert!(catalog.models.contains_key(MODEL_ALIAS));
@@ -2458,7 +3897,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_accepts_and_preserves_authoritative_bounded_context_windows() {
+    fn test_catalog_accepts_and_preserves_authoritative_bounded_context_windows() {
         for (sol, alias) in [(200_000, 262_144), (1_000_000, 1_050_000)] {
             let catalog =
                 parse_catalog(catalog_body_with_context_windows(sol, alias).as_bytes()).unwrap();
@@ -2474,7 +3913,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_rejects_missing_malformed_zero_and_excessive_context_windows() {
+    fn test_catalog_rejects_missing_malformed_zero_and_excessive_context_windows() {
         let assert_invalid = |catalog: Value| {
             let error = parse_catalog(catalog.to_string().as_bytes())
                 .err()
@@ -2508,7 +3947,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
+    fn test_catalog_context_metadata_does_not_weaken_slug_api_or_modality_checks() {
         let mut wrong_slug: Value =
             serde_json::from_str(&single_model_catalog_body(DEFAULT_MODEL, 1_000_000)).unwrap();
         wrong_slug["models"][0]["slug"] = json!("gpt-5.6-sol-impostor");
@@ -2544,13 +3983,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_client_version_is_pinned_to_audited_codex_not_finch_package() {
+    fn test_compatibility_version_is_pinned_to_audited_codex_not_finch_package() {
         assert_eq!(CHATGPT_CATALOG_CLIENT_VERSION, "0.151.0");
         assert_ne!(CHATGPT_CATALOG_CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
-    fn chatgpt_user_agent_is_static_bounded_and_has_no_user_identity() {
+    fn test_chatgpt_user_agent_is_static_bounded_and_has_no_user_identity() {
         assert_eq!(
             FINCH_CHATGPT_USER_AGENT,
             concat!(
@@ -2572,7 +4011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_catalog_is_typed_actionable_and_secret_free() {
+    async fn test_empty_catalog_is_typed_actionable_and_secret_free() {
         let access_secret = "empty-catalog-access-secret";
         let account_secret = "empty-catalog-account-secret";
         let mut server = mockito::Server::new_async().await;
@@ -2618,7 +4057,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ignores_unrelated_models_and_accepts_one_pinned_identifier() {
+    fn test_catalog_ignores_unrelated_models_and_accepts_one_pinned_identifier() {
         let mut catalog: Value = serde_json::from_str(&catalog_body()).unwrap();
         catalog["models"].as_array_mut().unwrap().push(json!({
             "slug":"unrelated-account-model",
@@ -2638,12 +4077,12 @@ mod tests {
     }
 
     #[test]
-    fn actual_model_uses_authoritative_header_and_never_payload_model() {
+    fn test_actual_model_provenance_accepts_agreement_and_rejects_conflict_or_absence() {
         let allowed = HashSet::new();
         let terminal = json!({
             "id":"resp-1",
             "status":"completed",
-            "model":"attacker-payload-model",
+            "model":DEFAULT_MODEL,
             "output":[],
             "usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}
         });
@@ -2658,22 +4097,41 @@ mod tests {
         .unwrap();
         assert_eq!(completed.model, DEFAULT_MODEL);
 
+        let conflicting = json!({
+            "id":"resp-conflict",
+            "status":"completed",
+            "model":MODEL_ALIAS,
+            "output":[]
+        });
         let mut accumulator = StreamAccumulator::default();
         let error = parse_completed(
-            terminal.as_object().unwrap(),
+            conflicting.as_object().unwrap(),
             DEFAULT_MODEL,
-            None,
+            Some(DEFAULT_MODEL),
             &allowed,
             &mut accumulator,
         )
         .err()
-        .expect("missing authoritative model header must fail")
+        .expect("conflicting payload and header provenance must fail")
+        .to_string();
+        assert!(error.contains("actual model changed"));
+
+        let missing = json!({"id":"resp-missing","status":"completed","output":[]});
+        let error = parse_completed(
+            missing.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &allowed,
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("absent payload and header provenance must fail")
         .to_string();
         assert!(error.contains("omitted actual model provenance"));
     }
 
     #[test]
-    fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
+    fn test_malformed_unknown_and_misordered_terminal_events_fail_closed() {
         let mut accumulator = StreamAccumulator::default();
         let unknown = json!({"type":"response.future","sequence_number":1});
         assert!(parse_event(
@@ -2717,7 +4175,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_metadata_events_preserve_top_level_actual_model_and_reject_drift() {
+    fn test_pinned_metadata_events_preserve_top_level_actual_model_and_reject_drift() {
         for kind in ["response.metadata", "codex.response.metadata"] {
             let mut accumulator = StreamAccumulator::default();
             let event = json!({
@@ -2759,7 +4217,7 @@ mod tests {
     }
 
     #[test]
-    fn production_refresh_lock_is_shared_by_named_credential_and_account() {
+    fn test_production_refresh_lock_is_shared_by_named_credential_and_account() {
         let first = shared_refresh_lock("credential-a", "account-a");
         let second = shared_refresh_lock("credential-a", "account-a");
         let other_account = shared_refresh_lock("credential-a", "account-b");
@@ -2770,7 +4228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validated_dispatch_uses_exact_account_routes_and_preserves_terminal_metadata() {
+    async fn test_validated_dispatch_uses_exact_account_routes_and_preserves_terminal_metadata() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2782,6 +4240,7 @@ mod tests {
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
             .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_header("etag", "account-etag")
@@ -2820,6 +4279,7 @@ mod tests {
             "reasoning": {"effort":"high","context":"all_turns"},
             "store": false,
             "stream": true,
+            "stream_options": {"include_obfuscation": false},
             "include": ["reasoning.encrypted_content"]
         });
         let inference = server
@@ -2828,6 +4288,7 @@ mod tests {
             .match_header("chatgpt-account-id", "account-1")
             .match_header("originator", "finch")
             .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .match_header("x-openai-internal-codex-responses-lite", "true")
             .match_body(mockito::Matcher::Json(expected))
             .with_status(200)
@@ -2853,8 +4314,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.model, DEFAULT_MODEL);
-        assert_eq!(response.usage.unwrap().output_tokens, 7);
-        assert_eq!(response.allowance.unwrap().primary_used_percent, Some(25.5));
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .expect("validated response must preserve usage metadata")
+                .output_tokens,
+            7
+        );
+        assert_eq!(
+            response
+                .allowance
+                .as_ref()
+                .expect("validated response must preserve allowance metadata")
+                .primary_used_percent,
+            Some(25.5)
+        );
         assert!(matches!(
             response.content.first(),
             Some(ContentBlock::OpaqueReasoning { encrypted_content }) if encrypted_content == "opaque-1"
@@ -2863,13 +4338,18 @@ mod tests {
             response.content.last(),
             Some(ContentBlock::ToolUse { id, .. }) if id == "call-2"
         ));
+        assert_eq!(
+            response.stop_reason.as_deref(),
+            Some("tool_use"),
+            "tool output with omitted end_turn did not report tool_use; response={response:?}"
+        );
         assert_eq!(source.refreshes.load(Ordering::SeqCst), 0);
         models.assert_async().await;
         inference.assert_async().await;
     }
 
     #[tokio::test]
-    async fn stream_and_nonstream_preserve_equal_terminal_output_and_provenance() {
+    async fn test_stream_and_nonstream_preserve_equal_terminal_output_and_provenance() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2877,6 +4357,9 @@ mod tests {
                 "client_version".into(),
                 CHATGPT_CATALOG_CLIENT_VERSION.into(),
             ))
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_body(single_model_catalog_body(DEFAULT_MODEL, 1_000_000))
             .expect(1)
@@ -2884,6 +4367,9 @@ mod tests {
             .await;
         let inference = server
             .mock("POST", RESPONSES_PATH)
+            .match_header("originator", "finch")
+            .match_header("user-agent", FINCH_CHATGPT_USER_AGENT)
+            .match_header("version", CHATGPT_CATALOG_CLIENT_VERSION)
             .with_status(200)
             .with_header("content-type", "text/event-stream")
             .with_header("openai-model", DEFAULT_MODEL)
@@ -2928,7 +4414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_and_streaming_require_the_exact_requested_catalog_entry() {
+    async fn test_buffered_and_streaming_require_the_exact_requested_catalog_entry() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2970,7 +4456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_fragmented_sse_preserves_ordered_opaque_and_tool_items() {
+    async fn test_byte_fragmented_sse_preserves_ordered_opaque_and_tool_items() {
         let base = fragmented_subscription_server(completed_sse(DEFAULT_MODEL)).await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -2995,7 +4481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_pre_stream_unauthorized_refreshes_same_account_once() {
+    async fn test_one_pre_stream_unauthorized_refreshes_same_account_once() {
         let mut server = mockito::Server::new_async().await;
         let initial_catalog = server
             .mock("GET", "/backend-api/codex/models")
@@ -3024,7 +4510,10 @@ mod tests {
             .mock("POST", RESPONSES_PATH)
             .match_header("authorization", "Bearer subscription-secret")
             .with_status(401)
-            .with_body("do-not-log-this-secret")
+            .with_body(format!(
+                "do-not-log-this-secret{}",
+                "x".repeat(MAX_ERROR_BYTES)
+            ))
             .expect(1)
             .create_async()
             .await;
@@ -3059,7 +4548,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_catalog_unauthorized_refreshes_before_inference_only_once() {
+    async fn test_repeated_oversized_unauthorized_is_typed_after_one_refresh() {
+        let mut server = mockito::Server::new_async().await;
+        let initial_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let refreshed_catalog = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let attacker_body = format!(
+            "account-1 subscription-secret private-tool-argument{}",
+            "x".repeat(MAX_ERROR_BYTES)
+        );
+        let first = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer subscription-secret")
+            .with_status(401)
+            .with_body(attacker_body.clone())
+            .expect(1)
+            .create_async()
+            .await;
+        let second = server
+            .mock("POST", RESPONSES_PATH)
+            .match_header("authorization", "Bearer refreshed-subscription-secret")
+            .with_status(401)
+            .with_body(attacker_body.clone())
+            .expect(1)
+            .create_async()
+            .await;
+        let source = Arc::new(StaticSource::new());
+        let provider = ChatGptSubscriptionProvider::for_test(
+            source.clone(),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err();
+        let Some(rejection) = error.downcast_ref::<SubscriptionResponseRejected>() else {
+            panic!(
+                "the second HTTP rejection lost its typed status: {error:#}; matches: initial_catalog={}, refreshed_catalog={}, first={}, second={}",
+                initial_catalog.matched_async().await,
+                refreshed_catalog.matched_async().await,
+                first.matched_async().await,
+                second.matched_async().await,
+            );
+        };
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(source.refreshes.load(Ordering::SeqCst), 1);
+        let display = error.to_string();
+        assert!(display.contains("HTTP 401 Unauthorized"));
+        assert!(!display.contains("account-1"));
+        assert!(!display.contains("subscription-secret"));
+        assert!(!display.contains("private-tool-argument"));
+        assert!(display.len() < 256);
+        initial_catalog.assert_async().await;
+        refreshed_catalog.assert_async().await;
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_one_catalog_unauthorized_refreshes_before_inference_only_once() {
         let mut server = mockito::Server::new_async().await;
         let rejected_catalog = server
             .mock("GET", "/backend-api/codex/models")
@@ -3115,7 +4684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_receiver_drop_cancels_and_releases_subscription_transport() {
+    async fn test_stream_receiver_drop_cancels_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(true).await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -3135,7 +4704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_cancellation_reaches_and_releases_subscription_transport() {
+    async fn test_caller_cancellation_reaches_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(true).await;
         let provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -3166,7 +4735,659 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_timeout_is_bounded_and_releases_subscription_transport() {
+    async fn test_buffered_cancellation_reaches_and_releases_subscription_transport() {
+        let (base, headers_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(Vec::new()),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("buffered-cancellation fixture must construct a test provider");
+        let cancel = CancellationToken::new();
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_cancellation_token(cancel.clone());
+        let task = tokio::spawn(async move { provider.send_message(&request).await });
+        tokio::time::timeout(Duration::from_secs(2), headers_sent)
+            .await
+            .expect("buffered-cancellation fixture did not send response headers")
+            .expect("buffered-cancellation fixture dropped its headers-sent signal");
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("buffered request ignored caller cancellation")
+            .expect("buffered cancellation task panicked")
+            .expect_err("cancelled buffered request unexpectedly succeeded");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "buffered cancellation returned the wrong diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("buffered cancellation did not release the HTTP transport")
+            .expect("buffered-cancellation fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_buffered_cancellation_wins_over_released_completed_response() {
+        let (base, response_ready, release_body, closed) =
+            gated_completed_subscription_server(completed_sse(DEFAULT_MODEL)).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("gated cancellation fixture must construct a test provider");
+        let cancel = CancellationToken::new();
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_tools(vec![tool()])
+            .with_cancellation_token(cancel.clone());
+        let task = tokio::spawn(async move { provider.send_message(&request).await });
+        tokio::time::timeout(Duration::from_secs(2), response_ready)
+            .await
+            .expect("gated cancellation fixture did not send response headers")
+            .expect("gated cancellation fixture dropped its ready signal");
+        cancel.cancel();
+        release_body
+            .send(())
+            .expect("gated cancellation fixture dropped its body gate");
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("buffered completion won over caller cancellation")
+            .expect("gated cancellation task panicked")
+            .expect_err("cancelled buffered request published a completed response");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "completion/cancellation race returned the wrong diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("completion/cancellation race retained the HTTP transport")
+            .expect("gated cancellation fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_backpressured_stream_cancellation_releases_transport_without_terminal_effects() {
+        let mut body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"model":DEFAULT_MODEL}})
+        );
+        for index in 0..40u64 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":index + 2,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"x"
+                })
+            ));
+        }
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("backpressure fixture must construct a test provider");
+        let cancel = CancellationToken::new();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")])
+                    .with_cancellation_token(cancel.clone()),
+            )
+            .await
+            .expect("backpressure fixture must start a subscription stream");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("backpressure fixture did not send its response body")
+            .expect("backpressure fixture dropped its body-sent signal");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription output queue never reached the intended backpressure boundary");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("backpressured cancellation did not release the HTTP transport")
+            .expect("backpressure fixture dropped its transport-close signal");
+
+        let mut queued = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                queued.push(chunk);
+            }
+        })
+        .await
+        .expect("backpressured stream channel did not close after cancellation");
+        assert_eq!(
+            queued.len(),
+            32,
+            "cancellation should preserve only the 32 deltas queued before backpressure; queued={queued:?}"
+        );
+        assert!(
+            queued.iter().all(|chunk| matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == "x")),
+            "cancellation projected a post-terminal chunk or diagnostic instead of only pre-cancel deltas: {queued:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backpressured_protocol_failure_is_delivered_after_transport_release() {
+        let mut body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"model":DEFAULT_MODEL}})
+        );
+        for index in 0..32u64 {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":index + 2,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"x"
+                })
+            ));
+        }
+        body.push_str(&format!(
+            "event: response.output_text.delta\ndata: {}\n\n",
+            json!({
+                "type":"response.output_text.delta",
+                "sequence_number":33,
+                "item_id":"message-1",
+                "output_index":0,
+                "content_index":0,
+                "delta":"must-not-project"
+            })
+        ));
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("backpressured-error fixture must construct a test provider");
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("backpressured-error fixture must start a subscription stream");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("backpressured-error fixture did not send its body")
+            .expect("backpressured-error fixture dropped its body-sent signal");
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("protocol failure did not release its HTTP transport before delivery")
+            .expect("backpressured-error fixture dropped its transport-close signal");
+
+        let mut chunks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                chunks.push(chunk.map_err(|error| error.to_string()));
+            }
+        })
+        .await
+        .expect("backpressured protocol failure did not close its output channel");
+        assert_eq!(
+            chunks.len(),
+            33,
+            "expected 32 queued deltas followed by one terminal error; chunks={chunks:?}"
+        );
+        assert!(
+            chunks[..32]
+                .iter()
+                .all(|chunk| matches!(chunk, Ok(delta) if matches!(delta, StreamChunk::TextDelta(text) if text == "x"))),
+            "backpressured failure changed pre-error deltas: {chunks:?}"
+        );
+        assert!(
+            matches!(chunks.last(), Some(Err(error)) if error.contains("strictly increasing")),
+            "backpressured parse failure was lost or changed: {chunks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_event_completes_with_or_without_done_before_socket_eof() {
+        for include_done in [true, false] {
+            let mut body = completed_sse(DEFAULT_MODEL);
+            if !include_done {
+                body = body
+                    .strip_suffix("data: [DONE]\n\n")
+                    .expect("completed fixture must end in [DONE]")
+                    .to_string();
+            }
+            let (base, body_sent, closed) = held_open_subscription_server(
+                "200 OK",
+                "text/event-stream",
+                DEFAULT_MODEL,
+                Some(vec![body]),
+            )
+            .await;
+            let provider = ChatGptSubscriptionProvider::for_test(
+                Arc::new(StaticSource::new()),
+                &base,
+                DEFAULT_MODEL,
+            )
+            .expect("held-open completion fixture must construct a test provider");
+            let request =
+                ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                    "validated terminal event waited for socket EOF; include_done={include_done}"
+                )
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!(
+                    "validated terminal event failed; include_done={include_done}; error={error:#}"
+                )
+                    });
+            body_sent.await.unwrap_or_else(|_| {
+                panic!(
+                    "held-open completion fixture dropped its body-sent signal; include_done={include_done}"
+                )
+            });
+            assert_eq!(
+                response.model, DEFAULT_MODEL,
+                "held-open completion returned unexpected model provenance; include_done={include_done}; response={response:?}"
+            );
+            assert!(
+                response
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == "hello")),
+                "held-open completion omitted its validated text block; include_done={include_done}; response={response:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(2), closed)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "validated completion did not release HTTP transport; include_done={include_done}"
+                    )
+                })
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "held-open fixture dropped its close signal; include_done={include_done}"
+                    )
+                });
+        }
+    }
+
+    #[tokio::test]
+    async fn test_completed_response_ignores_every_held_open_optional_done_prefix() {
+        let terminal = completed_sse(DEFAULT_MODEL)
+            .strip_suffix("data: [DONE]\n\n")
+            .expect("completed fixture must contain its optional terminal marker")
+            .to_string();
+        for sentinel in ["data: [DONE]\n\n", "data: [DONE]\r\n\r\n"] {
+            for split in 1..sentinel.len() {
+                let chunks = vec![format!("{}{}", terminal, &sentinel[..split])];
+                let (base, body_sent, closed) = held_open_subscription_server(
+                    "200 OK",
+                    "text/event-stream",
+                    DEFAULT_MODEL,
+                    Some(chunks),
+                )
+                .await;
+                let provider = ChatGptSubscriptionProvider::for_test(
+                    Arc::new(StaticSource::new()),
+                    &base,
+                    DEFAULT_MODEL,
+                )
+                .expect("fragmented-DONE fixture must construct a test provider");
+                let request =
+                    ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+                let response = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    provider.send_message(&request),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "held-open optional marker prefix stalled at split {split}; sentinel={sentinel:?}"
+                    )
+                })
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "held-open optional marker prefix failed at split {split}; sentinel={sentinel:?}; error={error:#}"
+                    )
+                });
+                body_sent.await.unwrap_or_else(|_| {
+                    panic!(
+                        "optional-prefix fixture dropped body signal at split {split}; sentinel={sentinel:?}"
+                    )
+                });
+                assert_eq!(
+                    response.model, DEFAULT_MODEL,
+                    "held-open optional marker prefix changed model at split {split}; sentinel={sentinel:?}; response={response:?}"
+                );
+                tokio::time::timeout(Duration::from_secs(2), closed)
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "held-open optional marker prefix retained transport at split {split}; sentinel={sentinel:?}"
+                        )
+                    })
+                    .expect("optional-prefix fixture dropped its transport-close signal");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_end_turn_false_is_preserved_as_follow_up_stop_reason() {
+        let body = completed_sse_with_terminal_field(DEFAULT_MODEL, "end_turn", json!(false));
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("end_turn fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                .await
+                .expect("end_turn=false response waited for socket EOF")
+                .unwrap_or_else(|error| panic!("end_turn=false response was rejected: {error:#}"));
+        body_sent
+            .await
+            .expect("end_turn fixture dropped its body-sent signal");
+        assert_eq!(
+            response.stop_reason.as_deref(),
+            Some("tool_use"),
+            "end_turn=false did not retain follow-up semantics: {response:?}"
+        );
+        assert!(
+            response
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == "read")),
+            "end_turn=false response lost its advertised tool call: {response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("end_turn=false response did not release its HTTP transport")
+            .expect("end_turn fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_end_turn_false_without_executable_tool_fails_closed() {
+        let body = sse_with_terminal_field(
+            compact_terminal_text_sse(DEFAULT_MODEL),
+            "end_turn",
+            json!(false),
+        );
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("text-only follow-up fixture must construct a test provider");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(&ProviderRequest::new(vec![Message::user("hello")])),
+        )
+        .await
+        .expect("text-only end_turn=false response waited for socket EOF")
+        .expect_err("text-only end_turn=false response was silently finalized");
+        body_sent
+            .await
+            .expect("text-only follow-up fixture dropped its body-sent signal");
+        assert!(
+            error
+                .to_string()
+                .contains("follow-up response without an executable tool call"),
+            "text-only end_turn=false returned an unhelpful diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("rejected text-only follow-up did not release its HTTP transport")
+            .expect("text-only follow-up fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_end_turn_true_with_executable_tool_fails_closed() {
+        let body = completed_sse_with_terminal_field(DEFAULT_MODEL, "end_turn", json!(true));
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("inconsistent end_turn fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let error = tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+            .await
+            .expect("inconsistent end_turn response waited for socket EOF")
+            .expect_err("end_turn=true with an executable tool was accepted");
+        body_sent
+            .await
+            .expect("inconsistent end_turn fixture dropped its body-sent signal");
+        assert!(
+            error
+                .to_string()
+                .contains("ended a response that still contained an executable tool call"),
+            "inconsistent end_turn response returned the wrong diagnostic: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("inconsistent end_turn response retained the HTTP transport")
+            .expect("inconsistent end_turn fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_safety_routed_actual_model_is_preserved_with_exact_event_consistency() {
+        const SAFETY_MODEL: &str = "gpt-5.6-sol-safety-routed";
+        let body = completed_sse(DEFAULT_MODEL).replace(DEFAULT_MODEL, SAFETY_MODEL);
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            SAFETY_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("safety-route fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                .await
+                .expect("safety-routed response waited for socket EOF")
+                .unwrap_or_else(|error| panic!("safety-routed response was rejected: {error:#}"));
+        body_sent
+            .await
+            .expect("safety-route fixture dropped its body-sent signal");
+        assert_eq!(
+            response.model, SAFETY_MODEL,
+            "safety-routed actual-model provenance was not preserved: {response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("safety-routed response did not release its HTTP transport")
+            .expect("safety-route fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_safety_buffering_event_metadata_is_accepted_and_bounded() {
+        let body = completed_sse_with_safety_buffering(
+            DEFAULT_MODEL,
+            json!({"state":"buffered","tokens":3}),
+        );
+        let (base, body_sent, closed) = held_open_subscription_server(
+            "200 OK",
+            "text/event-stream",
+            DEFAULT_MODEL,
+            Some(vec![body]),
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("safety-buffering fixture must construct a test provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), provider.send_message(&request))
+                .await
+                .expect("bounded safety_buffering response waited for socket EOF")
+                .unwrap_or_else(|error| {
+                    panic!("bounded safety_buffering metadata was rejected: {error:#}")
+                });
+        body_sent
+            .await
+            .expect("safety-buffering fixture dropped its body-sent signal");
+        assert_eq!(
+            response.model, DEFAULT_MODEL,
+            "safety_buffering response changed actual-model provenance: {response:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("safety_buffering response did not release its HTTP transport")
+            .expect("safety-buffering fixture dropped its transport-close signal");
+
+        let mut accumulator = StreamAccumulator::default();
+        let oversized = parse_event(
+            json!({
+                "type":"response.created",
+                "sequence_number":1,
+                "response":{"model":DEFAULT_MODEL},
+                "safety_buffering":"x".repeat(MAX_SSE_EVENT_BYTES)
+            }),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .err()
+        .expect("oversized safety_buffering metadata unexpectedly passed validation");
+        assert!(
+            oversized
+                .to_string()
+                .contains("safety buffering metadata exceeded the size limit"),
+            "oversized safety_buffering returned an unhelpful diagnostic: {oversized:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_rejection_returns_typed_status_without_waiting_for_body_eof() {
+        let (base, headers_sent, closed) = held_open_subscription_server(
+            "429 Too Many Requests",
+            "text/plain",
+            DEFAULT_MODEL,
+            None,
+        )
+        .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("held-open rejection fixture must construct a test provider");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(&ProviderRequest::new(vec![Message::user("hello")])),
+        )
+        .await
+        .expect("known HTTP rejection waited for body EOF")
+        .expect_err("held-open 429 response unexpectedly succeeded");
+        headers_sent
+            .await
+            .expect("held-open rejection fixture dropped its headers-sent signal");
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("held-open rejection lost its typed HTTP status");
+        assert_eq!(
+            rejection.0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "held-open rejection returned the wrong typed status: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("typed HTTP rejection did not release the stalled body transport")
+            .expect("held-open rejection fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_rejection_returns_status_without_waiting_for_body_eof() {
+        let (base, headers_sent, closed) = held_open_catalog_rejection_server().await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("catalog rejection fixture must construct a test provider");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.send_message(&ProviderRequest::new(vec![Message::user("hello")])),
+        )
+        .await
+        .expect("known catalog rejection waited for body EOF")
+        .expect_err("held-open catalog 429 unexpectedly reached inference");
+        headers_sent
+            .await
+            .expect("catalog rejection fixture dropped its headers-sent signal");
+        let display = error.to_string();
+        assert!(
+            display.contains("model discovery failed (HTTP 429 Too Many Requests)"),
+            "held-open catalog rejection lost its HTTP status: {error:#}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("catalog rejection did not release the stalled body transport")
+            .expect("catalog rejection fixture dropped its transport-close signal");
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout_is_bounded_and_releases_subscription_transport() {
         let (base, closed) = stalling_subscription_server(false).await;
         let mut provider = ChatGptSubscriptionProvider::for_test(
             Arc::new(StaticSource::new()),
@@ -3192,50 +5413,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
+    async fn test_premature_stream_termination_fails_before_completion_effects() {
         let created = format!(
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
         );
         let eof = subscription_stream_outcome(created.clone(), DEFAULT_MODEL).await;
-        assert_eq!(eof.len(), 1);
-        assert!(eof[0].contains("before response.completed"));
-
-        let terminal = format!(
-            "{}event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
-            created,
-            json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp"}})
+        assert_eq!(
+            eof.len(),
+            1,
+            "premature EOF should produce exactly one terminal error and no successful effects; chunks={eof:?}"
         );
-        let duplicate =
-            subscription_stream_outcome(format!("{terminal}data: [DONE]\n\n"), DEFAULT_MODEL).await;
-        assert_eq!(duplicate.len(), 1);
-        assert!(duplicate[0].contains("terminal marker was invalid"));
+        assert!(
+            matches!(&eof[0], Err(error) if error.contains("before response.completed")),
+            "premature EOF returned the wrong outcome; chunks={eof:?}"
+        );
 
-        let late = subscription_stream_outcome(
-            format!(
-                "{terminal}event: response.in_progress\ndata: {}\n\n",
-                json!({"type":"response.in_progress","sequence_number":3,"response":{}})
-            ),
-            DEFAULT_MODEL,
-        )
-        .await;
-        assert_eq!(late.len(), 1);
-        assert!(late[0].contains("data after its terminal response"));
+        let premature_done =
+            subscription_stream_outcome(format!("{created}data: [DONE]\n\n"), DEFAULT_MODEL).await;
+        assert_eq!(
+            premature_done.len(),
+            1,
+            "premature DONE should produce exactly one terminal error and no successful effects; chunks={premature_done:?}"
+        );
+        assert!(
+            matches!(&premature_done[0], Err(error) if error.contains("terminal marker was invalid")),
+            "premature DONE returned the wrong outcome; chunks={premature_done:?}"
+        );
+
+        assert!(
+            eof.iter().all(Result::is_err),
+            "premature EOF leaked a successful stream effect; chunks={eof:?}"
+        );
+        assert!(
+            premature_done.iter().all(Result::is_err),
+            "premature DONE leaked a successful stream effect; chunks={premature_done:?}"
+        );
     }
 
     #[tokio::test]
-    async fn actual_model_drift_fails_before_completion_effects() {
+    async fn test_actual_model_drift_fails_before_completion_effects() {
         let body = format!(
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}})
         );
-        let errors = subscription_stream_outcome(body, DEFAULT_MODEL).await;
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("incompatible actual model"));
+        let chunks = subscription_stream_outcome(body, DEFAULT_MODEL).await;
+        assert_eq!(
+            chunks.len(),
+            1,
+            "model drift should produce exactly one terminal error and no successful effects; chunks={chunks:?}"
+        );
+        assert!(
+            matches!(&chunks[0], Err(error) if error.contains("incompatible actual model")),
+            "model drift returned the wrong outcome; chunks={chunks:?}"
+        );
     }
 
     #[tokio::test]
-    async fn catalog_etag_is_generation_revalidated_but_never_crosses_accounts() {
+    async fn test_catalog_etag_is_generation_revalidated_but_never_crosses_accounts() {
         let mut server = mockito::Server::new_async().await;
         let first = server
             .mock("GET", "/backend-api/codex/models")
@@ -3322,7 +5557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_success_bodies_are_bounded_and_redacted() {
+    async fn test_non_success_bodies_are_bounded_and_redacted() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3350,18 +5585,23 @@ mod tests {
         let error = provider
             .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains(secret));
-        assert!(!error.contains("subscription-secret"));
-        assert!(error.contains("size limit"));
-        assert!(error.len() < 256);
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<SubscriptionResponseRejected>()
+            .expect("oversized HTTP rejection must retain its typed status");
+        assert_eq!(rejection.0, StatusCode::TOO_MANY_REQUESTS);
+        let display = error.to_string();
+        assert!(display.contains("HTTP 429 Too Many Requests"));
+        assert!(!display.contains(secret));
+        assert!(!display.contains("subscription-secret"));
+        assert!(!display.contains("size limit"));
+        assert!(display.len() < 256);
         models.assert_async().await;
         inference.assert_async().await;
     }
 
     #[tokio::test]
-    async fn response_rejection_is_typed_clear_and_secret_free() {
+    async fn test_oversized_success_json_is_typed_bounded_and_redacted() {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -3373,11 +5613,652 @@ mod tests {
             .with_body(catalog_body())
             .create_async()
             .await;
-        let attacker_body = "account-1 subscription-secret private-tool-argument private-reasoning";
+        let secret = "account-1 subscription-secret private-tool-argument";
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "application/json; charset=utf-8")
+            .with_body(format!("{secret}{}", "x".repeat(MAX_ERROR_BYTES)))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap_err();
+        let classification = error
+            .downcast_ref::<SubscriptionUnexpectedContentType>()
+            .expect("successful JSON response must retain its typed media classification");
+        assert_eq!(classification, &SubscriptionUnexpectedContentType::Json);
+        let display = error.to_string();
+        assert!(display.contains("HTTP success with application/json"));
+        assert!(!display.contains(secret));
+        assert!(!display.contains("size limit"));
+        assert!(display.len() < 256);
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_successful_sse_without_content_type_is_accepted_and_validated() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+
+        let response = provider
+            .send_message(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .expect("a valid SSE body does not require a Content-Type header");
+
+        assert_eq!(response.model, DEFAULT_MODEL);
+        assert_eq!(response.usage.unwrap().output_tokens, 7);
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[test]
+    fn test_unknown_response_field_diagnostic_reflects_neither_key_nor_value() {
+        let secret_key = "private-key-that-is-also-a-secret";
+        let secret_value = "private-reasoning-and-tool-argument";
+        let mut object = Map::new();
+        object.insert("known".to_string(), json!(true));
+        object.insert(secret_key.to_string(), json!(secret_value));
+        let error = exact_keys(&object, &["known"])
+            .expect_err("an unknown protocol field must remain explicit until audited");
+        let display = error.to_string();
+        assert!(display.contains("unknown field"));
+        assert!(!display.contains(secret_key));
+        assert!(!display.contains(secret_value));
+    }
+
+    #[test]
+    fn test_response_obfuscation_must_be_a_bounded_string() {
+        let invalid = json!({"known":true,"obfuscation":{"secret":"not padding"}});
+        let error = exact_event_keys(invalid.as_object().unwrap(), &["known"])
+            .expect_err("structured obfuscation must not bypass response validation");
+        assert!(error.to_string().contains("padding was invalid"));
+
+        let excessive = json!({
+            "known":true,
+            "obfuscation":"x".repeat(MAX_SSE_LINE_BYTES + 1)
+        });
+        let error = exact_event_keys(excessive.as_object().unwrap(), &["known"])
+            .expect_err("unbounded obfuscation must not bypass stream limits");
+        assert!(error.to_string().contains("exceeded the size limit"));
+
+        let terminal = json!({
+            "id":"resp-obfuscation",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[],
+            "obfuscation":"padding-is-not-terminal-metadata"
+        });
+        let error = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("event padding must not bypass terminal response validation");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_terminal_background_response_is_rejected() {
+        let response = json!({"id":"resp-background","background":true});
+        let error = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("Finch does not submit or accept background Responses runs here");
+        assert!(error.to_string().contains("background state was invalid"));
+    }
+
+    #[test]
+    fn test_terminal_completion_timestamp_must_be_null_or_nonnegative_numeric_seconds() {
+        for invalid in [json!(-1), json!("1777777777")] {
+            let response = json!({"id":"resp-timestamp","completed_at":invalid});
+            let error = parse_completed(
+                response.as_object().unwrap(),
+                DEFAULT_MODEL,
+                None,
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .err()
+            .expect("invalid completion timestamps must fail before projection");
+            assert!(error
+                .to_string()
+                .contains("completion timestamp was invalid"));
+        }
+    }
+
+    #[test]
+    fn test_terminal_penalties_must_remain_within_documented_bounds() {
+        for name in ["frequency_penalty", "presence_penalty"] {
+            let mut response = Map::new();
+            response.insert("id".to_string(), json!("resp-penalty"));
+            response.insert(name.to_string(), json!(2.01));
+            let error = parse_completed(
+                &response,
+                DEFAULT_MODEL,
+                None,
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .err()
+            .expect("out-of-range response penalties must fail before projection");
+            assert!(error.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn test_audited_terminal_tool_usage_is_bounded_but_not_projected() {
+        let mut response = Map::new();
+        response.insert("id".to_string(), json!("resp-extension"));
+        response.insert("model".to_string(), json!(DEFAULT_MODEL));
+        response.insert("status".to_string(), json!("completed"));
+        response.insert("output".to_string(), json!([]));
+        response.insert(
+            "tool_usage".to_string(),
+            json!({"future_accounting_shape":{"read":1}}),
+        );
+        parse_completed(
+            &response,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .expect("audited bounded terminal accounting metadata must be accepted");
+
+        response.insert(
+            "tool_usage".to_string(),
+            json!("x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)),
+        );
+        let error = parse_completed(
+            &response,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("terminal extension metadata must remain bounded");
+        assert!(error.to_string().contains("exceeded the size limit"));
+
+        response.remove("tool_usage");
+        response.insert("unknown_future_semantics".to_string(), json!(false));
+        let error = parse_completed(
+            &response,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("unaudited terminal fields must remain fail closed");
+        assert!(error.to_string().contains("unknown field"));
+
+        let executable_event = json!({
+            "type":"response.output_item.done",
+            "sequence_number":1,
+            "output_index":0,
+            "item":{"type":"message"},
+            "unknown_executable_semantics":true
+        });
+        let error = parse_event(
+            executable_event,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("unknown event semantics must remain strict");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_terminal_output_may_replace_only_opaque_streamed_state() {
+        let streamed_item = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"hello"}]
+        });
+        let terminal_item = json!({
+            "id":"msg-terminal",
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "phase":"final_answer",
+            "content":[{
+                "type":"output_text",
+                "text":"hello",
+                "annotations":[],
+                "logprobs":[]
+            }]
+        });
+        let response = json!({
+            "id":"resp-semantic",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[terminal_item]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(
+            0,
+            json!({
+                "type":"reasoning",
+                "summary":[],
+                "encrypted_content":"streamed-opaque"
+            }),
+        );
+        accumulator.output_items.insert(1, streamed_item.clone());
+        let terminal_reasoning = json!({
+            "type":"reasoning",
+            "summary":[],
+            "encrypted_content":"terminal-opaque"
+        });
+        let mut response = response;
+        response["output"] = json!([terminal_reasoning, terminal_item]);
+        let completed = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("terminal metadata enrichment must preserve semantic output equality");
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::OpaqueReasoning { encrypted_content }, ContentBlock::Text { text }]
+                if encrypted_content == "terminal-opaque" && text == "hello"
+        ));
+
+        let changed = json!({
+            "id":"resp-changed",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"different"}]
+            }]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, streamed_item);
+        let error = parse_completed(
+            changed.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .err()
+        .expect("terminal text drift must remain rejected");
+        assert!(error.to_string().contains("did not match"));
+    }
+
+    #[test]
+    fn test_empty_terminal_output_retains_validated_completed_stream_items() {
+        let streamed_item = json!({
+            "id":"msg-streamed",
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "phase":"final_answer",
+            "content":[{
+                "type":"output_text",
+                "text":"Finch native subscription transport accepted",
+                "annotations":[],
+                "logprobs":[]
+            }]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, streamed_item.clone());
+        let response = json!({
+            "id":"resp-compact-terminal",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[]
+        });
+
+        let completed = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("an empty compact terminal must retain completed stream items");
+
+        assert_eq!(accumulator.output_items.get(&0), Some(&streamed_item));
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::Text { text }]
+                if text == "Finch native subscription transport accepted"
+        ));
+    }
+
+    #[test]
+    fn test_terminal_output_may_consolidate_adjacent_streamed_text_items() {
+        let message = |text: &str| {
+            json!({
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":text}]
+            })
+        };
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, message("hello"));
+        accumulator.output_items.insert(1, message(" there"));
+        let response = json!({
+            "id":"resp-consolidated",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[message("hello there")]
+        });
+        let completed = parse_completed(
+            response.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("message item boundaries must not change ordered visible text semantics");
+        assert!(matches!(
+            completed.blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "hello there"
+        ));
+
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, message("hello"));
+        accumulator.output_items.insert(1, message(" there"));
+        let changed = json!({
+            "id":"resp-changed-consolidation",
+            "model":DEFAULT_MODEL,
+            "status":"completed",
+            "output":[message("hello world")]
+        });
+        let error = parse_completed(
+            changed.as_object().unwrap(),
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .err()
+        .expect("changed terminal text must remain rejected");
+        assert!(error.to_string().contains("did not match"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_lite_reconciles_consolidated_terminal_text_items() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(consolidated_text_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let response = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "hello there"
+        ));
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_responses_lite_retains_done_item_when_terminal_output_is_compact() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(compact_terminal_text_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+
+        let response = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("compact terminal output must retain the validated done item");
+
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentBlock::Text { text }]
+                if text == "Finch native subscription transport accepted"
+        ));
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[test]
+    fn test_terminal_text_consolidation_cannot_cross_or_mutate_tool_calls() {
+        let text = |value: &str| ContentBlock::Text {
+            text: value.to_string(),
+        };
+        let tool = |id: &str, name: &str, path: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({"path":path}),
+        };
+        let streamed = vec![
+            text("before"),
+            tool("call-1", "read", "a"),
+            text("between"),
+            tool("call-2", "write", "b"),
+            text("after"),
+        ];
+        for terminal in [
+            vec![
+                text("beforebetween"),
+                tool("call-1", "read", "a"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("changed-id", "read", "a"),
+                text("between"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("call-1", "write", "a"),
+                text("between"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("call-1", "read", "changed"),
+                text("between"),
+                tool("call-2", "write", "b"),
+                text("after"),
+            ],
+            vec![
+                text("before"),
+                tool("call-2", "write", "b"),
+                text("between"),
+                tool("call-1", "read", "a"),
+                text("after"),
+            ],
+        ] {
+            assert_ne!(observable_blocks(&streamed), observable_blocks(&terminal));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streamed_text_delta_drift_emits_no_terminal_projection() {
+        let body = completed_sse(DEFAULT_MODEL).replace(
+            "\"delta\":\"hello\"",
+            "\"delta\":\"unsafe-progressive-text\"",
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_delta = false;
+        let mut saw_terminal_projection = false;
+        let mut error = None;
+        while let Some(chunk) = receiver.recv().await {
+            match chunk {
+                Ok(StreamChunk::TextDelta(delta)) => {
+                    saw_delta |= delta == "unsafe-progressive-text";
+                }
+                Ok(StreamChunk::ResponseMetadata { .. })
+                | Ok(StreamChunk::Usage { .. })
+                | Ok(StreamChunk::Allowance { .. })
+                | Ok(StreamChunk::ContentBlockComplete(_)) => {
+                    saw_terminal_projection = true;
+                }
+                Err(stream_error) => error = Some(stream_error.to_string()),
+            }
+        }
+        assert!(
+            saw_delta,
+            "the test must observe the deliberately inconsistent progressive text"
+        );
+        assert!(
+            !saw_terminal_projection,
+            "a rejected terminal snapshot must not emit metadata or completed blocks"
+        );
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("did not match")),
+            "streamed text drift returned the wrong sanitized diagnostic; error={error:?}"
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_response_rejection_is_typed_clear_and_secret_free() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let attacker_body = format!(
+            "account-1 subscription-secret private-tool-argument private-reasoning{}",
+            "x".repeat(MAX_ERROR_BYTES)
+        );
         let inference = server
             .mock("POST", RESPONSES_PATH)
             .with_status(400)
-            .with_body(attacker_body)
+            .with_body(attacker_body.clone())
             .create_async()
             .await;
         let provider = ChatGptSubscriptionProvider::for_test(
@@ -3397,7 +6278,7 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("HTTP 400 Bad Request"));
         assert!(display.contains("pinned protocol contract may have changed"));
-        assert!(!display.contains(attacker_body));
+        assert!(!display.contains(attacker_body.as_str()));
         assert!(!display.contains("account-1"));
         assert!(!display.contains("subscription-secret"));
         assert!(display.len() < 256);
@@ -3406,7 +6287,7 @@ mod tests {
     }
 
     #[test]
-    fn hostile_origin_route_and_request_preflight_fail_before_credentials() {
+    fn test_hostile_origin_route_and_request_preflight_fail_before_credentials() {
         let source = Arc::new(StaticSource::new());
         for endpoint in [
             "https://api.openai.com/backend-api/codex",
@@ -3427,7 +6308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_image_and_history_fail_before_credential_or_network_use() {
+    async fn test_malformed_image_and_history_fail_before_credential_or_network_use() {
         let source = Arc::new(StaticSource::new());
         let provider = ChatGptSubscriptionProvider::for_test(
             source.clone(),
@@ -3449,7 +6330,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_argument_reasoning_and_sse_boundaries_are_enforced() {
+    fn test_tool_argument_reasoning_and_sse_boundaries_are_enforced() {
         let huge = "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1);
         let request = ProviderRequest::new(vec![Message::with_content(
             "assistant",
@@ -3463,43 +6344,5 @@ mod tests {
         assert!(responses_lite_request(&request, ReasoningEffort::High).is_err());
         assert!(enforce_sse_remainder_bounds(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
         assert!(sse_data(b"future: attacker-secret").is_err());
-    }
-
-    /// Opt-in live acceptance uses Finch's own named device credential. It is
-    /// ignored by default and intentionally never prints tokens or bodies.
-    #[tokio::test]
-    #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
-    async fn live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in() -> Result<()> {
-        if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
-            bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
-        }
-        let config = crate::config::load_config()?;
-        let profile = config
-            .providers
-            .iter()
-            .find(|entry| {
-                matches!(
-                    entry,
-                    crate::config::ProviderEntry::Credentialed {
-                        provider: CredentialProvider::ChatgptSubscription,
-                        ..
-                    }
-                )
-            })
-            .context("No Finch ChatGPT subscription profile is configured")?
-            .profile_name();
-        let provider = crate::providers::create_provider_profile_from_config(&config, &profile)?;
-        let response = provider
-            .send_message(
-                &ProviderRequest::new(vec![Message::user(
-                    "Reply with exactly: Finch native subscription transport accepted",
-                )])
-                .with_model(DEFAULT_MODEL),
-            )
-            .await?;
-        if response.model != DEFAULT_MODEL || response.text().is_empty() {
-            bail!("Live ChatGPT subscription acceptance returned incompatible provenance");
-        }
-        Ok::<(), anyhow::Error>(())
     }
 }
