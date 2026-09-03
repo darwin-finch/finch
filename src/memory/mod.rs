@@ -1162,25 +1162,33 @@ impl MemorySystem {
         promotion: Option<(NodeId, NodeId)>,
     ) -> Result<()> {
         let (changed, nodes): (Vec<NodeId>, Vec<TreeNode>) = {
-            let mut tree = self.tree.lock().await;
-            let changed = tree.take_dirty();
-            let nodes = changed
-                .iter()
-                .filter_map(|id| tree.all_nodes().get(id).cloned())
-                .collect();
+            let tree = self.tree.lock().await;
+            let changed = tree.dirty_nodes();
+            let mut nodes = Vec::with_capacity(changed.len());
+            for id in &changed {
+                let node = tree.all_nodes().get(id).ok_or_else(|| {
+                    // Unreachable while nothing removes nodes, and an error
+                    // rather than a skip precisely because this change exists
+                    // to bound silent loss: dropping a marked id here would be
+                    // the failure it is trying to prevent.
+                    anyhow::anyhow!(
+                        "memory: node {id} was marked for persistence but is not in the tree"
+                    )
+                })?;
+                nodes.push(node.clone());
+            }
             (changed, nodes)
         };
 
-        // A failure below leaves the transaction uncommitted, so the drained
-        // ids have to go back; otherwise the tree believes it was persisted and
-        // the next successful save skips those nodes for good. Writing the
-        // whole tree every time made this impossible to get wrong, which is
-        // part of why it survived.
-        let written = self.write_nodes(&nodes, source, promotion).await;
-        if written.is_err() {
-            self.tree.lock().await.restore_dirty(changed);
-        }
-        written
+        // The marks are *copied* above, not drained, and are cleared only once
+        // the transaction has committed. So a save that fails, panics, or is
+        // cancelled between here and the commit leaves them set, and the next
+        // save writes them. Draining first and restoring on error -- the
+        // obvious shape -- silently lost them to cancellation, which returns no
+        // error to restore on.
+        self.write_nodes(&nodes, source, promotion).await?;
+        self.tree.lock().await.mark_persisted(&changed);
+        Ok(())
     }
 
     /// Upsert exactly `nodes`, plus the provenance rows for this insert.
@@ -2003,20 +2011,25 @@ mod tests {
         Ok((tree_node_writes(temp.path())?, nodes))
     }
 
-    /// Everything the tree holds reaches disk, across promotions and dedup.
+    /// Every persisted column of every node reaches disk.
     ///
     /// This is the guard the incremental save needs and the old whole-tree
     /// write did not. Writing every node on every insert made a forgotten
-    /// write impossible; writing only the marked ones makes a forgotten *mark*
-    /// silent data loss. So this reloads the store from disk in a fresh
-    /// process-equivalent and requires the durable rows to carry every text
-    /// the in-memory tree has.
+    /// write impossible; writing only marked ones makes a forgotten *mark*
+    /// silent data loss.
     ///
-    /// The inputs are chosen to exercise all three mutation paths: distinct
-    /// texts attach children, near-duplicates promote leaves into parents, and
-    /// exact repeats take the dedup path that only bumps importance.
+    /// It compares whole nodes, not texts. An earlier version compared sorted
+    /// texts and review of #313 showed that was too weak to support the claim
+    /// made for it: deleting the dedup importance mark left it green, and so
+    /// did deleting the aggregation mark. Text alone cannot see a stale
+    /// `importance` or a parent embedding that never got its aggregate. Every
+    /// column the table stores is compared here, so a mark forgotten for any
+    /// of them fails.
+    ///
+    /// The inputs drive all three mutation paths. Instrumented while writing
+    /// this: 19 attaches, 61 promotions, 40 dedups.
     #[tokio::test]
-    async fn test_every_inserted_memory_survives_a_reload() -> Result<()> {
+    async fn test_every_persisted_column_survives_a_reload() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -2024,7 +2037,7 @@ mod tests {
             ..Default::default()
         };
 
-        let expected: Vec<String> = {
+        let expected: Vec<(NodeId, Option<NodeId>, String, usize, u8, Vec<f32>)> = {
             let memory = MemorySystem::new(config.clone())?;
             for i in 0..40 {
                 memory
@@ -2036,7 +2049,8 @@ mod tests {
                     )
                     .await?;
                 // Near-duplicate: close enough to descend to the same leaf and
-                // promote it rather than attach beside it.
+                // promote it into a parent rather than attach beside it. That
+                // is the path that creates aggregated embeddings.
                 memory
                     .insert_conversation(
                         "user",
@@ -2054,32 +2068,71 @@ mod tests {
                         None,
                     )
                     .await?;
+                // The same fact stored *explicitly*. This is the only way the
+                // dedup importance bump fires in production: `process` gives
+                // role "system" Critical and classifies everything else, and
+                // `extract` is role-independent below 300 characters, so this
+                // dedups onto the existing node and raises its importance.
+                //
+                // Without it the bump never triggers -- identical text from an
+                // identical role classifies identically, so
+                // `importance > node.importance` is false and there is nothing
+                // to persist. Review of #313 caught exactly that: deleting the
+                // mark left the suite green because no test reached the branch.
+                memory
+                    .insert_conversation(
+                        "system",
+                        &format!("a distinct memory numbered {i}"),
+                        None,
+                        None,
+                    )
+                    .await?;
             }
-            let tree = memory.tree.lock().await;
-            let mut texts: Vec<String> =
-                tree.all_nodes().values().map(|n| n.text.clone()).collect();
-            texts.sort();
-            texts
+            snapshot(&memory).await
         };
 
-        // Reopen from the same file. `MemorySystem::new` hydrates from disk, so
+        // Reopen from the same file: `MemorySystem::new` hydrates from disk, so
         // this is the restart path.
         let reopened = MemorySystem::new(config)?;
         reopened.ensure_hydrated().await?;
-        let restored: Vec<String> = {
-            let tree = reopened.tree.lock().await;
-            let mut texts: Vec<String> =
-                tree.all_nodes().values().map(|n| n.text.clone()).collect();
-            texts.sort();
-            texts
-        };
+        let restored = snapshot(&reopened).await;
 
         assert_eq!(
-            restored, expected,
-            "the durable rows must carry every text the tree held; a node whose \
-             mutation forgot to mark it dirty is lost here and nowhere else"
+            restored.len(),
+            expected.len(),
+            "a node was lost entirely between memory and disk"
         );
+        for (before, after) in expected.iter().zip(restored.iter()) {
+            assert_eq!(
+                before, after,
+                "a persisted column did not survive the reload; a mutation that \
+                 forgot to mark its node dirty is lost here and nowhere else"
+            );
+        }
         Ok(())
+    }
+
+    /// Every node's persisted columns, ordered by id.
+    async fn snapshot(
+        memory: &MemorySystem,
+    ) -> Vec<(NodeId, Option<NodeId>, String, usize, u8, Vec<f32>)> {
+        let tree = memory.tree.lock().await;
+        let mut rows: Vec<_> = tree
+            .all_nodes()
+            .values()
+            .map(|n| {
+                (
+                    n.id,
+                    n.parent,
+                    n.text.clone(),
+                    n.level,
+                    n.importance,
+                    n.embedding.clone(),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|row| row.0);
+        rows
     }
 
     /// One new memory must not rewrite every node in the tree.

@@ -587,40 +587,61 @@ impl MemTree {
     }
 
     /// Mutable access to nodes map (used by persistence layer to reconstruct tree).
-    pub fn all_nodes_mut(&mut self) -> &mut HashMap<NodeId, TreeNode> {
+    /// Mutable access to every node, **without marking anything dirty**.
+    ///
+    /// Crate-visible on purpose. Before persistence became incremental an
+    /// unmarked mutation here was merely wasteful; now it is silent data loss,
+    /// and nothing in the type system says so. The callers are the hydration
+    /// paths, which are reconstructing the tree *from* the durable rows and
+    /// must not mark them for rewriting. Anything else that mutates a
+    /// persisted column belongs on `MemTree` itself, where it can mark.
+    pub(crate) fn all_nodes_mut(&mut self) -> &mut HashMap<NodeId, TreeNode> {
         &mut self.nodes
     }
 
-    /// Take the set of nodes whose persisted columns changed, clearing it.
+    /// The nodes whose persisted columns have changed, ascending.
     ///
-    /// The caller is committing them; anything it does not write is lost, so
-    /// this drains rather than copies only because the write happens in the
-    /// same transaction. A failed save must put them back -- see
-    /// `restore_dirty`.
-    pub fn take_dirty(&mut self) -> Vec<NodeId> {
-        let mut ids: Vec<NodeId> = self.dirty.drain().collect();
-        // Ascending, so a parent row lands before the child that references
-        // it. New nodes always take a higher id than the parent they attach
-        // to, and the root is 0.
+    /// A **copy**, not a drain. An earlier version drained here and put the
+    /// ids back if the transaction failed, which left two holes: a future
+    /// cancelled between the drain and the commit dropped them with no error
+    /// and no restore, and a concurrent save could drain a node the other save
+    /// then referenced before it was committed. Copying closes both -- nothing
+    /// is forgotten until `mark_persisted` is told it reached disk -- at the
+    /// cost of writing a node twice when two saves overlap, which an upsert
+    /// makes harmless.
+    ///
+    /// Ascending, so a parent row lands before the child that references it.
+    /// New nodes always take a higher id than the parent they attach to, and
+    /// the root is 0.
+    pub fn dirty_nodes(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self.dirty.iter().copied().collect();
         ids.sort_unstable();
         ids
     }
 
-    /// Put drained ids back after a save that did not commit.
+    /// Forget exactly the ids that a transaction committed.
     ///
-    /// Without this a failed transaction would leave the tree believing it had
-    /// been persisted, and the next successful save would skip those nodes
-    /// permanently.
-    pub fn restore_dirty(&mut self, ids: impl IntoIterator<Item = NodeId>) {
-        self.dirty.extend(ids);
+    /// Only these, never the whole set: another task may have marked more
+    /// nodes while this save was writing, and those still need persisting.
+    pub fn mark_persisted(&mut self, ids: &[NodeId]) {
+        for id in ids {
+            self.dirty.remove(id);
+        }
     }
 
     /// Forget pending changes, because the tree now matches the durable rows.
     ///
     /// Only for the hydration paths, which replace the tree wholesale from
-    /// disk.
+    /// disk. **The root's mark survives**, because a reload does not prove the
+    /// root is on disk: a store with zero `tree_nodes` rows reloads into a
+    /// tree whose root has never been written, and the next insert's child row
+    /// would then violate `parent_id`'s foreign key. Review of #313 found that
+    /// the root only stayed durable because `update_parent_aggregation`
+    /// happened to re-mark it on every insert -- the incidental guarantee this
+    /// change was supposed to replace with a deliberate one.
     pub fn clear_dirty(&mut self) {
         self.dirty.clear();
+        self.dirty.insert(self.root);
     }
 
     /// Set the next_id counter (used after loading from disk to avoid ID collisions).
