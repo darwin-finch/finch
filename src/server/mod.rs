@@ -23,8 +23,7 @@ pub use brain_runner::{
     RunnerHostEffectPermit, RunnerMemoryProjectionRequest, RunnerOperation,
     RunnerProgramControlRequest, RunnerProgramError, RunnerProgramInteraction,
     RunnerProgramRequest, RunnerProgramResult, RunnerProjectionError, RunnerRegistrationId,
-    RunnerRequest,
-    RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
+    RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
     RunnerTurnRequest, RunnerTurnResult, RUNNER_UNAVAILABLE_PREFIX,
 };
 pub use brain_service::{

@@ -1432,7 +1432,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(value) => value,
             Err(error) => return Promise::err(error),
         };
-        let rendered = match required_runner_text(request.get_rendered(), "rendered") {
+        let source = match required_runner_text(request.get_source(), "source") {
             Ok(value) => value,
             Err(error) => return Promise::err(error),
         };
@@ -1908,7 +1908,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(value) => value,
             Err(error) => return Promise::err(error),
         };
-        let source = match required_runner_text(request.get_source(), "source") {
+        let rendered = match required_runner_text(request.get_rendered(), "rendered") {
             Ok(value) => value,
             Err(error) => return Promise::err(error),
         };
@@ -2943,7 +2943,7 @@ mod tests {
                 request.set_brain_id(&brain_id);
                 request.set_brain("shared");
                 request.set_run_id(&run_id);
-                request.set_source("valid");
+                request.set_rendered("valid");
             }
             let error = match missing_memory.send().promise.await {
                 Err(error) => error.to_string(),
@@ -2958,11 +2958,11 @@ mod tests {
                 request.set_brain("shared");
                 request.set_run_id(&run_id);
                 request.set_prompt("valid");
-                request.set_source(capnp::text::Reader(&[0xff, 0xfe]));
+                request.set_rendered(capnp::text::Reader(&[0xff, 0xfe]));
             }
             let error = match invalid_memory.send().promise.await {
                 Err(error) => error.to_string(),
-                Ok(_) => panic!("invalid memory source was accepted"),
+                Ok(_) => panic!("invalid rendered memory output was accepted"),
             };
             assert!(error.contains("UTF-8"), "unexpected error: {error}");
 
