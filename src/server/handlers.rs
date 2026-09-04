@@ -132,6 +132,18 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
 /// The TLS listener deliberately exposes only the collaboration protocol.
 /// Daemon administration, passwords, file APIs, provider APIs, and registry
 /// endpoints remain on the loopback listener.
+///
+/// With one exception, stated here because this sentence was becoming less
+/// true than it reads. `/health` is mounted on this router and now reports
+/// real process uptime (#131), so it does carry a little daemon-administration
+/// data — beside the `named_brains` and `pending_brain_terminalizations`
+/// counts already in that payload. This router attaches no auth layer, so all
+/// of it is readable by any peer that can reach the advertised listener.
+///
+/// Accepted deliberately: process age is not a secret and #131 asks for
+/// truthful health. If that stops being acceptable, the split already exists —
+/// `RestrictedBrainListener` is available as an extension here, and
+/// `health_check` simply ignores it today.
 pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
     Router::new()
         .route(

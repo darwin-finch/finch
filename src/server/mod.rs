@@ -111,7 +111,13 @@ pub struct AgentServer {
     /// `named_brains` and `pending_brain_terminalizations` already exposed
     /// there. That is a deliberate acceptance of a small disclosure, not an
     /// oversight: process age is not a secret, and #131 asks for truthful
-    /// health. Anything more sensitive belongs on the loopback router.
+    /// health. Anything more sensitive belongs on the local router.
+    ///
+    /// That router is loopback *by default*, not by construction:
+    /// `bind_address` is user-configurable and the CLI help itself suggests
+    /// `--bind 0.0.0.0:8000`, while `requires_client_auth` covers only the
+    /// three inference routes. So a non-loopback bind publishes `/metrics`
+    /// unauthenticated too.
     started_at: std::time::Instant,
     /// Claude API client (shared across sessions; kept for backward compat with handlers.rs)
     claude_client: Arc<ClaudeClient>,
@@ -1276,44 +1282,90 @@ mod tests {
         );
     }
 
-    /// `/metrics` exposes what is measured and nothing invented.
+    /// `/metrics` reports a measured value, not a constant.
     ///
-    /// It used to return a constant `finch_queries_total 0`, which a scraper
-    /// cannot tell from "no queries yet" (#131). Both halves are asserted: the
-    /// uptime gauge is present, and the fabricated counter is gone — so
-    /// reintroducing a zeroed placeholder fails here.
+    /// Asserting the series *name* is not enough, and review of #334 proved
+    /// it: hardcoding `finch_daemon_uptime_seconds 0` left the whole suite
+    /// green, which is #131's own acceptance wording ("never reports
+    /// fabricated zero placeholders as live truth") failing under the name
+    /// this PR introduced. A `contains` check was also satisfied by the
+    /// `# HELP` line alone, so an endpoint emitting no sample at all passed.
+    ///
+    /// So this parses the sample and scrapes twice. A constant fails whatever
+    /// it is named and whatever value it is given, which a name check
+    /// structurally cannot catch.
     #[tokio::test]
-    async fn production_router_metrics_reports_only_measured_series() {
+    async fn production_router_metrics_reports_a_measured_value() {
         use tower::ServiceExt as _;
         let (_state, server) = isolated_http_server();
-        let response = isolated_http_router(server)
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/metrics")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("metrics body");
-        let text = String::from_utf8(body.to_vec()).expect("metrics is UTF-8");
+        async fn scrape(server: Arc<AgentServer>) -> String {
+            use tower::ServiceExt as _;
+            let response = isolated_http_router(server)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/metrics")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("metrics body");
+            String::from_utf8(body.to_vec()).expect("metrics is UTF-8")
+        }
+
+        fn gauge(text: &str) -> f64 {
+            text.lines()
+                .find_map(|line| line.strip_prefix("finch_daemon_uptime_seconds "))
+                .unwrap_or_else(|| panic!("no gauge sample line in:\n{text}"))
+                .trim()
+                .parse()
+                .unwrap_or_else(|error| panic!("gauge is not a float ({error}) in:\n{text}"))
+        }
+
+        let first_text = scrape(Arc::clone(&server)).await;
+        assert!(
+            first_text.contains("# TYPE finch_daemon_uptime_seconds gauge"),
+            "the gauge needs its TYPE line: {first_text}"
+        );
+        // Every series present must be one this daemon actually measures.
+        //
+        // Naming the historical offender alone was not enough: review of #334
+        // added `finch_requests_total 0` beside a working gauge and the test
+        // passed. #131 asks that no fabricated placeholder be published, not
+        // that one string stay absent, so the check is a whitelist —
+        // publishing anything new requires deciding here whether it is
+        // measured.
+        const MEASURED: [&str; 1] = ["finch_daemon_uptime_seconds"];
+        for line in first_text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let series = line.split_whitespace().next().unwrap_or_default();
+            assert!(
+                MEASURED.contains(&series),
+                "`{series}` is published but not in the measured set. If it is \
+                 real, add it to MEASURED; if it is a placeholder, do not \
+                 publish it (#131): {first_text}"
+            );
+        }
+
+        let first = gauge(&first_text);
+        assert!(
+            first > 0.0,
+            "the gauge must report measured time, not zero: {first_text}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = gauge(&scrape(server).await);
 
         assert!(
-            text.contains("# TYPE finch_daemon_uptime_seconds gauge"),
-            "the uptime gauge must be exposed with its TYPE line: {text}"
-        );
-        assert!(
-            text.contains("finch_daemon_uptime_seconds "),
-            "the gauge must carry a sample line: {text}"
-        );
-        assert!(
-            !text.contains("finch_queries_total"),
-            "a series nothing measures must not be published; that placeholder \
-             is the defect #131 names: {text}"
+            second > first,
+            "two scrapes must differ -- a constant is a fabricated series \
+             whatever it is called: {first} then {second}"
         );
     }
 

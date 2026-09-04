@@ -116,7 +116,7 @@ canonical request lifecycle.
 ```
 # HELP finch_daemon_uptime_seconds Seconds since this server was constructed.
 # TYPE finch_daemon_uptime_seconds gauge
-finch_daemon_uptime_seconds 1874
+finch_daemon_uptime_seconds 1874.320001234
 ```
 
 ## Session Management
