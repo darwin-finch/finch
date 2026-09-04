@@ -30,6 +30,28 @@ pub fn claim_notice_showing_now(
         chrono::Duration::days(7),
     )
 }
+
+/// Forget any recorded notice suppression, so the next start shows it.
+///
+/// Called when a licence is removed: that used to un-suppress the notice as a
+/// side effect of writing `notice_suppress_until: None` to the config, and the
+/// move to a state file silently stopped it working (#329 review).
+pub fn forget_notice_suppression() {
+    if let Ok(path) = notice_state::notice_state_path() {
+        notice_state::forget_recorded_suppression(&path);
+    }
+}
+
+/// The startup decision with every path injected, for tests that need to prove
+/// `config.toml` is untouched. See `notice_state::claim_notice_showing_for`.
+pub(crate) fn claim_notice_showing_for(
+    config: &Config,
+    config_path: &std::path::Path,
+    state_path: &std::path::Path,
+    today: chrono::NaiveDate,
+) -> bool {
+    notice_state::claim_notice_showing_for(config, config_path, state_path, today)
+}
 pub mod persona;
 pub mod provider;
 mod settings;

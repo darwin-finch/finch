@@ -2314,6 +2314,10 @@ impl EventLoop {
                         cfg.license.notice_suppress_until.as_deref(),
                         today,
                     );
+                    // NOTE: the invariant that this block writes no config is
+                    // tested at `claim_notice_showing_for`, which takes both
+                    // paths. Keep any future write of `cfg` out of here, or
+                    // move it there so the test can see it.
                     if should_show {
                         // Startup notices are application status, not a
                         // conversation artifact. Keeping this out of the
@@ -3244,6 +3248,13 @@ Rules:\n\
                         use crate::config::{load_config, LicenseConfig};
                         if let Ok(mut cfg) = load_config() {
                             cfg.license = LicenseConfig::default();
+                            // Removing a licence un-suppressed the notice as a side effect of
+
+                            // writing `notice_suppress_until: None`. The record lives in a state
+
+                            // file now, so that has to be explicit (#329 review).
+
+                            crate::config::forget_notice_suppression();
                             if let Err(e) = cfg.save() {
                                 self.output_manager
                                     .write_info(format!("⚠️  Could not save config: {}", e));

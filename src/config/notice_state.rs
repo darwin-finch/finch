@@ -65,13 +65,32 @@ impl NoticeState {
     }
 }
 
+/// Forget any recorded suppression, so the next start shows the notice.
+///
+/// `finch license remove` used to achieve this for free: it wrote
+/// `LicenseConfig::default()`, whose `notice_suppress_until` is `None`, and
+/// the notice reappeared next start. Once the record moved out of the config
+/// that stopped working — the state file wins, so removing a licence left the
+/// user un-nagged until the old date expired. Review of #329 caught it;
+/// deleting the file restores the previous behaviour exactly.
+pub(crate) fn forget_recorded_suppression(state_path: &Path) {
+    // Absent is the same as forgotten, so a failure here costs one missed
+    // notice rather than anything durable.
+    let _ = std::fs::remove_file(state_path);
+}
+
 /// Decide whether to show the notice, and record the decision — **without
 /// touching `config.toml`**.
 ///
 /// `config_suppress_until` is the legacy value that used to live in
 /// `config.toml`. It is still read, so an existing installation's suppression
-/// survives this change; it is never written back. Once the state file exists
-/// it wins, because it is the only one this code updates.
+/// survives this change; it is never written back.
+///
+/// A state file that *carries a date* wins. One that exists but holds no date
+/// — an empty file, or a serialized default, which `skip_serializing_if`
+/// renders as empty — falls back to the config value, because `.or` runs on
+/// the `Option` before parsing. That fallback is right, and it is not what an
+/// earlier version of this sentence claimed.
 pub(crate) fn claim_notice_showing(
     state_path: &Path,
     config_suppress_until: Option<&str>,
@@ -98,6 +117,33 @@ pub(crate) fn claim_notice_showing(
     // is a far smaller cost than refusing to start or writing to the config.
     let _ = next.save_to(state_path);
     true
+}
+
+/// The whole startup decision, taking every path it touches as an argument.
+///
+/// This exists so the #76 invariant can be tested. The narrower
+/// `claim_notice_showing` cannot express it: it takes the legacy date as an
+/// `Option<&str>` and has no config path at all, so it is *structurally
+/// incapable* of writing `config.toml` — which makes a "the config was not
+/// touched" assertion against it vacuous. Review of #329 proved that by
+/// restoring the original defect to the startup path and watching all 96 tests
+/// pass.
+///
+/// The startup path calls this, so a test that points `config_path` and
+/// `state_path` at a temporary directory exercises the same code the REPL runs.
+pub(crate) fn claim_notice_showing_for(
+    config: &crate::config::Config,
+    config_path: &Path,
+    state_path: &Path,
+    today: chrono::NaiveDate,
+) -> bool {
+    let _ = config_path; // Deliberately unused: nothing here may write it.
+    claim_notice_showing(
+        state_path,
+        config.license.notice_suppress_until.as_deref(),
+        today,
+        chrono::Duration::days(7),
+    )
 }
 
 #[cfg(test)]
@@ -224,6 +270,99 @@ mod tests {
             Some("2026-09-10"),
             "and records the next date in the state file, not the config"
         );
+    }
+
+    /// The #76 invariant, at the seam the startup path actually calls.
+    ///
+    /// This is the regression test. The one below it, which asserts bytes and
+    /// mtime against `claim_notice_showing`, cannot fail for the right reason:
+    /// that function receives the legacy date as an `Option<&str>` and never
+    /// sees a config path, so it could not write `config.toml` even if it
+    /// tried. Review of #329 restored the original defect to `event_loop.rs`
+    /// and all 96 tests passed.
+    ///
+    /// `claim_notice_showing_for` takes both paths, so a restored
+    /// `config.save_to(config_path)` inside it fails here.
+    #[test]
+    fn test_the_startup_decision_leaves_the_config_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join("config.toml");
+        let original =
+            b"# a comment the serializer would drop\n[license]\nlicense_type = \"noncommercial\"\n";
+        std::fs::write(&config_path, original).unwrap();
+        let before = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let config = crate::config::Config::new(Vec::new());
+        let state_path = home.path().join("notice_state.toml");
+        assert!(
+            crate::config::claim_notice_showing_for(
+                &config,
+                &config_path,
+                &state_path,
+                day("2026-09-03"),
+            ),
+            "nothing recorded, so the notice is due"
+        );
+
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            original,
+            "the startup decision must not rewrite config.toml -- this is #76"
+        );
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().modified().unwrap(),
+            before,
+            "nor move its mtime: an identical-bytes rewrite still tells every \
+             backup and sync tool the file changed"
+        );
+
+        // The record went to the state file, and nothing else was left beside
+        // it -- a surviving `.tmp` would mean the atomic write did not complete.
+        let written: Vec<String> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.toml")
+            .collect();
+        assert_eq!(
+            written,
+            vec!["notice_state.toml".to_string()],
+            "the state file, and no temporary left behind"
+        );
+    }
+
+    /// Removing a licence makes the notice due again.
+    ///
+    /// This used to happen for free: `LicenseRemove` wrote
+    /// `LicenseConfig::default()` with `notice_suppress_until: None`, and the
+    /// notice reappeared. Moving the record to a state file silently broke it,
+    /// because the state file wins over the config's `None` — so a user who
+    /// removed their licence stayed un-nagged until the old date expired.
+    /// Nothing caught that; review of #329 did.
+    #[test]
+    fn test_removing_a_licence_makes_the_notice_due_again() {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("notice_state.toml");
+
+        assert!(claim_notice_showing(
+            &state,
+            None,
+            day("2026-09-03"),
+            Duration::days(7)
+        ));
+        assert!(
+            !claim_notice_showing(&state, None, day("2026-09-04"), Duration::days(7)),
+            "still inside the period, so suppressed"
+        );
+
+        forget_recorded_suppression(&state);
+
+        assert!(
+            claim_notice_showing(&state, None, day("2026-09-04"), Duration::days(7)),
+            "removing the licence must make it due again on the same day"
+        );
+        // And forgetting when there is nothing recorded is not an error.
+        forget_recorded_suppression(&home.path().join("absent.toml"));
     }
 
     /// The boundary matches the behaviour this replaced, exactly.
