@@ -1113,11 +1113,8 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
-    fn observe_model(&mut self, model: &str, expected_model: &str) -> Result<()> {
+    fn observe_model(&mut self, model: &str) -> Result<()> {
         validate_identifier(model, 256, "actual model")?;
-        if !model_is_compatible(expected_model, model) {
-            bail!("ChatGPT subscription returned an incompatible actual model");
-        }
         if self
             .actual_model
             .as_deref()
@@ -1137,16 +1134,14 @@ async fn consume_sse(
     expected_model: String,
     allowed_tools: HashSet<String>,
 ) -> Result<CompletedResponse> {
-    let header_model = bounded_header(response.headers(), "openai-model")?;
     let header_allowance = parse_allowance_headers(response.headers())?;
+    let mut accumulator = StreamAccumulator::default();
+    observe_outer_model_headers(response.headers(), &mut accumulator)?;
+    let header_model = accumulator.actual_model.clone();
     let mut bytes = response.bytes_stream();
     let mut buffer = Vec::new();
     let mut total = 0usize;
     let mut terminal: Option<CompletedResponse> = None;
-    let mut accumulator = StreamAccumulator::default();
-    if let Some(model) = header_model.as_deref() {
-        accumulator.observe_model(model, &expected_model)?;
-    }
     let mut done_seen = false;
     let mut last_sequence = None;
     loop {
@@ -1294,8 +1289,8 @@ fn parse_event(
                 .get("response")
                 .and_then(Value::as_object)
                 .context("ChatGPT response lifecycle event omitted response")?;
-            observe_response_model(response, expected_model, accumulator)?;
-            observe_event_headers(object, expected_model, accumulator)?;
+            observe_response_model(response, accumulator)?;
+            observe_event_headers(object, accumulator)?;
             Ok(None)
         }
         "response.metadata" | "codex.response.metadata" => {
@@ -1326,7 +1321,7 @@ fn parse_event(
                     }
                 }
             }
-            observe_event_headers(object, expected_model, accumulator)?;
+            observe_event_headers(object, accumulator)?;
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
@@ -1454,7 +1449,6 @@ fn validate_output_item_shape(item: &Value) -> Result<()> {
 
 fn observe_response_model(
     response: &Map<String, Value>,
-    expected_model: &str,
     accumulator: &mut StreamAccumulator,
 ) -> Result<()> {
     if let Some(headers) = response.get("headers") {
@@ -1472,7 +1466,7 @@ fn observe_response_model(
                         .context("ChatGPT response model header was invalid")?,
                     _ => bail!("ChatGPT response model header was invalid"),
                 };
-                accumulator.observe_model(model, expected_model)?;
+                accumulator.observe_model(model)?;
             }
         }
     }
@@ -1481,7 +1475,6 @@ fn observe_response_model(
 
 fn observe_event_headers(
     event: &Map<String, Value>,
-    expected_model: &str,
     accumulator: &mut StreamAccumulator,
 ) -> Result<()> {
     let Some(headers) = event.get("headers") else {
@@ -1500,7 +1493,7 @@ fn observe_event_headers(
                     .context("ChatGPT response model header was invalid")?,
                 _ => bail!("ChatGPT response model header was invalid"),
             };
-            accumulator.observe_model(model, expected_model)?;
+            accumulator.observe_model(model)?;
         }
     }
     Ok(())
@@ -1641,14 +1634,19 @@ fn parse_completed(
         bail!("ChatGPT terminal response status was invalid");
     }
     let id = required_identifier(response, "id", 256)?;
-    observe_response_model(response, expected_model, accumulator)?;
+    observe_response_model(response, accumulator)?;
     if let Some(header_model) = header_model {
-        accumulator.observe_model(header_model, expected_model)?;
+        accumulator.observe_model(header_model)?;
     }
+    // Responses-Lite may route the selected catalog model through another
+    // serving model and does not consistently emit an `openai-model` header.
+    // Report a bounded explicit serving model when present; otherwise retain
+    // the validated route Finch requested. Never trust the terminal payload's
+    // passive `model` field, and reject contradictory explicit identities.
     let response_model = accumulator
         .actual_model
         .clone()
-        .context("ChatGPT subscription response omitted actual model provenance")?;
+        .unwrap_or_else(|| expected_model.to_string());
     let terminal_output = response
         .get("output")
         .map(|output| {
@@ -1666,17 +1664,21 @@ fn parse_completed(
         if !accumulator.output_items.is_empty() {
             validate_output_snapshot(accumulator.output_items.values(), allowed_tools)?;
             validate_output_snapshot(output.iter(), allowed_tools)?;
-            if output.len() != accumulator.output_items.len()
-                || output.iter().enumerate().any(|(index, item)| {
-                    accumulator
-                        .output_items
-                        .get(&(index as u64))
-                        .is_none_or(|streamed| {
-                            canonical_output_item(streamed) != canonical_output_item(item)
-                        })
-                })
-            {
-                bail!("ChatGPT terminal output did not match streamed output items");
+            if output.len() != accumulator.output_items.len() {
+                bail!(
+                    "ChatGPT terminal output item count did not match the streamed output item count"
+                );
+            }
+            for (index, item) in output.iter().enumerate() {
+                let streamed = accumulator
+                    .output_items
+                    .get(&(index as u64))
+                    .context("ChatGPT streamed output item index was missing")?;
+                if canonical_output_item(streamed) != canonical_output_item(item) {
+                    bail!(
+                        "ChatGPT terminal output item {index} did not match its streamed semantic content"
+                    );
+                }
             }
         }
         if accumulator.output_items.is_empty() {
@@ -1726,21 +1728,28 @@ fn validate_output_snapshot<'a>(
 
 fn canonical_output_item(item: &Value) -> Value {
     let mut canonical = item.clone();
-    let Some(content) = canonical
-        .as_object_mut()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
-        .and_then(|item| item.get_mut("content"))
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(object) = canonical.as_object_mut() else {
         return canonical;
     };
-    for part in content {
-        let Some(part) = part.as_object_mut() else {
-            continue;
-        };
-        if part.get("type").and_then(Value::as_str) == Some("output_text") {
-            part.remove("annotations");
-            part.remove("logprobs");
+    for field in [
+        "id",
+        "status",
+        "phase",
+        "internal_chat_message_metadata_passthrough",
+    ] {
+        object.remove(field);
+    }
+    if object.get("type").and_then(Value::as_str) == Some("message") {
+        if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
+            for part in content {
+                let Some(part) = part.as_object_mut() else {
+                    continue;
+                };
+                if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                    part.remove("annotations");
+                    part.remove("logprobs");
+                }
+            }
         }
     }
     canonical
@@ -2184,11 +2193,6 @@ fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Optio
     )
 }
 
-fn model_is_compatible(requested: &str, actual: &str) -> bool {
-    matches!(requested, DEFAULT_MODEL | MODEL_ALIAS)
-        && matches!(actual, DEFAULT_MODEL | MODEL_ALIAS)
-}
-
 fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         bail!("ChatGPT subscription response contained an unknown field");
@@ -2259,6 +2263,19 @@ fn bounded_header(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Op
             Ok(value.to_string())
         })
         .transpose()
+}
+
+fn observe_outer_model_headers(
+    headers: &reqwest::header::HeaderMap,
+    accumulator: &mut StreamAccumulator,
+) -> Result<()> {
+    for value in headers.get_all("openai-model") {
+        let model = value
+            .to_str()
+            .context("ChatGPT subscription response model header was invalid")?;
+        accumulator.observe_model(model)?;
+    }
+    Ok(())
 }
 
 async fn read_bounded(
@@ -2440,7 +2457,13 @@ mod tests {
         .to_string()
     }
 
-    fn completed_sse(model: &str) -> String {
+    fn completed_sse_with_model_provenance(model: Option<&str>) -> String {
+        let created = match model {
+            Some(model) => {
+                json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}})
+            }
+            None => json!({"type":"response.created","sequence_number":1,"response":{}}),
+        };
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
@@ -2451,13 +2474,17 @@ mod tests {
                 "event: response.completed\ndata: {}\n\n",
                 "data: [DONE]\n\n"
             ),
-            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            created,
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
             json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
             json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
             json!({"type":"response.output_item.done","sequence_number":5,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
             json!({"type":"response.completed","sequence_number":6,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
         )
+    }
+
+    fn completed_sse(model: &str) -> String {
+        completed_sse_with_model_provenance(Some(model))
     }
 
     fn completed_sse_with_audited_passive_fields(model: &str) -> String {
@@ -2518,7 +2545,7 @@ mod tests {
             "output".to_string(),
             json!([
                 {"type":"reasoning","summary":[],"encrypted_content":"opaque-1"},
-                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}
+                {"id":"message-terminal","type":"message","status":"completed","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"source":"terminal"},"content":[{"type":"output_text","text":"hello"}]}
             ]),
         );
         let completed = json!({
@@ -2540,7 +2567,7 @@ mod tests {
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}},"obfuscation":"padding-created","safety_buffering":{"enabled":false}}),
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"},"obfuscation":"padding-reasoning"}),
             json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello","logprobs":[],"obfuscation":"padding-delta"}),
-            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]},"obfuscation":"padding-message"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"id":"message-stream","type":"message","status":"completed","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"source":"stream"},"content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]},"obfuscation":"padding-message"}),
             completed
         )
     }
@@ -2649,7 +2676,10 @@ mod tests {
         format!("http://{address}/backend-api/codex")
     }
 
-    async fn subscription_stream_outcome(body: String, header_model: &str) -> Vec<String> {
+    async fn subscription_stream_outcome(
+        body: String,
+        header_model: &str,
+    ) -> Vec<std::result::Result<StreamChunk, String>> {
         let mut server = mockito::Server::new_async().await;
         let _models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2679,13 +2709,11 @@ mod tests {
             .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
             .await
             .unwrap();
-        let mut errors = Vec::new();
+        let mut outcome = Vec::new();
         while let Some(chunk) = receiver.recv().await {
-            if let Err(error) = chunk {
-                errors.push(error.to_string());
-            }
+            outcome.push(chunk.map_err(|error| error.to_string()));
         }
-        errors
+        outcome
     }
 
     #[test]
@@ -2985,7 +3013,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_model_uses_authoritative_header_and_never_payload_model() {
+    fn test_actual_model_uses_authoritative_header_or_requested_route_and_never_payload_model() {
         let allowed = HashSet::new();
         let terminal = json!({
             "id":"resp-1",
@@ -3002,21 +3030,26 @@ mod tests {
             &allowed,
             &mut accumulator,
         )
-        .unwrap();
-        assert_eq!(completed.model, DEFAULT_MODEL);
+        .expect("a valid authoritative header must complete successfully");
+        assert_eq!(
+            completed.model, DEFAULT_MODEL,
+            "authoritative header model was not retained; observed_model={}",
+            completed.model
+        );
 
         let mut accumulator = StreamAccumulator::default();
-        let error = parse_completed(
+        let completed = parse_completed(
             terminal.as_object().unwrap(),
             DEFAULT_MODEL,
             None,
             &allowed,
             &mut accumulator,
         )
-        .err()
-        .expect("missing authoritative model header must fail")
-        .to_string();
-        assert!(error.contains("omitted actual model provenance"));
+        .expect("missing authoritative model provenance must retain the validated requested route");
+        assert_eq!(
+            completed.model, DEFAULT_MODEL,
+            "missing provenance must not copy the untrusted terminal payload model"
+        );
     }
 
     #[test]
@@ -3382,7 +3415,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_metadata_events_preserve_top_level_actual_model_and_reject_drift() {
+    fn test_metadata_events_accept_a_routed_model_and_reject_within_response_drift() {
         for kind in ["response.metadata", "codex.response.metadata"] {
             let mut accumulator = StreamAccumulator::default();
             let event = json!({
@@ -3392,23 +3425,57 @@ mod tests {
                 "headers":{"OpenAI-Model":DEFAULT_MODEL},
                 "metadata":{}
             });
-            assert!(parse_event(
+            let parsed = parse_event(
                 event,
                 DEFAULT_MODEL,
                 None,
                 &HashSet::new(),
                 &mut accumulator,
             )
-            .unwrap()
-            .is_none());
-            assert_eq!(accumulator.actual_model.as_deref(), Some(DEFAULT_MODEL));
+            .unwrap_or_else(|error| panic!("{kind} rejected a valid model header: {error:#}"));
+            assert!(
+                parsed.is_none(),
+                "{kind} unexpectedly completed a response; completed={}",
+                parsed.is_some()
+            );
+            assert_eq!(
+                accumulator.actual_model.as_deref(),
+                Some(DEFAULT_MODEL),
+                "{kind} did not retain its observed model; accumulator={:?}",
+                accumulator.actual_model
+            );
         }
 
         let mut accumulator = StreamAccumulator::default();
-        let drift = json!({
+        let routed = json!({
             "type":"response.metadata",
             "sequence_number":1,
             "headers":{"openai-model":"gpt-4o"}
+        });
+        let parsed = parse_event(
+            routed,
+            DEFAULT_MODEL,
+            None,
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .expect("a bounded serving-model identifier may differ from the requested route");
+        assert!(
+            parsed.is_none(),
+            "routed model metadata unexpectedly completed a response; completed={}",
+            parsed.is_some()
+        );
+        assert_eq!(
+            accumulator.actual_model.as_deref(),
+            Some("gpt-4o"),
+            "routed model metadata was not retained; accumulator={:?}",
+            accumulator.actual_model
+        );
+
+        let drift = json!({
+            "type":"response.metadata",
+            "sequence_number":2,
+            "headers":{"openai-model":DEFAULT_MODEL}
         });
         let error = parse_event(
             drift,
@@ -3418,9 +3485,57 @@ mod tests {
             &mut accumulator,
         )
         .err()
-        .expect("model drift must fail")
+        .expect("contradictory model identities within one response must fail")
         .to_string();
-        assert!(error.contains("incompatible actual model"));
+        assert!(
+            error.contains("changed during the response"),
+            "model-identity drift returned an unhelpful diagnostic: {error}"
+        );
+
+        for (case, model) in [
+            ("empty", String::new()),
+            ("whitespace", "bad model".to_string()),
+            ("over-limit", "m".repeat(257)),
+        ] {
+            let error = StreamAccumulator::default()
+                .observe_model(&model)
+                .err()
+                .unwrap_or_else(|| panic!("{case} actual-model identifier was accepted"));
+            assert!(
+                error.to_string().contains("actual model was invalid"),
+                "{case} actual-model identifier returned an unhelpful diagnostic: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_outer_model_headers_accept_identical_duplicates_and_reject_drift() {
+        let mut identical = reqwest::header::HeaderMap::new();
+        identical.append("openai-model", "gpt-4o".parse().expect("valid header"));
+        identical.append("openai-model", "gpt-4o".parse().expect("valid header"));
+        let mut accumulator = StreamAccumulator::default();
+        observe_outer_model_headers(&identical, &mut accumulator)
+            .expect("identical outer model headers must remain valid");
+        assert_eq!(
+            accumulator.actual_model.as_deref(),
+            Some("gpt-4o"),
+            "identical duplicate headers did not retain their model; accumulator={:?}",
+            accumulator.actual_model
+        );
+
+        let mut conflicting = identical;
+        conflicting.append(
+            "openai-model",
+            DEFAULT_MODEL.parse().expect("valid default-model header"),
+        );
+        let mut accumulator = StreamAccumulator::default();
+        let error = observe_outer_model_headers(&conflicting, &mut accumulator)
+            .err()
+            .expect("conflicting outer model headers must fail");
+        assert!(
+            error.to_string().contains("changed during the response"),
+            "conflicting outer model headers returned an unhelpful diagnostic: {error:#}"
+        );
     }
 
     #[test]
@@ -3545,6 +3660,163 @@ mod tests {
             terminal_metadata.as_deref(),
             Some(DEFAULT_MODEL),
             "headerless SSE omitted terminal model metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_report_omitted_or_routed_model_provenance() {
+        for (case, provenance, reported_model) in [
+            ("omitted", None, DEFAULT_MODEL),
+            ("routed", Some("gpt-4o"), "gpt-4o"),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let models = server
+                .mock("GET", "/backend-api/codex/models")
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "client_version".into(),
+                    CHATGPT_CATALOG_CLIENT_VERSION.into(),
+                ))
+                .with_status(200)
+                .with_body(catalog_body())
+                .expect(1)
+                .create_async()
+                .await;
+            let mut inference = server
+                .mock("POST", RESPONSES_PATH)
+                .with_status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_body(completed_sse_with_model_provenance(provenance))
+                .expect(2);
+            if let Some(model) = provenance {
+                inference = inference.with_header("openai-model", model);
+            }
+            let inference = inference.create_async().await;
+            let provider = ChatGptSubscriptionProvider::for_test(
+                Arc::new(StaticSource::new()),
+                &format!("{}/backend-api/codex", server.url()),
+                DEFAULT_MODEL,
+            )
+            .unwrap_or_else(|error| panic!("{case} model fixture failed to construct: {error:#}"));
+            let request =
+                ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+
+            let (buffered, streaming) = tokio::join!(
+                provider.send_message(&request),
+                provider.send_message_stream(&request)
+            );
+
+            models.assert_async().await;
+            inference.assert_async().await;
+            let buffered = buffered.unwrap_or_else(|error| {
+                panic!("{case} model provenance failed through the buffered boundary: {error:#}")
+            });
+            assert_eq!(
+                buffered.model, reported_model,
+                "buffered response reported the wrong model for {case} provenance; \
+                 response={buffered:?}"
+            );
+            assert!(
+                buffered
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == "hello")),
+                "{case} model-provenance response lost buffered text; response={buffered:?}"
+            );
+
+            let mut receiver = streaming.unwrap_or_else(|error| {
+                panic!("{case} model provenance failed through the streaming boundary: {error:#}")
+            });
+            let mut streamed_text = String::new();
+            let mut terminal_model = None;
+            while let Some(chunk) = receiver.recv().await {
+                match chunk.unwrap_or_else(|error| {
+                    panic!("{case} model provenance emitted a stream error: {error:#}")
+                }) {
+                    StreamChunk::TextDelta(delta) => streamed_text.push_str(&delta),
+                    StreamChunk::ResponseMetadata { model } => terminal_model = Some(model),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                streamed_text, "hello",
+                "{case} model-provenance streaming response lost parsed text"
+            );
+            assert_eq!(
+                terminal_model.as_deref(),
+                Some(reported_model),
+                "streaming response reported the wrong model for {case} provenance"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_reject_malformed_model_provenance_before_terminal_effects()
+    {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let malformed = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"bad model"}}})
+        );
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(malformed)
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("malformed-model-provenance fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered_error = buffered
+            .err()
+            .expect("malformed model provenance must fail the buffered response");
+        assert!(
+            buffered_error
+                .to_string()
+                .contains("actual model was invalid"),
+            "malformed buffered provenance returned an unhelpful diagnostic: {buffered_error:#}"
+        );
+
+        let mut receiver = streaming
+            .expect("stream setup must succeed before malformed SSE provenance is consumed");
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert_eq!(
+            outcome.len(),
+            1,
+            "malformed streaming provenance must emit exactly one terminal error and no effects; \
+             outcome={outcome:?}"
+        );
+        assert!(
+            matches!(&outcome[0], Err(error) if error.contains("actual model was invalid")),
+            "malformed streaming provenance must emit its actionable terminal error and no effects; \
+             outcome={outcome:?}"
         );
     }
 
@@ -4101,14 +4373,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
+    async fn test_eof_duplicate_done_and_post_terminal_data_fail_before_completion_effects() {
         let created = format!(
             "event: response.created\ndata: {}\n\n",
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
         );
         let eof = subscription_stream_outcome(created.clone(), DEFAULT_MODEL).await;
-        assert_eq!(eof.len(), 1);
-        assert!(eof[0].contains("before response.completed"));
+        assert_eq!(
+            eof.len(),
+            1,
+            "EOF before completion must emit exactly one terminal error and no completion effects; \
+             outcome={eof:?}"
+        );
+        assert!(
+            matches!(&eof[0], Err(error) if error.contains("before response.completed")),
+            "EOF before completion must report the missing response.completed event; \
+             outcome={eof:?}"
+        );
 
         let terminal = format!(
             "{}event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
@@ -4117,8 +4398,17 @@ mod tests {
         );
         let duplicate =
             subscription_stream_outcome(format!("{terminal}data: [DONE]\n\n"), DEFAULT_MODEL).await;
-        assert_eq!(duplicate.len(), 1);
-        assert!(duplicate[0].contains("terminal marker was invalid"));
+        assert_eq!(
+            duplicate.len(),
+            1,
+            "duplicate terminal markers must emit exactly one terminal error and no completion \
+             effects; outcome={duplicate:?}"
+        );
+        assert!(
+            matches!(&duplicate[0], Err(error) if error.contains("terminal marker was invalid")),
+            "duplicate terminal markers must report an invalid terminal marker; \
+             outcome={duplicate:?}"
+        );
 
         let late = subscription_stream_outcome(
             format!(
@@ -4128,19 +4418,157 @@ mod tests {
             DEFAULT_MODEL,
         )
         .await;
-        assert_eq!(late.len(), 1);
-        assert!(late[0].contains("data after its terminal response"));
+        assert_eq!(
+            late.len(),
+            1,
+            "post-terminal data must emit exactly one terminal error and no completion effects; \
+             outcome={late:?}"
+        );
+        assert!(
+            matches!(&late[0], Err(error) if error.contains("data after its terminal response")),
+            "post-terminal data must report data after the terminal response; outcome={late:?}"
+        );
     }
 
     #[tokio::test]
-    async fn actual_model_drift_fails_before_completion_effects() {
+    async fn test_buffered_and_streaming_reject_actual_model_drift_before_completion_effects() {
         let body = format!(
-            "event: response.created\ndata: {}\n\n",
-            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}})
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.metadata\ndata: {}\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":"gpt-4o"}}}),
+            json!({"type":"response.metadata","sequence_number":2,"headers":{"openai-model":DEFAULT_MODEL}})
         );
-        let errors = subscription_stream_outcome(body, DEFAULT_MODEL).await;
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("incompatible actual model"));
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", "gpt-4o")
+            .with_body(body)
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("model-drift fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
+
+        let buffered_error = buffered
+            .err()
+            .expect("model drift must fail the buffered response");
+        assert!(
+            buffered_error
+                .to_string()
+                .contains("changed during the response"),
+            "buffered model drift returned an unhelpful diagnostic: {buffered_error:#}"
+        );
+        let mut receiver = streaming
+            .expect("stream setup must succeed before contradictory provenance is consumed");
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert_eq!(
+            outcome.len(),
+            1,
+            "model drift must emit exactly one terminal error and no completion effects; \
+             outcome={outcome:?}"
+        );
+        assert!(
+            matches!(&outcome[0], Err(error) if error.contains("changed during the response")),
+            "model drift must emit exactly one terminal error and no completion effects; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_reject_conflicting_outer_model_headers_before_effects() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", "gpt-4o")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_model_provenance(None))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("conflicting-outer-header fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
+
+        let buffered_error = buffered
+            .err()
+            .expect("conflicting outer model headers must fail the buffered response");
+        assert!(
+            buffered_error
+                .to_string()
+                .contains("changed during the response"),
+            "conflicting buffered outer headers returned an unhelpful diagnostic: \
+             {buffered_error:#}"
+        );
+        let mut receiver = streaming.expect(
+            "stream setup must succeed before conflicting outer model headers are consumed",
+        );
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert_eq!(
+            outcome.len(),
+            1,
+            "conflicting outer model headers must emit exactly one terminal error and no effects; \
+             outcome={outcome:?}"
+        );
+        assert!(
+            matches!(&outcome[0], Err(error) if error.contains("changed during the response")),
+            "conflicting outer model headers returned the wrong streaming outcome; \
+             outcome={outcome:?}"
+        );
     }
 
     #[tokio::test]

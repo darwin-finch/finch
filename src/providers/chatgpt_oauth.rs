@@ -562,19 +562,27 @@ impl ChatGptSubscriptionService {
         })
     }
 
+    /// Return an explicit serving-model header when available, otherwise the
+    /// validated requested route. `response_model` is passive terminal payload
+    /// metadata and is intentionally not authoritative.
     pub fn actual_model(
         &self,
         requested: &str,
-        response_model: Option<&str>,
+        _response_model: Option<&str>,
         header_model: Option<&str>,
     ) -> Result<String> {
-        let actual = header_model
-            .or(response_model)
-            .context("ChatGPT subscription response omitted actual model provenance")?;
-        if requested.trim().is_empty()
-            || actual.is_empty()
+        if requested.is_empty()
+            || requested.len() > 256
+            || !requested.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            bail!("ChatGPT subscription model provenance is invalid");
+        }
+        let Some(actual) = header_model else {
+            return Ok(requested.to_string());
+        };
+        if actual.is_empty()
             || actual.len() > 256
-            || actual.chars().any(char::is_control)
+            || !actual.bytes().all(|byte| byte.is_ascii_graphic())
         {
             bail!("ChatGPT subscription model provenance is invalid");
         }
@@ -729,24 +737,47 @@ mod tests {
     }
 
     #[test]
-    fn fake_subscription_catalog_binds_account_allowance_and_actual_model_provenance() {
+    fn test_fake_subscription_catalog_binds_account_allowance_and_actual_model_provenance() {
         let service = ChatGptSubscriptionService::default();
         let body = br#"{"account_id":"acct-work","allowance":"subscription","models":[{"slug":"gpt-5.6-sol","supported_in_api":true}]}"#;
         let catalog = service.parse_catalog("acct-work", body).unwrap();
         assert_eq!(catalog.allowance.as_deref(), Some("subscription"));
         assert_eq!(catalog.models, ["gpt-5.6-sol"]);
         assert!(service.parse_catalog("acct-other", body).is_err());
-        assert_eq!(
-            service
-                .actual_model(
-                    "gpt-5.6-sol",
-                    Some("gpt-5.6-sol"),
-                    Some("gpt-5.6-sol-safety-routed")
-                )
-                .unwrap(),
-            "gpt-5.6-sol-safety-routed"
-        );
-        assert!(service.actual_model("gpt-5.6-sol", None, None).is_err());
+        for (case, response_model, header_model, expected) in [
+            ("omitted", None, None, "gpt-5.6-sol"),
+            (
+                "passive-response-only",
+                Some("untrusted-terminal-model"),
+                None,
+                "gpt-5.6-sol",
+            ),
+            (
+                "routed-header",
+                Some("untrusted-terminal-model"),
+                Some("gpt-5.6-sol-safety-routed"),
+                "gpt-5.6-sol-safety-routed",
+            ),
+        ] {
+            let actual = service
+                .actual_model("gpt-5.6-sol", response_model, header_model)
+                .unwrap_or_else(|error| panic!("{case} model provenance failed: {error:#}"));
+            assert_eq!(actual, expected, "{case} reported the wrong model");
+        }
+        for (case, requested, header_model) in [
+            ("empty-requested", "", None),
+            ("malformed-requested", "bad model", None),
+            ("malformed-header", "gpt-5.6-sol", Some("bad model")),
+        ] {
+            let error = service
+                .actual_model(requested, None, header_model)
+                .err()
+                .unwrap_or_else(|| panic!("{case} model provenance was accepted"));
+            assert!(
+                error.to_string().contains("model provenance is invalid"),
+                "{case} returned an unhelpful diagnostic: {error:#}"
+            );
+        }
     }
 
     #[tokio::test]
