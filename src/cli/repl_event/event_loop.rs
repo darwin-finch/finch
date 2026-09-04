@@ -2314,10 +2314,17 @@ impl EventLoop {
                         cfg.license.notice_suppress_until.as_deref(),
                         today,
                     );
-                    // NOTE: the invariant that this block writes no config is
-                    // tested at `claim_notice_showing_for`, which takes both
-                    // paths. Keep any future write of `cfg` out of here, or
-                    // move it there so the test can see it.
+                    // What is and is not covered, stated exactly, because an
+                    // earlier version of this note claimed more and named a
+                    // function that no longer exists.
+                    //
+                    // `tests/startup_is_readonly_on_config.rs` proves
+                    // `claim_notice_showing_now` writes no config. It does NOT
+                    // cover this block: a `cfg.save()` added anywhere in here
+                    // reships #76 with a green suite, because nothing calls
+                    // `EventLoop::run` outside production. So do not add one.
+                    // If this block ever needs to persist something, put it
+                    // behind a function the integration test can call.
                     if should_show {
                         // Startup notices are application status, not a
                         // conversation artifact. Keeping this out of the

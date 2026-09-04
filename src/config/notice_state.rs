@@ -47,21 +47,32 @@ impl NoticeState {
         }
         let text = toml::to_string_pretty(self).context("Failed to serialize notice state")?;
         // Write-and-rename, not a plain write. Two Finch processes can start
-        // at the same moment and both land here, and a half-written file is a
-        // readable outcome of an interrupted `fs::write`. The corrupt path in
-        // `load_from` recovers from that, but recovering means showing the
-        // notice an extra time; renaming means it cannot happen at all. The
-        // temporary carries the process id so two writers never share one.
+        // at the same moment and both land here, and a plain write to the
+        // target truncates it before the new bytes land — so a save that then
+        // fails destroys the previous record. Creating a temporary fails
+        // first, leaving the old file untouched.
+        //
+        // Not a durability guarantee: neither the file nor the directory is
+        // fsynced, so a crash or power loss can still expose a truncated file
+        // on some filesystems. `load_from`'s tolerance of unreadable state is
+        // what covers that, and it stays load-bearing. The process id keeps two
+        // *processes* off one temporary; two threads in one process would
+        // share it, which nothing here does.
         let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
         std::fs::write(&temporary, text)
             .with_context(|| format!("Failed to write {}", temporary.display()))?;
-        std::fs::rename(&temporary, path).with_context(|| {
-            format!(
-                "Failed to replace {} with {}",
-                path.display(),
-                temporary.display()
-            )
-        })
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            // Do not leave `notice_state.toml.<pid>.tmp` littering ~/.finch.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to replace {} with {}",
+                    path.display(),
+                    temporary.display()
+                )
+            });
+        }
+        Ok(())
     }
 }
 
@@ -121,22 +132,22 @@ pub(crate) fn claim_notice_showing(
 
 /// The same decision, taking the legacy date directly.
 ///
-/// `claim_notice_showing_now` calls this, so the startup path and the
-/// regression test share one body. An earlier version had them in parallel:
-/// production called `_now`, the test called `_for`, and `_for` had no
-/// production caller at all. The compiler said so in two dead-code warnings I
-/// did not read, and restoring the real #76 defect left every test green,
-/// exactly as before the seam existed (#329 review).
+/// `claim_notice_showing_now` calls this, so the startup path and the tests
+/// share one body. An earlier version had them in parallel: production called
+/// `_now`, a test called a `_for` wrapper, and that wrapper had no production
+/// caller at all — the compiler said so in two dead-code warnings I did not
+/// read, and restoring the real #76 defect left every test green (#329).
+///
+/// It took a config path once, threaded through and never used, so that a test
+/// could "hold both paths". No test ever called it, and a parameter that exists
+/// to be ignored is not a guarantee. The real one is
+/// `tests/startup_is_readonly_on_config.rs`, which sets `HOME` and calls
+/// `claim_notice_showing_now`.
 pub(crate) fn claim_notice_showing_for_paths(
-    config_path: &Path,
     state_path: &Path,
     legacy_suppress_until: Option<&str>,
     today: chrono::NaiveDate,
 ) -> bool {
-    // Threaded through and deliberately never written. That is the point: a
-    // test can hold both paths and assert this decision leaves the config
-    // untouched, on the same body production runs.
-    let _ = config_path;
     claim_notice_showing(
         state_path,
         legacy_suppress_until,
@@ -284,6 +295,7 @@ mod tests {
     /// could not catch this: a successful rename and a plain write leave
     /// identical directory contents, so removing atomicity altogether left
     /// every test green.
+    #[cfg(unix)]
     #[test]
     fn test_a_save_that_cannot_complete_does_not_destroy_the_previous_state() {
         let home = tempfile::tempdir().unwrap();

@@ -27,11 +27,7 @@ pub fn claim_notice_showing_now(
     // These were two parallel paths, and the regression test exercised the one
     // production did not call, so restoring the real defect left every test
     // green (#329 review).
-    let config_path = path
-        .parent()
-        .map(|dir| dir.join("config.toml"))
-        .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
-    notice_state::claim_notice_showing_for_paths(&config_path, &path, legacy_suppress_until, today)
+    notice_state::claim_notice_showing_for_paths(&path, legacy_suppress_until, today)
 }
 
 /// Forget any recorded notice suppression, so the next start shows it.

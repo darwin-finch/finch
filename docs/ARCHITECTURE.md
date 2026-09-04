@@ -774,7 +774,7 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 
 **REPL commands:** `/license`, `/license activate <key>`, `/license remove`
 
-**Enforcement:** Honor system — no blocking; weekly startup notice for Noncommercial users (suppressed by `notice_suppress_until` date in config).
+**Enforcement:** Honor system — no blocking; weekly startup notice for Noncommercial users. The suppression date lives in `~/.finch/notice_state.toml`, not in `config.toml`: recording it in the config meant ordinary startup rewrote a file the user never asked to change (#76). A legacy `notice_suppress_until` still in `config.toml` is honoured on read and never written back.
 
 **Key Files:**
 - `src/license/mod.rs` — `validate_key()`, `ParsedLicense`; 8 unit tests
@@ -902,6 +902,7 @@ executable training queue, and does not trigger training or adapter loading.
 │   └── 2026-02-14.jsonl
 ├── feedback.jsonl           # Explicit feedback; does not trigger training
 ├── training_queue.jsonl     # Preserved legacy queue; not processed by daemon
+├── notice_state.toml        # Licence-notice bookkeeping; kept out of config.toml (#76)
 └── tool_patterns.json       # Approved tool patterns
 
 ~/.cache/huggingface/hub/    # Base models (HF standard)

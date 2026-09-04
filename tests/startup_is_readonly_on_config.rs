@@ -44,8 +44,13 @@ fn test_the_startup_notice_decision_does_not_rewrite_the_config() {
     // Coarse filesystem timestamps would hide a rewrite inside the same tick.
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
-    // SAFETY: integration tests get their own process, so this cannot race
-    // another test's view of HOME.
+    // SAFETY: not "its own process" — libtest runs the tests in this binary on
+    // concurrent threads, and an earlier version of this comment said
+    // otherwise. What makes it sound is that this is the only test here that
+    // mutates the environment (the other passes HOME via `Command::env`), and
+    // std serialises `set_var` against its own readers. The residual risk is a
+    // non-std `getenv` on another thread, which is why `set_var` is unsafe at
+    // all; with one mutator and one reader of this variable, there is none.
     unsafe {
         std::env::set_var("HOME", home.path());
     }
