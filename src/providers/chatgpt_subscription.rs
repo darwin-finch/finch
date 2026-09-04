@@ -566,9 +566,14 @@ impl ChatGptSubscriptionProvider {
                 return Err(SubscriptionResponseRejected(status).into());
             }
             let content_type =
-                bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?
-                    .unwrap_or_default();
-            if !content_type.starts_with("text/event-stream") {
+                bounded_header(response.headers(), reqwest::header::CONTENT_TYPE.as_str())?;
+            // The ChatGPT Codex backend may omit Content-Type on a successful
+            // streaming response. In that case the bounded SSE parser remains
+            // the authoritative validator.
+            if content_type
+                .as_deref()
+                .is_some_and(|value| !value.starts_with("text/event-stream"))
+            {
                 let _ = read_bounded(response, MAX_ERROR_BYTES, &cancel).await?;
                 bail!("ChatGPT subscription response was not an event stream");
             }
@@ -2814,6 +2819,112 @@ mod tests {
         assert_eq!(
             response.model, DEFAULT_MODEL,
             "catalog-version boundary changed terminal model provenance; response={response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_successful_sse_without_content_type() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("missing-content-type fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!("valid headerless SSE failed through the buffered boundary: {error:#}")
+        });
+        assert_eq!(
+            buffered.model, DEFAULT_MODEL,
+            "headerless buffered SSE changed model provenance; response={buffered:?}"
+        );
+        let mut receiver = streaming.unwrap_or_else(|error| {
+            panic!("valid headerless SSE failed through the streaming boundary: {error:#}")
+        });
+        let mut streamed_text = String::new();
+        let mut terminal_metadata = None;
+        while let Some(chunk) = receiver.recv().await {
+            match chunk.unwrap_or_else(|error| {
+                panic!("valid headerless SSE emitted a stream error: {error:#}")
+            }) {
+                StreamChunk::TextDelta(delta) => streamed_text.push_str(&delta),
+                StreamChunk::ResponseMetadata { model } => terminal_metadata = Some(model),
+                _ => {}
+            }
+        }
+        assert_eq!(streamed_text, "hello", "headerless SSE lost streamed text");
+        assert_eq!(
+            terminal_metadata.as_deref(),
+            Some(DEFAULT_MODEL),
+            "headerless SSE omitted terminal model metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_sse_with_explicit_empty_content_type_is_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "")
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("empty-content-type fixture must construct a provider");
+
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect_err("an explicit empty Content-Type was treated as an omitted header");
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        assert!(
+            error.to_string().contains("not an event stream"),
+            "explicit empty Content-Type returned the wrong diagnostic: {error:#}"
         );
     }
 
