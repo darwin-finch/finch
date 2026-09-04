@@ -96,6 +96,14 @@ impl Default for ServerConfig {
 
 /// Main agent server structure
 pub struct AgentServer {
+    /// When this server was constructed, for `/health`'s uptime.
+    ///
+    /// `Instant` rather than a wall clock: uptime is an elapsed duration, and
+    /// a system clock that steps backwards over NTP or a timezone change
+    /// would otherwise report a negative or wildly wrong age. `/health`
+    /// previously reported a hardcoded `0` however long the daemon had run
+    /// (#131).
+    started_at: std::time::Instant,
     /// Claude API client (shared across sessions; kept for backward compat with handlers.rs)
     claude_client: Arc<ClaudeClient>,
     /// Multi-provider pool: cloud providers from [[providers]] config.
@@ -245,6 +253,7 @@ impl AgentServer {
     ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
         Ok(Self {
+            started_at: std::time::Instant::now(),
             claude_client: Arc::new(ClaudeClient::new(String::new())?),
             providers: Vec::new(),
             router: Arc::new(RwLock::new(Router::new(
@@ -297,6 +306,7 @@ impl AgentServer {
         let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
         let bootstrap_loader = Arc::new(BootstrapLoader::new(generator_state.clone(), None));
         Ok(Self {
+            started_at: std::time::Instant::now(),
             claude_client: Arc::new(ClaudeClient::new("brain-protocol-test".into())?),
             providers: Vec::new(),
             router: Arc::new(RwLock::new(Router::new(
@@ -373,6 +383,7 @@ impl AgentServer {
         let mcp_servers = config.mcp_servers.clone();
 
         Ok(Self {
+            started_at: std::time::Instant::now(),
             claude_client: Arc::new(claude_client),
             providers,
             router: Arc::new(RwLock::new(router)),
@@ -611,6 +622,11 @@ impl AgentServer {
     /// Get server configuration
     pub fn config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    /// How long this server has been running.
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     pub fn brain_store(&self) -> &crate::brain::store::BrainStore {
@@ -1344,6 +1360,69 @@ mod tests {
         assert_eq!(
             oversized.status(),
             axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    /// A real server reports the time it has actually been running.
+    ///
+    /// `/health` used to answer `uptime_seconds: 0` however long the daemon
+    /// had been up, and `/metrics` a constant `finch_queries_total 0`. Both
+    /// were marked as placeholders in the source and neither was tested, so a
+    /// scraper could not tell "nothing has happened" from "nothing is
+    /// measured" (#131).
+    ///
+    /// Built through the production constructor rather than by reading a
+    /// field: the defect was that the *server* did not know when it started,
+    /// and a test that constructs a `Duration` by hand would not have noticed.
+    #[test]
+    fn production_server_reports_real_uptime() {
+        if !supervisor_contract_present() {
+            return;
+        }
+        let proof = crate::brain::isolated_test_proof()
+            .expect("uptime test requires supervisor-issued authority");
+        let daemon_address = proof.daemon_address().to_owned();
+        let brain_password = proof.brain_password().unwrap();
+        let home = proof.home;
+
+        let config =
+            crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
+                api_key: "isolated-uptime-test".into(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("isolated-uptime-test".into()),
+            }]);
+        let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
+        let server = AgentServer::new(
+            config,
+            ServerConfig {
+                bind_address: daemon_address,
+                brain_password,
+                ..ServerConfig::default()
+            },
+            ClaudeClient::new("isolated-uptime-test".to_string()).unwrap(),
+            Router::new(crate::models::ThresholdRouter::new()),
+            MetricsLogger::new(home.join(".finch/uptime-metrics")).unwrap(),
+            Arc::new(RwLock::new(LocalGenerator::new())),
+            Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
+            generator_state,
+            isolated_provider_graph(),
+        )
+        .unwrap();
+
+        let first = server.uptime();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let second = server.uptime();
+
+        assert!(
+            second > first,
+            "uptime must advance: {first:?} then {second:?}"
+        );
+        assert!(
+            second >= std::time::Duration::from_millis(50),
+            "uptime must reflect the elapsed time, not a constant: {second:?}"
         );
     }
 

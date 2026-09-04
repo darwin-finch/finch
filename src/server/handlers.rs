@@ -3962,7 +3962,6 @@ pub struct HealthStatus {
 pub async fn health_check(
     State(server): State<Arc<AgentServer>>,
 ) -> Result<Json<HealthStatus>, AppError> {
-    // TODO: Track actual uptime
     let named_brains = server.brain_store().list()?.len();
     let pending_brain_terminalizations = server
         .brain_store()
@@ -3974,7 +3973,7 @@ pub async fn health_check(
             "degraded"
         }
         .to_string(),
-        uptime_seconds: 0, // Placeholder
+        uptime_seconds: server.uptime().as_secs(),
         named_brains,
         pending_brain_terminalizations,
     };
@@ -3984,12 +3983,24 @@ pub async fn health_check(
 
 /// Handle GET /metrics - Prometheus metrics endpoint
 pub async fn metrics_endpoint(
-    State(_server): State<Arc<AgentServer>>,
+    State(server): State<Arc<AgentServer>>,
 ) -> Result<Response, AppError> {
-    // TODO: Implement Prometheus metrics
-    let metrics = "# HELP finch_queries_total Total number of queries\n\
-                   # TYPE finch_queries_total counter\n\
-                   finch_queries_total 0\n";
+    // Only what is measured. This used to emit a constant
+    // `finch_queries_total 0`, which a scraper cannot distinguish from "no
+    // queries yet" — a fabricated series reported as live truth, and the thing
+    // #131 asks to stop.
+    //
+    // Request-lifecycle counters (accepted, in-flight, completed, failed,
+    // cancelled, streamed), routing aggregates and token usage are the rest of
+    // #131. They belong on the canonical request lifecycle rather than a
+    // parallel counter invented here, so this exposes uptime and nothing else
+    // until they exist.
+    let metrics = format!(
+        "# HELP finch_daemon_uptime_seconds Seconds since this daemon process started.\n\
+         # TYPE finch_daemon_uptime_seconds gauge\n\
+         finch_daemon_uptime_seconds {}\n",
+        server.uptime().as_secs()
+    );
 
     Ok((StatusCode::OK, metrics).into_response())
 }
