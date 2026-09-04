@@ -96,6 +96,36 @@ impl Default for ServerConfig {
 
 /// Main agent server structure
 pub struct AgentServer {
+    /// When this server was constructed, reported by `/health` and `/metrics`.
+    ///
+    /// `Instant` rather than a wall clock: uptime is an elapsed duration, and
+    /// a system clock that steps backwards over NTP or a timezone change
+    /// would otherwise report a negative or wildly wrong age. `/health`
+    /// previously reported a hardcoded `0` however long the daemon had run
+    /// (#131).
+    ///
+    /// Note where this ends up. `/metrics` is on the local router only, but
+    /// `/health` is
+    /// mounted on the remote Brain listener as well (default `0.0.0.0:11436`
+    /// when advertisement is on), and that router carries no auth layer — so
+    /// uptime is readable by any peer that can reach it, alongside the
+    /// `named_brains` and `pending_brain_terminalizations` already exposed
+    /// there. That is a deliberate acceptance of a small disclosure, not an
+    /// oversight: process age is not a secret, and #131 asks for truthful
+    /// health. Anything more sensitive belongs on the local router.
+    ///
+    /// The local router is loopback *by default*, not by construction:
+    /// `bind_address` is user-configurable, and `finch worker` defaults to
+    /// `--bind 0.0.0.0:8000` while serving the full router. Since
+    /// `requires_client_auth` covers only the three inference routes, such a
+    /// bind publishes `/metrics` unauthenticated too.
+    ///
+    /// `Instant` does not advance while the host is suspended, on any
+    /// platform Finch targets. A laptop daemon resumed the next morning
+    /// reports the seconds it was awake for, not wall-clock age. That is the
+    /// intended reading of "uptime", and the `/metrics` HELP string says so
+    /// rather than claiming age since construction.
+    started_at: std::time::Instant,
     /// Claude API client (shared across sessions; kept for backward compat with handlers.rs)
     claude_client: Arc<ClaudeClient>,
     /// Multi-provider pool: cloud providers from [[providers]] config.
@@ -245,6 +275,7 @@ impl AgentServer {
     ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
         Ok(Self {
+            started_at: std::time::Instant::now(),
             claude_client: Arc::new(ClaudeClient::new(String::new())?),
             providers: Vec::new(),
             router: Arc::new(RwLock::new(Router::new(
@@ -297,6 +328,7 @@ impl AgentServer {
         let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
         let bootstrap_loader = Arc::new(BootstrapLoader::new(generator_state.clone(), None));
         Ok(Self {
+            started_at: std::time::Instant::now(),
             claude_client: Arc::new(ClaudeClient::new("brain-protocol-test".into())?),
             providers: Vec::new(),
             router: Arc::new(RwLock::new(Router::new(
@@ -373,6 +405,7 @@ impl AgentServer {
         let mcp_servers = config.mcp_servers.clone();
 
         Ok(Self {
+            started_at: std::time::Instant::now(),
             claude_client: Arc::new(claude_client),
             providers,
             router: Arc::new(RwLock::new(router)),
@@ -611,6 +644,11 @@ impl AgentServer {
     /// Get server configuration
     pub fn config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    /// How long this server has been running.
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     pub fn brain_store(&self) -> &crate::brain::store::BrainStore {
@@ -1207,6 +1245,198 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
     }
 
+    /// `/health` reports the uptime it has actually accumulated.
+    ///
+    /// Over HTTP through the real router, because that is where the defect
+    /// was: `uptime_seconds` was a hardcoded `0` in the handler (#131). An
+    /// earlier version of this PR tested `AgentServer::uptime()` instead, and
+    /// reverting the handler to `uptime_seconds: 0` left the whole suite green
+    /// — the accessor was right and the endpoint still lied.
+    #[tokio::test]
+    async fn production_router_health_reports_real_uptime() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+
+        // The handler reports whole seconds, so the server has to have existed
+        // for at least one before a truthful answer is distinguishable from
+        // the placeholder.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let response = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("health body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("health returns JSON");
+        let reported = parsed
+            .get("uptime_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .expect("health reports uptime_seconds");
+
+        assert!(
+            reported >= 1,
+            "/health must report the time this server has run, not a \
+             placeholder; got {reported} after sleeping past a second"
+        );
+
+        // Pin the response shape. `src/main.rs` re-declares this struct to
+        // deserialize it, so a rename here compiles, passes `cargo test
+        // --lib`, and breaks `finch daemon-status` at runtime with "Failed to
+        // parse health response" -- review of #334 proved that by renaming
+        // `named_brains` and watching 150/150 stay green.
+        //
+        // `uptime_seconds` is a whole-second `u64`, so a daemon does report
+        // `0` for its first second. That is truncation of a measured value,
+        // not #131's hardcoded placeholder, but it is indistinguishable from
+        // one in a single scrape -- `/metrics` carries the sub-second gauge.
+        for (field, ok) in [
+            (
+                "status",
+                parsed.get("status").is_some_and(|v| v.is_string()),
+            ),
+            (
+                "named_brains",
+                parsed
+                    .get("named_brains")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+            ),
+            (
+                "pending_brain_terminalizations",
+                parsed
+                    .get("pending_brain_terminalizations")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+            ),
+        ] {
+            assert!(
+                ok,
+                "/health must keep publishing `{field}` with the type \
+                 `finch daemon-status` deserializes; body was {parsed}"
+            );
+        }
+    }
+
+    /// `/metrics` reports a measured value, not a constant.
+    ///
+    /// Asserting the series *name* is not enough, and review of #334 proved
+    /// it: hardcoding `finch_daemon_uptime_seconds 0` left the whole suite
+    /// green, which is #131's own acceptance wording ("never reports
+    /// fabricated zero placeholders as live truth") failing under the name
+    /// this PR introduced. A `contains` check was also satisfied by the
+    /// `# HELP` line alone, so an endpoint emitting no sample at all passed.
+    ///
+    /// So this parses the sample and scrapes twice. A constant fails whatever
+    /// it is named and whatever value it is given, which a name check
+    /// structurally cannot catch.
+    #[tokio::test]
+    async fn production_router_metrics_reports_a_measured_value() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+
+        async fn scrape(server: Arc<AgentServer>) -> String {
+            use tower::ServiceExt as _;
+            let response = isolated_http_router(server)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/metrics")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("metrics body");
+            String::from_utf8(body.to_vec()).expect("metrics is UTF-8")
+        }
+
+        /// The metric name of an exposition sample line, without its
+        /// labelset. `foo{a="b c"} 1` and `foo 1` both yield `foo`.
+        ///
+        /// Splitting on whitespace alone would keep the labels, so the
+        /// whitelist below would reject every labelled series and its advice
+        /// ("add it to MEASURED") would be wrong -- a labelset is not a name
+        /// and whitelisting one breaks on the next label value. The #131 work
+        /// this PR defers is routing and token aggregates, which are labelled
+        /// by construction, so that is the first follow-up and not a remote
+        /// case.
+        fn sample_name(line: &str) -> &str {
+            line.split(['{', ' ']).next().unwrap_or_default()
+        }
+
+        fn gauge(text: &str) -> f64 {
+            let line = text
+                .lines()
+                .find(|line| {
+                    !line.starts_with('#') && sample_name(line) == "finch_daemon_uptime_seconds"
+                })
+                .unwrap_or_else(|| panic!("no gauge sample line in:\n{text}"));
+            let value = match line.find('}') {
+                Some(labelset_end) => &line[labelset_end + 1..],
+                None => &line[sample_name(line).len()..],
+            };
+            value
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("gauge sample has no value in:\n{text}"))
+                .parse()
+                .unwrap_or_else(|error| panic!("gauge is not a float ({error}) in:\n{text}"))
+        }
+
+        let first_text = scrape(Arc::clone(&server)).await;
+        assert!(
+            first_text.contains("# TYPE finch_daemon_uptime_seconds gauge"),
+            "the gauge needs its TYPE line: {first_text}"
+        );
+        // Every series present must be one this daemon actually measures.
+        //
+        // Naming the historical offender alone was not enough: review of #334
+        // added `finch_requests_total 0` beside a working gauge and the test
+        // passed. #131 asks that no fabricated placeholder be published, not
+        // that one string stay absent, so the check is a whitelist —
+        // publishing anything new requires deciding here whether it is
+        // measured.
+        const MEASURED: &[&str] = &["finch_daemon_uptime_seconds"];
+        for line in first_text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let series = sample_name(line);
+            assert!(
+                MEASURED.contains(&series),
+                "`{series}` is published but not in the measured set. If it is \
+                 real, add it to MEASURED; if it is a placeholder, do not \
+                 publish it (#131): {first_text}"
+            );
+        }
+
+        let first = gauge(&first_text);
+        assert!(
+            first > 0.0,
+            "the gauge must report measured time, not zero: {first_text}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let second = gauge(&scrape(server).await);
+
+        assert!(
+            second > first,
+            "two scrapes must differ -- a constant is a fabricated series \
+             whatever it is called: {first} then {second}"
+        );
+    }
+
     async fn serve_http2_test_router(
         app: axum::Router,
     ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
@@ -1344,6 +1574,69 @@ mod tests {
         assert_eq!(
             oversized.status(),
             axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    /// A real server reports the time it has actually been running.
+    ///
+    /// `/health` used to answer `uptime_seconds: 0` however long the daemon
+    /// had been up, and `/metrics` a constant `finch_queries_total 0`. Both
+    /// were marked as placeholders in the source and neither was tested, so a
+    /// scraper could not tell "nothing has happened" from "nothing is
+    /// measured" (#131).
+    ///
+    /// Built through the production constructor rather than by reading a
+    /// field: the defect was that the *server* did not know when it started,
+    /// and a test that constructs a `Duration` by hand would not have noticed.
+    #[test]
+    fn production_server_reports_real_uptime() {
+        if !supervisor_contract_present() {
+            return;
+        }
+        let proof = crate::brain::isolated_test_proof()
+            .expect("uptime test requires supervisor-issued authority");
+        let daemon_address = proof.daemon_address().to_owned();
+        let brain_password = proof.brain_password().unwrap();
+        let home = proof.home;
+
+        let config =
+            crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
+                api_key: "isolated-uptime-test".into(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("isolated-uptime-test".into()),
+            }]);
+        let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
+        let server = AgentServer::new(
+            config,
+            ServerConfig {
+                bind_address: daemon_address,
+                brain_password,
+                ..ServerConfig::default()
+            },
+            ClaudeClient::new("isolated-uptime-test".to_string()).unwrap(),
+            Router::new(crate::models::ThresholdRouter::new()),
+            MetricsLogger::new(home.join(".finch/uptime-metrics")).unwrap(),
+            Arc::new(RwLock::new(LocalGenerator::new())),
+            Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
+            generator_state,
+            isolated_provider_graph(),
+        )
+        .unwrap();
+
+        let first = server.uptime();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let second = server.uptime();
+
+        assert!(
+            second > first,
+            "uptime must advance: {first:?} then {second:?}"
+        );
+        assert!(
+            second >= std::time::Duration::from_millis(50),
+            "uptime must reflect the elapsed time, not a constant: {second:?}"
         );
     }
 

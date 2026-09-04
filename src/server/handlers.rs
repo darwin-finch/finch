@@ -132,6 +132,18 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
 /// The TLS listener deliberately exposes only the collaboration protocol.
 /// Daemon administration, passwords, file APIs, provider APIs, and registry
 /// endpoints remain on the loopback listener.
+///
+/// With one exception, stated here because this sentence was becoming less
+/// true than it reads. `/health` is mounted on this router and now reports
+/// real process uptime (#131), so it does carry a little daemon-administration
+/// data — beside the `named_brains` and `pending_brain_terminalizations`
+/// counts already in that payload. This router attaches no auth layer, so all
+/// of it is readable by any peer that can reach the advertised listener.
+///
+/// Accepted deliberately: process age is not a secret and #131 asks for
+/// truthful health. If that stops being acceptable, the split already exists —
+/// `RestrictedBrainListener` is available as an extension here, and
+/// `health_check` simply ignores it today.
 pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
     Router::new()
         .route(
@@ -3962,7 +3974,6 @@ pub struct HealthStatus {
 pub async fn health_check(
     State(server): State<Arc<AgentServer>>,
 ) -> Result<Json<HealthStatus>, AppError> {
-    // TODO: Track actual uptime
     let named_brains = server.brain_store().list()?.len();
     let pending_brain_terminalizations = server
         .brain_store()
@@ -3974,7 +3985,7 @@ pub async fn health_check(
             "degraded"
         }
         .to_string(),
-        uptime_seconds: 0, // Placeholder
+        uptime_seconds: server.uptime().as_secs(),
         named_brains,
         pending_brain_terminalizations,
     };
@@ -3984,12 +3995,24 @@ pub async fn health_check(
 
 /// Handle GET /metrics - Prometheus metrics endpoint
 pub async fn metrics_endpoint(
-    State(_server): State<Arc<AgentServer>>,
+    State(server): State<Arc<AgentServer>>,
 ) -> Result<Response, AppError> {
-    // TODO: Implement Prometheus metrics
-    let metrics = "# HELP finch_queries_total Total number of queries\n\
-                   # TYPE finch_queries_total counter\n\
-                   finch_queries_total 0\n";
+    // Only what is measured. This used to emit a constant
+    // `finch_queries_total 0`, which a scraper cannot distinguish from "no
+    // queries yet" — a fabricated series reported as live truth, and the thing
+    // #131 asks to stop.
+    //
+    // Request-lifecycle counters (accepted, in-flight, completed, failed,
+    // cancelled, streamed), routing aggregates and token usage are the rest of
+    // #131. They belong on the canonical request lifecycle rather than a
+    // parallel counter invented here, so this exposes uptime and nothing else
+    // until they exist.
+    let metrics = format!(
+        "# HELP finch_daemon_uptime_seconds Seconds this server has been running, not counting host suspend.\n\
+         # TYPE finch_daemon_uptime_seconds gauge\n\
+         finch_daemon_uptime_seconds {}\n",
+        server.uptime().as_secs_f64()
+    );
 
     Ok((StatusCode::OK, metrics).into_response())
 }
