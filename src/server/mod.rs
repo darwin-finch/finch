@@ -104,7 +104,8 @@ pub struct AgentServer {
     /// previously reported a hardcoded `0` however long the daemon had run
     /// (#131).
     ///
-    /// Note where this ends up. `/metrics` is loopback-only, but `/health` is
+    /// Note where this ends up. `/metrics` is on the local router only, but
+    /// `/health` is
     /// mounted on the remote Brain listener as well (default `0.0.0.0:11436`
     /// when advertisement is on), and that router carries no auth layer — so
     /// uptime is readable by any peer that can reach it, alongside the
@@ -113,11 +114,17 @@ pub struct AgentServer {
     /// oversight: process age is not a secret, and #131 asks for truthful
     /// health. Anything more sensitive belongs on the local router.
     ///
-    /// That router is loopback *by default*, not by construction:
-    /// `bind_address` is user-configurable and the CLI help itself suggests
-    /// `--bind 0.0.0.0:8000`, while `requires_client_auth` covers only the
-    /// three inference routes. So a non-loopback bind publishes `/metrics`
-    /// unauthenticated too.
+    /// The local router is loopback *by default*, not by construction:
+    /// `bind_address` is user-configurable, and `finch worker` defaults to
+    /// `--bind 0.0.0.0:8000` while serving the full router. Since
+    /// `requires_client_auth` covers only the three inference routes, such a
+    /// bind publishes `/metrics` unauthenticated too.
+    ///
+    /// `Instant` does not advance while the host is suspended, on any
+    /// platform Finch targets. A laptop daemon resumed the next morning
+    /// reports the seconds it was awake for, not wall-clock age. That is the
+    /// intended reading of "uptime", and the `/metrics` HELP string says so
+    /// rather than claiming age since construction.
     started_at: std::time::Instant,
     /// Claude API client (shared across sessions; kept for backward compat with handlers.rs)
     claude_client: Arc<ClaudeClient>,
@@ -1280,6 +1287,43 @@ mod tests {
             "/health must report the time this server has run, not a \
              placeholder; got {reported} after sleeping past a second"
         );
+
+        // Pin the response shape. `src/main.rs` re-declares this struct to
+        // deserialize it, so a rename here compiles, passes `cargo test
+        // --lib`, and breaks `finch daemon-status` at runtime with "Failed to
+        // parse health response" -- review of #334 proved that by renaming
+        // `named_brains` and watching 150/150 stay green.
+        //
+        // `uptime_seconds` is a whole-second `u64`, so a daemon does report
+        // `0` for its first second. That is truncation of a measured value,
+        // not #131's hardcoded placeholder, but it is indistinguishable from
+        // one in a single scrape -- `/metrics` carries the sub-second gauge.
+        for (field, ok) in [
+            (
+                "status",
+                parsed.get("status").is_some_and(|v| v.is_string()),
+            ),
+            (
+                "named_brains",
+                parsed
+                    .get("named_brains")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+            ),
+            (
+                "pending_brain_terminalizations",
+                parsed
+                    .get("pending_brain_terminalizations")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+            ),
+        ] {
+            assert!(
+                ok,
+                "/health must keep publishing `{field}` with the type \
+                 `finch daemon-status` deserializes; body was {parsed}"
+            );
+        }
     }
 
     /// `/metrics` reports a measured value, not a constant.
@@ -1317,11 +1361,35 @@ mod tests {
             String::from_utf8(body.to_vec()).expect("metrics is UTF-8")
         }
 
+        /// The metric name of an exposition sample line, without its
+        /// labelset. `foo{a="b c"} 1` and `foo 1` both yield `foo`.
+        ///
+        /// Splitting on whitespace alone would keep the labels, so the
+        /// whitelist below would reject every labelled series and its advice
+        /// ("add it to MEASURED") would be wrong -- a labelset is not a name
+        /// and whitelisting one breaks on the next label value. The #131 work
+        /// this PR defers is routing and token aggregates, which are labelled
+        /// by construction, so that is the first follow-up and not a remote
+        /// case.
+        fn sample_name(line: &str) -> &str {
+            line.split(['{', ' ']).next().unwrap_or_default()
+        }
+
         fn gauge(text: &str) -> f64 {
-            text.lines()
-                .find_map(|line| line.strip_prefix("finch_daemon_uptime_seconds "))
-                .unwrap_or_else(|| panic!("no gauge sample line in:\n{text}"))
-                .trim()
+            let line = text
+                .lines()
+                .find(|line| {
+                    !line.starts_with('#') && sample_name(line) == "finch_daemon_uptime_seconds"
+                })
+                .unwrap_or_else(|| panic!("no gauge sample line in:\n{text}"));
+            let value = match line.find('}') {
+                Some(labelset_end) => &line[labelset_end + 1..],
+                None => &line[sample_name(line).len()..],
+            };
+            value
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("gauge sample has no value in:\n{text}"))
                 .parse()
                 .unwrap_or_else(|error| panic!("gauge is not a float ({error}) in:\n{text}"))
         }
@@ -1339,12 +1407,12 @@ mod tests {
         // that one string stay absent, so the check is a whitelist —
         // publishing anything new requires deciding here whether it is
         // measured.
-        const MEASURED: [&str; 1] = ["finch_daemon_uptime_seconds"];
+        const MEASURED: &[&str] = &["finch_daemon_uptime_seconds"];
         for line in first_text.lines() {
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
             }
-            let series = line.split_whitespace().next().unwrap_or_default();
+            let series = sample_name(line);
             assert!(
                 MEASURED.contains(&series),
                 "`{series}` is published but not in the measured set. If it is \

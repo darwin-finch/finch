@@ -98,13 +98,17 @@ Health check endpoint.
 {
   "status": "healthy",
   "uptime_seconds": 3600,
-  "named_brains": 5
+  "named_brains": 5,
+  "pending_brain_terminalizations": 0
 }
 ```
 
 ### GET /metrics
 
-Prometheus metrics (plain text format, exposition version 0.0.4).
+Prometheus metrics, in exposition format 0.0.4. The response is served as
+`text/plain; charset=utf-8` without a `version=0.0.4` parameter; scrapers
+default to 0.0.4 parsing, so this is accepted as-is until the `prometheus`
+crate's `TextEncoder` supplies the header.
 
 Exposes only series that are actually measured. A `finch_queries_total` counter
 was published here until #131; it was hardcoded to `0`, so a scraper could not

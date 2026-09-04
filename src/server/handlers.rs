@@ -4008,7 +4008,7 @@ pub async fn metrics_endpoint(
     // parallel counter invented here, so this exposes uptime and nothing else
     // until they exist.
     let metrics = format!(
-        "# HELP finch_daemon_uptime_seconds Seconds since this server was constructed.\n\
+        "# HELP finch_daemon_uptime_seconds Seconds this server has been running, not counting host suspend.\n\
          # TYPE finch_daemon_uptime_seconds gauge\n\
          finch_daemon_uptime_seconds {}\n",
         server.uptime().as_secs_f64()
