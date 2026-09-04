@@ -165,7 +165,10 @@ pub struct ResponseMetadata {
 pub enum StreamChunk {
     TextDelta(String),                  // Incremental text
     ContentBlockComplete(ContentBlock), // Complete tool_use or text block
-    /// Provider-reported model that actually served the streaming response.
+    /// Best available completed-inference model identity.
+    ///
+    /// Providers report an explicit serving model when available and may fall
+    /// back to their validated dispatch identity when it is not.
     ResponseMetadata {
         model: String,
     },

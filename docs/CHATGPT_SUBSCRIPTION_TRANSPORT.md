@@ -112,8 +112,11 @@ stream work.
 The SSE parser bounds each line and event and the total response. It validates
 standard `event:` names against JSON event types, requires strictly increasing
 sequence numbers, accumulates completed output items by contiguous output
-index, and reconciles them with any terminal output. Actual-model provenance
-must remain compatible and unchanged. Unknown fields/events, malformed tool
+index, and reconciles their semantic content with any terminal output while
+ignoring validated passive item metadata that may differ between snapshots.
+Actual-model provenance is optional: when absent Finch reports the validated requested catalog route;
+when present the bounded serving-model identity may differ from that route but
+must remain unchanged throughout the response. Unknown fields/events, malformed tool
 arguments, missing completion, duplicate terminal markers, post-terminal data,
 partial EOF, idle timeout, receiver drop, and payload-limit violations fail
 visibly before terminal chunks are published.

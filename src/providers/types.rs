@@ -788,9 +788,11 @@ pub struct ProviderAllowance {
 
 /// Provider-neutral identity and accounting for one completed inference.
 ///
-/// Requested/resolved identity is Finch-owned dispatch state; `actual_model`
-/// is authoritative provider response metadata. Subscription allowance is
-/// deliberately distinct from billable token usage.
+/// Requested/resolved identity is Finch-owned dispatch state. `actual_model`
+/// is the best available completed-inference identity: an explicit serving
+/// model when the provider supplies one, otherwise the validated dispatch
+/// identity. Subscription allowance is deliberately distinct from billable
+/// token usage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvocationMetadata {
     pub requested_model: String,
