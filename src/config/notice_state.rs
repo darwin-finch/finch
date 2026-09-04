@@ -271,6 +271,62 @@ mod tests {
         );
     }
 
+    /// A save that cannot complete leaves the previous state intact.
+    ///
+    /// This is the property temp-and-rename buys, and the reason to prefer it
+    /// over a plain write. With `fs::write` straight to the target, a
+    /// directory the process may not create files in is still one whose
+    /// existing writable file can be truncated and rewritten — so the old
+    /// record is destroyed by a save that then fails. Writing to a temporary
+    /// first fails before the target is touched.
+    ///
+    /// Review of #329 showed the earlier assertion (that no `.tmp` survives)
+    /// could not catch this: a successful rename and a plain write leave
+    /// identical directory contents, so removing atomicity altogether left
+    /// every test green.
+    #[test]
+    fn test_a_save_that_cannot_complete_does_not_destroy_the_previous_state() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notice_state.toml");
+
+        NoticeState {
+            suppress_until: Some("2026-09-10".into()),
+        }
+        .save_to(&path)
+        .expect("the first save succeeds");
+        let recorded = std::fs::read(&path).unwrap();
+
+        // Deny creating new entries in the directory, while leaving the
+        // existing file writable. `fs::write` to the target would still
+        // succeed here and clobber it; creating a temporary cannot.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let outcome = NoticeState {
+            suppress_until: Some("2026-12-25".into()),
+        }
+        .save_to(&path);
+
+        // Restore before asserting, so a failure does not leave an
+        // undeletable temporary directory behind.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        assert!(
+            outcome.is_err(),
+            "a save that cannot create its temporary must report failure"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            recorded,
+            "and must leave the previous record exactly as it was"
+        );
+    }
+
     /// The boundary matches the behaviour this replaced, exactly.
     ///
     /// The original predicate was `is_none_or(|d| today > d)` -- show when

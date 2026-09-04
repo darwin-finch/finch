@@ -69,3 +69,42 @@ fn test_the_startup_notice_decision_does_not_rewrite_the_config() {
         "the record belongs in the state file"
     );
 }
+
+/// `finch license remove` clears the recorded notice suppression.
+///
+/// This drives the real binary, because the wiring is what was broken and a
+/// helper test could not see it. Before the record moved out of `config.toml`,
+/// removal un-suppressed the notice for free — `LicenseRemove` writes
+/// `notice_suppress_until: None`. Afterwards the state file won and that
+/// stopped working, silently.
+///
+/// Review of #329 deleted both production call sites and 98 tests still
+/// passed; the only thing that had ever noticed one of them was rustc, when it
+/// failed to compile. This runs the command a user runs.
+#[test]
+fn test_license_remove_clears_the_recorded_suppression() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let finch = home.path().join(".finch");
+    std::fs::create_dir_all(&finch).expect("create .finch");
+
+    let state = finch.join("notice_state.toml");
+    std::fs::write(&state, "suppress_until = \"2030-01-01\"\n").expect("seed state");
+    assert!(state.exists());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_finch"))
+        .args(["license", "remove"])
+        .env("HOME", home.path())
+        .output()
+        .expect("run finch license remove");
+
+    assert!(
+        output.status.success(),
+        "`finch license remove` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !state.exists(),
+        "removing a licence must clear the recorded suppression, or the notice \
+         stays hidden until the old date expires"
+    );
+}
