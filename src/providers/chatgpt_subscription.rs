@@ -1288,7 +1288,7 @@ fn parse_event(
         .context("ChatGPT subscription stream event omitted type")?;
     match kind {
         "response.created" | "response.in_progress" => {
-            exact_keys(object, &["type", "sequence_number", "response", "headers"])?;
+            exact_event_keys(object, &["type", "sequence_number", "response", "headers"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1299,7 +1299,7 @@ fn parse_event(
             Ok(None)
         }
         "response.metadata" | "codex.response.metadata" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1330,7 +1330,7 @@ fn parse_event(
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
-            exact_keys(object, &["type", "sequence_number", "output_index", "item"])?;
+            exact_event_keys(object, &["type", "sequence_number", "output_index", "item"])?;
             required_sequence(object)?;
             let output_index = required_index(object, "output_index")?;
             let item = object
@@ -1348,7 +1348,7 @@ fn parse_event(
             Ok(None)
         }
         "response.content_part.added" | "response.content_part.done" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1398,7 +1398,7 @@ fn parse_event(
             Ok(None)
         }
         "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
-            exact_keys(
+            exact_event_keys(
                 object,
                 &[
                     "type",
@@ -1420,7 +1420,7 @@ fn parse_event(
             Ok(None)
         }
         "response.completed" => {
-            exact_keys(object, &["type", "sequence_number", "response"])?;
+            exact_event_keys(object, &["type", "sequence_number", "response"])?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1529,7 +1529,7 @@ fn validate_text_event(
     if has_content_index {
         keys.extend(["content_index", "logprobs"]);
     }
-    exact_keys(object, &keys)?;
+    exact_event_keys(object, &keys)?;
     required_sequence(object)?;
     required_identifier(object, "item_id", 256)?;
     required_index(object, "output_index")?;
@@ -1548,7 +1548,7 @@ fn validate_reasoning_text_event(
     field: &str,
     index_field: &str,
 ) -> Result<()> {
-    exact_keys(
+    exact_event_keys(
         object,
         &[
             "type",
@@ -1609,8 +1609,31 @@ fn parse_completed(
             "headers",
             "usage_metadata",
             "end_turn",
+            "background",
+            "completed_at",
+            "conversation",
+            "max_tool_calls",
+            "moderation",
+            "prompt",
+            "prompt_cache_diagnostics",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+            "top_logprobs",
+            "frequency_penalty",
+            "presence_penalty",
+            "tool_usage",
         ],
     )?;
+    if let Some(tool_usage) = response.get("tool_usage") {
+        if serde_json::to_vec(tool_usage)
+            .context("ChatGPT terminal response tool usage metadata was invalid")?
+            .len()
+            > MAX_TOOL_ARGUMENT_BYTES
+        {
+            bail!("ChatGPT terminal response tool usage metadata exceeded the size limit");
+        }
+    }
+    validate_documented_response_metadata(response)?;
     if response
         .get("status")
         .is_some_and(|status| status.as_str() != Some("completed"))
@@ -1640,13 +1663,21 @@ fn parse_completed(
         bail!("ChatGPT completion returned too many output items");
     }
     if let Some(output) = terminal_output {
-        if !accumulator.output_items.is_empty()
-            && (output.len() != accumulator.output_items.len()
+        if !accumulator.output_items.is_empty() {
+            validate_output_snapshot(accumulator.output_items.values(), allowed_tools)?;
+            validate_output_snapshot(output.iter(), allowed_tools)?;
+            if output.len() != accumulator.output_items.len()
                 || output.iter().enumerate().any(|(index, item)| {
-                    accumulator.output_items.get(&(index as u64)) != Some(item)
-                }))
-        {
-            bail!("ChatGPT terminal output did not match streamed output items");
+                    accumulator
+                        .output_items
+                        .get(&(index as u64))
+                        .is_none_or(|streamed| {
+                            canonical_output_item(streamed) != canonical_output_item(item)
+                        })
+                })
+            {
+                bail!("ChatGPT terminal output did not match streamed output items");
+            }
         }
         if accumulator.output_items.is_empty() {
             accumulator.output_items = output
@@ -1679,6 +1710,40 @@ fn parse_completed(
         output_tokens,
         allowance: None,
     })
+}
+
+fn validate_output_snapshot<'a>(
+    items: impl Iterator<Item = &'a Value>,
+    allowed_tools: &HashSet<String>,
+) -> Result<()> {
+    let mut blocks = Vec::new();
+    let mut call_ids = HashSet::new();
+    for item in items {
+        parse_output_item(item, &mut blocks, &mut call_ids, allowed_tools)?;
+    }
+    Ok(())
+}
+
+fn canonical_output_item(item: &Value) -> Value {
+    let mut canonical = item.clone();
+    let Some(content) = canonical
+        .as_object_mut()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .and_then(|item| item.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return canonical;
+    };
+    for part in content {
+        let Some(part) = part.as_object_mut() else {
+            continue;
+        };
+        if part.get("type").and_then(Value::as_str) == Some("output_text") {
+            part.remove("annotations");
+            part.remove("logprobs");
+        }
+    }
+    canonical
 }
 
 fn parse_output_item(
@@ -1726,7 +1791,7 @@ fn parse_output_item(
                 let part = part
                     .as_object()
                     .context("ChatGPT response content was invalid")?;
-                exact_keys(part, &["type", "text"])?;
+                exact_keys(part, &["type", "text", "annotations", "logprobs"])?;
                 if part.get("type").and_then(Value::as_str) != Some("output_text") {
                     bail!("ChatGPT response contained an unknown message content type");
                 }
@@ -1735,6 +1800,21 @@ fn parse_output_item(
                     .and_then(Value::as_str)
                     .context("ChatGPT output text was invalid")?;
                 validate_bounded_text(text, MAX_RESPONSE_BYTES, "output text")?;
+                for field in ["annotations", "logprobs"] {
+                    if let Some(value) = part.get(field) {
+                        let values = value
+                            .as_array()
+                            .context("ChatGPT output text metadata was invalid")?;
+                        if values.len() > 256
+                            || serde_json::to_vec(values)
+                                .context("ChatGPT output text metadata was invalid")?
+                                .len()
+                                > MAX_TOOL_ARGUMENT_BYTES
+                        {
+                            bail!("ChatGPT output text metadata exceeded the size limit");
+                        }
+                    }
+                }
                 blocks.push(ContentBlock::Text {
                     text: text.to_string(),
                 });
@@ -1825,6 +1905,157 @@ fn parse_output_item(
             });
         }
         _ => bail!("ChatGPT response contained an unknown output item type"),
+    }
+    Ok(())
+}
+
+fn validate_documented_response_metadata(response: &Map<String, Value>) -> Result<()> {
+    let optional_number = |name: &str, minimum: f64, maximum: f64| -> Result<()> {
+        let Some(value) = response.get(name) else {
+            return Ok(());
+        };
+        if value.is_null() {
+            return Ok(());
+        }
+        value
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= minimum && *value <= maximum)
+            .with_context(|| format!("ChatGPT terminal response {name} was invalid"))?;
+        Ok(())
+    };
+    optional_number("created_at", 0.0, u64::MAX as f64)?;
+    optional_number("completed_at", 0.0, u64::MAX as f64)?;
+    optional_number("temperature", 0.0, 2.0)?;
+    optional_number("top_p", 0.0, 1.0)?;
+    optional_number("frequency_penalty", -2.0, 2.0)?;
+    optional_number("presence_penalty", -2.0, 2.0)?;
+
+    if response
+        .get("object")
+        .is_some_and(|value| value.as_str() != Some("response"))
+    {
+        bail!("ChatGPT terminal response object type was invalid");
+    }
+    for (name, expected) in [("parallel_tool_calls", false), ("store", false)] {
+        if response
+            .get(name)
+            .is_some_and(|value| !value.is_null() && value.as_bool() != Some(expected))
+        {
+            bail!("ChatGPT terminal response {name} was invalid");
+        }
+    }
+    if response
+        .get("background")
+        .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
+    {
+        bail!("ChatGPT terminal response background state was invalid");
+    }
+    if response
+        .get("end_turn")
+        .is_some_and(|value| !value.is_null() && value.as_bool().is_none())
+    {
+        bail!("ChatGPT terminal response end_turn was invalid");
+    }
+    for name in ["max_output_tokens", "max_tool_calls"] {
+        if response.get(name).is_some_and(|value| {
+            !value.is_null() && value.as_u64().is_none_or(|value| value > u32::MAX as u64)
+        }) {
+            bail!("ChatGPT terminal response {name} was invalid");
+        }
+    }
+    if response
+        .get("top_logprobs")
+        .is_some_and(|value| !value.is_null() && value.as_u64().is_none_or(|value| value > 20))
+    {
+        bail!("ChatGPT terminal response top_logprobs was invalid");
+    }
+    if let Some(value) = response
+        .get("conversation")
+        .filter(|value| !value.is_null())
+    {
+        let conversation = value
+            .as_object()
+            .context("ChatGPT terminal response conversation was invalid")?;
+        exact_keys(conversation, &["id"])?;
+        required_identifier(conversation, "id", 256)?;
+    }
+    if let Some(value) = response
+        .get("prompt_cache_options")
+        .filter(|value| !value.is_null())
+    {
+        let options = value
+            .as_object()
+            .context("ChatGPT terminal response prompt cache options were invalid")?;
+        exact_keys(options, &["mode", "ttl", "comparison_response_id"])?;
+        if !matches!(
+            options.get("mode").and_then(Value::as_str),
+            Some("implicit" | "explicit")
+        ) || options.get("ttl").and_then(Value::as_str) != Some("30m")
+        {
+            bail!("ChatGPT terminal response prompt cache options were invalid");
+        }
+        if options.contains_key("comparison_response_id") {
+            required_identifier(options, "comparison_response_id", 256)?;
+        }
+    }
+    if response.get("prompt_cache_retention").is_some_and(|value| {
+        !value.is_null() && !matches!(value.as_str(), Some("in_memory" | "24h"))
+    }) {
+        bail!("ChatGPT terminal response prompt cache retention was invalid");
+    }
+    if response.get("service_tier").is_some_and(|value| {
+        !value.is_null()
+            && !matches!(
+                value.as_str(),
+                Some("auto" | "default" | "flex" | "scale" | "priority" | "fast" | "ultrafast")
+            )
+    }) {
+        bail!("ChatGPT terminal response service tier was invalid");
+    }
+    for (name, maximum) in [
+        ("prompt_cache_key", 256usize),
+        ("safety_identifier", 64usize),
+        ("user", 256usize),
+    ] {
+        if let Some(value) = response.get(name).filter(|value| !value.is_null()) {
+            let value = value
+                .as_str()
+                .with_context(|| format!("ChatGPT terminal response {name} was invalid"))?;
+            validate_bounded_text(value, maximum, name)?;
+        }
+    }
+    if let Some(value) = response.get("metadata").filter(|value| !value.is_null()) {
+        let metadata = value
+            .as_object()
+            .context("ChatGPT terminal response metadata was invalid")?;
+        if metadata.len() > 16 {
+            bail!("ChatGPT terminal response metadata was excessive");
+        }
+        for (key, value) in metadata {
+            if key.len() > 64 || value.as_str().is_none_or(|value| value.len() > 512) {
+                bail!("ChatGPT terminal response metadata was invalid");
+            }
+        }
+    }
+    for name in [
+        "moderation",
+        "prompt",
+        "prompt_cache_diagnostics",
+        "reasoning",
+        "text",
+        "headers",
+        "usage_metadata",
+    ] {
+        if let Some(value) = response.get(name).filter(|value| !value.is_null()) {
+            if !value.is_object()
+                || serde_json::to_vec(value)
+                    .context("ChatGPT terminal response metadata was invalid")?
+                    .len()
+                    > MAX_TOOL_ARGUMENT_BYTES
+            {
+                bail!("ChatGPT terminal response {name} was invalid");
+            }
+        }
     }
     Ok(())
 }
@@ -1963,6 +2194,32 @@ fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
         bail!("ChatGPT subscription response contained an unknown field");
     }
     Ok(())
+}
+
+/// Validate an audited SSE event envelope while accepting only bounded passive
+/// padding fields that cannot alter Finch's execution semantics.
+fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
+    if let Some(obfuscation) = object.get("obfuscation") {
+        let obfuscation = obfuscation
+            .as_str()
+            .context("ChatGPT subscription response obfuscation padding was invalid")?;
+        validate_bounded_text(
+            obfuscation,
+            MAX_SSE_LINE_BYTES,
+            "response obfuscation padding",
+        )?;
+    }
+    if let Some(safety_buffering) = object.get("safety_buffering") {
+        let encoded = serde_json::to_vec(safety_buffering)
+            .context("ChatGPT subscription safety buffering metadata was invalid")?;
+        if encoded.len() > MAX_SSE_EVENT_BYTES {
+            bail!("ChatGPT subscription safety buffering metadata exceeded the size limit");
+        }
+    }
+    let mut event_fields = Vec::with_capacity(allowed.len() + 2);
+    event_fields.extend_from_slice(allowed);
+    event_fields.extend(["obfuscation", "safety_buffering"]);
+    exact_keys(object, &event_fields)
 }
 
 fn required_identifier(object: &Map<String, Value>, name: &str, maximum: usize) -> Result<String> {
@@ -2200,6 +2457,91 @@ mod tests {
             json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
             json!({"type":"response.output_item.done","sequence_number":5,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
             json!({"type":"response.completed","sequence_number":6,"response":{"id":"resp-1","usage":{"input_tokens":12,"output_tokens":7}}})
+        )
+    }
+
+    fn completed_sse_with_audited_passive_fields(model: &str) -> String {
+        let mut response = json!({
+            "id":"resp-passive-fields",
+            "object":"response",
+            "created_at":1_777_777_776.5,
+            "completed_at":1_777_777_777.5,
+            "status":"completed",
+            "error":null,
+            "incomplete_details":null,
+            "instructions":null,
+            "max_output_tokens":null,
+            "max_tool_calls":null,
+            "model":model,
+            "parallel_tool_calls":false,
+            "previous_response_id":null,
+            "reasoning":{},
+            "store":false,
+            "temperature":1.0,
+            "text":{},
+            "tool_choice":"auto",
+            "tools":[],
+            "top_p":1.0,
+            "truncation":"disabled"
+        })
+        .as_object()
+        .expect("passive-field response fixture must be an object")
+        .clone();
+        response.extend(
+            json!({
+                "usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19},
+                "user":null,
+                "metadata":{"fixture":"audited-passive-fields"},
+                "service_tier":"default",
+                "prompt_cache_key":null,
+                "prompt_cache_diagnostics":{"type":"cache_hit"},
+                "prompt_cache_options":{"mode":"implicit","ttl":"30m","comparison_response_id":"resp-cache-comparison"},
+                "prompt_cache_retention":"24h",
+                "safety_identifier":null,
+                "headers":{},
+                "usage_metadata":{},
+                "end_turn":true,
+                "background":null,
+                "conversation":{"id":"conv-fixture"},
+                "moderation":{},
+                "prompt":{},
+                "top_logprobs":0,
+                "frequency_penalty":0.0,
+                "presence_penalty":0.0,
+                "tool_usage":[{"name":"read","calls":1}]
+            })
+            .as_object()
+            .expect("passive-field response extension fixture must be an object")
+                .clone(),
+        );
+        response.insert(
+            "output".to_string(),
+            json!([
+                {"type":"reasoning","summary":[],"encrypted_content":"opaque-1"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}
+            ]),
+        );
+        let completed = json!({
+            "type":"response.completed",
+            "sequence_number":5,
+            "obfuscation":"padding-terminal",
+            "safety_buffering":{"enabled":false},
+            "response":response
+        });
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}},"obfuscation":"padding-created","safety_buffering":{"enabled":false}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"},"obfuscation":"padding-reasoning"}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello","logprobs":[],"obfuscation":"padding-delta"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]},"obfuscation":"padding-message"}),
+            completed
         )
     }
 
@@ -2678,6 +3020,324 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_background_accepts_null_and_false_but_rejects_other_values() {
+        for (case, value) in [("null", Value::Null), ("false", json!(false))] {
+            let terminal = json!({
+                "id":"resp-background",
+                "status":"completed",
+                "model":DEFAULT_MODEL,
+                "output":[],
+                "background":value
+            });
+            parse_completed(
+                terminal.as_object().unwrap(),
+                DEFAULT_MODEL,
+                Some(DEFAULT_MODEL),
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .unwrap_or_else(|error| panic!("documented {case} background state failed: {error:#}"));
+        }
+
+        for (case, value) in [("true", json!(true)), ("string", json!("false"))] {
+            let background = json!({
+                "id":"resp-background",
+                "status":"completed",
+                "model":DEFAULT_MODEL,
+                "output":[],
+                "background":value
+            });
+            let error = parse_completed(
+                background.as_object().unwrap(),
+                DEFAULT_MODEL,
+                Some(DEFAULT_MODEL),
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{case} background execution unexpectedly succeeded"));
+            assert!(
+                error.to_string().contains("background state was invalid"),
+                "{case} background state returned an unhelpful diagnostic: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_terminal_tool_usage_is_bounded_without_requiring_an_object() {
+        let terminal = json!({
+            "id":"resp-tool-usage",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "tool_usage":[{"name":"read","calls":1}]
+        });
+        parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .expect("bounded passive tool usage must not require a provider-specific shape");
+
+        for value in [json!(true), json!("x".repeat(MAX_TOOL_ARGUMENT_BYTES - 2))] {
+            let mut bounded = terminal.clone();
+            bounded["tool_usage"] = value;
+            parse_completed(
+                bounded.as_object().unwrap(),
+                DEFAULT_MODEL,
+                Some(DEFAULT_MODEL),
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .expect("opaque tool usage at or below the inclusive byte limit must be accepted");
+        }
+
+        let mut excessive = terminal;
+        excessive["tool_usage"] = json!("x".repeat(MAX_TOOL_ARGUMENT_BYTES - 1));
+        let error = parse_completed(
+            excessive.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("oversized passive tool usage must remain bounded");
+        assert!(
+            error
+                .to_string()
+                .contains("tool usage metadata exceeded the size limit"),
+            "oversized tool usage returned an unhelpful diagnostic: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_terminal_unknown_fields_remain_fail_closed() {
+        let terminal = json!({
+            "id":"resp-unknown-terminal",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "future_authority_field":true
+        });
+        let error = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("unaudited terminal semantics must remain fail closed");
+        assert!(
+            error.to_string().contains("unknown field"),
+            "unknown terminal semantics returned an unhelpful diagnostic: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_terminal_prompt_cache_diagnostics_are_object_shaped_and_bounded() {
+        let exactly_bounded = json!({"p":"x".repeat(MAX_TOOL_ARGUMENT_BYTES - 8)});
+        assert_eq!(
+            serde_json::to_vec(&exactly_bounded).unwrap().len(),
+            MAX_TOOL_ARGUMENT_BYTES,
+            "prompt cache diagnostics exact-bound fixture drifted"
+        );
+        validate_documented_response_metadata(
+            json!({"prompt_cache_diagnostics":exactly_bounded})
+                .as_object()
+                .unwrap(),
+        )
+        .expect("prompt cache diagnostics at the inclusive byte limit must be accepted");
+
+        for (case, value) in [
+            ("non-object", json!(false)),
+            (
+                "oversized-object",
+                json!({"payload":"x".repeat(MAX_TOOL_ARGUMENT_BYTES)}),
+            ),
+        ] {
+            let terminal = json!({
+                "id":"resp-cache-diagnostics",
+                "status":"completed",
+                "model":DEFAULT_MODEL,
+                "output":[],
+                "prompt_cache_diagnostics":value
+            });
+            let error = parse_completed(
+                terminal.as_object().unwrap(),
+                DEFAULT_MODEL,
+                Some(DEFAULT_MODEL),
+                &HashSet::new(),
+                &mut StreamAccumulator::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{case} prompt cache diagnostics unexpectedly succeeded"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("prompt_cache_diagnostics was invalid"),
+                "{case} prompt cache diagnostics returned an unhelpful diagnostic: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_terminal_prompt_cache_options_and_retention_are_strict() {
+        for (case, metadata) in [
+            (
+                "explicit-without-comparison",
+                json!({"prompt_cache_options":{"mode":"explicit","ttl":"30m"}}),
+            ),
+            (
+                "in-memory-retention",
+                json!({"prompt_cache_retention":"in_memory"}),
+            ),
+            (
+                "bounded-cache-key",
+                json!({"prompt_cache_key":"k".repeat(256)}),
+            ),
+        ] {
+            validate_documented_response_metadata(metadata.as_object().unwrap())
+                .unwrap_or_else(|error| panic!("valid {case} metadata failed: {error:#}"));
+        }
+
+        for (case, metadata) in [
+            (
+                "invalid-mode",
+                json!({"prompt_cache_options":{"mode":"future","ttl":"30m"}}),
+            ),
+            (
+                "missing-ttl",
+                json!({"prompt_cache_options":{"mode":"implicit"}}),
+            ),
+            (
+                "unknown-option",
+                json!({"prompt_cache_options":{"mode":"implicit","ttl":"30m","future":true}}),
+            ),
+            (
+                "invalid-comparison-id",
+                json!({"prompt_cache_options":{"mode":"implicit","ttl":"30m","comparison_response_id":""}}),
+            ),
+            (
+                "invalid-retention",
+                json!({"prompt_cache_retention":"forever"}),
+            ),
+            ("non-string-cache-key", json!({"prompt_cache_key":false})),
+            (
+                "oversized-cache-key",
+                json!({"prompt_cache_key":"k".repeat(257)}),
+            ),
+        ] {
+            let error = validate_documented_response_metadata(metadata.as_object().unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("{case} prompt cache metadata unexpectedly succeeded"));
+            assert!(
+                error.to_string().contains("invalid")
+                    || error.to_string().contains("unknown field")
+                    || error.to_string().contains("exceeded the size limit"),
+                "{case} prompt cache metadata returned an unhelpful diagnostic: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_text_metadata_is_array_shaped_and_count_bounded() {
+        for field in ["annotations", "logprobs"] {
+            let mut accepted = json!({
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"hello"}]
+            });
+            accepted["content"][0][field] = json!(vec![Value::Null; 256]);
+            parse_output_item(
+                &accepted,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{field} metadata at the inclusive count limit failed: {error:#}")
+            });
+
+            for (case, value) in [
+                ("non-array", json!(false)),
+                ("257 entries", json!(vec![Value::Null; 257])),
+            ] {
+                let mut rejected = json!({
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"hello"}]
+                });
+                rejected["content"][0][field] = value;
+                let error = parse_output_item(
+                    &rejected,
+                    &mut Vec::new(),
+                    &mut HashSet::new(),
+                    &HashSet::new(),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{case} {field} metadata unexpectedly succeeded"));
+                assert!(
+                    error.to_string().contains("metadata was invalid")
+                        || error
+                            .to_string()
+                            .contains("metadata exceeded the size limit"),
+                    "{case} {field} metadata returned an unhelpful diagnostic: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_event_obfuscation_must_be_string_padding() {
+        let event = json!({"type":"response.created","obfuscation":{"future":true}});
+        let error = exact_event_keys(event.as_object().unwrap(), &["type"])
+            .err()
+            .expect("structured obfuscation must not bypass event validation");
+        assert!(
+            error.to_string().contains("padding was invalid"),
+            "structured obfuscation returned an unhelpful diagnostic: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_terminal_output_rejects_semantic_drift_after_passive_normalization() {
+        let streamed = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]
+        });
+        let terminal = json!({
+            "id":"resp-semantic-drift",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"different"}]
+            }]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.output_items.insert(0, streamed);
+        let error = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut accumulator,
+        )
+        .err()
+        .expect("terminal text drift must remain fail closed");
+        assert!(
+            error.to_string().contains("did not match"),
+            "terminal semantic drift returned an unhelpful diagnostic: {error:#}"
+        );
+    }
+
+    #[test]
     fn malformed_unknown_and_misordered_terminal_events_fail_closed() {
         let mut accumulator = StreamAccumulator::default();
         let unknown = json!({"type":"response.future","sequence_number":1});
@@ -2885,6 +3545,84 @@ mod tests {
             terminal_metadata.as_deref(),
             Some(DEFAULT_MODEL),
             "headerless SSE omitted terminal model metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_audited_passive_response_fields() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_audited_passive_fields(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("audited-passive-field fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!("audited passive fields failed through the buffered boundary: {error:#}")
+        });
+        assert_eq!(
+            buffered.model, DEFAULT_MODEL,
+            "audited passive fields changed buffered model provenance; response={buffered:?}"
+        );
+        assert!(
+            buffered
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == "hello")),
+            "audited passive fields lost buffered response text; response={buffered:?}"
+        );
+
+        let mut receiver = streaming.unwrap_or_else(|error| {
+            panic!("audited passive fields failed through the streaming boundary: {error:#}")
+        });
+        let mut streamed_text = String::new();
+        let mut terminal_metadata = None;
+        while let Some(chunk) = receiver.recv().await {
+            match chunk.unwrap_or_else(|error| {
+                panic!("audited passive fields emitted a stream error: {error:#}")
+            }) {
+                StreamChunk::TextDelta(delta) => streamed_text.push_str(&delta),
+                StreamChunk::ResponseMetadata { model } => terminal_metadata = Some(model),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            streamed_text, "hello",
+            "audited passive fields lost streamed text"
+        );
+        assert_eq!(
+            terminal_metadata.as_deref(),
+            Some(DEFAULT_MODEL),
+            "audited passive fields omitted terminal model metadata"
         );
     }
 
