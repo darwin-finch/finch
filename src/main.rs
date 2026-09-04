@@ -2914,12 +2914,9 @@ async fn run_license_command(cmd: Option<LicenseCommand>) -> Result<()> {
         Some(LicenseCommand::Remove) => {
             config.license = LicenseConfig::default();
             // Removing a licence un-suppressed the notice as a side effect of
-
-            // writing `notice_suppress_until: None`. The record lives in a state
-
-            // file now, so that has to be explicit (#329 review).
-
-            crate::config::forget_notice_suppression();
+            // writing `notice_suppress_until: None`. The record lives in a
+            // state file now, so that has to be explicit (#329 review).
+            finch::config::forget_notice_suppression();
             if let Err(e) = config.save() {
                 eprintln!("⚠️  Could not save config: {}", e);
             } else {

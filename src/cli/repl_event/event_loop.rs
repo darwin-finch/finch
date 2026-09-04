@@ -3248,12 +3248,10 @@ Rules:\n\
                         use crate::config::{load_config, LicenseConfig};
                         if let Ok(mut cfg) = load_config() {
                             cfg.license = LicenseConfig::default();
-                            // Removing a licence un-suppressed the notice as a side effect of
-
-                            // writing `notice_suppress_until: None`. The record lives in a state
-
-                            // file now, so that has to be explicit (#329 review).
-
+                            // Removing a licence un-suppressed the notice as a
+                            // side effect of writing `notice_suppress_until:
+                            // None`. The record lives in a state file now, so
+                            // that has to be explicit (#329 review).
                             crate::config::forget_notice_suppression();
                             if let Err(e) = cfg.save() {
                                 self.output_manager
