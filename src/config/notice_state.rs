@@ -46,7 +46,22 @@ impl NoticeState {
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self).context("Failed to serialize notice state")?;
-        std::fs::write(path, text).with_context(|| format!("Failed to write {}", path.display()))
+        // Write-and-rename, not a plain write. Two Finch processes can start
+        // at the same moment and both land here, and a half-written file is a
+        // readable outcome of an interrupted `fs::write`. The corrupt path in
+        // `load_from` recovers from that, but recovering means showing the
+        // notice an extra time; renaming means it cannot happen at all. The
+        // temporary carries the process id so two writers never share one.
+        let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        std::fs::write(&temporary, text)
+            .with_context(|| format!("Failed to write {}", temporary.display()))?;
+        std::fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "Failed to replace {} with {}",
+                path.display(),
+                temporary.display()
+            )
+        })
     }
 }
 
@@ -209,6 +224,40 @@ mod tests {
             Some("2026-09-10"),
             "and records the next date in the state file, not the config"
         );
+    }
+
+    /// The boundary matches the behaviour this replaced, exactly.
+    ///
+    /// The original predicate was `is_none_or(|d| today > d)` -- show when
+    /// today is strictly after the recorded date. The replacement suppresses
+    /// when `today <= until`, the same predicate negated. Nothing else pins
+    /// that equivalence, so an edit turning `<=` into `<` would change how
+    /// often every user sees the notice and no test would object.
+    ///
+    /// The old predicate is written out here rather than referenced, so this
+    /// still means something now the code it came from is gone.
+    #[test]
+    fn test_the_boundary_matches_the_behaviour_it_replaced() {
+        let home = tempfile::tempdir().unwrap();
+        let recorded = day("2026-09-10");
+
+        for (today, original_would_show) in [
+            (day("2026-09-09"), false),
+            (day("2026-09-10"), false),
+            (day("2026-09-11"), true),
+        ] {
+            assert_eq!(
+                today > recorded,
+                original_would_show,
+                "the reference predicate itself must be right, or this proves nothing"
+            );
+            let state = home.path().join(format!("state-{today}.toml"));
+            assert_eq!(
+                claim_notice_showing(&state, Some("2026-09-10"), today, Duration::days(7)),
+                original_would_show,
+                "on {today} the replacement must agree with `today > suppress_until`"
+            );
+        }
     }
 
     /// A corrupt state file is not a reason to fail or to touch the config.
