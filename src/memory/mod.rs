@@ -35,6 +35,26 @@ struct HydrationBatchPause {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct HydrationCompletionPause {
+    reached: watch::Sender<bool>,
+    release: watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+impl HydrationCompletionPause {
+    async fn after_completion(&self) {
+        self.reached.send_replace(true);
+        let mut release = self.release.clone();
+        while !*release.borrow_and_update() {
+            if release.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 impl HydrationBatchPause {
     async fn after_batch(&self, loaded: usize) {
         if loaded < self.after_loaded {
@@ -57,15 +77,41 @@ static HYDRATION_BATCH_PAUSES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[cfg(test)]
+static HYDRATION_COMPLETION_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<HydrationCompletionPause>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
 pub(crate) struct HydrationBatchPauseRegistration {
     path: PathBuf,
     pause: Arc<HydrationBatchPause>,
 }
 
 #[cfg(test)]
+struct HydrationCompletionPauseRegistration {
+    path: PathBuf,
+    pause: Arc<HydrationCompletionPause>,
+}
+
+#[cfg(test)]
 impl Drop for HydrationBatchPauseRegistration {
     fn drop(&mut self) {
         let mut pauses = HYDRATION_BATCH_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pauses
+            .get(&self.path)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.pause))
+        {
+            pauses.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HydrationCompletionPauseRegistration {
+    fn drop(&mut self) {
+        let mut pauses = HYDRATION_COMPLETION_PAUSES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pauses
@@ -113,8 +159,48 @@ pub(crate) fn register_hydration_batch_pause(
 }
 
 #[cfg(test)]
+fn register_hydration_completion_pause(
+    path: PathBuf,
+) -> (
+    HydrationCompletionPauseRegistration,
+    watch::Receiver<bool>,
+    watch::Sender<bool>,
+) {
+    let (reached, reached_rx) = watch::channel(false);
+    let (release, release_rx) = watch::channel(false);
+    let pause = Arc::new(HydrationCompletionPause {
+        reached,
+        release: release_rx,
+    });
+    let mut pauses = HYDRATION_COMPLETION_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses.insert(path.clone(), Arc::clone(&pause)).is_none(),
+        "a hydration completion pause is already registered for {}",
+        path.display()
+    );
+    drop(pauses);
+    (
+        HydrationCompletionPauseRegistration { path, pause },
+        reached_rx,
+        release,
+    )
+}
+
+#[cfg(test)]
 fn take_hydration_batch_pause(path: &std::path::Path) -> Option<Arc<HydrationBatchPause>> {
     HYDRATION_BATCH_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path)
+}
+
+#[cfg(test)]
+fn take_hydration_completion_pause(
+    path: &std::path::Path,
+) -> Option<Arc<HydrationCompletionPause>> {
+    HYDRATION_COMPLETION_PAUSES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(path)
@@ -199,6 +285,8 @@ struct HydrationState {
     failure: std::sync::Mutex<Option<Failure>>,
     #[cfg(test)]
     batch_pause: std::sync::Mutex<Option<Arc<HydrationBatchPause>>>,
+    #[cfg(test)]
+    completion_pause: std::sync::Mutex<Option<Arc<HydrationCompletionPause>>>,
 }
 
 /// Opens the write gate if the loader ends without finishing.
@@ -237,6 +325,8 @@ impl HydrationState {
             failure: std::sync::Mutex::new(None),
             #[cfg(test)]
             batch_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            completion_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -257,6 +347,26 @@ impl HydrationState {
             .clone();
         if let Some(pause) = pause {
             pause.after_batch(loaded).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn install_completion_pause(&self, pause: Option<Arc<HydrationCompletionPause>>) {
+        *self
+            .completion_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
+    }
+
+    #[cfg(test)]
+    async fn pause_after_completion(&self) {
+        let pause = self
+            .completion_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pause) = pause {
+            pause.after_completion().await;
         }
     }
 
@@ -651,7 +761,10 @@ impl MemorySystem {
 
         let hydration = Arc::new(HydrationState::new(node_count.max(0) as usize));
         #[cfg(test)]
-        hydration.install_batch_pause(take_hydration_batch_pause(&config.db_path));
+        {
+            hydration.install_batch_pause(take_hydration_batch_pause(&config.db_path));
+            hydration.install_completion_pause(take_hydration_completion_pause(&config.db_path));
+        }
         let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
         let mut hydration_task = None;
@@ -901,8 +1014,9 @@ impl MemorySystem {
         // cannot reconstruct.
         //
         // Refusing here leaves the conversation row written and no
-        // `memory_sources` row, which is exactly the state a later
-        // re-projection repairs.
+        // `memory_sources` row. That preserves the irreplaceable raw turn for
+        // explicit inspection, but automatic re-projection of this pending
+        // state is not implemented yet and is tracked in #339.
         self.ensure_hydrated().await?;
 
         // Quality filter: classify and extract key content before indexing.
@@ -1467,9 +1581,11 @@ impl MemorySystem {
                     nodes.insert(node.id, node);
                 }
             }
-            let loaded = state.loaded.fetch_add(count, Ordering::SeqCst) + count;
+            state.loaded.fetch_add(count, Ordering::SeqCst);
             #[cfg(test)]
-            state.pause_after_batch(loaded).await;
+            state
+                .pause_after_batch(state.loaded.load(Ordering::SeqCst))
+                .await;
 
             // Yield so a turn submitted mid-hydration is served promptly.
             tokio::task::yield_now().await;
@@ -1477,6 +1593,8 @@ impl MemorySystem {
 
         Self::link_loaded_children(&tree).await;
         state.complete();
+        #[cfg(test)]
+        state.pause_after_completion().await;
     }
 
     /// Rebuild every `children` list from the `parent` links of the nodes
@@ -2570,6 +2688,34 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
+    async fn await_registered_hydration_pause(
+        reached: &mut watch::Receiver<bool>,
+        memory: &MemorySystem,
+    ) {
+        if *reached.borrow_and_update() {
+            return;
+        }
+
+        let wait = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                reached.changed().await.expect(
+                    "the registered hydration pause disappeared before the production loader reached it",
+                );
+                if *reached.borrow_and_update() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            wait.is_ok(),
+            "the production loader did not reach its registered pause within 2s; \
+             status={:?}, gate_receivers={}",
+            memory.hydration_status(),
+            memory.hydration.done.receiver_count()
+        );
+    }
+
     fn seed_tree_nodes(path: &std::path::Path, count: u64, overrides: &[(u64, u64)]) -> Result<()> {
         let conn = Connection::open(path)?;
         let embedding: Vec<u8> = 0.5f32.to_le_bytes().repeat(8);
@@ -2986,48 +3132,430 @@ mod tests {
         );
     }
 
+    const ABORTED_HYDRATION_REASON: &str = "the MemTree loader ended without finishing: it \
+        panicked, was aborted, or its runtime shut down before it could run";
+    const ABORTED_HYDRATION_WRITE_ERROR: &str = "MemTree hydration failed, so this write cannot \
+        be placed: the MemTree loader ended without finishing: it panicked, was aborted, or its \
+        runtime shut down before it could run";
+    const PRE_POLL_ABORT_WRITE: &str = "A write after pre-poll cancellation retains raw history \
+        without entering the incomplete semantic tree.";
+    const MID_HYDRATION_ABORT_WRITE: &str = "A waiting write must retain raw history but never \
+        enter the incomplete semantic tree.";
+    const POST_READY_ABORT_WRITE: &str = "The deployment audit record remains writable after a \
+        completed hydration loader is cancelled during cleanup.";
+
+    /// #333. Cancellation before the production loader's first poll must
+    /// still drop its guard and release the write gate as failed.
+    ///
+    /// The existing cancellation regressions deliberately stop the loader
+    /// after a batch or after completion. Neither can distinguish a guard
+    /// captured by the spawned future from one constructed inside it: in both
+    /// cases the future has already run. Occupying the runtime's only worker
+    /// makes the pre-poll ordering causal rather than scheduler-dependent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_loader_abort_before_first_poll_releases_write_without_semantic_commit(
+    ) -> Result<()> {
+        const NODES: u64 = HYDRATION_BATCH as u64;
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), NODES, &[])?;
+
+        // This task blocks the sole Tokio worker. The test future itself is
+        // driven by Runtime::block_on on the caller thread, so it can create
+        // and cancel the loader while no worker exists that could poll it.
+        // Both channel waits are bounded; dropping the release sender also
+        // wakes the blocker if an assertion below panics.
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::spawn(async move {
+            worker_started_tx
+                .send(())
+                .expect("the test thread must remain alive for the worker handshake");
+            release_worker_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the test must release the occupied Tokio worker within 5s");
+        });
+        worker_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the sole Tokio worker did not enter the blocker within 2s");
+
+        let mut memory = MemorySystem::new(config)?;
+        assert_eq!(
+            memory.hydration.loaded.load(Ordering::SeqCst),
+            0,
+            "the occupied sole worker must prevent the production loader's first poll"
+        );
+        let loader = memory
+            .hydration_task
+            .take()
+            .expect("a nonempty store on a multi-thread runtime must retain its loader handle");
+        loader.abort();
+        release_worker_tx
+            .send(())
+            .expect("the occupied Tokio worker must remain available for release");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), blocker)
+            .await
+            .expect("the occupied Tokio worker did not exit within 2s after release")
+            .context("the occupied Tokio worker task panicked")?;
+        let loader_result = tokio::time::timeout(std::time::Duration::from_secs(2), loader)
+            .await
+            .expect("the pre-poll loader cancellation did not finish within 2s");
+        let join_error = loader_result
+            .expect_err("the pre-poll loader must terminate through the requested cancellation");
+        assert!(
+            join_error.is_cancelled(),
+            "the pre-poll loader must report cancellation; join_error={join_error}"
+        );
+
+        match memory.hydration_status() {
+            HydrationStatus::Failed { reason } => assert_eq!(
+                reason, ABORTED_HYDRATION_REASON,
+                "pre-poll cancellation must retain the exact guard diagnosis"
+            ),
+            other => panic!(
+                "pre-poll cancellation must release the gate as Failed, not leave it shut; \
+                 status={other:?}, loaded={}",
+                memory.hydration.loaded.load(Ordering::SeqCst)
+            ),
+        }
+        assert!(
+            *memory.hydration.done.borrow(),
+            "pre-poll cancellation must publish a terminal gate state"
+        );
+
+        let write_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            memory.insert_conversation("user", PRE_POLL_ABORT_WRITE, None, None),
+        )
+        .await
+        .expect("the production write remained stuck on the hydration gate for more than 2s");
+        let error = write_result.expect_err(
+            "a write after pre-poll cancellation must be refused rather than semantically committed",
+        );
+        assert_eq!(
+            error.to_string(),
+            ABORTED_HYDRATION_WRITE_ERROR,
+            "the write must report the exact actionable cancellation diagnosis; status={:?}",
+            memory.hydration_status()
+        );
+        let live_results = memory
+            .query(PRE_POLL_ABORT_WRITE, Some(NODES as usize + 1))
+            .await?;
+        assert!(
+            live_results
+                .iter()
+                .all(|result| result != PRE_POLL_ABORT_WRITE),
+            "a refused write must not remain searchable in the live MemTree; \
+             status={:?}, results={live_results:?}",
+            memory.hydration_status()
+        );
+
+        let conn = Connection::open(temp.path())?;
+        let raw_conversations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+        let semantic_sources: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?;
+        let persisted_nodes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?;
+        assert_eq!(
+            raw_conversations, 1,
+            "the refused semantic write must retain raw history for explicit \
+             inspection and the pending-projection recovery tracked in #339; \
+             semantic_sources={semantic_sources}, persisted_nodes={persisted_nodes}"
+        );
+        assert_eq!(
+            semantic_sources, 0,
+            "pre-poll cancellation must prevent semantic provenance from committing; \
+             raw_conversations={raw_conversations}, persisted_nodes={persisted_nodes}"
+        );
+        assert_eq!(
+            persisted_nodes, NODES as i64,
+            "pre-poll cancellation must not alter the stored semantic tree; \
+             raw_conversations={raw_conversations}, semantic_sources={semantic_sources}"
+        );
+        assert_eq!(
+            memory.hydration.done.receiver_count(),
+            0,
+            "the completed write must leave no waiter subscribed to the terminal gate"
+        );
+        Ok(())
+    }
+
     // Multi-thread, because that is the only flavor that spawns the
     // background loader now — a current-thread runtime loads
     // synchronously, so there is no task for this to observe. It is
     // also the flavor production runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_an_aborted_loader_releases_a_waiting_write() -> Result<()> {
+    async fn test_loader_abort_before_completion_releases_waiter_without_semantic_commit(
+    ) -> Result<()> {
         // Aborts the handle `MemorySystem::new` actually spawned, not a task
         // the test built for itself. An earlier version did the latter, and
         // removing the guard from the production spawn site then failed
         // nothing — the test proved the guard type worked while leaving the
         // one place it has to be installed uncovered.
+        const NODES: u64 = 4 * HYDRATION_BATCH as u64;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
             ..Default::default()
         };
         drop(MemorySystem::new(config.clone())?);
-        // Enough rows that the loader is still working when it is aborted.
-        seed_tree_nodes(temp.path(), 4 * HYDRATION_BATCH as u64, &[])?;
+        seed_tree_nodes(temp.path(), NODES, &[])?;
 
-        let memory = MemorySystem::new(config)?;
+        let (_pause_registration, mut batch_reached, _release_batch) =
+            register_hydration_batch_pause(temp.path().to_path_buf(), HYDRATION_BATCH);
+        let mut memory = Arc::new(MemorySystem::new(config)?);
+        await_registered_hydration_pause(&mut batch_reached, &memory).await;
+        assert_eq!(
+            memory.hydration_status(),
+            HydrationStatus::Loading {
+                loaded: HYDRATION_BATCH,
+                total: NODES as usize,
+            },
+            "the abort precondition must hold the real production loader after \
+             exactly one committed batch"
+        );
+
+        let writer = {
+            let memory = Arc::clone(&memory);
+            tokio::spawn(async move {
+                memory
+                    .insert_conversation("user", MID_HYDRATION_ABORT_WRITE, None, None)
+                    .await
+            })
+        };
+        let waiter_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while memory.hydration.done.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            waiter_started.is_ok(),
+            "the production write did not reach the hydration gate within 2s; \
+             status={:?}, gate_receivers={}",
+            memory.hydration_status(),
+            memory.hydration.done.receiver_count()
+        );
+
         memory
             .hydration_task
             .as_ref()
             .expect("a store with rows must spawn a loader")
             .abort();
-        // Let the runtime process the cancellation and drop the future.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-            if !matches!(memory.hydration_status(), HydrationStatus::Loading { .. }) {
-                break;
-            }
-        }
 
-        let error = memory
-            .ensure_hydrated()
+        let write_result =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), writer).await {
+                Ok(joined) => joined.context("the waiting production write task panicked")?,
+                Err(_) => panic!(
+                    "the waiting production write did not terminate within 2s after abort; \
+                 status={:?}, gate_receivers={}",
+                    memory.hydration_status(),
+                    memory.hydration.done.receiver_count()
+                ),
+            };
+        let loader = Arc::get_mut(&mut memory)
+            .expect("the completed writer must release its only MemorySystem clone")
+            .hydration_task
+            .take()
+            .expect("a store with rows must retain its aborted loader handle");
+        let loader_result = tokio::time::timeout(std::time::Duration::from_secs(2), loader)
             .await
-            .expect_err("an aborted loader must fail the write, not hang it");
+            .expect("the aborted loader task must finish unwinding within 2s");
+        let join_error = loader_result.expect_err(
+            "the loader must terminate through the requested cancellation, not detach or finish",
+        );
         assert!(
-            error.to_string().contains("ended without finishing"),
-            "the write must be refused for the reason the guard recorded, not \
-             by the timeout; got {error}"
+            join_error.is_cancelled(),
+            "the loader must report cancellation after abort; join_error={join_error}"
+        );
+        let error = write_result.expect_err(
+            "an aborted loader must fail the waiting production write, not commit or hang it",
+        );
+        assert_eq!(
+            error.to_string(),
+            ABORTED_HYDRATION_WRITE_ERROR,
+            "the write must be refused with the exact guard diagnosis, not by \
+             the timeout; status={:?}",
+            memory.hydration_status()
+        );
+        match memory.hydration_status() {
+            HydrationStatus::Failed { reason } => assert_eq!(
+                reason, ABORTED_HYDRATION_REASON,
+                "the terminal gate state must retain the exact abort diagnosis"
+            ),
+            other => panic!(
+                "an abort before terminal completion must leave the gate Failed; \
+                 status={other:?}"
+            ),
+        }
+        let live_results = memory
+            .query(MID_HYDRATION_ABORT_WRITE, Some(NODES as usize + 1))
+            .await?;
+        assert!(
+            live_results
+                .iter()
+                .all(|result| result != MID_HYDRATION_ABORT_WRITE),
+            "a write refused after partial hydration must not remain searchable \
+             in the live MemTree; status={:?}, results={live_results:?}",
+            memory.hydration_status()
+        );
+
+        let conn = Connection::open(temp.path())?;
+        let raw_conversations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+        let semantic_sources: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?;
+        let persisted_nodes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?;
+        assert_eq!(
+            raw_conversations, 1,
+            "the failed semantic write must retain raw history for explicit \
+             inspection and the pending-projection recovery tracked in #339; \
+             semantic_sources={semantic_sources}, persisted_nodes={persisted_nodes}"
+        );
+        assert_eq!(
+            semantic_sources, 0,
+            "an aborted loader must prevent semantic provenance from committing; \
+             raw_conversations={raw_conversations}, persisted_nodes={persisted_nodes}"
+        );
+        assert_eq!(
+            persisted_nodes, NODES as i64,
+            "an aborted loader must not persist a placement into the partial tree; \
+             raw_conversations={raw_conversations}, semantic_sources={semantic_sources}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_loader_abort_after_completion_preserves_ready_state() -> Result<()> {
+        const NODES: u64 = HYDRATION_BATCH as u64;
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        drop(MemorySystem::new(config.clone())?);
+        seed_tree_nodes(temp.path(), NODES, &[])?;
+
+        // Hold the real loader after it publishes Ready but before its future
+        // can return and drop HydrationGuard. Aborting at that exact point
+        // causally exercises cancellation-driven guard drop after completion.
+        let (_pause_registration, mut completion_reached, _release_completion) =
+            register_hydration_completion_pause(temp.path().to_path_buf());
+        let mut memory = MemorySystem::new(config)?;
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !*completion_reached.borrow_and_update() {
+                completion_reached
+                    .changed()
+                    .await
+                    .expect("the production loader dropped its completion signal");
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the production loader did not reach its post-completion pause within 2s; \
+             status={:?}",
+            memory.hydration_status()
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(2), memory.ensure_hydrated())
+            .await
+        {
+            Ok(result) => result.context("hydration failed at its post-completion pause")?,
+            Err(_) => panic!(
+                "hydration did not expose Ready within 2s at its completion pause; \
+                 status={:?}, gate_receivers={}",
+                memory.hydration_status(),
+                memory.hydration.done.receiver_count()
+            ),
+        }
+        assert_eq!(
+            memory.hydration_status(),
+            HydrationStatus::Ready {
+                nodes: NODES as usize,
+            },
+            "the loader must publish the complete row count before the late abort"
+        );
+
+        let loader = memory
+            .hydration_task
+            .take()
+            .expect("a store with rows must retain its paused loader handle");
+        loader.abort();
+        let loader_result = tokio::time::timeout(std::time::Duration::from_secs(2), loader)
+            .await
+            .expect("the post-completion loader cancellation must finish within 2s");
+        let join_error = loader_result
+            .expect_err("the paused loader must terminate through the requested cancellation");
+        assert!(
+            join_error.is_cancelled(),
+            "the post-completion loader must report cancellation; join_error={join_error}"
+        );
+        assert_eq!(
+            memory.hydration_status(),
+            HydrationStatus::Ready {
+                nodes: NODES as usize,
+            },
+            "a late abort must not overwrite an already completed hydration"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), memory.ensure_hydrated())
+            .await
+            .expect("the completed write gate must remain immediately available")
+            .context("the completed write gate must remain successful after a late abort")?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            memory.insert_conversation("user", POST_READY_ABORT_WRITE, None, None),
+        )
+        .await
+        .expect("the first production write after a late abort did not finish within 2s")
+        .context("the first production write after a late abort must succeed")?;
+        let live_results = memory
+            .query(POST_READY_ABORT_WRITE, Some(NODES as usize + 2))
+            .await?;
+        assert!(
+            live_results
+                .iter()
+                .any(|result| result == POST_READY_ABORT_WRITE),
+            "the successful post-abort write must be searchable in the live MemTree; \
+             status={:?}, results={live_results:?}",
+            memory.hydration_status()
+        );
+
+        let conn = Connection::open(temp.path())?;
+        let raw_conversations: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+        let semantic_sources: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_sources WHERE node_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let persisted_nodes: i64 =
+            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?;
+        assert_eq!(
+            raw_conversations, 1,
+            "the successful post-abort write must persist exactly one raw turn; \
+             semantic_sources={semantic_sources}, persisted_nodes={persisted_nodes}"
+        );
+        assert_eq!(
+            semantic_sources, 1,
+            "the successful post-abort write must persist exactly one semantic source; \
+             raw_conversations={raw_conversations}, persisted_nodes={persisted_nodes}"
+        );
+        assert!(
+            persisted_nodes > NODES as i64,
+            "the successful post-abort write must persist a semantic tree placement; \
+             seeded_nodes={NODES}, persisted_nodes={persisted_nodes}, \
+             raw_conversations={raw_conversations}, semantic_sources={semantic_sources}"
         );
         Ok(())
     }
