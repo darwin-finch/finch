@@ -96,13 +96,22 @@ impl Default for ServerConfig {
 
 /// Main agent server structure
 pub struct AgentServer {
-    /// When this server was constructed, for `/health`'s uptime.
+    /// When this server was constructed, reported by `/health` and `/metrics`.
     ///
     /// `Instant` rather than a wall clock: uptime is an elapsed duration, and
     /// a system clock that steps backwards over NTP or a timezone change
     /// would otherwise report a negative or wildly wrong age. `/health`
     /// previously reported a hardcoded `0` however long the daemon had run
     /// (#131).
+    ///
+    /// Note where this ends up. `/metrics` is loopback-only, but `/health` is
+    /// mounted on the remote Brain listener as well (default `0.0.0.0:11436`
+    /// when advertisement is on), and that router carries no auth layer — so
+    /// uptime is readable by any peer that can reach it, alongside the
+    /// `named_brains` and `pending_brain_terminalizations` already exposed
+    /// there. That is a deliberate acceptance of a small disclosure, not an
+    /// oversight: process age is not a secret, and #131 asks for truthful
+    /// health. Anything more sensitive belongs on the loopback router.
     started_at: std::time::Instant,
     /// Claude API client (shared across sessions; kept for backward compat with handlers.rs)
     claude_client: Arc<ClaudeClient>,
@@ -1221,6 +1230,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    /// `/health` reports the uptime it has actually accumulated.
+    ///
+    /// Over HTTP through the real router, because that is where the defect
+    /// was: `uptime_seconds` was a hardcoded `0` in the handler (#131). An
+    /// earlier version of this PR tested `AgentServer::uptime()` instead, and
+    /// reverting the handler to `uptime_seconds: 0` left the whole suite green
+    /// — the accessor was right and the endpoint still lied.
+    #[tokio::test]
+    async fn production_router_health_reports_real_uptime() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+
+        // The handler reports whole seconds, so the server has to have existed
+        // for at least one before a truthful answer is distinguishable from
+        // the placeholder.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let response = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("health body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("health returns JSON");
+        let reported = parsed
+            .get("uptime_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .expect("health reports uptime_seconds");
+
+        assert!(
+            reported >= 1,
+            "/health must report the time this server has run, not a \
+             placeholder; got {reported} after sleeping past a second"
+        );
+    }
+
+    /// `/metrics` exposes what is measured and nothing invented.
+    ///
+    /// It used to return a constant `finch_queries_total 0`, which a scraper
+    /// cannot tell from "no queries yet" (#131). Both halves are asserted: the
+    /// uptime gauge is present, and the fabricated counter is gone — so
+    /// reintroducing a zeroed placeholder fails here.
+    #[tokio::test]
+    async fn production_router_metrics_reports_only_measured_series() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+        let response = isolated_http_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("metrics body");
+        let text = String::from_utf8(body.to_vec()).expect("metrics is UTF-8");
+
+        assert!(
+            text.contains("# TYPE finch_daemon_uptime_seconds gauge"),
+            "the uptime gauge must be exposed with its TYPE line: {text}"
+        );
+        assert!(
+            text.contains("finch_daemon_uptime_seconds "),
+            "the gauge must carry a sample line: {text}"
+        );
+        assert!(
+            !text.contains("finch_queries_total"),
+            "a series nothing measures must not be published; that placeholder \
+             is the defect #131 names: {text}"
+        );
     }
 
     async fn serve_http2_test_router(

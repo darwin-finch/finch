@@ -104,13 +104,19 @@ Health check endpoint.
 
 ### GET /metrics
 
-Prometheus metrics (plain text format).
+Prometheus metrics (plain text format, exposition version 0.0.4).
+
+Exposes only series that are actually measured. A `finch_queries_total` counter
+was published here until #131; it was hardcoded to `0`, so a scraper could not
+tell "no queries yet" from "not implemented". It was removed rather than
+zeroed — request-lifecycle counters will appear when they are wired to the
+canonical request lifecycle.
 
 **Example Output:**
 ```
-# HELP finch_queries_total Total number of queries
-# TYPE finch_queries_total counter
-finch_queries_total 0
+# HELP finch_daemon_uptime_seconds Seconds since this server was constructed.
+# TYPE finch_daemon_uptime_seconds gauge
+finch_daemon_uptime_seconds 1874
 ```
 
 ## Session Management
@@ -343,7 +349,7 @@ Structured logs via `tracing`:
 
 ### Metrics (Phase 1 - Basic)
 
-Currently provides basic Prometheus metrics endpoint. Phase 4 will add:
+Currently exposes daemon uptime only. Still to come (#131):
 - Query count by routing decision
 - Response time histograms
 - Error rates
