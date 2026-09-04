@@ -23,12 +23,15 @@ pub fn claim_notice_showing_now(
         // write nothing.
         return true;
     };
-    notice_state::claim_notice_showing(
-        &path,
-        legacy_suppress_until,
-        today,
-        chrono::Duration::days(7),
-    )
+    // Delegate to the injectable form rather than duplicating the decision.
+    // These were two parallel paths, and the regression test exercised the one
+    // production did not call, so restoring the real defect left every test
+    // green (#329 review).
+    let config_path = path
+        .parent()
+        .map(|dir| dir.join("config.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
+    notice_state::claim_notice_showing_for_paths(&config_path, &path, legacy_suppress_until, today)
 }
 
 /// Forget any recorded notice suppression, so the next start shows it.
@@ -42,16 +45,6 @@ pub fn forget_notice_suppression() {
     }
 }
 
-/// The startup decision with every path injected, for tests that need to prove
-/// `config.toml` is untouched. See `notice_state::claim_notice_showing_for`.
-pub(crate) fn claim_notice_showing_for(
-    config: &Config,
-    config_path: &std::path::Path,
-    state_path: &std::path::Path,
-    today: chrono::NaiveDate,
-) -> bool {
-    notice_state::claim_notice_showing_for(config, config_path, state_path, today)
-}
 pub mod persona;
 pub mod provider;
 mod settings;

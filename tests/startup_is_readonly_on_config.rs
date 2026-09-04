@@ -1,0 +1,71 @@
+//! Ordinary startup must not rewrite `~/.finch/config.toml` (#76).
+//!
+//! This lives here, not in a unit test, because the property is about a real
+//! home directory. `Config::save()` resolves `dirs::home_dir()`, so a unit
+//! test pointing at a temporary path cannot observe production writing to the
+//! actual config — and three successive attempts to test this in-crate all
+//! passed with the defect restored, because they exercised functions the REPL
+//! does not call.
+//!
+//! An integration test gets its own process, so `HOME` can be set safely.
+
+use std::path::Path;
+
+/// The bytes and mtime of a file, for comparison across a call.
+fn fingerprint(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+    (
+        std::fs::read(path).expect("config must exist"),
+        std::fs::metadata(path)
+            .expect("config must exist")
+            .modified()
+            .expect("mtime"),
+    )
+}
+
+/// The startup licence-notice decision leaves `config.toml` untouched.
+///
+/// `claim_notice_showing_now` is what `EventLoop::run` calls — the same
+/// function, resolving the same home directory. Restoring the original defect
+/// (`cfg.license.notice_suppress_until = ...; cfg.save();`) makes this fail,
+/// which is what every earlier version of this test could not do.
+#[test]
+fn test_the_startup_notice_decision_does_not_rewrite_the_config() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let finch = home.path().join(".finch");
+    std::fs::create_dir_all(&finch).expect("create .finch");
+
+    let config = finch.join("config.toml");
+    let original = b"# a comment a serializer round-trip would drop\n\
+                     [license]\n\
+                     license_type = \"noncommercial\"\n";
+    std::fs::write(&config, original).expect("write config");
+    let before = fingerprint(&config);
+
+    // Coarse filesystem timestamps would hide a rewrite inside the same tick.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // SAFETY: integration tests get their own process, so this cannot race
+    // another test's view of HOME.
+    unsafe {
+        std::env::set_var("HOME", home.path());
+    }
+
+    let shown = finch::config::claim_notice_showing_now(None, chrono::Local::now().date_naive());
+    assert!(shown, "nothing recorded yet, so the notice is due");
+
+    let after = fingerprint(&config);
+    assert_eq!(
+        after.0, before.0,
+        "startup rewrote config.toml -- this is the #76 defect"
+    );
+    assert_eq!(
+        after.1, before.1,
+        "startup moved config.toml's mtime; an identical-bytes rewrite still \
+         tells every backup and sync tool the file changed"
+    );
+
+    assert!(
+        finch.join("notice_state.toml").exists(),
+        "the record belongs in the state file"
+    );
+}
