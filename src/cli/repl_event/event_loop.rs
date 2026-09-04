@@ -2302,16 +2302,29 @@ impl EventLoop {
         // Show weekly license notice for non-commercial users (honor system)
         {
             use crate::config::{load_config, LicenseType};
-            use chrono::NaiveDate;
-            if let Ok(mut cfg) = load_config() {
+            if let Ok(cfg) = load_config() {
                 if cfg.license.license_type == LicenseType::Noncommercial {
                     let today = chrono::Local::now().date_naive();
-                    let suppress_until = cfg
-                        .license
-                        .notice_suppress_until
-                        .as_deref()
-                        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-                    let should_show = suppress_until.is_none_or(|d| today > d);
+                    // Recorded in a runtime-state file, not in `config.toml`.
+                    // This runs on every start, and writing the user's config
+                    // to remember that a notice was shown rewrote a file they
+                    // never asked to change -- reformatting it, dropping
+                    // comments, moving its mtime (#76).
+                    let should_show = crate::config::claim_notice_showing_now(
+                        cfg.license.notice_suppress_until.as_deref(),
+                        today,
+                    );
+                    // What is and is not covered, stated exactly, because an
+                    // earlier version of this note claimed more and named a
+                    // function that no longer exists.
+                    //
+                    // `tests/startup_is_readonly_on_config.rs` proves
+                    // `claim_notice_showing_now` writes no config. It does NOT
+                    // cover this block: a `cfg.save()` added anywhere in here
+                    // reships #76 with a green suite, because nothing calls
+                    // `EventLoop::run` outside production. So do not add one.
+                    // If this block ever needs to persist something, put it
+                    // behind a function the integration test can call.
                     if should_show {
                         // Startup notices are application status, not a
                         // conversation artifact. Keeping this out of the
@@ -2323,11 +2336,6 @@ impl EventLoop {
                             ),
                             "Using Finch commercially? $10/yr · finch license activate --key <key>",
                         );
-                        let new_date = (today + chrono::Duration::days(7))
-                            .format("%Y-%m-%d")
-                            .to_string();
-                        cfg.license.notice_suppress_until = Some(new_date);
-                        let _ = cfg.save(); // non-fatal if save fails
                     }
                 }
             }
@@ -3247,6 +3255,11 @@ Rules:\n\
                         use crate::config::{load_config, LicenseConfig};
                         if let Ok(mut cfg) = load_config() {
                             cfg.license = LicenseConfig::default();
+                            // Removing a licence un-suppressed the notice as a
+                            // side effect of writing `notice_suppress_until:
+                            // None`. The record lives in a state file now, so
+                            // that has to be explicit (#329 review).
+                            crate::config::forget_notice_suppression();
                             if let Err(e) = cfg.save() {
                                 self.output_manager
                                     .write_info(format!("⚠️  Could not save config: {}", e));

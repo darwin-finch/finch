@@ -101,6 +101,7 @@ The source contains ONNX Runtime and Candle loaders. Historical backend experime
 ├── feedback.jsonl       # Private explicit feedback; never a training trigger
 ├── training_queue.jsonl # Preserved legacy queue; not processed automatically
 ├── metrics/             # Usage metrics
+├── notice_state.toml    # Licence-notice bookkeeping; kept out of config.toml (#76)
 ├── tool_patterns.json   # Approved tool patterns
 ├── sessions/            # Saved REPL sessions
 └── brains/              # Named Brain event logs and state

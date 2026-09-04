@@ -6,6 +6,41 @@ mod colors;
 pub mod constants;
 pub mod credential;
 mod loader;
+mod notice_state;
+
+/// Decide whether the licence notice is due, recording the decision in the
+/// runtime-state file rather than in `config.toml` (#76).
+///
+/// `legacy_suppress_until` is the value that used to live in the config. It is
+/// still honoured so an existing installation's suppression survives, and is
+/// never written back.
+pub fn claim_notice_showing_now(
+    legacy_suppress_until: Option<&str>,
+    today: chrono::NaiveDate,
+) -> bool {
+    let Ok(path) = notice_state::notice_state_path() else {
+        // No home directory: show the notice rather than guess, and still
+        // write nothing.
+        return true;
+    };
+    // Delegate to the injectable form rather than duplicating the decision.
+    // These were two parallel paths, and the regression test exercised the one
+    // production did not call, so restoring the real defect left every test
+    // green (#329 review).
+    notice_state::claim_notice_showing_for_paths(&path, legacy_suppress_until, today)
+}
+
+/// Forget any recorded notice suppression, so the next start shows it.
+///
+/// Called when a licence is removed: that used to un-suppress the notice as a
+/// side effect of writing `notice_suppress_until: None` to the config, and the
+/// move to a state file silently stopped it working (#329 review).
+pub fn forget_notice_suppression() {
+    if let Ok(path) = notice_state::notice_state_path() {
+        notice_state::forget_recorded_suppression(&path);
+    }
+}
+
 pub mod persona;
 pub mod provider;
 mod settings;
