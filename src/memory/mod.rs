@@ -2816,19 +2816,25 @@ mod tests {
         // at 11.5ms against 41.6ms -- backgrounding was 3.6x faster and needed
         // 4x, so the property held and the threshold did not.
         //
-        // An earlier version asserted status instead, and was rightly replaced:
-        // it ran on a current-thread runtime, where the loader cannot be polled
-        // until the test awaits, so `Loading` was true whether or not
-        // construction backgrounded anything. That objection was about the
-        // flavor, not the assertion. This test runs multi-thread, where the
-        // loader really is spawned, so the status carries information again --
-        // and with a margin the ratio never had: to see `Ready` here the task
-        // must schedule and finish the whole store in the few instructions
-        // after `new` returns, against the ~40ms the blocking arm below
-        // measures for the same work.
+        // This restores the assertion #273 originally had. It was replaced for
+        // a reason that no longer applies: it ran on a current-thread runtime,
+        // where the loader cannot be polled until the test awaits, so it was
+        // deterministic only under a flavor nothing ships. It did discriminate
+        // there -- forcing the blocking arm failed it -- so the objection was
+        // about the flavor, not the assertion. This test runs multi-thread,
+        // where the loader really is spawned.
         //
-        // It is also strictly stronger. The ratio passed while construction
-        // blocked for up to a quarter of the load.
+        // `loaded: 0` rather than merely "not Ready", because `Ready` latches
+        // only at the end: a construction that blocks until half the store is
+        // in still reports `Loading`, and an assertion against `Ready` alone
+        // accepts it. Measured on a mutant that busy-waits for half the store,
+        // `!Ready` missed the regression in 30 of 50 runs -- once while
+        // reporting `Loading { loaded: 2048, total: 2048 }`, the whole store
+        // loaded during construction. `loaded: 0` catches it every time.
+        //
+        // The margin is not close: 200 runs under 16 CPU hogs reported
+        // `loaded: 0` on every one, so not a single 512-row batch landed in
+        // the window between the spawn and this line.
         const NODES: u64 = 4 * HYDRATION_BATCH as u64;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
@@ -2858,10 +2864,10 @@ mod tests {
         let status = reopened.hydration_status();
 
         assert!(
-            !matches!(status, HydrationStatus::Ready { .. }),
+            matches!(status, HydrationStatus::Loading { loaded: 0, .. }),
             "construction must return before the index is loaded, but hydration \
-             was already complete when `new` returned: status {status:?} for the \
-             same {NODES}-node store that the no-runtime arm took {blocking:?} \
+             had already made progress when `new` returned: status {status:?} for \
+             the same {NODES}-node store that the no-runtime arm took {blocking:?} \
              to load synchronously"
         );
 
