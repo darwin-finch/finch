@@ -2808,14 +2808,27 @@ mod tests {
         // returning — 131 MiB on the dogfood store, 3.25 s to first prompt.
         // Construction must return before the index is loaded.
         //
-        // Asserted by comparison rather than against a fixed threshold, and
-        // rather than against an immediate `Loading` status. The old assertion
-        // relied on a current-thread runtime being unable to poll the loader
-        // until the test awaited; under the flavor production actually runs,
-        // the loader may well have started, so that assertion was pinned to a
-        // configuration nothing ships. Timing the same store loaded both ways
-        // measures the property directly and cannot be satisfied by a blocking
-        // load.
+        // Asserted against hydration state, not against a wall-clock ratio.
+        //
+        // The ratio form (`backgrounded * 4 < blocking`) compared two timings
+        // taken on a runner executing ~2970 tests in parallel, so both terms
+        // were noisy and the quotient doubly so. It failed on an unrelated PR
+        // at 11.5ms against 41.6ms -- backgrounding was 3.6x faster and needed
+        // 4x, so the property held and the threshold did not.
+        //
+        // An earlier version asserted status instead, and was rightly replaced:
+        // it ran on a current-thread runtime, where the loader cannot be polled
+        // until the test awaits, so `Loading` was true whether or not
+        // construction backgrounded anything. That objection was about the
+        // flavor, not the assertion. This test runs multi-thread, where the
+        // loader really is spawned, so the status carries information again --
+        // and with a margin the ratio never had: to see `Ready` here the task
+        // must schedule and finish the whole store in the few instructions
+        // after `new` returns, against the ~40ms the blocking arm below
+        // measures for the same work.
+        //
+        // It is also strictly stronger. The ratio passed while construction
+        // blocked for up to a quarter of the load.
         const NODES: u64 = 4 * HYDRATION_BATCH as u64;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
@@ -2841,15 +2854,15 @@ mod tests {
         .expect("blocking construction thread");
 
         // The backgrounded one.
-        let started = std::time::Instant::now();
         let reopened = MemorySystem::new(config)?;
-        let backgrounded = started.elapsed();
+        let status = reopened.hydration_status();
 
         assert!(
-            backgrounded * 4 < blocking,
-            "construction must return before the index is loaded: backgrounded \
-             {backgrounded:?} against a blocking load of {blocking:?} for the \
-             same {NODES}-node store"
+            !matches!(status, HydrationStatus::Ready { .. }),
+            "construction must return before the index is loaded, but hydration \
+             was already complete when `new` returned: status {status:?} for the \
+             same {NODES}-node store that the no-runtime arm took {blocking:?} \
+             to load synchronously"
         );
 
         // And it must still complete, with every node present.
