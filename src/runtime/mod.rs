@@ -6593,7 +6593,7 @@ fn spawn_open_process(
     target_os = "freebsd",
     target_os = "dragonfly"
 ))]
-const TEXT_FILE_BUSY_ATTEMPTS: u32 = 1;
+const TEXT_FILE_BUSY_ATTEMPTS: u32 = 8;
 
 #[cfg(any(
     target_os = "linux",
