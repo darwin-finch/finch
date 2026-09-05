@@ -58,6 +58,7 @@ const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_USAGE_METADATA_BYTES: usize = 256 * 1024;
 const MAX_OPAQUE_REASONING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -205,6 +206,17 @@ fn shared_refresh_lock(reference: &str, account: &str) -> Arc<Mutex<()>> {
 
 impl ProductionCredentialSource {
     fn new(credential: &ProviderCredential) -> Result<Self> {
+        let root = dirs::home_dir()
+            .context("Could not determine Finch credential store location")?
+            .join(".finch")
+            .join("oauth");
+        Self::new_in_root(credential, root)
+    }
+
+    fn new_in_root(
+        credential: &ProviderCredential,
+        root: impl Into<std::path::PathBuf>,
+    ) -> Result<Self> {
         validate_configured_credential(credential)?;
         let reference = credential
             .secret_ref
@@ -213,11 +225,7 @@ impl ProductionCredentialSource {
         if reference != credential.name {
             bail!("ChatGPT subscription credential reference changed identity");
         }
-        let root = dirs::home_dir()
-            .context("Could not determine Finch credential store location")?
-            .join(".finch")
-            .join("oauth");
-        let store = Arc::new(FileOAuthCredentialStore::new(root));
+        let store = Arc::new(FileOAuthCredentialStore::new(root.into()));
         let dialect = Arc::new(OpenAiChatGptOAuthDialect::production()?);
         let oauth = Arc::new(OAuthClient::new(dialect, store.clone())?);
         let expected_account = credential
@@ -371,6 +379,25 @@ impl ChatGptSubscriptionProvider {
         validate_configured_credential(credential)?;
         Self::new(
             Arc::new(ProductionCredentialSource::new(credential)?),
+            CHATGPT_SUBSCRIPTION_BASE_URL,
+            model.unwrap_or(DEFAULT_MODEL),
+            reasoning_effort.unwrap_or(DEFAULT_REASONING_EFFORT),
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn production_in_oauth_root(
+        credential: &ProviderCredential,
+        model: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
+        oauth_root: impl Into<std::path::PathBuf>,
+    ) -> Result<Self> {
+        validate_configured_credential(credential)?;
+        Self::new(
+            Arc::new(ProductionCredentialSource::new_in_root(
+                credential, oauth_root,
+            )?),
             CHATGPT_SUBSCRIPTION_BASE_URL,
             model.unwrap_or(DEFAULT_MODEL),
             reasoning_effort.unwrap_or(DEFAULT_REASONING_EFFORT),
@@ -2253,6 +2280,7 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
             "total_tokens",
             "codex_rollout_budget_units",
             "extra",
+            "attribution",
         ],
         "response usage",
     )?;
@@ -2260,6 +2288,16 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
         extra
             .as_object()
             .context("ChatGPT response usage extra metadata was invalid")?;
+    }
+    if let Some(attribution) = object.get("attribution") {
+        attribution
+            .as_object()
+            .context("ChatGPT response usage attribution metadata was invalid")?;
+        let encoded = serde_json::to_vec(attribution)
+            .context("ChatGPT response usage attribution metadata was invalid")?;
+        if encoded.len() > MAX_USAGE_METADATA_BYTES {
+            bail!("ChatGPT response usage attribution metadata exceeded the size limit");
+        }
     }
     let convert = |name: &str| -> Result<Option<u32>> {
         object
@@ -3882,6 +3920,117 @@ family = "chatgpt_subscription"
             "usage extra metadata did not preserve exact ordered streaming effects; \
              outcome={outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_bounded_usage_attribution_metadata() {
+        let terminal = json!({
+            "id":"resp-usage-attribution",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":{
+                "input_tokens":12,
+                "output_tokens":7,
+                "total_tokens":19,
+                "attribution":{
+                    "items":{
+                        "dynamic-attribution-id":{
+                            "input_tokens":12,
+                            "output_tokens":7
+                        }
+                    }
+                }
+            }
+        });
+        let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!("bounded usage attribution metadata failed buffered parsing: {error}")
+        });
+        assert!(
+            matches!(buffered.content.as_slice(), [ContentBlock::Text { text }] if text == "hello"),
+            "usage attribution metadata changed buffered semantic content; response={buffered:?}"
+        );
+        assert_eq!(
+            buffered
+                .usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((12, 7)),
+            "usage attribution metadata changed token accounting"
+        );
+        assert_eq!(
+            buffered.model, DEFAULT_MODEL,
+            "usage attribution metadata changed buffered model provenance"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [
+                    Ok(StreamChunk::TextDelta(delta)),
+                    Ok(StreamChunk::ResponseMetadata { model }),
+                    Ok(StreamChunk::Usage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                    }),
+                    Ok(StreamChunk::Allowance {
+                        primary_used_percent: Some(primary),
+                        secondary_used_percent: None,
+                    }),
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
+                ] if delta == "hello"
+                    && model == DEFAULT_MODEL
+                    && *primary == 25.5
+                    && text == "hello"
+            ),
+            "usage attribution metadata did not preserve exact ordered streaming effects; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_reject_invalid_usage_attribution_before_terminal_effects()
+    {
+        for (case, attribution, expected) in [
+            (
+                "non-object",
+                json!(false),
+                "ChatGPT response usage attribution metadata was invalid",
+            ),
+            (
+                "oversized-object",
+                json!({"payload":"x".repeat(MAX_USAGE_METADATA_BYTES)}),
+                "ChatGPT response usage attribution metadata exceeded the size limit",
+            ),
+        ] {
+            let terminal = json!({
+                "id":format!("resp-invalid-usage-attribution-{case}"),
+                "status":"completed",
+                "model":DEFAULT_MODEL,
+                "output":[],
+                "usage":{
+                    "input_tokens":12,
+                    "output_tokens":7,
+                    "total_tokens":19,
+                    "attribution":attribution
+                }
+            });
+            let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
+            assert_eq!(
+                buffered.err().as_deref(),
+                Some(expected),
+                "{case} usage attribution crossed the buffered provider boundary"
+            );
+            assert!(
+                matches!(
+                    outcome.as_slice(),
+                    [Ok(StreamChunk::TextDelta(delta)), Err(error)]
+                        if delta == "hello" && error == expected
+                ),
+                "{case} usage attribution must end with one error and no terminal effects; \
+                 outcome={outcome:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5832,22 +5981,36 @@ family = "chatgpt_subscription"
         if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
             bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
         }
-        let config = crate::config::load_config()?;
-        let profile = config
+        let config_path = std::env::var_os("FINCH_LIVE_CHATGPT_CONFIG")
+            .context("Set FINCH_LIVE_CHATGPT_CONFIG to Finch's config.toml")?;
+        let config = crate::config::load_config_from_path(std::path::Path::new(&config_path))?;
+        let (binding, configured_model, configured_reasoning) = config
             .providers
             .iter()
-            .find(|entry| {
-                matches!(
-                    entry,
-                    crate::config::ProviderEntry::Credentialed {
-                        provider: CredentialProvider::ChatgptSubscription,
-                        ..
-                    }
-                )
+            .find_map(|entry| match entry {
+                crate::config::ProviderEntry::Credentialed {
+                    provider: CredentialProvider::ChatgptSubscription,
+                    credential,
+                    model,
+                    reasoning_effort,
+                    ..
+                } => Some((credential, model.as_deref(), *reasoning_effort)),
+                _ => None,
             })
-            .context("No Finch ChatGPT subscription profile is configured")?
-            .profile_name();
-        let provider = crate::providers::create_provider_profile_from_config(&config, &profile)?;
+            .context("No Finch ChatGPT subscription profile is configured")?;
+        let credential = config
+            .credentials
+            .iter()
+            .find(|credential| credential.name == binding.credential_ref)
+            .context("Finch ChatGPT subscription profile references a missing credential")?;
+        let oauth_root = std::env::var_os("FINCH_LIVE_CHATGPT_OAUTH_ROOT")
+            .context("Set FINCH_LIVE_CHATGPT_OAUTH_ROOT to Finch's oauth directory")?;
+        let provider = ChatGptSubscriptionProvider::production_in_oauth_root(
+            credential,
+            configured_model,
+            configured_reasoning,
+            oauth_root,
+        )?;
         let response = provider
             .send_message(
                 &ProviderRequest::new(vec![Message::user(
