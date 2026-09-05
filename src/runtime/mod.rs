@@ -6222,12 +6222,17 @@ fn open_process_executable(
         run_snapshot_write_hook(&canonical, &snapshot_path);
         std::io::copy(&mut source, &mut snapshot_writer)
             .map_err(|error| format!("snapshot process executable: {error}"))?;
-        // Deliberately not `sync_all`. The snapshot is unlinked before it is
-        // executed and is only ever read back through a descriptor this
-        // function already holds, so durability buys nothing -- while the
-        // fsync sat inside the window during which a concurrent `fork()` can
-        // inherit this writer and block the exec with `ETXTBSY` (#287). It was
-        // the dominant term of that window.
+        // Deliberately not `sync_all`. The snapshot is reopened by path just
+        // below, but read-after-write through the page cache is coherent
+        // without a sync and `File` is unbuffered in userspace, so both the
+        // hash and the exec see every byte written here. Nothing reads this
+        // file after the process exits -- it is unlinked before the exec --
+        // so durability bought nothing.
+        //
+        // It did cost. The fsync sat inside the window during which a
+        // concurrent `fork()` can inherit this writer and block the exec with
+        // `ETXTBSY` (#287), so removing it shortens that window. By how much
+        // is unmeasured; the copy above is inside the window too.
         snapshot_writer
             .set_permissions(std::fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("seal process executable snapshot mode: {error}"))?;
@@ -6448,7 +6453,7 @@ static SNAPSHOT_WRITE_HOOK: std::sync::OnceLock<Mutex<SnapshotWriteHooks>> =
 ///
 /// Without this, a test that means to exercise the retry can pass for the
 /// wrong reason: if the blocking descriptor happens to be released before the
-/// first exec -- an `fsync` on a loaded runner is enough -- the exec succeeds
+/// first exec -- any pause before the spawn is enough -- the exec succeeds
 /// on attempt one, the assertions all hold, and the retry is never run. The
 /// test asserts this count moved, so "the retry works" cannot be concluded
 /// from a run where nothing was retried.
@@ -12620,7 +12625,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         SNAPSHOT_WRITE_HOOK
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 key.clone(),
                 Box::new(move |snapshot: &Path| {
@@ -12633,7 +12638,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
 
                     // Release once the exec has actually been refused, rather than
                     // after a fixed delay. A timer would make the test vacuous on
-                    // a loaded runner: if the snapshot's fsync outlasts it the
+                    // a loaded runner: if the work before the spawn outlasts it the
                     // descriptor is gone before the first exec, everything below
                     // still passes, and nothing was retried.
                     let watched = refused.clone();
@@ -12727,7 +12732,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         SNAPSHOT_WRITE_HOOK
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 key.clone(),
                 Box::new(move |snapshot: &Path| {
@@ -12787,13 +12792,34 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
              stop; it was refused {refusals} time(s) against a budget of {}",
             TEXT_FILE_BUSY_ATTEMPTS
         );
-        // 140ms of backoff plus the execution around it. Five seconds proved
-        // only "not a hang" and would not have noticed the budget growing by
-        // an order of magnitude.
+        // That comparison alone is tautological: every attempt is refused
+        // here, so the count mirrors the constant whatever the constant is,
+        // and this test passed unchanged with the budget set to 1. It catches
+        // an off-by-one in the loop bounds and nothing more. What binds this
+        // test to the budget's actual value is the pair below.
+        assert_eq!(
+            TEXT_FILE_BUSY_ATTEMPTS, 8,
+            "this test's timing bounds are written against a budget of 8; \
+             changing the budget means revisiting them"
+        );
+        // `thread::sleep` never returns early, so the backoff the loop is
+        // documented to spend is a hard lower bound on a fully refused exec.
+        // Without this, a loop that skipped its sleeps -- or a budget quietly
+        // reduced -- would still satisfy everything above.
+        let backoff: std::time::Duration = (1..TEXT_FILE_BUSY_ATTEMPTS)
+            .map(|attempt| TEXT_FILE_BUSY_BACKOFF * attempt)
+            .sum();
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the retry budget must stay bounded near its documented 140ms \
-             ceiling; giving up took {elapsed:?}"
+            elapsed >= backoff,
+            "a fully refused exec must actually spend its backoff; the loop \
+             is documented to wait {backoff:?} but gave up after {elapsed:?}"
+        );
+        // Deliberately loose. The lower bound above is what ties this test to
+        // the budget; this one only says "not a hang", and tightening it buys
+        // little against a runner executing ~2950 tests in parallel.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the retry budget must stay bounded; giving up took {elapsed:?}"
         );
 
         // #287 introduces a second way for an approved `process-run` to fail
@@ -12806,6 +12832,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .grants
             .last()
             .expect("once grant remains visible");
+        assert!(
+            matches!(once.scope, GrantScope::Once { .. }),
+            "the grant under test must be the once grant; grant={once:#?}"
+        );
         assert!(
             once.consumed_at_unix_ms.is_none(),
             "an exec the kernel never performed must not consume the once \
