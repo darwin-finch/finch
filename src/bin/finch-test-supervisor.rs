@@ -30,11 +30,19 @@ use nix::libc;
 /// way to the expected state, which reads as an authority regression.
 ///
 /// The pause below is derived, not chosen. `run_child_stubborn_probe` parks
-/// and asserts the supervisor kills it first, so the fixture is only
-/// meaningful while its pause exceeds `TEARDOWN_BOUND_SECS`. Written as two
-/// independent literals -- which is how they were -- raising the teardown
-/// bound for load tolerance silently inverts the ordering and turns a real
-/// teardown regression into a passing test.
+/// ~10ms into the SIGTERM stage and is freed by the first SIGKILL, so the
+/// stage it actually races is `TEARDOWN_SIGTERM_SECS` -- not the sum, which an
+/// earlier version of this comment claimed. Written as two independent
+/// literals, which is how they were, raising the teardown bound for load
+/// tolerance silently inverts the ordering and turns a real teardown
+/// regression into a passing test.
+///
+/// The derivation makes the surviving comparison in
+/// `the_stubborn_fixture_outlives_the_teardown_bound` unfalsifiable on its own
+/// -- `(T + K) * 2 > T` holds for any non-negative K. The assertion with teeth
+/// there is `TEARDOWN_SIGTERM_SECS > 0`, which catches the mutation that
+/// deletes the SIGTERM stage and with it the window the fixture exists to
+/// exercise.
 const TEARDOWN_SIGTERM_SECS: u64 = 4;
 const TEARDOWN_SIGKILL_SECS: u64 = 4;
 const TEARDOWN_BOUND_SECS: u64 = TEARDOWN_SIGTERM_SECS + TEARDOWN_SIGKILL_SECS;
