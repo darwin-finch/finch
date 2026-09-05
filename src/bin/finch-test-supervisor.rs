@@ -70,7 +70,9 @@ fn await_bounded(
     let started = Instant::now();
     let deadline = started + bound;
     loop {
-        if condition()? {
+        let held =
+            condition().with_context(|| format!("{phase}: failed while evaluating {awaited}"))?;
+        if held {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -878,8 +880,21 @@ fn terminate_and_reap(child: &mut Child, group: libc::pid_t) -> anyhow::Result<E
             "the owned process group to become quiescent after SIGKILL",
             TEARDOWN_SIGKILL_BOUND,
             || {
+                // Check before signalling, never after. `signal_process_group`
+                // tolerates only ESRCH, and this function's opening comment
+                // records that on macOS a group whose sole member is an
+                // unreaped zombie leader answers `kill` with EPERM. Signalling
+                // unconditionally therefore errors on a group that has *just
+                // become quiescent* -- and `run()` treats that error by
+                // preserving the isolated HOME and reporting a live group. It
+                // needs one member to outlive a poll interval to happen at
+                // all, which is exactly the loaded host this change exists to
+                // tolerate.
+                if leader_exited(child)? && process_group_members(group)?.is_empty() {
+                    return Ok(true);
+                }
                 signal_process_group(group, libc::SIGKILL)?;
-                Ok(leader_exited(child)? && process_group_members(group)?.is_empty())
+                Ok(false)
             },
             || {
                 let survivors = process_group_members(group_for_context)
@@ -1461,8 +1476,20 @@ mod tests {
     /// being true.
     #[test]
     fn the_stubborn_fixture_outlives_the_teardown_bound() {
+        // The stage the fixture actually races. It parks ~10ms into SIGTERM
+        // and is freed by the first SIGKILL, so what its pause must exceed is
+        // the SIGTERM stage, not the sum -- and a zero-length SIGTERM stage
+        // deletes the escalation window the fixture exists to exercise
+        // without failing any comparison between pause and bound.
         assert!(
-            super::STUBBORN_FIXTURE_PAUSE_SECS > super::TEARDOWN_BOUND_SECS,
+            super::TEARDOWN_SIGTERM_SECS > 0,
+            "a zero-length SIGTERM stage means the supervisor SIGKILLs on its \
+             first poll, so the stubborn probe never receives a second SIGTERM, \
+             never parks, and the append/truncate window it exists to cover is \
+             never entered -- while every assertion about it still passes"
+        );
+        assert!(
+            super::STUBBORN_FIXTURE_PAUSE_SECS > super::TEARDOWN_SIGTERM_SECS,
             "the stubborn fixture parks for {}s but the supervisor may spend \
              {}s tearing down ({}s SIGTERM + {}s SIGKILL); the fixture would \
              give up before the supervisor is obliged to have killed it, and \
@@ -1474,13 +1501,18 @@ mod tests {
         );
     }
 
-    /// A wait that is satisfied late still succeeds.
+    /// A wait satisfied late still succeeds, and the waiting is real.
     ///
     /// This is the #328 case: the supervised process reached the expected
-    /// state, just later than a fixed window allowed.
+    /// state, just later than a fixed window allowed. The elapsed assertion is
+    /// the part that earns its place -- without it this counts to seven with
+    /// no time passing, and a version of `await_bounded` that never sleeps
+    /// (spinning a core flat for the whole bound) passes it. That is a poor
+    /// outcome for a change whose entire purpose is behaving under load.
     #[test]
-    fn a_bounded_wait_succeeds_when_readiness_arrives_late() {
+    fn a_bounded_wait_paces_itself_and_succeeds_when_readiness_arrives_late() {
         let mut polls = 0;
+        let started = std::time::Instant::now();
         let outcome = super::await_bounded(
             "test",
             "a late condition",
@@ -1491,10 +1523,19 @@ mod tests {
             },
             || "unused".into(),
         );
+        let elapsed = started.elapsed();
         assert!(
             outcome.is_ok(),
             "a condition that becomes true after {polls} polls must satisfy a \
              bound it fits inside; got {outcome:?}"
+        );
+        let slept = super::POLL_INTERVAL * 5;
+        assert!(
+            elapsed >= slept,
+            "six polls must be spaced by {:?} each, so at least {slept:?} of \
+             waiting; {polls} polls took {elapsed:?}, which means the loop is \
+             spinning rather than sleeping",
+            super::POLL_INTERVAL
         );
     }
 
@@ -1566,10 +1607,21 @@ mod tests {
             || "unused".into(),
         )
         .expect_err("a condition that errors must propagate");
+        let rendered = format!("{error:#}");
         assert!(
-            format!("{error}").contains("process table unreadable"),
-            "the condition's own error must survive; got: {error}"
+            rendered.contains("process table unreadable"),
+            "the condition's own error must survive; got: {rendered}"
         );
+        for expected in ["teardown", "quiescence"] {
+            assert!(
+                rendered.contains(expected),
+                "a condition that cannot be evaluated must still say which \
+                 phase and which awaited condition it failed under -- that is \
+                 the same naming a timeout gets, and the absence of it is the \
+                 complaint this whole change answers; missing `{expected}` in: \
+                 {rendered}"
+            );
+        }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "an unevaluable condition must fail immediately, not wait out the \

@@ -242,7 +242,14 @@ brain_test_isolation_reexec_launcher() {
   exec "$repo_root/scripts/test_brains.sh" "$launcher" "$@"
 }
 
-# Waits for a daemon to publish its bound address, bounded and monotonic.
+# Waits for a daemon to publish its bound address, on a wall-clock bound.
+#
+# Not monotonic: `date +%s` is CLOCK_REALTIME, so a clock step during the wait
+# moves the deadline. #328 asked for monotonic deadlines and this is the one
+# place that does not deliver one -- bash has no monotonic clock without
+# reaching outside it, and the failure mode (a step large enough to matter
+# during a 30-second daemon startup) is not worth that. Said plainly rather
+# than left to be assumed.
 #
 # Replaces a bare `for _ in {1..100}; do ... sleep 0.05; done` that expired
 # after five seconds and reported only "Daemon did not publish its bound
