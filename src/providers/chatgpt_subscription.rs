@@ -58,6 +58,7 @@ const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_USAGE_EXTRA_BYTES: usize = 64 * 1024;
 const MAX_OPAQUE_REASONING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -2263,7 +2264,7 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
         if serde_json::to_vec(extra)
             .context("ChatGPT response usage extra metadata was invalid")?
             .len()
-            > MAX_TOOL_ARGUMENT_BYTES
+            > MAX_USAGE_EXTRA_BYTES
         {
             bail!("ChatGPT response usage extra metadata exceeded the size limit");
         }
@@ -3658,7 +3659,7 @@ family = "chatgpt_subscription"
     }
 
     #[test]
-    fn test_usage_extra_requires_bounded_object_metadata() {
+    fn test_usage_extra_requires_object_metadata() {
         for value in [json!(false), json!("opaque")] {
             let usage = json!({
                 "input_tokens":12,
@@ -3675,44 +3676,89 @@ family = "chatgpt_subscription"
                 "non-object usage extra metadata returned an unhelpful diagnostic"
             );
         }
+    }
 
-        let exactly_bounded_extra = json!({"p":"x".repeat(MAX_TOOL_ARGUMENT_BYTES - 8)});
+    #[tokio::test]
+    async fn test_buffered_and_streaming_enforce_usage_extra_metadata_bound() {
+        let exactly_bounded_extra = json!({"p":"x".repeat(MAX_USAGE_EXTRA_BYTES - 8)});
         assert_eq!(
             serde_json::to_vec(&exactly_bounded_extra).unwrap().len(),
-            MAX_TOOL_ARGUMENT_BYTES,
+            MAX_USAGE_EXTRA_BYTES,
             "inclusive usage-extra boundary fixture drifted"
         );
-        let exactly_bounded_usage = json!({
-            "input_tokens":12,
-            "output_tokens":7,
-            "total_tokens":19,
-            "extra":exactly_bounded_extra
+        let terminal = json!({
+            "id":"resp-bounded-usage-extra",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":{
+                "input_tokens":12,
+                "output_tokens":7,
+                "total_tokens":19,
+                "extra":exactly_bounded_extra
+            }
+        });
+        let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!("usage extra metadata at the inclusive bound failed: {error}")
         });
         assert_eq!(
-            parse_usage(Some(&exactly_bounded_usage))
-                .expect("usage extra metadata at the inclusive byte limit must be accepted"),
-            (Some(12), Some(7)),
-            "passive usage extra metadata changed token accounting"
+            buffered
+                .usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((12, 7)),
+            "inclusive passive metadata changed buffered token accounting"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [
+                    Ok(StreamChunk::TextDelta(delta)),
+                    Ok(StreamChunk::ResponseMetadata { model }),
+                    Ok(StreamChunk::Usage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                    }),
+                    Ok(StreamChunk::Allowance { .. }),
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
+                ] if delta == "hello" && model == DEFAULT_MODEL && text == "hello"
+            ),
+            "inclusive passive metadata changed ordered streaming effects; outcome={outcome:?}"
         );
 
-        let usage = json!({
-            "input_tokens":12,
-            "output_tokens":7,
-            "total_tokens":19,
-            "extra":{"p":"x".repeat(MAX_TOOL_ARGUMENT_BYTES - 7)}
-        });
+        let excessive_extra = json!({"p":"x".repeat(MAX_USAGE_EXTRA_BYTES - 7)});
         assert_eq!(
-            serde_json::to_vec(&usage["extra"]).unwrap().len(),
-            MAX_TOOL_ARGUMENT_BYTES + 1,
+            serde_json::to_vec(&excessive_extra).unwrap().len(),
+            MAX_USAGE_EXTRA_BYTES + 1,
             "oversized usage-extra boundary fixture drifted"
         );
-        let error = parse_usage(Some(&usage))
-            .err()
-            .expect("oversized usage extra metadata must remain bounded");
+        let excessive_terminal = json!({
+            "id":"resp-excessive-usage-extra",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":{
+                "input_tokens":12,
+                "output_tokens":7,
+                "total_tokens":19,
+                "extra":excessive_extra
+            }
+        });
+        let (buffered, outcome) = run_streamed_message_terminal_response(excessive_terminal).await;
+        let expected = "ChatGPT response usage extra metadata exceeded the size limit";
         assert_eq!(
-            error.to_string(),
-            "ChatGPT response usage extra metadata exceeded the size limit",
-            "oversized usage extra metadata returned an unhelpful diagnostic"
+            buffered.err().as_deref(),
+            Some(expected),
+            "oversized metadata crossed the buffered provider boundary"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [Ok(StreamChunk::TextDelta(delta)), Err(error)]
+                    if delta == "hello" && error == expected
+            ),
+            "oversized metadata must end with one error and no terminal effects; outcome={outcome:?}"
         );
     }
 
