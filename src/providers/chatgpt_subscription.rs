@@ -1668,11 +1668,14 @@ fn parse_completed(
     if let Some(output) = terminal_output {
         if !accumulator.output_items.is_empty() {
             validate_output_snapshot(accumulator.output_items.values(), allowed_tools)?;
+            // An explicit empty completion `output` has the same meaning as an
+            // omitted snapshot: Responses-Lite supplied no redundant terminal
+            // projection, so the validated `response.output_item.done` stream
+            // remains authoritative. A non-empty snapshot must still reconcile
+            // in order and one-to-one so it cannot conceal message or tool drift.
+        }
+        if !accumulator.output_items.is_empty() && !output.is_empty() {
             validate_output_snapshot(output.iter(), allowed_tools)?;
-            // `response.output_item.done` is the authoritative streamed output.
-            // Responses-Lite completion snapshots may omit already-streamed
-            // reasoning. Reconcile the remaining items in order and one-to-one
-            // so the exception cannot conceal message or tool-call drift.
             let streamed_items = accumulator
                 .output_items
                 .values()
@@ -2766,7 +2769,7 @@ family = "chatgpt_subscription"
         )
     }
 
-    fn completed_sse_with_terminal_message_only(model: &str) -> String {
+    fn completed_sse_with_terminal_output(model: &str, terminal_output: Value) -> String {
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
@@ -2780,7 +2783,23 @@ family = "chatgpt_subscription"
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
             json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
             json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"id":"message-stream","type":"message","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}}),
-            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-terminal-subset","status":"completed","model":model,"output":[{"id":"message-terminal","type":"message","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":12,"output_tokens":7}}})
+            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-terminal-subset","status":"completed","model":model,"output":terminal_output,"usage":{"input_tokens":12,"output_tokens":7}}})
+        )
+    }
+
+    fn completed_sse_with_streamed_message_and_empty_terminal_output(model: &str) -> String {
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.output_text.delta","sequence_number":2,"item_id":"message-1","output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.completed","sequence_number":4,"response":{"id":"resp-empty-terminal-output","status":"completed","model":model,"output":[],"usage":{"input_tokens":12,"output_tokens":7}}})
         )
     }
 
@@ -4237,7 +4256,17 @@ family = "chatgpt_subscription"
             .with_status(200)
             .with_header("content-type", "text/event-stream")
             .with_header("openai-model", DEFAULT_MODEL)
-            .with_body(completed_sse_with_terminal_message_only(DEFAULT_MODEL))
+            .with_body(completed_sse_with_terminal_output(
+                DEFAULT_MODEL,
+                json!([{
+                    "id":"message-terminal",
+                    "type":"message",
+                    "status":"completed",
+                    "role":"assistant",
+                    "phase":"final_answer",
+                    "content":[{"type":"output_text","text":"hello"}]
+                }]),
+            ))
             .expect(2)
             .create_async()
             .await;
@@ -4307,6 +4336,99 @@ family = "chatgpt_subscription"
                 ))
             )),
             "terminal-subset reconciliation lost the completed streamed reasoning item; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_empty_terminal_output_after_streamed_message() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_streamed_message_and_empty_terminal_output(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("empty-terminal-output fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!(
+                "an empty terminal output snapshot rejected a validated streamed message at the \
+                 buffered provider boundary: {error:#}"
+            )
+        });
+        assert!(
+            matches!(
+                buffered.content.as_slice(),
+                [ContentBlock::Text { text }] if text == "hello"
+            ),
+            "empty-terminal-output reconciliation lost buffered text; response={buffered:?}"
+        );
+        assert_eq!(
+            buffered.model, DEFAULT_MODEL,
+            "empty-terminal-output reconciliation lost model metadata"
+        );
+        assert_eq!(
+            buffered
+                .usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((12, 7)),
+            "empty-terminal-output reconciliation lost terminal usage"
+        );
+
+        let mut receiver = streaming.unwrap_or_else(|error| {
+            panic!(
+                "an empty terminal output snapshot failed before the streaming provider \
+                 boundary: {error:#}"
+            )
+        });
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [
+                    Ok(StreamChunk::TextDelta(delta)),
+                    Ok(StreamChunk::ResponseMetadata { model }),
+                    Ok(StreamChunk::Usage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                    }),
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
+                ] if delta == "hello" && model == DEFAULT_MODEL && text == "hello"
+            ),
+            "empty-terminal-output reconciliation did not emit exactly one ordered text delta, \
+             model identity, usage record, and completed message with no extra terminal effects; \
              outcome={outcome:?}"
         );
     }
