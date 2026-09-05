@@ -131,12 +131,15 @@ Unknown fields/events, malformed tool arguments, missing completion, duplicate
 terminal markers, post-terminal data, partial EOF, idle timeout, receiver drop,
 and payload-limit violations fail visibly before terminal chunks are published.
 Unknown-field errors identify only Finch's static containing-object or event
-label; response-derived field names and values are never reflected. The current
-Codex `response.usage.extra` and `response.usage.attribution` objects are
-accepted only as named passive metadata. Attribution is bounded to 256 KiB;
-extra remains bounded by the enclosing stream-event limit. Neither can alter
-Finch's validated input/output token accounting, and other usage siblings
-remain fail-closed.
+label; response-derived field names and values are never reflected. The pinned
+Codex source tolerates `response.usage.extra` as an unknown passive object. A
+Finch-owned live acceptance run on 2026-09-05 additionally observed an object
+named `response.usage.attribution`; this is dated live-service compatibility
+evidence, not a field declared by the pinned public Codex usage struct. Finch
+accepts only those two named passive metadata objects. Attribution is bounded
+to 256 KiB; extra remains bounded by the enclosing stream-event limit. Neither
+can alter Finch's validated input/output token accounting, and other usage
+siblings remain fail-closed.
 
 Non-success bodies are consumed only to a small bound and discarded. A
 Responses-Lite rejection retains a typed HTTP status and a compatibility or
@@ -158,8 +161,10 @@ can run:
 FINCH_LIVE_CHATGPT_ACCEPTANCE=1 \
 FINCH_LIVE_CHATGPT_CONFIG="$HOME/.finch/config.toml" \
 FINCH_LIVE_CHATGPT_OAUTH_ROOT="$HOME/.finch/oauth" \
-./scripts/test_brains.sh cargo test --lib \
-  providers::chatgpt_subscription::tests::live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in \
+CARGO_BUILD_JOBS=2 \
+./.agents/skills/finch-backlog/scripts/with-cargo-slot \
+  ./scripts/test_brains.sh cargo test --lib \
+  providers::chatgpt_subscription::tests::live_chatgpt_subscription_acceptance_is_explicitly_opt_in \
   -- --ignored --exact
 ```
 

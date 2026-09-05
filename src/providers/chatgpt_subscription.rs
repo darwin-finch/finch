@@ -3936,8 +3936,8 @@ family = "chatgpt_subscription"
                 "attribution":{
                     "items":{
                         "dynamic-attribution-id":{
-                            "input_tokens":12,
-                            "output_tokens":7
+                            "input_tokens":9001,
+                            "output_tokens":8002
                         }
                     }
                 }
@@ -5977,13 +5977,14 @@ family = "chatgpt_subscription"
     /// ignored by default and intentionally never prints tokens or bodies.
     #[tokio::test]
     #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
-    async fn live_chatgpt_subscription_sol_acceptance_is_explicitly_opt_in() -> Result<()> {
+    async fn live_chatgpt_subscription_acceptance_is_explicitly_opt_in() -> Result<()> {
         if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
             bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
         }
         let config_path = std::env::var_os("FINCH_LIVE_CHATGPT_CONFIG")
             .context("Set FINCH_LIVE_CHATGPT_CONFIG to Finch's config.toml")?;
         let config = crate::config::load_config_from_path(std::path::Path::new(&config_path))?;
+        crate::providers::factory::preflight_provider_config(&config)?;
         let (binding, configured_model, configured_reasoning) = config
             .providers
             .iter()
@@ -6012,14 +6013,11 @@ family = "chatgpt_subscription"
             oauth_root,
         )?;
         let response = provider
-            .send_message(
-                &ProviderRequest::new(vec![Message::user(
-                    "Reply with exactly: Finch native subscription transport accepted",
-                )])
-                .with_model(DEFAULT_MODEL),
-            )
+            .send_message(&ProviderRequest::new(vec![Message::user(
+                "Reply with exactly: Finch native subscription transport accepted",
+            )]))
             .await?;
-        if response.model != DEFAULT_MODEL || response.text().is_empty() {
+        if response.model.trim().is_empty() || response.text().is_empty() {
             bail!("Live ChatGPT subscription acceptance returned incompatible provenance");
         }
         Ok::<(), anyhow::Error>(())
