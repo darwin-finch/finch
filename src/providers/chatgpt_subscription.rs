@@ -2892,6 +2892,19 @@ family = "chatgpt_subscription"
         Result<ProviderResponse, String>,
         Vec<Result<StreamChunk, String>>,
     ) {
+        run_streamed_message_sse(completed_sse_with_streamed_message_and_terminal_response(
+            DEFAULT_MODEL,
+            terminal_response,
+        ))
+        .await
+    }
+
+    async fn run_streamed_message_sse(
+        response_body: String,
+    ) -> (
+        Result<ProviderResponse, String>,
+        Vec<Result<StreamChunk, String>>,
+    ) {
         let mut server = mockito::Server::new_async().await;
         let models = server
             .mock("GET", "/backend-api/codex/models")
@@ -2910,10 +2923,7 @@ family = "chatgpt_subscription"
             .with_header("content-type", "text/event-stream")
             .with_header("openai-model", DEFAULT_MODEL)
             .with_header("x-codex-primary-used-percent", "25.5")
-            .with_body(completed_sse_with_streamed_message_and_terminal_response(
-                DEFAULT_MODEL,
-                terminal_response,
-            ))
+            .with_body(response_body)
             .expect(2)
             .create_async()
             .await;
@@ -3668,6 +3678,95 @@ family = "chatgpt_subscription"
                 "non-object usage extra metadata returned an unhelpful diagnostic"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_reject_non_object_usage_extra_before_terminal_effects() {
+        let terminal = json!({
+            "id":"resp-invalid-usage-extra",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":{
+                "input_tokens":12,
+                "output_tokens":7,
+                "total_tokens":19,
+                "extra":false
+            }
+        });
+        let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
+        let expected = "ChatGPT response usage extra metadata was invalid";
+        assert_eq!(
+            buffered.err().as_deref(),
+            Some(expected),
+            "non-object usage extra crossed the buffered provider boundary"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [Ok(StreamChunk::TextDelta(delta)), Err(error)]
+                    if delta == "hello" && error == expected
+            ),
+            "non-object usage extra must end with one error and no terminal effects; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_bound_multiline_usage_extra_event() {
+        let first_items = "0,".repeat(300_000);
+        let second_items = "0,".repeat(300_000);
+        let response_body = format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\n",
+                "data: {{\"type\":\"response.completed\",\"sequence_number\":4,",
+                "\"response\":{{\"id\":\"resp-oversized-usage-extra\",",
+                "\"status\":\"completed\",\"model\":\"{}\",\"output\":[],",
+                "\"usage\":{{\"input_tokens\":12,\"output_tokens\":7,",
+                "\"total_tokens\":19,\"extra\":{{\"items\":[{}\n",
+                "data: {}0]}}}}}}}}\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}}),
+            json!({"type":"response.output_text.delta","sequence_number":2,"item_id":"message-1","output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            DEFAULT_MODEL,
+            first_items,
+            second_items,
+        );
+        let completed_event = response_body
+            .split("event: response.completed\n")
+            .nth(1)
+            .expect("oversized completed event fixture must exist");
+        assert!(
+            completed_event.len() > MAX_SSE_EVENT_BYTES,
+            "oversized completed event fixture drifted below the aggregate limit"
+        );
+        assert!(
+            completed_event
+                .lines()
+                .all(|line| line.len() <= MAX_SSE_LINE_BYTES),
+            "aggregate event fixture accidentally exceeded the per-line limit"
+        );
+
+        let (buffered, outcome) = run_streamed_message_sse(response_body).await;
+        let expected = "ChatGPT subscription stream event exceeded the size limit";
+        assert_eq!(
+            buffered.err().as_deref(),
+            Some(expected),
+            "oversized multiline usage event crossed the buffered provider boundary"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [Ok(StreamChunk::TextDelta(delta)), Err(error)]
+                    if delta == "hello" && error == expected
+            ),
+            "oversized multiline usage event must end with one error and no terminal effects; \
+             outcome={outcome:?}"
+        );
     }
 
     #[tokio::test]
