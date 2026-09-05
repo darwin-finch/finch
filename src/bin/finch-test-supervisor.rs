@@ -20,6 +20,71 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use nix::libc;
 
+/// Teardown bounds, in seconds, and the fixture pause that races them.
+///
+/// These are ownership bounds, not convenience timeouts. The supervisor must
+/// prove the group quiescent before HOME cleanup, so they stay finite; they
+/// are generous because a loaded host delays the *child's* exit, never the
+/// supervisor's obligation. Under #328 the previous two-second stages expired
+/// on a busy developer machine while the supervised process was still on its
+/// way to the expected state, which reads as an authority regression.
+///
+/// The pause below is derived, not chosen. `run_child_stubborn_probe` parks
+/// and asserts the supervisor kills it first, so the fixture is only
+/// meaningful while its pause exceeds `TEARDOWN_BOUND_SECS`. Written as two
+/// independent literals -- which is how they were -- raising the teardown
+/// bound for load tolerance silently inverts the ordering and turns a real
+/// teardown regression into a passing test.
+const TEARDOWN_SIGTERM_SECS: u64 = 4;
+const TEARDOWN_SIGKILL_SECS: u64 = 4;
+const TEARDOWN_BOUND_SECS: u64 = TEARDOWN_SIGTERM_SECS + TEARDOWN_SIGKILL_SECS;
+const STUBBORN_FIXTURE_PAUSE_SECS: u64 = TEARDOWN_BOUND_SECS * 2;
+
+const TEARDOWN_SIGTERM_BOUND: Duration = Duration::from_secs(TEARDOWN_SIGTERM_SECS);
+const TEARDOWN_SIGKILL_BOUND: Duration = Duration::from_secs(TEARDOWN_SIGKILL_SECS);
+const STUBBORN_FIXTURE_PAUSE: Duration = Duration::from_secs(STUBBORN_FIXTURE_PAUSE_SECS);
+
+/// How long a probe waits for its continuation before giving up.
+const PROBE_CONTINUATION_BOUND: Duration = Duration::from_secs(TEARDOWN_BOUND_SECS);
+
+/// Poll spacing for every bounded wait in this binary.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Waits for `condition` to hold, or until `bound` elapses.
+///
+/// On expiry the error names the phase, what was being awaited, how long it
+/// waited against what bound, and whatever `context` reports about the
+/// supervised process. The failures this replaces surfaced as bare assertions
+/// carrying only a line number, which cannot distinguish a slow host from a
+/// lifecycle regression -- the distinction the reader actually needs.
+///
+/// `context` is only called on the failure path, so it may be expensive, and
+/// it must report identities and paths rather than proof material.
+fn await_bounded(
+    phase: &str,
+    awaited: &str,
+    bound: Duration,
+    mut condition: impl FnMut() -> anyhow::Result<bool>,
+    context: impl FnOnce() -> String,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let deadline = started + bound;
+    loop {
+        if condition()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "{phase}: timed out awaiting {awaited} after {:?} against a {:?} bound; {}",
+                started.elapsed(),
+                bound,
+                context()
+            );
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
 
@@ -199,14 +264,20 @@ fn hash_manifest_directory(
             let ready = control_root.join(".manifest-race-ready");
             let continuation = control_root.join(".manifest-race-continue");
             fs::write(&ready, b"ready\n")?;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !Path::new(&continuation).exists() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            anyhow::ensure!(
-                Path::new(&continuation).exists(),
-                "manifest race probe continuation timed out"
-            );
+            await_bounded(
+                "manifest race probe",
+                "the harness to publish its continuation file",
+                PROBE_CONTINUATION_BOUND,
+                || Ok(Path::new(&continuation).exists()),
+                || {
+                    format!(
+                        "continuation path {}, readiness path {} (written: {})",
+                        continuation.display(),
+                        ready.display(),
+                        ready.exists()
+                    )
+                },
+            )?;
         }
         let kind = SFlag::from_bits_truncate(observed.st_mode);
         if kind.contains(SFlag::S_IFLNK) {
@@ -780,30 +851,49 @@ fn terminate_and_reap(child: &mut Child, group: libc::pid_t) -> anyhow::Result<E
     if leader_exited(child)? && process_group_members(group)?.is_empty() {
         return Ok(child.wait()?);
     }
+    // Each stage re-signals while it waits, so a member that arrives late --
+    // or one that was blocking signals when the first went out -- still gets
+    // one. Escalation is what the bound is for, so an expired SIGTERM stage is
+    // not an error; it is the reason SIGKILL follows.
+    let quiescent = |child: &mut Child| -> anyhow::Result<bool> {
+        Ok(leader_exited(child)? && process_group_members(group)?.is_empty())
+    };
+
     signal_process_group(group, libc::SIGTERM)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if leader_exited(child)? && process_group_members(group)?.is_empty() {
+    let term_deadline = Instant::now() + TEARDOWN_SIGTERM_BOUND;
+    while Instant::now() < term_deadline {
+        if quiescent(child)? {
             break;
         }
         signal_process_group(group, libc::SIGTERM)?;
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(POLL_INTERVAL);
     }
-    if !leader_exited(child)? || !process_group_members(group)?.is_empty() {
+
+    if !quiescent(child)? {
         signal_process_group(group, libc::SIGKILL)?;
-        let quiescence_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < quiescence_deadline {
-            if leader_exited(child)? && process_group_members(group)?.is_empty() {
-                break;
-            }
-            signal_process_group(group, libc::SIGKILL)?;
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let group_for_context = group;
+        let leader = child.id();
+        await_bounded(
+            "teardown",
+            "the owned process group to become quiescent after SIGKILL",
+            TEARDOWN_SIGKILL_BOUND,
+            || {
+                signal_process_group(group, libc::SIGKILL)?;
+                Ok(leader_exited(child)? && process_group_members(group)?.is_empty())
+            },
+            || {
+                let survivors = process_group_members(group_for_context)
+                    .map(|members| format!("{members:?}"))
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+                format!(
+                    "leader pid {leader}, process group {group_for_context}, \
+                     surviving members {survivors}. SIGTERM had already been \
+                     given {TEARDOWN_SIGTERM_BOUND:?}. HOME is preserved rather \
+                     than cleaned under a live group"
+                )
+            },
+        )?;
     }
-    anyhow::ensure!(
-        leader_exited(child)? && process_group_members(group)?.is_empty(),
-        "owned test process group did not become quiescent"
-    );
     // Reaping is the final lifecycle operation. The unreaped leader pins the
     // PGID throughout every group signal and membership check above, so the
     // kernel cannot reuse it as an unrelated process group before this wait.
@@ -843,7 +933,7 @@ impl Drop for OwnedProcessGroup {
         std::thread::sleep(Duration::from_millis(100));
         let _ = signal_process_group(self.group, libc::SIGKILL);
         let mut quiescent = false;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + TEARDOWN_SIGKILL_BOUND;
         while Instant::now() < deadline {
             if leader_exited(&self.child).unwrap_or(false)
                 && process_group_members(self.group).is_ok_and(|members| members.is_empty())
@@ -852,7 +942,21 @@ impl Drop for OwnedProcessGroup {
                 break;
             }
             let _ = signal_process_group(self.group, libc::SIGKILL);
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        if !quiescent {
+            // Drop cannot return an error, and leaving no trace here is how a
+            // teardown failure gets misread later as an unexplained dirty
+            // HOME. Name the survivors on the way out.
+            let survivors = process_group_members(self.group)
+                .map(|members| format!("{members:?}"))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"));
+            eprintln!(
+                "finch-test-supervisor: process group {} did not become quiescent \
+                 within {:?} of SIGKILL during drop; surviving members {}; the \
+                 leader stays unreaped so the kernel cannot reuse the PGID",
+                self.group, TEARDOWN_SIGKILL_BOUND, survivors
+            );
         }
         // Never reap the leader while another member might remain: the zombie
         // pins the PGID against reuse until this supervisor exits. Error paths
@@ -1164,11 +1268,19 @@ fn run_child_stubborn_probe() -> anyhow::Result<()> {
                 // before this pause. The real supervisor must reach its
                 // SIGKILL bound while this fixture remains parked.
                 fs::write(ready_path, b"later publication paused\n")?;
-                let deadline = Instant::now() + Duration::from_secs(5);
+                // Derived from the teardown bound rather than chosen to sit
+                // above it: this fixture only proves anything while it
+                // outlives the supervisor's escalation.
+                let deadline = Instant::now() + STUBBORN_FIXTURE_PAUSE;
                 while Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(POLL_INTERVAL);
                 }
-                anyhow::bail!("stubborn marker pause outlived supervisor teardown bound");
+                anyhow::bail!(
+                    "stubborn marker pause of {STUBBORN_FIXTURE_PAUSE:?} outlived the \
+                     supervisor teardown bound of {:?}; the supervisor did not reach \
+                     its SIGKILL escalation",
+                    Duration::from_secs(TEARDOWN_BOUND_SECS)
+                );
             }
             marker.write_all(b"term\n")?;
             publications += 1;
@@ -1336,5 +1448,133 @@ mod tests {
         let (device, inode) = encoded.split_once(':').unwrap();
         assert_eq!(device.parse::<u64>().unwrap(), signed_device as u64);
         assert_eq!(inode.parse::<u64>().unwrap(), 42);
+    }
+
+    /// The fixture that races teardown must outlive it (#328).
+    ///
+    /// `run_child_stubborn_probe` parks and asserts the supervisor kills it
+    /// first, so it only proves anything while its pause exceeds the
+    /// supervisor's escalation. Both were bare literals -- 5s against 2s+2s --
+    /// and raising the teardown bound for load tolerance would have inverted
+    /// the ordering silently, turning a real teardown regression into a
+    /// passing test. The constants are derived now; this fails if that stops
+    /// being true.
+    #[test]
+    fn the_stubborn_fixture_outlives_the_teardown_bound() {
+        assert!(
+            super::STUBBORN_FIXTURE_PAUSE_SECS > super::TEARDOWN_BOUND_SECS,
+            "the stubborn fixture parks for {}s but the supervisor may spend \
+             {}s tearing down ({}s SIGTERM + {}s SIGKILL); the fixture would \
+             give up before the supervisor is obliged to have killed it, and \
+             would pass while proving nothing",
+            super::STUBBORN_FIXTURE_PAUSE_SECS,
+            super::TEARDOWN_BOUND_SECS,
+            super::TEARDOWN_SIGTERM_SECS,
+            super::TEARDOWN_SIGKILL_SECS
+        );
+    }
+
+    /// A wait that is satisfied late still succeeds.
+    ///
+    /// This is the #328 case: the supervised process reached the expected
+    /// state, just later than a fixed window allowed.
+    #[test]
+    fn a_bounded_wait_succeeds_when_readiness_arrives_late() {
+        let mut polls = 0;
+        let outcome = super::await_bounded(
+            "test",
+            "a late condition",
+            std::time::Duration::from_secs(5),
+            || {
+                polls += 1;
+                Ok(polls > 6)
+            },
+            || "unused".into(),
+        );
+        assert!(
+            outcome.is_ok(),
+            "a condition that becomes true after {polls} polls must satisfy a \
+             bound it fits inside; got {outcome:?}"
+        );
+    }
+
+    /// On expiry the error must say what was awaited, not just that something
+    /// timed out. The failures this replaces carried a line number and nothing
+    /// else, which cannot separate a loaded host from a lifecycle regression.
+    #[test]
+    fn an_expired_wait_reports_the_phase_condition_and_context() {
+        let error = super::await_bounded(
+            "teardown",
+            "the owned process group to become quiescent",
+            std::time::Duration::from_millis(30),
+            || Ok(false),
+            || "leader pid 4242, process group 4242, surviving members [4243]".into(),
+        )
+        .expect_err("a condition that never holds must expire");
+        let rendered = format!("{error}");
+        for expected in [
+            "teardown",
+            "the owned process group to become quiescent",
+            "leader pid 4242",
+            "surviving members [4243]",
+            "30ms",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "an expired wait must report `{expected}` so the reader can \
+                 tell a slow host from a regression; got: {rendered}"
+            );
+        }
+    }
+
+    /// The context closure runs only on the failure path, so it may be as
+    /// expensive as it needs to be -- reading `ps`, stat-ing paths. A wait
+    /// that succeeds must not pay for diagnostics nobody reads.
+    #[test]
+    fn context_is_not_built_for_a_wait_that_succeeds() {
+        let mut built = false;
+        super::await_bounded(
+            "test",
+            "an immediate condition",
+            std::time::Duration::from_secs(1),
+            || Ok(true),
+            || {
+                built = true;
+                String::new()
+            },
+        )
+        .expect("an immediately true condition succeeds");
+        assert!(
+            !built,
+            "the context closure ran on the success path; it is allowed to be \
+             expensive precisely because it should not"
+        );
+    }
+
+    /// A condition that cannot be evaluated is not a timeout, and must not be
+    /// reported as one -- an unreadable process table means the harness has
+    /// lost the ability to observe ownership, which is worse news than a slow
+    /// child and must not wait out the bound before saying so.
+    #[test]
+    fn a_failing_condition_surfaces_its_own_error_immediately() {
+        let started = std::time::Instant::now();
+        let error = super::await_bounded(
+            "teardown",
+            "quiescence",
+            std::time::Duration::from_secs(30),
+            || anyhow::bail!("process table unreadable"),
+            || "unused".into(),
+        )
+        .expect_err("a condition that errors must propagate");
+        assert!(
+            format!("{error}").contains("process table unreadable"),
+            "the condition's own error must survive; got: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an unevaluable condition must fail immediately, not wait out the \
+             bound; took {:?}",
+            started.elapsed()
+        );
     }
 }
