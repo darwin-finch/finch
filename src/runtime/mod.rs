@@ -6427,7 +6427,7 @@ static PROCESS_BEFORE_EXEC_HOOK: std::sync::OnceLock<Mutex<Option<ProcessBeforeE
         target_os = "dragonfly"
     )
 ))]
-type SnapshotWriteHook = (String, Box<dyn FnMut(&Path) + Send>);
+type SnapshotWriteHooks = HashMap<String, Box<dyn FnMut(&Path) + Send>>;
 
 #[cfg(all(
     test,
@@ -6438,17 +6438,22 @@ type SnapshotWriteHook = (String, Box<dyn FnMut(&Path) + Send>);
         target_os = "dragonfly"
     )
 ))]
-static SNAPSHOT_WRITE_HOOK: std::sync::OnceLock<Mutex<Option<SnapshotWriteHook>>> =
+static SNAPSHOT_WRITE_HOOK: std::sync::OnceLock<Mutex<SnapshotWriteHooks>> =
     std::sync::OnceLock::new();
 
-/// Counts execs the kernel refused with `ETXTBSY`.
+/// Counts execs the kernel refused with `ETXTBSY`, per executable.
 ///
 /// Without this, a test that means to exercise the retry can pass for the
 /// wrong reason: if the blocking descriptor happens to be released before the
 /// first exec -- an `fsync` on a loaded runner is enough -- the exec succeeds
 /// on attempt one, the assertions all hold, and the retry is never run. The
-/// test asserts this counter moved, so "the retry works" cannot be concluded
+/// test asserts this count moved, so "the retry works" cannot be concluded
 /// from a run where nothing was retried.
+///
+/// Keyed by executable rather than global, because the tests here run in
+/// parallel and one deliberately provokes refusals forever. A single counter
+/// would let its refusals satisfy the other test's guard, which would make the
+/// guard against vacuity itself vacuous.
 #[cfg(all(
     test,
     any(
@@ -6458,8 +6463,45 @@ static SNAPSHOT_WRITE_HOOK: std::sync::OnceLock<Mutex<Option<SnapshotWriteHook>>
         target_os = "dragonfly"
     )
 ))]
-static TEXT_FILE_BUSY_RETRIES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static TEXT_FILE_BUSY_RETRIES: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+fn record_text_file_busy(executable: &str) {
+    *TEXT_FILE_BUSY_RETRIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("text-file-busy refusal ledger lock")
+        .entry(executable.to_string())
+        .or_insert(0) += 1;
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+fn text_file_busy_refusals(executable: &str) -> usize {
+    TEXT_FILE_BUSY_RETRIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("text-file-busy refusal ledger lock")
+        .get(executable)
+        .copied()
+        .unwrap_or(0)
+}
 
 #[cfg(all(
     test,
@@ -6471,18 +6513,13 @@ static TEXT_FILE_BUSY_RETRIES: std::sync::atomic::AtomicUsize =
     )
 ))]
 fn run_snapshot_write_hook(executable: &Path, snapshot: &Path) {
-    let mut hook = SNAPSHOT_WRITE_HOOK
-        .get_or_init(|| Mutex::new(None))
+    let mut hooks = SNAPSHOT_WRITE_HOOK
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("snapshot write test hook lock");
-    let matches = hook
-        .as_ref()
-        .is_some_and(|(expected, _)| Path::new(expected) == executable);
-    if !matches {
-        return;
+    if let Some(callback) = hooks.get_mut(executable.to_string_lossy().as_ref()) {
+        callback(snapshot);
     }
-    let (_, callback) = hook.as_mut().expect("matching snapshot hook");
-    callback(snapshot);
 }
 
 #[cfg(all(
@@ -6524,6 +6561,7 @@ fn spawn_open_process(
         .map(|value| CString::new(value).map_err(|_| "process argument contains NUL".to_string()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let environment = Vec::<CString>::new();
+    let identity_path = executable.identity.path.clone();
     let fd = executable.file.as_raw_fd();
     let cwd_fd = executable.cwd.as_raw_fd();
     #[cfg(test)]
@@ -6543,7 +6581,7 @@ fn spawn_open_process(
             }
         });
     }
-    spawn_retrying_text_file_busy(&mut command)
+    spawn_retrying_text_file_busy(&mut command, &identity_path)
 }
 
 /// How many times to re-attempt an exec that returns `ETXTBSY`, and how long
@@ -6590,13 +6628,16 @@ const TEXT_FILE_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_mi
 ))]
 fn spawn_retrying_text_file_busy(
     command: &mut std::process::Command,
+    executable: &str,
 ) -> std::result::Result<std::process::Child, String> {
+    #[cfg(not(test))]
+    let _ = executable;
     for attempt in 1..=TEXT_FILE_BUSY_ATTEMPTS {
         match command.spawn() {
             Ok(child) => return Ok(child),
             Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) => {
                 #[cfg(test)]
-                TEXT_FILE_BUSY_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                record_text_file_busy(executable);
                 if attempt == TEXT_FILE_BUSY_ATTEMPTS {
                     break;
                 }
@@ -12474,7 +12515,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         target_os = "freebsd",
         target_os = "dragonfly"
     ))]
-    struct SnapshotWriteHookGuard;
+    struct SnapshotWriteHookGuard(String);
 
     #[cfg(any(
         target_os = "linux",
@@ -12484,10 +12525,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     ))]
     impl Drop for SnapshotWriteHookGuard {
         fn drop(&mut self) {
-            *SNAPSHOT_WRITE_HOOK
-                .get_or_init(|| Mutex::new(None))
+            SNAPSHOT_WRITE_HOOK
+                .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
-                .expect("snapshot write test hook lock") = None;
+                .expect("snapshot write test hook lock")
+                .remove(&self.0);
         }
     }
 
@@ -12537,13 +12579,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     ))]
     #[tokio::test]
     async fn process_run_retries_a_transient_text_file_busy() {
-        use std::sync::atomic::Ordering;
-
         let directory = tempfile::tempdir().unwrap();
         let executable = private_printf(directory.path());
-        let _guard = SnapshotWriteHookGuard;
+        let key = executable.to_string_lossy().into_owned();
+        let _guard = SnapshotWriteHookGuard(key.clone());
 
-        TEXT_FILE_BUSY_RETRIES.store(0, Ordering::SeqCst);
         // Every writer is kept, not just the newest. One approved execution
         // calls `open_process_executable` more than once -- validation, grant
         // normalization, then the exec -- and each call snapshots to a fresh
@@ -12553,35 +12593,39 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         // descriptor supposedly held throughout.
         let held: Arc<Mutex<Vec<std::fs::File>>> = Arc::new(Mutex::new(Vec::new()));
         let installer = Arc::clone(&held);
-        *SNAPSHOT_WRITE_HOOK
-            .get_or_init(|| Mutex::new(None))
+        let refused = key.clone();
+        SNAPSHOT_WRITE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap() = Some((
-            executable.to_string_lossy().into_owned(),
-            Box::new(move |snapshot: &Path| {
-                let writer = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(snapshot)
-                    .expect("open the snapshot for writing while it is still named");
-                installer.lock().unwrap().push(writer);
+            .unwrap()
+            .insert(
+                key.clone(),
+                Box::new(move |snapshot: &Path| {
+                    let writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(snapshot)
+                        .expect("open the snapshot for writing while it is still named");
+                    installer.lock().unwrap().push(writer);
 
-                // Release once the exec has actually been refused, rather than
-                // after a fixed delay. A timer would make the test vacuous on
-                // a loaded runner: if the snapshot's fsync outlasts it the
-                // descriptor is gone before the first exec, everything below
-                // still passes, and nothing was retried.
-                let releaser = Arc::clone(&installer);
-                std::thread::spawn(move || {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while TEXT_FILE_BUSY_RETRIES.load(Ordering::SeqCst) == 0
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    releaser.lock().unwrap().clear();
-                });
-            }),
-        ));
+                    // Release once the exec has actually been refused, rather than
+                    // after a fixed delay. A timer would make the test vacuous on
+                    // a loaded runner: if the snapshot's fsync outlasts it the
+                    // descriptor is gone before the first exec, everything below
+                    // still passes, and nothing was retried.
+                    let releaser = Arc::clone(&installer);
+                    let watched = refused.clone();
+                    std::thread::spawn(move || {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        while text_file_busy_refusals(&watched) == 0
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        releaser.lock().unwrap().clear();
+                    });
+                }),
+            );
 
         let source = format!(
             "(process-run {} (list \"ok\"))",
@@ -12610,7 +12654,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
 
-        let retries = TEXT_FILE_BUSY_RETRIES.load(Ordering::SeqCst);
+        let retries = text_file_busy_refusals(&key);
         assert!(
             retries > 0,
             "the blocking descriptor was released before the exec was ever \
@@ -12646,30 +12690,28 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     async fn process_run_reports_a_permanent_text_file_busy_without_hanging() {
         let directory = tempfile::tempdir().unwrap();
         let executable = private_printf(directory.path());
-        let _guard = SnapshotWriteHookGuard;
+        let key = executable.to_string_lossy().into_owned();
+        let _guard = SnapshotWriteHookGuard(key.clone());
 
-        // Every writer is kept, not just the newest. One approved execution
-        // calls `open_process_executable` more than once -- validation, grant
-        // normalization, then the exec -- and each call snapshots to a fresh
-        // temporary file. Holding only the latest descriptor leaves whichever
-        // snapshot is actually exec'd unblocked whenever another call follows
-        // it, which is how the first CI run reached `Completed` with a
-        // descriptor supposedly held throughout.
+        // Keep every writer, for the same reason as the transient test: one
+        // approved execution snapshots more than once, so the descriptor that
+        // matters is not necessarily the newest.
         let held: Arc<Mutex<Vec<std::fs::File>>> = Arc::new(Mutex::new(Vec::new()));
         let installer = Arc::clone(&held);
-        *SNAPSHOT_WRITE_HOOK
-            .get_or_init(|| Mutex::new(None))
+        SNAPSHOT_WRITE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap() = Some((
-            executable.to_string_lossy().into_owned(),
-            Box::new(move |snapshot: &Path| {
-                let writer = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(snapshot)
-                    .expect("open the snapshot for writing");
-                installer.lock().unwrap().push(writer);
-            }),
-        ));
+            .unwrap()
+            .insert(
+                key.clone(),
+                Box::new(move |snapshot: &Path| {
+                    let writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(snapshot)
+                        .expect("open the snapshot for writing");
+                    installer.lock().unwrap().push(writer);
+                }),
+            );
 
         let source = format!(
             "(process-run {} (list \"ok\"))",
