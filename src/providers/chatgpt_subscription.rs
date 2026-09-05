@@ -1021,6 +1021,7 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
         root.as_object()
             .context("ChatGPT catalog root was invalid")?,
         &["models"],
+        "model catalog",
     )?;
     let models = root["models"]
         .as_array()
@@ -1621,6 +1622,7 @@ fn parse_completed(
             "presence_penalty",
             "tool_usage",
         ],
+        "terminal response",
     )?;
     if let Some(tool_usage) = response.get("tool_usage") {
         if serde_json::to_vec(tool_usage)
@@ -1668,11 +1670,14 @@ fn parse_completed(
     if let Some(output) = terminal_output {
         if !accumulator.output_items.is_empty() {
             validate_output_snapshot(accumulator.output_items.values(), allowed_tools)?;
+            // An explicit empty completion `output` has the same meaning as an
+            // omitted snapshot: Responses-Lite supplied no redundant terminal
+            // projection, so the validated `response.output_item.done` stream
+            // remains authoritative. A non-empty snapshot must still reconcile
+            // in order and one-to-one so it cannot conceal message or tool drift.
+        }
+        if !accumulator.output_items.is_empty() && !output.is_empty() {
             validate_output_snapshot(output.iter(), allowed_tools)?;
-            // `response.output_item.done` is the authoritative streamed output.
-            // Responses-Lite completion snapshots may omit already-streamed
-            // reasoning. Reconcile the remaining items in order and one-to-one
-            // so the exception cannot conceal message or tool-call drift.
             let streamed_items = accumulator
                 .output_items
                 .values()
@@ -1833,6 +1838,7 @@ fn parse_output_item(
                     "phase",
                     "internal_chat_message_metadata_passthrough",
                 ],
+                "message output item",
             )?;
             if object.get("role").and_then(Value::as_str) != Some("assistant") {
                 bail!("ChatGPT response message role was invalid");
@@ -1852,7 +1858,11 @@ fn parse_output_item(
                 let part = part
                     .as_object()
                     .context("ChatGPT response content was invalid")?;
-                exact_keys(part, &["type", "text", "annotations", "logprobs"])?;
+                exact_keys(
+                    part,
+                    &["type", "text", "annotations", "logprobs"],
+                    "output text content",
+                )?;
                 if part.get("type").and_then(Value::as_str) != Some("output_text") {
                     bail!("ChatGPT response contained an unknown message content type");
                 }
@@ -1893,6 +1903,7 @@ fn parse_output_item(
                     "status",
                     "internal_chat_message_metadata_passthrough",
                 ],
+                "reasoning output item",
             )?;
             validate_optional_item_fields(object)?;
             validate_reasoning_projection(object.get("summary"), "reasoning summary")?;
@@ -1918,6 +1929,7 @@ fn parse_output_item(
                     "encrypted_function_args",
                     "internal_chat_message_metadata_passthrough",
                 ],
+                "function call output item",
             )?;
             validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
@@ -2037,7 +2049,7 @@ fn validate_documented_response_metadata(response: &Map<String, Value>) -> Resul
         let conversation = value
             .as_object()
             .context("ChatGPT terminal response conversation was invalid")?;
-        exact_keys(conversation, &["id"])?;
+        exact_keys(conversation, &["id"], "terminal response conversation")?;
         required_identifier(conversation, "id", 256)?;
     }
     if let Some(value) = response
@@ -2047,7 +2059,11 @@ fn validate_documented_response_metadata(response: &Map<String, Value>) -> Resul
         let options = value
             .as_object()
             .context("ChatGPT terminal response prompt cache options were invalid")?;
-        exact_keys(options, &["mode", "ttl", "comparison_response_id"])?;
+        exact_keys(
+            options,
+            &["mode", "ttl", "comparison_response_id"],
+            "terminal response prompt cache options",
+        )?;
         if !matches!(
             options.get("mode").and_then(Value::as_str),
             Some("implicit" | "explicit")
@@ -2161,7 +2177,8 @@ fn validate_reasoning_projection(value: Option<&Value>, label: &str) -> Result<(
         let item = item
             .as_object()
             .with_context(|| format!("ChatGPT {label} was invalid"))?;
-        exact_keys(item, &["type", "text"])?;
+        let location = format!("{label} item");
+        exact_keys(item, &["type", "text"], &location)?;
         if !matches!(
             item.get("type").and_then(Value::as_str),
             Some("summary_text" | "reasoning_text" | "text")
@@ -2194,6 +2211,7 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
             "total_tokens",
             "codex_rollout_budget_units",
         ],
+        "response usage",
     )?;
     let convert = |name: &str| -> Result<Option<u32>> {
         object
@@ -2245,11 +2263,23 @@ fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Optio
     )
 }
 
-fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
-    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        bail!("ChatGPT subscription response contained an unknown field");
+fn exact_keys(object: &Map<String, Value>, allowed: &[&str], location: &str) -> Result<()> {
+    let Some(field) = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .min()
+    else {
+        return Ok(());
+    };
+    if field.len() > 128
+        || field.is_empty()
+        || !field
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("ChatGPT subscription {location} contained unknown field with an invalid name");
     }
-    Ok(())
+    bail!("ChatGPT subscription {location} contained unknown field `{field}`");
 }
 
 /// Validate an audited SSE event envelope while accepting only bounded passive
@@ -2275,7 +2305,18 @@ fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()>
     let mut event_fields = Vec::with_capacity(allowed.len() + 2);
     event_fields.extend_from_slice(allowed);
     event_fields.extend(["obfuscation", "safety_buffering"]);
-    exact_keys(object, &event_fields)
+    let event = object
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        })
+        .unwrap_or("SSE");
+    exact_keys(object, &event_fields, &format!("{event} event"))
 }
 
 fn required_identifier(object: &Map<String, Value>, name: &str, maximum: usize) -> Result<String> {
@@ -2766,7 +2807,7 @@ family = "chatgpt_subscription"
         )
     }
 
-    fn completed_sse_with_terminal_message_only(model: &str) -> String {
+    fn completed_sse_with_terminal_output(model: &str, terminal_output: Value) -> String {
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
@@ -2780,7 +2821,39 @@ family = "chatgpt_subscription"
             json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
             json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
             json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"id":"message-stream","type":"message","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}}),
-            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-terminal-subset","status":"completed","model":model,"output":[{"id":"message-terminal","type":"message","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":12,"output_tokens":7}}})
+            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-terminal-subset","status":"completed","model":model,"output":terminal_output,"usage":{"input_tokens":12,"output_tokens":7}}})
+        )
+    }
+
+    fn completed_sse_with_streamed_message_and_terminal_response(
+        model: &str,
+        terminal_response: Value,
+    ) -> String {
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.output_text.delta","sequence_number":2,"item_id":"message-1","output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.completed","sequence_number":4,"response":terminal_response})
+        )
+    }
+
+    fn completed_sse_with_streamed_message_and_empty_terminal_output(model: &str) -> String {
+        completed_sse_with_streamed_message_and_terminal_response(
+            model,
+            json!({
+                "id":"resp-empty-terminal-output",
+                "status":"completed",
+                "model":model,
+                "output":[],
+                "usage":{"input_tokens":12,"output_tokens":7}
+            }),
         )
     }
 
@@ -3481,9 +3554,117 @@ family = "chatgpt_subscription"
         )
         .err()
         .expect("unaudited terminal semantics must remain fail closed");
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT subscription terminal response contained unknown field \
+             `future_authority_field`",
+            "unknown terminal semantics must identify their safe field and containing object"
+        );
+    }
+
+    #[test]
+    fn test_unknown_field_diagnostic_redacts_hostile_field_names() {
+        let terminal = json!({
+            "id":"resp-hostile-unknown-terminal",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "secret\nvalue":true
+        });
+        let error = parse_completed(
+            terminal.as_object().unwrap(),
+            DEFAULT_MODEL,
+            Some(DEFAULT_MODEL),
+            &HashSet::new(),
+            &mut StreamAccumulator::default(),
+        )
+        .err()
+        .expect("unaudited terminal semantics must remain fail closed");
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT subscription terminal response contained unknown field with an invalid name",
+            "hostile field names must not be copied into terminal diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_unknown_field_names_safe_path_before_terminal_effects() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let terminal_response = json!({
+            "id":"resp-unknown-terminal",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":{"input_tokens":12,"output_tokens":7},
+            "future_authority_field":true
+        });
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_streamed_message_and_terminal_response(
+                DEFAULT_MODEL,
+                terminal_response,
+            ))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("unknown-field fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let expected = "ChatGPT subscription terminal response contained unknown field \
+                        `future_authority_field`";
+        let buffered_error = buffered
+            .err()
+            .expect("unknown terminal semantics passed the buffered provider boundary");
+        assert_eq!(
+            buffered_error.to_string(),
+            expected,
+            "buffered rejection did not safely identify the protocol drift"
+        );
+
+        let mut receiver = streaming.expect("stream setup must consume the complete SSE fixture");
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert_eq!(
+            outcome.len(),
+            2,
+            "unknown terminal fields must produce one prior text delta and one terminal error; \
+             outcome={outcome:?}"
+        );
         assert!(
-            error.to_string().contains("unknown field"),
-            "unknown terminal semantics returned an unhelpful diagnostic: {error:#}"
+            matches!(&outcome[0], Ok(StreamChunk::TextDelta(text)) if text == "hello"),
+            "streaming rejection lost or reordered the preceding text delta; outcome={outcome:?}"
+        );
+        assert!(
+            matches!(&outcome[1], Err(error) if error == expected),
+            "streaming rejection did not safely identify the protocol drift; outcome={outcome:?}"
         );
     }
 
@@ -4237,7 +4418,17 @@ family = "chatgpt_subscription"
             .with_status(200)
             .with_header("content-type", "text/event-stream")
             .with_header("openai-model", DEFAULT_MODEL)
-            .with_body(completed_sse_with_terminal_message_only(DEFAULT_MODEL))
+            .with_body(completed_sse_with_terminal_output(
+                DEFAULT_MODEL,
+                json!([{
+                    "id":"message-terminal",
+                    "type":"message",
+                    "status":"completed",
+                    "role":"assistant",
+                    "phase":"final_answer",
+                    "content":[{"type":"output_text","text":"hello"}]
+                }]),
+            ))
             .expect(2)
             .create_async()
             .await;
@@ -4307,6 +4498,99 @@ family = "chatgpt_subscription"
                 ))
             )),
             "terminal-subset reconciliation lost the completed streamed reasoning item; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_empty_terminal_output_after_streamed_message() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_streamed_message_and_empty_terminal_output(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("empty-terminal-output fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!(
+                "an empty terminal output snapshot rejected a validated streamed message at the \
+                 buffered provider boundary: {error:#}"
+            )
+        });
+        assert!(
+            matches!(
+                buffered.content.as_slice(),
+                [ContentBlock::Text { text }] if text == "hello"
+            ),
+            "empty-terminal-output reconciliation lost buffered text; response={buffered:?}"
+        );
+        assert_eq!(
+            buffered.model, DEFAULT_MODEL,
+            "empty-terminal-output reconciliation lost model metadata"
+        );
+        assert_eq!(
+            buffered
+                .usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((12, 7)),
+            "empty-terminal-output reconciliation lost terminal usage"
+        );
+
+        let mut receiver = streaming.unwrap_or_else(|error| {
+            panic!(
+                "an empty terminal output snapshot failed before the streaming provider \
+                 boundary: {error:#}"
+            )
+        });
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [
+                    Ok(StreamChunk::TextDelta(delta)),
+                    Ok(StreamChunk::ResponseMetadata { model }),
+                    Ok(StreamChunk::Usage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                    }),
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
+                ] if delta == "hello" && model == DEFAULT_MODEL && text == "hello"
+            ),
+            "empty-terminal-output reconciliation did not emit exactly one ordered text delta, \
+             model identity, usage record, and completed message with no extra terminal effects; \
              outcome={outcome:?}"
         );
     }
