@@ -118,14 +118,18 @@ stream work.
 The SSE parser bounds each line and event and the total response. It validates
 standard `event:` names against JSON event types, requires strictly increasing
 sequence numbers, accumulates completed output items by contiguous output
-index, and reconciles their semantic content with any terminal output while
-ignoring validated passive item metadata that may differ between snapshots.
-Actual-model provenance is optional: when absent Finch reports the validated requested catalog route;
-when present the bounded serving-model identity may differ from that route but
-must remain unchanged throughout the response. Unknown fields/events, malformed tool
-arguments, missing completion, duplicate terminal markers, post-terminal data,
-partial EOF, idle timeout, receiver drop, and payload-limit violations fail
-visibly before terminal chunks are published.
+index, and treats validated `response.output_item.done` items as the
+authoritative output when they are present. A terminal completion snapshot may
+omit already-streamed reasoning, but its remaining items must match streamed
+messages and function calls in order and one-to-one after ignoring only
+validated passive item metadata. Terminal message/tool omissions, additions,
+duplicates, reordering, and semantic changes fail closed.
+Actual-model provenance is optional: when absent Finch reports the validated
+requested catalog route; when present the bounded serving-model identity may
+differ from that route but must remain unchanged throughout the response.
+Unknown fields/events, malformed tool arguments, missing completion, duplicate
+terminal markers, post-terminal data, partial EOF, idle timeout, receiver drop,
+and payload-limit violations fail visibly before terminal chunks are published.
 
 Non-success bodies are consumed only to a small bound and discarded. A
 Responses-Lite rejection retains a typed HTTP status and a compatibility or
