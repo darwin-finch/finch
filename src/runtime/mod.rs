@@ -12544,7 +12544,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let _guard = SnapshotWriteHookGuard;
 
         TEXT_FILE_BUSY_RETRIES.store(0, Ordering::SeqCst);
-        let held: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
+        // Every writer is kept, not just the newest. One approved execution
+        // calls `open_process_executable` more than once -- validation, grant
+        // normalization, then the exec -- and each call snapshots to a fresh
+        // temporary file. Holding only the latest descriptor leaves whichever
+        // snapshot is actually exec'd unblocked whenever another call follows
+        // it, which is how the first CI run reached `Completed` with a
+        // descriptor supposedly held throughout.
+        let held: Arc<Mutex<Vec<std::fs::File>>> = Arc::new(Mutex::new(Vec::new()));
         let installer = Arc::clone(&held);
         *SNAPSHOT_WRITE_HOOK
             .get_or_init(|| Mutex::new(None))
@@ -12556,7 +12563,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                     .write(true)
                     .open(snapshot)
                     .expect("open the snapshot for writing while it is still named");
-                *installer.lock().unwrap() = Some(writer);
+                installer.lock().unwrap().push(writer);
 
                 // Release once the exec has actually been refused, rather than
                 // after a fixed delay. A timer would make the test vacuous on
@@ -12571,7 +12578,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                     {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    releaser.lock().unwrap().take();
+                    releaser.lock().unwrap().clear();
                 });
             }),
         ));
@@ -12619,8 +12626,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         assert_eq!(completed.values, vec![ProgramValue::String("ok".into())]);
         assert!(
-            held.lock().unwrap().is_none(),
-            "the hook released its writer"
+            held.lock().unwrap().is_empty(),
+            "the hook must have released every writer it opened"
         );
     }
 
@@ -12641,7 +12648,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let executable = private_printf(directory.path());
         let _guard = SnapshotWriteHookGuard;
 
-        let held: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
+        // Every writer is kept, not just the newest. One approved execution
+        // calls `open_process_executable` more than once -- validation, grant
+        // normalization, then the exec -- and each call snapshots to a fresh
+        // temporary file. Holding only the latest descriptor leaves whichever
+        // snapshot is actually exec'd unblocked whenever another call follows
+        // it, which is how the first CI run reached `Completed` with a
+        // descriptor supposedly held throughout.
+        let held: Arc<Mutex<Vec<std::fs::File>>> = Arc::new(Mutex::new(Vec::new()));
         let installer = Arc::clone(&held);
         *SNAPSHOT_WRITE_HOOK
             .get_or_init(|| Mutex::new(None))
@@ -12653,7 +12667,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                     .write(true)
                     .open(snapshot)
                     .expect("open the snapshot for writing");
-                *installer.lock().unwrap() = Some(writer);
+                installer.lock().unwrap().push(writer);
             }),
         ));
 
@@ -12702,7 +12716,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             elapsed < std::time::Duration::from_secs(5),
             "the retry budget must be bounded; giving up took {elapsed:?}"
         );
-        drop(held.lock().unwrap().take());
+        held.lock().unwrap().clear();
     }
 
     #[cfg(any(
