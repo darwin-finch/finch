@@ -58,7 +58,6 @@ const MAX_CATALOG_CONTEXT_WINDOW: u64 = 10_000_000;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
-const MAX_USAGE_EXTRA_BYTES: usize = 64 * 1024;
 const MAX_OPAQUE_REASONING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -2258,16 +2257,9 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
         "response usage",
     )?;
     if let Some(extra) = object.get("extra") {
-        let extra = extra
+        extra
             .as_object()
             .context("ChatGPT response usage extra metadata was invalid")?;
-        if serde_json::to_vec(extra)
-            .context("ChatGPT response usage extra metadata was invalid")?
-            .len()
-            > MAX_USAGE_EXTRA_BYTES
-        {
-            bail!("ChatGPT response usage extra metadata exceeded the size limit");
-        }
     }
     let convert = |name: &str| -> Result<Option<u32>> {
         object
@@ -3679,15 +3671,15 @@ family = "chatgpt_subscription"
     }
 
     #[tokio::test]
-    async fn test_buffered_and_streaming_enforce_usage_extra_metadata_bound() {
-        let exactly_bounded_extra = json!({"p":"x".repeat(MAX_USAGE_EXTRA_BYTES - 8)});
+    async fn test_buffered_and_streaming_accept_large_usage_extra_within_event_bound() {
+        let large_extra = json!({"p":"x".repeat(128 * 1024 - 8)});
         assert_eq!(
-            serde_json::to_vec(&exactly_bounded_extra).unwrap().len(),
-            MAX_USAGE_EXTRA_BYTES,
-            "inclusive usage-extra boundary fixture drifted"
+            serde_json::to_vec(&large_extra).unwrap().len(),
+            128 * 1024,
+            "large usage-extra fixture drifted"
         );
         let terminal = json!({
-            "id":"resp-bounded-usage-extra",
+            "id":"resp-large-usage-extra",
             "status":"completed",
             "model":DEFAULT_MODEL,
             "output":[],
@@ -3695,12 +3687,12 @@ family = "chatgpt_subscription"
                 "input_tokens":12,
                 "output_tokens":7,
                 "total_tokens":19,
-                "extra":exactly_bounded_extra
+                "extra":large_extra
             }
         });
         let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
         let buffered = buffered.unwrap_or_else(|error| {
-            panic!("usage extra metadata at the inclusive bound failed: {error}")
+            panic!("large usage extra metadata within the event bound failed: {error}")
         });
         assert_eq!(
             buffered
@@ -3708,7 +3700,7 @@ family = "chatgpt_subscription"
                 .as_ref()
                 .map(|usage| (usage.input_tokens, usage.output_tokens)),
             Some((12, 7)),
-            "inclusive passive metadata changed buffered token accounting"
+            "large passive metadata changed buffered token accounting"
         );
         assert!(
             matches!(
@@ -3720,45 +3712,17 @@ family = "chatgpt_subscription"
                         input_tokens: 12,
                         output_tokens: 7,
                     }),
-                    Ok(StreamChunk::Allowance { .. }),
+                    Ok(StreamChunk::Allowance {
+                        primary_used_percent: Some(primary),
+                        secondary_used_percent: None,
+                    }),
                     Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
-                ] if delta == "hello" && model == DEFAULT_MODEL && text == "hello"
+                ] if delta == "hello"
+                    && model == DEFAULT_MODEL
+                    && *primary == 25.5
+                    && text == "hello"
             ),
-            "inclusive passive metadata changed ordered streaming effects; outcome={outcome:?}"
-        );
-
-        let excessive_extra = json!({"p":"x".repeat(MAX_USAGE_EXTRA_BYTES - 7)});
-        assert_eq!(
-            serde_json::to_vec(&excessive_extra).unwrap().len(),
-            MAX_USAGE_EXTRA_BYTES + 1,
-            "oversized usage-extra boundary fixture drifted"
-        );
-        let excessive_terminal = json!({
-            "id":"resp-excessive-usage-extra",
-            "status":"completed",
-            "model":DEFAULT_MODEL,
-            "output":[],
-            "usage":{
-                "input_tokens":12,
-                "output_tokens":7,
-                "total_tokens":19,
-                "extra":excessive_extra
-            }
-        });
-        let (buffered, outcome) = run_streamed_message_terminal_response(excessive_terminal).await;
-        let expected = "ChatGPT response usage extra metadata exceeded the size limit";
-        assert_eq!(
-            buffered.err().as_deref(),
-            Some(expected),
-            "oversized metadata crossed the buffered provider boundary"
-        );
-        assert!(
-            matches!(
-                outcome.as_slice(),
-                [Ok(StreamChunk::TextDelta(delta)), Err(error)]
-                    if delta == "hello" && error == expected
-            ),
-            "oversized metadata must end with one error and no terminal effects; outcome={outcome:?}"
+            "large passive metadata changed exact ordered streaming effects; outcome={outcome:?}"
         );
     }
 
@@ -3806,9 +3770,15 @@ family = "chatgpt_subscription"
                         input_tokens: 12,
                         output_tokens: 7,
                     }),
-                    Ok(StreamChunk::Allowance { .. }),
+                    Ok(StreamChunk::Allowance {
+                        primary_used_percent: Some(primary),
+                        secondary_used_percent: None,
+                    }),
                     Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
-                ] if delta == "hello" && model == DEFAULT_MODEL && text == "hello"
+                ] if delta == "hello"
+                    && model == DEFAULT_MODEL
+                    && *primary == 25.5
+                    && text == "hello"
             ),
             "usage extra metadata did not preserve exact ordered streaming effects; \
              outcome={outcome:?}"
