@@ -6222,9 +6222,12 @@ fn open_process_executable(
         run_snapshot_write_hook(&canonical, &snapshot_path);
         std::io::copy(&mut source, &mut snapshot_writer)
             .map_err(|error| format!("snapshot process executable: {error}"))?;
-        snapshot_writer
-            .sync_all()
-            .map_err(|error| format!("sync process executable snapshot: {error}"))?;
+        // Deliberately not `sync_all`. The snapshot is unlinked before it is
+        // executed and is only ever read back through a descriptor this
+        // function already holds, so durability buys nothing -- while the
+        // fsync sat inside the window during which a concurrent `fork()` can
+        // inherit this writer and block the exec with `ETXTBSY` (#287). It was
+        // the dominant term of that window.
         snapshot_writer
             .set_permissions(std::fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("seal process executable snapshot mode: {error}"))?;
@@ -6479,7 +6482,7 @@ fn record_text_file_busy(executable: &str) {
     *TEXT_FILE_BUSY_RETRIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("text-file-busy refusal ledger lock")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(executable.to_string())
         .or_insert(0) += 1;
 }
@@ -6497,7 +6500,7 @@ fn text_file_busy_refusals(executable: &str) -> usize {
     TEXT_FILE_BUSY_RETRIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("text-file-busy refusal ledger lock")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(executable)
         .copied()
         .unwrap_or(0)
@@ -6513,10 +6516,14 @@ fn text_file_busy_refusals(executable: &str) -> usize {
     )
 ))]
 fn run_snapshot_write_hook(executable: &Path, snapshot: &Path) {
+    // Poison-tolerant on purpose. The callback runs under this lock, so a
+    // panic inside one test's hook would otherwise poison the map for every
+    // later `open_process_executable` in the binary, and the guard's own drop
+    // would panic during unwind. One root cause, many misattributed failures.
     let mut hooks = SNAPSHOT_WRITE_HOOK
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("snapshot write test hook lock");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(callback) = hooks.get_mut(executable.to_string_lossy().as_ref()) {
         callback(snapshot);
     }
@@ -6585,8 +6592,9 @@ fn spawn_open_process(
 }
 
 /// How many times to re-attempt an exec that returns `ETXTBSY`, and how long
-/// to wait between attempts. The waits are cumulative-linear, so the ceiling
-/// is `5ms * (1 + 2 + ... + 8)` -- about 180ms before giving up.
+/// to wait between attempts. The loop breaks before sleeping on its final
+/// attempt, so eight attempts means seven waits: `5ms * (1 + 2 + ... + 7)`,
+/// a ceiling of 140ms before giving up.
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -6630,14 +6638,18 @@ fn spawn_retrying_text_file_busy(
     command: &mut std::process::Command,
     executable: &str,
 ) -> std::result::Result<std::process::Child, String> {
-    #[cfg(not(test))]
-    let _ = executable;
     for attempt in 1..=TEXT_FILE_BUSY_ATTEMPTS {
         match command.spawn() {
             Ok(child) => return Ok(child),
             Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) => {
                 #[cfg(test)]
                 record_text_file_busy(executable);
+                tracing::debug!(
+                    executable,
+                    attempt,
+                    "exec refused with ETXTBSY; a descriptor still holds the \
+                     snapshot open for writing, retrying"
+                );
                 if attempt == TEXT_FILE_BUSY_ATTEMPTS {
                     break;
                 }
@@ -6648,6 +6660,11 @@ fn spawn_retrying_text_file_busy(
             Err(error) => return Err(error.to_string()),
         }
     }
+    tracing::warn!(
+        executable,
+        attempts = TEXT_FILE_BUSY_ATTEMPTS,
+        "exec refused with ETXTBSY on every attempt; giving up"
+    );
     Err(format!(
         "execute process snapshot: Text file busy (os error {}) after {} attempts -- \
          a descriptor has held the executable open for writing throughout",
@@ -12528,7 +12545,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             SNAPSHOT_WRITE_HOOK
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
-                .expect("snapshot write test hook lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&self.0);
         }
     }
@@ -12591,7 +12608,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         // snapshot is actually exec'd unblocked whenever another call follows
         // it, which is how the first CI run reached `Completed` with a
         // descriptor supposedly held throughout.
-        let held: Arc<Mutex<Vec<std::fs::File>>> = Arc::new(Mutex::new(Vec::new()));
+        // One slot per firing, not one shared vector. Every firing spawns its
+        // own releaser with its own deadline; if they all cleared the same
+        // vector, an early firing timing out could drop the exec-time writer
+        // and the test would fail at the refusal guard blaming the hook for
+        // not holding long enough.
+        type Slot = Arc<Mutex<Option<std::fs::File>>>;
+        let held: Arc<Mutex<Vec<Slot>>> = Arc::new(Mutex::new(Vec::new()));
         let installer = Arc::clone(&held);
         let refused = key.clone();
         SNAPSHOT_WRITE_HOOK
@@ -12605,24 +12628,24 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                         .write(true)
                         .open(snapshot)
                         .expect("open the snapshot for writing while it is still named");
-                    installer.lock().unwrap().push(writer);
+                    let slot: Slot = Arc::new(Mutex::new(Some(writer)));
+                    installer.lock().unwrap().push(Arc::clone(&slot));
 
                     // Release once the exec has actually been refused, rather than
                     // after a fixed delay. A timer would make the test vacuous on
                     // a loaded runner: if the snapshot's fsync outlasts it the
                     // descriptor is gone before the first exec, everything below
                     // still passes, and nothing was retried.
-                    let releaser = Arc::clone(&installer);
                     let watched = refused.clone();
                     std::thread::spawn(move || {
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
                         while text_file_busy_refusals(&watched) == 0
                             && std::time::Instant::now() < deadline
                         {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        releaser.lock().unwrap().clear();
+                        slot.lock().unwrap().take();
                     });
                 }),
             );
@@ -12670,8 +12693,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         assert_eq!(completed.values, vec![ProgramValue::String("ok".into())]);
         assert!(
-            held.lock().unwrap().is_empty(),
-            "the hook must have released every writer it opened"
+            held.lock()
+                .unwrap()
+                .iter()
+                .all(|slot| slot.lock().unwrap().is_none()),
+            "every writer the hook opened must have been released"
         );
     }
 
@@ -12754,9 +12780,49 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
              retries are spent; diagnostics={:#?}; outcome={outcome:#?}",
             outcome.diagnostics
         );
+        let refusals = text_file_busy_refusals(&key);
+        assert_eq!(
+            refusals, TEXT_FILE_BUSY_ATTEMPTS as usize,
+            "a permanently blocked exec must spend the whole budget and then \
+             stop; it was refused {refusals} time(s) against a budget of {}",
+            TEXT_FILE_BUSY_ATTEMPTS
+        );
+        // 140ms of backoff plus the execution around it. Five seconds proved
+        // only "not a hang" and would not have noticed the budget growing by
+        // an order of magnitude.
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "the retry budget must be bounded; giving up took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(2),
+            "the retry budget must stay bounded near its documented 140ms \
+             ceiling; giving up took {elapsed:?}"
+        );
+
+        // #287 introduces a second way for an approved `process-run` to fail
+        // after its approval resolved, so it needs the invariant
+        // `kernel_rejected_launch_does_not_consume_or_audit_once_grant`
+        // protects: a launch the kernel refused is not a use of the authority.
+        let ledger = runtime.capability_ledger().unwrap();
+        let once = ledger
+            .grants
+            .grants
+            .last()
+            .expect("once grant remains visible");
+        assert!(
+            once.consumed_at_unix_ms.is_none(),
+            "an exec the kernel never performed must not consume the once \
+             grant; grant={once:#?}"
+        );
+        assert!(
+            ledger.authorization_audit.is_empty(),
+            "a refused exec must not audit a host use; audit={:#?}",
+            ledger.authorization_audit
+        );
+        assert!(
+            !ledger
+                .audit
+                .iter()
+                .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed),
+            "a refused exec must not record consumption; audit={:#?}",
+            ledger.audit
         );
         held.lock().unwrap().clear();
     }
