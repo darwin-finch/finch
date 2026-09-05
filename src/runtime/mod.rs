@@ -6598,8 +6598,11 @@ fn spawn_open_process(
 
 /// How many times to re-attempt an exec that returns `ETXTBSY`, and how long
 /// to wait between attempts. The loop breaks before sleeping on its final
-/// attempt, so eight attempts means seven waits: `5ms * (1 + 2 + ... + 7)`,
-/// a ceiling of 140ms before giving up.
+/// attempt, so eight attempts means seven waits: `5ms * (1 + 2 + ... + 7)`.
+///
+/// That is 140ms of sleep as a *floor*, not a ceiling -- `thread::sleep`
+/// guarantees at least its duration. Nothing bounds a fully refused exec from
+/// above in production; only the test does.
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -12799,16 +12802,38 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         // test to the budget's actual value is the pair below.
         assert_eq!(
             TEXT_FILE_BUSY_ATTEMPTS, 8,
-            "this test's timing bounds are written against a budget of 8; \
-             changing the budget means revisiting them"
+            "this pin, not the elapsed bound below, is what catches a changed \
+             budget; the bound is derived from this constant and moves with \
+             it"
         );
-        // `thread::sleep` never returns early, so the backoff the loop is
-        // documented to spend is a hard lower bound on a fully refused exec.
-        // Without this, a loop that skipped its sleeps -- or a budget quietly
-        // reduced -- would still satisfy everything above.
+        // What this catches, precisely: a loop that stops sleeping. Deleting
+        // the `sleep` from the retry arm makes a fully refused exec return in
+        // ~86ms against this 140ms bound, and CI run 33960900348 confirms it
+        // fails there. It does NOT catch a reduced budget -- `backoff` is
+        // derived from `TEXT_FILE_BUSY_ATTEMPTS`, so a smaller budget shrinks
+        // this bound in lockstep, and at a budget of 1 it degrades to
+        // `elapsed >= 0`. The pin above is what catches that.
+        //
+        // The margin is thinner than it looks. That ~86ms is ambient work in
+        // `resolve_typed_approval`, not backoff, so only ~54ms of the bound is
+        // actually doing discriminating work. It can never fail spuriously --
+        // noise only pushes `elapsed` up -- but on a slow enough runner, or if
+        // approval grows another `open_process_executable` call, it would stop
+        // detecting the mutation silently.
         let backoff: std::time::Duration = (1..TEXT_FILE_BUSY_ATTEMPTS)
             .map(|attempt| TEXT_FILE_BUSY_BACKOFF * attempt)
             .sum();
+        // Pins `TEXT_FILE_BUSY_BACKOFF` as well as the attempt count. Without
+        // it, halving the backoff fails nothing here and quietly stales the
+        // 140ms in the production doc comment -- a number this branch has
+        // already had to correct once.
+        assert_eq!(
+            backoff,
+            std::time::Duration::from_millis(140),
+            "the documented backoff is 140ms; the constants now sum to \
+             {backoff:?}, so the doc comment on TEXT_FILE_BUSY_ATTEMPTS and \
+             this test both need revisiting"
+        );
         assert!(
             elapsed >= backoff,
             "a fully refused exec must actually spend its backoff; the loop \
