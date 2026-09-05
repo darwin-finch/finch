@@ -6012,13 +6012,17 @@ family = "chatgpt_subscription"
             configured_reasoning,
             oauth_root,
         )?;
+        const EXPECTED_TEXT: &str = "Finch native subscription transport accepted";
         let response = provider
-            .send_message(&ProviderRequest::new(vec![Message::user(
-                "Reply with exactly: Finch native subscription transport accepted",
-            )]))
+            .send_message(&ProviderRequest::new(vec![Message::user(format!(
+                "Reply with exactly: {EXPECTED_TEXT}"
+            ))]))
             .await?;
-        if response.model.trim().is_empty() || response.text().is_empty() {
+        if response.model.trim().is_empty() {
             bail!("Live ChatGPT subscription acceptance returned incompatible provenance");
+        }
+        if response.text().trim() != EXPECTED_TEXT {
+            bail!("Live ChatGPT subscription acceptance returned unexpected text");
         }
         Ok::<(), anyhow::Error>(())
     }

@@ -168,10 +168,13 @@ CARGO_BUILD_JOBS=2 \
   -- --ignored --exact
 ```
 
-The explicit paths let the supervised test read only Finch's real configuration
-and Finch-owned OAuth store while all other test state remains in the
-supervisor's disposable home. The test selects a Finch-owned named credential
-and asserts non-empty Sol model provenance. It does not print tokens or response
-bodies. Until that opt-in test is run, live-service acceptance—including current
-account entitlement and server-side compatibility with the pinned
-revision—remains intentionally unverified.
+The explicit paths let the supervised test read Finch's real configuration and
+use Finch's production OAuth store while all other test state remains in the
+supervisor's disposable home. The configuration file is not modified. The OAuth
+store retains production behavior: it creates its normal lock and may atomically
+refresh the credential when it is near expiry or the service returns 401. The
+test selects a Finch-owned named credential and requires non-empty model
+provenance plus the exact requested static response text. It does not print
+tokens or response bodies. Until that opt-in test is run, live-service
+acceptance—including current account entitlement and server-side compatibility
+with the pinned revision—remains intentionally unverified.
