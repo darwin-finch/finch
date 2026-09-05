@@ -241,3 +241,41 @@ brain_test_isolation_reexec_launcher() {
   repo_root="$(cd "$(dirname "$launcher")/.." && pwd -P)" || exit 64
   exec "$repo_root/scripts/test_brains.sh" "$launcher" "$@"
 }
+
+# Waits for a daemon to publish its bound address, on a wall-clock bound.
+#
+# Not monotonic: `date +%s` is CLOCK_REALTIME, so a clock step during the wait
+# moves the deadline. #328 asked for monotonic deadlines and this is the one
+# place that does not deliver one -- bash has no monotonic clock without
+# reaching outside it, and the failure mode (a step large enough to matter
+# during a 30-second daemon startup) is not worth that. Said plainly rather
+# than left to be assumed.
+#
+# Replaces a bare `for _ in {1..100}; do ... sleep 0.05; done` that expired
+# after five seconds and reported only "Daemon did not publish its bound
+# address" (#328). On a loaded host that message was indistinguishable from a
+# daemon that had crashed on startup, so it names the child's fate instead:
+# whether the process is still running, its exit status if not, and where the
+# address file was expected.
+#
+# Usage: await_bound_address <address_file> <daemon_pid> [bound_seconds]
+await_bound_address() {
+    local address_file="$1" daemon_pid="$2" bound="${3:-30}"
+    local deadline=$(( $(date +%s) + bound ))
+
+    while [[ ! -s "$address_file" ]]; do
+        # A daemon that has already exited will never publish. Fail now with
+        # its status rather than polling out the remaining window.
+        if ! kill -0 "$daemon_pid" 2>/dev/null; then
+            local status=0
+            wait "$daemon_pid" 2>/dev/null || status=$?
+            echo "Daemon (pid $daemon_pid) exited with status $status before publishing its bound address to $address_file" >&2
+            return 1
+        fi
+        if (( $(date +%s) >= deadline )); then
+            echo "Daemon (pid $daemon_pid) is still running but did not publish its bound address to $address_file within ${bound}s" >&2
+            return 1
+        fi
+        sleep 0.05
+    done
+}

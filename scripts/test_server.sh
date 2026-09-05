@@ -49,8 +49,7 @@ DAEMON_PID=$!
 daemon_pid="$DAEMON_PID"
 
 echo "Daemon started with PID: $DAEMON_PID"
-for _ in {1..100}; do [[ -s "$address_file" ]] && break; sleep 0.05; done
-[[ -s "$address_file" ]] || { echo "Daemon did not publish its bound address" >&2; exit 1; }
+await_bound_address "$address_file" "$DAEMON_PID" || exit 1
 daemon_url="http://$(cat "$address_file")"
 
 # Test health endpoint

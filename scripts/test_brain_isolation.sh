@@ -765,12 +765,24 @@ phase=manifest-swap-to-fifo-status
 race_name=manifest-race-node
 race_path="$fake_home/.finch/brains/$race_name"
 (
-  for _ in {1..400}; do
+  # Paired with PROBE_CONTINUATION_BOUND in finch-test-supervisor.rs. The probe
+  # parks waiting for the continuation this subshell publishes, so a shorter
+  # window here means the probe waits out a bound for a file that was already
+  # abandoned. Raising one side alone is worse than raising neither (#328).
+  race_deadline=$(( $(date +%s) + 8 ))
+  while :; do
     race_ready="$(find "$temp_parent" -maxdepth 2 -name .manifest-race-ready -print -quit)"
     [[ -n "$race_ready" ]] && break
+    if (( $(date +%s) >= race_deadline )); then
+      echo "manifest race swapper: probe never published .manifest-race-ready under $temp_parent within 8s; the probe is waiting on a continuation this subshell will not write" >&2
+      exit 1
+    fi
     sleep 0.005
   done
-  [[ -n "$race_ready" && -e "$race_ready" ]]
+  [[ -e "$race_ready" ]] || {
+    echo "manifest race swapper: readiness path $race_ready vanished between discovery and use" >&2
+    exit 1
+  }
   rm -f -- "$race_path"
   mkfifo "$race_path"
   : >"$(dirname "$race_ready")/.manifest-race-continue"

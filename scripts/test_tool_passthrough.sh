@@ -35,8 +35,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 mkdir -p "$HOME/.finch"
 FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind "$FINCH_TEST_DAEMON_ADDR" & daemon_pid=$!
-for _ in {1..100}; do [[ -s "$address_file" ]] && break; sleep 0.05; done
-[[ -s "$address_file" ]] || { echo 'Daemon did not publish its bound address' >&2; exit 1; }
+await_bound_address "$address_file" "$daemon_pid" || exit 1
 DAEMON_URL="http://$(cat "$address_file")"
 
 echo "🧪 Testing Tool Pass-Through in Daemon Architecture"
