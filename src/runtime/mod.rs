@@ -6218,11 +6218,21 @@ fn open_process_executable(
             .mode(0o700)
             .open(&snapshot_path)
             .map_err(|error| format!("create private executable snapshot: {error}"))?;
+        #[cfg(test)]
+        run_snapshot_write_hook(&canonical, &snapshot_path);
         std::io::copy(&mut source, &mut snapshot_writer)
             .map_err(|error| format!("snapshot process executable: {error}"))?;
-        snapshot_writer
-            .sync_all()
-            .map_err(|error| format!("sync process executable snapshot: {error}"))?;
+        // Deliberately not `sync_all`. The snapshot is reopened by path just
+        // below, but read-after-write through the page cache is coherent
+        // without a sync and `File` is unbuffered in userspace, so both the
+        // hash and the exec see every byte written here. Nothing reads this
+        // file after the process exits -- it is unlinked before the exec --
+        // so durability bought nothing.
+        //
+        // It did cost. The fsync sat inside the window during which a
+        // concurrent `fork()` can inherit this writer and block the exec with
+        // `ETXTBSY` (#287), so removing it shortens that window. By how much
+        // is unmeasured; the copy above is inside the window too.
         snapshot_writer
             .set_permissions(std::fs::Permissions::from_mode(0o500))
             .map_err(|error| format!("seal process executable snapshot mode: {error}"))?;
@@ -6404,6 +6414,126 @@ fn run_authorization_before_lease_hook(execution_id: uuid::Uuid, capability: Cap
 static PROCESS_BEFORE_EXEC_HOOK: std::sync::OnceLock<Mutex<Option<ProcessBeforeExecHook>>> =
     std::sync::OnceLock::new();
 
+/// Called while the private executable snapshot is still open for writing,
+/// with the executable's canonical path and the snapshot's path.
+///
+/// That window is invisible from outside `open_process_executable`: the
+/// snapshot is unlinked before it is executed, so no test can otherwise hold a
+/// descriptor to it. #287 is precisely a failure inside that window -- a
+/// descriptor still open for writing when the exec runs -- so a test needs to
+/// be able to open one deterministically instead of waiting for CI to
+/// interleave two `process-run` calls by chance.
+///
+/// Keyed on the executable path, like the before-exec hook, so a concurrent
+/// unrelated `process-run` does not trip another test's callback.
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+type SnapshotWriteHooks = HashMap<String, Box<dyn FnMut(&Path) + Send>>;
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+static SNAPSHOT_WRITE_HOOK: std::sync::OnceLock<Mutex<SnapshotWriteHooks>> =
+    std::sync::OnceLock::new();
+
+/// Counts execs the kernel refused with `ETXTBSY`, per executable.
+///
+/// Without this, a test that means to exercise the retry can pass for the
+/// wrong reason: if the blocking descriptor happens to be released before the
+/// first exec -- any pause before the spawn is enough -- the exec succeeds
+/// on attempt one, the assertions all hold, and the retry is never run. The
+/// test asserts this count moved, so "the retry works" cannot be concluded
+/// from a run where nothing was retried.
+///
+/// Keyed by executable rather than global, because the tests here run in
+/// parallel and one deliberately provokes refusals forever. A single counter
+/// would let its refusals satisfy the other test's guard, which would make the
+/// guard against vacuity itself vacuous.
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+static TEXT_FILE_BUSY_RETRIES: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+fn record_text_file_busy(executable: &str) {
+    *TEXT_FILE_BUSY_RETRIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(executable.to_string())
+        .or_insert(0) += 1;
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+fn text_file_busy_refusals(executable: &str) -> usize {
+    TEXT_FILE_BUSY_RETRIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(executable)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+fn run_snapshot_write_hook(executable: &Path, snapshot: &Path) {
+    // Poison-tolerant on purpose. The callback runs under this lock, so a
+    // panic inside one test's hook would otherwise poison the map for every
+    // later `open_process_executable` in the binary, and the guard's own drop
+    // would panic during unwind. One root cause, many misattributed failures.
+    let mut hooks = SNAPSHOT_WRITE_HOOK
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(callback) = hooks.get_mut(executable.to_string_lossy().as_ref()) {
+        callback(snapshot);
+    }
+}
+
 #[cfg(all(
     test,
     any(
@@ -6443,6 +6573,7 @@ fn spawn_open_process(
         .map(|value| CString::new(value).map_err(|_| "process argument contains NUL".to_string()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let environment = Vec::<CString>::new();
+    let identity_path = executable.identity.path.clone();
     let fd = executable.file.as_raw_fd();
     let cwd_fd = executable.cwd.as_raw_fd();
     #[cfg(test)]
@@ -6462,7 +6593,92 @@ fn spawn_open_process(
             }
         });
     }
-    command.spawn().map_err(|error| error.to_string())
+    spawn_retrying_text_file_busy(&mut command, &identity_path)
+}
+
+/// How many times to re-attempt an exec that returns `ETXTBSY`, and how long
+/// to wait between attempts. The loop breaks before sleeping on its final
+/// attempt, so eight attempts means seven waits: `5ms * (1 + 2 + ... + 7)`.
+///
+/// That is 140ms of sleep as a *floor*, not a ceiling -- `thread::sleep`
+/// guarantees at least its duration. Nothing bounds a fully refused exec from
+/// above in production; only the test does.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+const TEXT_FILE_BUSY_ATTEMPTS: u32 = 8;
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+const TEXT_FILE_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Spawn, re-attempting while the kernel reports `ETXTBSY`.
+///
+/// Every `process-run` writes a private snapshot of the authorized executable
+/// and then execs it. The kernel refuses to exec a file that any process holds
+/// open for writing, and `fork()` copies the whole descriptor table -- so a
+/// second `process-run` forking anywhere inside the first one's write window
+/// gives its child an inherited write descriptor, and the first one's exec
+/// fails with "Text file busy" (#287). The descriptor closes when that child
+/// execs, which makes the condition transient and self-clearing.
+///
+/// Retrying cannot widen the authorization. The object is already pinned by
+/// the time this runs: the snapshot is sealed `0o500`, unlinked, and
+/// identity-checked, and every attempt execs the same descriptor, so a retry
+/// has no path to a different file than the one approved.
+///
+/// A genuinely permanent `ETXTBSY` still fails, with the kernel's own message
+/// rather than a hang.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn spawn_retrying_text_file_busy(
+    command: &mut std::process::Command,
+    executable: &str,
+) -> std::result::Result<std::process::Child, String> {
+    for attempt in 1..=TEXT_FILE_BUSY_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                #[cfg(test)]
+                record_text_file_busy(executable);
+                tracing::debug!(
+                    executable,
+                    attempt,
+                    "exec refused with ETXTBSY; a descriptor still holds the \
+                     snapshot open for writing, retrying"
+                );
+                if attempt == TEXT_FILE_BUSY_ATTEMPTS {
+                    break;
+                }
+                // The caller already blocks on `wait_with_output`, so sleeping
+                // here does not introduce blocking the call path did not have.
+                std::thread::sleep(TEXT_FILE_BUSY_BACKOFF * attempt);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    tracing::warn!(
+        executable,
+        attempts = TEXT_FILE_BUSY_ATTEMPTS,
+        "exec refused with ETXTBSY on every attempt; giving up"
+    );
+    Err(format!(
+        "execute process snapshot: Text file busy (os error {}) after {} attempts -- \
+         a descriptor has held the executable open for writing throughout",
+        nix::libc::ETXTBSY,
+        TEXT_FILE_BUSY_ATTEMPTS
+    ))
 }
 
 #[cfg(not(any(
@@ -12313,6 +12529,357 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         };
         assert!(manifest.contains("vm-vocabulary"));
         assert!(manifest.contains("file-read"));
+    }
+
+    /// Installs the snapshot-write hook for one executable and hands back a
+    /// guard that clears it, so a panicking test cannot leave a hook armed for
+    /// the rest of the process.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    struct SnapshotWriteHookGuard(String);
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    impl Drop for SnapshotWriteHookGuard {
+        fn drop(&mut self) {
+            SNAPSHOT_WRITE_HOOK
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
+
+    /// Copies `/usr/bin/printf` somewhere private and returns its canonical
+    /// path. Each test keys its hook on its own copy: the hook is global and
+    /// matched by path, so sharing `/usr/bin/printf` would fire one test's
+    /// callback inside another's `process-run`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    fn private_printf(directory: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = directory.join("tool");
+        std::fs::copy("/usr/bin/printf", &executable).expect("copy printf");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make the copy executable");
+        std::fs::canonicalize(executable).expect("canonicalize the copy")
+    }
+
+    /// #287: an exec the kernel refuses with `ETXTBSY` is retried, not
+    /// reported to the caller as a failure.
+    ///
+    /// Every `process-run` writes a private snapshot of the authorized
+    /// executable and then execs it, and the kernel refuses to exec a file any
+    /// process holds open for writing. `fork()` copies the whole descriptor
+    /// table, so a second `process-run` forking anywhere inside the first
+    /// one's write window hands its child an inherited write descriptor and
+    /// the first one's exec fails. In CI this surfaced as
+    /// `approved_typed_process_runs_without_a_shell` failing intermittently on
+    /// ubuntu with "Text file busy (os error 26)" -- and, on one commit,
+    /// failing on attempt 1 and passing on attempt 2 of the same run.
+    ///
+    /// Reproducing it does not need a second process. The kernel's check is
+    /// per-inode, so a second write descriptor opened here blocks the exec
+    /// exactly the same way, on demand rather than at CI's whim.
+    ///
+    /// Before the fix this fails at the status assertion: the first refusal is
+    /// returned to the caller verbatim.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn process_run_retries_a_transient_text_file_busy() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = private_printf(directory.path());
+        let key = executable.to_string_lossy().into_owned();
+        let _guard = SnapshotWriteHookGuard(key.clone());
+
+        // Every writer is kept, not just the newest. One approved execution
+        // calls `open_process_executable` more than once -- validation, grant
+        // normalization, then the exec -- and each call snapshots to a fresh
+        // temporary file. Holding only the latest descriptor leaves whichever
+        // snapshot is actually exec'd unblocked whenever another call follows
+        // it, which is how the first CI run reached `Completed` with a
+        // descriptor supposedly held throughout.
+        // One slot per firing, not one shared vector. Every firing spawns its
+        // own releaser with its own deadline; if they all cleared the same
+        // vector, an early firing timing out could drop the exec-time writer
+        // and the test would fail at the refusal guard blaming the hook for
+        // not holding long enough.
+        type Slot = Arc<Mutex<Option<std::fs::File>>>;
+        let held: Arc<Mutex<Vec<Slot>>> = Arc::new(Mutex::new(Vec::new()));
+        let installer = Arc::clone(&held);
+        let refused = key.clone();
+        SNAPSHOT_WRITE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key.clone(),
+                Box::new(move |snapshot: &Path| {
+                    let writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(snapshot)
+                        .expect("open the snapshot for writing while it is still named");
+                    let slot: Slot = Arc::new(Mutex::new(Some(writer)));
+                    installer.lock().unwrap().push(Arc::clone(&slot));
+
+                    // Release once the exec has actually been refused, rather than
+                    // after a fixed delay. A timer would make the test vacuous on
+                    // a loaded runner: if the work before the spawn outlasts it the
+                    // descriptor is gone before the first exec, everything below
+                    // still passes, and nothing was retried.
+                    let watched = refused.clone();
+                    std::thread::spawn(move || {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        while text_file_busy_refusals(&watched) == 0
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        slot.lock().unwrap().take();
+                    });
+                }),
+            );
+
+        let source = format!(
+            "(process-run {} (list \"ok\"))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.status,
+            ExecutionStatus::AuthorizationRequired,
+            "an unapproved typed process must stop at its capability boundary; outcome={pending:#?}"
+        );
+        let completed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+
+        let retries = text_file_busy_refusals(&key);
+        assert!(
+            retries > 0,
+            "the blocking descriptor was released before the exec was ever \
+             refused, so this run proves nothing about the retry; make the \
+             hook hold it longer. retries={retries}; outcome={completed:#?}"
+        );
+        assert_eq!(
+            completed.status,
+            ExecutionStatus::Completed,
+            "a transient `Text file busy` must be retried rather than \
+             surfaced as a failed execution (#287); it was refused {retries} \
+             time(s); outcome={completed:#?}"
+        );
+        assert_eq!(completed.values, vec![ProgramValue::String("ok".into())]);
+        assert!(
+            held.lock()
+                .unwrap()
+                .iter()
+                .all(|slot| slot.lock().unwrap().is_none()),
+            "every writer the hook opened must have been released"
+        );
+    }
+
+    /// A descriptor that never closes must fail, bounded, with the kernel's
+    /// own diagnosis -- not spin until the caller gives up.
+    ///
+    /// This is the other half of the retry: it must not turn a permanent
+    /// condition into a hang, and the message must still say what happened.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn process_run_reports_a_permanent_text_file_busy_without_hanging() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = private_printf(directory.path());
+        let key = executable.to_string_lossy().into_owned();
+        let _guard = SnapshotWriteHookGuard(key.clone());
+
+        // Keep every writer, for the same reason as the transient test: one
+        // approved execution snapshots more than once, so the descriptor that
+        // matters is not necessarily the newest.
+        let held: Arc<Mutex<Vec<std::fs::File>>> = Arc::new(Mutex::new(Vec::new()));
+        let installer = Arc::clone(&held);
+        SNAPSHOT_WRITE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key.clone(),
+                Box::new(move |snapshot: &Path| {
+                    let writer = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(snapshot)
+                        .expect("open the snapshot for writing");
+                    installer.lock().unwrap().push(writer);
+                }),
+            );
+
+        let source = format!(
+            "(process-run {} (list \"ok\"))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+
+        let started = std::time::Instant::now();
+        let outcome = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Failed,
+            "a descriptor held open for writing throughout must fail the \
+             execution, not succeed; outcome={outcome:#?}"
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("Text file busy")),
+            "the failure must still name the kernel's condition after the \
+             retries are spent; diagnostics={:#?}; outcome={outcome:#?}",
+            outcome.diagnostics
+        );
+        let refusals = text_file_busy_refusals(&key);
+        assert_eq!(
+            refusals, TEXT_FILE_BUSY_ATTEMPTS as usize,
+            "a permanently blocked exec must spend the whole budget and then \
+             stop; it was refused {refusals} time(s) against a budget of {}",
+            TEXT_FILE_BUSY_ATTEMPTS
+        );
+        // That comparison alone is tautological: every attempt is refused
+        // here, so the count mirrors the constant whatever the constant is,
+        // and this test passed unchanged with the budget set to 1. It catches
+        // an off-by-one in the loop bounds and nothing more. What binds this
+        // test to the budget's actual value is the pair below.
+        assert_eq!(
+            TEXT_FILE_BUSY_ATTEMPTS, 8,
+            "this pin, not the elapsed bound below, is what catches a changed \
+             budget; the bound is derived from this constant and moves with \
+             it"
+        );
+        // What this catches, precisely: a loop that stops sleeping. Deleting
+        // the `sleep` from the retry arm makes a fully refused exec return in
+        // ~86ms against this 140ms bound, and CI run 33960900348 confirms it
+        // fails there. It does NOT catch a reduced budget -- `backoff` is
+        // derived from `TEXT_FILE_BUSY_ATTEMPTS`, so a smaller budget shrinks
+        // this bound in lockstep, and at a budget of 1 it degrades to
+        // `elapsed >= 0`. The pin above is what catches that.
+        //
+        // The margin is thinner than it looks. That ~86ms is ambient work in
+        // `resolve_typed_approval`, not backoff, so only ~54ms of the bound is
+        // actually doing discriminating work. It can never fail spuriously --
+        // noise only pushes `elapsed` up -- but on a slow enough runner, or if
+        // approval grows another `open_process_executable` call, it would stop
+        // detecting the mutation silently.
+        let backoff: std::time::Duration = (1..TEXT_FILE_BUSY_ATTEMPTS)
+            .map(|attempt| TEXT_FILE_BUSY_BACKOFF * attempt)
+            .sum();
+        // Pins `TEXT_FILE_BUSY_BACKOFF` as well as the attempt count. Without
+        // it, halving the backoff fails nothing here and quietly stales the
+        // 140ms in the production doc comment -- a number this branch has
+        // already had to correct once.
+        assert_eq!(
+            backoff,
+            std::time::Duration::from_millis(140),
+            "the documented backoff is 140ms; the constants now sum to \
+             {backoff:?}, so the doc comment on TEXT_FILE_BUSY_ATTEMPTS and \
+             this test both need revisiting"
+        );
+        assert!(
+            elapsed >= backoff,
+            "a fully refused exec must actually spend its backoff; the loop \
+             is documented to wait {backoff:?} but gave up after {elapsed:?}"
+        );
+        // Deliberately loose. The lower bound above is what ties this test to
+        // the budget; this one only says "not a hang", and tightening it buys
+        // little against a runner executing ~2950 tests in parallel.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the retry budget must stay bounded; giving up took {elapsed:?}"
+        );
+
+        // #287 introduces a second way for an approved `process-run` to fail
+        // after its approval resolved, so it needs the invariant
+        // `kernel_rejected_launch_does_not_consume_or_audit_once_grant`
+        // protects: a launch the kernel refused is not a use of the authority.
+        let ledger = runtime.capability_ledger().unwrap();
+        let once = ledger
+            .grants
+            .grants
+            .last()
+            .expect("once grant remains visible");
+        assert!(
+            matches!(once.scope, GrantScope::Once { .. }),
+            "the grant under test must be the once grant; grant={once:#?}"
+        );
+        assert!(
+            once.consumed_at_unix_ms.is_none(),
+            "an exec the kernel never performed must not consume the once \
+             grant; grant={once:#?}"
+        );
+        assert!(
+            ledger.authorization_audit.is_empty(),
+            "a refused exec must not audit a host use; audit={:#?}",
+            ledger.authorization_audit
+        );
+        assert!(
+            !ledger
+                .audit
+                .iter()
+                .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed),
+            "a refused exec must not record consumption; audit={:#?}",
+            ledger.audit
+        );
+        held.lock().unwrap().clear();
     }
 
     #[cfg(any(
