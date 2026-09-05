@@ -1669,21 +1669,61 @@ fn parse_completed(
         if !accumulator.output_items.is_empty() {
             validate_output_snapshot(accumulator.output_items.values(), allowed_tools)?;
             validate_output_snapshot(output.iter(), allowed_tools)?;
-            if output.len() != accumulator.output_items.len() {
-                bail!(
-                    "ChatGPT terminal output item count did not match the streamed output item count"
-                );
-            }
-            for (index, item) in output.iter().enumerate() {
-                let streamed = accumulator
-                    .output_items
-                    .get(&(index as u64))
-                    .context("ChatGPT streamed output item index was missing")?;
-                if canonical_output_item(streamed) != canonical_output_item(item) {
+            // `response.output_item.done` is the authoritative streamed output.
+            // Responses-Lite completion snapshots may omit already-streamed
+            // reasoning. Reconcile the remaining items in order and one-to-one
+            // so the exception cannot conceal message or tool-call drift.
+            let streamed_items = accumulator
+                .output_items
+                .values()
+                .map(canonical_output_item)
+                .collect::<Vec<_>>();
+            let streamed_values = accumulator.output_items.values().collect::<Vec<_>>();
+            let mut streamed_index = 0;
+            for (terminal_index, item) in output.iter().enumerate() {
+                let terminal_item = canonical_output_item(item);
+                while streamed_index < streamed_items.len()
+                    && streamed_items[streamed_index] != terminal_item
+                    && output_item_kind(streamed_values[streamed_index]) == "reasoning"
+                {
+                    streamed_index += 1;
+                }
+                if streamed_index >= streamed_items.len() {
                     bail!(
-                        "ChatGPT terminal output item {index} did not match its streamed semantic content"
+                        "ChatGPT terminal output item {terminal_index} ({terminal_kind}) did not \
+                         match a remaining streamed semantic item; terminal_count={}, \
+                         streamed_count={}",
+                        output.len(),
+                        streamed_items.len(),
+                        terminal_kind = output_item_kind(item),
                     );
                 }
+                if streamed_items[streamed_index] != terminal_item {
+                    bail!(
+                        "ChatGPT terminal output item {terminal_index} ({terminal_kind}) did not \
+                         match streamed output item {streamed_index} ({streamed_kind}); \
+                         terminal_count={}, streamed_count={}",
+                        output.len(),
+                        streamed_items.len(),
+                        terminal_kind = output_item_kind(item),
+                        streamed_kind = output_item_kind(streamed_values[streamed_index]),
+                    );
+                }
+                streamed_index += 1;
+            }
+            while streamed_index < streamed_items.len()
+                && output_item_kind(streamed_values[streamed_index]) == "reasoning"
+            {
+                streamed_index += 1;
+            }
+            if streamed_index < streamed_items.len() {
+                bail!(
+                    "ChatGPT terminal snapshot omitted streamed output item {streamed_index} \
+                     ({streamed_kind}); terminal_count={}, streamed_count={}",
+                    output.len(),
+                    streamed_items.len(),
+                    streamed_kind = output_item_kind(streamed_values[streamed_index]),
+                );
             }
         }
         if accumulator.output_items.is_empty() {
@@ -1758,6 +1798,13 @@ fn canonical_output_item(item: &Value) -> Value {
         }
     }
     canonical
+}
+
+fn output_item_kind(item: &Value) -> &str {
+    item.as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("invalid")
 }
 
 fn parse_output_item(
@@ -2719,6 +2766,129 @@ family = "chatgpt_subscription"
         )
     }
 
+    fn completed_sse_with_terminal_message_only(model: &str) -> String {
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"id":"message-stream","type":"message","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.completed","sequence_number":5,"response":{"id":"resp-terminal-subset","status":"completed","model":model,"output":[{"id":"message-terminal","type":"message","status":"completed","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":12,"output_tokens":7}}})
+        )
+    }
+
+    fn completed_sse_with_streamed_tool_and_terminal_output(
+        model: &str,
+        terminal_output: Value,
+    ) -> String {
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_text.delta\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
+            json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"opaque-1"}}),
+            json!({"type":"response.output_text.delta","sequence_number":3,"item_id":"message-1","output_index":1,"content_index":0,"delta":"hello"}),
+            json!({"type":"response.output_item.done","sequence_number":4,"output_index":1,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
+            json!({"type":"response.output_item.done","sequence_number":5,"output_index":2,"item":{"type":"function_call","call_id":"call-2","name":"read","namespace":"functions","arguments":"{\"path\":\"README.md\"}"}}),
+            json!({"type":"response.completed","sequence_number":6,"response":{"id":"resp-terminal-negative","status":"completed","model":model,"output":terminal_output,"usage":{"input_tokens":12,"output_tokens":7}}})
+        )
+    }
+
+    async fn assert_terminal_snapshot_rejected_at_provider_boundary(
+        case: &str,
+        terminal_output: Value,
+        expected_diagnostic: &str,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_header("x-codex-primary-used-percent", "25.5")
+            .with_body(completed_sse_with_streamed_tool_and_terminal_output(
+                DEFAULT_MODEL,
+                terminal_output,
+            ))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .unwrap_or_else(|error| panic!("{case} fixture failed to construct a provider: {error:#}"));
+        let request = ProviderRequest::new(vec![Message::user("hello")]).with_tools(vec![tool()]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered_error = buffered.err().unwrap_or_else(|| {
+            panic!("{case} terminal semantic drift passed the buffered boundary")
+        });
+        assert!(
+            buffered_error.to_string().contains(expected_diagnostic),
+            "{case} buffered rejection was not actionable: {buffered_error:#}"
+        );
+
+        let mut receiver = streaming.unwrap_or_else(|error| {
+            panic!("{case} stream setup failed before the SSE fixture was consumed: {error:#}")
+        });
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert_eq!(
+            outcome.iter().filter(|chunk| chunk.is_err()).count(),
+            1,
+            "{case} must emit exactly one terminal stream error; outcome={outcome:?}"
+        );
+        assert!(
+            matches!(outcome.last(), Some(Err(error)) if error.contains(expected_diagnostic)),
+            "{case} did not end with its actionable stream error; outcome={outcome:?}"
+        );
+        assert!(
+            outcome.iter().all(|chunk| !matches!(
+                chunk,
+                Ok(StreamChunk::ResponseMetadata { .. }
+                    | StreamChunk::Usage { .. }
+                    | StreamChunk::Allowance { .. }
+                    | StreamChunk::ContentBlockComplete(_))
+            )),
+            "{case} published terminal metadata, usage, allowance, or completed content after \
+             semantic reconciliation failed; outcome={outcome:?}"
+        );
+    }
+
     fn tool() -> ToolDefinition {
         ToolDefinition {
             name: "read".to_string(),
@@ -3512,7 +3682,10 @@ family = "chatgpt_subscription"
         .err()
         .expect("terminal text drift must remain fail closed");
         assert!(
-            error.to_string().contains("did not match"),
+            error.to_string().contains(
+                "terminal output item 0 (message) did not match streamed output item 0 \
+                 (message); terminal_count=1, streamed_count=1"
+            ),
             "terminal semantic drift returned an unhelpful diagnostic: {error:#}"
         );
     }
@@ -4043,6 +4216,142 @@ family = "chatgpt_subscription"
             Some(DEFAULT_MODEL),
             "audited passive fields omitted terminal model metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_terminal_snapshot_omitting_streamed_reasoning() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse_with_terminal_message_only(DEFAULT_MODEL))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("terminal-subset fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!(
+                "a terminal snapshot that omits already-validated streamed reasoning failed at \
+                 the buffered provider boundary: {error:#}"
+            )
+        });
+        assert!(
+            buffered
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == "hello")),
+            "terminal-subset reconciliation lost buffered text; response={buffered:?}"
+        );
+        assert!(
+            buffered
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::OpaqueReasoning { .. })),
+            "terminal-subset reconciliation lost the authoritative streamed reasoning item; \
+             response={buffered:?}"
+        );
+
+        let mut receiver = streaming.unwrap_or_else(|error| {
+            panic!(
+                "a terminal snapshot that omits already-validated streamed reasoning failed \
+                 before the streaming provider boundary: {error:#}"
+            )
+        });
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        assert!(
+            outcome.iter().all(Result::is_ok),
+            "terminal-subset reconciliation emitted a streaming error after valid text; \
+             outcome={outcome:?}"
+        );
+        assert!(
+            outcome
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(StreamChunk::TextDelta(text)) if text == "hello")),
+            "terminal-subset reconciliation lost the streamed text delta; outcome={outcome:?}"
+        );
+        assert!(
+            outcome.iter().any(|chunk| matches!(
+                chunk,
+                Ok(StreamChunk::ContentBlockComplete(
+                    ContentBlock::OpaqueReasoning { .. }
+                ))
+            )),
+            "terminal-subset reconciliation lost the completed streamed reasoning item; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_reject_non_reasoning_terminal_snapshot_drift() {
+        let reasoning = json!({
+            "type":"reasoning",
+            "summary":[],
+            "encrypted_content":"opaque-1"
+        });
+        let message = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"hello"}]
+        });
+        let function_call = json!({
+            "type":"function_call",
+            "call_id":"call-2",
+            "name":"read",
+            "namespace":"functions",
+            "arguments":"{\"path\":\"README.md\"}"
+        });
+
+        assert_terminal_snapshot_rejected_at_provider_boundary(
+            "omitted streamed function call",
+            json!([reasoning.clone(), message.clone()]),
+            "terminal snapshot omitted streamed output item 2 (function_call); \
+             terminal_count=2, streamed_count=3",
+        )
+        .await;
+        assert_terminal_snapshot_rejected_at_provider_boundary(
+            "duplicate message masking a streamed function call",
+            json!([reasoning.clone(), message.clone(), message.clone()]),
+            "terminal output item 2 (message) did not match streamed output item 2 \
+             (function_call); terminal_count=3, streamed_count=3",
+        )
+        .await;
+        assert_terminal_snapshot_rejected_at_provider_boundary(
+            "reordered message and function call",
+            json!([reasoning, function_call, message]),
+            "terminal output item 1 (function_call) did not match streamed output item 1 \
+             (message); terminal_count=3, streamed_count=3",
+        )
+        .await;
     }
 
     #[tokio::test]
