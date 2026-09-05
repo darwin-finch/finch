@@ -507,6 +507,52 @@ model = "gpt-5.6-sol"
     }
 
     #[test]
+    fn test_chatgpt_subscription_reasoning_omission_and_explicit_value_roundtrip() {
+        let omitted = r#"type = "credentialed"
+provider = "chatgpt_subscription"
+model = "gpt-5.6-sol"
+name = "chatgpt"
+
+[credential]
+credential_ref = "work"
+"#;
+        let omitted_entry = toml::from_str::<ProviderEntry>(omitted)
+            .expect("omitted ChatGPT subscription reasoning must deserialize");
+        let ProviderEntry::Credentialed {
+            reasoning_effort, ..
+        } = &omitted_entry
+        else {
+            panic!("omitted ChatGPT subscription profile changed variant")
+        };
+        assert_eq!(
+            *reasoning_effort, None,
+            "omitted reasoning must remain distinguishable from an explicit value"
+        );
+        let omitted_encoded = toml::to_string(&omitted_entry).unwrap();
+        assert!(
+            !omitted_encoded.contains("reasoning_effort"),
+            "round-trip invented an explicit reasoning setting: {omitted_encoded}"
+        );
+
+        let explicit = omitted.replace(
+            "name = \"chatgpt\"",
+            "name = \"chatgpt\"\nreasoning_effort = \"xhigh\"",
+        );
+        let explicit_entry = toml::from_str::<ProviderEntry>(&explicit)
+            .expect("explicit ChatGPT subscription reasoning must deserialize");
+        let explicit_encoded = toml::to_string(&explicit_entry).unwrap();
+        assert!(
+            explicit_encoded.contains("reasoning_effort = \"xhigh\""),
+            "round-trip lost the explicit reasoning setting: {explicit_encoded}"
+        );
+        assert_eq!(
+            toml::from_str::<ProviderEntry>(&explicit_encoded).unwrap(),
+            explicit_entry,
+            "explicit ChatGPT subscription reasoning changed across config round-trip"
+        );
+    }
+
+    #[test]
     fn test_local_serde_roundtrip() {
         let entry = ProviderEntry::Local {
             inference_provider: InferenceProvider::Onnx,

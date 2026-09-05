@@ -47,6 +47,7 @@ const FINCH_CHATGPT_USER_AGENT: &str = concat!(
 );
 const DEFAULT_MODEL: &str = "gpt-5.6-sol";
 const MODEL_ALIAS: &str = "gpt-5.6";
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 const RESPONSES_PATH: &str = "/backend-api/codex/responses";
 const MODELS_PATH: &str = "/backend-api/codex/models";
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
@@ -354,6 +355,7 @@ impl fmt::Debug for ChatGptSubscriptionProvider {
         formatter
             .debug_struct("ChatGptSubscriptionProvider")
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("protocol", &CHATGPT_INFERENCE_PROTOCOL_REVISION)
             .field("credential", &"[REDACTED]")
             .finish()
@@ -371,7 +373,7 @@ impl ChatGptSubscriptionProvider {
             Arc::new(ProductionCredentialSource::new(credential)?),
             CHATGPT_SUBSCRIPTION_BASE_URL,
             model.unwrap_or(DEFAULT_MODEL),
-            reasoning_effort.unwrap_or(ReasoningEffort::High),
+            reasoning_effort.unwrap_or(DEFAULT_REASONING_EFFORT),
             false,
         )
     }
@@ -738,7 +740,10 @@ fn validate_reasoning(effort: ReasoningEffort) -> Result<()> {
             | ReasoningEffort::Xhigh
             | ReasoningEffort::Max
     ) {
-        bail!("ChatGPT GPT-5.6 Sol reasoning effort is unsupported");
+        bail!(
+            "ChatGPT GPT-5.6 Sol does not support reasoning effort '{}' on the pinned Responses-Lite route; allowed efforts: low, medium, high, xhigh, max",
+            effort.as_str()
+        );
     }
     Ok(())
 }
@@ -2368,6 +2373,148 @@ mod tests {
 
     const VALID_PNG_BASE64: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    fn production_credential() -> ProviderCredential {
+        toml::from_str(
+            r#"name = "work"
+kind = "oauth_device"
+provider = "chatgpt_subscription"
+issuer = "openai-chatgpt"
+account = "account-1"
+secret_ref = "oauth-store:work"
+
+[audience]
+family = "chatgpt_subscription"
+"#,
+        )
+        .expect("production credential fixture must deserialize")
+    }
+
+    #[tokio::test]
+    async fn test_production_omitted_reasoning_uses_medium_in_request_and_debug_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(catalog_body())
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "reasoning": {"effort": "medium", "context": "all_turns"}
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(completed_sse(DEFAULT_MODEL))
+            .create_async()
+            .await;
+        let mut provider = ChatGptSubscriptionProvider::production(
+            &production_credential(),
+            Some(DEFAULT_MODEL),
+            None,
+        )
+        .expect("omitted reasoning must construct the production subscription provider");
+        provider.source = Arc::new(StaticSource::new());
+        provider.base = validate_base(&format!("{}/backend-api/codex", server.url()), true)
+            .expect("loopback production-boundary fixture must have a valid base URL");
+        provider.allow_loopback = true;
+        let request = ProviderRequest::new(vec![Message::user("hello")])
+            .with_model(DEFAULT_MODEL)
+            .with_tools(vec![tool()]);
+
+        assert_eq!(
+            provider.requested_reasoning_effort(&request),
+            Some(ReasoningEffort::Medium),
+            "omitted subscription reasoning selected the wrong effective effort"
+        );
+        let debug = format!("{provider:?}");
+        assert!(
+            debug.contains("reasoning_effort: Medium"),
+            "provider debug metadata omitted the effective reasoning effort: {debug}"
+        );
+        assert!(
+            !debug.contains("account-1") && !debug.contains("oauth-store:work"),
+            "provider debug metadata exposed credential identity: {debug}"
+        );
+
+        let response = provider
+            .send_message(&request)
+            .await
+            .expect("production provider failed to dispatch the omitted reasoning default");
+        models.assert_async().await;
+        inference.assert_async().await;
+        assert_eq!(
+            response.text(),
+            "hello",
+            "production-boundary fixture returned the wrong response: {response:?}"
+        );
+    }
+
+    #[test]
+    fn test_production_explicit_reasoning_efforts_reach_the_request_exactly() {
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ] {
+            let provider = ChatGptSubscriptionProvider::production(
+                &production_credential(),
+                Some(DEFAULT_MODEL),
+                Some(effort),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "explicit reasoning effort {} was rejected: {error:#}",
+                    effort.as_str()
+                )
+            });
+            let request =
+                ProviderRequest::new(vec![Message::user("hello")]).with_model(DEFAULT_MODEL);
+            let body = responses_lite_request(&request, provider.reasoning_effort)
+                .expect("validated explicit reasoning must serialize");
+
+            assert_eq!(
+                provider.requested_reasoning_effort(&request),
+                Some(effort),
+                "explicit effort {} changed before dispatch",
+                effort.as_str()
+            );
+            assert_eq!(
+                body["reasoning"]["effort"],
+                effort.as_str(),
+                "explicit effort {} changed at the request boundary: {body}",
+                effort.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_production_unsupported_reasoning_names_value_and_allowed_efforts() {
+        for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
+            let error = ChatGptSubscriptionProvider::production(
+                &production_credential(),
+                Some(DEFAULT_MODEL),
+                Some(effort),
+            )
+            .expect_err("unproven subscription reasoning effort was accepted");
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(effort.as_str())
+                    && diagnostic.contains("low, medium, high, xhigh, max"),
+                "unsupported effort {} returned an unactionable diagnostic: {error:#}",
+                effort.as_str()
+            );
+        }
+    }
 
     struct StaticSource {
         generation: Mutex<String>,
