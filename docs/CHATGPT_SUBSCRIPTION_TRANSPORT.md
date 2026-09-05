@@ -81,7 +81,13 @@ substituted and an unrecognized slug is never accepted.
 
 Every request uses `store: false`, `stream: true`,
 `include: ["reasoning.encrypted_content"]`, and
-`reasoning.context: "all_turns"`. Reasoning effort is explicit. Instructions
+`reasoning.context: "all_turns"`. Reasoning effort is explicit. An omitted
+profile setting emits `medium`, matching the
+[documented GPT-5.6 Sol default](https://developers.openai.com/api/docs/models/gpt-5.6-sol);
+explicit `low`, `medium`, `high`, `xhigh`, and `max` settings are preserved.
+The public API also documents `none`, but Finch does not send it through the
+separately pinned subscription Responses-Lite route without route-specific
+conformance evidence. Instructions
 and tools are Responses-Lite developer items; user/assistant text, validated
 PNG/JPEG inputs, function calls, and function outputs retain their history
 order.
