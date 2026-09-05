@@ -1021,6 +1021,7 @@ fn parse_catalog(body: &[u8]) -> Result<Catalog> {
         root.as_object()
             .context("ChatGPT catalog root was invalid")?,
         &["models"],
+        "model catalog",
     )?;
     let models = root["models"]
         .as_array()
@@ -1288,7 +1289,11 @@ fn parse_event(
         .context("ChatGPT subscription stream event omitted type")?;
     match kind {
         "response.created" | "response.in_progress" => {
-            exact_event_keys(object, &["type", "sequence_number", "response", "headers"])?;
+            exact_event_keys(
+                object,
+                &["type", "sequence_number", "response", "headers"],
+                "response lifecycle event",
+            )?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1309,6 +1314,7 @@ fn parse_event(
                     "metadata",
                     "safety_buffering",
                 ],
+                "response metadata event",
             )?;
             required_sequence(object)?;
             if let Some(response_id) = object.get("response_id") {
@@ -1330,7 +1336,11 @@ fn parse_event(
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
-            exact_event_keys(object, &["type", "sequence_number", "output_index", "item"])?;
+            exact_event_keys(
+                object,
+                &["type", "sequence_number", "output_index", "item"],
+                "response output item event",
+            )?;
             required_sequence(object)?;
             let output_index = required_index(object, "output_index")?;
             let item = object
@@ -1358,6 +1368,7 @@ fn parse_event(
                     "content_index",
                     "part",
                 ],
+                "response content part event",
             )?;
             required_sequence(object)?;
             required_identifier(object, "item_id", 256)?;
@@ -1370,31 +1381,56 @@ fn parse_event(
             Ok(None)
         }
         "response.output_text.delta" => {
-            validate_text_event(object, "delta", true)?;
+            validate_text_event(object, "delta", true, "response output text event")?;
             Ok(None)
         }
         "response.output_text.done" => {
-            validate_text_event(object, "text", true)?;
+            validate_text_event(object, "text", true, "response output text event")?;
             Ok(None)
         }
         "response.function_call_arguments.delta" => {
-            validate_text_event(object, "delta", false)?;
+            validate_text_event(
+                object,
+                "delta",
+                false,
+                "response function call arguments event",
+            )?;
             Ok(None)
         }
         "response.function_call_arguments.done" => {
-            validate_text_event(object, "arguments", false)?;
+            validate_text_event(
+                object,
+                "arguments",
+                false,
+                "response function call arguments event",
+            )?;
             Ok(None)
         }
         "response.reasoning_summary_text.delta" => {
-            validate_reasoning_text_event(object, "delta", "summary_index")?;
+            validate_reasoning_text_event(
+                object,
+                "delta",
+                "summary_index",
+                "response reasoning summary text event",
+            )?;
             Ok(None)
         }
         "response.reasoning_summary_text.done" => {
-            validate_reasoning_text_event(object, "text", "summary_index")?;
+            validate_reasoning_text_event(
+                object,
+                "text",
+                "summary_index",
+                "response reasoning summary text event",
+            )?;
             Ok(None)
         }
         "response.reasoning_text.delta" => {
-            validate_reasoning_text_event(object, "delta", "content_index")?;
+            validate_reasoning_text_event(
+                object,
+                "delta",
+                "content_index",
+                "response reasoning text event",
+            )?;
             Ok(None)
         }
         "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
@@ -1408,6 +1444,7 @@ fn parse_event(
                     "summary_index",
                     "part",
                 ],
+                "response reasoning summary part event",
             )?;
             required_sequence(object)?;
             required_identifier(object, "item_id", 256)?;
@@ -1420,7 +1457,11 @@ fn parse_event(
             Ok(None)
         }
         "response.completed" => {
-            exact_event_keys(object, &["type", "sequence_number", "response"])?;
+            exact_event_keys(
+                object,
+                &["type", "sequence_number", "response"],
+                "response completed event",
+            )?;
             required_sequence(object)?;
             let response = object
                 .get("response")
@@ -1522,12 +1563,13 @@ fn validate_text_event(
     object: &Map<String, Value>,
     field: &str,
     has_content_index: bool,
+    location: &'static str,
 ) -> Result<()> {
     let mut keys = vec!["type", "sequence_number", "item_id", "output_index", field];
     if has_content_index {
         keys.extend(["content_index", "logprobs"]);
     }
-    exact_event_keys(object, &keys)?;
+    exact_event_keys(object, &keys, location)?;
     required_sequence(object)?;
     required_identifier(object, "item_id", 256)?;
     required_index(object, "output_index")?;
@@ -1545,6 +1587,7 @@ fn validate_reasoning_text_event(
     object: &Map<String, Value>,
     field: &str,
     index_field: &str,
+    location: &'static str,
 ) -> Result<()> {
     exact_event_keys(
         object,
@@ -1556,6 +1599,7 @@ fn validate_reasoning_text_event(
             index_field,
             field,
         ],
+        location,
     )?;
     required_sequence(object)?;
     required_identifier(object, "item_id", 256)?;
@@ -1621,6 +1665,7 @@ fn parse_completed(
             "presence_penalty",
             "tool_usage",
         ],
+        "terminal response",
     )?;
     if let Some(tool_usage) = response.get("tool_usage") {
         if serde_json::to_vec(tool_usage)
@@ -1836,6 +1881,7 @@ fn parse_output_item(
                     "phase",
                     "internal_chat_message_metadata_passthrough",
                 ],
+                "message output item",
             )?;
             if object.get("role").and_then(Value::as_str) != Some("assistant") {
                 bail!("ChatGPT response message role was invalid");
@@ -1855,7 +1901,11 @@ fn parse_output_item(
                 let part = part
                     .as_object()
                     .context("ChatGPT response content was invalid")?;
-                exact_keys(part, &["type", "text", "annotations", "logprobs"])?;
+                exact_keys(
+                    part,
+                    &["type", "text", "annotations", "logprobs"],
+                    "output text content",
+                )?;
                 if part.get("type").and_then(Value::as_str) != Some("output_text") {
                     bail!("ChatGPT response contained an unknown message content type");
                 }
@@ -1896,6 +1946,7 @@ fn parse_output_item(
                     "status",
                     "internal_chat_message_metadata_passthrough",
                 ],
+                "reasoning output item",
             )?;
             validate_optional_item_fields(object)?;
             validate_reasoning_projection(object.get("summary"), "reasoning summary")?;
@@ -1921,6 +1972,7 @@ fn parse_output_item(
                     "encrypted_function_args",
                     "internal_chat_message_metadata_passthrough",
                 ],
+                "function call output item",
             )?;
             validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
@@ -2040,7 +2092,7 @@ fn validate_documented_response_metadata(response: &Map<String, Value>) -> Resul
         let conversation = value
             .as_object()
             .context("ChatGPT terminal response conversation was invalid")?;
-        exact_keys(conversation, &["id"])?;
+        exact_keys(conversation, &["id"], "terminal response conversation")?;
         required_identifier(conversation, "id", 256)?;
     }
     if let Some(value) = response
@@ -2050,7 +2102,11 @@ fn validate_documented_response_metadata(response: &Map<String, Value>) -> Resul
         let options = value
             .as_object()
             .context("ChatGPT terminal response prompt cache options were invalid")?;
-        exact_keys(options, &["mode", "ttl", "comparison_response_id"])?;
+        exact_keys(
+            options,
+            &["mode", "ttl", "comparison_response_id"],
+            "terminal response prompt cache options",
+        )?;
         if !matches!(
             options.get("mode").and_then(Value::as_str),
             Some("implicit" | "explicit")
@@ -2164,7 +2220,7 @@ fn validate_reasoning_projection(value: Option<&Value>, label: &str) -> Result<(
         let item = item
             .as_object()
             .with_context(|| format!("ChatGPT {label} was invalid"))?;
-        exact_keys(item, &["type", "text"])?;
+        exact_keys(item, &["type", "text"], "reasoning projection item")?;
         if !matches!(
             item.get("type").and_then(Value::as_str),
             Some("summary_text" | "reasoning_text" | "text")
@@ -2196,8 +2252,22 @@ fn parse_usage(value: Option<&Value>) -> Result<(Option<u32>, Option<u32>)> {
             "output_tokens_details",
             "total_tokens",
             "codex_rollout_budget_units",
+            "extra",
         ],
+        "response usage",
     )?;
+    if let Some(extra) = object.get("extra") {
+        let extra = extra
+            .as_object()
+            .context("ChatGPT response usage extra metadata was invalid")?;
+        if serde_json::to_vec(extra)
+            .context("ChatGPT response usage extra metadata was invalid")?
+            .len()
+            > MAX_TOOL_ARGUMENT_BYTES
+        {
+            bail!("ChatGPT response usage extra metadata exceeded the size limit");
+        }
+    }
     let convert = |name: &str| -> Result<Option<u32>> {
         object
             .get(name)
@@ -2248,16 +2318,20 @@ fn parse_allowance_headers(headers: &reqwest::header::HeaderMap) -> Result<Optio
     )
 }
 
-fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
+fn exact_keys(object: &Map<String, Value>, allowed: &[&str], location: &'static str) -> Result<()> {
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-        bail!("ChatGPT subscription response contained an unknown field");
+        bail!("ChatGPT subscription {location} contained an unknown field");
     }
     Ok(())
 }
 
 /// Validate an audited SSE event envelope while accepting only bounded passive
 /// padding fields that cannot alter Finch's execution semantics.
-fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()> {
+fn exact_event_keys(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    location: &'static str,
+) -> Result<()> {
     if let Some(obfuscation) = object.get("obfuscation") {
         let obfuscation = obfuscation
             .as_str()
@@ -2278,7 +2352,7 @@ fn exact_event_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<()>
     let mut event_fields = Vec::with_capacity(allowed.len() + 2);
     event_fields.extend_from_slice(allowed);
     event_fields.extend(["obfuscation", "safety_buffering"]);
-    exact_keys(object, &event_fields)
+    exact_keys(object, &event_fields, location)
 }
 
 fn required_identifier(object: &Map<String, Value>, name: &str, maximum: usize) -> Result<String> {
@@ -2787,7 +2861,10 @@ family = "chatgpt_subscription"
         )
     }
 
-    fn completed_sse_with_streamed_message_and_empty_terminal_output(model: &str) -> String {
+    fn completed_sse_with_streamed_message_and_terminal_response(
+        model: &str,
+        terminal_response: Value,
+    ) -> String {
         format!(
             concat!(
                 "event: response.created\ndata: {}\n\n",
@@ -2799,8 +2876,76 @@ family = "chatgpt_subscription"
             json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":model}}}),
             json!({"type":"response.output_text.delta","sequence_number":2,"item_id":"message-1","output_index":0,"content_index":0,"delta":"hello"}),
             json!({"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}),
-            json!({"type":"response.completed","sequence_number":4,"response":{"id":"resp-empty-terminal-output","status":"completed","model":model,"output":[],"usage":{"input_tokens":12,"output_tokens":7}}})
+            json!({"type":"response.completed","sequence_number":4,"response":terminal_response})
         )
+    }
+
+    fn completed_sse_with_streamed_message_and_empty_terminal_output(model: &str) -> String {
+        completed_sse_with_streamed_message_and_terminal_response(
+            model,
+            json!({
+                "id":"resp-empty-terminal-output",
+                "status":"completed",
+                "model":model,
+                "output":[],
+                "usage":{"input_tokens":12,"output_tokens":7}
+            }),
+        )
+    }
+
+    async fn run_streamed_message_terminal_response(
+        terminal_response: Value,
+    ) -> (
+        Result<ProviderResponse, String>,
+        Vec<Result<StreamChunk, String>>,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_header("x-codex-primary-used-percent", "25.5")
+            .with_body(completed_sse_with_streamed_message_and_terminal_response(
+                DEFAULT_MODEL,
+                terminal_response,
+            ))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("terminal-response fixture must construct a provider");
+        let request = ProviderRequest::new(vec![Message::user("hello")]);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.map_err(|error| error.to_string());
+        let mut receiver = streaming.expect("stream setup must consume the complete SSE fixture");
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        (buffered, outcome)
     }
 
     fn completed_sse_with_streamed_tool_and_terminal_output(
@@ -3484,12 +3629,13 @@ family = "chatgpt_subscription"
 
     #[test]
     fn test_terminal_unknown_fields_remain_fail_closed() {
+        let sentinel = "sk-proj-SensitiveToken123";
         let terminal = json!({
             "id":"resp-unknown-terminal",
             "status":"completed",
             "model":DEFAULT_MODEL,
             "output":[],
-            "future_authority_field":true
+            sentinel:true
         });
         let error = parse_completed(
             terminal.as_object().unwrap(),
@@ -3500,9 +3646,166 @@ family = "chatgpt_subscription"
         )
         .err()
         .expect("unaudited terminal semantics must remain fail closed");
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT subscription terminal response contained an unknown field",
+            "unknown terminal semantics must report only the static containing object"
+        );
         assert!(
-            error.to_string().contains("unknown field"),
-            "unknown terminal semantics returned an unhelpful diagnostic: {error:#}"
+            !error.to_string().contains(sentinel),
+            "unknown terminal semantics reflected response-body field data"
+        );
+    }
+
+    #[test]
+    fn test_usage_extra_requires_bounded_object_metadata() {
+        for value in [json!(false), json!("opaque")] {
+            let usage = json!({
+                "input_tokens":12,
+                "output_tokens":7,
+                "total_tokens":19,
+                "extra":value
+            });
+            let error = parse_usage(Some(&usage))
+                .err()
+                .expect("non-object usage extra metadata must remain fail closed");
+            assert_eq!(
+                error.to_string(),
+                "ChatGPT response usage extra metadata was invalid",
+                "non-object usage extra metadata returned an unhelpful diagnostic"
+            );
+        }
+
+        let exactly_bounded_extra = json!({"p":"x".repeat(MAX_TOOL_ARGUMENT_BYTES - 8)});
+        assert_eq!(
+            serde_json::to_vec(&exactly_bounded_extra).unwrap().len(),
+            MAX_TOOL_ARGUMENT_BYTES,
+            "inclusive usage-extra boundary fixture drifted"
+        );
+        let exactly_bounded_usage = json!({
+            "input_tokens":12,
+            "output_tokens":7,
+            "total_tokens":19,
+            "extra":exactly_bounded_extra
+        });
+        assert_eq!(
+            parse_usage(Some(&exactly_bounded_usage))
+                .expect("usage extra metadata at the inclusive byte limit must be accepted"),
+            (Some(12), Some(7)),
+            "passive usage extra metadata changed token accounting"
+        );
+
+        let usage = json!({
+            "input_tokens":12,
+            "output_tokens":7,
+            "total_tokens":19,
+            "extra":{"p":"x".repeat(MAX_TOOL_ARGUMENT_BYTES - 7)}
+        });
+        assert_eq!(
+            serde_json::to_vec(&usage["extra"]).unwrap().len(),
+            MAX_TOOL_ARGUMENT_BYTES + 1,
+            "oversized usage-extra boundary fixture drifted"
+        );
+        let error = parse_usage(Some(&usage))
+            .err()
+            .expect("oversized usage extra metadata must remain bounded");
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT response usage extra metadata exceeded the size limit",
+            "oversized usage extra metadata returned an unhelpful diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_accept_bounded_usage_extra_metadata() {
+        let terminal = json!({
+            "id":"resp-usage-extra",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":{
+                "input_tokens":12,
+                "output_tokens":7,
+                "total_tokens":19,
+                "extra":{"label":"example","items":[0,null,true]}
+            }
+        });
+        let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
+        let buffered = buffered.unwrap_or_else(|error| {
+            panic!("bounded official usage extra metadata failed buffered parsing: {error}")
+        });
+        assert!(
+            matches!(buffered.content.as_slice(), [ContentBlock::Text { text }] if text == "hello"),
+            "usage extra metadata changed buffered semantic content; response={buffered:?}"
+        );
+        assert_eq!(
+            buffered
+                .usage
+                .as_ref()
+                .map(|usage| (usage.input_tokens, usage.output_tokens)),
+            Some((12, 7)),
+            "usage extra metadata changed token accounting"
+        );
+        assert_eq!(
+            buffered.model, DEFAULT_MODEL,
+            "usage extra metadata changed buffered model provenance"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [
+                    Ok(StreamChunk::TextDelta(delta)),
+                    Ok(StreamChunk::ResponseMetadata { model }),
+                    Ok(StreamChunk::Usage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                    }),
+                    Ok(StreamChunk::Allowance { .. }),
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })),
+                ] if delta == "hello" && model == DEFAULT_MODEL && text == "hello"
+            ),
+            "usage extra metadata did not preserve exact ordered streaming effects; \
+             outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_unknown_usage_fields_report_only_static_location() {
+        let sentinel = "sk-proj-SensitiveToken123";
+        let mut usage = json!({
+            "input_tokens":12,
+            "output_tokens":7,
+            "total_tokens":19
+        });
+        usage
+            .as_object_mut()
+            .expect("usage fixture must be an object")
+            .insert(sentinel.to_string(), Value::Null);
+        let terminal = json!({
+            "id":"resp-unknown-usage",
+            "status":"completed",
+            "model":DEFAULT_MODEL,
+            "output":[],
+            "usage":usage
+        });
+        let (buffered, outcome) = run_streamed_message_terminal_response(terminal).await;
+        let expected = "ChatGPT subscription response usage contained an unknown field";
+        let buffered_error = buffered
+            .err()
+            .expect("unknown usage semantics passed the buffered provider boundary");
+        assert_eq!(buffered_error, expected);
+        assert!(
+            !buffered_error.contains(sentinel),
+            "buffered error reflected response-body field data"
+        );
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [Ok(StreamChunk::TextDelta(delta)), Err(error)]
+                    if delta == "hello" && error == expected && !error.contains(sentinel)
+            ),
+            "unknown usage semantics must end with exactly one static-location error and no \
+             terminal metadata, usage, allowance, or completed content; outcome={outcome:?}"
         );
     }
 
@@ -3663,12 +3966,38 @@ family = "chatgpt_subscription"
     #[test]
     fn test_event_obfuscation_must_be_string_padding() {
         let event = json!({"type":"response.created","obfuscation":{"future":true}});
-        let error = exact_event_keys(event.as_object().unwrap(), &["type"])
-            .err()
-            .expect("structured obfuscation must not bypass event validation");
+        let error = exact_event_keys(
+            event.as_object().unwrap(),
+            &["type"],
+            "response created event",
+        )
+        .err()
+        .expect("structured obfuscation must not bypass event validation");
         assert!(
             error.to_string().contains("padding was invalid"),
             "structured obfuscation returned an unhelpful diagnostic: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_event_fields_report_only_static_location() {
+        let sentinel = "sk-proj-SensitiveToken123";
+        let event = json!({"type":"response.created",sentinel:null});
+        let error = exact_event_keys(
+            event.as_object().expect("event fixture must be an object"),
+            &["type"],
+            "response created event",
+        )
+        .err()
+        .expect("unknown event semantics must remain fail closed");
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT subscription response created event contained an unknown field",
+            "unknown event semantics must report only the static event location"
+        );
+        assert!(
+            !error.to_string().contains(sentinel),
+            "unknown event semantics reflected response-body field data"
         );
     }
 

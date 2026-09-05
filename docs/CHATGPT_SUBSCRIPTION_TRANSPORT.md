@@ -130,6 +130,10 @@ differ from that route but must remain unchanged throughout the response.
 Unknown fields/events, malformed tool arguments, missing completion, duplicate
 terminal markers, post-terminal data, partial EOF, idle timeout, receiver drop,
 and payload-limit violations fail visibly before terminal chunks are published.
+Unknown-field errors identify only Finch's static containing-object or event
+label; response-derived field names and values are never reflected. The current
+Codex `response.usage.extra` object is accepted only as bounded passive metadata;
+it cannot alter Finch's validated input/output token accounting.
 
 Non-success bodies are consumed only to a small bound and discarded. A
 Responses-Lite rejection retains a typed HTTP status and a compatibility or
