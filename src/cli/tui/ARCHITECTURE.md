@@ -18,8 +18,10 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
   same toggle behavior when terminal mouse reporting is available.
-- Disclosure labels include `expanded`/`collapsed`; neither color nor triangle
-  shape is the sole carrier of state.
+- Unicode-capable terminals use compact disclosure triangles without redundant
+  `expanded`/`collapsed` words. `TERM=dumb`, non-UTF-8 locales, and narrow pinned
+  controls retain explicit plain-text `open`/`closed` state, so color or glyph
+  shape is never the only fallback carrier.
 - Hit regions are rebuilt from Unicode physical-row geometry after every frame
   and resize. Never persist terminal coordinates as row identity.
 

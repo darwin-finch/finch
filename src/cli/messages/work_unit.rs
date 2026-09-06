@@ -733,9 +733,18 @@ impl Message for WorkUnit {
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
                 lines(&inner.response_text),
-                inner.status == MessageStatus::InProgress
-                    || inner.response_text.lines().count() <= 3,
+                inner.status != MessageStatus::Complete,
             ),
+            WorkUnitPresentation::ProgramOutput { title: None }
+                if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+            {
+                (
+                    TranscriptRowKind::Response,
+                    "Assistant response".to_string(),
+                    program_output_lines(&inner),
+                    true,
+                )
+            }
             WorkUnitPresentation::ProgramOutput { title } => (
                 TranscriptRowKind::Output,
                 title
@@ -763,6 +772,11 @@ impl Message for WorkUnit {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let band = match &inner.presentation {
             WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+            WorkUnitPresentation::ProgramOutput { title: None }
+                if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+            {
+                MessageBand::Assistant
+            }
             WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
             WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
                 MessageBand::Assistant
@@ -781,6 +795,11 @@ impl Message for WorkUnit {
         if inner.rows.is_empty() {
             let band = match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { title: None }
+                    if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+                {
+                    MessageBand::Assistant
+                }
                 WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
                 WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
                     MessageBand::Assistant
@@ -816,6 +835,11 @@ impl Message for WorkUnit {
         } else {
             match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { title: None }
+                    if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+                {
+                    MessageBand::Assistant
+                }
                 WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
                 WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
                     MessageBand::Assistant
@@ -838,6 +862,18 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
             &inner.presentation,
             WorkUnitPresentation::ProgramOutput { title: Some(_) }
         )
+}
+
+/// Provider wire failures historically share the untitled output presentation
+/// with successful `say` effects. Keep their diagnostic chrome inspectable
+/// instead of projecting an error as assistant prose.
+fn program_output_is_failure(inner: &WorkUnitInner) -> bool {
+    inner.status == MessageStatus::Failed
+        || inner
+            .response_text
+            .trim_start()
+            .starts_with("VM wire error:")
+        || inner.response_text.trim_start().starts_with("VM error:")
 }
 
 fn lines(text: &str) -> Vec<String> {

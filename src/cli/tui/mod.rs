@@ -1235,7 +1235,7 @@ impl TuiRenderer {
             viewport_invalidated: false,
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
-            accordion: AccordionState::default(),
+            accordion: AccordionState::for_terminal(),
 
             active_dialog: None,
             active_tabbed_dialog: None,
@@ -4066,7 +4066,8 @@ mod tests {
         let projected = state.render_message(&message, &colors);
 
         assert_eq!(projected.len(), 1);
-        assert!(projected[0].text.contains("[collapsed]"));
+        assert!(projected[0].text.contains('▶'));
+        assert!(!projected[0].text.contains("collapsed"));
         assert!(!projected[0].text.contains("line four"));
         assert!(work.complete_transcript(&colors).contains("line four"));
 
@@ -4083,14 +4084,172 @@ mod tests {
         let mut bytes = Vec::new();
         begin_full_viewport_paint(&mut bytes, plan, &text).expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
-        assert!(raw.contains("[collapsed]"));
+        assert!(raw.contains('▶'));
+        assert!(!raw.contains("collapsed"));
         assert!(!raw.contains("line four"));
         assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
     }
 
     #[test]
-    fn oversized_expanded_projection_pins_a_keyboard_and_mouse_target() {
+    fn production_viewport_transitions_assistant_prose_from_hollow_to_filled() {
         let work = Arc::new(WorkUnit::new("response"));
+        let message: MessageRef = work.clone();
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let waiting = state.render_message(&message, &colors);
+        assert_eq!(
+            waiting[0].text.trim(),
+            "◌",
+            "pending assistant row must be the compact hollow activity glyph: {waiting:?}"
+        );
+
+        work.set_response("Hello, Shammah!");
+        let streaming = state.render_message(&message, &colors);
+        assert_eq!(
+            streaming[0].text.trim(),
+            "◌ Hello, Shammah!",
+            "streaming assistant prose must stay inline behind the hollow glyph: {streaming:?}"
+        );
+        work.set_complete();
+        let completed = state.render_message(&message, &colors);
+        assert_eq!(
+            completed[0].text.trim(),
+            "● Hello, Shammah!",
+            "completed assistant prose must switch to the filled glyph: {completed:?}"
+        );
+
+        let text = completed
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        begin_full_viewport_paint(&mut bytes, viewport_redraw_plan(8, 2, 1), &text)
+            .expect("production viewport paint for completed assistant prose");
+        let raw = String::from_utf8(bytes).expect("TUI paint is UTF-8");
+        assert!(
+            raw.contains("● Hello, Shammah!"),
+            "painted production viewport must contain conversational assistant prose: {raw:?}"
+        );
+        assert!(
+            !raw.contains("Assistant response"),
+            "Unicode production viewport must omit the noisy placeholder: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn production_commit_collapses_source_and_writes_successful_say_as_prose_once() {
+        let source = Arc::new(WorkUnit::new("source"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"Hello from Finch\")");
+        source.set_complete();
+        let output = Arc::new(WorkUnit::new("output"));
+        output.set_program_output();
+        output.set_response("Hello from Finch");
+        output.set_complete();
+        let colors = ColorScheme::default();
+        assert_eq!(
+            output.background_style(&colors),
+            Some(colors.message_band_style(crate::config::MessageBand::Assistant)),
+            "successful say output must use the assistant semantic band"
+        );
+        let source_message: MessageRef = source;
+        let output_message: MessageRef = output;
+        let mut state = AccordionState::default();
+
+        let projected_source = state.render_message(&source_message, &colors);
+        assert_eq!(
+            projected_source.len(),
+            1,
+            "even one-line completed provider source must default collapsed: {projected_source:?}"
+        );
+        assert!(
+            projected_source[0].text.contains("▶ Program source (lisp)"),
+            "collapsed source must remain inspectable by semantic label: {projected_source:?}"
+        );
+        let projected_output = state.render_message(&output_message, &colors);
+        assert_eq!(
+            projected_output[0].text.trim(),
+            "● Hello from Finch",
+            "successful say output must project as assistant prose: {projected_output:?}"
+        );
+        assert!(
+            !projected_output[0].text.contains("Program output"),
+            "successful say output must not expose the VM implementation label: {projected_output:?}"
+        );
+
+        let messages = vec![source_message, output_message];
+        let mut printed = HashSet::new();
+        let mut bytes = Vec::new();
+        commit_complete_messages(&mut bytes, &messages, &mut state, &colors, &mut printed, 6)
+            .expect("commit successful program turn to native scrollback");
+        commit_complete_messages(&mut bytes, &messages, &mut state, &colors, &mut printed, 6)
+            .expect("already committed turn must be skipped exactly once");
+        let raw = String::from_utf8(bytes).expect("canonical transcript is UTF-8");
+        assert_eq!(
+            raw.matches("(say \"Hello from Finch\")").count(),
+            1,
+            "generated source must enter native scrollback exactly once: {raw:?}"
+        );
+        assert_eq!(
+            raw.matches("● Hello from Finch").count(),
+            1,
+            "assistant prose must enter native scrollback exactly once: {raw:?}"
+        );
+        assert_eq!(
+            printed.len(),
+            2,
+            "both semantic messages must be marked committed once: {printed:?}"
+        );
+    }
+
+    #[test]
+    fn production_failed_program_keeps_source_and_error_expanded() {
+        let source = Arc::new(WorkUnit::new("source"));
+        source.set_program_source("forth");
+        source.set_response("3 4 + say");
+        source.set_failed();
+        let error = Arc::new(WorkUnit::new("output"));
+        error.set_program_output();
+        error.set_response("VM wire error: say expected a string, found int");
+        error.set_complete();
+        let source_message: MessageRef = source;
+        let error_message: MessageRef = error;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let failed_source = state.render_message(&source_message, &colors);
+        assert!(
+            failed_source[0].text.contains("▼ Program source (forth)"),
+            "failed source must remain expanded and inspectable: {failed_source:?}"
+        );
+        assert!(
+            failed_source
+                .iter()
+                .any(|line| line.text.contains("3 4 + say")),
+            "failed projection must retain the source that failed: {failed_source:?}"
+        );
+        let failed_output = state.render_message(&error_message, &colors);
+        assert!(
+            failed_output[0].text.contains("▼ Program output"),
+            "program errors must retain explicit expanded diagnostic chrome: {failed_output:?}"
+        );
+        assert!(
+            failed_output
+                .iter()
+                .any(|line| line.text.contains("expected a string, found int")),
+            "failed program detail must remain actionable: {failed_output:?}"
+        );
+        assert!(
+            failed_output.iter().all(|line| !line.text.contains('●')),
+            "a VM failure must never masquerade as completed assistant prose: {failed_output:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_expanded_projection_pins_a_keyboard_and_mouse_target() {
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth");
         work.set_response(
             (0..40)
                 .map(|n| format!("row {n}"))
@@ -4100,7 +4259,11 @@ mod tests {
         work.set_complete();
         let message: MessageRef = work;
         let colors = ColorScheme::default();
-        let state = AccordionState::default();
+        let mut state = AccordionState::default();
+        let collapsed = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&collapsed, 0, 20);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
         let all = state.render_message(&message, &colors);
 
         let visible = viewport_tail_rendered_lines(&all, 20, 4);
@@ -4109,7 +4272,8 @@ mod tests {
             visible[0].row_id.is_some(),
             "disclosure control must stay visible"
         );
-        assert!(visible[0].text.contains("[expanded]"));
+        assert!(visible[0].text.contains('▼'));
+        assert!(!visible[0].text.contains("expanded"));
         assert!(visible.iter().any(|line| line.text.contains("row 39")));
         assert!(
             visible
@@ -4157,7 +4321,8 @@ mod tests {
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
         let before = state.render_message(&message, &colors);
-        assert!(before[0].text.contains("[collapsed]"));
+        assert!(before[0].text.contains('▶'));
+        assert!(!before[0].text.contains("collapsed"));
         let mut printed = HashSet::new();
         let mut failure = FlushFailure(Vec::new());
         assert!(commit_complete_messages(

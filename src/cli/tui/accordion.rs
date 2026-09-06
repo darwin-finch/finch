@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use crate::cli::messages::{MessageRef, TranscriptRow, TranscriptRowId};
+use crate::cli::messages::{
+    MessageRef, MessageStatus, TranscriptRow, TranscriptRowId, TranscriptRowKind,
+};
 use crate::config::ColorScheme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,16 +25,62 @@ pub struct TranscriptHitRegion {
     pub right: u16,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisclosureStyle {
+    Unicode,
+    Text,
+}
+
+#[derive(Debug)]
 pub struct AccordionState {
     expanded: HashMap<TranscriptRowId, bool>,
     pub focused: Option<TranscriptRowId>,
     pub hit_regions: Vec<TranscriptHitRegion>,
     visible_order: Vec<TranscriptRowId>,
     visible_expanded: HashMap<TranscriptRowId, bool>,
+    disclosure_style: DisclosureStyle,
+}
+
+impl Default for AccordionState {
+    fn default() -> Self {
+        Self::with_disclosure_style(DisclosureStyle::Unicode)
+    }
 }
 
 impl AccordionState {
+    fn with_disclosure_style(disclosure_style: DisclosureStyle) -> Self {
+        Self {
+            expanded: HashMap::new(),
+            focused: None,
+            hit_regions: Vec::new(),
+            visible_order: Vec::new(),
+            visible_expanded: HashMap::new(),
+            disclosure_style,
+        }
+    }
+
+    /// Select textual disclosure states when the terminal cannot reliably
+    /// present Unicode glyphs. The normal TUI remains compact while `TERM=dumb`
+    /// and non-UTF-8 locales stay meaningful to plain-text consumers.
+    pub fn for_terminal() -> Self {
+        let term = std::env::var("TERM").ok();
+        let locale = std::env::var("LC_ALL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("LC_CTYPE")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| std::env::var("LANG").ok().filter(|value| !value.is_empty()));
+        let style = if terminal_supports_unicode(term.as_deref(), locale.as_deref()) {
+            DisclosureStyle::Unicode
+        } else {
+            DisclosureStyle::Text
+        };
+        Self::with_disclosure_style(style)
+    }
+
     pub fn is_expanded(&self, row: &TranscriptRow) -> bool {
         self.expanded
             .get(&row.id)
@@ -57,7 +105,7 @@ impl AccordionState {
                 .collect();
         };
         let mut lines = Vec::new();
-        self.render_row(&root, 0, false, &mut lines);
+        self.render_row(&root, 0, false, message.status(), &mut lines);
         lines
     }
 
@@ -70,7 +118,7 @@ impl AccordionState {
             return self.render_message(message, colors);
         };
         let mut lines = Vec::new();
-        self.render_row(&root, 0, true, &mut lines);
+        self.render_row(&root, 0, true, message.status(), &mut lines);
         lines
     }
 
@@ -79,23 +127,22 @@ impl AccordionState {
         row: &TranscriptRow,
         depth: usize,
         force_expanded: bool,
+        message_status: MessageStatus,
         lines: &mut Vec<RenderedTranscriptLine>,
     ) {
+        if row.kind == TranscriptRowKind::Response {
+            self.render_response(row, depth, message_status, lines);
+            return;
+        }
         let expandable = !row.body.is_empty() || !row.children.is_empty();
         let expanded = expandable && (force_expanded || self.is_expanded(row));
-        let marker = match (expandable, expanded) {
-            (true, true) => "▼",
-            (true, false) => "▶",
-            (false, _) => "•",
-        };
-        let state = if expandable {
-            if expanded {
-                " [expanded]"
-            } else {
-                " [collapsed]"
-            }
-        } else {
-            ""
+        let (marker, state) = match (self.disclosure_style, expandable, expanded) {
+            (DisclosureStyle::Unicode, true, true) => ("▼", ""),
+            (DisclosureStyle::Unicode, true, false) => ("▶", ""),
+            (DisclosureStyle::Unicode, false, _) => ("•", ""),
+            (DisclosureStyle::Text, true, true) => ("[-]", " [open]"),
+            (DisclosureStyle::Text, true, false) => ("[+]", " [closed]"),
+            (DisclosureStyle::Text, false, _) => ("*", ""),
         };
         let focus = if self.focused.as_ref() == Some(&row.id) {
             "> "
@@ -124,7 +171,50 @@ impl AccordionState {
             });
         }
         for child in &row.children {
-            self.render_row(child, depth + 1, force_expanded, lines);
+            self.render_row(child, depth + 1, force_expanded, message_status, lines);
+        }
+    }
+
+    fn render_response(
+        &self,
+        row: &TranscriptRow,
+        depth: usize,
+        status: MessageStatus,
+        lines: &mut Vec<RenderedTranscriptLine>,
+    ) {
+        let marker = match (self.disclosure_style, status) {
+            (DisclosureStyle::Unicode, MessageStatus::InProgress) => "◌".to_string(),
+            (DisclosureStyle::Unicode, MessageStatus::Complete) => "●".to_string(),
+            (DisclosureStyle::Unicode, MessageStatus::Failed) => {
+                "✕ Assistant response failed".to_string()
+            }
+            (DisclosureStyle::Text, MessageStatus::InProgress) => {
+                "[pending] Assistant response".to_string()
+            }
+            (DisclosureStyle::Text, MessageStatus::Complete) => {
+                "[complete] Assistant response".to_string()
+            }
+            (DisclosureStyle::Text, MessageStatus::Failed) => {
+                "[failed] Assistant response".to_string()
+            }
+        };
+        let indent = "  ".repeat(depth);
+        let mut body = row.body.iter();
+        let first = body.next();
+        lines.push(RenderedTranscriptLine {
+            text: match first {
+                Some(first) => format!("  {indent}{marker} {first}"),
+                None => format!("  {indent}{marker}"),
+            },
+            row_id: None,
+            row_expanded: None,
+        });
+        for line in body {
+            lines.push(RenderedTranscriptLine {
+                text: format!("    {indent}{line}"),
+                row_id: None,
+                row_expanded: None,
+            });
         }
     }
 
@@ -232,6 +322,17 @@ impl AccordionState {
         self.visible_expanded.insert(row_id, !current);
         true
     }
+}
+
+fn terminal_supports_unicode(term: Option<&str>, locale: Option<&str>) -> bool {
+    if term == Some("dumb") {
+        return false;
+    }
+    let Some(locale) = locale else {
+        return true;
+    };
+    let locale = locale.to_ascii_lowercase();
+    locale.contains("utf-8") || locale.contains("utf8")
 }
 
 #[cfg(test)]
@@ -372,9 +473,9 @@ mod tests {
 
     #[test]
     fn test_mouse_disclosure_uses_reflowed_region_without_leaking_keyboard_focus() {
-        let work = Arc::new(WorkUnit::new("response"));
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth");
         work.set_response("one\ntwo");
-        work.set_complete();
         let message: MessageRef = work;
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
@@ -408,10 +509,10 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_defaults_collapse_long_completed_source_but_not_output() {
+    fn test_completed_source_collapses_and_successful_say_is_inline_prose() {
         let source = Arc::new(WorkUnit::new("program"));
         source.set_program_source("forth");
-        source.set_response("a\nb\nc\nd");
+        source.set_response("s\"visible output\" say");
         source.set_complete();
         let output = Arc::new(WorkUnit::new("output"));
         output.set_program_output();
@@ -423,14 +524,16 @@ mod tests {
         let output_message: MessageRef = output;
 
         let collapsed = state.render_message(&source_message, &colors);
-        assert!(collapsed[0].text.contains("[collapsed]"));
+        assert!(collapsed[0].text.contains('▶'));
+        assert!(!collapsed[0].text.contains("collapsed"));
         assert_eq!(collapsed.len(), 1);
-        assert!(source.complete_transcript(&colors).contains("a\nb\nc\nd"));
+        assert!(source
+            .complete_transcript(&colors)
+            .contains("s\"visible output\" say"));
         let visible = state.render_message(&output_message, &colors);
-        assert!(visible[0].text.contains("[expanded]"));
-        assert!(visible
-            .iter()
-            .any(|line| line.text.contains("visible output")));
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].text.contains("● visible output"));
+        assert!(!visible[0].text.contains("Program output"));
     }
 
     #[test]
@@ -454,9 +557,46 @@ mod tests {
         replayed.set_complete();
         let replayed_message: MessageRef = replayed;
         let rendered = state.render_message(&replayed_message, &colors);
-        assert!(rendered[0].text.contains("[expanded]"));
+        assert!(rendered[0].text.contains('▼'));
+        assert!(!rendered[0].text.contains("expanded"));
         assert!(rendered
             .iter()
             .any(|line| line.text.contains("after reconnect")));
+    }
+
+    #[test]
+    fn test_text_fallback_names_response_and_disclosure_states() {
+        assert!(terminal_supports_unicode(
+            Some("xterm-256color"),
+            Some("en_US.UTF-8")
+        ));
+        assert!(!terminal_supports_unicode(
+            Some("dumb"),
+            Some("en_US.UTF-8")
+        ));
+        assert!(!terminal_supports_unicode(Some("xterm"), Some("C")));
+
+        let response = Arc::new(WorkUnit::new("response"));
+        response.set_response("hello");
+        let response_message: MessageRef = response;
+        let source = Arc::new(WorkUnit::new("source"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"hello\")");
+        source.set_complete();
+        let source_message: MessageRef = source;
+        let state = AccordionState::with_disclosure_style(DisclosureStyle::Text);
+        let colors = ColorScheme::default();
+
+        let pending = state.render_message(&response_message, &colors);
+        assert_eq!(
+            pending[0].text.trim(),
+            "[pending] Assistant response hello",
+            "plain-text pending projection must name role and state: {pending:?}"
+        );
+        let collapsed = state.render_message(&source_message, &colors);
+        assert!(
+            collapsed[0].text.contains("[closed]"),
+            "plain-text disclosure fallback must name closed state: {collapsed:?}"
+        );
     }
 }
