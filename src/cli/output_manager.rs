@@ -130,7 +130,9 @@ impl VmOutputProjection {
     fn project_for_execution(&self, execution_id: Option<uuid::Uuid>, effect: &VmSideEffect) {
         match &effect.event {
             HostSideEffect::Emit { text } => {
-                self.default_response.set_assistant_output();
+                if !text.is_empty() {
+                    self.default_response.set_assistant_output();
+                }
                 self.default_response.append_response(text);
             }
             HostSideEffect::Request { .. } => {}

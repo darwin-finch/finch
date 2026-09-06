@@ -8837,88 +8837,135 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    async fn project_direct_interactive_program(
+    struct UnusedInteractiveGenerator;
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for UnusedInteractiveGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            anyhow::bail!("interactive VM boundary must not invoke a provider")
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            anyhow::bail!("interactive VM boundary must not invoke a provider stream")
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: false,
+                    max_context_messages: Some(1),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "unused-interactive-generator"
+        }
+    }
+
+    fn interactive_event_loop() -> super::EventLoop {
+        let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+        let generator: std::sync::Arc<dyn crate::generators::Generator> =
+            std::sync::Arc::new(UnusedInteractiveGenerator);
+        let executor = crate::tools::executor::ToolExecutor::new(
+            crate::tools::registry::ToolRegistry::new(),
+            crate::tools::permissions::PermissionManager::new(),
+            std::env::temp_dir().join(format!("finch-350-{}.json", uuid::Uuid::new_v4())),
+        )
+        .expect("an empty test tool executor must initialize");
+        super::EventLoop::new_named_brain_test_runner(
+            generator,
+            Vec::new(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(executor)),
+            runtime,
+        )
+    }
+
+    async fn drive_direct_interactive_program(
         source: &str,
     ) -> (
-        crate::runtime::outcome::ExecutionOutcome,
-        std::sync::Arc<crate::cli::messages::WorkUnit>,
+        std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
+        crate::cli::messages::MessageRef,
+        usize,
     ) {
-        let runtime = crate::runtime::ProgramRuntime::new();
-        let output = std::sync::Arc::new(crate::cli::output_manager::OutputManager::default());
-        output.disable_stdout();
-        let (output_unit, projection) = super::start_interactive_program_output(&output);
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let effect_tx = event_tx.clone();
-        let sink: crate::runtime::TypedEffectSink = std::sync::Arc::new(move |envelope| {
-            effect_tx
-                .send(crate::cli::repl_event::events::ReplEvent::VmEffect {
-                    projection: projection.clone(),
-                    envelope,
-                })
-                .expect("the direct interactive event receiver must remain live");
-        });
-        let submission = crate::runtime::ProgramSubmission {
-            language: crate::programs::ProgramLanguage::Lisp,
-            source_id: Some("interactive.lisp".into()),
-            source: source.into(),
-            intent: "interactive typed source".into(),
-            effect: crate::programs::ExecutionEffect::Unclassified,
-            declared_capabilities: Vec::new(),
-            manifest_generation: runtime.manifest_generation(),
-            expected_revision: Some(runtime.revision()),
-            budget: None,
-        };
-        let outcome = runtime
-            .submit_with_deferred_program_effects(submission, sink)
+        let source = source.to_string();
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let mut event_loop = interactive_event_loop();
+                event_loop
+                    .execute_interactive_typed_program(
+                        crate::programs::ProgramLanguage::Lisp,
+                        source.clone(),
+                    )
+                    .await
+                    .expect("headless interactive execution must start");
+                let mut effects = 0;
+                let result = loop {
+                    let event = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        event_loop.event_rx.recv(),
+                    )
+                    .await
+                    .expect("direct interactive execution must produce its terminal event")
+                    .expect("direct interactive event channel must remain live");
+                    if matches!(
+                        event,
+                        crate::cli::repl_event::events::ReplEvent::VmEffect { .. }
+                    ) {
+                        effects += 1;
+                    }
+                    let terminal_result = match &event {
+                        crate::cli::repl_event::events::ReplEvent::TypedProgramComplete {
+                            result,
+                            ..
+                        } => Some(result.clone()),
+                        _ => None,
+                    };
+                    event_loop
+                        .handle_event(event)
+                        .await
+                        .expect("the real event-loop handler must accept a direct program event");
+                    if let Some(result) = terminal_result {
+                        break result;
+                    }
+                };
+                let messages = event_loop.output_manager.get_messages();
+                let output = messages
+                    .last()
+                    .cloned()
+                    .expect("interactive execution must retain its output WorkUnit");
+                (result, output, effects)
+            })
             .await
-            .expect("the direct interactive runtime boundary must return an outcome");
-        event_tx
-            .send(
-                crate::cli::repl_event::events::ReplEvent::TypedProgramComplete {
-                    output_unit: std::sync::Arc::clone(&output_unit),
-                    result: Ok(outcome.clone()),
-                },
-            )
-            .expect("the direct interactive completion receiver must remain live");
-
-        while let Ok(event) = event_rx.try_recv() {
-            match event {
-                crate::cli::repl_event::events::ReplEvent::VmEffect {
-                    projection,
-                    envelope,
-                } => {
-                    let projected = projection.project_envelope(envelope);
-                    assert_eq!(
-                        projected.len(),
-                        1,
-                        "each direct interactive effect must project exactly once: source={source:?} outcome={outcome:?}"
-                    );
-                }
-                crate::cli::repl_event::events::ReplEvent::TypedProgramComplete {
-                    output_unit,
-                    result,
-                } => super::complete_typed_program_output(&output_unit, result),
-                other => panic!(
-                    "direct interactive projection emitted an unexpected event: source={source:?} event={other:?}"
-                ),
-            }
-        }
-        (outcome, output_unit)
     }
 
     #[tokio::test]
     async fn direct_interactive_event_loop_projects_successful_say_as_response() {
-        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+        use crate::cli::messages::{MessageStatus, TranscriptRowKind};
 
-        let (outcome, output_unit) = project_direct_interactive_program("(say \"hello\")").await;
+        let (outcome, output_unit, effects) =
+            drive_direct_interactive_program("(say \"hello\")").await;
         let row = output_unit
             .transcript_row(&crate::config::ColorScheme::default())
             .expect("successful direct interactive say must produce a transcript row");
         assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed,
+            outcome.as_ref().map(|outcome| outcome.status),
+            Ok(crate::runtime::outcome::ExecutionStatus::Completed),
             "successful direct interactive say must complete: outcome={outcome:?} row={row:?}"
         );
+        assert_eq!(effects, 1, "successful say must traverse exactly one real VmEffect branch: outcome={outcome:?} row={row:?}");
         assert_eq!(
             output_unit.status(),
             MessageStatus::Complete,
@@ -8933,18 +8980,19 @@ mod tests {
 
     #[tokio::test]
     async fn direct_interactive_event_loop_keeps_emit_prefix_before_failure() {
-        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+        use crate::cli::messages::{MessageStatus, TranscriptRowKind};
 
-        let (outcome, output_unit) =
-            project_direct_interactive_program("(begin (say \"visible first\\n\") (/ 1 0))").await;
+        let (outcome, output_unit, effects) =
+            drive_direct_interactive_program("(begin (say \"visible first\\n\") (/ 1 0))").await;
         let row = output_unit
             .transcript_row(&crate::config::ColorScheme::default())
             .expect("failed direct interactive output must produce a transcript row");
         assert_eq!(
-            outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Failed,
+            outcome.as_ref().map(|outcome| outcome.status),
+            Ok(crate::runtime::outcome::ExecutionStatus::Failed),
             "division by zero must exercise the non-Completed event-loop call site: outcome={outcome:?} row={row:?}"
         );
+        assert_eq!(effects, 1, "emit-then-failure must traverse exactly one real VmEffect branch: outcome={outcome:?} row={row:?}");
         assert_eq!(
             output_unit.status(),
             MessageStatus::Complete,
@@ -8955,6 +9003,7 @@ mod tests {
             TranscriptRowKind::Output,
             "an emit followed by direct VM failure must remain ordinary Program output: outcome={outcome:?} row={row:?}"
         );
+        assert_eq!(row.body.len(), 2, "direct Ok(non-Completed) output must contain exactly one Emit and one diagnostic: outcome={outcome:?} row={row:?}");
         assert!(
             row.body.first().is_some_and(|line| line == "visible first"),
             "the emitted prefix must precede the direct diagnostic: outcome={outcome:?} row={row:?}"
@@ -8966,6 +9015,104 @@ mod tests {
                 .any(|line| line.contains("VM error:") && line.contains("division by zero")),
             "the direct failure must retain its actionable diagnostic after the emitted prefix: outcome={outcome:?} row={row:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_interactive_event_loop_keeps_emit_before_err_completion() {
+        use crate::cli::messages::{MessageStatus, TranscriptRowKind};
+
+        let (result, output, effects) = drive_direct_interactive_program(
+            "(begin (say \"visible before conversion\\n\") (lambda ((value : int)) value))",
+        )
+        .await;
+        let row = output
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("Err(String) direct output must retain a transcript row");
+        assert!(result.is_err(), "a nonportable closure must exercise TypedProgramComplete Err(String): result={result:?} row={row:?}");
+        assert_eq!(effects, 1, "the prefix before conversion failure must traverse one real VmEffect branch: result={result:?} row={row:?}");
+        assert_eq!(
+            output.status(),
+            MessageStatus::Complete,
+            "Err(String) completion must terminalize the WorkUnit: result={result:?} row={row:?}"
+        );
+        assert_eq!(row.kind, TranscriptRowKind::Output, "an emit followed by Err(String) must be ordinary Program output: result={result:?} row={row:?}");
+        assert_eq!(row.body.len(), 2, "direct Err(String) output must contain exactly one Emit and one diagnostic: result={result:?} row={row:?}");
+        assert!(
+            row.body
+                .first()
+                .is_some_and(|line| line == "visible before conversion"),
+            "the emitted prefix must remain first: result={result:?} row={row:?}"
+        );
+        assert!(row.body.iter().skip(1).any(|line| line.contains("VM error:")), "the Err(String) diagnostic must follow the emitted prefix: result={result:?} row={row:?}");
+    }
+
+    #[tokio::test]
+    async fn event_loop_program_invoke_lifecycle_demotes_prior_say_to_program_output() {
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut event_loop = interactive_event_loop();
+                let (output_unit, projection) =
+                    super::start_interactive_program_output(&event_loop.output_manager);
+                let execution_id = uuid::Uuid::new_v4();
+                let envelope = |sequence, capability, event| crate::runtime::VmEffectEnvelope {
+                    execution_id,
+                    effect: crate::vm::VmSideEffect {
+                        protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                        sequence,
+                        requirement: crate::vm::CapabilityRequirement {
+                            capability,
+                            selector: crate::vm::ResourceSelector::None,
+                        },
+                        event,
+                        output: Vec::new(),
+                        origin: crate::vm::SourceOrigin::generated("issue-350-lifecycle"),
+                    },
+                };
+                event_loop
+                    .handle_event(crate::cli::repl_event::events::ReplEvent::VmEffect {
+                        projection: projection.clone(),
+                        envelope: envelope(
+                            0,
+                            crate::vm::CapabilityKind::SessionEmit,
+                            crate::vm::HostSideEffect::Emit {
+                                text: "assistant prefix\n".into(),
+                            },
+                        ),
+                    })
+                    .await
+                    .expect("the actual VmEffect handler must project Emit");
+                let after_emit = output_unit
+                    .transcript_row(&crate::config::ColorScheme::default())
+                    .expect("Emit must retain a transcript row");
+                assert_eq!(after_emit.kind, TranscriptRowKind::Response, "a nonempty Emit must initially be assistant prose: row={after_emit:?}");
+
+                event_loop
+                    .handle_event(crate::cli::repl_event::events::ReplEvent::VmEffect {
+                        projection,
+                        envelope: envelope(
+                            1,
+                            crate::vm::CapabilityKind::ProgramInvoke,
+                            crate::vm::HostSideEffect::Request {
+                                arguments: vec![
+                                    crate::vm::TypedValue::String("lisp".into()),
+                                    crate::vm::TypedValue::String("inspect artifact".into()),
+                                ],
+                            },
+                        ),
+                    })
+                    .await
+                    .expect("the actual VmEffect handler must append ProgramInvoke lifecycle output");
+                let row = output_unit
+                    .transcript_row(&crate::config::ColorScheme::default())
+                    .expect("ProgramInvoke lifecycle output must retain a transcript row");
+                assert_eq!(row.kind, TranscriptRowKind::Output, "host lifecycle bytes must demote prior say to Program output: execution_id={execution_id} row={row:?}");
+                assert_eq!(row.body.len(), 2, "Emit and lifecycle notice must each occur exactly once: execution_id={execution_id} row={row:?}");
+                assert_eq!(row.body[0], "assistant prefix", "the FIFO Emit must precede lifecycle output: execution_id={execution_id} row={row:?}");
+                assert!(row.body[1].contains("Proposal awaiting review: inspect artifact") && row.body[1].contains(&execution_id.to_string()) && row.body[1].contains("effect 1"), "the lifecycle notice must retain intent and effect identity: execution_id={execution_id} row={row:?}");
+            })
+            .await;
     }
 
     /// Every systemic condition this runner can report must declare itself with

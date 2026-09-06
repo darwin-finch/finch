@@ -2880,7 +2880,7 @@ mod tests {
         for (label, source, generator) in [
             (
                 "initial",
-                "(+ 1 2)",
+                "(say \"\")",
                 Arc::new(FixtureRepairGenerator {
                     fixture: RepairFixture::Error("repair must not run"),
                 }) as Arc<dyn Generator>,
@@ -2889,7 +2889,7 @@ mod tests {
                 "repaired",
                 "```lisp\n(say \"must not run\")\n```",
                 Arc::new(FixtureRepairGenerator {
-                    fixture: RepairFixture::Source("(+ 1 2)"),
+                    fixture: RepairFixture::Source("(say \"\")"),
                 }) as Arc<dyn Generator>,
             ),
         ] {
@@ -2920,8 +2920,8 @@ mod tests {
                 "the {label} outputless program must exercise MissingOutputEffect: row={row:?} projected={projected}"
             );
             assert_eq!(
-                projected, 0,
-                "the {label} outputless program must not manufacture a say effect: row={row:?}"
+                projected, 1,
+                "the {label} empty say must project its real empty Emit exactly once without becoming prose: row={row:?}"
             );
             assert_eq!(
                 row.kind,
@@ -2938,7 +2938,7 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_provider_effect_stays_before_staged_failure_diagnostic() {
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
 
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -2962,8 +2962,8 @@ mod tests {
 
         let before = execution.output_unit.content();
         assert!(
-            before.starts_with("VM wire error:"),
-            "the worker must stage its diagnostic before the deliberately delayed event-loop drain: content={before:?} response={:?}",
+            !before.contains("VM wire error:") && !before.contains("repair prefix"),
+            "neither a queued effect nor its staged terminal diagnostic may be renderable before the FIFO event-loop drain: content={before:?} response={:?}",
             execution.response
         );
         let projected = drain_provider_vm_events(&mut event_rx);
@@ -2982,6 +2982,8 @@ mod tests {
             "a repaired Ok(non-Completed) result must remain ordinary Program output: row={row:?} response={:?}",
             execution.response
         );
+        assert_eq!(execution.output_unit.status(), MessageStatus::Complete, "the repaired non-Completed provider result must terminalize through VmOutputComplete: before={before:?} row={row:?} response={:?}", execution.response);
+        assert_eq!(row.body.len(), 2, "repaired Ok(non-Completed) output must contain exactly one Emit and one diagnostic: before={before:?} row={row:?} response={:?}", execution.response);
         assert!(
             row.body.first().is_some_and(|line| line == "repair prefix"),
             "the delayed say effect must be inserted before the staged provider diagnostic: before={before:?} row={row:?} response={:?}",
@@ -2998,8 +3000,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_provider_effect_stays_before_staged_failure_diagnostic() {
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(FixtureRepairGenerator {
+            fixture: RepairFixture::Error("runtime failures must not request repair"),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            output,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator,
+            &[crate::claude::Message::user("emit then fail")],
+            "(begin (say \"initial prefix\\n\") (/ 1 0))".to_string(),
+            None,
+            None,
+        )
+        .await;
+        let before = execution.output_unit.content();
+        assert!(before.is_empty(), "the worker must expose neither queued Emit nor staged failure bytes before FIFO drain: before={before:?} response={:?}", execution.response);
+        let projected = drain_provider_vm_events(&mut event_rx);
+        let row = execution
+            .output_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("initial failed provider output must retain a row");
+        assert_eq!(projected, 1, "initial emit-then-fail must project exactly one Emit: before={before:?} row={row:?} response={:?}", execution.response);
+        assert_eq!(execution.output_unit.status(), MessageStatus::Complete, "initial non-Completed provider result must terminalize through VmOutputComplete: before={before:?} row={row:?}");
+        assert_eq!(row.kind, TranscriptRowKind::Output, "initial emit-then-fail must remain ordinary Program output: before={before:?} row={row:?}");
+        assert_eq!(row.body.len(), 2, "initial provider failure must contain exactly one Emit and one diagnostic: before={before:?} row={row:?}");
+        assert_eq!(
+            row.body.first().map(String::as_str),
+            Some("initial prefix"),
+            "initial Emit must precede its diagnostic: before={before:?} row={row:?}"
+        );
+        assert!(row.body.iter().skip(1).any(|line| line.contains("VM wire error:") && line.contains("division by zero")), "initial failure diagnostic must follow the Emit exactly once: before={before:?} row={row:?}");
+    }
+
+    #[tokio::test]
     async fn malformed_repaired_provider_source_remains_program_output() {
-        use crate::cli::messages::{Message, TranscriptRowKind};
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
 
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -3020,6 +3064,12 @@ mod tests {
             None,
         )
         .await;
+        let before = execution.output_unit.content();
+        assert!(
+            !before.contains("VM wire error:"),
+            "the repaired Err(String) diagnostic must remain private until VmOutputComplete: before={before:?} response={:?}",
+            execution.response
+        );
         let projected = drain_provider_vm_events(&mut event_rx);
         let row = execution
             .output_unit
@@ -3036,6 +3086,8 @@ mod tests {
             "the repaired Err call site must keep malformed-source diagnostics as ordinary Program output: row={row:?} response={:?}",
             execution.response
         );
+        assert_eq!(execution.output_unit.status(), MessageStatus::Complete, "the repaired Err(String) path must terminalize through VmOutputComplete: row={row:?} response={:?}", execution.response);
+        assert_eq!(row.body.len(), 1, "repaired Err(String) output must contain exactly one diagnostic and no manufactured effect: row={row:?} response={:?}", execution.response);
         assert!(
             row.body
                 .iter()
