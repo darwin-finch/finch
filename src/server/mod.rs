@@ -456,17 +456,47 @@ impl AgentServer {
         let schedule_store = self.brain_store.clone();
         let schedule_runners = self.brain_runners.clone();
         let schedule_task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Warm the due index once. Schedules only become known when a Brain
+            // is loaded, so the index covers exactly the resident Brains and
+            // starts empty. This is the one remaining enumeration; steady state
+            // selects from the index and hydrates nothing it does not need
+            // (#374). Per-Brain fault tolerance for this warm-up is #371's.
+            if let Err(error) = schedule_store.warm_schedule_index() {
+                tracing::warn!(%error, "could not warm the schedule due index");
+            }
+
+            let wakeup = schedule_store.schedule_wakeup();
+            // A ceiling on the sleep, so a clock jump or a missed notification
+            // costs one idle wake rather than an unbounded stall. It is a
+            // backstop, not the mechanism: with nothing due, this loop wakes
+            // once a minute instead of sixty times.
+            const MAX_SLEEP: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+            // A due schedule whose Brain has no ready runner is not delivered
+            // and its `next_due_ms` is not advanced, so the index head stays
+            // due. Without a floor the loop would then spin: the old code was
+            // safe from this only because it slept a second unconditionally.
+            const UNDELIVERED_RETRY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
             loop {
-                tick.tick().await;
-                let names = match schedule_store.list() {
-                    Ok(names) => names,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not list Brains for schedule delivery");
-                        continue;
-                    }
+                let now = crate::brain::store::unix_millis();
+                let sleep_for = match schedule_store.next_schedule_due_ms() {
+                    Some(due) if due <= now => tokio::time::Duration::ZERO,
+                    Some(due) => tokio::time::Duration::from_millis(due - now).min(MAX_SLEEP),
+                    None => MAX_SLEEP,
                 };
+                if !sleep_for.is_zero() {
+                    // Wake early when a schedule appears that is due sooner
+                    // than the head this sleep was computed against.
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep_for) => {}
+                        _ = wakeup.notified() => {}
+                    }
+                }
+
+                let now = crate::brain::store::unix_millis();
+                let head_before = schedule_store.next_schedule_due_ms();
+                // Selection by due time, not by Brain: this names only the
+                // Brains that actually have work, without hydrating any.
+                let names = schedule_store.due_schedule_brains(now);
                 for name in names {
                     if let Err(error) = handlers::deliver_due_named_brain_schedules(
                         schedule_store.clone(),
@@ -478,6 +508,16 @@ impl AgentServer {
                     {
                         tracing::warn!(brain = %name, %error, "could not deliver due Brain schedule");
                     }
+                }
+
+                // If the head did not move, nothing advanced -- typically a due
+                // Brain with no ready runner. Back off to the old cadence
+                // rather than re-selecting the same entry immediately.
+                let head_after = schedule_store.next_schedule_due_ms();
+                if head_after == head_before
+                    && head_after.is_some_and(|due| due <= crate::brain::store::unix_millis())
+                {
+                    tokio::time::sleep(UNDELIVERED_RETRY).await;
                 }
             }
         });
