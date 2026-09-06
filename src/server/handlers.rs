@@ -3954,7 +3954,10 @@ async fn get_status(
 
     let response = StatusResponse {
         generator: generator_status,
-        named_brains: server.brain_store().list()?.len(),
+        // A count, not a hydration (#364). `list()` replays every Brain's
+        // event log and opens its effect-audit databases; this probe wants
+        // only how many there are.
+        named_brains: server.brain_store().count_unhydrated(),
         training_enabled: false,
     };
 
@@ -3974,7 +3977,12 @@ pub struct HealthStatus {
 pub async fn health_check(
     State(server): State<Arc<AgentServer>>,
 ) -> Result<Json<HealthStatus>, AppError> {
-    let named_brains = server.brain_store().list()?.len();
+    // `list()` here was a full store hydration on the unauthenticated probe
+    // that gates every `finch` launch: `DaemonClient::connect` ->
+    // `ensure_daemon_running` -> `health_check_succeeds` -> GET /health, under
+    // a 500 ms client timeout whose expiry costs the launch an unconditional
+    // two-second sleep (#364, and see #344). Health needs the count.
+    let named_brains = server.brain_store().count_unhydrated();
     let pending_brain_terminalizations = server
         .brain_store()
         .pending_disconnect_terminalization_retries();

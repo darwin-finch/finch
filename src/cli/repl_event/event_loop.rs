@@ -1957,7 +1957,14 @@ impl EventLoop {
         // Unit-level production-boundary fixtures drive the event channel
         // directly and must not install a competing terminal reader.
         #[cfg(not(test))]
-        let input_rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+        let input_rx = {
+            let rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+            // Keys are buffered from here, but nothing acts on them until the
+            // select loop below. The two instants are recorded separately
+            // because they are routinely confused (#364).
+            crate::startup::mark(crate::startup::MARK_INPUT_CAPTURED);
+            rx
+        };
         #[cfg(test)]
         let input_rx = {
             drop(quit_tx);
@@ -2223,11 +2230,25 @@ impl EventLoop {
             })
             .unwrap_or_else(|| "~".to_string());
         self.cwd = cwd.clone();
-        let home_runner_state = match self.register_home_brain().await {
-            Ok(state) => state,
-            Err(error) => {
-                tracing::warn!("could not register home Brain: {error}");
-                None
+        let home_runner_state = {
+            // Four serial IPC round-trips, before the first frame (#364).
+            let mut phase = crate::startup::phase(crate::startup::PHASE_BRAIN_REGISTER);
+            match self.register_home_brain().await {
+                Ok(state) => {
+                    phase.detail(crate::startup::PhaseDetail::count(1).with_category(
+                        if state.is_some() {
+                            "registered"
+                        } else {
+                            "offline"
+                        },
+                    ));
+                    state
+                }
+                Err(error) => {
+                    phase.detail(crate::startup::PhaseDetail::count(1).with_category("failed"));
+                    tracing::warn!("could not register home Brain: {error}");
+                    None
+                }
             }
         };
         self.home_runner_lease_id = home_runner_state
@@ -2270,6 +2291,7 @@ impl EventLoop {
             &cwd,
             &self.session_label,
         ));
+        crate::startup::mark(crate::startup::MARK_HEADER_PAINTED);
         if let Some(error) = self.daemon_ipc_error.take() {
             self.output_manager
                 .write_info(format!("Brain daemon unavailable: {error}"));
@@ -2287,6 +2309,11 @@ impl EventLoop {
             }
         }
         if self.daemon_base_url.is_some() {
+            // One Brain, whatever the size of the on-disk inventory: the
+            // frontend attaches its own home Brain and never enumerates the
+            // Brain root (#364).
+            let mut phase = crate::startup::phase(crate::startup::PHASE_BRAIN_ATTACH);
+            phase.detail(crate::startup::PhaseDetail::count(1));
             if let Err(error) = self.attach_home_brain().await {
                 let detail = error.to_string();
                 self.last_home_watch_error = Some(detail.clone());
@@ -2404,6 +2431,10 @@ impl EventLoop {
 
         // Flag to control the loop
         let mut should_exit = false;
+
+        // Time-to-ready ends here: the first instant at which a typed key is
+        // acted upon rather than merely buffered (#364).
+        crate::startup::ready();
 
         while !should_exit {
             tokio::select! {

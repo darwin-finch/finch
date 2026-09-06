@@ -786,6 +786,10 @@ mod script_tests {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Start the startup clock first, so t0 is as close to process entry as a
+    // statement in `main` can be (#364).
+    finch::startup::begin();
+
     // Suppress ONNX Runtime verbose logs BEFORE any initialization
     // Must be set early, before any ONNX library code runs
     // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
@@ -795,7 +799,10 @@ async fn main() -> Result<()> {
     install_panic_handler();
 
     // Parse command-line arguments
-    let args = Args::parse();
+    let args = {
+        let _phase = finch::startup::phase(finch::startup::PHASE_ARGS);
+        Args::parse()
+    };
     // `Command::Query` is dispatched before the REPL setup below, so preserve
     // this global flag explicitly rather than accidentally dropping it on the
     // one-shot path.
@@ -927,23 +934,38 @@ async fn main() -> Result<()> {
 
     // Check if debug logging is enabled in config (before init_tracing)
     // This allows the debug_logging feature flag to control log verbosity
-    if let Ok(temp_config) = load_config() {
-        if temp_config.features.debug_logging {
-            // Set RUST_LOG to debug if not already set by user
-            if std::env::var("RUST_LOG").is_err() {
-                std::env::set_var("RUST_LOG", "debug");
+    //
+    // This is the first of four full reads and TOML parses of `config.toml`
+    // per interactive start; the timing separates it from the load that
+    // actually produces the configuration (#364).
+    {
+        let mut phase = finch::startup::phase(finch::startup::PHASE_CONFIG);
+        phase.detail(finch::startup::PhaseDetail::category("debug_logging_probe"));
+        if let Ok(temp_config) = load_config() {
+            if temp_config.features.debug_logging {
+                // Set RUST_LOG to debug if not already set by user
+                if std::env::var("RUST_LOG").is_err() {
+                    std::env::set_var("RUST_LOG", "debug");
+                }
             }
         }
     }
 
     // NOW initialize tracing (will use the global OutputManager we just configured)
-    init_tracing();
+    {
+        let _phase = finch::startup::phase(finch::startup::PHASE_TRACING);
+        init_tracing();
+    }
 
     // Load configuration (or run setup only when the file is genuinely
     // absent). A broken existing file is never an invitation to overwrite it
     // with auto-detected or default first-run state.
-    let persisted_config = finch::config::load_persisted_config()
-        .context("Existing Finch configuration could not be loaded and was left unchanged")?;
+    let persisted_config = {
+        let mut phase = finch::startup::phase(finch::startup::PHASE_CONFIG);
+        phase.detail(finch::startup::PhaseDetail::category("persisted"));
+        finch::config::load_persisted_config()
+            .context("Existing Finch configuration could not be loaded and was left unchanged")?
+    };
     let mut config = match persisted_config {
         Some(cfg) => cfg,
         None => match load_config() {
@@ -1021,6 +1043,7 @@ async fn main() -> Result<()> {
     let use_daemon = !args.direct && !args.cloud_only;
 
     // Load or create threshold router
+    let _threshold_router_phase = finch::startup::phase(finch::startup::PHASE_THRESHOLD_ROUTER);
     let models_dir = dirs::home_dir()
         .map(|home| home.join(".finch").join("models"))
         .expect("Failed to determine home directory");
@@ -1053,21 +1076,37 @@ async fn main() -> Result<()> {
         ThresholdRouter::new()
     };
 
+    drop(_threshold_router_phase);
+
     // Create router
     let router = Router::new(threshold_router);
 
     // Construct the named provider graph once. The compatibility client and daemon profile
     // router share these exact instances.
-    let provider_graph = finch::providers::create_provider_graph_from_config(&config)?;
-    let claude_client = ClaudeClient::with_shared_provider(provider_graph.default_provider());
+    // Built once here and, today, a second time inside `run_event_loop` via
+    // `create_provider_profile_from_config`. Both are timed, so the report
+    // shows the duplication rather than hiding it (#364).
+    let claude_client = {
+        let _phase = finch::startup::phase(finch::startup::PHASE_PROVIDER_GRAPH);
+        let provider_graph = finch::providers::create_provider_graph_from_config(&config)?;
+        ClaudeClient::with_shared_provider(provider_graph.default_provider())
+    };
 
     // Create metrics logger
-    let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
+    let metrics_logger = {
+        let _phase = finch::startup::phase(finch::startup::PHASE_METRICS);
+        MetricsLogger::new(config.metrics_dir.clone())?
+    };
 
     // Try to connect to daemon BEFORE creating Repl
     // This allows Repl to suppress local model logs if daemon is available
     use finch::client::{DaemonClient, DaemonConfig};
     let daemon_client = if use_daemon && config.client.use_daemon {
+        // The health probe behind this connect is what gates every launch:
+        // GET /health, under a 500 ms client timeout whose expiry costs an
+        // unconditional two-second sleep in
+        // `ensure_daemon_running_after_isolation_gate` (#364).
+        let mut phase = finch::startup::phase(finch::startup::PHASE_DAEMON_CONNECT);
         let daemon_config = DaemonConfig {
             bind_address: config.client.daemon_address.clone(),
             auto_spawn: config.client.auto_spawn,
@@ -1075,13 +1114,19 @@ async fn main() -> Result<()> {
             api_key: config.server.api_keys.first().cloned(),
         };
         match DaemonClient::connect(daemon_config).await {
-            Ok(client) => Some(Arc::new(client)),
+            Ok(client) => {
+                phase.detail(finch::startup::PhaseDetail::category("connected"));
+                Some(Arc::new(client))
+            }
             Err(_e) => {
+                phase.detail(finch::startup::PhaseDetail::category("unavailable"));
                 tracing::debug!("Failed to connect to daemon: {}", _e);
                 None
             }
         }
     } else {
+        finch::startup::phase(finch::startup::PHASE_DAEMON_CONNECT)
+            .finish(finch::startup::PhaseDetail::category("disabled"));
         None
     };
 
@@ -1095,15 +1140,18 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(finch::brain::names::generate);
 
-    let mut repl = Repl::new(
-        config,
-        claude_client,
-        router,
-        metrics_logger,
-        daemon_client,
-        brain_name,
-    )
-    .await;
+    let mut repl = {
+        let _phase = finch::startup::phase(finch::startup::PHASE_REPL_NEW);
+        Repl::new(
+            config,
+            claude_client,
+            router,
+            metrics_logger,
+            daemon_client,
+            brain_name,
+        )
+        .await
+    };
 
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
@@ -1119,6 +1167,7 @@ async fn main() -> Result<()> {
     // Restore session if requested
     if let Some(session_path) = restore_session {
         if session_path.exists() {
+            let _phase = finch::startup::phase(finch::startup::PHASE_SESSION_RESTORE);
             match ConversationHistory::load(&session_path) {
                 Ok(history) => {
                     repl.restore_conversation_from(history, &session_path);
@@ -1149,9 +1198,18 @@ async fn main() -> Result<()> {
             // creates any Brain attachment or runner identity. Preserve a
             // failure for the startup projection instead of silently entering
             // a half-connected Brain state.
-            match finch::ipc::IpcClient::connect().await {
-                Ok(ipc) => repl.set_ipc_client(ipc),
-                Err(error) => repl.set_daemon_ipc_error(error.to_string()),
+            {
+                let mut phase = finch::startup::phase(finch::startup::PHASE_IPC_CONNECT);
+                match finch::ipc::IpcClient::connect().await {
+                    Ok(ipc) => {
+                        phase.detail(finch::startup::PhaseDetail::category("connected"));
+                        repl.set_ipc_client(ipc)
+                    }
+                    Err(error) => {
+                        phase.detail(finch::startup::PhaseDetail::category("unavailable"));
+                        repl.set_daemon_ipc_error(error.to_string())
+                    }
+                }
             }
             repl.run_event_loop(args.initial_prompt).await
         })

@@ -666,11 +666,21 @@ impl Repl {
 
         // Phase 4: Initialize memory system (before tool registry so we can register memory tools)
         let memory_system = if config.memory.enabled {
-            match crate::memory::MemorySystem::new(config.memory.clone()) {
+            // `memory_open` covers the synchronous prologue only -- SQLite
+            // open, schema batch, migrations, the embedding-cache probe.
+            // MemTree hydration runs in the background from here (#242), so
+            // its cost is deliberately not inside this phase (#364).
+            let memory_open = crate::startup::phase(crate::startup::PHASE_MEMORY_OPEN);
+            let opened = crate::memory::MemorySystem::new(config.memory.clone());
+            drop(memory_open);
+            match opened {
                 Ok(system) => {
                     let system = Arc::new(system);
+                    let mut sync_phase = crate::startup::phase(crate::startup::PHASE_PROGRAM_SYNC);
+                    let mut synced_roots: u64 = 0;
                     // Plain-text program files are canonical; SQLite is their discovery index.
                     if let Some(root) = project_program_root.as_ref() {
+                        synced_roots += 1;
                         if let Err(error) = system
                             .sync_program_files(root, crate::programs::ProgramScope::Project)
                             .await
@@ -679,12 +689,15 @@ impl Repl {
                         }
                     }
                     let root = system.program_source_root();
+                    synced_roots += 1;
                     if let Err(error) = system
                         .sync_program_files(&root, crate::programs::ProgramScope::Personal)
                         .await
                     {
                         tracing::warn!("Failed to index personal program vocabulary: {error}");
                     }
+                    sync_phase.detail(crate::startup::PhaseDetail::count(synced_roots));
+                    drop(sync_phase);
                     Some(system)
                 }
                 Err(e) => {
@@ -698,6 +711,7 @@ impl Repl {
         };
 
         // Initialize tool execution system
+        let tool_registry_phase = crate::startup::phase(crate::startup::PHASE_TOOL_REGISTRY);
         let mut tool_registry = ToolRegistry::new();
         let program_runtime = Arc::new(
             crate::runtime::ProgramRuntime::with_automation_in_workspace(
@@ -966,7 +980,16 @@ impl Repl {
                 .expect("Failed to create fallback tool executor")
             });
 
+        drop(tool_registry_phase);
+
         // Add MCP support if configured (graceful - always returns even on error)
+        // Serial per server, with a 300 s default per-request timeout
+        // (`src/tools/mcp/config.rs`). Free today with no servers configured;
+        // timed so that stops being invisible the moment one is (#364).
+        let mut mcp_phase = crate::startup::phase(crate::startup::PHASE_MCP_CONNECT);
+        mcp_phase.detail(crate::startup::PhaseDetail::count(
+            config.mcp_servers.len() as u64
+        ));
         let executor = executor.with_mcp(&config).await;
         if let Some(client) = executor.mcp_client().cloned() {
             match program_runtime.bind_mcp_client(client).await {
@@ -980,6 +1003,8 @@ impl Repl {
                 }
             }
         }
+
+        drop(mcp_phase);
 
         let tool_executor = Arc::new(tokio::sync::Mutex::new(executor));
 
@@ -1050,6 +1075,9 @@ impl Repl {
         // Initialize TUI renderer if enabled (Phase 2: Ratatui interface)
         // Moved to global for Phase 5 native ratatui dialogs
         if config.tui_enabled && is_interactive {
+            // Timed from here rather than inside `TuiRenderer::new` so that
+            // `src/cli/tui/` is untouched; #264 owns terminal lifecycle.
+            let mut phase = crate::startup::phase(crate::startup::PHASE_TERMINAL_INIT);
             match TuiRenderer::new(
                 Arc::new(output_manager.clone()),
                 Arc::new(status_bar.clone()),
@@ -1059,8 +1087,13 @@ impl Repl {
                     // Set global TUI renderer for Menu dialogs (Phase 5)
                     use crate::cli::global_output::set_global_tui_renderer;
                     set_global_tui_renderer(renderer);
+                    phase.detail(crate::startup::PhaseDetail::category("raw_mode"));
+                    drop(phase);
+                    crate::startup::mark(crate::startup::MARK_TERMINAL_OWNED);
                 }
                 Err(e) => {
+                    phase.detail(crate::startup::PhaseDetail::category("failed"));
+                    drop(phase);
                     output_status!("⚠️  Failed to initialize TUI: {}", e);
                     output_status!("   Falling back to standard output mode");
                 }
@@ -2124,11 +2157,18 @@ impl Repl {
             .iter()
             .position(|entry| !entry.is_local())
             .unwrap_or(0);
+        // The second full provider-graph construction of this startup;
+        // `create_provider_profile_from_config` re-runs
+        // `create_provider_graph_from_config`. Timed under the same phase name
+        // as the first, so the report shows the duplication rather than
+        // hiding it (#364).
         let claude_gen: Arc<dyn crate::generators::Generator> = self
             .available_providers
             .get(initial_provider_index)
             .filter(|entry| !entry.is_local())
             .and_then(|entry| {
+                let mut phase = crate::startup::phase(crate::startup::PHASE_PROVIDER_GRAPH);
+                phase.detail(crate::startup::PhaseDetail::category("profile_rebuild"));
                 crate::providers::create_provider_profile_from_config(
                     &self._config,
                     &entry.profile_name(),

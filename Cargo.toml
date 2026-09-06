@@ -170,6 +170,12 @@ tower = { version = "0.5", features = ["util"] }  # ServiceExt::oneshot() for in
 http-body-util = "0.1"  # axum::body::to_bytes helper
 tokio = { version = "1.35", features = ["test-util"] }  # start_paused for time-controlled tests
 
+# A real PTY for the interactive-startup regression (#364). `nix` is already a
+# unix dependency; `term` is what gates `nix::pty::openpty`, so this adds a
+# module rather than a crate. Test-only: nothing in the binary opens a PTY.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["term", "process", "signal"] }
+
 [features]
 default = ["onnx", "candle"]  # ONNX Runtime + Candle are the default providers
 onnx = []  # ONNX Runtime support (always available)
