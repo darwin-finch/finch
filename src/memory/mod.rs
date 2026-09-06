@@ -2816,25 +2816,28 @@ mod tests {
         // at 11.5ms against 41.6ms -- backgrounding was 3.6x faster and needed
         // 4x, so the property held and the threshold did not.
         //
-        // This restores the assertion #273 originally had. It was replaced for
-        // a reason that no longer applies: it ran on a current-thread runtime,
-        // where the loader cannot be polled until the test awaits, so it was
-        // deterministic only under a flavor nothing ships. It did discriminate
-        // there -- forcing the blocking arm failed it -- so the objection was
-        // about the flavor, not the assertion. This test runs multi-thread,
-        // where the loader really is spawned.
+        // Asserted structurally first: did construction *delegate* the load,
+        // or perform it? `hydration_task` answers that with no clock in it,
+        // which is what the neighbouring
+        // `test_a_current_thread_runtime_loads_without_spawning_a_loader`
+        // already relies on.
         //
-        // `loaded: 0` rather than merely "not Ready", because `Ready` latches
-        // only at the end: a construction that blocks until half the store is
-        // in still reports `Loading`, and an assertion against `Ready` alone
-        // accepts it. Measured on a mutant that busy-waits for half the store,
-        // `!Ready` missed the regression in 30 of 50 runs -- once while
-        // reporting `Loading { loaded: 2048, total: 2048 }`, the whole store
-        // loaded during construction. `loaded: 0` catches it every time.
+        // Three timing-based forms were tried here and each failed for its own
+        // reason. `backgrounded * 4 < blocking` is a quotient of two wall-clock
+        // measurements on a loaded runner; it failed in CI at 3.6x against a 4x
+        // threshold, with the property intact. `Loading { loaded: 0, .. }` --
+        // #273's original -- looks deterministic and is not: run alone, with
+        // both worker threads idle, the loader reliably lands two batches
+        // before this line, and it fails 5 times in 5 reporting
+        // `loaded: 1024`. It survives only inside the full suite, where
+        // contention starves the loader. That is a trap, not a margin.
         //
-        // The margin is not close: 200 runs under 16 CPU hogs reported
-        // `loaded: 0` on every one, so not a single 512-row batch landed in
-        // the window between the spawn and this line.
+        // What remains uncovered, honestly: a construction that spawns the
+        // loader and then waits on it anyway reports a spawned task and a
+        // non-`Ready` status, and passes. That is a timing property with no
+        // structural signature, and the ratio only caught it 48 times in 50.
+        // Detecting it deterministically needs a gate the loader must pass,
+        // which is a larger change than this flake fix.
         const NODES: u64 = 4 * HYDRATION_BATCH as u64;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
@@ -2864,11 +2867,15 @@ mod tests {
         let status = reopened.hydration_status();
 
         assert!(
-            matches!(status, HydrationStatus::Loading { loaded: 0, .. }),
-            "construction must return before the index is loaded, but hydration \
-             had already made progress when `new` returned: status {status:?} for \
-             the same {NODES}-node store that the no-runtime arm took {blocking:?} \
-             to load synchronously"
+            reopened.hydration_task.is_some(),
+            "construction must delegate the load to a spawned task rather than \
+             perform it: no loader was spawned, and the no-runtime arm shows \
+             this store takes {blocking:?} to load synchronously"
+        );
+        assert!(
+            !matches!(status, HydrationStatus::Ready { .. }),
+            "construction must return before the load finishes; it was already \
+             complete when `new` returned: status {status:?} for {NODES} nodes"
         );
 
         // And it must still complete, with every node present.
