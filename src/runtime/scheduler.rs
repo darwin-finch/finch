@@ -506,6 +506,8 @@ pub struct AgentScheduler {
     active_brain_parent: RwLock<Option<AgentBrainContext>>,
     #[cfg(test)]
     wait_after_initial_check: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(test)]
+    wait_before_provider_poll: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl AgentScheduler {
@@ -530,6 +532,8 @@ impl AgentScheduler {
             active_brain_parent: RwLock::new(None),
             #[cfg(test)]
             wait_after_initial_check: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            wait_before_provider_poll: tokio::sync::Mutex::new(None),
         });
         runtime.attach_agent_scheduler(&scheduler);
         scheduler
@@ -925,11 +929,18 @@ impl AgentScheduler {
             if cancellation.is_cancelled() {
                 bail!("agent cancelled");
             }
-            *turns += 1;
+            #[cfg(test)]
+            if let Some((waiting, resume)) = self.wait_before_provider_poll.lock().await.take() {
+                waiting.notify_one();
+                resume.notified().await;
+            }
             let response = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => bail!("agent cancelled"),
-                response = provider.generate(messages.clone(), Some(definitions.clone())) => response?,
+                response = async {
+                    *turns += 1;
+                    provider.generate(messages.clone(), Some(definitions.clone())).await
+                } => response?,
             };
             if response.tool_uses.is_empty() {
                 return Ok(response.text);
@@ -1697,6 +1708,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn typed_agent_await_cancellation_before_provider_poll_reports_zero_attempts() {
+        let provider = AttemptGenerator::new(vec![AttemptAction::Success("must not run")]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let waiting = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *scheduler.wait_before_provider_poll.lock().await =
+            Some((Arc::clone(&waiting), Arc::clone(&resume)));
+        let mut events = scheduler.subscribe();
+        let submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 10_000));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .expect(
+                "the child did not reach the boundary after its cancellation precheck and before polling the provider",
+            );
+        let task_id = scheduler
+            .tasks
+            .read()
+            .await
+            .values()
+            .next()
+            .expect("typed agent-spawn-with must register one child before provider polling")
+            .snapshot
+            .identity
+            .task_id;
+        scheduler
+            .cancel(task_id)
+            .await
+            .expect("the child paused before provider polling must accept cancellation");
+        resume.notify_one();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), submission)
+            .await
+            .expect(
+                "typed agent-await did not terminate after cancellation at the provider-poll boundary",
+            )
+            .expect("typed agent-await submission panicked during boundary cancellation");
+
+        assert_typed_agent_result(&outcome, "cancelled", 0, &["agent cancelled"]);
+        assert_eq!(
+            provider.attempts(),
+            0,
+            "cancellation before the provider future is first-polled must not report or perform an attempt; task_id={task_id} outcome={outcome:?}"
+        );
+        let mut observed = Vec::new();
+        loop {
+            match events.try_recv() {
+                Ok(event) => observed.push(event),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!(
+                    "the provider-poll boundary regression must retain the complete lifecycle; error={error:?} events={observed:?} outcome={outcome:?}"
+                ),
+            }
+        }
+        let finished = observed
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TaskFinished { .. }))
+            .count();
+        assert_eq!(
+            finished, 1,
+            "boundary cancellation must publish exactly one TaskFinished; task_id={task_id} events={observed:?} outcome={outcome:?}"
+        );
+        assert!(
+            matches!(observed.last(), Some(AgentEvent::TaskFinished { .. })),
+            "TaskFinished must remain terminal after boundary cancellation; task_id={task_id} events={observed:?} outcome={outcome:?}"
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            provider.attempts(),
+            0,
+            "no provider attempt may start after boundary cancellation terminalizes; task_id={task_id} events={observed:?} outcome={outcome:?}"
+        );
+        let late_event = events.try_recv();
+        assert!(
+            matches!(late_event, Err(broadcast::error::TryRecvError::Empty)),
+            "no lifecycle event may occur after boundary-cancellation TaskFinished; task_id={task_id} late_event={late_event:?} events={observed:?} outcome={outcome:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn typed_agent_await_reports_deadline_during_second_attempt() {
         let second_started = Arc::new(Notify::new());
@@ -1710,8 +1806,19 @@ mod tests {
             ProviderResolver::new(provider.clone()),
             Arc::clone(&runtime),
         );
-        let submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 100));
-        second_started.notified().await;
+        let mut submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 100));
+        let second_attempt =
+            tokio::time::timeout(std::time::Duration::from_secs(5), second_started.notified());
+        tokio::pin!(second_attempt);
+        tokio::select! {
+            started = &mut second_attempt => started.expect(
+                "the scripted provider did not enter its second invocation before the bounded synchronization deadline",
+            ),
+            completed = &mut submission => panic!(
+                "typed agent-await completed before the scripted provider entered attempt two; completed={completed:?} provider_attempts={}",
+                provider.attempts()
+            ),
+        }
         tokio::time::advance(std::time::Duration::from_millis(101)).await;
         let outcome = submission
             .await
