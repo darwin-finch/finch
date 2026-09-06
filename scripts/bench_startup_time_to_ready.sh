@@ -18,6 +18,22 @@
 #
 # Never run against the real ~/.finch: every run gets a disposable HOME, the
 # daemon is disabled in its config, and no provider credential is inherited.
+#
+# SCOPE, because it is easy to over-read this number. Every benched run sets
+# `use_daemon = false`, so `DaemonClient::connect` never runs and GET /health is
+# never called. This measures **frontend** time-to-ready: config, provider
+# graph, memory open, program sync, tool registry, terminal init and first
+# render. It deliberately does not measure the /health Brain enumeration this
+# work also fixes, because doing so would require a live daemon and would make
+# the number depend on that daemon's warmth rather than on the code.
+#
+# The /health cost is measured separately and directly by
+# `brain::store::tests::bench_list_versus_count_over_a_realistic_brain_root`:
+#
+#   cargo test --lib bench_list_versus_count -- --ignored --nocapture
+#
+# with FINCH_BENCH_BRAIN_ROOT pointed at a *copy* of a real Brain root.
+# Together the two cover both halves; neither covers both.
 
 set -euo pipefail
 
@@ -145,6 +161,12 @@ printf '%s\n' "${samples[@]}" | sort -g | awk -v runs="$runs" -v failed="$failed
     printf "p90             %.1f ms\n", v[p90i]
     printf "min / max       %.1f / %.1f ms\n", v[1], v[n]
   }'
+
+printf '\nscope\n'
+printf '  frontend time-to-ready only; use_daemon = false, so GET /health is\n'
+printf '  not on this path. For the /health enumeration cost run\n'
+printf '  bench_list_versus_count_over_a_realistic_brain_root with\n'
+printf '  FINCH_BENCH_BRAIN_ROOT set to a copy of a real Brain root.\n'
 
 printf '\nmachine\n'
 printf '  uname           %s\n' "$(uname -srm)"

@@ -2102,6 +2102,13 @@ impl Repl {
 
     /// Run REPL with an optional initial prompt
     pub async fn run_with_initial_prompt(&mut self, initial_prompt: Option<String>) -> Result<()> {
+        // `--raw` and `--no-tui` reach the REPL through here, never through
+        // `EventLoop::run`. Without this the startup report was silently never
+        // published on those paths: `FINCH_STARTUP_TIMINGS=... finch --raw`
+        // produced no file and no diagnostic (#364). `ready` is idempotent, so
+        // the TUI path's later call is a no-op if both were somehow reached.
+        crate::startup::ready();
+
         if let Some(prompt) = initial_prompt {
             // Process initial prompt before starting interactive loop
             if self.is_interactive {

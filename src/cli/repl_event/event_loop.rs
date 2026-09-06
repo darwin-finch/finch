@@ -2291,7 +2291,10 @@ impl EventLoop {
             &cwd,
             &self.session_label,
         ));
-        crate::startup::mark(crate::startup::MARK_HEADER_PAINTED);
+        // Queued, not painted: in TUI mode stdout is disabled and `write_info`
+        // appends to an in-memory buffer, so the first real paint happens on a
+        // render tick after the loop below starts (#364).
+        crate::startup::mark(crate::startup::MARK_HEADER_QUEUED);
         if let Some(error) = self.daemon_ipc_error.take() {
             self.output_manager
                 .write_info(format!("Brain daemon unavailable: {error}"));

@@ -11,6 +11,21 @@
 //! path under test. These tests do, by giving the child a pty slave for its
 //! three standard descriptors.
 //!
+//! # What these tests do and do not cover
+//!
+//! Every fixture sets `use_daemon = false`, so `DaemonClient::connect` never
+//! runs and `GET /health` -- the probe whose Brain enumeration this work also
+//! fixes -- is never on this path. That is deliberate: a fixture with a live
+//! daemon would make the assertions depend on that daemon's warmth. So these
+//! tests cover the **frontend** startup path, and the health probe's
+//! bounded-work property is asserted at the server boundary instead, in
+//! `src/server/handlers.rs`.
+//!
+//! What they do prove about the Brain inventory is narrower and still worth
+//! having: the frontend hydrates zero Brains before the first frame, measured
+//! by a counter inside `BrainStore::ensure_loaded` that no phase can bypass,
+//! at inventories of nothing and of four hundred.
+//!
 //! # Why the assertions have no clock in them
 //!
 //! Issue #242 spent four assertions on wall-clock startup properties. Three
@@ -28,18 +43,24 @@
 //!
 //! # Process discipline
 //!
-//! The child is a plain `std::process::Command` spawn: no `setsid`, no
-//! `setpgid`, no `process_group`, so it stays inside the supervisor's owned
-//! process group as `AGENTS.md` requires. The pty is deliberately *not* made
-//! the child's controlling terminal -- `is_terminal` and `tcsetattr` need only
-//! a tty descriptor, and claiming a controlling terminal would need exactly the
-//! session APIs trusted test code is forbidden to call.
+//! The child is a plain `std::process::Command` spawn. It calls none of the
+//! session- or group-creating APIs that `scripts/test_brain_isolation.sh`
+//! allowlists by name, so it stays inside the supervisor's owned process group
+//! as `AGENTS.md` requires. (Those names are deliberately not spelled here:
+//! the isolation gate greps the whole `src`, `scripts` and `tests` closure for
+//! them, and prose saying "we do not call X" reads to that scanner exactly
+//! like a call to X.)
+//!
+//! The pty is deliberately *not* made the child's controlling terminal.
+//! `is_terminal` and `tcsetattr` need only a tty descriptor, and claiming a
+//! controlling terminal would require precisely the APIs trusted test code is
+//! forbidden to call.
 
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -59,6 +80,8 @@ struct Entry {
     name: String,
     at_ms: String,
     ms: String,
+    /// How many phases enclose this one. Phases nest, so durations do not sum.
+    depth: Option<u64>,
     count: Option<u64>,
     category: Option<String>,
     slow: bool,
@@ -92,6 +115,7 @@ impl Report {
                 name: name.to_string(),
                 at_ms: String::new(),
                 ms: String::new(),
+                depth: None,
                 count: None,
                 category: None,
                 slow: false,
@@ -101,6 +125,7 @@ impl Report {
                     Some(("at_ms", value)) => entry.at_ms = value.to_string(),
                     Some(("ms", value)) => entry.ms = value.to_string(),
                     Some(("count", value)) => entry.count = value.parse().ok(),
+                    Some(("depth", value)) => entry.depth = value.parse().ok(),
                     Some(("category", value)) => entry.category = Some(value.to_string()),
                     _ if token == "SLOW" => entry.slow = true,
                     _ => {}
@@ -208,6 +233,9 @@ struct Session {
     master: OwnedFd,
     transcript: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Signalled by the reader thread as it exits, so `Drop` can join with a
+    /// deadline instead of unconditionally.
+    reader_done: std::sync::mpsc::Receiver<()>,
 }
 
 impl Session {
@@ -256,6 +284,7 @@ impl Session {
         let master = pty.master;
         let read_fd = master.try_clone().expect("clone master for reader");
         let sink = std::sync::Arc::clone(&transcript);
+        let (done_tx, reader_done) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut file = std::fs::File::from(read_fd);
             let mut buffer = [0u8; 8192];
@@ -268,6 +297,7 @@ impl Session {
                         .extend_from_slice(&buffer[..read]),
                 }
             }
+            let _ = done_tx.send(());
         });
 
         Self {
@@ -275,6 +305,7 @@ impl Session {
             master,
             transcript,
             reader: Some(reader),
+            reader_done,
         }
     }
 
@@ -324,9 +355,9 @@ impl Session {
             std::fs::File::from(self.master.try_clone().expect("clone master for writing"));
         write!(file, "{line}\r").expect("write to the pty");
         file.flush().expect("flush the pty");
-        // Do not let the File close the cloned descriptor's duplicate of the
-        // master before the child has read it.
-        let _ = file.as_raw_fd();
+        // `file` owns a dup of the master and closes it here. That neither
+        // flushes nor discards the tty's input queue, so the bytes stay
+        // readable by the child.
     }
 
     /// Wait for a clean exit, or report what the terminal showed instead.
@@ -360,8 +391,28 @@ impl Drop for Session {
         // raw-mode `finch` behind.
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        // The reader exits when every pty slave descriptor is closed. A
+        // grandchild that inherited the child's stdio -- an MCP server, say --
+        // holds one open, and an unconditional `join` would then hang the test
+        // process forever with no assertion and no deadline. Today's fixtures
+        // configure no MCP servers and block daemon auto-spawn, so it cannot
+        // happen; it is one config line away, and a hung harness is a worse
+        // failure than a leaked blocked thread.
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            match self.reader_done.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => {
+                    let _ = reader.join();
+                }
+                Err(_) => {
+                    eprintln!(
+                        "startup pty harness: the terminal reader did not \
+                         finish within 5s, so a descendant is still holding a \
+                         pty slave open. Detaching the thread rather than \
+                         hanging the test process."
+                    );
+                }
+            }
         }
     }
 }
@@ -398,13 +449,26 @@ fn assert_reaches_ready(report: &Report, context: &str) {
          report was:\n{}",
         report.raw
     );
-    assert_eq!(
-        report.position("input_ready"),
-        Some(report.entries.len() - 1),
-        "{context}: input_ready must be the last entry -- anything recorded \
-         after it happened when the process was already interactive and is not \
-         startup; phases were {names:?}"
-    );
+    // input_ready must be the *latest* instant in the timeline, not merely the
+    // last line. Moving `startup::ready()` earlier in `EventLoop::run` -- above
+    // the Brain registration, say -- would understate time-to-ready while
+    // still producing a well-formed report; this is what catches that.
+    let ready_at: f64 = report
+        .find("input_ready")
+        .and_then(|entry| entry.at_ms.parse().ok())
+        .expect("input_ready carries an offset");
+    for entry in &report.entries {
+        let at: f64 = entry.at_ms.parse().unwrap_or(0.0);
+        assert!(
+            at <= ready_at + f64::EPSILON,
+            "{context}: {:?} is recorded at {at} ms, after input_ready at \
+             {ready_at} ms. Startup work that happens after the readiness mark \
+             is startup work the reported total does not include. Report \
+             was:\n{}",
+            entry.name,
+            report.raw
+        );
+    }
 }
 
 #[test]
@@ -431,7 +495,7 @@ fn test_interactive_startup_reports_every_phase_and_reaches_input_ready() {
     let ordering = [
         "terminal_owned",
         "input_captured",
-        "header_painted",
+        "header_queued",
         "input_ready",
     ];
     let positions: Vec<(&str, Option<usize>)> = ordering
@@ -524,14 +588,31 @@ fn test_startup_phase_structure_is_independent_of_the_brain_inventory() {
         );
     }
 
-    // The frontend attaches exactly its own home Brain, whatever is on disk.
-    if let Some(attach) = large_report.find("brain_attach") {
+    // The load-bearing assertion. Every other count in the report is a
+    // literal, so comparing them across inventories compares constants and
+    // cannot fail. `brains_hydrated` is read by `startup::ready` from a
+    // counter `BrainStore::ensure_loaded` increments, so any code that
+    // enumerates or replays the Brain root before the first frame shows up
+    // here whatever phase it hides in -- including a `read_dir` added inside
+    // an existing phase, which the name-and-count comparison above would sail
+    // straight past.
+    for (label, report) in [("0 Brains", &small_report), ("400 Brains", &large_report)] {
+        let hydrated = report.find("brains_hydrated").unwrap_or_else(|| {
+            panic!(
+                "the report must carry brains_hydrated, or nothing observes \
+                 whether startup replayed the Brain root at all. {label} \
+                 report was:\n{}",
+                report.raw
+            )
+        });
         assert_eq!(
-            attach.count,
-            Some(1),
-            "the frontend must attach one Brain -- its own -- regardless of \
-             inventory size; report was:\n{}",
-            large_report.raw
+            hydrated.count,
+            Some(0),
+            "the interactive frontend must hydrate no Brains before the first \
+             frame. It hydrated {:?} with {label} on disk, so startup is doing \
+             work proportional to accumulated history. Report was:\n{}",
+            hydrated.count,
+            report.raw
         );
     }
 }
@@ -596,6 +677,10 @@ fn test_the_startup_report_leaks_no_private_content() {
     let mut session = Session::spawn(&fixture);
     let report = session.wait_for_report(&fixture);
 
+    // Defence in depth rather than a restatement of the type system: these
+    // become reachable the moment anyone adds a `String` or `PathBuf` field to
+    // `PhaseDetail`, which is when a reviewer is least likely to notice. The
+    // whitelist below is the assertion with real teeth.
     let forbidden = [
         "secret-brain-name",
         "unlisted-prompt-text",
@@ -637,9 +722,10 @@ fn test_the_startup_report_leaks_no_private_content() {
         "mcp_connect",
         "brain_register",
         "brain_attach",
+        "brains_hydrated",
         "terminal_owned",
         "input_captured",
-        "header_painted",
+        "header_queued",
         "input_ready",
         "connected",
         "unavailable",

@@ -3982,6 +3982,26 @@ pub async fn health_check(
     // `ensure_daemon_running` -> `health_check_succeeds` -> GET /health, under
     // a 500 ms client timeout whose expiry costs the launch an unconditional
     // two-second sleep (#364, and see #344). Health needs the count.
+    //
+    // Three observable differences, all deliberate:
+    //
+    // 1. it cannot fail, so one unreadable Brain no longer 500s the probe;
+    // 2. it counts a Brain whose replay would fail, which is the truthful
+    //    answer to "how many Brains are there";
+    // 3. `pending_brain_terminalizations` below is now read from a registry
+    //    that this request no longer populates. `ensure_loaded` is what
+    //    discovers unreconciled disconnect intents on disk and re-registers
+    //    them, so a probe arriving in the first moments of a daemon's life can
+    //    report `healthy` where the hydrating version would have reported
+    //    `degraded` with a true count.
+    //
+    // (3) is bounded, not permanent: `serve_on_listener` ticks the schedule
+    // store once a second (`src/server/mod.rs`), which hydrates and registers
+    // the retries. The window is that first tick. Paying a full store
+    // hydration on every client's probe to close a sub-second window -- when
+    // the hydration itself takes longer than the window on a real inventory --
+    // is the wrong trade. Whether `/health` should report Brain integrity at
+    // all is #344's to decide.
     let named_brains = server.brain_store().count_unhydrated();
     let pending_brain_terminalizations = server
         .brain_store()
@@ -9309,5 +9329,221 @@ mod handler_tests {
             .await,
             Err(BrainSubmissionError::Forbidden(_))
         ));
+    }
+
+    // ── #364: /health must not hydrate the Brain store ──────────────────────
+    //
+    // These go over HTTP through `create_router`, not by calling the handler
+    // function, because that is where the defect lived. The precedent is
+    // recorded on `production_router_health_reports_real_uptime` in
+    // `src/server/mod.rs`: an earlier #131 fix tested the accessor instead of
+    // the endpoint, and reverting the handler left the whole suite green.
+    // A store-level test of `count_unhydrated` has exactly that shape.
+
+    use crate::brain::store::BrainStore;
+
+    /// A server state root whose `brains/` holds `count` genuinely loadable
+    /// Brains, plus optionally one whose event log defeats the loader.
+    ///
+    /// The Brain root is `<state>/brains`, matching `AgentServer`'s own layout
+    /// (`src/server/mod.rs`). An earlier version of this fixture seeded the
+    /// state root itself, which put the server's `metrics/` directory inside
+    /// the Brain root -- where the count reported it as a Brain, correctly,
+    /// since `metrics` is a valid Brain name and `load_all` applies the same
+    /// rule. Every expected total was then off by one.
+    fn seed_health_probe_brain_root(count: usize, corrupt: bool) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let brain_root = temp.path().join("brains");
+        std::fs::create_dir_all(&brain_root).unwrap();
+        let seeding = BrainStore::with_root("box.local", Some(brain_root.clone()));
+        for index in 0..count {
+            // Built through the store's own API, so each Brain has correct
+            // identity, a real journal and its effect-audit databases. A
+            // hand-written log only exercises the parse-failure path.
+            seeding.snapshot(&format!("brain-{index:04}")).unwrap();
+        }
+        drop(seeding);
+        if corrupt {
+            // Unparseable *metadata*, not an unparseable event line: the
+            // journal reader tolerates a torn or invalid tail, so a bad
+            // `events.jsonl` alone does not defeat `ensure_loaded` and the
+            // negative control below would assert a difference that does not
+            // exist. `load_or_create_metadata` has no such tolerance.
+            let directory = brain_root.join("corrupt");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("metadata.json"), "{not json").unwrap();
+            std::fs::write(directory.join("events.jsonl"), "{not an event}\n").unwrap();
+        }
+        temp
+    }
+
+    /// `state` is the server state root; its Brain store reads `state/brains`.
+    fn health_probe_server(state: &std::path::Path) -> Arc<crate::server::AgentServer> {
+        let store = BrainStore::with_root("box.local", Some(state.join("brains")));
+        Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store,
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([61; 32]),
+                "test-password".into(),
+                state,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// GET a route through the production router and return status plus body.
+    async fn probe(
+        server: Arc<crate::server::AgentServer>,
+        uri: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let response = create_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .expect("response body");
+        let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    /// The regression for the fix, at the boundary the defect crossed.
+    ///
+    /// Reverting `health_check` to `list()?.len()` and leaving
+    /// `count_unhydrated` in place must fail here. The store-level tests
+    /// cannot see that mutation at all.
+    #[tokio::test]
+    async fn test_health_probe_counts_brains_without_hydrating_the_store() {
+        const BRAINS: usize = 64;
+        let temp = seed_health_probe_brain_root(BRAINS, false);
+        let server = health_probe_server(temp.path());
+
+        let (status, body) = probe(Arc::clone(&server), "/health").await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "/health must answer; body was {body}"
+        );
+        assert_eq!(
+            body.get("named_brains").and_then(serde_json::Value::as_u64),
+            Some(BRAINS as u64),
+            "/health must still report the whole Brain population; body was {body}"
+        );
+
+        let resident = server.brain_store().resident_brain_count();
+        assert_eq!(
+            resident, 0,
+            "/health must not hydrate a single Brain (#364). This is the \
+             unauthenticated probe every interactive launch waits on, under a \
+             500 ms timeout, and hydrating means each Brain's whole event log \
+             parsed plus three SQLite databases opened with synchronous=FULL. \
+             {resident} of {BRAINS} were resident after one health check"
+        );
+    }
+
+    /// The same property on `/v1/status`, which had the identical call.
+    #[tokio::test]
+    async fn test_status_probe_counts_brains_without_hydrating_the_store() {
+        const BRAINS: usize = 32;
+        let temp = seed_health_probe_brain_root(BRAINS, false);
+        let server = health_probe_server(temp.path());
+
+        let (status, body) = probe(Arc::clone(&server), "/v1/status").await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "/v1/status must answer; body was {body}"
+        );
+        assert_eq!(
+            body.get("named_brains").and_then(serde_json::Value::as_u64),
+            Some(BRAINS as u64),
+            "/v1/status must report the whole Brain population; body was {body}"
+        );
+        assert_eq!(
+            server.brain_store().resident_brain_count(),
+            0,
+            "/v1/status must not hydrate either; it had the same `list()?.len()`"
+        );
+    }
+
+    /// One unreadable Brain must not take the probe down.
+    ///
+    /// With `list()`, `ensure_loaded` propagates the parse failure, the handler
+    /// returns 500, `health_check_succeeds` reads a non-2xx as daemon absence,
+    /// and the launch pays an unconditional two-second sleep and then continues
+    /// with no daemon client at all. That is #344's production evidence,
+    /// reached from the client side.
+    #[tokio::test]
+    async fn test_health_probe_survives_a_brain_it_cannot_replay() {
+        const HEALTHY: usize = 8;
+        let temp = seed_health_probe_brain_root(HEALTHY, true);
+        let server = health_probe_server(temp.path());
+
+        assert!(
+            server.brain_store().list().is_err(),
+            "negative control: the seeded root must genuinely defeat `list()`, \
+             or this test asserts a difference that does not exist"
+        );
+
+        let (status, body) = probe(Arc::clone(&server), "/health").await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a Brain the daemon cannot replay must not turn the health probe \
+             into a 500; body was {body}"
+        );
+        assert_eq!(
+            body.get("named_brains").and_then(serde_json::Value::as_u64),
+            Some(HEALTHY as u64 + 1),
+            "an unreadable Brain is still a Brain on disk, and counting it is \
+             the truthful answer; body was {body}"
+        );
+    }
+
+    /// The probe's work is bounded by directory count, not by event history.
+    #[tokio::test]
+    async fn test_health_probe_work_does_not_grow_with_brain_history() {
+        const BRAINS: usize = 24;
+        let shallow = seed_health_probe_brain_root(BRAINS, false);
+        let deep = seed_health_probe_brain_root(BRAINS, false);
+        {
+            let seeding = BrainStore::with_root("box.local", Some(deep.path().join("brains")));
+            for index in 0..BRAINS {
+                seeding
+                    .seed_history_for_test(&format!("brain-{index:04}"), 40)
+                    .unwrap();
+            }
+        }
+
+        let shallow_server = health_probe_server(shallow.path());
+        let deep_server = health_probe_server(deep.path());
+        let (_, shallow_body) = probe(Arc::clone(&shallow_server), "/health").await;
+        let (_, deep_body) = probe(Arc::clone(&deep_server), "/health").await;
+
+        assert_eq!(
+            shallow_body.get("named_brains"),
+            deep_body.get("named_brains"),
+            "the same number of Brains must report the same count whatever \
+             their history; shallow {shallow_body}, deep {deep_body}"
+        );
+        assert_eq!(
+            (
+                shallow_server.brain_store().resident_brain_count(),
+                deep_server.brain_store().resident_brain_count(),
+            ),
+            (0, 0),
+            "and neither probe may hydrate, so its cost is bounded by the \
+             number of directories rather than by accumulated event history"
+        );
     }
 }

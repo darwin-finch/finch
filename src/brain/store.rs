@@ -16,6 +16,20 @@ use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
+
+/// How many Brains this process has hydrated, ever.
+///
+/// Incremented by [`BrainStore::ensure_loaded`] on the path that actually
+/// loads. It exists so that "startup did not hydrate any Brains" is an
+/// observable fact rather than an argument (#364): the startup report carries
+/// this number, so any code that enumerates or replays the Brain root before
+/// the first interactive frame shows up in it, whatever phase it hides in.
+static HYDRATED_BRAINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many Brains this process has hydrated. See [`HYDRATED_BRAINS`].
+pub fn hydrated_brain_count() -> u64 {
+    HYDRATED_BRAINS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Completed audit histories retained per named Brain. Together with the
 /// bounded intent/outcome encodings this caps the audit projection and its
 /// share of `events.jsonl`; unresolved write-ahead entries are never pruned.
@@ -1589,6 +1603,48 @@ impl BrainStore {
     /// status probes want; they were calling `list()?.len()`.
     pub fn count_unhydrated(&self) -> usize {
         self.list_names_unhydrated().len()
+    }
+
+    /// How many Brains are actually resident in memory, i.e. hydrated.
+    ///
+    /// Test-only. This is the observable that separates counting from loading:
+    /// a probe that hydrates leaves Brains here, and one that does not leaves
+    /// zero (#364).
+    #[cfg(test)]
+    pub(crate) fn resident_brain_count(&self) -> usize {
+        self.brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .len()
+    }
+
+    /// Give a Brain `events` journal entries, through the ordinary append path.
+    ///
+    /// Test-only. Hand-written JSON does not survive `ensure_loaded`'s identity
+    /// and sequence validation, so a fixture that needs real history has to be
+    /// built with the real writer.
+    #[cfg(test)]
+    pub(crate) fn seed_history_for_test(&self, name: &str, events: u64) -> Result<()> {
+        let brain_id = self.snapshot(name)?.brain_id;
+        for seq in 1..=events {
+            self.append_event(
+                name,
+                &BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id,
+                    seq,
+                    environment_generation: 1,
+                    sender: "seed".into(),
+                    created_ms: seq,
+                    run_id: None,
+                    mutation: None,
+                    kind: BrainEventKind::Prompt {
+                        text: "seed".into(),
+                    },
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self, name: &str) -> Result<BrainSnapshot> {
@@ -5090,6 +5146,7 @@ impl BrainStore {
         {
             return Ok(());
         }
+        HYDRATED_BRAINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let brain_id = self.load_or_create_metadata(name)?.brain_id;
         let initialization = self.load_or_create_initialization(name, brain_id)?;
         let mut events = self.read_events(name)?;
@@ -6450,7 +6507,11 @@ mod tests {
         let counted = store.count_unhydrated();
         let after = walk_paths(temp.path());
 
-        assert_eq!(counted, BRAINS);
+        assert_eq!(
+            counted, BRAINS,
+            "the count must be right before its side effects are interesting; \
+             root held {BRAINS} directories and the count was {counted}"
+        );
         assert_eq!(
             before,
             after,
@@ -6562,6 +6623,140 @@ mod tests {
             0,
             "a root that does not exist yet is zero Brains -- `load_all` \
              returns Ok on an unreadable root and the count must agree"
+        );
+    }
+
+    #[test]
+    fn test_counting_then_loading_still_hydrates_correctly_and_once() {
+        // Counting must not poison the loader: a Brain counted and then used
+        // has to hydrate normally, exactly once.
+        let temp = tempfile::tempdir().unwrap();
+        let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+        seeding.seed_history_for_test("shared", 6).unwrap();
+        drop(seeding);
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(store.count_unhydrated(), 1);
+        assert_eq!(store.resident_brain_count(), 0);
+
+        let first = store.snapshot("shared").unwrap();
+        let resident_after_first = store.resident_brain_count();
+        let second = store.snapshot("shared").unwrap();
+        let resident_after_second = store.resident_brain_count();
+
+        assert_eq!(
+            first.revision, 6,
+            "a Brain that was counted must still replay its whole journal when \
+             something actually needs it; got revision {}",
+            first.revision
+        );
+        assert_eq!(
+            second.revision, first.revision,
+            "and a second read must agree with the first"
+        );
+        assert_eq!(
+            resident_after_first, 1,
+            "the first use must hydrate the Brain the count skipped"
+        );
+        assert_eq!(
+            resident_after_second, resident_after_first,
+            "and the second use must not hydrate it again -- `ensure_loaded` \
+             early-returns on the resident map, which is what makes hydration \
+             exactly-once per store"
+        );
+
+        // Deliberately not asserted here: a delta on the process-global
+        // `HYDRATED_BRAINS`. libtest runs this file's tests concurrently and
+        // several of them hydrate, so any before/after difference on a global
+        // counter is a race. That counter's placement behind the early-return
+        // gate is covered where it can be observed in isolation -- by
+        // `tests/startup_time_to_ready.rs`, which reads it out of a whole
+        // separate process.
+    }
+
+    #[test]
+    fn test_counting_survives_a_brain_root_mutating_underneath_it() {
+        // `list_names_unhydrated` takes the resident-map read lock, releases
+        // it, then `read_dir`s. A Brain appearing or being hydrated between
+        // the two must not panic, double-count, or lose an existing name.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        for index in 0..40 {
+            std::fs::create_dir_all(root.join(format!("stable-{index:04}"))).unwrap();
+        }
+        let store = std::sync::Arc::new(BrainStore::with_root("box.local", Some(root.clone())));
+
+        let churn_root = root.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_stop = std::sync::Arc::clone(&stop);
+        let churn = std::thread::spawn(move || {
+            let mut index = 0u32;
+            while !churn_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let path = churn_root.join(format!("churn-{index:04}"));
+                let _ = std::fs::create_dir_all(&path);
+                let _ = std::fs::remove_dir_all(&path);
+                index = index.wrapping_add(1);
+            }
+        });
+
+        for _ in 0..200 {
+            let names = store.list_names_unhydrated();
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(
+                names, sorted,
+                "the count must stay sorted while the root changes underneath \
+                 it, because callers compare it against `list()`; got {names:?}"
+            );
+            let mut deduped = names.clone();
+            deduped.dedup();
+            assert_eq!(
+                names.len(),
+                deduped.len(),
+                "and must never report a name twice; got {names:?}"
+            );
+            for index in 0..40 {
+                let stable = format!("stable-{index:04}");
+                assert!(
+                    names.contains(&stable),
+                    "a Brain that never moved must be reported on every pass; \
+                     {stable} was missing from {names:?}"
+                );
+            }
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+    }
+
+    #[test]
+    fn test_the_count_is_stable_across_a_store_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+        for index in 0..9 {
+            seeding
+                .seed_history_for_test(&format!("brain-{index:04}"), 3)
+                .unwrap();
+        }
+        drop(seeding);
+
+        let first = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let before_restart = first.list_names_unhydrated();
+        drop(first);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let after_restart = restarted.list_names_unhydrated();
+
+        assert_eq!(
+            before_restart, after_restart,
+            "the Brain count is a fact about the filesystem, so a daemon \
+             restart must not change it -- if it does, /health's answer depends \
+             on daemon uptime"
+        );
+        assert_eq!(
+            restarted.resident_brain_count(),
+            0,
+            "and a restarted store must still not hydrate to answer it"
         );
     }
 
