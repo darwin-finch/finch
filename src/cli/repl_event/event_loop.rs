@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
 use crate::cli::conversation::{ConversationHistory, ToolRoundProgress, ToolRoundToken};
+use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
@@ -1808,6 +1809,39 @@ mod deferred_proposal_tests {
     }
 }
 
+fn start_interactive_program_output(
+    output_manager: &Arc<OutputManager>,
+) -> (Arc<WorkUnit>, VmOutputProjection) {
+    let output_unit = output_manager.start_work_unit("VM program output");
+    output_unit.set_pending_program_output();
+    let projection = VmOutputProjection::new(Arc::clone(output_manager), Arc::clone(&output_unit));
+    (output_unit, projection)
+}
+
+pub(super) fn complete_vm_output(output_unit: &WorkUnit) {
+    output_unit.flush_staged_program_diagnostic();
+    output_unit.set_complete();
+}
+
+fn complete_typed_program_output(
+    output_unit: &WorkUnit,
+    result: std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
+) {
+    match result {
+        Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {}
+        Ok(outcome) => {
+            let detail = outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            output_unit.append_program_diagnostic(&format!("VM error: {detail}"));
+        }
+        Err(error) => output_unit.append_program_diagnostic(&format!("VM error: {error}")),
+    }
+    output_unit.set_complete();
+}
+
 impl EventLoop {
     fn start_llm_worker(&mut self) {
         let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
@@ -3566,10 +3600,7 @@ Rules:\n\
         source_unit.set_program_source(language.as_str());
         source_unit.set_response(source.clone());
         source_unit.set_complete();
-        let output_unit = self.output_manager.start_work_unit("VM program output");
-        output_unit.set_pending_program_output();
-        let projection =
-            VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
+        let (output_unit, projection) = start_interactive_program_output(&self.output_manager);
         let event_tx = self.event_tx.clone();
         let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
             let _ = event_tx.send(ReplEvent::VmEffect {
@@ -4403,7 +4434,7 @@ Rules:\n\
             }
 
             ReplEvent::VmOutputComplete { output_unit } => {
-                output_unit.set_complete();
+                complete_vm_output(&output_unit);
                 self.render_tui().await?;
             }
 
@@ -4417,22 +4448,7 @@ Rules:\n\
                 output_unit,
                 result,
             } => {
-                match result {
-                    Ok(outcome)
-                        if outcome.status
-                            == crate::runtime::outcome::ExecutionStatus::Completed => {}
-                    Ok(outcome) => {
-                        let detail =
-                            outcome.diagnostics.first().cloned().unwrap_or_else(|| {
-                                format!("VM program ended as {:?}", outcome.status)
-                            });
-                        output_unit.append_program_diagnostic(&format!("VM error: {detail}"));
-                    }
-                    Err(error) => {
-                        output_unit.append_program_diagnostic(&format!("VM error: {error}"));
-                    }
-                }
-                output_unit.set_complete();
+                complete_typed_program_output(&output_unit, result);
                 self.render_tui().await?;
             }
 
@@ -8821,6 +8837,137 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    async fn project_direct_interactive_program(
+        source: &str,
+    ) -> (
+        crate::runtime::outcome::ExecutionOutcome,
+        std::sync::Arc<crate::cli::messages::WorkUnit>,
+    ) {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = std::sync::Arc::new(crate::cli::output_manager::OutputManager::default());
+        output.disable_stdout();
+        let (output_unit, projection) = super::start_interactive_program_output(&output);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let effect_tx = event_tx.clone();
+        let sink: crate::runtime::TypedEffectSink = std::sync::Arc::new(move |envelope| {
+            effect_tx
+                .send(crate::cli::repl_event::events::ReplEvent::VmEffect {
+                    projection: projection.clone(),
+                    envelope,
+                })
+                .expect("the direct interactive event receiver must remain live");
+        });
+        let submission = crate::runtime::ProgramSubmission {
+            language: crate::programs::ProgramLanguage::Lisp,
+            source_id: Some("interactive.lisp".into()),
+            source: source.into(),
+            intent: "interactive typed source".into(),
+            effect: crate::programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(runtime.revision()),
+            budget: None,
+        };
+        let outcome = runtime
+            .submit_with_deferred_program_effects(submission, sink)
+            .await
+            .expect("the direct interactive runtime boundary must return an outcome");
+        event_tx
+            .send(
+                crate::cli::repl_event::events::ReplEvent::TypedProgramComplete {
+                    output_unit: std::sync::Arc::clone(&output_unit),
+                    result: Ok(outcome.clone()),
+                },
+            )
+            .expect("the direct interactive completion receiver must remain live");
+
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                crate::cli::repl_event::events::ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    let projected = projection.project_envelope(envelope);
+                    assert_eq!(
+                        projected.len(),
+                        1,
+                        "each direct interactive effect must project exactly once: source={source:?} outcome={outcome:?}"
+                    );
+                }
+                crate::cli::repl_event::events::ReplEvent::TypedProgramComplete {
+                    output_unit,
+                    result,
+                } => super::complete_typed_program_output(&output_unit, result),
+                other => panic!(
+                    "direct interactive projection emitted an unexpected event: source={source:?} event={other:?}"
+                ),
+            }
+        }
+        (outcome, output_unit)
+    }
+
+    #[tokio::test]
+    async fn direct_interactive_event_loop_projects_successful_say_as_response() {
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+
+        let (outcome, output_unit) = project_direct_interactive_program("(say \"hello\")").await;
+        let row = output_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("successful direct interactive say must produce a transcript row");
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "successful direct interactive say must complete: outcome={outcome:?} row={row:?}"
+        );
+        assert_eq!(
+            output_unit.status(),
+            MessageStatus::Complete,
+            "the event-loop completion call site must terminalize successful say output: outcome={outcome:?} row={row:?}"
+        );
+        assert_eq!(
+            (row.kind, row.body),
+            (TranscriptRowKind::Response, vec!["hello".to_string()]),
+            "successful direct interactive say must project as assistant prose: outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_interactive_event_loop_keeps_emit_prefix_before_failure() {
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+
+        let (outcome, output_unit) =
+            project_direct_interactive_program("(begin (say \"visible first\\n\") (/ 1 0))").await;
+        let row = output_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("failed direct interactive output must produce a transcript row");
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Failed,
+            "division by zero must exercise the non-Completed event-loop call site: outcome={outcome:?} row={row:?}"
+        );
+        assert_eq!(
+            output_unit.status(),
+            MessageStatus::Complete,
+            "the existing direct completion contract must remain Complete after a VM failure: outcome={outcome:?} row={row:?}"
+        );
+        assert_eq!(
+            row.kind,
+            TranscriptRowKind::Output,
+            "an emit followed by direct VM failure must remain ordinary Program output: outcome={outcome:?} row={row:?}"
+        );
+        assert!(
+            row.body.first().is_some_and(|line| line == "visible first"),
+            "the emitted prefix must precede the direct diagnostic: outcome={outcome:?} row={row:?}"
+        );
+        assert!(
+            row.body
+                .iter()
+                .skip(1)
+                .any(|line| line.contains("VM error:") && line.contains("division by zero")),
+            "the direct failure must retain its actionable diagnostic after the emitted prefix: outcome={outcome:?} row={row:?}"
+        );
+    }
+
     /// Every systemic condition this runner can report must declare itself with
     /// `RUNNER_UNAVAILABLE_PREFIX`, so a replay pass aborts instead of paying a
     /// round trip per completed run. #254.

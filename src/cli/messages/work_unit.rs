@@ -172,6 +172,9 @@ struct WorkUnitInner {
     elapsed_at_finish: Option<std::time::Duration>,
     presentation: WorkUnitPresentation,
     program_output_semantics: ProgramOutputSemantics,
+    /// Byte offset of a provider diagnostic suffix that must remain after
+    /// any VM effects already queued ahead of its completion event.
+    staged_program_diagnostic_start: Option<usize>,
     /// Host/UI state distinct from the output body. A VM `output-status`
     /// must not erase prior `output-append`/`output-replace` content.
     transient_status: Option<String>,
@@ -232,6 +235,7 @@ impl WorkUnit {
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
                 program_output_semantics: ProgramOutputSemantics::Ordinary,
+                staged_program_diagnostic_start: None,
                 transient_status: None,
                 progress: None,
             })),
@@ -259,10 +263,9 @@ impl WorkUnit {
 
     /// Set the final response text (call after streaming ends).
     pub fn set_response(&self, text: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .response_text = text.into();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.response_text = text.into();
+        inner.staged_program_diagnostic_start = None;
     }
 
     /// Return a generation unit to ordinary assistant/tool presentation.
@@ -289,11 +292,13 @@ impl WorkUnit {
 
     /// Append a chunk to the response text (for partial updates).
     pub fn append_response(&self, text: &str) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .response_text
-            .push_str(text);
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(start) = inner.staged_program_diagnostic_start {
+            inner.response_text.insert_str(start, text);
+            inner.staged_program_diagnostic_start = Some(start + text.len());
+            return;
+        }
+        inner.response_text.push_str(text);
     }
 
     /// Render this unit as the exact program received from the provider.
@@ -312,6 +317,7 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
         inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        inner.staged_program_diagnostic_start = None;
     }
 
     /// Start an untitled VM response port whose producer will classify the
@@ -320,6 +326,7 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
         inner.program_output_semantics = ProgramOutputSemantics::Pending;
+        inner.staged_program_diagnostic_start = None;
     }
 
     /// Mark a pending response port as conversational `say` output. Ordinary
@@ -343,7 +350,30 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
         inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        inner.staged_program_diagnostic_start = None;
         inner.response_text.push_str(text);
+    }
+
+    /// Stage a provider diagnostic as an ordinary-output suffix. VM effects
+    /// delivered before the existing FIFO completion event are inserted ahead
+    /// of this suffix even when the worker finishes first.
+    pub(crate) fn stage_program_diagnostic(&self, text: &str) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        if inner.staged_program_diagnostic_start.is_none() {
+            inner.staged_program_diagnostic_start = Some(inner.response_text.len());
+        }
+        inner.response_text.push_str(text);
+    }
+
+    /// Commit the staged provider diagnostic after FIFO VM effects have been
+    /// projected. The visible text is already in final order.
+    pub(crate) fn flush_staged_program_diagnostic(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .staged_program_diagnostic_start = None;
     }
 
     /// Resolve a pending response port as host lifecycle output while leaving

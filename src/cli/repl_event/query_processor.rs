@@ -298,6 +298,15 @@ struct WireExecution {
     output_unit: Arc<crate::cli::messages::WorkUnit>,
 }
 
+fn enqueue_vm_output_complete(
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    output_unit: &Arc<crate::cli::messages::WorkUnit>,
+) {
+    let _ = event_tx.send(ReplEvent::VmOutputComplete {
+        output_unit: Arc::clone(output_unit),
+    });
+}
+
 /// What a turn produced, as distinct from the wire program that produced it.
 ///
 /// In its own module so the tuple field is unreachable from this one: the
@@ -423,9 +432,7 @@ async fn execute_wire_with_single_repair(
                 metric.terminal_failure = true;
             }
             record_wire_metric(metrics_logger, &metric);
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&output_unit),
-            });
+            enqueue_vm_output_complete(&event_tx, &output_unit);
             let effect_journal = runner_effect_records(&outcome);
             return WireExecution {
                 source_for_history: source,
@@ -453,13 +460,11 @@ async fn execute_wire_with_single_repair(
     metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
     metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
 
-    output_unit.append_program_diagnostic(&format!("VM wire error: {diagnostic}"));
+    output_unit.stage_program_diagnostic(&format!("VM wire error: {diagnostic}"));
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        let _ = event_tx.send(ReplEvent::VmOutputComplete {
-            output_unit: Arc::clone(&output_unit),
-        });
+        enqueue_vm_output_complete(&event_tx, &output_unit);
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -577,9 +582,7 @@ async fn execute_wire_with_single_repair(
                 metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
             }
             record_wire_metric(metrics_logger, &metric);
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&repair_output_unit),
-            });
+            enqueue_vm_output_complete(&event_tx, &repair_output_unit);
             WireExecution {
                 source_for_history: repaired_source,
                 response: outcome.output,
@@ -594,10 +597,8 @@ async fn execute_wire_with_single_repair(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            repair_output_unit.append_program_diagnostic(&format!("VM wire error: {detail}"));
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&repair_output_unit),
-            });
+            repair_output_unit.stage_program_diagnostic(&format!("VM wire error: {detail}"));
+            enqueue_vm_output_complete(&event_tx, &repair_output_unit);
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
@@ -609,10 +610,8 @@ async fn execute_wire_with_single_repair(
         }
         Err(error) => {
             let detail = format!("VM wire error: {error}");
-            repair_output_unit.append_program_diagnostic(&detail);
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&repair_output_unit),
-            });
+            repair_output_unit.stage_program_diagnostic(&detail);
+            enqueue_vm_output_complete(&event_tx, &repair_output_unit);
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
@@ -2293,6 +2292,16 @@ mod tests {
         started: tokio::sync::Notify,
     }
 
+    #[derive(Clone, Copy)]
+    enum RepairFixture {
+        Source(&'static str),
+        Error(&'static str),
+    }
+
+    struct FixtureRepairGenerator {
+        fixture: RepairFixture,
+    }
+
     #[async_trait::async_trait]
     impl Generator for SingleRepairGenerator {
         async fn generate(
@@ -2384,6 +2393,62 @@ mod tests {
 
         fn name(&self) -> &str {
             "blocking-repair"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for FixtureRepairGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let RepairFixture::Source(source) = self.fixture else {
+                let RepairFixture::Error(error) = self.fixture else {
+                    unreachable!("repair fixture variants are exhaustive")
+                };
+                anyhow::bail!(error);
+            };
+            Ok(crate::generators::GeneratorResponse {
+                text: source.to_string(),
+                content_blocks: vec![ContentBlock::text(source)],
+                tool_uses: Vec::new(),
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "fixture-repair".to_string(),
+                    model: "fixture-repair".to_string(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "fixture-repair"
         }
     }
 
@@ -2526,7 +2591,9 @@ mod tests {
                     projection.project_envelope(envelope);
                     emitted += 1;
                 }
-                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    crate::cli::repl_event::event_loop::complete_vm_output(&output_unit)
+                }
                 other => panic!("unexpected event: {other:?}"),
             }
         }
@@ -2786,6 +2853,198 @@ mod tests {
         assert!(!has_streamed_wire_source("  \n\t"));
     }
 
+    fn drain_provider_vm_events(event_rx: &mut mpsc::UnboundedReceiver<ReplEvent>) -> usize {
+        let mut projected = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    projected += projection.project_envelope(envelope).len();
+                }
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    crate::cli::repl_event::event_loop::complete_vm_output(&output_unit)
+                }
+                other => panic!("provider VM projection emitted an unexpected event: {other:?}"),
+            }
+        }
+        projected
+    }
+
+    #[tokio::test]
+    async fn empty_initial_and_repaired_provider_programs_remain_program_output() {
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+
+        let colors = crate::config::ColorScheme::default();
+        for (label, source, generator) in [
+            (
+                "initial",
+                "(+ 1 2)",
+                Arc::new(FixtureRepairGenerator {
+                    fixture: RepairFixture::Error("repair must not run"),
+                }) as Arc<dyn Generator>,
+            ),
+            (
+                "repaired",
+                "```lisp\n(say \"must not run\")\n```",
+                Arc::new(FixtureRepairGenerator {
+                    fixture: RepairFixture::Source("(+ 1 2)"),
+                }) as Arc<dyn Generator>,
+            ),
+        ] {
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let output = Arc::new(OutputManager::default());
+            output.disable_stdout();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let execution = execute_wire_with_single_repair(
+                &runtime,
+                Arc::clone(&output),
+                event_tx,
+                tokio_util::sync::CancellationToken::new(),
+                generator,
+                &[crate::claude::Message::user("return no output")],
+                source.to_string(),
+                None,
+                None,
+            )
+            .await;
+            let projected = drain_provider_vm_events(&mut event_rx);
+            let row = execution
+                .output_unit
+                .transcript_row(&colors)
+                .expect("an outputless provider program must retain a transcript row");
+            assert_eq!(
+                execution.response,
+                "",
+                "the {label} outputless program must exercise MissingOutputEffect: row={row:?} projected={projected}"
+            );
+            assert_eq!(
+                projected, 0,
+                "the {label} outputless program must not manufacture a say effect: row={row:?}"
+            );
+            assert_eq!(
+                row.kind,
+                TranscriptRowKind::Output,
+                "the {label} MissingOutputEffect terminal must remain ordinary Program output: row={row:?}"
+            );
+            assert_eq!(
+                execution.output_unit.status(),
+                MessageStatus::Complete,
+                "the {label} MissingOutputEffect terminal must complete through the FIFO output event: row={row:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_provider_effect_stays_before_staged_failure_diagnostic() {
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(FixtureRepairGenerator {
+            fixture: RepairFixture::Source("(begin (say \"repair prefix\\n\") (/ 1 0))"),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator,
+            &[crate::claude::Message::user("repair then fail")],
+            "```lisp\n(say \"must not run\")\n```".to_string(),
+            None,
+            None,
+        )
+        .await;
+
+        let before = execution.output_unit.content();
+        assert!(
+            before.starts_with("VM wire error:"),
+            "the worker must stage its diagnostic before the deliberately delayed event-loop drain: content={before:?} response={:?}",
+            execution.response
+        );
+        let projected = drain_provider_vm_events(&mut event_rx);
+        let row = execution
+            .output_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("failed repaired provider output must produce a transcript row");
+        assert_eq!(
+            projected, 1,
+            "the delayed repaired say prefix must project exactly once: row={row:?} response={:?}",
+            execution.response
+        );
+        assert_eq!(
+            row.kind,
+            TranscriptRowKind::Output,
+            "a repaired Ok(non-Completed) result must remain ordinary Program output: row={row:?} response={:?}",
+            execution.response
+        );
+        assert!(
+            row.body.first().is_some_and(|line| line == "repair prefix"),
+            "the delayed say effect must be inserted before the staged provider diagnostic: before={before:?} row={row:?} response={:?}",
+            execution.response
+        );
+        assert!(
+            row.body
+                .iter()
+                .skip(1)
+                .any(|line| line.contains("VM wire error:") && line.contains("division by zero")),
+            "the repaired non-Completed diagnostic must remain after its effect prefix: before={before:?} row={row:?} response={:?}",
+            execution.response
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_repaired_provider_source_remains_program_output() {
+        use crate::cli::messages::{Message, TranscriptRowKind};
+
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(FixtureRepairGenerator {
+            fixture: RepairFixture::Source("("),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            output,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator,
+            &[crate::claude::Message::user("return malformed repair")],
+            "```lisp\n(say \"must not run\")\n```".to_string(),
+            None,
+            None,
+        )
+        .await;
+        let projected = drain_provider_vm_events(&mut event_rx);
+        let row = execution
+            .output_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("malformed repaired provider source must produce a transcript row");
+        assert_eq!(
+            projected, 0,
+            "malformed repaired source must not project a VM effect: row={row:?} response={:?}",
+            execution.response
+        );
+        assert_eq!(
+            row.kind,
+            TranscriptRowKind::Output,
+            "the repaired Err call site must keep malformed-source diagnostics as ordinary Program output: row={row:?} response={:?}",
+            execution.response
+        );
+        assert!(
+            row.body
+                .iter()
+                .any(|line| line.contains("VM wire error:")),
+            "the malformed repaired-source diagnostic must remain visible: row={row:?} response={:?}",
+            execution.response
+        );
+    }
+
     #[tokio::test]
     async fn fenced_wire_response_is_repaired_once_without_executing_its_body() {
         let runtime = crate::runtime::ProgramRuntime::new();
@@ -2826,7 +3085,9 @@ mod tests {
                         projected += 1;
                     }
                 }
-                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    crate::cli::repl_event::event_loop::complete_vm_output(&output_unit)
+                }
                 other => panic!("wire execution emitted an unexpected event: {other:?}"),
             }
         }
