@@ -479,6 +479,8 @@ pub struct EventLoop {
                 + Sync,
         >,
     >,
+    #[cfg(test)]
+    checkpoint_path_override: Option<std::path::PathBuf>,
 }
 
 /// View mode for the REPL
@@ -2089,6 +2091,8 @@ impl EventLoop {
             llm_rx: Some(llm_rx),
             #[cfg(test)]
             effect_audit_test_wrapper: None,
+            #[cfg(test)]
+            checkpoint_path_override: None,
         }
     }
 
@@ -4251,6 +4255,10 @@ Rules:\n\
                 // A terminal provider failure has no later StreamingComplete.
                 // Release the turn so queued user input cannot wedge behind it.
                 if *self.active_query_id.read().await == Some(query_id) {
+                    if matches!(self.mode.read().await.clone(), ReplMode::Executing { .. }) {
+                        *self.mode.write().await = ReplMode::Normal;
+                        self.update_plan_mode_indicator(&ReplMode::Normal);
+                    }
                     *self.active_query_id.write().await = None;
                     if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
                         self.execute_query_inner(next, echo, chat_only).await?;
@@ -4516,15 +4524,28 @@ Rules:\n\
                 self.render_tui().await?;
                 tracing::debug!("[EVENT_LOOP] StreamingComplete handled, TUI rendered");
 
-                // Clear active query (query completed successfully)
-                {
+                // Clear and release only the query that actually owns the active turn. A late
+                // completion from an older query must not normalize or drain a newer turn.
+                let released_active_query = {
+                    let owns_active_query = *self.active_query_id.read().await == Some(query_id);
+                    if owns_active_query
+                        && matches!(self.mode.read().await.clone(), ReplMode::Executing { .. })
+                    {
+                        *self.mode.write().await = ReplMode::Normal;
+                        self.update_plan_mode_indicator(&ReplMode::Normal);
+                    }
                     let mut active = self.active_query_id.write().await;
                     if *active == Some(query_id) {
                         *active = None;
+                        true
+                    } else {
+                        false
                     }
-                }
-                if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
-                    self.execute_query_inner(next, echo, chat_only).await?;
+                };
+                if released_active_query {
+                    if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
+                        self.execute_query_inner(next, echo, chat_only).await?;
+                    }
                 }
                 // Record final response + save execution graph
                 if !is_executing_tools {
@@ -6905,6 +6926,10 @@ Rules:\n\
     }
 
     fn conversation_checkpoint_path(&self) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = &self.checkpoint_path_override {
+            return Some(path.clone());
+        }
         dirs::home_dir().map(|home| {
             home.join(".finch")
                 .join("sessions")
@@ -7134,52 +7159,10 @@ Rules:\n\
         let current_mode = self.mode.read().await.clone();
         self.update_plan_mode_indicator(&current_mode);
 
-        // ── Plan-approval fast path ───────────────────────────────────────────
-        // When the user just approved a PresentPlan, the mode is now Executing.
-        // The long planning exploration history confuses the model (it forgets the
-        // task and re-explores instead of implementing). Reset to a clean context
-        // with just the execution directive.
-        if matches!(current_mode, ReplMode::Executing { .. }) {
-            let plan_directive = results.iter().find_map(|result| {
-                if !result.is_error && result.content.starts_with("Plan approved by user.") {
-                    Some(result.content.clone())
-                } else {
-                    None
-                }
+        let approved_plan = matches!(current_mode, ReplMode::Executing { .. })
+            && results.iter().any(|result| {
+                !result.is_error && result.content.starts_with("Plan approved by user.")
             });
-
-            if let Some(directive) = plan_directive {
-                // Clear tool-call history so planning-phase reads/globs don't
-                // trigger loop detection when Claude calls them again during execution.
-                self.tool_call_history.write().await.remove(&query_id);
-
-                // Reset conversation to a single clear execution prompt.
-                let mut proposed_history = self.conversation.read().await.clone();
-                proposed_history.clear();
-                proposed_history.add_user_message(directive);
-                if let Err(error) = self.checkpoint_history(&proposed_history) {
-                    let _ = self.event_tx.send(ReplEvent::QueryFailed {
-                        query_id,
-                        error: format!(
-                            "Plan continuation was not sent because its checkpoint failed: {error:#}"
-                        ),
-                    });
-                    return Ok(());
-                }
-                *self.conversation.write().await = proposed_history;
-
-                let _ = self.llm_tx.send(LlmRequest::Query {
-                    id: query_id,
-                    text: String::new(),
-                    no_tools: false,
-                    admission: None,
-                    admission_ready: None,
-                    spawned: None,
-                    publication: None,
-                });
-                return Ok(());
-            }
-        }
 
         let checkpoint_path = self.conversation_checkpoint_path();
         let committed = commit_tool_round_and_continue(
@@ -7196,6 +7179,15 @@ Rules:\n\
                 error: format!("Tool continuation could not be admitted: {error}"),
             });
             return Ok(());
+        }
+
+        if approved_plan {
+            // Planning-phase inspections may legitimately be repeated while
+            // implementing. Reset only loop-detection metadata after the
+            // assistant ToolUse + user ToolResult pair is committed and the
+            // acknowledged continuation is published. Conversation history
+            // itself remains intact.
+            self.tool_call_history.write().await.remove(&query_id);
         }
 
         Ok(())
@@ -8819,6 +8811,343 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    struct UnusedPlanGenerator;
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for UnusedPlanGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            panic!("focused finalize fixture must not invoke a provider")
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            panic!("focused finalize fixture must not invoke streaming")
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: true,
+                    supports_conversation: true,
+                    max_context_messages: None,
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "unused-plan-generator"
+        }
+    }
+
+    fn plan_finalize_loop(temp: &tempfile::TempDir) -> super::EventLoop {
+        let executor = Arc::new(tokio::sync::Mutex::new(
+            crate::tools::executor::ToolExecutor::new(
+                crate::tools::registry::ToolRegistry::new(),
+                crate::tools::permissions::PermissionManager::new(),
+                temp.path().join("tool-patterns.json"),
+            )
+            .expect("plan finalize fixture must initialize its tool executor"),
+        ));
+        let generator: Arc<dyn crate::generators::Generator> = Arc::new(UnusedPlanGenerator);
+        let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+            generator,
+            Vec::new(),
+            executor,
+            Arc::new(crate::runtime::ProgramRuntime::new()),
+        );
+        event_loop.checkpoint_path_override = Some(temp.path().join("session.json"));
+        event_loop
+    }
+
+    async fn stage_approved_plan(
+        event_loop: &mut super::EventLoop,
+        temp: &tempfile::TempDir,
+    ) -> (uuid::Uuid, crate::cli::conversation::ToolRoundToken) {
+        let query_id = event_loop.query_states.create_query(Vec::new()).await;
+        let token = event_loop
+            .conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::claude::Message {
+                    role: "assistant".into(),
+                    content: vec![crate::claude::ContentBlock::ToolUse {
+                        id: "present-plan-1".into(),
+                        name: "present_plan".into(),
+                        input: serde_json::json!({"plan": "Implement the accepted plan."}),
+                    }],
+                },
+            )
+            .expect("fixture must stage the plan ToolUse");
+        let approved = Ok(
+            "Plan approved by user. Execute this plan step by step:\n\nImplement the accepted plan."
+                .to_string(),
+        );
+        event_loop
+            .conversation
+            .write()
+            .await
+            .record_tool_result(query_id, token, "present-plan-1", &approved)
+            .expect("fixture must complete the plan ToolResult");
+        assert!(
+            event_loop
+                .query_states
+                .begin_tool_execution(query_id, 1)
+                .await,
+            "fixture must enter ExecutingTools; state={:?}",
+            event_loop.query_states.get_state(query_id).await
+        );
+        *event_loop.mode.write().await = crate::cli::ReplMode::Executing {
+            task: "repair plan approval".into(),
+            plan_path: temp.path().join("plan.md"),
+            approved_at: chrono::Utc::now(),
+        };
+        *event_loop.active_query_id.write().await = Some(query_id);
+        (query_id, token)
+    }
+
+    #[tokio::test]
+    async fn issue_363_approved_plan_commits_history_and_acknowledges_continuation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+        let temp = tempfile::tempdir().expect("plan finalize test needs a temporary directory");
+        let mut event_loop = plan_finalize_loop(&temp);
+        let (query_id, token) = stage_approved_plan(&mut event_loop, &temp).await;
+        let (llm_tx, mut admitted) = admitting_llm_channel();
+        event_loop.llm_tx = llm_tx;
+
+        event_loop
+            .finalize_tool_execution(query_id, token)
+            .await
+            .expect("approved plan finalization must remain an event-loop operation");
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), admitted.recv())
+                .await
+                .expect("acknowledged continuation was not published within one second"),
+            Some(query_id),
+            "the admitted continuation must retain the active query identity"
+        );
+        assert!(
+            admitted.try_recv().is_err(),
+            "one approved tool round must publish exactly one continuation"
+        );
+        let messages = event_loop.conversation.read().await.get_messages();
+        assert_eq!(
+            messages.len(), 2,
+            "approval must commit the assistant ToolUse and matching user ToolResult without clearing history; history={messages:?}"
+        );
+        assert!(
+            matches!(messages[0].content.as_slice(), [crate::claude::ContentBlock::ToolUse { id, .. }] if id == "present-plan-1"),
+            "committed assistant history lost the exact present_plan call; history={messages:?}"
+        );
+        assert!(
+            matches!(messages[1].content.as_slice(), [crate::claude::ContentBlock::ToolResult { tool_use_id, content, .. }] if tool_use_id == "present-plan-1" && content.starts_with("Plan approved by user.")),
+            "committed user history lost the approved matching result; history={messages:?}"
+        );
+        let restored = crate::cli::conversation::ConversationHistory::load(
+            temp.path().join("session.json"),
+        )
+        .expect("acknowledged plan commit must be checkpointed");
+        assert_eq!(
+            serde_json::to_value(restored.get_messages()).expect("restored history serializes"),
+            serde_json::to_value(&messages).expect("live history serializes"),
+            "durable approved-plan history must equal the provider-visible live history"
+        );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue_363_unavailable_continuation_fails_visibly_and_drains_queue() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+        let temp = tempfile::tempdir().expect("plan failure test needs a temporary directory");
+        let mut event_loop = plan_finalize_loop(&temp);
+        let (query_id, token) = stage_approved_plan(&mut event_loop, &temp).await;
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(closed_rx);
+        event_loop.llm_tx = closed_tx;
+
+        event_loop
+            .finalize_tool_execution(query_id, token)
+            .await
+            .expect("channel failure must be converted into a query event");
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = event_loop
+                    .event_rx
+                    .recv()
+                    .await
+                    .expect("event channel closed before plan continuation failure");
+                if matches!(event, super::ReplEvent::QueryFailed { query_id: id, .. } if id == query_id)
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("closed continuation channel did not become terminal within one second");
+        let detail = match &failure {
+            super::ReplEvent::QueryFailed { error, .. } => error.clone(),
+            _ => unreachable!("loop filters for QueryFailed"),
+        };
+        assert!(
+            detail.contains("could not be admitted"),
+            "terminal failure must explain continuation admission, got {detail:?}"
+        );
+        event_loop
+            .pending_queries
+            .push_back(("queued after plan".into(), false, false));
+        let (next_tx, mut next_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_loop.llm_tx = next_tx;
+        event_loop
+            .handle_event(failure)
+            .await
+            .expect("terminal continuation failure must be renderable");
+        let next_request = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_rx.recv(),
+        )
+        .await
+        .expect("terminal plan failure did not drain the queued turn within one second")
+        .expect("queued-turn request channel closed unexpectedly");
+        let (next_id, next_text) = match next_request {
+            super::LlmRequest::Query { id, text, .. } => (id, text),
+        };
+        assert_ne!(
+            next_id, query_id,
+            "queued turn must receive a fresh query identity after terminal release"
+        );
+        assert_eq!(
+            next_text, "queued after plan",
+            "terminal release must drain the exact queued user turn"
+        );
+        assert_eq!(
+            *event_loop.active_query_id.read().await,
+            Some(next_id),
+            "old plan query must release exactly once before the queued turn becomes active"
+        );
+        assert!(
+            event_loop.pending_queries.is_empty(),
+            "queued turn must be removed exactly once after admission; queue={:?}",
+            event_loop.pending_queries
+        );
+        assert!(
+            matches!(&*event_loop.mode.read().await, crate::cli::ReplMode::Normal),
+            "failed approved-plan continuation must normalize mode before draining; mode={:?}",
+            event_loop.mode.read().await
+        );
+        assert!(
+            matches!(event_loop.query_states.get_state(query_id).await, Some(super::QueryState::Failed { ref error }) if error.contains("could not be admitted")),
+            "terminal state must retain actionable admission detail; state={:?}",
+            event_loop.query_states.get_state(query_id).await
+        );
+        let visible = event_loop
+            .output_manager
+            .get_messages()
+            .into_iter()
+            .map(|message| message.content())
+            .collect::<Vec<_>>();
+        assert!(
+            visible.iter().any(|line| line.contains("Query failed") && line.contains("could not be admitted")),
+            "continuation failure must be visible in transcript output; messages={visible:?}"
+        );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue_363_completed_continuation_normalizes_mode_and_drains_queue() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp =
+                    tempfile::tempdir().expect("completed plan test needs a temporary directory");
+                let mut event_loop = plan_finalize_loop(&temp);
+                let (query_id, token) = stage_approved_plan(&mut event_loop, &temp).await;
+                let (admission_tx, mut admitted) = admitting_llm_channel();
+                event_loop.llm_tx = admission_tx;
+                event_loop
+                    .finalize_tool_execution(query_id, token)
+                    .await
+                    .expect("approved plan must publish its continuation");
+                assert_eq!(
+                    admitted.recv().await,
+                    Some(query_id),
+                    "fixture must observe the acknowledged plan continuation"
+                );
+                assert!(
+                    event_loop
+                        .query_states
+                        .try_publish_completion(
+                            query_id,
+                            "implementation complete".into(),
+                            "(say \"implementation complete\")".into(),
+                            &event_loop.conversation,
+                        )
+                        .await,
+                    "completed continuation must publish before its terminal event; state={:?}",
+                    event_loop.query_states.get_state(query_id).await
+                );
+                event_loop
+                    .pending_queries
+                    .push_back(("queued after success".into(), false, false));
+                let (next_tx, mut next_rx) = tokio::sync::mpsc::unbounded_channel();
+                event_loop.llm_tx = next_tx;
+
+                event_loop
+                    .handle_event(super::ReplEvent::StreamingComplete {
+                        query_id,
+                        full_response: "implementation complete".into(),
+                    })
+                    .await
+                    .expect("completed plan continuation must terminalize in the event loop");
+
+                let next_request =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), next_rx.recv())
+                        .await
+                        .expect("successful plan terminalization did not drain the queue")
+                        .expect("queued request channel closed");
+                let (next_id, text) = match next_request {
+                    super::LlmRequest::Query { id, text, .. } => (id, text),
+                };
+                assert_ne!(
+                    next_id, query_id,
+                    "queued turn must not reuse the completed plan identity"
+                );
+                assert_eq!(text, "queued after success", "wrong queued turn drained");
+                assert_eq!(
+                    *event_loop.active_query_id.read().await,
+                    Some(next_id),
+                    "completed plan must release exactly once before the next turn becomes active"
+                );
+                assert!(
+                    event_loop.pending_queries.is_empty(),
+                    "successful plan completion must consume one queued turn; queue={:?}",
+                    event_loop.pending_queries
+                );
+                assert!(
+                    matches!(&*event_loop.mode.read().await, crate::cli::ReplMode::Normal),
+                    "successful plan completion must restore normal input mode; mode={:?}",
+                    event_loop.mode.read().await
+                );
+            })
+            .await;
+    }
+
     /// Every systemic condition this runner can report must declare itself with
     /// `RUNNER_UNAVAILABLE_PREFIX`, so a replay pass aborts instead of paying a
     /// round trip per completed run. #254.

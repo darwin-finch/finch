@@ -855,8 +855,27 @@ pub(super) async fn dispatch_tool_uses(
         .get_metadata(query_id)
         .await
         .and_then(|metadata| metadata.effect_audit);
-    let current_mode = mode.read().await;
+    let mut plan_boundary_crossed = false;
     for tool_use in tool_uses {
+        // `present_plan` is a control boundary, not an ordinary sibling tool.
+        // The model chose the remaining calls under the pre-review Planning
+        // authority, so they must receive results but must not execute after
+        // the user has changed (or declined to change) that authority.
+        if plan_boundary_crossed {
+            let label = format_tool_label(&tool_use.name, &tool_use.input);
+            let row_idx = work_unit.add_row(label);
+            work_unit.fail_row(row_idx, "superseded by plan review");
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                round_token,
+                tool_id: tool_use.id,
+                result: Err(anyhow::anyhow!(
+                    "Tool was not executed because present_plan is a serialized control boundary; submit it in the next provider turn if the reviewed mode allows it"
+                )),
+            });
+            continue;
+        }
+
         // Loop detection: a second identical (tool, input) call for this query means
         // the model is stuck; return a terminal error so it breaks out.
         //
@@ -896,6 +915,9 @@ pub(super) async fn dispatch_tool_uses(
         }
 
         // Plan-mode gate: block destructive tools while exploring
+        // Never retain the mode guard across an interactive handler. In
+        // particular, approving/rejecting `present_plan` writes this lock.
+        let current_mode = mode.read().await.clone();
         if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
             let label = format_tool_label(&tool_use.name, &tool_use.input);
             let row_idx = work_unit.add_row(label);
@@ -969,6 +991,7 @@ pub(super) async fn dispatch_tool_uses(
                 tool_id: tool_use.id.clone(),
                 result,
             });
+            plan_boundary_crossed = true;
         } else {
             // Regular tool: run concurrently in a background task
             tool_coordinator.spawn_tool_execution(
@@ -981,8 +1004,6 @@ pub(super) async fn dispatch_tool_uses(
             );
         }
     }
-    drop(current_mode);
-
     // Update memory status bar now that tools are queued
     if let Some(ref mem) = memory_system {
         status_bar.update_line(
@@ -2023,6 +2044,140 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn issue_363_present_plan_approval_returns_from_real_dispatch_without_deadlock() {
+        let temp = tempfile::tempdir().expect("plan approval fixture needs a temporary directory");
+        let colors = crate::config::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let tui = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "repair plan approval".into(),
+            plan_path: temp.path().join("plan.md"),
+            created_at: chrono::Utc::now(),
+        }));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states.create_query(Vec::new()).await;
+        let tool_use = ToolUse {
+            id: "present-plan-1".into(),
+            name: "present_plan".into(),
+            input: serde_json::json!({"plan": "Implement the approved change."}),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::claude::Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: tool_use.id.clone(),
+                        name: tool_use.name.clone(),
+                        input: tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("fixture must stage the provider's present_plan call");
+        assert!(
+            query_states.begin_tool_execution(query_id, 1).await,
+            "fixture must enter ExecutingTools before dispatch; state={:?}",
+            query_states.get_state(query_id).await
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let executor = Arc::new(tokio::sync::Mutex::new(
+            crate::tools::executor::ToolExecutor::new(
+                crate::tools::registry::ToolRegistry::new(),
+                crate::tools::permissions::PermissionManager::new(),
+                temp.path().join("tool-patterns.json"),
+            )
+            .expect("fixture tool executor must initialize"),
+        ));
+        let coordinator = super::super::tool_execution::ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            executor,
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+        let work_unit = output.start_work_unit("planning");
+        let active_tool_uses = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let tool_call_history = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let dispatch = tokio::spawn({
+            let mode = Arc::clone(&mode);
+            let work_unit = Arc::clone(&work_unit);
+            let tui = Arc::clone(&tui);
+            let output = Arc::clone(&output);
+            let query_states = Arc::clone(&query_states);
+            let active_tool_uses = Arc::clone(&active_tool_uses);
+            let tool_call_history = Arc::clone(&tool_call_history);
+            let status = Arc::clone(&status);
+            async move {
+                dispatch_tool_uses(
+                    vec![tool_use],
+                    query_id,
+                    round_token,
+                    &work_unit,
+                    &mode,
+                    &tool_call_history,
+                    &event_tx,
+                    &active_tool_uses,
+                    &tui,
+                    &output,
+                    &query_states,
+                    &coordinator,
+                    &None,
+                    crate::memory_status::Recall::none(),
+                    "plan-test",
+                    "/workspace",
+                    &status,
+                    0,
+                )
+                .await;
+            }
+        });
+
+        let response_tx = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("real dispatch did not publish the plan dialog within one second")
+                .expect("real dispatch event channel closed before plan dialog");
+            if let ReplEvent::ShowDialog { response_tx, .. } = event {
+                break response_tx;
+            }
+        };
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("plan dialog receiver disappeared before approval");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dispatch)
+            .await
+            .expect(
+                "approved present_plan deadlocked in dispatch; mode read/write ownership never released",
+            )
+            .expect("dispatch task panicked");
+        assert!(
+            matches!(&*mode.read().await, ReplMode::Executing { .. }),
+            "approval must transition Planning to Executing; mode={:?}",
+            mode.read().await
+        );
+        let result_events = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| matches!(event, ReplEvent::ToolResult { .. }))
+            .count();
+        assert_eq!(
+            result_events, 1,
+            "one approved present_plan dispatch must publish exactly one ToolResult; remaining events produced {result_events} results"
+        );
+    }
 
     #[test]
     fn streaming_requires_both_user_opt_in_and_provider_support() {
