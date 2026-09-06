@@ -22,7 +22,7 @@ mod status_bar;
 pub mod suggestions; // Contextual prompt suggestions (like Claude Code)
 pub mod tui; // Phase 2: Terminal UI
 
-pub use commands::handle_command;
+pub use commands::{handle_command, MOUSE_SELECTION_HINT};
 pub use conversation::ConversationHistory;
 pub use input::InputHandler;
 pub use llm_dialogs::{

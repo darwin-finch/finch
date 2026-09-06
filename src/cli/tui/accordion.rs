@@ -214,6 +214,15 @@ impl AccordionState {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
+        // Selection modifiers belong to the terminal, not transcript
+        // disclosure. iTerm2 uses Option and many xterm-compatible terminals
+        // use Shift to bypass application mouse reporting. Most such drags do
+        // not reach Finch at all; ignore them if a terminal does report one.
+        if mouse.modifiers.contains(KeyModifiers::ALT)
+            || mouse.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            return false;
+        }
         let Some(region) = self.hit_regions.iter().find(|region| {
             mouse.row >= region.top
                 && mouse.row <= region.bottom
@@ -405,6 +414,32 @@ mod tests {
             .render_message(&message, &colors)
             .iter()
             .any(|line| line.text.contains("one")));
+    }
+
+    #[test]
+    fn test_selection_modifiers_do_not_trigger_mouse_disclosure() {
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            let work = Arc::new(WorkUnit::new("response"));
+            work.set_response("selectable transcript text");
+            work.set_complete();
+            let message: MessageRef = work;
+            let colors = ColorScheme::default();
+            let mut state = AccordionState::default();
+            let lines = state.render_message(&message, &colors);
+            state.rebuild_hit_regions(&lines, 3, 80);
+            let region = state.hit_regions[0].clone();
+
+            assert!(!state.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.left,
+                row: region.top,
+                modifiers,
+            }));
+            assert!(state
+                .render_message(&message, &colors)
+                .iter()
+                .any(|line| line.text.contains("selectable transcript text")));
+        }
     }
 
     #[test]

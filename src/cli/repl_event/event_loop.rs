@@ -2886,9 +2886,12 @@ impl EventLoop {
                         // Suspend the inline TUI, run the full setup wizard,
                         // then resume.  The wizard manages its own terminal
                         // lifecycle (enable_raw_mode / alternate screen).
+                        let input_pause = crate::cli::tui::pause_input_task()
+                            .await
+                            .context("pause REPL input for setup wizard")?;
                         {
                             let tui = self.tui_renderer.lock().await;
-                            tui.suspend().ok();
+                            tui.suspend().context("release terminal for setup wizard")?;
                         }
                         let wizard_result =
                             tokio::task::spawn_blocking(crate::cli::setup_wizard::run_setup_wizard)
@@ -2928,8 +2931,10 @@ impl EventLoop {
                         // state is terminal, including cancellation and error recovery.
                         {
                             let mut tui = self.tui_renderer.lock().await;
-                            tui.resume().ok();
+                            tui.resume()
+                                .context("restore terminal after setup wizard")?;
                         }
+                        drop(input_pause);
                         self.render_tui().await?;
                     }
                     Command::SelfFix => {
