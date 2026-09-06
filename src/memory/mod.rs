@@ -2808,14 +2808,36 @@ mod tests {
         // returning — 131 MiB on the dogfood store, 3.25 s to first prompt.
         // Construction must return before the index is loaded.
         //
-        // Asserted by comparison rather than against a fixed threshold, and
-        // rather than against an immediate `Loading` status. The old assertion
-        // relied on a current-thread runtime being unable to poll the loader
-        // until the test awaited; under the flavor production actually runs,
-        // the loader may well have started, so that assertion was pinned to a
-        // configuration nothing ships. Timing the same store loaded both ways
-        // measures the property directly and cannot be satisfied by a blocking
-        // load.
+        // Asserted against hydration state, not against a wall-clock ratio.
+        //
+        // The ratio form (`backgrounded * 4 < blocking`) compared two timings
+        // taken on a runner executing ~2970 tests in parallel, so both terms
+        // were noisy and the quotient doubly so. It failed on an unrelated PR
+        // at 11.5ms against 41.6ms -- backgrounding was 3.6x faster and needed
+        // 4x, so the property held and the threshold did not.
+        //
+        // Asserted structurally first: did construction *delegate* the load,
+        // or perform it? `hydration_task` answers that with no clock in it,
+        // which is what the neighbouring
+        // `test_a_current_thread_runtime_loads_without_spawning_a_loader`
+        // already relies on.
+        //
+        // Three timing-based forms were tried here and each failed for its own
+        // reason. `backgrounded * 4 < blocking` is a quotient of two wall-clock
+        // measurements on a loaded runner; it failed in CI at 3.6x against a 4x
+        // threshold, with the property intact. `Loading { loaded: 0, .. }` --
+        // #273's original -- looks deterministic and is not: run alone, with
+        // both worker threads idle, the loader reliably lands two batches
+        // before this line, and it fails 5 times in 5 reporting
+        // `loaded: 1024`. It survives only inside the full suite, where
+        // contention starves the loader. That is a trap, not a margin.
+        //
+        // What remains uncovered, honestly: a construction that spawns the
+        // loader and then waits on it anyway reports a spawned task and a
+        // non-`Ready` status, and passes. That is a timing property with no
+        // structural signature, and the ratio only caught it 48 times in 50.
+        // Detecting it deterministically needs a gate the loader must pass,
+        // which is a larger change than this flake fix.
         const NODES: u64 = 4 * HYDRATION_BATCH as u64;
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
@@ -2841,15 +2863,19 @@ mod tests {
         .expect("blocking construction thread");
 
         // The backgrounded one.
-        let started = std::time::Instant::now();
         let reopened = MemorySystem::new(config)?;
-        let backgrounded = started.elapsed();
+        let status = reopened.hydration_status();
 
         assert!(
-            backgrounded * 4 < blocking,
-            "construction must return before the index is loaded: backgrounded \
-             {backgrounded:?} against a blocking load of {blocking:?} for the \
-             same {NODES}-node store"
+            reopened.hydration_task.is_some(),
+            "construction must delegate the load to a spawned task rather than \
+             perform it: no loader was spawned, and the no-runtime arm shows \
+             this store takes {blocking:?} to load synchronously"
+        );
+        assert!(
+            !matches!(status, HydrationStatus::Ready { .. }),
+            "construction must return before the load finishes; it was already \
+             complete when `new` returned: status {status:?} for {NODES} nodes"
         );
 
         // And it must still complete, with every node present.
