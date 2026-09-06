@@ -252,7 +252,8 @@ mod disabled_training_tests {
             "fallback-boundary".into(),
             initialization,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(ambient_input_calls.load(Ordering::SeqCst), 0);
         repl.conversation_logger = Arc::new(tokio::sync::Mutex::new(
             crate::logging::ConversationLogger::new(legacy_conversations.clone()).unwrap(),
@@ -605,7 +606,7 @@ impl Repl {
         metrics_logger: MetricsLogger,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
         session_label: String,
-    ) -> Self {
+    ) -> Result<Self> {
         let initialization = ReplInitialization::from_user_environment(&config);
         Self::new_with_initialization(
             config,
@@ -627,7 +628,7 @@ impl Repl {
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
         session_label: String,
         initialization: ReplInitialization,
-    ) -> Self {
+    ) -> Result<Self> {
         let ReplInitialization {
             is_interactive,
             input_handler_factory,
@@ -1058,9 +1059,22 @@ impl Repl {
                 Ok(renderer) => {
                     // Set global TUI renderer for Menu dialogs (Phase 5)
                     use crate::cli::global_output::set_global_tui_renderer;
-                    set_global_tui_renderer(renderer);
+                    if let Err(error) = set_global_tui_renderer(renderer) {
+                        output_status!("⚠️  Failed to publish TUI renderer: {}", error);
+                        output_status!("   Terminal remains fail-closed until cleanup retry");
+                    }
                 }
                 Err(e) => {
+                    crate::cli::tui::recover_terminal_after_failed_activation().with_context(
+                        || {
+                            format!(
+                                "Failed to initialize TUI ({e}); automatic terminal recovery failed"
+                            )
+                        },
+                    )?;
+                    // Only an exact successful repair authorizes stdout again.
+                    // This is the production constructor fallback boundary.
+                    output_manager.enable_stdout();
                     output_status!("⚠️  Failed to initialize TUI: {}", e);
                     output_status!("   Falling back to standard output mode");
                 }
@@ -1113,7 +1127,7 @@ impl Repl {
             }
         };
 
-        Self {
+        Ok(Self {
             _config: config,
             claude_client,
             daemon_client,
@@ -1172,7 +1186,7 @@ impl Repl {
             context_recall_k,
             enable_summarization,
             auto_compact_enabled,
-        }
+        })
     }
 
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).

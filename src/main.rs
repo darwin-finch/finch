@@ -1095,7 +1095,13 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(finch::brain::names::generate);
 
-    let mut repl = Repl::new(
+    // Install the binary-only signal transport before terminal activation.
+    // TuiRenderer::new arms it transactionally with the terminal session, and
+    // renderer cleanup restores the embedding host's prior handlers before the
+    // session becomes replaceable.
+    let _terminal_session = finch::cli::tui::BinaryTerminalSession::install()
+        .context("Failed to install terminal signal ownership")?;
+    let repl_result = Repl::new(
         config,
         claude_client,
         router,
@@ -1104,7 +1110,90 @@ async fn main() -> Result<()> {
         brain_name,
     )
     .await;
-
+    #[cfg(unix)]
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_ASSERT_DIRTY_CONSTRUCTION").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        anyhow::ensure!(
+            repl_result.is_err()
+                && finch::cli::tui::supervised_terminal_cleanup_owner_is_retained()?,
+            "dirty Repl construction did not retain fail-closed terminal repair ownership"
+        );
+    }
+    let mut repl = repl_result?;
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_RETURN_AFTER_CONSTRUCTION").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_QUIT_SAME_THREAD_GATE").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        finch::cli::tui::supervised_exit_while_holding_terminal_gate(23)?;
+    }
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_AFTER_ACTIVE").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        #[cfg(unix)]
+        finch::cli::tui::supervised_publish_terminal_bytes(b"FINCH_MAIN_PANIC_ARMED")?;
+        #[cfg(unix)]
+        if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_CLEANUP_OWNER").is_some() {
+            finch::cli::tui::supervised_panic_while_owning_terminal_cleanup();
+        }
+        #[cfg(unix)]
+        if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_SAME_THREAD_GATE").is_some() {
+            finch::cli::tui::supervised_panic_while_holding_terminal_gate();
+        }
+        if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_GATE_HELD").is_some() {
+            finch::cli::tui::supervised_set_terminal_writer_gate_pause(true)?;
+            std::thread::spawn(|| {
+                let _ = finch::cli::tui::supervised_publish_terminal_bytes(b"FINCH_PANIC_FRAME");
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !finch::cli::tui::supervised_terminal_writer_gate_is_paused()? {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "panic probe writer did not acquire terminal gate"
+                );
+                std::thread::yield_now();
+            }
+            if std::env::var_os("FINCH_TEST_TUI_MAIN_PANIC_GATE_PERMANENT").is_none() {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let _ = finch::cli::tui::supervised_set_terminal_writer_gate_pause(false);
+                });
+            }
+        }
+        panic!("supervised panic after Finch terminal activation");
+    }
+    #[cfg(unix)]
+    if std::env::var_os("FINCH_TEST_TUI_MAIN_IPC_QUIT_RETRY").is_some()
+        && matches!(finch::brain::isolated_test_proof_if_present(), Ok(Some(_)))
+    {
+        finch::cli::tui::supervised_set_signal_transition_stall(true)?;
+        std::thread::spawn(|| {
+            while !finch::cli::tui::supervised_signal_transition_stall_is_observed()
+                .unwrap_or(false)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if let Some(fd) = std::env::var("FINCH_TEST_TERMINAL_CONTROL_FD")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+            {
+                let marker = b'S';
+                unsafe {
+                    nix::libc::write(fd, (&marker as *const u8).cast(), 1);
+                }
+            }
+            // Outlive the first 500ms quit cleanup attempt. Releasing the
+            // transition publishes progress; the already-latched watcher must
+            // retry without another ControlMessage.
+            std::thread::sleep(std::time::Duration::from_millis(550));
+            let _ = finch::cli::tui::supervised_set_signal_transition_stall(false);
+        });
+    }
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
         args.resume.as_deref().and_then(|uuid| {
@@ -1170,14 +1259,13 @@ async fn main() -> Result<()> {
 fn install_panic_handler() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Emergency terminal cleanup
-        use crossterm::{cursor, execute, terminal};
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            cursor::Show,
-            terminal::Clear(terminal::ClearType::FromCursorDown)
-        );
+        // The restore helper latches termination and uses one absolute
+        // deadline. Under the supported scheduler/kernel progress model it
+        // safely revokes a pre-effect application stall and restores exactly;
+        // outside that model it leaves the generation fail-closed. The hook
+        // must still return to Rust's bounded panic policy instead of parking
+        // the process forever.
+        let _ = finch::cli::tui::restore_terminal_before_termination();
 
         // Call the default panic handler
         default_panic(info);
@@ -2546,8 +2634,6 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
     use finch::cli::chatgpt_auth::{
         render_status_line, save_named_credential, ChatGptAuthService, DeviceLoginPresentation,
     };
-    use tokio_util::sync::CancellationToken;
-
     let service = ChatGptAuthService::production()?;
     match command {
         AuthCommand::Status {

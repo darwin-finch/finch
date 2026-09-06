@@ -48,6 +48,19 @@ jobs:
     - name: Verify clean-checkout formatting
       run: cargo fmt --all -- --check
 
+  windows-terminal-actor-probe:
+    name: Portable terminal actor probe (Windows stdout unsupported)
+    runs-on: windows-2025
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+
+    - name: Test exact portable terminal actor (real console remains acceptance-gated)
+      run: cargo test --manifest-path .github/issue-264-windows-probe/Cargo.toml -- --nocapture
+
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
     runs-on: ${{ matrix.os }}
@@ -110,6 +123,10 @@ jobs:
 
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+
+    - name: Run supervised PTY terminal lifecycle regressions
+      if: matrix.feature_name == 'default'
+      run: ./scripts/test_brains.sh cargo test --test tui_integration_test -- --nocapture
 
     - name: Verify binary reports its version
       # Exercise Cargo's default binary selection so adding a test-only binary
