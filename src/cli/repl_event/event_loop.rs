@@ -75,6 +75,50 @@ fn is_outputless_forth_say_mismatch(outcome: &crate::runtime::outcome::Execution
         && outcome.effect_journal.is_empty()
 }
 
+fn enrich_outputless_interactive_forth_diagnostic(
+    language: crate::programs::ProgramLanguage,
+    source_id: &str,
+    source: Option<&str>,
+    outcome: &mut crate::runtime::outcome::ExecutionOutcome,
+    lookup: impl FnOnce(
+        u64,
+    )
+        -> anyhow::Result<Option<crate::runtime::InteractiveForthDiagnosticSignatures>>,
+) {
+    if language != crate::programs::ProgramLanguage::Forth
+        || source_id != "interactive.forth"
+        || source.is_none_or(|source| source.len() > 4 * 1024)
+        || !is_outputless_forth_say_mismatch(outcome)
+    {
+        return;
+    }
+    let source = source.expect("bounded source checked above");
+    let evidence = lookup(outcome.input_revision).ok().flatten();
+    let mut active_signatures = std::collections::BTreeMap::new();
+    if let Some(evidence) = evidence.filter(|evidence| evidence.revision == outcome.input_revision)
+    {
+        if let Some(signature) = evidence.plus {
+            active_signatures.insert("+".to_string(), signature.to_string());
+        }
+        if let Some(signature) = evidence.int_to_string {
+            active_signatures.insert("int-to-string".to_string(), signature.to_string());
+        }
+    }
+    for diagnostic in &mut outcome.vm_diagnostics {
+        crate::vm::frontend::forth::enrich_interactive_say_mismatch(
+            source_id,
+            source,
+            diagnostic,
+            &active_signatures,
+        );
+    }
+    if let Some(rendered) = outcome.vm_diagnostics.iter().find_map(|diagnostic| {
+        crate::vm::diagnostic::render_interactive_forth_say_mismatch(diagnostic, source_id, source)
+    }) {
+        outcome.diagnostics.insert(0, rendered);
+    }
+}
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
@@ -3591,6 +3635,7 @@ Rules:\n\
             });
         });
         let source_id = format!("interactive.{}", language.as_str());
+        let diagnostic_language = language;
         let diagnostic_source_id = source_id.clone();
         // The diagnostic path must not retain another unbounded copy of an
         // interactive program. The reported reproduction is tiny; oversized
@@ -3624,44 +3669,13 @@ Rules:\n\
             .await;
             let result = match result {
                 Ok(mut outcome) => {
-                    if is_outputless_forth_say_mismatch(&outcome) {
-                        let active_signatures = runtime
-                            .inspect()
-                            .await
-                            .ok()
-                            .map(|snapshot| {
-                                snapshot
-                                    .typed_vocabulary
-                                    .into_iter()
-                                    .filter(|entry| {
-                                        matches!(entry.name.as_str(), "+" | "int-to-string")
-                                    })
-                                    .filter_map(|entry| {
-                                        entry.signature.map(|signature| (entry.name, signature))
-                                    })
-                                    .collect::<std::collections::BTreeMap<_, _>>()
-                            })
-                            .unwrap_or_default();
-                        for diagnostic in &mut outcome.vm_diagnostics {
-                            crate::vm::frontend::forth::enrich_interactive_say_mismatch(
-                                &diagnostic_source_id,
-                                diagnostic_source.as_deref().unwrap_or(""),
-                                diagnostic,
-                                &active_signatures,
-                            );
-                        }
-                        if let Some(rendered) =
-                            outcome.vm_diagnostics.iter().find_map(|diagnostic| {
-                                crate::vm::diagnostic::render_interactive_forth_say_mismatch(
-                                    diagnostic,
-                                    &diagnostic_source_id,
-                                    diagnostic_source.as_deref().unwrap_or(""),
-                                )
-                            })
-                        {
-                            outcome.diagnostics.insert(0, rendered);
-                        }
-                    }
+                    enrich_outputless_interactive_forth_diagnostic(
+                        diagnostic_language,
+                        &diagnostic_source_id,
+                        diagnostic_source.as_deref(),
+                        &mut outcome,
+                        |revision| runtime.interactive_forth_diagnostic_signatures(revision),
+                    );
                     Ok(outcome)
                 }
                 Err(error) => Err(error.to_string()),
@@ -8934,6 +8948,128 @@ mod tests {
 
         fn name(&self) -> &str {
             "unused-interactive-diagnostic-provider"
+        }
+    }
+
+    #[test]
+    fn test_interactive_diagnostic_rejects_language_source_id_and_oversize_before_lookup() {
+        let diagnostics = crate::vm::frontend::forth::compile_forth(
+            "interactive.forth",
+            "3 4 + say",
+            Vec::new(),
+            &crate::vm::core_vocabulary(),
+        )
+        .expect_err("fixture should produce the eligible base mismatch");
+        let mut base = crate::runtime::outcome::ExecutionOutcome::failed(
+            uuid::Uuid::new_v4(),
+            23,
+            crate::programs::ExecutionEffect::Unclassified,
+            crate::runtime::outcome::ExecutionBackend::TypedVm,
+            diagnostics[0].to_string(),
+            0,
+        );
+        base.vm_diagnostics = diagnostics;
+        let oversized = "x".repeat(4 * 1024 + 1);
+        for (name, language, source_id, source) in [
+            (
+                "language",
+                crate::programs::ProgramLanguage::Lisp,
+                "interactive.forth",
+                "3 4 + say",
+            ),
+            (
+                "source-id",
+                crate::programs::ProgramLanguage::Forth,
+                "provider-response.forth",
+                "3 4 + say",
+            ),
+            (
+                "oversized-source",
+                crate::programs::ProgramLanguage::Forth,
+                "interactive.forth",
+                oversized.as_str(),
+            ),
+        ] {
+            let mut outcome = base.clone();
+            let before = serde_json::to_value(&outcome)
+                .expect("base mismatch should be serializable before rejection");
+            super::enrich_outputless_interactive_forth_diagnostic(
+                language,
+                source_id,
+                Some(source),
+                &mut outcome,
+                |_| panic!("{name} rejection invoked runtime vocabulary lookup"),
+            );
+            assert_eq!(
+                serde_json::to_value(&outcome)
+                    .expect("rejected mismatch should remain serializable"),
+                before,
+                "{name} rejection altered the base outcome before lookup; outcome={outcome:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interactive_diagnostic_omits_unproven_facts_for_stale_or_missing_signatures() {
+        let diagnostics = crate::vm::frontend::forth::compile_forth(
+            "interactive.forth",
+            "3 4 + say",
+            Vec::new(),
+            &crate::vm::core_vocabulary(),
+        )
+        .expect_err("fixture should produce the eligible base mismatch");
+        let mut base = crate::runtime::outcome::ExecutionOutcome::failed(
+            uuid::Uuid::new_v4(),
+            31,
+            crate::programs::ExecutionEffect::Unclassified,
+            crate::runtime::outcome::ExecutionBackend::TypedVm,
+            diagnostics[0].to_string(),
+            0,
+        );
+        base.vm_diagnostics = diagnostics;
+        let base_vm_diagnostics = base.vm_diagnostics.clone();
+        let core = crate::vm::core_vocabulary();
+        let cases = [
+            (
+                "revision-mismatch",
+                crate::runtime::InteractiveForthDiagnosticSignatures {
+                    revision: 30,
+                    plus: core.get("+").cloned(),
+                    int_to_string: core.get("int-to-string").cloned(),
+                },
+            ),
+            (
+                "missing-signatures",
+                crate::runtime::InteractiveForthDiagnosticSignatures {
+                    revision: 31,
+                    plus: None,
+                    int_to_string: None,
+                },
+            ),
+        ];
+        for (name, evidence) in cases {
+            let mut outcome = base.clone();
+            super::enrich_outputless_interactive_forth_diagnostic(
+                crate::programs::ProgramLanguage::Forth,
+                "interactive.forth",
+                Some("3 4 + say"),
+                &mut outcome,
+                |_| Ok(Some(evidence)),
+            );
+            assert_eq!(
+                outcome.vm_diagnostics, base_vm_diagnostics,
+                "{name} mutated the base structured failure without current evidence; outcome={outcome:#?}"
+            );
+            let rendered = outcome
+                .diagnostics
+                .first()
+                .expect("eligible failure should retain a bounded consumer diagnostic");
+            assert!(
+                rendered.contains("`say` expected string, but received int")
+                    && !rendered.contains("produced by `+`")
+                    && !rendered.contains("Hint:"),
+                "{name} presented unproven provenance or correction; rendered={rendered:?} outcome={outcome:#?}"
+            );
         }
     }
 

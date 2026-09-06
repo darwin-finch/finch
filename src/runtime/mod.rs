@@ -19,8 +19,8 @@ use crate::vm::vocabulary::{
 use crate::vm::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
     CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
-    CapabilityRequirement, EffectSet, GrantScope, ResourceSelector, SourceOrigin, Type,
-    TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue,
+    CapabilityRequirement, EffectSet, GrantScope, ResourceSelector, SourceOrigin, StackSignature,
+    Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue,
     VmDiagnostic, VmSideEffect,
 };
 use anyhow::{bail, Context, Result};
@@ -386,6 +386,16 @@ pub struct ProgramRuntime {
     /// the UI. Approval and resumption use this exact verified program state.
     pending_typed: Mutex<HashMap<uuid::Uuid, PendingTypedExecution>>,
     revision_history: Mutex<Vec<VmRevisionSnapshot>>,
+}
+
+/// Constant-size vocabulary evidence for the narrow interactive Forth
+/// diagnostic. This deliberately cannot carry stack values, documentation,
+/// host metadata, or arbitrary vocabulary entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InteractiveForthDiagnosticSignatures {
+    pub(crate) revision: u64,
+    pub(crate) plus: Option<StackSignature>,
+    pub(crate) int_to_string: Option<StackSignature>,
 }
 
 /// Host-owned socket metadata. Finch source sees only the opaque resource
@@ -2468,6 +2478,25 @@ impl ProgramRuntime {
         self.revision.load(Ordering::Acquire)
     }
 
+    /// Read only the two signatures needed to justify issue #353's
+    /// interactive diagnostic. Revision and vocabulary are observed while the
+    /// same typed-runtime lock is held; stale callers receive no evidence.
+    pub(crate) fn interactive_forth_diagnostic_signatures(
+        &self,
+        expected_revision: u64,
+    ) -> Result<Option<InteractiveForthDiagnosticSignatures>> {
+        let typed = self
+            .typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
+        let revision = self.revision();
+        Ok(lookup_interactive_forth_diagnostic_signatures(
+            typed.vocabulary(),
+            revision,
+            expected_revision,
+        ))
+    }
+
     /// Install a newer application-owned reducible checkpoint without
     /// replacing this frontend's host authority or resource bindings. The
     /// submission gate makes hydration mutually exclusive with ProgramRun
@@ -3404,6 +3433,21 @@ impl ProgramRuntime {
         .await?;
         Ok((runtime, execution))
     }
+}
+
+fn lookup_interactive_forth_diagnostic_signatures(
+    vocabulary: &crate::vm::Vocabulary,
+    revision: u64,
+    expected_revision: u64,
+) -> Option<InteractiveForthDiagnosticSignatures> {
+    if revision != expected_revision {
+        return None;
+    }
+    Some(InteractiveForthDiagnosticSignatures {
+        revision,
+        plus: vocabulary.get("+").cloned(),
+        int_to_string: vocabulary.get("int-to-string").cloned(),
+    })
 }
 
 struct TypedHostHandler {
@@ -8970,6 +9014,94 @@ mod tests {
             expected_revision: None,
             budget: None,
         }
+    }
+
+    #[test]
+    fn test_interactive_forth_signature_lookup_is_exact_bounded_and_revision_aware() {
+        let mut vocabulary = crate::vm::core_vocabulary();
+        let decoy = vocabulary
+            .get("+")
+            .expect("core vocabulary should define +")
+            .clone();
+        for index in 0..4_096 {
+            vocabulary.insert(format!("decoy-{index}"), decoy.clone());
+        }
+
+        let evidence = lookup_interactive_forth_diagnostic_signatures(&vocabulary, 17, 17)
+            .expect("matching revision should return bounded signature evidence");
+        assert!(
+            evidence.revision == 17
+                && evidence.plus.as_ref() == vocabulary.get("+")
+                && evidence.int_to_string.as_ref() == vocabulary.get("int-to-string"),
+            "lookup did not return exactly the two named signatures; evidence={evidence:#?} vocabulary_len={}",
+            vocabulary.len()
+        );
+        assert!(
+            lookup_interactive_forth_diagnostic_signatures(&vocabulary, 18, 17).is_none(),
+            "stale revision unexpectedly received vocabulary evidence"
+        );
+
+        vocabulary.remove("int-to-string");
+        let missing = lookup_interactive_forth_diagnostic_signatures(&vocabulary, 17, 17)
+            .expect("a missing optional word should preserve bounded evidence for the revision");
+        assert!(
+            missing.plus.is_some() && missing.int_to_string.is_none(),
+            "missing word was invented or unrelated evidence was lost; evidence={missing:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interactive_forth_signature_lookup_ignores_large_persistent_state() {
+        let runtime = ProgramRuntime::new();
+        let definitions = (0..128)
+            .map(|index| format!(": diagnostic-decoy-{index} ( S -- S int ! pure ) {index} ;"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stack_values = (0..512)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!("{definitions} {stack_values}");
+        let completed = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                &source,
+                ExecutionEffect::Unclassified,
+            ))
+            .await
+            .expect("large persistent typed state should execute without a provider");
+        assert_eq!(
+            completed.status,
+            ExecutionStatus::Completed,
+            "large persistent fixture did not commit; diagnostics={:?}",
+            completed.vm_diagnostics
+        );
+        {
+            let typed = runtime
+                .typed
+                .lock()
+                .expect("large persistent typed state lock should remain healthy");
+            assert!(
+                typed.stack().len() >= 512 && typed.vocabulary().len() >= 128,
+                "fixture did not establish a large persistent stack/vocabulary; stack_len={} vocabulary_len={}",
+                typed.stack().len(),
+                typed.vocabulary().len()
+            );
+        }
+
+        let evidence = runtime
+            .interactive_forth_diagnostic_signatures(completed.output_revision)
+            .expect("constant-size lookup should read large persistent state")
+            .expect("matching persistent revision should return evidence");
+        assert!(
+            evidence.plus.is_some() && evidence.int_to_string.is_some(),
+            "large unrelated state changed the exact two-word lookup; evidence={evidence:#?}"
+        );
+        assert!(
+            std::mem::size_of_val(&evidence) <= 2_048,
+            "lookup result is not structurally constant-size; result_bytes={} evidence={evidence:#?}",
+            std::mem::size_of_val(&evidence)
+        );
     }
 
     #[tokio::test]
