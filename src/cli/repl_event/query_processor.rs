@@ -971,6 +971,11 @@ pub(super) async fn dispatch_tool_uses(
             });
         } else {
             // Regular tool: run concurrently in a background task
+            let cancellation_token = query_states
+                .get_metadata(query_id)
+                .await
+                .map(|metadata| metadata.cancellation_token)
+                .unwrap_or_else(CancellationToken::new);
             tool_coordinator.spawn_tool_execution(
                 query_id,
                 round_token,
@@ -978,6 +983,7 @@ pub(super) async fn dispatch_tool_uses(
                 Arc::clone(work_unit),
                 row_idx,
                 effect_audit.clone(),
+                cancellation_token,
             );
         }
     }
@@ -2024,9 +2030,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn dispatch_canonical_enter_plan_mode(
-        initial_mode: ReplMode,
-    ) -> (usize, anyhow::Result<String>, Vec<String>, ReplMode) {
+    struct PlanDispatchObservation {
+        approvals: usize,
+        calls_started: usize,
+        results: usize,
+        result: anyhow::Result<String>,
+        events: Vec<String>,
+        final_mode: ReplMode,
+        active_tools: usize,
+        injected_plans_dir: std::path::PathBuf,
+    }
+
+    async fn dispatch_canonical_enter_plan_mode(initial_mode: ReplMode) -> PlanDispatchObservation {
         use crate::tools::executor::ToolExecutor;
         use crate::tools::implementations::EnterPlanModeTool;
         use crate::tools::permissions::{PermissionManager, PermissionRule};
@@ -2034,7 +2049,10 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("create isolated plan-tool test directory");
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(EnterPlanModeTool));
+        let injected_plans_dir = temp.path().join("plans");
+        registry.register(Box::new(EnterPlanModeTool::with_plans_dir(
+            &injected_plans_dir,
+        )));
         registry.register_alias("EnterPlanMode", "enter_plan_mode");
         let executor = ToolExecutor::new(
             registry,
@@ -2044,9 +2062,7 @@ mod tests {
         .expect("create real tool executor for plan-mode dispatch regression");
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let output_manager = Arc::new(OutputManager::new(
-            crate::config::ColorScheme::default(),
-        ));
+        let output_manager = Arc::new(OutputManager::new(crate::config::ColorScheme::default()));
         output_manager.disable_stdout();
         let status_bar = Arc::new(StatusBar::new());
         let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
@@ -2090,13 +2106,14 @@ mod tests {
             .expect("stage canonical enter_plan_mode tool round");
         let work_unit = Arc::new(crate::cli::messages::WorkUnit::new("Testing"));
 
+        let active_tools = Arc::new(RwLock::new(std::collections::HashMap::new()));
         dispatch_tool_uses(
             vec![tool_use],
             query_id,
             round_token,
             &work_unit,
             &mode,
-            &Arc::new(RwLock::new(std::collections::HashMap::new())),
+            &active_tools,
             &event_tx,
             &Arc::new(RwLock::new(std::collections::HashMap::new())),
             &tui_renderer,
@@ -2113,11 +2130,14 @@ mod tests {
         .await;
 
         let mut approvals = 0;
+        let mut calls_started = 0;
+        let mut results = 0;
         let mut observed = Vec::new();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match event_rx.recv().await.expect("tool event channel stayed open") {
                     ReplEvent::ToolCallsStarted { tool_uses, .. } => {
+                        calls_started += 1;
                         observed.push(format!("ToolCallsStarted({})", tool_uses[0].name));
                     }
                     ReplEvent::ToolApprovalNeeded {
@@ -2130,6 +2150,7 @@ mod tests {
                         let _ = response_tx.send(super::super::events::ConfirmationResult::Deny);
                     }
                     ReplEvent::ToolResult { result, .. } => {
+                        results += 1;
                         observed.push(format!("ToolResult({result:?})"));
                         break result;
                     }
@@ -2144,8 +2165,9 @@ mod tests {
             )
         });
 
-        tokio::task::yield_now().await;
-        while let Ok(event) = event_rx.try_recv() {
+        if let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await
+        {
             match event {
                 ReplEvent::ToolApprovalNeeded {
                     tool_use,
@@ -2156,12 +2178,30 @@ mod tests {
                     observed.push(format!("late ToolApprovalNeeded({})", tool_use.name));
                     let _ = response_tx.send(super::super::events::ConfirmationResult::Deny);
                 }
+                ReplEvent::ToolCallsStarted { tool_uses, .. } => {
+                    calls_started += 1;
+                    observed.push(format!("late ToolCallsStarted({})", tool_uses[0].name));
+                }
+                ReplEvent::ToolResult { result, .. } => {
+                    results += 1;
+                    observed.push(format!("late ToolResult({result:?})"));
+                }
                 other => observed.push(format!("late {other:?}")),
             }
         }
 
         let final_mode = mode.read().await.clone();
-        (approvals, result, observed, final_mode)
+        let active_tools = active_tools.read().await.len();
+        PlanDispatchObservation {
+            approvals,
+            calls_started,
+            results,
+            result,
+            events: observed,
+            final_mode,
+            active_tools,
+            injected_plans_dir,
+        }
     }
 
     #[tokio::test]
@@ -2180,25 +2220,40 @@ mod tests {
         ];
 
         for (starting_mode, initial_mode, expected_result) in cases {
-            let (approvals, result, events, final_mode) =
-                dispatch_canonical_enter_plan_mode(initial_mode).await;
+            let observed = dispatch_canonical_enter_plan_mode(initial_mode).await;
             assert_eq!(
-                approvals, 0,
-                "canonical enter_plan_mode must reduce capability without approval; starting_mode={starting_mode}, final_mode={final_mode:?}, events={events:?}"
+                observed.approvals, 0,
+                "canonical enter_plan_mode must reduce capability without approval; starting_mode={starting_mode}, final_mode={:?}, events={:?}", observed.final_mode, observed.events
             );
-            let result = result.unwrap_or_else(|error| {
+            assert_eq!(
+                (observed.calls_started, observed.results, observed.active_tools),
+                (1, 1, 1),
+                "the scoped dispatcher must emit one start/result and track one tool until EventLoop cleanup; starting_mode={starting_mode}, final_mode={:?}, events={:?}", observed.final_mode, observed.events
+            );
+            let result = observed.result.unwrap_or_else(|error| {
                 panic!(
-                    "canonical enter_plan_mode failed at dispatch boundary; starting_mode={starting_mode}, final_mode={final_mode:?}, events={events:?}, error={error:#}"
+                    "canonical enter_plan_mode failed at dispatch boundary; starting_mode={starting_mode}, final_mode={:?}, events={:?}, error={error:#}", observed.final_mode, observed.events
                 )
             });
             assert!(
                 result.contains(expected_result),
-                "canonical enter_plan_mode returned the wrong result; starting_mode={starting_mode}, expected={expected_result:?}, result={result:?}, final_mode={final_mode:?}, events={events:?}"
+                "canonical enter_plan_mode returned the wrong result; starting_mode={starting_mode}, expected={expected_result:?}, result={result:?}, final_mode={:?}, events={:?}", observed.final_mode, observed.events
             );
             assert!(
-                matches!(final_mode, ReplMode::Planning { .. }),
-                "canonical enter_plan_mode must leave the session planning; starting_mode={starting_mode}, final_mode={final_mode:?}, result={result:?}, events={events:?}"
+                matches!(observed.final_mode, ReplMode::Planning { .. }),
+                "canonical enter_plan_mode must leave the session planning; starting_mode={starting_mode}, final_mode={:?}, result={result:?}, events={:?}", observed.final_mode, observed.events
             );
+            if starting_mode == "normal" {
+                let plan_path = match &observed.final_mode {
+                    ReplMode::Planning { plan_path, .. } => plan_path,
+                    _ => unreachable!("mode assertion above established Planning"),
+                };
+                assert!(
+                    plan_path.starts_with(&observed.injected_plans_dir),
+                    "plan-mode regression escaped its isolated plan directory; plan_path={}, injected_dir={}, events={:?}",
+                    plan_path.display(), observed.injected_plans_dir.display(), observed.events
+                );
+            }
         }
     }
 

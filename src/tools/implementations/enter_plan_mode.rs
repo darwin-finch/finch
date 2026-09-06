@@ -8,28 +8,22 @@ use serde_json::Value;
 
 pub struct EnterPlanModeTool;
 
-#[async_trait]
-impl Tool for EnterPlanModeTool {
-    fn name(&self) -> &str {
-        "enter_plan_mode"
+impl EnterPlanModeTool {
+    #[cfg(test)]
+    pub(crate) fn with_plans_dir(
+        plans_dir: impl Into<std::path::PathBuf>,
+    ) -> TestEnterPlanModeTool {
+        TestEnterPlanModeTool {
+            plans_dir: plans_dir.into(),
+        }
     }
 
-    fn description(&self) -> &str {
-        "Enter read-only planning mode to explore the codebase before making changes. \
-         Use this when you need to research and develop an implementation plan. \
-         In plan mode, only read-only tools (Read, Glob, Grep, WebFetch) and \
-         ask_user_question is available. Use it to clarify requirements \
-         with the user. When ready, use present_plan to show your plan."
-    }
-
-    fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema::simple(vec![(
-            "reason",
-            "Brief explanation of why planning is needed (optional)",
-        )])
-    }
-
-    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
+    async fn execute_with_plans_dir(
+        &self,
+        input: Value,
+        context: &ToolContext<'_>,
+        injected_plans_dir: Option<&std::path::Path>,
+    ) -> Result<String> {
         use chrono::Utc;
 
         let reason = input["reason"].as_str().unwrap_or("Planning session");
@@ -60,11 +54,13 @@ impl Tool for EnterPlanModeTool {
             }
         }
 
-        // Create plans directory
-        let plans_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?
-            .join(".finch")
-            .join("plans");
+        let plans_dir = match injected_plans_dir {
+            Some(path) => path.to_path_buf(),
+            None => dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?
+                .join(".finch")
+                .join("plans"),
+        };
         std::fs::create_dir_all(&plans_dir)?;
 
         // Generate plan filename
@@ -94,12 +90,66 @@ impl Tool for EnterPlanModeTool {
 }
 
 #[cfg(test)]
+pub(crate) struct TestEnterPlanModeTool {
+    plans_dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl Tool for EnterPlanModeTool {
+    fn name(&self) -> &str {
+        "enter_plan_mode"
+    }
+
+    fn description(&self) -> &str {
+        "Enter read-only planning mode to explore the codebase before making changes. \
+         Use this when you need to research and develop an implementation plan. \
+         In plan mode, only read-only tools (Read, Glob, Grep, WebFetch) and \
+         ask_user_question is available. Use it to clarify requirements \
+         with the user. When ready, use present_plan to show your plan."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema::simple(vec![(
+            "reason",
+            "Brief explanation of why planning is needed (optional)",
+        )])
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
+        self.execute_with_plans_dir(input, context, None).await
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Tool for TestEnterPlanModeTool {
+    fn name(&self) -> &str {
+        EnterPlanModeTool.name()
+    }
+
+    fn description(&self) -> &str {
+        EnterPlanModeTool.description()
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        EnterPlanModeTool.input_schema()
+    }
+
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
+        EnterPlanModeTool
+            .execute_with_plans_dir(input, context, Some(&self.plans_dir))
+            .await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn test_execute() {
-        let tool = EnterPlanModeTool;
+        let plans = tempfile::tempdir().expect("create isolated plan tool directory");
+        let tool = EnterPlanModeTool::with_plans_dir(plans.path());
         use crate::cli::ReplMode;
         use std::sync::Arc;
         use tokio::sync::RwLock;

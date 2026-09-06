@@ -128,7 +128,8 @@ impl PermissionManager {
 
     /// Register tool-specific configuration
     pub fn register_tool_config(&mut self, tool_name: String, config: ToolPermissionConfig) {
-        self.configs.insert(tool_name, config);
+        self.configs
+            .insert(canonical_plan_tool_name(&tool_name).to_string(), config);
     }
 
     /// Check if tool execution is permitted
@@ -138,8 +139,11 @@ impl PermissionManager {
             return self.check_peer_tool_use(tool_name, input);
         }
 
-        // Get tool config or use default
-        let config = self.configs.get(tool_name);
+        // Dispatch-only legacy spellings share the canonical tool's configured
+        // authority. A caller cannot evade a disabled/Deny rule by choosing an
+        // alias that resolves to the same implementation.
+        let policy_name = canonical_plan_tool_name(tool_name);
+        let config = self.configs.get(policy_name);
 
         // Check if tool is enabled
         if let Some(cfg) = config {
@@ -182,7 +186,7 @@ impl PermissionManager {
 
         // Apply tool-specific patterns
         if let Some(cfg) = config {
-            if let Some(reason) = self.check_patterns(tool_name, input, cfg) {
+            if let Some(reason) = self.check_patterns(policy_name, input, cfg) {
                 return reason;
             }
         }
@@ -891,6 +895,44 @@ mod tests {
                 "workspace mutation must remain approval-gated; tool={tool}, effect={effect:?}"
             );
         }
+    }
+
+    #[test]
+    fn configured_plan_tool_authority_applies_across_aliases() {
+        let mut manager = PermissionManager::new().with_default_rule(PermissionRule::Allow);
+        manager.register_tool_config(
+            "enter_plan_mode".to_string(),
+            ToolPermissionConfig {
+                enabled: false,
+                rule: PermissionRule::Allow,
+                allowed_patterns: Vec::new(),
+                blocked_patterns: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(
+                manager.check_tool_use("EnterPlanMode", &serde_json::json!({})),
+                PermissionCheck::Deny(reason) if reason.contains("disabled")
+            ),
+            "canonical disabled authority must govern legacy EnterPlanMode"
+        );
+
+        manager.register_tool_config(
+            "TodoWrite".to_string(),
+            ToolPermissionConfig {
+                enabled: true,
+                rule: PermissionRule::Deny,
+                allowed_patterns: Vec::new(),
+                blocked_patterns: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(
+                manager.check_tool_use("todo_write", &serde_json::json!({"todos": []})),
+                PermissionCheck::Deny(reason) if reason.contains("not allowed")
+            ),
+            "legacy-registered Deny authority must govern canonical todo_write"
+        );
     }
 
     #[test]
