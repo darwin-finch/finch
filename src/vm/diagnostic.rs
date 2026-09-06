@@ -2,6 +2,11 @@ use super::effects::{CapabilityRequirement, EffectSet};
 use super::types::Type;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use unicode_width::UnicodeWidthChar;
+
+const FOUND_VALUE_ORIGIN_CODE: &str = "N-VALUE-ORIGIN-001";
+const MAX_RENDERED_CAUSE_DEPTH: usize = 16;
+const MAX_RENDERED_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,10 +101,6 @@ pub struct VmDiagnostic {
     pub related: Vec<SourceOrigin>,
     pub expected_types: Vec<Type>,
     pub found_types: Vec<Type>,
-    /// Source operation that produced the incompatible value, when the
-    /// frontend can prove that relationship from its typed dataflow.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub found_value_origin: Option<SourceOrigin>,
     pub expected_effects: EffectSet,
     pub found_effects: EffectSet,
     pub capability: Option<CapabilityRequirement>,
@@ -124,7 +125,6 @@ impl VmDiagnostic {
             related: Vec::new(),
             expected_types: Vec::new(),
             found_types: Vec::new(),
-            found_value_origin: None,
             expected_effects: EffectSet::pure(),
             found_effects: EffectSet::pure(),
             capability: None,
@@ -144,6 +144,48 @@ impl VmDiagnostic {
         diagnostic.expected_types.push(expected);
         diagnostic.found_types.push(found);
         diagnostic
+    }
+
+    /// Attach compiler-proven provenance for the incompatible value.
+    ///
+    /// The relation is encoded as a stable, structured note in the existing
+    /// diagnostic cause chain. This keeps aggregate construction of the public
+    /// `VmDiagnostic` source-compatible while preserving the producer origin
+    /// through serde and the existing recursive IPC codec.
+    pub fn set_found_value_origin(&mut self, origin: SourceOrigin) {
+        if self
+            .cause
+            .as_deref()
+            .is_some_and(|cause| cause.code == FOUND_VALUE_ORIGIN_CODE)
+        {
+            self.cause.as_mut().expect("checked producer note").primary = Some(origin);
+            return;
+        }
+        let mut provenance = Self::error(
+            FOUND_VALUE_ORIGIN_CODE,
+            self.phase,
+            "incompatible value producer",
+            Some(origin),
+        );
+        provenance.severity = Severity::Note;
+        provenance.cause = self.cause.take();
+        self.cause = Some(Box::new(provenance));
+    }
+
+    /// Return compiler-proven provenance for the incompatible value.
+    pub fn found_value_origin(&self) -> Option<&SourceOrigin> {
+        self.cause
+            .as_deref()
+            .filter(|cause| cause.code == FOUND_VALUE_ORIGIN_CODE)
+            .and_then(|cause| cause.primary.as_ref())
+    }
+
+    fn presentation_cause(&self) -> Option<&VmDiagnostic> {
+        let cause = self.cause.as_deref()?;
+        if cause.code == FOUND_VALUE_ORIGIN_CODE {
+            return cause.cause.as_deref();
+        }
+        Some(cause)
     }
 }
 
@@ -170,29 +212,65 @@ pub fn render_vm_diagnostics(
     diagnostics: &[VmDiagnostic],
     sources: &[DiagnosticSource<'_>],
 ) -> String {
-    diagnostics
-        .iter()
-        .map(|diagnostic| render_vm_diagnostic(diagnostic, sources, 0))
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let mut rendered = String::new();
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str("\n\n");
+        }
+        render_vm_diagnostic_chain(&mut rendered, diagnostic, sources);
+        if rendered.len() >= MAX_RENDERED_DIAGNOSTIC_BYTES {
+            truncate_rendered(&mut rendered);
+            break;
+        }
+    }
+    rendered
 }
 
-fn render_vm_diagnostic(
+fn render_vm_diagnostic_chain(
+    rendered: &mut String,
+    diagnostic: &VmDiagnostic,
+    sources: &[DiagnosticSource<'_>],
+) {
+    let mut current = Some(diagnostic);
+    let mut depth = 0;
+    while let Some(diagnostic) = current {
+        if depth > 0 {
+            let padding = " ".repeat(depth * 2 - 2);
+            rendered.push('\n');
+            rendered.push_str(&padding);
+            rendered.push_str("Caused by:\n");
+        }
+        render_vm_diagnostic_body(rendered, diagnostic, sources, depth * 2);
+        current = diagnostic.presentation_cause();
+        depth += 1;
+        if current.is_some() && depth == MAX_RENDERED_CAUSE_DEPTH {
+            rendered.push_str("\n… additional diagnostic causes omitted");
+            break;
+        }
+        if rendered.len() >= MAX_RENDERED_DIAGNOSTIC_BYTES {
+            truncate_rendered(rendered);
+            break;
+        }
+    }
+}
+
+fn render_vm_diagnostic_body(
+    rendered: &mut String,
     diagnostic: &VmDiagnostic,
     sources: &[DiagnosticSource<'_>],
     indent: usize,
-) -> String {
+) {
     let padding = " ".repeat(indent);
     let location = diagnostic
         .primary
         .as_ref()
         .and_then(|origin| validated_excerpt(origin, sources));
-    let mut rendered = format!(
+    rendered.push_str(&format!(
         "{padding}{} · {} {}",
         diagnostic.code,
         phase_name(diagnostic.phase),
         severity_name(diagnostic.severity)
-    );
+    ));
     if let Some(excerpt) = &location {
         rendered.push_str(&format!(
             " at {}:{}:{}",
@@ -215,19 +293,29 @@ fn render_vm_diagnostic(
         .primary
         .as_ref()
         .and_then(|origin| origin.word.as_deref());
-    if let (Some(word), Some(expected), Some(found)) = (
-        word,
-        type_list(&diagnostic.expected_types),
-        type_list(&diagnostic.found_types),
-    ) {
-        rendered.push_str(&format!(
-            "{padding}`{word}` expected {expected}, but received {found}"
-        ));
-        if let Some(producer) = &diagnostic.found_value_origin {
-            rendered.push_str(" produced by ");
-            rendered.push_str(&origin_label(producer, sources));
+    if diagnostic.code == "E-TYPE-002"
+        && matches!(
+            diagnostic.phase,
+            DiagnosticPhase::TypeInference | DiagnosticPhase::Verification
+        )
+    {
+        if let (Some(word), Some(expected), Some(found)) = (
+            word,
+            type_list(&diagnostic.expected_types),
+            type_list(&diagnostic.found_types),
+        ) {
+            rendered.push_str(&format!(
+                "{padding}`{word}` expected {expected}, but received {found}"
+            ));
+            if let Some(producer) = diagnostic.found_value_origin() {
+                rendered.push_str(" produced by ");
+                rendered.push_str(&origin_label(producer, sources));
+            }
+            rendered.push('.');
+        } else {
+            rendered.push_str(&padding);
+            rendered.push_str(&diagnostic.message);
         }
-        rendered.push('.');
     } else {
         rendered.push_str(&padding);
         rendered.push_str(&diagnostic.message);
@@ -243,12 +331,20 @@ fn render_vm_diagnostic(
         .primary
         .as_ref()
         .and_then(|origin| origin.expansion.as_deref());
+    let mut expansion_depth = 0;
     while let Some(origin) = expansion {
+        if expansion_depth == MAX_RENDERED_CAUSE_DEPTH {
+            rendered.push('\n');
+            rendered.push_str(&padding);
+            rendered.push_str("… additional expansion origins omitted");
+            break;
+        }
         rendered.push('\n');
         rendered.push_str(&padding);
         rendered.push_str("Expanded from: ");
         rendered.push_str(&origin_label(origin, sources));
         expansion = origin.expansion.as_deref();
+        expansion_depth += 1;
     }
     for entry in &diagnostic.trace {
         rendered.push('\n');
@@ -258,12 +354,19 @@ fn render_vm_diagnostic(
         rendered.push('\n');
         rendered.push_str(&format!("{padding}Hint: {hint}"));
     }
-    if let Some(cause) = &diagnostic.cause {
-        rendered.push('\n');
-        rendered.push_str(&format!("{padding}Caused by:\n"));
-        rendered.push_str(&render_vm_diagnostic(cause, sources, indent + 2));
+}
+
+fn truncate_rendered(rendered: &mut String) {
+    const MARKER: &str = "\n… diagnostic output truncated";
+    if rendered.len() <= MAX_RENDERED_DIAGNOSTIC_BYTES {
+        return;
     }
-    rendered
+    let mut end = MAX_RENDERED_DIAGNOSTIC_BYTES.saturating_sub(MARKER.len());
+    while !rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    rendered.truncate(end);
+    rendered.push_str(MARKER);
 }
 
 fn type_list(types: &[Type]) -> Option<String> {
@@ -333,8 +436,8 @@ fn validated_excerpt<'a>(
         line,
         column,
         line_text: expand_tabs(&source.source[line_start..line_end]),
-        underline_column: expand_tabs(prefix).chars().count(),
-        underline_width: expand_tabs(underlined).chars().count(),
+        underline_column: display_width_with_tabs(prefix),
+        underline_width: display_width_with_tabs(underlined),
     })
 }
 
@@ -349,10 +452,21 @@ fn expand_tabs(text: &str) -> String {
             column += spaces;
         } else {
             rendered.push(character);
-            column += 1;
+            column += character.width().unwrap_or(0);
         }
     }
     rendered
+}
+
+fn display_width_with_tabs(text: &str) -> usize {
+    const TAB_STOP: usize = 4;
+    text.chars().fold(0, |column, character| {
+        if character == '\t' {
+            column + TAB_STOP - column % TAB_STOP
+        } else {
+            column + character.width().unwrap_or(0)
+        }
+    })
 }
 
 fn severity_name(severity: Severity) -> &'static str {
@@ -417,7 +531,6 @@ mod tests {
         first
             .related
             .push(origin("unicode.forth", source, "3", "literal input"));
-        first.found_value_origin = Some(origin("unicode.forth", source, "+", "+"));
         first
             .hints
             .push("convert the integer with `int-to-string`".into());
@@ -436,6 +549,7 @@ mod tests {
             "nested failure",
             None,
         )));
+        first.set_found_value_origin(origin("unicode.forth", source, "+", "+"));
         let second = VmDiagnostic::error(
             "E-SECOND-001",
             DiagnosticPhase::Linking,
@@ -481,7 +595,7 @@ mod tests {
     #[test]
     fn test_renderer_falls_back_safely_for_malformed_or_missing_spans() {
         let source = "say";
-        let mut malformed = VmDiagnostic::error(
+        let malformed = VmDiagnostic::error(
             "E-SPAN-001",
             DiagnosticPhase::Reader,
             "bad external span",
@@ -492,8 +606,6 @@ mod tests {
                 expansion: None,
             }),
         );
-        malformed.expected_types.push(Type::String);
-        malformed.found_types.push(Type::Int);
         let rendered = render_vm_diagnostics(
             &[malformed],
             &[DiagnosticSource {
@@ -502,8 +614,135 @@ mod tests {
             }],
         );
         assert_eq!(
-            rendered, "E-SPAN-001 · reader error\n`say` expected string, but received int.",
-            "malformed span should retain structured facts without an invented location"
+            rendered, "E-SPAN-001 · reader error\nbad external span",
+            "malformed span should retain its diagnostic-specific message without an invented location"
+        );
+    }
+
+    #[test]
+    fn test_renderer_uses_terminal_cells_for_unicode_carets_and_scalar_source_columns() {
+        let source = "界\tsay";
+        let diagnostic = VmDiagnostic::type_mismatch(
+            Type::String,
+            Type::Int,
+            Some(origin("wide.forth", source, "say", "say")),
+        );
+        let rendered = render_vm_diagnostics(
+            &[diagnostic],
+            &[DiagnosticSource {
+                source_id: "wide.forth",
+                source,
+            }],
+        );
+        assert!(
+            rendered.contains("wide.forth:1:3\n界  say\n    ^^^"),
+            "source columns must remain Unicode-scalar based while carets and tabs use terminal cells; rendered={rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_renderer_bounds_hostile_nested_causes_and_output() {
+        let mut diagnostic = VmDiagnostic::error(
+            "E-ROOT-001",
+            DiagnosticPhase::Interpretation,
+            "root failure",
+            None,
+        );
+        for index in 0..2_048 {
+            let mut parent = VmDiagnostic::error(
+                format!("E-CAUSE-{index:04}"),
+                DiagnosticPhase::Interpretation,
+                "nested failure",
+                None,
+            );
+            parent.cause = Some(Box::new(diagnostic));
+            diagnostic = parent;
+        }
+        let rendered = render_vm_diagnostics(std::slice::from_ref(&diagnostic), &[]);
+        assert!(
+            rendered.contains("additional diagnostic causes omitted"),
+            "hostile cause chain was not explicitly bounded; rendered_len={}",
+            rendered.len()
+        );
+        assert!(
+            rendered.len() <= MAX_RENDERED_DIAGNOSTIC_BYTES,
+            "hostile cause chain exceeded the public renderer output bound: {} bytes",
+            rendered.len()
+        );
+        let mut current = Some(diagnostic);
+        while let Some(mut node) = current {
+            current = node.cause.take().map(|cause| *cause);
+        }
+
+        let oversized = VmDiagnostic::error(
+            "E-LARGE-001",
+            DiagnosticPhase::Interpretation,
+            "x".repeat(MAX_RENDERED_DIAGNOSTIC_BYTES * 2),
+            None,
+        );
+        let rendered = render_vm_diagnostics(&[oversized], &[]);
+        assert!(
+            rendered.ends_with("… diagnostic output truncated")
+                && rendered.len() <= MAX_RENDERED_DIAGNOSTIC_BYTES,
+            "oversized diagnostic did not honor the renderer byte bound; rendered_len={}",
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn test_renderer_handles_missing_sources_and_cross_line_spans_without_inference() {
+        let source = "ab\ncd";
+        let crossing = SourceOrigin {
+            language: SourceLanguage::Provider,
+            span: Some(SourceSpan::bytes("crossing", 1, source.len())),
+            word: Some("form".into()),
+            expansion: None,
+        };
+        let unavailable = SourceOrigin {
+            language: SourceLanguage::Provider,
+            span: None,
+            word: Some("say".into()),
+            expansion: None,
+        };
+        let cross_line = VmDiagnostic::error(
+            "E-CROSS-001",
+            DiagnosticPhase::Reader,
+            "cross-line failure",
+            Some(crossing),
+        );
+        let missing_source =
+            VmDiagnostic::type_mismatch(Type::String, Type::Int, Some(unavailable));
+        let rendered = render_vm_diagnostics(
+            &[cross_line, missing_source],
+            &[DiagnosticSource {
+                source_id: "crossing",
+                source,
+            }],
+        );
+        assert!(
+            rendered.contains("crossing:1:2\nab\n ^\ncross-line failure"),
+            "cross-line spans must underline only the available first source line; rendered={rendered:?}"
+        );
+        assert!(
+            rendered.contains("E-TYPE-002 · verification error\n`say` expected string, but received int."),
+            "missing source/span must keep typed facts without inventing a location; rendered={rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_renderer_preserves_non_verifier_diagnostic_specific_message() {
+        let mut diagnostic = VmDiagnostic::error(
+            "E-TYPE-002",
+            DiagnosticPhase::HostCall,
+            "host returned an incompatible value for request `lookup`",
+            Some(SourceOrigin::generated("broken")),
+        );
+        diagnostic.expected_types.push(Type::String);
+        diagnostic.found_types.push(Type::Int);
+        let rendered = render_vm_diagnostics(&[diagnostic], &[]);
+        assert!(
+            rendered.contains("host returned an incompatible value for request `lookup`"),
+            "renderer applied verifier-only wording to a diagnostic-specific host-call error; rendered={rendered:?}"
         );
     }
 }

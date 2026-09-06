@@ -298,6 +298,62 @@ struct WireExecution {
     output_unit: Arc<crate::cli::messages::WorkUnit>,
 }
 
+struct WireFailurePresentation {
+    human: String,
+    classifier: String,
+    diagnostic_code: Option<String>,
+}
+
+impl WireFailurePresentation {
+    fn from_outcome(outcome: &crate::runtime::outcome::ExecutionOutcome, source: &str) -> Self {
+        if !outcome.vm_diagnostics.is_empty() {
+            let human = crate::vm::render_vm_diagnostics(
+                &outcome.vm_diagnostics,
+                &[
+                    crate::vm::DiagnosticSource {
+                        source_id: "provider-response.forth",
+                        source,
+                    },
+                    crate::vm::DiagnosticSource {
+                        source_id: "provider-response.lisp",
+                        source,
+                    },
+                ],
+            );
+            let first = &outcome.vm_diagnostics[0];
+            return Self {
+                human,
+                classifier: first.to_string(),
+                diagnostic_code: Some(first.code.clone()),
+            };
+        }
+        let human = if outcome.diagnostics.is_empty() {
+            format!("VM program ended as {:?}", outcome.status)
+        } else {
+            outcome.diagnostics.join("\n")
+        };
+        let classifier = outcome
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| human.clone());
+        Self {
+            diagnostic_code: crate::programs::wire_diagnostic_code(&classifier),
+            human,
+            classifier,
+        }
+    }
+
+    fn from_error(error: impl ToString) -> Self {
+        let human = error.to_string();
+        Self {
+            diagnostic_code: crate::programs::wire_diagnostic_code(&human),
+            classifier: human.clone(),
+            human,
+        }
+    }
+}
+
 /// What a turn produced, as distinct from the wire program that produced it.
 ///
 /// In its own module so the tuple field is unreachable from this one: the
@@ -415,7 +471,7 @@ async fn execute_wire_with_single_repair(
     .await;
 
     let mut effect_journal = Vec::new();
-    let (diagnostic, repairable) = match initial {
+    let (failure, repairable) = match initial {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
             if outcome.output.is_empty() {
                 metric.first_pass_valid = false;
@@ -436,24 +492,26 @@ async fn execute_wire_with_single_repair(
         }
         Ok(outcome) => {
             effect_journal.extend(runner_effect_records(&outcome));
-            let detail = outcome
-                .diagnostics
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            (detail, is_repairable_wire_outcome(&outcome))
+            (
+                WireFailurePresentation::from_outcome(&outcome, &source),
+                is_repairable_wire_outcome(&outcome),
+            )
         }
         Err(error) => {
-            let detail = error.to_string();
-            (detail.clone(), is_repairable_wire_diagnostic(&detail))
+            let failure = WireFailurePresentation::from_error(error);
+            let repairable = is_repairable_wire_diagnostic(&failure.classifier);
+            (failure, repairable)
         }
     };
 
     metric.first_pass_valid = false;
-    metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
-    metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
+    metric.failure_class = Some(crate::programs::classify_wire_failure(
+        &source,
+        &failure.classifier,
+    ));
+    metric.diagnostic_code.clone_from(&failure.diagnostic_code);
 
-    output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+    output_manager.write_error(format!("VM wire error:\n{}", failure.human));
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
@@ -462,7 +520,7 @@ async fn execute_wire_with_single_repair(
         });
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: failure.human,
             effect_journal,
             output_unit,
         };
@@ -473,7 +531,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: failure.human,
             effect_journal,
             output_unit,
         };
@@ -487,7 +545,7 @@ async fn execute_wire_with_single_repair(
     output_unit.set_transient_status(Some(
         "requesting one corrected ProgramSubmission from the provider…".to_string(),
     ));
-    let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
+    let repair_messages = wire_repair_messages(messages, &source, &failure.human);
     let repair = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -497,7 +555,7 @@ async fn execute_wire_with_single_repair(
             output_unit.set_complete();
             return WireExecution {
                 source_for_history: source,
-                response: diagnostic,
+                response: failure.human,
                 effect_journal,
                 output_unit,
             };
@@ -511,7 +569,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: failure.human,
             effect_journal,
             output_unit,
         };
@@ -522,7 +580,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: failure.human,
             effect_journal,
             output_unit,
         };
@@ -533,7 +591,7 @@ async fn execute_wire_with_single_repair(
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
-            response: diagnostic,
+            response: failure.human,
             effect_journal,
             output_unit,
         };
@@ -560,7 +618,7 @@ async fn execute_wire_with_single_repair(
     repair_output_unit.set_program_output();
     match execute_direct_wire_response(
         runtime,
-        output_manager,
+        Arc::clone(&output_manager),
         Arc::clone(&repair_output_unit),
         event_tx.clone(),
         cancel,
@@ -589,12 +647,8 @@ async fn execute_wire_with_single_repair(
         }
         Ok(outcome) => {
             effect_journal.extend(runner_effect_records(&outcome));
-            let detail = outcome
-                .diagnostics
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            repair_output_unit.append_response(&format!("VM wire error: {detail}"));
+            let failure = WireFailurePresentation::from_outcome(&outcome, &repaired_source);
+            output_manager.write_error(format!("VM wire error:\n{}", failure.human));
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -602,14 +656,14 @@ async fn execute_wire_with_single_repair(
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
-                response: detail,
+                response: failure.human,
                 effect_journal,
                 output_unit: repair_output_unit,
             }
         }
         Err(error) => {
             let detail = format!("VM wire error: {error}");
-            repair_output_unit.append_response(&detail);
+            output_manager.write_error(&detail);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -2022,6 +2076,7 @@ pub(crate) fn apply_sliding_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::messages::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -2291,6 +2346,71 @@ mod tests {
     struct BlockingRepairGenerator {
         calls: AtomicUsize,
         started: tokio::sync::Notify,
+    }
+
+    struct DiagnosticRepairGenerator {
+        repaired_source: String,
+        repair_prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for DiagnosticRepairGenerator {
+        async fn generate(
+            &self,
+            messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let prompt = messages
+                .last()
+                .and_then(|message| message.content.first())
+                .and_then(ContentBlock::as_text)
+                .expect("typed wire repair must include its diagnostic prompt")
+                .to_string();
+            *self
+                .repair_prompt
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(prompt);
+            Ok(crate::generators::GeneratorResponse {
+                text: self.repaired_source.clone(),
+                content_blocks: vec![ContentBlock::text(self.repaired_source.clone())],
+                tool_uses: Vec::new(),
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "diagnostic-repair-test".into(),
+                    model: "diagnostic-repair-test".into(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "diagnostic-repair-test"
+        }
     }
 
     #[async_trait::async_trait]
@@ -2731,6 +2851,173 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_failure_presentation_keeps_real_multiple_diagnostics_in_order() {
+        let mut outcome = crate::runtime::outcome::ExecutionOutcome::failed(
+            uuid::Uuid::new_v4(),
+            0,
+            crate::programs::ExecutionEffect::Pure,
+            crate::runtime::outcome::ExecutionBackend::TypedVm,
+            "legacy first",
+            0,
+        );
+        outcome.vm_diagnostics = vec![
+            crate::vm::VmDiagnostic::error(
+                "E-FIRST-001",
+                crate::vm::DiagnosticPhase::Reader,
+                "first structured failure",
+                None,
+            ),
+            crate::vm::VmDiagnostic::error(
+                "E-SECOND-001",
+                crate::vm::DiagnosticPhase::Linking,
+                "second structured failure",
+                None,
+            ),
+        ];
+        let presentation = WireFailurePresentation::from_outcome(&outcome, "bad source");
+        assert!(
+            presentation.human.find("E-FIRST-001") < presentation.human.find("E-SECOND-001"),
+            "provider adapter discarded or reordered a later structured diagnostic; rendered={:?}",
+            presentation.human
+        );
+        assert_eq!(
+            presentation.diagnostic_code.as_deref(),
+            Some("E-FIRST-001"),
+            "provider metrics lost the first stable code while human output retained all diagnostics; rendered={:?}",
+            presentation.human
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_wire_initial_failure_is_source_cited_and_separate_from_program_output() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .expect("provider diagnostic fixture should grant only session output");
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(DiagnosticRepairGenerator {
+            repaired_source: "\"repaired\" say".into(),
+            repair_prompt: std::sync::Mutex::new(None),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::claude::Message::user("reply")],
+            "3 4 + say".into(),
+            None,
+            None,
+        )
+        .await;
+        while let Ok(ReplEvent::VmEffect {
+            projection,
+            envelope,
+        }) = event_rx.try_recv()
+        {
+            projection.project_envelope(envelope);
+        }
+        let prompt = generator
+            .repair_prompt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .expect("repair generator should receive the structured failure");
+        for required in [
+            "E-TYPE-002 · verification error at provider-response.forth:1:7",
+            "3 4 + say",
+            "      ^^^",
+            "`say` expected string, but received int produced by `+` at provider-response.forth:1:5",
+            "Hint: convert it first: 3 4 + int-to-string say",
+        ] {
+            assert!(
+                prompt.contains(required),
+                "provider repair prompt omitted {required:?}; prompt={prompt:?}"
+            );
+        }
+        let messages = output.get_messages();
+        let diagnostic_messages = messages
+            .iter()
+            .filter(|message| message.content().contains("E-TYPE-002"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostic_messages.len(),
+            1,
+            "initial provider failure was duplicated or lost; messages={:?}",
+            messages
+                .iter()
+                .map(|message| message.content())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            execution.output_unit.content() == "repaired"
+                && !execution.output_unit.content().contains("E-TYPE-002"),
+            "provider diagnostic leaked into repaired ordinary output; output={:?}; messages={:?}",
+            execution.output_unit.content(),
+            messages
+                .iter()
+                .map(|message| message.content())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_wire_repaired_failure_is_source_cited_and_separate_from_program_output()
+    {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(DiagnosticRepairGenerator {
+            repaired_source: "5 6 + say".into(),
+            repair_prompt: std::sync::Mutex::new(None),
+        });
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator,
+            &[crate::claude::Message::user("reply")],
+            "3 4 + say".into(),
+            None,
+            None,
+        )
+        .await;
+        let messages = output.get_messages();
+        let diagnostic_text = messages
+            .iter()
+            .map(|message| message.content())
+            .filter(|content| content.contains("E-TYPE-002"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostic_text.len(),
+            2,
+            "initial and repaired provider failures did not remain distinct diagnostics; messages={:?}",
+            messages
+                .iter()
+                .map(|message| message.content())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            diagnostic_text[1].contains("5 6 + say")
+                && diagnostic_text[1].contains("provider-response.forth:1:7"),
+            "repaired provider failure lost its own source citation; diagnostics={diagnostic_text:?}"
+        );
+        assert!(
+            execution.output_unit.content().is_empty(),
+            "repaired VM diagnostic leaked into ordinary program output: {:?}",
+            execution.output_unit.content()
+        );
+    }
+
+    #[test]
     fn every_nonempty_text_response_streams_as_candidate_program_source() {
         assert!(has_streamed_wire_source("(say \"hello\")"));
         assert!(has_streamed_wire_source("\"hello\" say"));
@@ -2804,8 +3091,12 @@ mod tests {
         let messages = output.get_messages();
         assert_eq!(
             messages.len(),
-            3,
-            "source, failed output, repaired source/output"
+            4,
+            "source, separate failed diagnostic, repaired source, and repaired output must remain distinct; messages={:?}",
+            messages
+                .iter()
+                .map(|message| message.content())
+                .collect::<Vec<_>>()
         );
         assert!(messages.iter().all(|message| !message
             .format(&crate::config::ColorScheme::default())

@@ -225,12 +225,64 @@ pub struct RunnerEffectRecord {
     pub entry: crate::vm::EffectJournalEntry,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{message}")]
+const RUNNER_VM_FAILURE_PREFIX: &str = "finch-vm-failure:v1:";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RunnerVmFailureEnvelope {
+    message: String,
+    diagnostics: Vec<crate::vm::VmDiagnostic>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunnerProgramError {
     pub message: String,
     pub effect_journal: Vec<RunnerEffectRecord>,
 }
+
+impl RunnerProgramError {
+    pub(crate) fn with_vm_diagnostics(
+        message: String,
+        diagnostics: Vec<crate::vm::VmDiagnostic>,
+        effect_journal: Vec<RunnerEffectRecord>,
+    ) -> Self {
+        let envelope = RunnerVmFailureEnvelope {
+            message: message.clone(),
+            diagnostics,
+        };
+        let encoded = serde_json::to_string(&envelope)
+            .map(|json| format!("{RUNNER_VM_FAILURE_PREFIX}{json}"))
+            .unwrap_or(message);
+        Self {
+            message: encoded,
+            effect_journal,
+        }
+    }
+
+    /// Decode a structured typed-VM failure carried through the compatible
+    /// runner error string envelope.
+    pub fn decode_vm_failure(message: &str) -> Option<(String, Vec<crate::vm::VmDiagnostic>)> {
+        let json = message.strip_prefix(RUNNER_VM_FAILURE_PREFIX)?;
+        let envelope: RunnerVmFailureEnvelope = serde_json::from_str(json).ok()?;
+        Some((envelope.message, envelope.diagnostics))
+    }
+
+    /// Return human-readable text from either a structured or legacy runner
+    /// error string.
+    pub fn human_message_from(message: &str) -> std::borrow::Cow<'_, str> {
+        Self::decode_vm_failure(message).map_or_else(
+            || std::borrow::Cow::Borrowed(message),
+            |(human, _)| std::borrow::Cow::Owned(human),
+        )
+    }
+}
+
+impl std::fmt::Display for RunnerProgramError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&Self::human_message_from(&self.message))
+    }
+}
+
+impl std::error::Error for RunnerProgramError {}
 
 impl From<String> for RunnerProgramError {
     fn from(message: String) -> Self {

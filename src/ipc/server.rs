@@ -2850,6 +2850,207 @@ mod tests {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    fn assert_brain_vm_failure(snapshot: &crate::brain::store::BrainSnapshot, request_seq: u64) {
+        let result = snapshot
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind,
+                    crate::brain::store::BrainEventKind::Result {
+                        request_seq: seq,
+                        ..
+                    } if seq == request_seq
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "named Brain snapshot lost the terminal result for program {request_seq}; events={:#?}",
+                    snapshot.events
+                )
+            });
+        let crate::brain::store::BrainEventKind::Result { output, error, .. } = &result.kind else {
+            unreachable!("result search returned a non-result event")
+        };
+        assert!(
+            output.is_empty(),
+            "named Brain VM diagnostics leaked into ordinary output; output={output:?}; error={error:?}"
+        );
+        let encoded = error.as_deref().unwrap_or_else(|| {
+            panic!(
+                "named Brain result lost its structured VM error; result={result:#?}; events={:#?}",
+                snapshot.events
+            )
+        });
+        let (human, diagnostics) = crate::server::RunnerProgramError::decode_vm_failure(encoded)
+            .unwrap_or_else(|| {
+                panic!(
+                    "named Brain result flattened its VM error envelope; error={encoded:?}; result={result:#?}"
+                )
+            });
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "named Brain must preserve the complete ordered diagnostic list; diagnostics={diagnostics:#?}; human={human:?}"
+        );
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code, "E-TYPE-002",
+            "wrong diagnostic survived named Brain transport; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.expected_types,
+            vec![crate::vm::Type::String],
+            "named Brain lost expected type; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.found_types,
+            vec![crate::vm::Type::Int],
+            "named Brain lost found type; diagnostic={diagnostic:#?}"
+        );
+        let primary = diagnostic.primary.as_ref().unwrap_or_else(|| {
+            panic!("named Brain lost the failing source origin; diagnostic={diagnostic:#?}")
+        });
+        assert_eq!(
+            primary.word.as_deref(),
+            Some("say"),
+            "named Brain lost the failing word; diagnostic={diagnostic:#?}"
+        );
+        let expected_source_id = format!("brain:shared:event:{request_seq}");
+        assert_eq!(
+            primary.span.as_ref().map(|span| span.source_id.as_str()),
+            Some(expected_source_id.as_str()),
+            "named Brain source identity no longer addresses the durable program event; diagnostic={diagnostic:#?}"
+        );
+        let producer = diagnostic.found_value_origin().unwrap_or_else(|| {
+            panic!("named Brain lost machine-readable value provenance; diagnostic={diagnostic:#?}")
+        });
+        assert_eq!(
+            producer.word.as_deref(),
+            Some("+"),
+            "named Brain lost the producer word; diagnostic={diagnostic:#?}"
+        );
+        assert!(
+            diagnostic
+                .hints
+                .iter()
+                .any(|hint| hint.contains("int-to-string")),
+            "named Brain lost the evidence-backed conversion hint; diagnostic={diagnostic:#?}"
+        );
+        assert!(
+            human.contains("say") && human.contains("expected string") && human.contains("3 4 + say"),
+            "named Brain human projection lost source-cited failure facts; human={human:?}; diagnostic={diagnostic:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn named_brain_vm_diagnostic_survives_runner_ipc_snapshot_and_restart() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().unwrap();
+                let brain_root = temp.path().join("brains");
+                let store = crate::brain::store::BrainStore::with_root(
+                    "box.local",
+                    Some(brain_root.clone()),
+                );
+                let server = std::sync::Arc::new(
+                    crate::server::AgentServer::for_brain_protocol_test(
+                        store.clone(),
+                        crate::brain::credential::BrainCredentialAuthority::ephemeral([49; 32]),
+                        "test-password".into(),
+                        temp.path(),
+                    )
+                    .unwrap(),
+                );
+                let daemon: super::finch_ipc_capnp::finch_daemon::Client = capnp_rpc::new_client(
+                    FinchDaemonImpl::new(std::sync::Arc::clone(&server), uuid::Uuid::new_v4()),
+                );
+                let ipc = crate::ipc::IpcClient::from_test_client(daemon);
+                let initial = ipc.brain_snapshot("shared").await.unwrap();
+                let runner_subject = "runner@box.local/vm-diagnostic";
+                ipc.brain_claim_runner_identity(runner_subject)
+                    .await
+                    .unwrap();
+                let lease = ipc
+                    .brain_acquire_runner(
+                        "shared",
+                        runner_subject,
+                        &initial.environment,
+                        None,
+                        300_000,
+                    )
+                    .await
+                    .unwrap();
+
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(ProviderSubmitProgramGenerator {
+                        input: serde_json::Value::Null,
+                        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    });
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        crate::tools::registry::ToolRegistry::new(),
+                        crate::tools::permissions::PermissionManager::new(),
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .unwrap(),
+                ));
+                let event_loop = crate::cli::repl_event::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    runtime,
+                );
+                let (event_tx, event_driver) =
+                    event_loop.start_named_brain_test_runner("shared".into());
+                let _bootstrap = ipc
+                    .register_brain_runner("shared", lease.lease_id, event_tx.clone())
+                    .await
+                    .unwrap();
+                let attachment = ipc
+                    .brain_attach(
+                        "shared",
+                        "alice",
+                        crate::brain::store::AttachmentRole::Driver,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let mut watch = ipc.brain_watch("shared", &attachment).await.unwrap();
+                let _initial_watch = watch.recv().await.unwrap().unwrap();
+                let submission = ipc
+                    .brain_submit(
+                        "shared",
+                        &attachment,
+                        crate::brain::store::BrainEventKind::Program {
+                            language: crate::brain::store::ProgramLanguage::Forth,
+                            source: "3 4 + say".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let request_seq = submission.accepted.seq;
+                let snapshot = ipc.brain_snapshot("shared").await.unwrap();
+                assert_brain_vm_failure(&snapshot, request_seq);
+
+                event_tx
+                    .send(crate::cli::repl_event::ReplEvent::Shutdown)
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), event_driver)
+                    .await
+                    .expect("named Brain diagnostic runner did not shut down within two seconds")
+                    .unwrap()
+                    .unwrap();
+
+                let restarted =
+                    crate::brain::store::BrainStore::with_root("box.local", Some(brain_root));
+                let replayed = restarted.snapshot("shared").unwrap();
+                assert_brain_vm_failure(&replayed, request_seq);
+            })
+            .await;
+    }
+
     #[async_trait::async_trait]
     impl crate::generators::Generator for ProviderSubmitProgramGenerator {
         async fn generate(

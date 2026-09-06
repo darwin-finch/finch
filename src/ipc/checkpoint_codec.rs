@@ -2001,14 +2001,6 @@ fn encode_diagnostic(
         &value.found_types,
         depth + 1,
     )?;
-    builder.set_has_found_value_origin(value.found_value_origin.is_some());
-    if let Some(origin) = &value.found_value_origin {
-        encode_origin(
-            builder.reborrow().init_found_value_origin(),
-            origin,
-            depth + 1,
-        )?;
-    }
     encode_effects(
         builder
             .reborrow()
@@ -2061,10 +2053,6 @@ fn decode_diagnostic(
             .collect::<Result<Vec<_>>>()?,
         expected_types: decode_type_list(reader.get_expected_types()?, depth + 1)?,
         found_types: decode_type_list(reader.get_found_types()?, depth + 1)?,
-        found_value_origin: reader
-            .get_has_found_value_origin()
-            .then(|| decode_origin(reader.get_found_value_origin()?, depth + 1))
-            .transpose()?,
         expected_effects: decode_effects(reader.get_expected_effects()?)?,
         found_effects: decode_effects(reader.get_found_effects()?)?,
         capability: reader
@@ -2437,21 +2425,6 @@ mod tests {
         decode_instruction(reader.get_root::<wire::instruction::Reader<'_>>()?, 0)
     }
 
-    fn round_trip_diagnostic(value: &VmDiagnostic) -> Result<VmDiagnostic> {
-        let mut message = capnp::message::Builder::new_default();
-        encode_diagnostic(
-            message.init_root::<wire::vm_diagnostic::Builder<'_>>(),
-            value,
-            0,
-        )?;
-        let words = capnp::serialize::write_message_to_words(&message);
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut words.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )?;
-        decode_diagnostic(reader.get_root::<wire::vm_diagnostic::Reader<'_>>()?, 0)
-    }
-
     fn sample_requirement() -> CapabilityRequirement {
         CapabilityRequirement {
             capability: CapabilityKind::FileRead,
@@ -2476,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vm_diagnostic_found_value_origin_round_trips_without_json() -> Result<()> {
+    fn test_failed_effect_record_preserves_vm_diagnostic_found_value_origin() -> Result<()> {
         let primary = SourceOrigin {
             language: SourceLanguage::Forth,
             span: Some(SourceSpan::bytes("input.forth", 6, 9)),
@@ -2490,13 +2463,41 @@ mod tests {
             expansion: None,
         };
         let mut diagnostic = VmDiagnostic::type_mismatch(Type::String, Type::Int, Some(primary));
-        diagnostic.found_value_origin = Some(producer);
+        diagnostic.set_found_value_origin(producer);
+        let execution_id = uuid::Uuid::new_v4();
+        let effect = EffectJournalEntry {
+            effect: VmSideEffect {
+                protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                sequence: 1,
+                requirement: CapabilityRequirement {
+                    capability: CapabilityKind::SessionEmit,
+                    selector: ResourceSelector::None,
+                },
+                event: HostSideEffect::Emit {
+                    text: "unpublished".into(),
+                },
+                output: Vec::new(),
+                origin: SourceOrigin::generated("say"),
+            },
+            state: EffectJournalState::Failed {
+                diagnostic: diagnostic.clone(),
+            },
+        };
 
-        let decoded = round_trip_diagnostic(&diagnostic)?;
+        let decoded = round_trip_effect_record(execution_id, &effect)?;
         assert_eq!(
-            decoded, diagnostic,
-            "Cap'n Proto checkpoint codec lost structured found-value provenance; \
-             decoded={decoded:#?}; original={diagnostic:#?}"
+            decoded,
+            (execution_id, effect.clone()),
+            "Cap'n Proto containing effect-record codec lost structured found-value provenance; \
+             decoded={decoded:#?}; original={effect:#?}"
+        );
+        let EffectJournalState::Failed { diagnostic } = decoded.1.state else {
+            panic!("decoded containing effect record changed its failure state: {decoded:#?}")
+        };
+        assert_eq!(
+            diagnostic.found_value_origin().and_then(|origin| origin.word.as_deref()),
+            Some("+"),
+            "containing effect-record projection dropped the machine-readable producer origin; diagnostic={diagnostic:#?}"
         );
         Ok(())
     }

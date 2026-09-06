@@ -3791,7 +3791,9 @@ impl Compiler<'_> {
         if diagnostic.code != "E-TYPE-002" || signature.input.values.len() != 1 {
             return diagnostic;
         }
-        diagnostic.found_value_origin = found_value_origin.cloned();
+        if let Some(found_value_origin) = found_value_origin {
+            diagnostic.set_found_value_origin(found_value_origin.clone());
+        }
         if word == "say"
             && diagnostic.expected_types == [Type::String]
             && diagnostic.found_types == [Type::Int]
@@ -5247,8 +5249,7 @@ mod tests {
             .and_then(|origin| origin.span.as_ref())
             .expect("say mismatch should retain its exact operator span");
         let producer = diagnostic
-            .found_value_origin
-            .as_ref()
+            .found_value_origin()
             .and_then(|origin| origin.span.as_ref())
             .expect("nested + call should retain its reader-owned operator span");
         assert_eq!(

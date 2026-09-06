@@ -762,8 +762,6 @@ struct VmDiagnostic {
   hints           @14 :List(Text);
   hasCause        @15 :Bool;
   cause           @16 :VmDiagnostic;
-  hasFoundValueOrigin @17 :Bool;
-  foundValueOrigin    @18 :SourceOrigin;
 }
 
 struct ProducerFiberRecord {

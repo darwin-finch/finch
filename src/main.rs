@@ -394,10 +394,7 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
         .with_context(|| format!("read Finch script '{}'", path.display()))?;
     let script = finch::programs::parse_finch_script(&path, &contents)?;
     let source_id = path.display().to_string();
-    // Preserve the stripped shebang's physical line in every runtime span.
-    // A leading newline is inert in both typed languages while keeping source
-    // excerpts and machine-readable locations aligned with the authored file.
-    let diagnostic_source = format!("\n{}", script.source);
+    let source_offset = contents.len().saturating_sub(script.source.len());
     let runtime = finch::runtime::ProgramRuntime::new();
     // Executing a local script is the user's explicit request to receive its
     // response.  Grant only that presentation capability here; every resource
@@ -407,11 +404,11 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
         capability: finch::vm::CapabilityKind::SessionEmit,
         selector: finch::vm::ResourceSelector::None,
     })?;
-    let outcome = runtime
+    let mut outcome = runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language: script.language,
             source_id: Some(source_id.clone()),
-            source: diagnostic_source.clone(),
+            source: script.source,
             intent: format!("execute Finch script {}", path.display()),
             // The typed verifier and broker derive the concrete capabilities.
             // This legacy coarse field is intentionally not used to authorize
@@ -423,6 +420,12 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
             budget: None,
         })
         .await?;
+    rebase_vm_diagnostic_spans(
+        &mut outcome.vm_diagnostics,
+        &source_id,
+        &contents,
+        source_offset,
+    );
 
     if json_output {
         // Keep stdout machine-readable even for a failed/paused program, but
@@ -439,7 +442,7 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
         finch::runtime::outcome::ExecutionStatus::Completed
     ) {
         let detail = if outcome.required_capabilities.is_empty() {
-            render_outcome_diagnostics(&outcome, &source_id, &diagnostic_source)
+            render_outcome_diagnostics(&outcome, &source_id, &contents)
                 .unwrap_or_else(|| "no diagnostic".to_string())
         } else {
             format!(
@@ -523,6 +526,74 @@ async fn run_direct_typed_source_with_json(
         "typed {} program did not complete: {detail}",
         language.as_str()
     )
+}
+
+fn rebase_vm_diagnostic_spans(
+    diagnostics: &mut [finch::vm::VmDiagnostic],
+    source_id: &str,
+    full_source: &str,
+    byte_offset: usize,
+) {
+    fn rebase_origin(
+        origin: &mut finch::vm::SourceOrigin,
+        source_id: &str,
+        full_source: &str,
+        byte_offset: usize,
+    ) {
+        if let Some(span) = origin
+            .span
+            .as_mut()
+            .filter(|span| span.source_id == source_id)
+        {
+            span.start_byte = span.start_byte.saturating_add(byte_offset);
+            span.end_byte = span.end_byte.saturating_add(byte_offset);
+            if span.end_byte <= full_source.len()
+                && full_source.is_char_boundary(span.start_byte)
+                && full_source.is_char_boundary(span.end_byte)
+            {
+                let start_prefix = &full_source[..span.start_byte];
+                let end_prefix = &full_source[..span.end_byte];
+                span.start_line = start_prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                span.end_line = end_prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                span.start_column = start_prefix
+                    .rsplit_once('\n')
+                    .map_or(start_prefix, |(_, line)| line)
+                    .chars()
+                    .count()
+                    + 1;
+                span.end_column = end_prefix
+                    .rsplit_once('\n')
+                    .map_or(end_prefix, |(_, line)| line)
+                    .chars()
+                    .count()
+                    + 1;
+            }
+        }
+        if let Some(expansion) = origin.expansion.as_mut() {
+            rebase_origin(expansion, source_id, full_source, byte_offset);
+        }
+    }
+
+    fn rebase_diagnostic(
+        diagnostic: &mut finch::vm::VmDiagnostic,
+        source_id: &str,
+        full_source: &str,
+        byte_offset: usize,
+    ) {
+        if let Some(primary) = diagnostic.primary.as_mut() {
+            rebase_origin(primary, source_id, full_source, byte_offset);
+        }
+        for related in &mut diagnostic.related {
+            rebase_origin(related, source_id, full_source, byte_offset);
+        }
+        if let Some(cause) = diagnostic.cause.as_mut() {
+            rebase_diagnostic(cause, source_id, full_source, byte_offset);
+        }
+    }
+
+    for diagnostic in diagnostics {
+        rebase_diagnostic(diagnostic, source_id, full_source, byte_offset);
+    }
 }
 
 fn render_outcome_diagnostics(

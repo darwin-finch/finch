@@ -1988,7 +1988,7 @@ async fn dispatch_named_brain_program(
                     name,
                     run_id,
                     request_seq,
-                    Err(anyhow::anyhow!(error.to_string())),
+                    Err(anyhow::anyhow!(failure.message.clone())),
                     Vec::new(),
                     None,
                 )?;

@@ -169,6 +169,9 @@ struct WorkUnitInner {
     /// Bounded or indeterminate progress reported by an explicit output
     /// handle. Plain `say` output never uses this field.
     progress: Option<(u64, Option<u64>)>,
+    /// Exact authored source for a typed-program diagnostic. This internal UI
+    /// metadata avoids widening the public `ReplEvent` aggregate.
+    vm_diagnostic_source: Option<(String, String)>,
 }
 
 // ============================================================================
@@ -224,6 +227,7 @@ impl WorkUnit {
                 presentation: WorkUnitPresentation::Assistant,
                 transient_status: None,
                 progress: None,
+                vm_diagnostic_source: None,
             })),
         }
     }
@@ -303,6 +307,27 @@ impl WorkUnit {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .presentation = WorkUnitPresentation::ProgramOutput { title: None };
+    }
+
+    /// Retain source text beside its typed-program output projection.
+    pub(crate) fn set_vm_diagnostic_source(
+        &self,
+        source_id: impl Into<String>,
+        source: impl Into<String>,
+    ) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .vm_diagnostic_source = Some((source_id.into(), source.into()));
+    }
+
+    /// Return the source retained for typed-program diagnostic presentation.
+    pub(crate) fn vm_diagnostic_source(&self) -> Option<(String, String)> {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .vm_diagnostic_source
+            .clone()
     }
 
     /// Render this unit as an independently addressable VM output handle.

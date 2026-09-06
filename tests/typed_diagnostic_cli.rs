@@ -138,11 +138,15 @@ fn test_json_failure_retains_structured_diagnostic_fields_and_span() {
         "JSON diagnostic lost its found type; diagnostic={diagnostic:#?}"
     );
     assert_eq!(
-        diagnostic["found_value_origin"]["word"], "+",
+        diagnostic["cause"]["code"], "N-VALUE-ORIGIN-001",
+        "JSON diagnostic lost the machine-readable producer relation; diagnostic={diagnostic:#?}"
+    );
+    assert_eq!(
+        diagnostic["cause"]["primary"]["word"], "+",
         "JSON diagnostic lost the proven producer word; diagnostic={diagnostic:#?}"
     );
     assert_eq!(
-        diagnostic["found_value_origin"]["span"]["start_byte"], 4,
+        diagnostic["cause"]["primary"]["span"]["start_byte"], 4,
         "JSON diagnostic lost the proven producer span; diagnostic={diagnostic:#?}"
     );
     assert!(
@@ -152,5 +156,43 @@ fn test_json_failure_retains_structured_diagnostic_fields_and_span() {
                 .as_str()
                 .is_some_and(|hint| hint.contains("int-to-string")))),
         "JSON diagnostic lost its actionable correction; diagnostic={diagnostic:#?}"
+    );
+}
+
+#[test]
+fn test_exec_json_spans_index_the_named_physical_script() {
+    let script = tempfile::NamedTempFile::new().expect("script fixture should be created");
+    let contents = "#!/usr/bin/env finch --exec --language=forth\n3 4 + say\n";
+    std::fs::write(script.path(), contents).expect("script fixture should be written");
+    let path = script.path().to_string_lossy().into_owned();
+    let output = run_finch(&["--exec", &path, "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "invalid JSON-mode script unexpectedly completed; stdout={stdout:?}; stderr={stderr:?}"
+    );
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!("--exec --json outcome was not machine-readable: {error}; stdout={stdout:?}")
+        });
+    let diagnostic = &outcome["vm_diagnostics"][0];
+    let say_offset = contents.find("say").expect("script contains say");
+    let plus_offset = contents.find('+').expect("script contains +");
+    assert_eq!(
+        diagnostic["primary"]["span"]["source_id"], path,
+        "--exec --json span names a source other than the physical script; diagnostic={diagnostic:#?}"
+    );
+    assert_eq!(
+        diagnostic["primary"]["span"]["start_byte"], say_offset,
+        "--exec --json primary offset does not index `say` in the named script; diagnostic={diagnostic:#?}"
+    );
+    assert_eq!(
+        diagnostic["primary"]["span"]["start_line"], 2,
+        "--exec --json primary line does not include the physical shebang; diagnostic={diagnostic:#?}"
+    );
+    assert_eq!(
+        diagnostic["cause"]["primary"]["span"]["start_byte"], plus_offset,
+        "--exec --json producer offset does not index `+` in the named script; diagnostic={diagnostic:#?}"
     );
 }

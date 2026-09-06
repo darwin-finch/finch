@@ -347,7 +347,13 @@ pub fn compile_forth_with_functions(
             &definition.locals,
             &[],
             Some(&definition.signature.output.values),
-        )?;
+        )
+        .map_err(|mut diagnostics| {
+            for diagnostic in &mut diagnostics {
+                diagnostic.related.push(definition.name_origin.clone());
+            }
+            diagnostics
+        })?;
         let verified = &compiled.functions[&compiled.module.entry];
         let mut function = compiled.module.functions[&compiled.module.entry].clone();
         for (nested_name, nested_function) in &compiled.module.functions {
@@ -2522,7 +2528,9 @@ fn enrich_forth_word_mismatch(
         return diagnostic;
     }
     if known_top.is_some_and(|known| known.stack_len == stack.len()) {
-        diagnostic.found_value_origin = known_top.map(|known| known.origin.clone());
+        if let Some(known) = known_top {
+            diagnostic.set_found_value_origin(known.origin.clone());
+        }
     }
     if diagnostic.expected_types == [Type::String]
         && diagnostic.found_types == [Type::Int]
@@ -2593,6 +2601,7 @@ fn merge_suspension_contract(
 #[derive(Debug, Clone)]
 struct ForthDefinitionAst {
     name: String,
+    name_origin: SourceOrigin,
     documentation: Option<String>,
     signature: StackSignature,
     declares_pure: bool,
@@ -2681,6 +2690,7 @@ fn parse_forth_module(source_id: &str, source: &str) -> Result<ForthModuleAst, V
         let definition_end = tokens[end].end;
         definitions.push(ForthDefinitionAst {
             name: name.clone(),
+            name_origin: origin(source_id, source, name_token.start, name_token.end),
             documentation: forth_definition_documentation(source, definition_start),
             signature,
             declares_pure,
@@ -4345,8 +4355,7 @@ mod tests {
             .and_then(|origin| origin.span.as_ref())
             .expect("say mismatch should retain its exact source span");
         let producer = diagnostic
-            .found_value_origin
-            .as_ref()
+            .found_value_origin()
             .and_then(|origin| origin.span.as_ref())
             .expect("straight-line + output should retain its proven producer span");
         assert_eq!(
@@ -4399,6 +4408,39 @@ mod tests {
             .expect("definition error retains its original module span");
         assert_eq!(span.start_line, 4);
         assert_eq!(&source[span.start_byte..span.end_byte], "+");
+    }
+
+    #[test]
+    fn test_nested_definition_type_mismatch_cites_body_producer_and_definition() {
+        let source = ": broken ( S -- S ! infer )\n  3 4 + say\n;\nbroken";
+        let errors = compile_forth(
+            "nested-definition.forth",
+            source,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("definition whose integer expression reaches say must be rejected");
+        let diagnostic = &errors[0];
+        let primary = diagnostic
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("nested definition mismatch should retain the consuming body span");
+        let producer = diagnostic
+            .found_value_origin()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("nested definition mismatch should retain the body producer span");
+        let definition = diagnostic
+            .related
+            .first()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("nested definition mismatch should link its enclosing definition");
+        assert!(
+            &source[primary.start_byte..primary.end_byte] == "say"
+                && &source[producer.start_byte..producer.end_byte] == "+"
+                && &source[definition.start_byte..definition.end_byte] == "broken",
+            "nested definition provenance lost consumer, producer, or definition; diagnostic={diagnostic:#?}"
+        );
     }
 
     #[test]

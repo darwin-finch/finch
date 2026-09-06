@@ -65,8 +65,6 @@ type PendingApprovalsMap = Arc<
 fn project_typed_program_completion(
     output_manager: &OutputManager,
     output_unit: &Arc<crate::cli::messages::WorkUnit>,
-    source_id: &str,
-    source: &str,
     result: std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
 ) {
     let failed = match result {
@@ -76,11 +74,16 @@ fn project_typed_program_completion(
         Ok(outcome) => {
             let detail = if outcome.vm_diagnostics.is_empty() {
                 outcome.diagnostics.join("\n")
-            } else {
+            } else if let Some((source_id, source)) = output_unit.vm_diagnostic_source() {
                 crate::vm::render_vm_diagnostics(
                     &outcome.vm_diagnostics,
-                    &[crate::vm::DiagnosticSource { source_id, source }],
+                    &[crate::vm::DiagnosticSource {
+                        source_id: &source_id,
+                        source: &source,
+                    }],
                 )
+            } else {
+                crate::vm::render_vm_diagnostics(&outcome.vm_diagnostics, &[])
             };
             output_manager.write_error(if detail.is_empty() {
                 format!("VM program ended as {:?}", outcome.status)
@@ -1241,7 +1244,10 @@ fn project_remote_brain_run_event(
                 .result_row
                 .get_or_insert_with(|| projection.unit.add_activity_row("result"));
             if let Some(error) = error {
-                projection.unit.fail_row(row, error);
+                projection.unit.fail_row(
+                    row,
+                    crate::server::RunnerProgramError::human_message_from(error).into_owned(),
+                );
             } else {
                 projection.unit.complete_row_with_body(
                     row,
@@ -3606,6 +3612,8 @@ Rules:\n\
         source_unit.set_complete();
         let output_unit = self.output_manager.start_work_unit("VM program output");
         output_unit.set_program_output();
+        output_unit
+            .set_vm_diagnostic_source(format!("interactive.{}", language.as_str()), source.clone());
         let projection =
             VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
         let event_tx = self.event_tx.clone();
@@ -3644,8 +3652,6 @@ Rules:\n\
             .map_err(|error: anyhow::Error| error.to_string());
             let _ = event_tx.send(ReplEvent::TypedProgramComplete {
                 output_unit,
-                source_id: format!("interactive.{}", language.as_str()),
-                source,
                 result,
             });
         });
@@ -4455,17 +4461,9 @@ Rules:\n\
 
             ReplEvent::TypedProgramComplete {
                 output_unit,
-                source_id,
-                source,
                 result,
             } => {
-                project_typed_program_completion(
-                    &self.output_manager,
-                    &output_unit,
-                    &source_id,
-                    &source,
-                    result,
-                );
+                project_typed_program_completion(&self.output_manager, &output_unit, result);
                 self.render_tui().await?;
             }
 
@@ -5086,13 +5084,12 @@ Rules:\n\
                     crate::programs::ProgramLanguage::Lisp
                 }
             };
+            let source_id = format!("brain:{}:event:{}", request.brain, request.request_seq);
+            let source = request.source;
             let submission = crate::runtime::ProgramSubmission {
                 language,
-                source_id: Some(format!(
-                    "brain:{}:event:{}",
-                    request.brain, request.request_seq
-                )),
-                source: request.source,
+                source_id: Some(source_id.clone()),
+                source: source.clone(),
                 intent: format!("named Brain program event {}", request.request_seq),
                 effect: crate::programs::ExecutionEffect::Unclassified,
                 declared_capabilities: Vec::new(),
@@ -5152,14 +5149,27 @@ Rules:\n\
                 };
                 let effect_journal = super::query_processor::runner_effect_records(&outcome);
                 if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
-                    return Err(crate::server::RunnerProgramError {
-                        message: format!(
-                            "named Brain ProgramRun ended as {:?}: {}",
-                            outcome.status,
-                            outcome.diagnostics.join("; ")
-                        ),
+                    let fallback = format!(
+                        "named Brain ProgramRun ended as {:?}: {}",
+                        outcome.status,
+                        outcome.diagnostics.join("; ")
+                    );
+                    let message = if outcome.vm_diagnostics.is_empty() {
+                        fallback
+                    } else {
+                        crate::vm::render_vm_diagnostics(
+                            &outcome.vm_diagnostics,
+                            &[crate::vm::DiagnosticSource {
+                                source_id: &source_id,
+                                source: &source,
+                            }],
+                        )
+                    };
+                    return Err(crate::server::RunnerProgramError::with_vm_diagnostics(
+                        message,
+                        outcome.vm_diagnostics,
                         effect_journal,
-                    });
+                    ));
                 }
                 let checkpoint = runtime
                     .revision_history()
@@ -6838,7 +6848,11 @@ Rules:\n\
                     );
                     let row = projection.unit.add_activity_row("result");
                     if let Some(error) = error {
-                        projection.unit.fail_row(row, error);
+                        projection.unit.fail_row(
+                            row,
+                            crate::server::RunnerProgramError::human_message_from(error)
+                                .into_owned(),
+                        );
                     } else {
                         projection.unit.complete_row_with_body(
                             row,
@@ -6856,6 +6870,7 @@ Rules:\n\
                     return;
                 }
                 if let Some(error) = error {
+                    let error = crate::server::RunnerProgramError::human_message_from(error);
                     self.output_manager.write_info(format!("error: {error}"));
                 } else if !output.is_empty() {
                     let label = event
@@ -9000,6 +9015,71 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[test]
+    fn test_typed_completion_adapter_renders_every_vm_diagnostic_in_order() {
+        use crate::cli::messages::Message;
+
+        let output_manager = OutputManager::default();
+        output_manager.disable_stdout();
+        let output_unit = output_manager.start_work_unit("VM program output");
+        output_unit.set_program_output();
+        output_unit.set_vm_diagnostic_source("interactive.forth", "first second");
+        let mut outcome = crate::runtime::outcome::ExecutionOutcome::failed(
+            uuid::Uuid::new_v4(),
+            0,
+            crate::programs::ExecutionEffect::Unclassified,
+            crate::runtime::outcome::ExecutionBackend::TypedVm,
+            "two VM failures",
+            0,
+        );
+        outcome.vm_diagnostics = vec![
+            crate::vm::VmDiagnostic::type_mismatch(
+                crate::vm::Type::String,
+                crate::vm::Type::Int,
+                Some(crate::vm::SourceOrigin {
+                    language: crate::vm::SourceLanguage::Forth,
+                    span: Some(crate::vm::SourceSpan::bytes("interactive.forth", 0, 5)),
+                    word: Some("first".into()),
+                    expansion: None,
+                }),
+            ),
+            crate::vm::VmDiagnostic::error(
+                "E-NAME-001",
+                crate::vm::DiagnosticPhase::NameResolution,
+                "unknown word `second`",
+                Some(crate::vm::SourceOrigin {
+                    language: crate::vm::SourceLanguage::Forth,
+                    span: Some(crate::vm::SourceSpan::bytes("interactive.forth", 6, 12)),
+                    word: Some("second".into()),
+                    expansion: None,
+                }),
+            ),
+        ];
+
+        project_typed_program_completion(&output_manager, &output_unit, Ok(outcome));
+
+        let messages = output_manager.get_messages();
+        let rendered = messages
+            .last()
+            .unwrap_or_else(|| panic!("typed completion adapter emitted no diagnostic"))
+            .content();
+        let first = rendered.find("E-TYPE-002").unwrap_or_else(|| {
+            panic!("typed completion adapter dropped the first diagnostic; rendered={rendered:?}")
+        });
+        let second = rendered.find("E-NAME-001").unwrap_or_else(|| {
+            panic!("typed completion adapter dropped the second diagnostic; rendered={rendered:?}")
+        });
+        assert!(
+            first < second,
+            "typed completion adapter reordered VM diagnostics; rendered={rendered:?}"
+        );
+        assert!(
+            output_unit.content().is_empty(),
+            "typed completion adapter leaked diagnostics into ordinary program output; rendered={rendered:?}; output={:?}",
+            output_unit.content()
+        );
     }
 
     /// Every systemic condition this runner can report must declare itself with
