@@ -164,12 +164,21 @@ pub struct AgentServer {
     /// Brain HTTP fixtures, so a pathname swap cannot redirect later opens.
     #[cfg(test)]
     supervised_state_root: Option<std::fs::File>,
+    #[cfg(test)]
+    schedule_scan_observer:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<ScheduleScanObservation>>>>,
 }
 
 #[cfg(test)]
 struct SupervisedStateRoot {
     directory: std::fs::File,
     path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct ScheduleScanObservation {
+    outcomes: Vec<(String, &'static str)>,
 }
 
 #[cfg(test)]
@@ -298,6 +307,7 @@ impl AgentServer {
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(String::new())),
             supervised_state_root: None,
+            schedule_scan_observer: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -351,6 +361,7 @@ impl AgentServer {
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(password)),
             supervised_state_root: None,
+            schedule_scan_observer: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -424,6 +435,8 @@ impl AgentServer {
             brain_password: Arc::new(RwLock::new(brain_password)),
             #[cfg(test)]
             supervised_state_root: None,
+            #[cfg(test)]
+            schedule_scan_observer: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -455,29 +468,95 @@ impl AgentServer {
         // Actual ProgramRuns remain on each Brain's leased environment runner.
         let schedule_store = self.brain_store.clone();
         let schedule_runners = self.brain_runners.clone();
+        #[cfg(test)]
+        let schedule_scan_observer = Arc::clone(&self.schedule_scan_observer);
         let schedule_task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut unavailable = std::collections::HashMap::new();
+            let mut discovery_unavailable = false;
             loop {
                 tick.tick().await;
-                let names = match schedule_store.list() {
+                let names = match schedule_store.candidate_names() {
                     Ok(names) => names,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not list Brains for schedule delivery");
+                    Err(_) => {
+                        if !discovery_unavailable {
+                            tracing::warn!(
+                                category = "brain_candidate_discovery_failed",
+                                "could not discover Brains for schedule delivery; check the Brain state directory and daemon permissions"
+                            );
+                            discovery_unavailable = true;
+                        }
                         continue;
                     }
                 };
+                #[cfg(test)]
+                let mut scan_outcomes = Vec::with_capacity(names.len());
+                unavailable.retain(|name, _| names.binary_search(name).is_ok());
+                if discovery_unavailable {
+                    tracing::info!(
+                        category = "brain_candidate_discovery_recovered",
+                        "Brain candidate discovery recovered; schedule delivery resumed"
+                    );
+                    discovery_unavailable = false;
+                }
                 for name in names {
-                    if let Err(error) = handlers::deliver_due_named_brain_schedules(
+                    if schedule_store.load_candidate(&name).is_err() {
+                        #[cfg(test)]
+                        scan_outcomes.push((name.clone(), "brain_replay_failed"));
+                        if unavailable.insert(name.clone(), "brain_replay_failed")
+                            != Some("brain_replay_failed")
+                        {
+                            tracing::warn!(
+                                brain = %name,
+                                category = "brain_replay_failed",
+                                "skipping an unavailable Brain during schedule delivery; repair its durable Brain state and Finch will retry it"
+                            );
+                        }
+                        continue;
+                    }
+                    if handlers::deliver_due_named_brain_schedules(
                         schedule_store.clone(),
                         schedule_runners.clone(),
                         name.clone(),
                         crate::brain::store::unix_millis(),
                     )
                     .await
+                    .is_err()
                     {
-                        tracing::warn!(brain = %name, %error, "could not deliver due Brain schedule");
+                        #[cfg(test)]
+                        scan_outcomes.push((name.clone(), "schedule_delivery_failed"));
+                        if unavailable.insert(name.clone(), "schedule_delivery_failed")
+                            != Some("schedule_delivery_failed")
+                        {
+                            tracing::warn!(
+                                brain = %name,
+                                category = "schedule_delivery_failed",
+                                "could not deliver a schedule for an available Brain; Finch will retry it"
+                            );
+                        }
+                    } else {
+                        #[cfg(test)]
+                        scan_outcomes.push((name.clone(), "delivered"));
+                        if let Some(previous_category) = unavailable.remove(&name) {
+                            tracing::info!(
+                                brain = %name,
+                                category = "brain_schedule_recovered",
+                                previous_category,
+                                "Brain schedule delivery recovered"
+                            );
+                        }
                     }
+                }
+                #[cfg(test)]
+                if let Some(observer) = schedule_scan_observer
+                    .lock()
+                    .expect("schedule scan observer lock poisoned")
+                    .as_ref()
+                {
+                    let _ = observer.send(ScheduleScanObservation {
+                        outcomes: scan_outcomes,
+                    });
                 }
             }
         });
@@ -653,6 +732,18 @@ impl AgentServer {
 
     pub fn brain_store(&self) -> &crate::brain::store::BrainStore {
         &self.brain_store
+    }
+
+    #[cfg(test)]
+    fn observe_schedule_scans(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ScheduleScanObservation> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .schedule_scan_observer
+            .lock()
+            .expect("schedule scan observer lock poisoned") = Some(sender);
+        receiver
     }
 
     pub fn brain_runners(&self) -> &BrainRunnerBroker {
@@ -1227,6 +1318,328 @@ mod tests {
         // The permanent Brain-isolation CI gate runs these entries through
         // scripts/test_brains.sh, which supplies the authenticated contract.
         std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_some()
+    }
+
+    fn create_due_schedule_fixture(store: &crate::brain::store::BrainStore, name: &str) {
+        let attachment = store
+            .attach(
+                name,
+                "schedule-isolation@test.local",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .expect("schedule-isolation fixture must attach a driver");
+        store
+            .create_schedule(
+                name,
+                &attachment.subject,
+                attachment.attachment_id,
+                crate::brain::store::ProgramLanguage::Lisp,
+                "(say \"scheduled once\")",
+                crate::vm::EffectSet::pure(),
+                1,
+                None,
+                crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .expect("schedule-isolation fixture must persist one due schedule");
+    }
+
+    fn scheduled_run_count(store: &crate::brain::store::BrainStore, name: &str) -> usize {
+        store
+            .snapshot(name)
+            .unwrap_or_else(|error| panic!("healthy Brain '{name}' must replay: {error:#}"))
+            .runs
+            .iter()
+            .filter(|run| run.kind == crate::brain::store::BrainRunKind::Scheduled)
+            .count()
+    }
+
+    struct ScheduleServerGuard(Option<tokio::task::JoinHandle<anyhow::Result<()>>>);
+
+    impl ScheduleServerGuard {
+        async fn shutdown(mut self) {
+            if let Some(task) = self.0.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    impl Drop for ScheduleServerGuard {
+        fn drop(&mut self) {
+            if let Some(task) = &self.0 {
+                task.abort();
+            }
+        }
+    }
+
+    async fn start_schedule_server(server: Arc<AgentServer>) -> ScheduleServerGuard {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("schedule-isolation daemon must bind its kernel-assigned endpoint");
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        tokio::task::yield_now().await;
+        ScheduleServerGuard(Some(serving))
+    }
+
+    fn schedule_state_diagnostic(store: &crate::brain::store::BrainStore) -> String {
+        match store.candidate_names() {
+            Ok(names) => names
+                .into_iter()
+                .map(|name| match store.snapshot(&name) {
+                    Ok(snapshot) => format!(
+                        "{name}:revision={},runs={},schedules={},pending={}",
+                        snapshot.revision,
+                        snapshot.runs.len(),
+                        snapshot.schedules.len(),
+                        snapshot.pending_schedule_dues.len()
+                    ),
+                    Err(error) => format!("{name}:unavailable={error:#}"),
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            Err(error) => format!("candidate-discovery-failed={error:#}"),
+        }
+    }
+
+    async fn await_schedule_scan(
+        server: &AgentServer,
+        scans: &mut tokio::sync::mpsc::UnboundedReceiver<ScheduleScanObservation>,
+        advance_one_tick: bool,
+    ) -> ScheduleScanObservation {
+        if advance_one_tick {
+            tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+        }
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), scans.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "daemon schedule scan did not finish within the bounded rendezvous; state: {}",
+                    schedule_state_diagnostic(server.brain_store())
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "daemon schedule scan observer closed before reporting; state: {}",
+                    schedule_state_diagnostic(server.brain_store())
+                )
+            })
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_daemon_schedule_loop_isolates_unreplayable_brains_and_retries_repair() {
+        assert!(
+            supervisor_contract_present(),
+            "schedule-isolation production regression must run through scripts/test_brains.sh"
+        );
+        let state = tempfile::tempdir()
+            .expect("schedule-isolation regression needs a disposable state directory");
+        let brain_root = state.path().join("brains");
+        let healthy_names = ["b-healthy", "n-healthy", "y-healthy"];
+        let corrupt_names = ["a-corrupt", "m-corrupt", "z-corrupt"];
+        let fixture_store = crate::brain::store::BrainStore::with_root(
+            "schedule-isolation.local",
+            Some(brain_root.clone()),
+        );
+        for name in healthy_names.into_iter().chain(corrupt_names) {
+            create_due_schedule_fixture(&fixture_store, name);
+        }
+        drop(fixture_store);
+
+        let mut valid_journals = std::collections::HashMap::new();
+        let mut corrupt_journals = std::collections::HashMap::new();
+        for name in corrupt_names {
+            let path = brain_root.join(name).join("events.jsonl");
+            let valid = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("fixture journal for '{name}' must exist: {error}"));
+            let last = valid
+                .split_inclusive(|byte| *byte == b'\n')
+                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+                .next_back()
+                .expect("fixture journal must contain a canonical event");
+            let mut corrupt = valid.clone();
+            corrupt.extend_from_slice(last);
+            std::fs::write(&path, &corrupt).unwrap_or_else(|error| {
+                panic!("fixture journal for '{name}' must corrupt: {error}")
+            });
+            valid_journals.insert(name, valid);
+            corrupt_journals.insert(name, corrupt);
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&captured_writer)))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let credentials = crate::brain::credential::BrainCredentialAuthority::ephemeral([81; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test(
+                "schedule-isolation.local",
+                state.path(),
+                credentials.clone(),
+            )
+            .expect("schedule-isolation daemon fixture must construct"),
+        );
+        let mut scans = server.observe_schedule_scans();
+        let serving = start_schedule_server(Arc::clone(&server)).await;
+        let first_scan = await_schedule_scan(&server, &mut scans, false).await;
+        let second_scan = await_schedule_scan(&server, &mut scans, true).await;
+        for scan in [&first_scan, &second_scan] {
+            for name in healthy_names {
+                assert!(
+                    scan.outcomes.contains(&(name.to_string(), "delivered")),
+                    "schedule scan must deliver healthy Brain '{name}'; observation: {scan:?}; state: {}",
+                    schedule_state_diagnostic(server.brain_store())
+                );
+            }
+            for name in corrupt_names {
+                assert!(
+                    scan.outcomes
+                        .contains(&(name.to_string(), "brain_replay_failed")),
+                    "schedule scan must isolate corrupt Brain '{name}' by category; observation: {scan:?}; state: {}",
+                    schedule_state_diagnostic(server.brain_store())
+                );
+            }
+        }
+        for name in healthy_names {
+            let count = scheduled_run_count(server.brain_store(), name);
+            assert_eq!(
+                count, 1,
+                "healthy Brain '{name}' must receive its due schedule exactly once despite corrupt siblings; observed {count} scheduled runs"
+            );
+        }
+        for name in corrupt_names {
+            let observed = std::fs::read(brain_root.join(name).join("events.jsonl"))
+                .unwrap_or_else(|error| {
+                    panic!("corrupt journal for '{name}' must remain readable: {error}")
+                });
+            assert_eq!(
+                observed, corrupt_journals[name],
+                "schedule delivery must preserve corrupt journal bytes for '{name}'"
+            );
+        }
+        serving.shutdown().await;
+        drop(server);
+
+        let restarted = Arc::new(
+            AgentServer::for_brain_http_test("schedule-isolation.local", state.path(), credentials)
+                .expect("schedule-isolation daemon fixture must restart"),
+        );
+        let mut restarted_scans = restarted.observe_schedule_scans();
+        let restarted_serving = start_schedule_server(Arc::clone(&restarted)).await;
+        let restart_scan = await_schedule_scan(&restarted, &mut restarted_scans, false).await;
+        for name in healthy_names {
+            assert!(
+                restart_scan
+                    .outcomes
+                    .contains(&(name.to_string(), "delivered")),
+                "restart scan must still process healthy Brain '{name}'; observation: {restart_scan:?}; state: {}",
+                schedule_state_diagnostic(restarted.brain_store())
+            );
+        }
+        for name in healthy_names {
+            let count = scheduled_run_count(restarted.brain_store(), name);
+            assert_eq!(
+                count, 1,
+                "daemon restart must not redeliver healthy Brain '{name}'; observed {count} scheduled runs"
+            );
+        }
+        for name in corrupt_names {
+            let observed = std::fs::read(brain_root.join(name).join("events.jsonl"))
+                .unwrap_or_else(|error| {
+                    panic!("restarted corrupt journal for '{name}' must remain readable: {error}")
+                });
+            assert_eq!(
+                observed, corrupt_journals[name],
+                "restart retries must preserve corrupt journal bytes for '{name}'"
+            );
+        }
+
+        let repaired_name = "m-corrupt";
+        let repaired_path = brain_root.join(repaired_name).join("events.jsonl");
+        let replacement = repaired_path.with_extension("jsonl.repair");
+        std::fs::write(&replacement, &valid_journals[repaired_name])
+            .expect("atomic repair staging file must be written");
+        std::fs::rename(&replacement, &repaired_path)
+            .expect("atomic repair must replace the corrupt journal");
+        let repaired_scan = await_schedule_scan(&restarted, &mut restarted_scans, true).await;
+        assert!(
+            repaired_scan
+                .outcomes
+                .contains(&(repaired_name.to_string(), "delivered")),
+            "live atomic repair must be retried on the next synchronized tick; observation: {repaired_scan:?}; state: {}",
+            schedule_state_diagnostic(restarted.brain_store())
+        );
+        let stable_scan = await_schedule_scan(&restarted, &mut restarted_scans, true).await;
+        assert!(
+            stable_scan
+                .outcomes
+                .contains(&(repaired_name.to_string(), "delivered")),
+            "repaired Brain must remain available on a later tick; observation: {stable_scan:?}; state: {}",
+            schedule_state_diagnostic(restarted.brain_store())
+        );
+        let repaired_count = scheduled_run_count(restarted.brain_store(), repaired_name);
+        assert_eq!(
+            repaired_count, 1,
+            "live atomic repair must make Brain '{repaired_name}' eligible on the next tick exactly once; observed {repaired_count} scheduled runs"
+        );
+        for name in ["a-corrupt", "z-corrupt"] {
+            let observed = std::fs::read(brain_root.join(name).join("events.jsonl"))
+                .unwrap_or_else(|error| {
+                    panic!("unrepaired journal for '{name}' must remain readable: {error}")
+                });
+            assert_eq!(
+                observed, corrupt_journals[name],
+                "live repair of another Brain must preserve corrupt journal bytes for '{name}'"
+            );
+        }
+
+        let logs = String::from_utf8(
+            captured
+                .lock()
+                .expect("captured schedule diagnostics lock must not be poisoned")
+                .clone(),
+        )
+        .expect("captured schedule diagnostics must be UTF-8");
+        for name in corrupt_names {
+            assert!(
+                logs.contains(name),
+                "schedule diagnostics must identify unavailable Brain '{name}'; logs: {logs}"
+            );
+        }
+        assert!(
+            logs.contains("category=\"brain_replay_failed\""),
+            "schedule diagnostics must provide a safe failure category; logs: {logs}"
+        );
+        assert_eq!(
+            logs.lines()
+                .filter(|line| {
+                    line.contains("skipping an unavailable Brain during schedule delivery")
+                        && line.contains("category=\"brain_replay_failed\"")
+                })
+                .count(),
+            6,
+            "each corrupt Brain must emit one warning per daemon lifecycle, not once per retry tick; logs: {logs}"
+        );
+        assert!(
+            logs.contains("category=\"brain_schedule_recovered\"")
+                && logs.contains("previous_category=\"brain_replay_failed\""),
+            "live repair must emit one categorized recovery diagnostic; logs: {logs}"
+        );
+        assert!(
+            !logs.contains(state.path().to_string_lossy().as_ref()),
+            "safe schedule diagnostics must not expose the durable state path; logs: {logs}"
+        );
+        assert!(
+            logs.len() < 16 * 1024,
+            "schedule diagnostics must remain bounded across retries and restart; captured {} bytes: {logs}",
+            logs.len()
+        );
+        restarted_serving.shutdown().await;
     }
 
     #[tokio::test]

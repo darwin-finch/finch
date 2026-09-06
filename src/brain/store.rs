@@ -1532,6 +1532,56 @@ impl BrainStore {
         Ok(names)
     }
 
+    /// Discover plausible durable Brain names without replaying or mutating them.
+    ///
+    /// Callers that can isolate replay failures use this as a fallible directory
+    /// boundary, then load each candidate independently. The public listing
+    /// contract remains unchanged until it can report partial failures itself.
+    pub(crate) fn candidate_names(&self) -> Result<Vec<String>> {
+        let Some(root) = &self.root else {
+            let brains = self.brains.read().expect("shared brain lock poisoned");
+            let mut names = brains.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            return Ok(names);
+        };
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let brains = self.brains.read().expect("shared brain lock poisoned");
+                let mut names = brains.keys().cloned().collect::<Vec<_>>();
+                names.sort();
+                return Ok(names);
+            }
+            Err(error) => return Err(error).context("read Brain candidate directory"),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.context("read Brain candidate directory entry")?;
+            if !entry
+                .file_type()
+                .context("inspect Brain candidate directory entry")?
+                .is_dir()
+            {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if Self::validate_name(&name).is_ok() {
+                names.push(name);
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Replay one previously discovered candidate without copying its projection.
+    pub(crate) fn load_candidate(&self, name: &str) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)
+    }
+
     pub fn snapshot(&self, name: &str) -> Result<BrainSnapshot> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
@@ -6263,6 +6313,48 @@ const fn legacy_schedule_language() -> ProgramLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_candidate_names_are_sorted_read_only_and_discovery_errors_are_fallible() {
+        let temp = tempfile::tempdir().expect("candidate-name test needs a disposable root");
+        for name in ["z-brain", "a-brain", "m-brain"] {
+            std::fs::create_dir(temp.path().join(name))
+                .unwrap_or_else(|error| panic!("candidate directory '{name}' must exist: {error}"));
+        }
+        std::fs::create_dir(temp.path().join("not a valid brain"))
+            .expect("invalid candidate directory must exist");
+        let corrupt_path = temp.path().join("m-brain/events.jsonl");
+        let corrupt_bytes = b"private corrupt bytes must remain untouched\n";
+        std::fs::write(&corrupt_path, corrupt_bytes)
+            .expect("corrupt candidate sentinel must be written");
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let names = store
+            .candidate_names()
+            .expect("candidate discovery must not replay corrupt journals");
+        assert_eq!(
+            names,
+            ["a-brain", "m-brain", "z-brain"],
+            "candidate discovery must return only valid directory names in stable order; observed {names:?}"
+        );
+        assert_eq!(
+            std::fs::read(&corrupt_path).expect("corrupt candidate sentinel must remain readable"),
+            corrupt_bytes,
+            "candidate discovery must not repair, hydrate, or rewrite journal bytes"
+        );
+
+        let non_directory_root = temp.path().join("root-is-a-file");
+        std::fs::write(&non_directory_root, b"not a directory")
+            .expect("fallible candidate root fixture must be written");
+        let invalid_store = BrainStore::with_root("box.local", Some(non_directory_root));
+        let error = invalid_store
+            .candidate_names()
+            .expect_err("candidate discovery must return directory I/O failures");
+        assert!(
+            error.to_string().contains("read Brain candidate directory"),
+            "candidate discovery error must name the failed operation: {error:#}"
+        );
+    }
 
     fn journal_event(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
         BrainEvent {
