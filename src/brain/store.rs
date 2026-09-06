@@ -6566,43 +6566,74 @@ mod tests {
     }
 
     /// Not a gate -- a measurement, printed with `--nocapture`, so the #364
-    /// optimization can be reported with a number instead of an adjective.
+    /// change can be reported with a number instead of an adjective.
     /// `#[ignore]` so it never runs in CI and never fails a build.
+    ///
+    /// Set `FINCH_BENCH_BRAIN_ROOT` to measure a real inventory instead of a
+    /// synthetic one. Point it at a *copy*: `list()` writes.
     #[test]
     #[ignore = "measurement, not a gate: run with --ignored --nocapture"]
     fn bench_list_versus_count_over_a_realistic_brain_root() {
         const BRAINS: usize = 113;
-        const EVENTS: usize = 20;
-        let temp = tempfile::tempdir().unwrap();
-        for index in 0..BRAINS {
-            let directory = temp.path().join(format!("brain-{index:04}"));
-            std::fs::create_dir_all(&directory).unwrap();
-            let mut log = String::new();
-            for seq in 1..=EVENTS {
-                log.push_str(&format!(
-                    "{{\"schema_version\":1,\"brain_id\":1,\"seq\":{seq},\
-                      \"environment_generation\":1,\"sender\":\"seed\",\
-                      \"created_ms\":{seq},\"run_id\":null,\"mutation\":null,\
-                      \"kind\":{{\"Prompt\":{{\"text\":\"seed\"}}}}}}\n"
-                ));
-            }
-            std::fs::write(directory.join("events.jsonl"), log).unwrap();
-        }
+        const EVENTS: u64 = 20;
 
-        let counting = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let synthetic;
+        let (root, described) = match std::env::var_os("FINCH_BENCH_BRAIN_ROOT") {
+            Some(path) => (
+                PathBuf::from(path),
+                "the inventory named by FINCH_BENCH_BRAIN_ROOT",
+            ),
+            None => {
+                // Build the store through its own API so every Brain is
+                // genuinely well-formed: correct identity, a real journal, and
+                // the effect-audit databases `ensure_loaded` expects. Seeding
+                // hand-written JSON measures the parse-failure path instead.
+                synthetic = tempfile::tempdir().unwrap();
+                let seeding = BrainStore::with_root("box.local", Some(synthetic.path().into()));
+                for index in 0..BRAINS {
+                    let name = format!("brain-{index:04}");
+                    let brain_id = seeding.snapshot(&name).unwrap().brain_id;
+                    for seq in 1..=EVENTS {
+                        seeding
+                            .append_event(&name, &journal_event(brain_id, seq, "seed"))
+                            .unwrap();
+                    }
+                }
+                drop(seeding);
+                (synthetic.path().to_path_buf(), "a synthetic inventory")
+            }
+        };
+
+        let directories = std::fs::read_dir(&root)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        let bytes: u64 = walk_paths(&root)
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum();
+
+        let counting = BrainStore::with_root("box.local", Some(root.clone()));
         let count_start = std::time::Instant::now();
         let counted = counting.count_unhydrated();
         let count_elapsed = count_start.elapsed();
 
-        let listing = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let listing = BrainStore::with_root("box.local", Some(root));
         let list_start = std::time::Instant::now();
-        let listed = listing.list().map(|names| names.len());
+        let listed = listing.list();
         let list_elapsed = list_start.elapsed();
+        let hydrated = hydrated_names(&listing).len();
 
         println!(
-            "#364 /health Brain enumeration over {BRAINS} Brains x {EVENTS} events\n  \
-             count_unhydrated: {counted} in {count_elapsed:?}\n  \
-             list (hydrating): {listed:?} in {list_elapsed:?}"
+            "\n#364 -- what GET /health costs over {described}\n  \
+             inventory:        {directories} directories, {bytes} bytes on disk\n  \
+             count_unhydrated: {counted} Brains in {count_elapsed:?} (0 hydrated)\n  \
+             list (hydrating): {} in {list_elapsed:?} ({hydrated} hydrated)\n",
+            match &listed {
+                Ok(names) => format!("{} Brains", names.len()),
+                Err(error) => format!("FAILED: {error}"),
+            }
         );
     }
 
