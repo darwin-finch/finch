@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
+
 /// Completed audit histories retained per named Brain. Together with the
 /// bounded intent/outcome encodings this caps the audit projection and its
 /// share of `events.jsonl`; unresolved write-ahead entries are never pruned.
@@ -1530,6 +1531,107 @@ impl BrainStore {
         let mut names: Vec<_> = brains.keys().cloned().collect();
         names.sort();
         Ok(names)
+    }
+
+    /// Every Brain name this store would answer for, without hydrating any of
+    /// them (#364).
+    ///
+    /// `list` calls `load_all`, which replays every Brain's whole event log,
+    /// opens its three effect-audit SQLite databases and folds every event
+    /// through the reducer. Callers that only need the set of names -- the
+    /// unauthenticated health and status probes that gate `finch` startup --
+    /// were paying a full store hydration for a directory question.
+    ///
+    /// The answer matches `list`'s in both membership and order for every
+    /// Brain that loads: the same directories-only rule and the same
+    /// `validate_name` filter `load_all` applies, over the same root, unioned
+    /// with names already resident (an in-memory store has no root at all).
+    /// Names are compared untrimmed exactly as `load_all` passes them to
+    /// `ensure_loaded`, so a directory whose name only validates after a trim
+    /// is reported under the name the loader would have used.
+    ///
+    /// Two differences are deliberate. This cannot fail, so one unreadable
+    /// Brain no longer turns the whole probe into an error (see #344); and it
+    /// counts a Brain directory whose replay would fail, which is the more
+    /// truthful answer to "how many Brains are there". It also cannot create
+    /// files, where `ensure_loaded` writes `metadata.json`, `initialization.json`
+    /// and the effect-audit databases for a directory that lacks them.
+    pub fn list_names_unhydrated(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        let Some(root) = &self.root else {
+            return names.into_iter().collect();
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return names.into_iter().collect();
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if Self::validate_name(&name).is_ok() {
+                names.insert(name);
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// How many Brains this store would answer for, without hydrating any.
+    ///
+    /// See [`BrainStore::list_names_unhydrated`]. This is what the health and
+    /// status probes want; they were calling `list()?.len()`.
+    pub fn count_unhydrated(&self) -> usize {
+        self.list_names_unhydrated().len()
+    }
+
+    /// How many Brains are actually resident in memory, i.e. hydrated.
+    ///
+    /// Test-only. This is the observable that separates counting from loading:
+    /// a probe that hydrates leaves Brains here, and one that does not leaves
+    /// zero (#364).
+    #[cfg(test)]
+    pub(crate) fn resident_brain_count(&self) -> usize {
+        self.brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .len()
+    }
+
+    /// Give a Brain `events` journal entries, through the ordinary append path.
+    ///
+    /// Test-only. Hand-written JSON does not survive `ensure_loaded`'s identity
+    /// and sequence validation, so a fixture that needs real history has to be
+    /// built with the real writer.
+    #[cfg(test)]
+    pub(crate) fn seed_history_for_test(&self, name: &str, events: u64) -> Result<()> {
+        let brain_id = self.snapshot(name)?.brain_id;
+        for seq in 1..=events {
+            self.append_event(
+                name,
+                &BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id,
+                    seq,
+                    environment_generation: 1,
+                    sender: "seed".into(),
+                    created_ms: seq,
+                    run_id: None,
+                    mutation: None,
+                    kind: BrainEventKind::Prompt {
+                        text: "seed".into(),
+                    },
+                },
+            )?;
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self, name: &str) -> Result<BrainSnapshot> {
@@ -6263,6 +6365,467 @@ const fn legacy_schedule_language() -> ProgramLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #364: the health/status Brain count must not hydrate the store ──────
+    //
+    // `list()` calls `load_all`, which `ensure_loaded`s every directory under
+    // the Brain root: whole event log parsed, three effect-audit SQLite
+    // databases opened with `synchronous=FULL`, every event folded through the
+    // reducer, and -- on a directory that lacks them -- `metadata.json`,
+    // `initialization.json` and those databases *created*. The unauthenticated
+    // `/health` probe that gates every `finch` launch was calling it to obtain
+    // a count.
+
+    /// A Brain root holding `count` plausible directories, none of them loaded.
+    ///
+    /// Deliberately shaped like the real thing -- an events log with content --
+    /// so that a hydrating implementation has real work to skip rather than an
+    /// empty directory it could shortcut.
+    fn seed_brain_root(count: usize) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..count {
+            let name = format!("brain-{index:04}");
+            let directory = temp.path().join(&name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("events.jsonl"),
+                "{\"schema_version\":1,\"seq\":1}\n",
+            )
+            .unwrap();
+        }
+        temp
+    }
+
+    /// Names resident in the store's in-memory map, i.e. actually hydrated.
+    fn hydrated_names(store: &BrainStore) -> Vec<String> {
+        let mut names: Vec<String> = store
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_count_unhydrated_reports_every_brain_without_loading_one() {
+        const BRAINS: usize = 300;
+        let temp = seed_brain_root(BRAINS);
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+
+        let counted = store.count_unhydrated();
+
+        assert_eq!(
+            counted, BRAINS,
+            "the unhydrated count must agree with the inventory on disk, or \
+             /health reports a Brain population that does not exist; root held \
+             {BRAINS} directories and the count was {counted}"
+        );
+        let hydrated = hydrated_names(&store);
+        assert!(
+            hydrated.is_empty(),
+            "counting Brains must not hydrate any of them -- this is the whole \
+             point of #364, since `list()` replays every event log and opens \
+             three SQLite databases per Brain on the probe that gates every \
+             launch; {} of {BRAINS} were resident after a count, first few: {:?}",
+            hydrated.len(),
+            hydrated.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_list_hydrates_every_brain_which_is_why_the_count_exists() {
+        // The negative control for the test above. If this ever stops being
+        // true, `list()` has changed and the two can be reunified.
+        const BRAINS: usize = 8;
+        let temp = seed_brain_root(BRAINS);
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+
+        let listed = store.list().expect("list over well-formed Brains");
+
+        assert_eq!(
+            listed.len(),
+            BRAINS,
+            "list must still report every Brain; got {listed:?}"
+        );
+        assert_eq!(
+            hydrated_names(&store).len(),
+            BRAINS,
+            "list is expected to hydrate -- if it no longer does, #364's \
+             separate count is redundant and this test should be deleted along \
+             with it; resident after list: {:?}",
+            hydrated_names(&store)
+        );
+    }
+
+    #[test]
+    fn test_the_unhydrated_count_agrees_with_list_on_a_healthy_inventory() {
+        const BRAINS: usize = 16;
+        let temp = seed_brain_root(BRAINS);
+        let counting = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let listing = BrainStore::with_root("box.local", Some(temp.path().into()));
+
+        let counted = counting.list_names_unhydrated();
+        let listed = listing.list().expect("list over well-formed Brains");
+
+        assert_eq!(
+            counted, listed,
+            "the count must answer the same question as `list`, in the same \
+             order, for every Brain that loads -- otherwise /health and \
+             /v1/status disagree with every other Brain surface"
+        );
+    }
+
+    #[test]
+    fn test_counting_brains_creates_no_files() {
+        // `ensure_loaded` writes: `load_or_create_metadata` and
+        // `load_or_create_initialization` create and fsync files, and the
+        // effect-audit journals create three SQLite databases. Ordinary
+        // startup is supposed to be read-only on user state (#76), and a
+        // health probe is the least appropriate place to break that.
+        const BRAINS: usize = 12;
+        let temp = seed_brain_root(BRAINS);
+
+        let before = walk_paths(temp.path());
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let counted = store.count_unhydrated();
+        let after = walk_paths(temp.path());
+
+        assert_eq!(
+            counted, BRAINS,
+            "the count must be right before its side effects are interesting; \
+             root held {BRAINS} directories and the count was {counted}"
+        );
+        assert_eq!(
+            before,
+            after,
+            "counting Brains must not create, remove or rename anything under \
+             the Brain root; appeared: {:?}, disappeared: {:?}",
+            after.difference(&before).collect::<Vec<_>>(),
+            before.difference(&after).collect::<Vec<_>>()
+        );
+    }
+
+    fn walk_paths(root: &std::path::Path) -> std::collections::BTreeSet<PathBuf> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    stack.push(path.clone());
+                }
+                found.insert(path);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn test_the_count_survives_a_hostile_brain_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Well-formed.
+        for name in ["alpha", "beta_two", "gamma-3"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("events.jsonl"), "{}\n").unwrap();
+        }
+        // A name `validate_name` rejects: `load_all` skips it, so must the count.
+        std::fs::create_dir_all(root.join("has spaces and !")).unwrap();
+        std::fs::create_dir_all(
+            root.join("sixty-five-characters-is-one-past-the-limit-aaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .unwrap();
+        // A regular file, not a directory: `load_all` skips it, so must the count.
+        std::fs::write(root.join("loose-file.json"), "{}").unwrap();
+        // Interrupted writes: a Brain whose event log is a torn tail, and one
+        // that has a directory and nothing else.
+        std::fs::create_dir_all(root.join("torn")).unwrap();
+        std::fs::write(root.join("torn").join("events.jsonl"), "{\"seq\":1}\n{\"se").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        // A directory whose metadata is unparseable JSON. `list()` errors on
+        // this; the count must not.
+        std::fs::create_dir_all(root.join("corrupt")).unwrap();
+        std::fs::write(root.join("corrupt").join("metadata.json"), "{not json").unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(root.into()));
+        let names = store.list_names_unhydrated();
+
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                "beta_two".to_string(),
+                "corrupt".to_string(),
+                "empty".to_string(),
+                "gamma-3".to_string(),
+                "torn".to_string(),
+            ],
+            "the count applies exactly `load_all`'s rules -- directories only, \
+             `validate_name` only -- and reports a Brain whose contents are \
+             torn or corrupt rather than failing or omitting it, because a \
+             health probe answering 'how many Brains' should not be the thing \
+             that goes down when one of them is unreadable (#344)"
+        );
+        assert!(
+            hydrated_names(&store).is_empty(),
+            "and it still hydrated nothing; resident: {:?}",
+            hydrated_names(&store)
+        );
+        assert!(
+            store.list().is_err(),
+            "negative control: `list()` genuinely fails on this root, which is \
+             the behaviour #364 removes from the health probe. If list starts \
+             tolerating a corrupt Brain, this test is asserting a difference \
+             that no longer exists"
+        );
+    }
+
+    #[test]
+    fn test_an_empty_brain_root_counts_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(
+            store.count_unhydrated(),
+            0,
+            "an empty root is zero Brains, not an error; names were {:?}",
+            store.list_names_unhydrated()
+        );
+    }
+
+    #[test]
+    fn test_a_missing_brain_root_counts_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("never-created");
+        let store = BrainStore::with_root("box.local", Some(absent));
+        assert_eq!(
+            store.count_unhydrated(),
+            0,
+            "a root that does not exist yet is zero Brains -- `load_all` \
+             returns Ok on an unreadable root and the count must agree"
+        );
+    }
+
+    #[test]
+    fn test_counting_then_loading_still_hydrates_correctly_and_once() {
+        // Counting must not poison the loader: a Brain counted and then used
+        // has to hydrate normally, exactly once.
+        let temp = tempfile::tempdir().unwrap();
+        let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+        seeding.seed_history_for_test("shared", 6).unwrap();
+        drop(seeding);
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(store.count_unhydrated(), 1);
+        assert_eq!(store.resident_brain_count(), 0);
+
+        let first = store.snapshot("shared").unwrap();
+        let resident_after_first = store.resident_brain_count();
+        let second = store.snapshot("shared").unwrap();
+        let resident_after_second = store.resident_brain_count();
+
+        assert_eq!(
+            first.revision, 6,
+            "a Brain that was counted must still replay its whole journal when \
+             something actually needs it; got revision {}",
+            first.revision
+        );
+        assert_eq!(
+            second.revision, first.revision,
+            "and a second read must agree with the first"
+        );
+        assert_eq!(
+            resident_after_first, 1,
+            "the first use must hydrate the Brain the count skipped"
+        );
+        assert_eq!(
+            resident_after_second, resident_after_first,
+            "and the second use must not hydrate it again -- `ensure_loaded` \
+             early-returns on the resident map, which is what makes hydration \
+             exactly-once per store"
+        );
+
+        // `resident_brain_count` is per-store, so this holds under libtest's
+        // concurrency. A process-global hydration counter would not: several
+        // tests in this file hydrate, and any before/after delta on a global
+        // would be a race.
+    }
+
+    #[test]
+    fn test_counting_survives_a_brain_root_mutating_underneath_it() {
+        // `list_names_unhydrated` takes the resident-map read lock, releases
+        // it, then `read_dir`s. A Brain appearing or being hydrated between
+        // the two must not panic, double-count, or lose an existing name.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        for index in 0..40 {
+            std::fs::create_dir_all(root.join(format!("stable-{index:04}"))).unwrap();
+        }
+        let store = std::sync::Arc::new(BrainStore::with_root("box.local", Some(root.clone())));
+
+        let churn_root = root.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_stop = std::sync::Arc::clone(&stop);
+        let churn = std::thread::spawn(move || {
+            let mut index = 0u32;
+            while !churn_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let path = churn_root.join(format!("churn-{index:04}"));
+                let _ = std::fs::create_dir_all(&path);
+                let _ = std::fs::remove_dir_all(&path);
+                index = index.wrapping_add(1);
+            }
+        });
+
+        for _ in 0..200 {
+            let names = store.list_names_unhydrated();
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(
+                names, sorted,
+                "the count must stay sorted while the root changes underneath \
+                 it, because callers compare it against `list()`; got {names:?}"
+            );
+            let mut deduped = names.clone();
+            deduped.dedup();
+            assert_eq!(
+                names.len(),
+                deduped.len(),
+                "and must never report a name twice; got {names:?}"
+            );
+            for index in 0..40 {
+                let stable = format!("stable-{index:04}");
+                assert!(
+                    names.contains(&stable),
+                    "a Brain that never moved must be reported on every pass; \
+                     {stable} was missing from {names:?}"
+                );
+            }
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+    }
+
+    #[test]
+    fn test_the_count_is_stable_across_a_store_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+        for index in 0..9 {
+            seeding
+                .seed_history_for_test(&format!("brain-{index:04}"), 3)
+                .unwrap();
+        }
+        drop(seeding);
+
+        let first = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let before_restart = first.list_names_unhydrated();
+        drop(first);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let after_restart = restarted.list_names_unhydrated();
+
+        assert_eq!(
+            before_restart, after_restart,
+            "the Brain count is a fact about the filesystem, so a daemon \
+             restart must not change it -- if it does, /health's answer depends \
+             on daemon uptime"
+        );
+        assert_eq!(
+            restarted.resident_brain_count(),
+            0,
+            "and a restarted store must still not hydrate to answer it"
+        );
+    }
+
+    /// Not a gate -- a measurement, printed with `--nocapture`, so the #364
+    /// change can be reported with a number instead of an adjective.
+    /// `#[ignore]` so it never runs in CI and never fails a build.
+    ///
+    /// Set `FINCH_BENCH_BRAIN_ROOT` to measure a real inventory instead of a
+    /// synthetic one. Point it at a *copy*: `list()` writes.
+    #[test]
+    #[ignore = "measurement, not a gate: run with --ignored --nocapture"]
+    fn bench_list_versus_count_over_a_realistic_brain_root() {
+        const BRAINS: usize = 113;
+        const EVENTS: u64 = 20;
+
+        let synthetic;
+        let (root, described) = match std::env::var_os("FINCH_BENCH_BRAIN_ROOT") {
+            Some(path) => (
+                PathBuf::from(path),
+                "the inventory named by FINCH_BENCH_BRAIN_ROOT",
+            ),
+            None => {
+                // Build the store through its own API so every Brain is
+                // genuinely well-formed: correct identity, a real journal, and
+                // the effect-audit databases `ensure_loaded` expects. Seeding
+                // hand-written JSON measures the parse-failure path instead.
+                synthetic = tempfile::tempdir().unwrap();
+                let seeding = BrainStore::with_root("box.local", Some(synthetic.path().into()));
+                for index in 0..BRAINS {
+                    let name = format!("brain-{index:04}");
+                    let brain_id = seeding.snapshot(&name).unwrap().brain_id;
+                    for seq in 1..=EVENTS {
+                        seeding
+                            .append_event(&name, &journal_event(brain_id, seq, "seed"))
+                            .unwrap();
+                    }
+                }
+                drop(seeding);
+                (synthetic.path().to_path_buf(), "a synthetic inventory")
+            }
+        };
+
+        let directories = std::fs::read_dir(&root)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        let bytes: u64 = walk_paths(&root)
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+            .sum();
+
+        let counting = BrainStore::with_root("box.local", Some(root.clone()));
+        let count_start = std::time::Instant::now();
+        let counted = counting.count_unhydrated();
+        let count_elapsed = count_start.elapsed();
+
+        let listing = BrainStore::with_root("box.local", Some(root));
+        let list_start = std::time::Instant::now();
+        let listed = listing.list();
+        let list_elapsed = list_start.elapsed();
+        let hydrated = hydrated_names(&listing).len();
+
+        println!(
+            "\n#364 -- what GET /health costs over {described}\n  \
+             inventory:        {directories} directories, {bytes} bytes on disk\n  \
+             count_unhydrated: {counted} Brains in {count_elapsed:?} (0 hydrated)\n  \
+             list (hydrating): {} in {list_elapsed:?} ({hydrated} hydrated)\n",
+            match &listed {
+                Ok(names) => format!("{} Brains", names.len()),
+                Err(error) => format!("FAILED: {error}"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_a_rootless_store_counts_its_resident_brains() {
+        let store = BrainStore::with_root("box.local", None);
+        store.snapshot("in-memory").unwrap();
+        assert_eq!(
+            store.list_names_unhydrated(),
+            vec!["in-memory".to_string()],
+            "an in-memory store has no directory to scan, so the count must \
+             fall back to what is resident, exactly as `list` does"
+        );
+    }
 
     fn journal_event(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
         BrainEvent {
