@@ -65,6 +65,33 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 const REFRESH_SKEW: ChronoDuration = ChronoDuration::minutes(2);
+// Preserve the provider contract of 32 caller-visible buffered chunks. The
+// physical channel has one additional slot which is reserved before the
+// receiver is returned, exclusively for an unambiguous terminal error.
+const STREAM_BUFFER_CAPACITY: usize = 32;
+const STREAM_CHANNEL_CAPACITY: usize = STREAM_BUFFER_CAPACITY + 1;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum StreamProducerEvent {
+    SendAttempt(StreamChunk),
+    Finished,
+}
+
+#[cfg(test)]
+type StreamProducerObserver = Arc<dyn Fn(StreamProducerEvent) + Send + Sync>;
+
+#[cfg(test)]
+struct StreamProducerFinishGuard(Option<StreamProducerObserver>);
+
+#[cfg(test)]
+impl Drop for StreamProducerFinishGuard {
+    fn drop(&mut self) {
+        if let Some(observer) = self.0.as_ref() {
+            observer(StreamProducerEvent::Finished);
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SubscriptionUnauthorized;
@@ -356,6 +383,8 @@ pub struct ChatGptSubscriptionProvider {
     base: Url,
     allow_loopback: bool,
     catalog: Mutex<Option<CatalogCache>>,
+    #[cfg(test)]
+    stream_producer_observer: Option<StreamProducerObserver>,
 }
 
 impl fmt::Debug for ChatGptSubscriptionProvider {
@@ -429,12 +458,20 @@ impl ChatGptSubscriptionProvider {
             base,
             allow_loopback,
             catalog: Mutex::new(None),
+            #[cfg(test)]
+            stream_producer_observer: None,
         })
     }
 
     #[cfg(test)]
     fn for_test(source: Arc<dyn ChatGptCredentialSource>, base: &str, model: &str) -> Result<Self> {
         Self::new(source, base, model, ReasoningEffort::High, true)
+    }
+
+    #[cfg(test)]
+    fn with_stream_producer_observer(mut self, observer: StreamProducerObserver) -> Self {
+        self.stream_producer_observer = Some(observer);
+        self
     }
 
     fn route(&self, path: &str, query: Option<(&str, &str)>) -> Result<Url> {
@@ -630,6 +667,8 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
             CancellationToken::new(),
             expected_model,
             allowed_tools,
+            #[cfg(test)]
+            self.stream_producer_observer.clone(),
         )
         .await?;
         Ok(ProviderResponse {
@@ -665,19 +704,35 @@ impl ProviderBackend for ChatGptSubscriptionProvider {
         let allowed_tools = advertised_tool_names(&request);
         let cancel = request.cancellation_token.clone().unwrap_or_default();
         let response = self.start_response(request, cancel.clone()).await?;
-        let (sender, receiver) = mpsc::channel(32);
+        let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        // Reserve the channel's dedicated terminal slot before exposing the
+        // receiver. Callers retain the historical 32-chunk ordinary buffer,
+        // while cancellation or protocol failure can always publish exactly
+        // one final error under complete backpressure.
+        let terminal_error = sender
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| anyhow::anyhow!("Failed to reserve ChatGPT terminal stream capacity"))?;
+        #[cfg(test)]
+        let stream_producer_observer = self.stream_producer_observer.clone();
         tokio::spawn(async move {
-            let failure = sender.clone();
+            #[cfg(test)]
+            let _finish_guard = StreamProducerFinishGuard(stream_producer_observer.clone());
             if let Err(error) = consume_sse(
                 response,
                 Some(sender),
                 cancel,
                 expected_model,
                 allowed_tools,
+                #[cfg(test)]
+                stream_producer_observer,
             )
             .await
             {
-                let _ = failure.send(Err(anyhow::anyhow!(error.to_string()))).await;
+                // The permit makes terminal failure publication non-blocking.
+                // Its returned sender is dropped immediately so the receiver
+                // observes this one error followed by channel closure.
+                drop(terminal_error.send(Err(anyhow::anyhow!(error.to_string()))));
             }
         });
         Ok(receiver)
@@ -1215,6 +1270,7 @@ async fn consume_sse(
     cancel: CancellationToken,
     expected_model: String,
     allowed_tools: HashSet<String>,
+    #[cfg(test)] stream_producer_observer: Option<StreamProducerObserver>,
 ) -> Result<CompletedResponse> {
     let header_allowance = parse_allowance_headers(response.headers())?;
     let mut accumulator = StreamAccumulator::default();
@@ -1298,12 +1354,14 @@ async fn consume_sse(
                 terminal = Some(completed);
             }
             if let (Some(sender), Some(delta)) = (sender.as_ref(), text_delta) {
-                sender
-                    .send(Ok(StreamChunk::TextDelta(delta)))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")
-                    })?;
+                send_stream_chunk(
+                    sender,
+                    &cancel,
+                    StreamChunk::TextDelta(delta),
+                    #[cfg(test)]
+                    stream_producer_observer.as_ref(),
+                )
+                .await?;
             }
             enforce_sse_remainder_bounds(&buffer)?;
         }
@@ -1315,38 +1373,73 @@ async fn consume_sse(
         terminal.context("ChatGPT subscription stream ended before response.completed")?;
     completed.allowance = completed.allowance.or(header_allowance);
     if let Some(sender) = sender {
-        sender
-            .send(Ok(StreamChunk::ResponseMetadata {
+        send_stream_chunk(
+            &sender,
+            &cancel,
+            StreamChunk::ResponseMetadata {
                 model: completed.model.clone(),
-            }))
-            .await
-            .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+            },
+            #[cfg(test)]
+            stream_producer_observer.as_ref(),
+        )
+        .await?;
         if let Some(input_tokens) = completed.input_tokens {
-            sender
-                .send(Ok(StreamChunk::Usage {
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::Usage {
                     input_tokens,
                     output_tokens: completed.output_tokens.unwrap_or_default(),
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+                },
+                #[cfg(test)]
+                stream_producer_observer.as_ref(),
+            )
+            .await?;
         }
         if let Some(allowance) = completed.allowance.as_ref() {
-            sender
-                .send(Ok(StreamChunk::Allowance {
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::Allowance {
                     primary_used_percent: allowance.primary_used_percent,
                     secondary_used_percent: allowance.secondary_used_percent,
-                }))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+                },
+                #[cfg(test)]
+                stream_producer_observer.as_ref(),
+            )
+            .await?;
         }
         for block in completed.blocks.iter().cloned() {
-            sender
-                .send(Ok(StreamChunk::ContentBlockComplete(block)))
-                .await
-                .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped"))?;
+            send_stream_chunk(
+                &sender,
+                &cancel,
+                StreamChunk::ContentBlockComplete(block),
+                #[cfg(test)]
+                stream_producer_observer.as_ref(),
+            )
+            .await?;
         }
     }
     Ok(completed)
+}
+
+async fn send_stream_chunk(
+    sender: &mpsc::Sender<Result<StreamChunk>>,
+    cancel: &CancellationToken,
+    chunk: StreamChunk,
+    #[cfg(test)] stream_producer_observer: Option<&StreamProducerObserver>,
+) -> Result<()> {
+    #[cfg(test)]
+    if let Some(observer) = stream_producer_observer {
+        observer(StreamProducerEvent::SendAttempt(chunk.clone()));
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("ChatGPT subscription stream was cancelled"),
+        _ = sender.closed() => bail!("ChatGPT subscription stream receiver was dropped"),
+        result = sender.send(Ok(chunk)) => result
+            .map_err(|_| anyhow::anyhow!("ChatGPT subscription stream receiver was dropped")),
+    }
 }
 
 fn parse_event(
@@ -3549,6 +3642,240 @@ family = "chatgpt_subscription"
             let _ = closed_tx.send(());
         });
         (format!("http://{address}/backend-api/codex"), closed_rx)
+    }
+
+    async fn held_open_subscription_server(
+        body: String,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backpressure fixture must bind a kernel-assigned loopback port");
+        let address = listener
+            .local_addr()
+            .expect("backpressure fixture must expose its loopback address");
+        let (body_sent_tx, body_sent_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut request = vec![0u8; 16 * 1024];
+            let (mut catalog_socket, _) = listener
+                .accept()
+                .await
+                .expect("backpressure fixture must accept the catalog request");
+            let _ = catalog_socket.read(&mut request).await;
+            let catalog = catalog_body();
+            catalog_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        catalog.len(),
+                        catalog
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("backpressure fixture must write the catalog response");
+            catalog_socket
+                .flush()
+                .await
+                .expect("backpressure fixture must flush the catalog response");
+            drop(catalog_socket);
+
+            let (mut response_socket, _) = listener
+                .accept()
+                .await
+                .expect("backpressure fixture must accept the inference request");
+            let _ = response_socket.read(&mut request).await;
+            response_socket
+                .write_all(
+                    format!(
+                        concat!(
+                            "HTTP/1.1 200 OK\r\n",
+                            "content-type: text/event-stream\r\n",
+                            "openai-model: {}\r\n",
+                            "transfer-encoding: chunked\r\n",
+                            "connection: close\r\n\r\n",
+                            "{:X}\r\n{}\r\n"
+                        ),
+                        DEFAULT_MODEL,
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("backpressure fixture must write its held-open SSE body");
+            response_socket
+                .flush()
+                .await
+                .expect("backpressure fixture must flush its held-open SSE body");
+            let _ = body_sent_tx.send(());
+
+            let mut byte = [0u8; 1];
+            loop {
+                match response_socket.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) => panic!(
+                        "backpressure fixture must observe peer EOF, not a socket error: {error}"
+                    ),
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+        (
+            format!("http://{address}/backend-api/codex"),
+            body_sent_rx,
+            closed_rx,
+        )
+    }
+
+    fn text_delta_sse(count: usize, duplicate_final_sequence: bool) -> String {
+        let mut body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
+        );
+        for index in 0..count {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":index + 2,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":format!("delta-{index}")
+                })
+            ));
+        }
+        if duplicate_final_sequence {
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":count + 1,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":"must-not-project"
+                })
+            ));
+        }
+        body
+    }
+
+    fn many_terminal_blocks_sse(count: usize) -> String {
+        let output = (0..count)
+            .map(|index| {
+                json!({
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":format!("block-{index}")}]
+                })
+            })
+            .collect::<Vec<_>>();
+        format!(
+            concat!(
+                "event: response.created\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}}),
+            json!({
+                "type":"response.completed",
+                "sequence_number":2,
+                "response":{
+                    "id":"resp-terminal-backpressure",
+                    "output":output,
+                    "usage":{"input_tokens":1,"output_tokens":count}
+                }
+            })
+        )
+    }
+
+    fn completed_sse_after_deltas(count: usize) -> String {
+        let mut body = format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","sequence_number":1,"response":{"headers":{"openai-model":DEFAULT_MODEL}}})
+        );
+        let mut text = String::new();
+        for index in 0..count {
+            let delta = format!("delta-{index}");
+            text.push_str(&delta);
+            body.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({
+                    "type":"response.output_text.delta",
+                    "sequence_number":index + 2,
+                    "item_id":"message-1",
+                    "output_index":0,
+                    "content_index":0,
+                    "delta":delta
+                })
+            ));
+        }
+        body.push_str(&format!(
+            concat!(
+                "event: response.output_item.done\ndata: {}\n\n",
+                "event: response.completed\ndata: {}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            json!({
+                "type":"response.output_item.done",
+                "sequence_number":count + 2,
+                "output_index":0,
+                "item":{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":text}]
+                }
+            }),
+            json!({
+                "type":"response.completed",
+                "sequence_number":count + 3,
+                "response":{
+                    "id":"resp-backpressure-complete",
+                    "status":"completed",
+                    "model":DEFAULT_MODEL,
+                    "output":[],
+                    "usage":{"input_tokens":12,"output_tokens":7}
+                }
+            })
+        ));
+        body
+    }
+
+    fn observe_stream_producer(
+        provider: ChatGptSubscriptionProvider,
+    ) -> (
+        ChatGptSubscriptionProvider,
+        mpsc::UnboundedReceiver<StreamProducerEvent>,
+    ) {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let observer = Arc::new(move |event| {
+            let _ = events_tx.send(event);
+        });
+        (provider.with_stream_producer_observer(observer), events_rx)
+    }
+
+    async fn wait_for_producer_finished(
+        events: &mut mpsc::UnboundedReceiver<StreamProducerEvent>,
+        case: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Some(StreamProducerEvent::Finished) => break,
+                    Some(StreamProducerEvent::SendAttempt(_)) => {}
+                    None => panic!("{case} observer closed before producer completion"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{case} producer did not terminate within the bound"));
     }
 
     async fn fragmented_subscription_server(body: String) -> String {
@@ -5989,6 +6316,557 @@ family = "chatgpt_subscription"
             .await
             .expect("subscription transport was not released after caller cancellation")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stream_receiver_preserves_32_chunk_ordinary_capacity() {
+        let (base, closed) = stalling_subscription_server(true).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("capacity fixture must construct a subscription provider");
+        let receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("capacity fixture must start the production streaming boundary");
+        assert_eq!(
+            receiver.capacity(),
+            STREAM_BUFFER_CAPACITY,
+            "reserved terminal slot changed the caller-visible ordinary capacity; max_capacity={}",
+            receiver.max_capacity()
+        );
+        assert_eq!(
+            receiver.max_capacity(),
+            STREAM_CHANNEL_CAPACITY,
+            "subscription channel must expose 32 ordinary slots plus one reserved terminal slot; capacity={}",
+            receiver.capacity()
+        );
+
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("capacity fixture retained its HTTP transport after receiver drop")
+            .expect("capacity fixture dropped its transport-close milestone");
+    }
+
+    #[tokio::test]
+    async fn test_backpressured_cancellation_releases_transport_and_terminates_once() {
+        const DELTA_COUNT: usize = 40;
+        const ORDINARY_CAPACITY: usize = STREAM_BUFFER_CAPACITY;
+        let (base, body_sent, closed) =
+            held_open_subscription_server(text_delta_sse(DELTA_COUNT, false)).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("backpressure fixture must construct a subscription provider");
+        let cancel = CancellationToken::new();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")])
+                    .with_cancellation_token(cancel.clone()),
+            )
+            .await
+            .expect("backpressure fixture must start the production streaming boundary");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("backpressure fixture did not send more than 32 valid SSE deltas")
+            .expect("backpressure fixture dropped its body-sent milestone");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "subscription producer did not reach backpressure; capacity={}; max_capacity={}",
+                receiver.capacity(),
+                receiver.max_capacity()
+            )
+        });
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("backpressured cancellation retained the ChatGPT HTTP transport")
+            .expect("backpressure fixture dropped its transport-close milestone");
+
+        let mut outcome = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                outcome.push(chunk.map_err(|error| error.to_string()));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "backpressured producer did not terminate after cancellation; outcome={outcome:?}"
+            )
+        });
+        assert_eq!(
+            outcome.len(),
+            ORDINARY_CAPACITY + 1,
+            "cancellation must preserve the queued prefix and emit one terminal error; outcome={outcome:?}"
+        );
+        for (index, chunk) in outcome[..ORDINARY_CAPACITY].iter().enumerate() {
+            assert!(
+                matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == &format!("delta-{index}")),
+                "backpressure changed or reordered delta {index}; outcome={outcome:?}"
+            );
+        }
+        assert!(
+            matches!(outcome.last(), Some(Err(error)) if error.contains("cancelled")),
+            "cancellation must be the one final stream outcome; outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backpressured_receiver_drop_releases_transport() {
+        let (base, body_sent, closed) =
+            held_open_subscription_server(text_delta_sse(40, false)).await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &base,
+            DEFAULT_MODEL,
+        )
+        .expect("receiver-drop fixture must construct a subscription provider");
+        let receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("receiver-drop fixture must start the production streaming boundary");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("receiver-drop fixture did not send more than 32 valid SSE deltas")
+            .expect("receiver-drop fixture dropped its body-sent milestone");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "receiver-drop fixture did not reach backpressure; capacity={}; max_capacity={}",
+                receiver.capacity(),
+                receiver.max_capacity()
+            )
+        });
+
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("dropping a full subscription receiver retained the HTTP transport")
+            .expect("receiver-drop fixture dropped its transport-close milestone");
+    }
+
+    #[tokio::test]
+    async fn test_full_queue_protocol_error_releases_transport_before_delivery() {
+        const ORDINARY_CAPACITY: usize = STREAM_BUFFER_CAPACITY;
+        let (base, body_sent, closed) =
+            held_open_subscription_server(text_delta_sse(ORDINARY_CAPACITY, true)).await;
+        let (provider, mut events) = observe_stream_producer(
+            ChatGptSubscriptionProvider::for_test(
+                Arc::new(StaticSource::new()),
+                &base,
+                DEFAULT_MODEL,
+            )
+            .expect("full-error fixture must construct a subscription provider"),
+        );
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("full-error fixture must start the production streaming boundary");
+        tokio::time::timeout(Duration::from_secs(2), body_sent)
+            .await
+            .expect("full-error fixture did not send its malformed SSE suffix")
+            .expect("full-error fixture dropped its body-sent milestone");
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("a full output queue retained HTTP after the protocol error")
+            .expect("full-error fixture dropped its transport-close milestone");
+        wait_for_producer_finished(&mut events, "full-queue protocol error").await;
+        assert!(
+            receiver.is_closed(),
+            "full-queue protocol error left a sender alive before drain; capacity={}; max_capacity={}",
+            receiver.capacity(),
+            receiver.max_capacity()
+        );
+        assert_eq!(
+            receiver.capacity(),
+            0,
+            "protocol error did not fill the ordinary queue plus reserved terminal slot; max_capacity={}",
+            receiver.max_capacity()
+        );
+
+        let mut outcome = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                outcome.push(chunk.map_err(|error| error.to_string()));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("full-queue protocol error did not terminate exactly once; outcome={outcome:?}")
+        });
+        assert_eq!(
+            outcome.len(),
+            ORDINARY_CAPACITY + 1,
+            "full queue must contain 32 deltas and one terminal error; outcome={outcome:?}"
+        );
+        for (index, chunk) in outcome[..ORDINARY_CAPACITY].iter().enumerate() {
+            assert!(
+                matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == &format!("delta-{index}")),
+                "protocol failure changed or reordered delta {index}; outcome={outcome:?}"
+            );
+        }
+        assert!(
+            matches!(outcome.last(), Some(Err(error)) if error.contains("strictly increasing")),
+            "protocol failure must be the one final stream outcome; outcome={outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_during_full_terminal_projection_ends_with_one_error() {
+        const BLOCK_COUNT: usize = 40;
+        const ORDINARY_CAPACITY: usize = STREAM_BUFFER_CAPACITY;
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(many_terminal_blocks_sse(BLOCK_COUNT))
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("terminal-backpressure fixture must construct a subscription provider");
+        let cancel = CancellationToken::new();
+        let mut receiver = provider
+            .send_message_stream(
+                &ProviderRequest::new(vec![Message::user("hello")])
+                    .with_cancellation_token(cancel.clone()),
+            )
+            .await
+            .expect("terminal-backpressure fixture must start the production stream");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "terminal projection did not fill its ordinary queue; capacity={}; max_capacity={}",
+                receiver.capacity(),
+                receiver.max_capacity()
+            )
+        });
+
+        cancel.cancel();
+        let mut outcome = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                outcome.push(chunk.map_err(|error| error.to_string()));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("cancelled terminal projection did not terminate; outcome={outcome:?}")
+        });
+        assert_eq!(
+            outcome.len(),
+            ORDINARY_CAPACITY + 1,
+            "terminal projection must end with one cancellation error; outcome={outcome:?}"
+        );
+        assert!(
+            matches!(outcome.first(), Some(Ok(StreamChunk::ResponseMetadata { model })) if model == DEFAULT_MODEL),
+            "terminal projection omitted or reordered response metadata; outcome={outcome:?}"
+        );
+        assert!(
+            matches!(outcome.get(1), Some(Ok(StreamChunk::Usage { input_tokens: 1, output_tokens })) if *output_tokens == BLOCK_COUNT as u32),
+            "terminal projection omitted or reordered usage; outcome={outcome:?}"
+        );
+        for (index, chunk) in outcome[2..ORDINARY_CAPACITY].iter().enumerate() {
+            assert!(
+                matches!(chunk, Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text })) if text == &format!("block-{index}")),
+                "terminal projection changed or reordered block {index}; outcome={outcome:?}"
+            );
+        }
+        assert!(
+            matches!(outcome.last(), Some(Err(error)) if error.contains("cancelled")),
+            "terminal cancellation must be the one final stream outcome; outcome={outcome:?}"
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_terminal_metadata_usage_and_allowance_sends_cancel_when_full() {
+        for (delta_count, target) in [
+            (32usize, "metadata"),
+            (31usize, "usage"),
+            (30usize, "allowance"),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let models = server
+                .mock("GET", "/backend-api/codex/models")
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "client_version".into(),
+                    CHATGPT_CATALOG_CLIENT_VERSION.into(),
+                ))
+                .with_status(200)
+                .with_body(catalog_body())
+                .expect(1)
+                .create_async()
+                .await;
+            let inference = server
+                .mock("POST", RESPONSES_PATH)
+                .with_status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_header("openai-model", DEFAULT_MODEL)
+                .with_header("x-codex-primary-used-percent", "25.5")
+                .with_body(completed_sse_after_deltas(delta_count))
+                .expect(1)
+                .create_async()
+                .await;
+            let (provider, mut events) = observe_stream_producer(
+                ChatGptSubscriptionProvider::for_test(
+                    Arc::new(StaticSource::new()),
+                    &format!("{}/backend-api/codex", server.url()),
+                    DEFAULT_MODEL,
+                )
+                .expect("terminal-callsite fixture must construct a subscription provider"),
+            );
+            let cancel = CancellationToken::new();
+            let mut receiver = provider
+                .send_message_stream(
+                    &ProviderRequest::new(vec![Message::user("hello")])
+                        .with_cancellation_token(cancel.clone()),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{target} fixture failed to start the production stream: {error:#}")
+                });
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await {
+                        Some(StreamProducerEvent::SendAttempt(chunk))
+                            if matches!(
+                                (target, &chunk),
+                                ("metadata", StreamChunk::ResponseMetadata { .. })
+                                    | ("usage", StreamChunk::Usage { .. })
+                                    | ("allowance", StreamChunk::Allowance { .. })
+                            ) =>
+                        {
+                            break;
+                        }
+                        Some(StreamProducerEvent::SendAttempt(_)) => {}
+                        Some(StreamProducerEvent::Finished) => {
+                            panic!("{target} producer finished before attempting its blocked send")
+                        }
+                        None => panic!("{target} observer closed before its blocked send"),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{target} send was not attempted while the queue was full; capacity={}; max_capacity={}",
+                    receiver.capacity(),
+                    receiver.max_capacity()
+                )
+            });
+            assert_eq!(
+                receiver.capacity(),
+                0,
+                "{target} send attempt was not pending behind 32 ordinary chunks; max_capacity={}",
+                receiver.max_capacity()
+            );
+
+            cancel.cancel();
+            wait_for_producer_finished(&mut events, target).await;
+            assert!(
+                receiver.is_closed(),
+                "{target} cancellation left a producer sender alive before drain; capacity={}",
+                receiver.capacity()
+            );
+            let mut outcome = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(chunk) = receiver.recv().await {
+                    outcome.push(chunk.map_err(|error| error.to_string()));
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{target} cancellation did not reach terminal None; outcome={outcome:?}")
+            });
+            assert_eq!(
+                outcome.len(),
+                STREAM_BUFFER_CAPACITY + 1,
+                "{target} cancellation must preserve 32 ordinary chunks plus one error; outcome={outcome:?}"
+            );
+            for (index, chunk) in outcome[..delta_count].iter().enumerate() {
+                assert!(
+                    matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == &format!("delta-{index}")),
+                    "{target} cancellation changed delta {index}; outcome={outcome:?}"
+                );
+            }
+            let mut next = delta_count;
+            if target != "metadata" {
+                assert!(
+                    matches!(outcome.get(next), Some(Ok(StreamChunk::ResponseMetadata { model })) if model == DEFAULT_MODEL),
+                    "{target} cancellation changed the queued metadata prefix; outcome={outcome:?}"
+                );
+                next += 1;
+            }
+            if target == "allowance" {
+                assert!(
+                    matches!(
+                        outcome.get(next),
+                        Some(Ok(StreamChunk::Usage {
+                            input_tokens: 12,
+                            output_tokens: 7
+                        }))
+                    ),
+                    "allowance cancellation changed the queued usage prefix; outcome={outcome:?}"
+                );
+                next += 1;
+            }
+            assert_eq!(
+                next, STREAM_BUFFER_CAPACITY,
+                "{target} fixture did not fill exactly the ordinary budget; outcome={outcome:?}"
+            );
+            assert!(
+                matches!(outcome.last(), Some(Err(error)) if error.contains("cancelled")),
+                "{target} cancellation must end in exactly one error with no target/post-terminal chunk; outcome={outcome:?}"
+            );
+            models.assert_async().await;
+            inference.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_queue_drains_valid_stream_to_exact_success() {
+        const DELTA_COUNT: usize = 35;
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_header("x-codex-primary-used-percent", "25.5")
+            .with_body(completed_sse_after_deltas(DELTA_COUNT))
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("successful-drain fixture must construct a subscription provider");
+        let mut receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![Message::user("hello")]))
+            .await
+            .expect("successful-drain fixture must start the production stream");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "valid stream never filled its 32 ordinary slots; capacity={}; max_capacity={}",
+                receiver.capacity(),
+                receiver.max_capacity()
+            )
+        });
+
+        let mut outcome = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = receiver.recv().await {
+                outcome.push(chunk.map_err(|error| error.to_string()));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("valid full queue did not resume as capacity drained; outcome={outcome:?}")
+        });
+        assert_eq!(
+            outcome.len(),
+            DELTA_COUNT + 4,
+            "valid stream must emit every delta and terminal projection exactly once; outcome={outcome:?}"
+        );
+        assert!(
+            outcome.iter().all(Result::is_ok),
+            "valid full-queue drain emitted a terminal error; outcome={outcome:?}"
+        );
+        for (index, chunk) in outcome[..DELTA_COUNT].iter().enumerate() {
+            assert!(
+                matches!(chunk, Ok(StreamChunk::TextDelta(delta)) if delta == &format!("delta-{index}")),
+                "valid drain changed or reordered delta {index}; outcome={outcome:?}"
+            );
+        }
+        assert!(
+            matches!(outcome.get(DELTA_COUNT), Some(Ok(StreamChunk::ResponseMetadata { model })) if model == DEFAULT_MODEL),
+            "valid drain omitted or reordered response metadata; outcome={outcome:?}"
+        );
+        assert!(
+            matches!(
+                outcome.get(DELTA_COUNT + 1),
+                Some(Ok(StreamChunk::Usage {
+                    input_tokens: 12,
+                    output_tokens: 7
+                }))
+            ),
+            "valid drain omitted or reordered usage; outcome={outcome:?}"
+        );
+        assert!(
+            matches!(outcome.get(DELTA_COUNT + 2), Some(Ok(StreamChunk::Allowance { primary_used_percent: Some(primary), secondary_used_percent: None })) if (*primary - 25.5).abs() < f32::EPSILON),
+            "valid drain omitted or reordered allowance; outcome={outcome:?}"
+        );
+        let expected_text = (0..DELTA_COUNT)
+            .map(|index| format!("delta-{index}"))
+            .collect::<String>();
+        assert!(
+            matches!(outcome.last(), Some(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text { text }))) if text == &expected_text),
+            "valid drain omitted or changed completed content; outcome={outcome:?}"
+        );
+        models.assert_async().await;
+        inference.assert_async().await;
     }
 
     #[tokio::test]
