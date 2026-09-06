@@ -129,7 +129,10 @@ impl VmOutputProjection {
 
     fn project_for_execution(&self, execution_id: Option<uuid::Uuid>, effect: &VmSideEffect) {
         match &effect.event {
-            HostSideEffect::Emit { text } => self.default_response.append_response(text),
+            HostSideEffect::Emit { text } => {
+                self.default_response.set_assistant_output();
+                self.default_response.append_response(text);
+            }
             HostSideEffect::Request { .. } => {}
             HostSideEffect::Ui {
                 operation,
@@ -151,6 +154,7 @@ impl VmOutputProjection {
     /// from `project`: the portable VM event remains unchanged and another
     /// embedder may choose a different presentation for it.
     pub fn append_default(&self, text: &str) {
+        self.default_response.set_host_output();
         self.default_response.append_response(text);
     }
 
@@ -179,10 +183,9 @@ impl VmOutputProjection {
                 } else {
                     self.output.start_work_unit(text.unwrap_or("Working"))
                 };
-                // A handle is a VM-owned reactive artifact, not a second
-                // assistant reply.  Give it the same plain output chrome as
-                // `say` output so progress/status updates never acquire the
-                // conversational bullet merely because they are addressable.
+                // A handle is a VM-owned reactive artifact, not an assistant
+                // reply. Keep progress/status updates in ordinary output
+                // chrome even though successful `say` uses prose semantics.
                 unit.set_output_handle(text.unwrap_or("Working"));
                 self.handles
                     .lock()
@@ -566,6 +569,99 @@ mod tests {
             },
             output: Vec::new(),
             origin: crate::vm::SourceOrigin::generated("test"),
+        }
+    }
+
+    fn emit_effect(text: &str) -> VmSideEffect {
+        VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit { text: text.into() },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("issue-350-producer-regression"),
+        }
+    }
+
+    #[test]
+    fn vm_output_projection_uses_producer_semantics_not_response_prefixes() {
+        let manager = Arc::new(silent_manager());
+        let colors = crate::config::ColorScheme::default();
+
+        let prose = manager.start_work_unit("say");
+        prose.set_pending_program_output();
+        let prose_projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&prose));
+        prose_projection.project(&emit_effect("VM error: this is valid prose"));
+        prose.set_complete();
+        let prose_row = prose
+            .transcript_row(&colors)
+            .expect("successful say must project a transcript row");
+        assert_eq!(
+            prose_row.kind,
+            crate::cli::messages::TranscriptRowKind::Response,
+            "a valid say beginning with an error-like prefix must remain assistant prose: {prose_row:?}"
+        );
+
+        let late_failure = manager.start_work_unit("late failure");
+        late_failure.set_pending_program_output();
+        let failure_projection =
+            VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&late_failure));
+        failure_projection.project(&emit_effect("visible before failure"));
+        late_failure.set_program_failed();
+        late_failure.append_response("\nVM error: later failure");
+        let failure_row = late_failure
+            .transcript_row(&colors)
+            .expect("late failure must project a transcript row");
+        assert_eq!(
+            failure_row.kind,
+            crate::cli::messages::TranscriptRowKind::Output,
+            "a later failure must replace provisional say semantics without losing earlier output: {failure_row:?}"
+        );
+        assert_eq!(
+            late_failure.status(),
+            crate::cli::messages::MessageStatus::Failed,
+            "late program failure must retain failed terminal status: {failure_row:?}"
+        );
+
+        let lifecycle = manager.start_work_unit("lifecycle");
+        lifecycle.set_pending_program_output();
+        let lifecycle_projection =
+            VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&lifecycle));
+        lifecycle_projection.append_default("Proposal awaiting review");
+        lifecycle.set_complete();
+        let lifecycle_row = lifecycle
+            .transcript_row(&colors)
+            .expect("host lifecycle notice must project a transcript row");
+        assert_eq!(
+            lifecycle_row.kind,
+            crate::cli::messages::TranscriptRowKind::Output,
+            "host lifecycle output must not masquerade as assistant prose: {lifecycle_row:?}"
+        );
+
+        for diagnostic in [
+            "VM error: direct failure",
+            "VM wire error: provider program failure",
+        ] {
+            let failed = manager.start_work_unit("failure");
+            failed.set_pending_program_output();
+            failed.set_program_failed();
+            failed.append_response(diagnostic);
+            let row = failed
+                .transcript_row(&colors)
+                .expect("failed output must project a transcript row");
+            assert_eq!(
+                row.kind,
+                crate::cli::messages::TranscriptRowKind::Output,
+                "direct and wire failures must use explicit diagnostic presentation: diagnostic={diagnostic:?} row={row:?}"
+            );
+            assert_eq!(
+                failed.status(),
+                crate::cli::messages::MessageStatus::Failed,
+                "diagnostic producer must preserve failed status: diagnostic={diagnostic:?} row={row:?}"
+            );
         }
     }
 

@@ -19,9 +19,9 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
   Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
   same toggle behavior when terminal mouse reporting is available.
 - Unicode-capable terminals use compact disclosure triangles without redundant
-  `expanded`/`collapsed` words. `TERM=dumb`, non-UTF-8 locales, and narrow pinned
-  controls retain explicit plain-text `open`/`closed` state, so color or glyph
-  shape is never the only fallback carrier.
+  `expanded`/`collapsed` words. `TERM=dumb`, missing or non-UTF-8 locales, and
+  narrow pinned controls retain explicit plain-text `open`/`closed` state, so
+  color or glyph shape is never the only fallback carrier.
 - Hit regions are rebuilt from Unicode physical-row geometry after every frame
   and resize. Never persist terminal coordinates as row identity.
 

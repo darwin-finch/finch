@@ -3565,9 +3565,8 @@ Rules:\n\
         let source_unit = self.output_manager.start_work_unit("typed program");
         source_unit.set_program_source(language.as_str());
         source_unit.set_response(source.clone());
-        source_unit.set_complete();
         let output_unit = self.output_manager.start_work_unit("VM program output");
-        output_unit.set_program_output();
+        output_unit.set_pending_program_output();
         let projection =
             VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
         let event_tx = self.event_tx.clone();
@@ -3604,6 +3603,16 @@ Rules:\n\
             }
             .await
             .map_err(|error: anyhow::Error| error.to_string());
+            if matches!(
+                &result,
+                Ok(outcome)
+                    if outcome.status
+                        == crate::runtime::outcome::ExecutionStatus::Completed
+            ) {
+                source_unit.set_complete();
+            } else {
+                source_unit.set_failed();
+            }
             let _ = event_tx.send(ReplEvent::TypedProgramComplete {
                 output_unit,
                 result,
@@ -4403,7 +4412,9 @@ Rules:\n\
             }
 
             ReplEvent::VmOutputComplete { output_unit } => {
-                output_unit.set_complete();
+                if !output_unit.is_failed() {
+                    output_unit.set_complete();
+                }
                 self.render_tui().await?;
             }
 
@@ -4417,6 +4428,12 @@ Rules:\n\
                 output_unit,
                 result,
             } => {
+                let succeeded = matches!(
+                    &result,
+                    Ok(outcome)
+                        if outcome.status
+                            == crate::runtime::outcome::ExecutionStatus::Completed
+                );
                 match result {
                     Ok(outcome)
                         if outcome.status
@@ -4426,11 +4443,17 @@ Rules:\n\
                             outcome.diagnostics.first().cloned().unwrap_or_else(|| {
                                 format!("VM program ended as {:?}", outcome.status)
                             });
+                        output_unit.set_program_failed();
                         output_unit.append_response(&format!("VM error: {detail}"));
                     }
-                    Err(error) => output_unit.append_response(&format!("VM error: {error}")),
+                    Err(error) => {
+                        output_unit.set_program_failed();
+                        output_unit.append_response(&format!("VM error: {error}"));
+                    }
                 }
-                output_unit.set_complete();
+                if succeeded {
+                    output_unit.set_complete();
+                }
                 self.render_tui().await?;
             }
 

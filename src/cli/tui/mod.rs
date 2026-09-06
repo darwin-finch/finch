@@ -4065,16 +4065,39 @@ mod tests {
         let state = AccordionState::default();
         let projected = state.render_message(&message, &colors);
 
-        assert_eq!(projected.len(), 1);
-        assert!(projected[0].text.contains('▶'));
-        assert!(!projected[0].text.contains("collapsed"));
-        assert!(!projected[0].text.contains("line four"));
-        assert!(work.complete_transcript(&colors).contains("line four"));
+        assert_eq!(
+            projected.len(),
+            1,
+            "collapsed source must occupy one logical row: {projected:?}"
+        );
+        assert!(
+            projected[0].text.contains('▶'),
+            "completed source must show collapsed disclosure: {projected:?}"
+        );
+        assert!(
+            !projected[0].text.contains("collapsed"),
+            "Unicode disclosure must omit redundant state words: {projected:?}"
+        );
+        assert!(
+            !projected[0].text.contains("line four"),
+            "collapsed viewport must hide source body: {projected:?}"
+        );
+        let canonical = work.complete_transcript(&colors);
+        assert!(
+            canonical.contains("line four"),
+            "canonical transcript must preserve hidden source body: {canonical:?}"
+        );
 
         let wide = viewport_tail_rendered_lines(&projected, 80, 4);
         let narrow = viewport_tail_rendered_lines(&projected, 8, 8);
-        assert_eq!(wide[0].row_id, narrow[0].row_id);
-        assert!(shadow_buffer::physical_rows(&narrow[0].text, 8) > 1);
+        assert_eq!(
+            wide[0].row_id, narrow[0].row_id,
+            "resize must preserve semantic disclosure identity: wide={wide:?} narrow={narrow:?}"
+        );
+        assert!(
+            shadow_buffer::physical_rows(&narrow[0].text, 8) > 1,
+            "narrow projection must exercise Unicode wrapping: {narrow:?}"
+        );
 
         let text = wide
             .iter()
@@ -4084,9 +4107,18 @@ mod tests {
         let mut bytes = Vec::new();
         begin_full_viewport_paint(&mut bytes, plan, &text).expect("production viewport paint");
         let raw = String::from_utf8(bytes).unwrap();
-        assert!(raw.contains('▶'));
-        assert!(!raw.contains("collapsed"));
-        assert!(!raw.contains("line four"));
+        assert!(
+            raw.contains('▶'),
+            "painted viewport must retain collapsed disclosure: {raw:?}"
+        );
+        assert!(
+            !raw.contains("collapsed"),
+            "painted Unicode viewport must omit redundant state words: {raw:?}"
+        );
+        assert!(
+            !raw.contains("line four"),
+            "painted collapsed viewport must hide source body: {raw:?}"
+        );
         assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
     }
 
@@ -4104,18 +4136,23 @@ mod tests {
             "pending assistant row must be the compact hollow activity glyph: {waiting:?}"
         );
 
-        work.set_response("Hello, Shammah!");
+        work.set_response("Hello,\nShammah!");
         let streaming = state.render_message(&message, &colors);
         assert_eq!(
             streaming[0].text.trim(),
-            "◌ Hello, Shammah!",
+            "◌ Hello,",
             "streaming assistant prose must stay inline behind the hollow glyph: {streaming:?}"
+        );
+        assert_eq!(
+            streaming.get(1).map(|line| line.text.trim()),
+            Some("Shammah!"),
+            "multiline live prose must retain its continuation line: {streaming:?}"
         );
         work.set_complete();
         let completed = state.render_message(&message, &colors);
         assert_eq!(
             completed[0].text.trim(),
-            "● Hello, Shammah!",
+            "● Hello,",
             "completed assistant prose must switch to the filled glyph: {completed:?}"
         );
 
@@ -4128,24 +4165,69 @@ mod tests {
             .expect("production viewport paint for completed assistant prose");
         let raw = String::from_utf8(bytes).expect("TUI paint is UTF-8");
         assert!(
-            raw.contains("● Hello, Shammah!"),
+            raw.contains("● Hello,"),
             "painted production viewport must contain conversational assistant prose: {raw:?}"
         );
         assert!(
             !raw.contains("Assistant response"),
             "Unicode production viewport must omit the noisy placeholder: {raw:?}"
         );
+
+        let mut canonical = Vec::new();
+        let mut printed = HashSet::new();
+        let mut commit_state = AccordionState::default();
+        commit_complete_messages(
+            &mut canonical,
+            std::slice::from_ref(&message),
+            &mut commit_state,
+            &colors,
+            &mut printed,
+            6,
+        )
+        .expect("commit multiline assistant response to native scrollback");
+        commit_complete_messages(
+            &mut canonical,
+            std::slice::from_ref(&message),
+            &mut commit_state,
+            &colors,
+            &mut printed,
+            6,
+        )
+        .expect("skip already committed multiline assistant response");
+        let canonical = String::from_utf8(canonical).expect("canonical response is UTF-8");
+        for expected in ["● Hello,", "Shammah!"] {
+            assert_eq!(
+                canonical.matches(expected).count(),
+                1,
+                "each multiline assistant fragment must enter scrollback exactly once: expected={expected:?} canonical={canonical:?}"
+            );
+        }
     }
 
     #[test]
     fn production_commit_collapses_source_and_writes_successful_say_as_prose_once() {
+        let manager = Arc::new(OutputManager::new(ColorScheme::default()));
+        manager.disable_stdout();
         let source = Arc::new(WorkUnit::new("source"));
         source.set_program_source("lisp");
         source.set_response("(say \"Hello from Finch\")");
         source.set_complete();
-        let output = Arc::new(WorkUnit::new("output"));
-        output.set_program_output();
-        output.set_response("Hello from Finch");
+        let output = manager.start_work_unit("output");
+        output.set_pending_program_output();
+        let projection = crate::cli::VmOutputProjection::new(manager, Arc::clone(&output));
+        projection.project(&crate::vm::VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: crate::vm::HostSideEffect::Emit {
+                text: "Hello from Finch\non another line".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("issue-350-production-regression"),
+        });
         output.set_complete();
         let colors = ColorScheme::default();
         assert_eq!(
@@ -4173,6 +4255,11 @@ mod tests {
             "● Hello from Finch",
             "successful say output must project as assistant prose: {projected_output:?}"
         );
+        assert_eq!(
+            projected_output.get(1).map(|line| line.text.trim()),
+            Some("on another line"),
+            "multiline say must retain its continuation as prose: {projected_output:?}"
+        );
         assert!(
             !projected_output[0].text.contains("Program output"),
             "successful say output must not expose the VM implementation label: {projected_output:?}"
@@ -4195,6 +4282,11 @@ mod tests {
             raw.matches("● Hello from Finch").count(),
             1,
             "assistant prose must enter native scrollback exactly once: {raw:?}"
+        );
+        assert_eq!(
+            raw.matches("on another line").count(),
+            1,
+            "multiline say continuation must enter native scrollback exactly once: {raw:?}"
         );
         assert_eq!(
             printed.len(),
@@ -4262,8 +4354,14 @@ mod tests {
         let mut state = AccordionState::default();
         let collapsed = state.render_message(&message, &colors);
         state.rebuild_hit_regions(&collapsed, 0, 20);
-        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
-        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        assert!(
+            state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+            "collapsed source must expose a semantic focus target: {collapsed:?}"
+        );
+        assert!(
+            state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            "Right must expand the focused completed source"
+        );
         let all = state.render_message(&message, &colors);
 
         let visible = viewport_tail_rendered_lines(&all, 20, 4);
@@ -4272,28 +4370,57 @@ mod tests {
             visible[0].row_id.is_some(),
             "disclosure control must stay visible"
         );
-        assert!(visible[0].text.contains('▼'));
-        assert!(!visible[0].text.contains("expanded"));
-        assert!(visible.iter().any(|line| line.text.contains("row 39")));
+        assert!(
+            visible[0].text.contains('▼'),
+            "expanded pinned projection must retain disclosure glyph: {visible:?}"
+        );
+        assert!(
+            !visible[0].text.contains("expanded"),
+            "Unicode disclosure must omit redundant state words: {visible:?}"
+        );
+        assert!(
+            visible.iter().any(|line| line.text.contains("row 39")),
+            "viewport tail must retain final expanded source row: {visible:?}"
+        );
         assert!(
             visible
                 .iter()
                 .map(|line| shadow_buffer::physical_rows(&line.text, 20))
                 .sum::<usize>()
-                <= 4
+                <= 4,
+            "expanded viewport projection must remain within four physical rows: {visible:?}"
         );
         let tiny = viewport_tail_rendered_lines(&all, 8, 1);
-        assert_eq!(tiny.len(), 1);
-        assert!(tiny[0].row_id.is_some());
-        assert!(matches!(tiny[0].text.as_str(), "[expanded]" | "open"));
-        assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
+        assert_eq!(tiny.len(), 1, "tiny viewport must pin one row: {tiny:?}");
+        assert!(
+            tiny[0].row_id.is_some(),
+            "tiny fallback must preserve semantic row identity: {tiny:?}"
+        );
+        assert!(
+            matches!(tiny[0].text.as_str(), "[expanded]" | "open"),
+            "tiny fallback must name expanded state: {tiny:?}"
+        );
+        assert_eq!(
+            shadow_buffer::physical_rows(&tiny[0].text, 8),
+            1,
+            "tiny fallback must fit one physical row: {tiny:?}"
+        );
         let mut collapsed_state = AccordionState::default();
         collapsed_state.rebuild_hit_regions(&all, 0, 20);
-        assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
-        assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        assert!(
+            collapsed_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+            "expanded pinned source must retain a semantic focus target: {all:?}"
+        );
+        assert!(
+            collapsed_state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            "Left must collapse the focused pinned source"
+        );
         let collapsed = collapsed_state.render_message(&message, &colors);
         let collapsed_tiny = viewport_tail_rendered_lines(&collapsed, 8, 1);
-        assert_eq!(collapsed_tiny[0].text, "closed");
+        assert_eq!(
+            collapsed_tiny[0].text, "closed",
+            "tiny collapsed fallback must name closed state: {collapsed_tiny:?}"
+        );
     }
 
     #[test]
@@ -4321,8 +4448,14 @@ mod tests {
         assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
         assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
         let before = state.render_message(&message, &colors);
-        assert!(before[0].text.contains('▶'));
-        assert!(!before[0].text.contains("collapsed"));
+        assert!(
+            before[0].text.contains('▶'),
+            "pre-commit source must retain collapsed disclosure: {before:?}"
+        );
+        assert!(
+            !before[0].text.contains("collapsed"),
+            "Unicode pre-commit source must omit redundant state text: {before:?}"
+        );
         let mut printed = HashSet::new();
         let mut failure = FlushFailure(Vec::new());
         assert!(commit_complete_messages(

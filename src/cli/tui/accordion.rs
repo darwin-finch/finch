@@ -73,7 +73,11 @@ impl AccordionState {
                     .filter(|value| !value.is_empty())
             })
             .or_else(|| std::env::var("LANG").ok().filter(|value| !value.is_empty()));
-        let style = if terminal_supports_unicode(term.as_deref(), locale.as_deref()) {
+        Self::for_terminal_capabilities(term.as_deref(), locale.as_deref())
+    }
+
+    fn for_terminal_capabilities(term: Option<&str>, locale: Option<&str>) -> Self {
+        let style = if terminal_supports_unicode(term, locale) {
             DisclosureStyle::Unicode
         } else {
             DisclosureStyle::Text
@@ -329,7 +333,7 @@ fn terminal_supports_unicode(term: Option<&str>, locale: Option<&str>) -> bool {
         return false;
     }
     let Some(locale) = locale else {
-        return true;
+        return false;
     };
     let locale = locale.to_ascii_lowercase();
     locale.contains("utf-8") || locale.contains("utf8")
@@ -515,7 +519,8 @@ mod tests {
         source.set_response("s\"visible output\" say");
         source.set_complete();
         let output = Arc::new(WorkUnit::new("output"));
-        output.set_program_output();
+        output.set_pending_program_output();
+        output.set_assistant_output();
         output.set_response("visible output");
         output.set_complete();
         let state = AccordionState::default();
@@ -524,16 +529,38 @@ mod tests {
         let output_message: MessageRef = output;
 
         let collapsed = state.render_message(&source_message, &colors);
-        assert!(collapsed[0].text.contains('▶'));
-        assert!(!collapsed[0].text.contains("collapsed"));
-        assert_eq!(collapsed.len(), 1);
-        assert!(source
-            .complete_transcript(&colors)
-            .contains("s\"visible output\" say"));
+        assert!(
+            collapsed[0].text.contains('▶'),
+            "completed source must use collapsed Unicode disclosure: {collapsed:?}"
+        );
+        assert!(
+            !collapsed[0].text.contains("collapsed"),
+            "Unicode disclosure must omit redundant state text: {collapsed:?}"
+        );
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "collapsed source must hide its body: {collapsed:?}"
+        );
+        let canonical = source.complete_transcript(&colors);
+        assert!(
+            canonical.contains("s\"visible output\" say"),
+            "canonical source must preserve the generated program: {canonical:?}"
+        );
         let visible = state.render_message(&output_message, &colors);
-        assert_eq!(visible.len(), 1);
-        assert!(visible[0].text.contains("● visible output"));
-        assert!(!visible[0].text.contains("Program output"));
+        assert_eq!(
+            visible.len(),
+            1,
+            "single-line say must remain one prose row: {visible:?}"
+        );
+        assert!(
+            visible[0].text.contains("● visible output"),
+            "completed say must use filled assistant glyph: {visible:?}"
+        );
+        assert!(
+            !visible[0].text.contains("Program output"),
+            "assistant say must omit implementation chrome: {visible:?}"
+        );
     }
 
     #[test]
@@ -557,34 +584,53 @@ mod tests {
         replayed.set_complete();
         let replayed_message: MessageRef = replayed;
         let rendered = state.render_message(&replayed_message, &colors);
-        assert!(rendered[0].text.contains('▼'));
-        assert!(!rendered[0].text.contains("expanded"));
-        assert!(rendered
-            .iter()
-            .any(|line| line.text.contains("after reconnect")));
+        assert!(
+            rendered[0].text.contains('▼'),
+            "replayed expanded row must retain its disclosure state: {rendered:?}"
+        );
+        assert!(
+            !rendered[0].text.contains("expanded"),
+            "Unicode replay must omit redundant state text: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.text.contains("after reconnect")),
+            "replayed expansion must reveal appended content: {rendered:?}"
+        );
     }
 
     #[test]
     fn test_text_fallback_names_response_and_disclosure_states() {
-        assert!(terminal_supports_unicode(
-            Some("xterm-256color"),
-            Some("en_US.UTF-8")
-        ));
-        assert!(!terminal_supports_unicode(
-            Some("dumb"),
-            Some("en_US.UTF-8")
-        ));
-        assert!(!terminal_supports_unicode(Some("xterm"), Some("C")));
+        let unicode =
+            AccordionState::for_terminal_capabilities(Some("xterm-256color"), Some("en_US.UTF-8"));
+        assert_eq!(
+            unicode.disclosure_style,
+            DisclosureStyle::Unicode,
+            "UTF-8 production capabilities must select compact glyphs"
+        );
+        for (term, locale) in [
+            (Some("dumb"), Some("en_US.UTF-8")),
+            (Some("xterm"), Some("C")),
+            (Some("xterm"), None),
+        ] {
+            let fallback = AccordionState::for_terminal_capabilities(term, locale);
+            assert_eq!(
+                fallback.disclosure_style,
+                DisclosureStyle::Text,
+                "unsupported or unknown terminal capabilities must fail closed: term={term:?} locale={locale:?}"
+            );
+        }
 
         let response = Arc::new(WorkUnit::new("response"));
         response.set_response("hello");
-        let response_message: MessageRef = response;
+        let response_message: MessageRef = response.clone();
         let source = Arc::new(WorkUnit::new("source"));
         source.set_program_source("lisp");
         source.set_response("(say \"hello\")");
         source.set_complete();
         let source_message: MessageRef = source;
-        let state = AccordionState::with_disclosure_style(DisclosureStyle::Text);
+        let mut state = AccordionState::for_terminal_capabilities(Some("xterm"), None);
         let colors = ColorScheme::default();
 
         let pending = state.render_message(&response_message, &colors);
@@ -593,10 +639,31 @@ mod tests {
             "[pending] Assistant response hello",
             "plain-text pending projection must name role and state: {pending:?}"
         );
+        response.set_complete();
+        let completed = state.render_message(&response_message, &colors);
+        assert_eq!(
+            completed[0].text.trim(),
+            "[complete] Assistant response hello",
+            "plain-text completed projection must name role and state: {completed:?}"
+        );
         let collapsed = state.render_message(&source_message, &colors);
         assert!(
             collapsed[0].text.contains("[closed]"),
             "plain-text disclosure fallback must name closed state: {collapsed:?}"
+        );
+        state.rebuild_hit_regions(&collapsed, 0, 80);
+        assert!(
+            state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)),
+            "plain-text closed source must expose a keyboard disclosure target: {collapsed:?}"
+        );
+        assert!(
+            state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            "Right must expand the focused plain-text source"
+        );
+        let expanded = state.render_message(&source_message, &colors);
+        assert!(
+            expanded[0].text.contains("[open]"),
+            "plain-text disclosure fallback must name open state: {expanded:?}"
         );
     }
 }

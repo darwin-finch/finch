@@ -380,6 +380,7 @@ fn record_wire_metric(
 async fn execute_wire_with_single_repair(
     runtime: &crate::runtime::ProgramRuntime,
     output_manager: Arc<OutputManager>,
+    source_unit: Arc<crate::cli::messages::WorkUnit>,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     generator: Arc<dyn Generator>,
@@ -402,7 +403,7 @@ async fn execute_wire_with_single_repair(
         &source,
     );
     let output_unit = output_manager.start_work_unit("VM program output");
-    output_unit.set_program_output();
+    output_unit.set_pending_program_output();
     let initial = execute_direct_wire_response(
         runtime,
         Arc::clone(&output_manager),
@@ -417,6 +418,7 @@ async fn execute_wire_with_single_repair(
     let mut effect_journal = Vec::new();
     let (diagnostic, repairable) = match initial {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            source_unit.set_complete();
             if outcome.output.is_empty() {
                 metric.first_pass_valid = false;
                 metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
@@ -449,12 +451,16 @@ async fn execute_wire_with_single_repair(
         }
     };
 
+    source_unit.set_failed();
+
     metric.first_pass_valid = false;
     metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
     metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
 
+    output_unit.set_program_output();
     output_unit.append_response(&format!("VM wire error: {diagnostic}"));
     if !repairable {
+        output_unit.set_program_failed();
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
         let _ = event_tx.send(ReplEvent::VmOutputComplete {
@@ -468,9 +474,9 @@ async fn execute_wire_with_single_repair(
         };
     }
     if cancel.is_cancelled() {
+        output_unit.set_program_failed();
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -492,9 +498,9 @@ async fn execute_wire_with_single_repair(
         biased;
         _ = cancel.cancelled() => {
             output_unit.set_transient_status(None);
+            output_unit.set_program_failed();
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
-            output_unit.set_complete();
             return WireExecution {
                 source_for_history: source,
                 response: diagnostic,
@@ -506,9 +512,9 @@ async fn execute_wire_with_single_repair(
     };
     output_unit.set_transient_status(None);
     if cancel.is_cancelled() {
+        output_unit.set_program_failed();
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -517,9 +523,9 @@ async fn execute_wire_with_single_repair(
         };
     }
     let Ok(repair) = repair else {
+        output_unit.set_program_failed();
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -528,9 +534,9 @@ async fn execute_wire_with_single_repair(
         };
     };
     if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
+        output_unit.set_program_failed();
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -538,8 +544,7 @@ async fn execute_wire_with_single_repair(
             output_unit,
         };
     }
-    output_unit.set_complete();
-
+    output_unit.set_program_failed();
     let repaired_source = raw_wire_source(&repair.text);
     crate::programs::corpus::capture_with_runtime_from_env(
         runtime,
@@ -554,10 +559,9 @@ async fn execute_wire_with_single_repair(
         crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
     );
     repair_source_unit.set_response(repaired_source.clone());
-    repair_source_unit.set_complete();
 
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
-    repair_output_unit.set_program_output();
+    repair_output_unit.set_pending_program_output();
     match execute_direct_wire_response(
         runtime,
         output_manager,
@@ -570,6 +574,7 @@ async fn execute_wire_with_single_repair(
     .await
     {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            repair_source_unit.set_complete();
             effect_journal.extend(runner_effect_records(&outcome));
             metric.repaired_successfully = !outcome.output.is_empty();
             metric.terminal_failure = outcome.output.is_empty();
@@ -588,12 +593,14 @@ async fn execute_wire_with_single_repair(
             }
         }
         Ok(outcome) => {
+            repair_source_unit.set_failed();
             effect_journal.extend(runner_effect_records(&outcome));
             let detail = outcome
                 .diagnostics
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            repair_output_unit.set_program_failed();
             repair_output_unit.append_response(&format!("VM wire error: {detail}"));
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
@@ -608,7 +615,9 @@ async fn execute_wire_with_single_repair(
             }
         }
         Err(error) => {
+            repair_source_unit.set_failed();
             let detail = format!("VM wire error: {error}");
+            repair_output_unit.set_program_failed();
             repair_output_unit.append_response(&detail);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
@@ -1432,7 +1441,6 @@ pub(crate) async fn process_query_with_tools(
                 let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
                 source_unit.set_program_source(wire_language.as_str());
                 source_unit.set_response(wire_source.clone());
-                source_unit.set_complete();
                 let query_metadata = query_states.get_metadata(query_id).await;
                 let cancel = query_metadata
                     .as_ref()
@@ -1442,6 +1450,7 @@ pub(crate) async fn process_query_with_tools(
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
+                    Arc::clone(&source_unit),
                     event_tx.clone(),
                     cancel,
                     Arc::clone(&generator),
@@ -1680,7 +1689,6 @@ pub(crate) async fn process_query_with_tools(
             let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
             source_unit.set_program_source(wire_language.as_str());
             source_unit.set_response(wire_source.clone());
-            source_unit.set_complete();
             let query_metadata = query_states.get_metadata(query_id).await;
             let cancel = query_metadata
                 .as_ref()
@@ -1690,6 +1698,7 @@ pub(crate) async fn process_query_with_tools(
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
+                Arc::clone(&source_unit),
                 event_tx.clone(),
                 cancel,
                 Arc::clone(&generator),
@@ -2487,6 +2496,7 @@ mod tests {
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
         let work_unit = output.start_work_unit("VM output");
+        work_unit.set_pending_program_output();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let complete = execute_direct_wire_response(
             &runtime,
@@ -2517,17 +2527,42 @@ mod tests {
                     projection,
                     envelope,
                 } => {
-                    assert_eq!(work_unit.status(), MessageStatus::InProgress);
+                    assert_eq!(
+                        work_unit.status(),
+                        MessageStatus::InProgress,
+                        "say effects must remain live until the terminal event: content={:?}",
+                        work_unit.content()
+                    );
                     projection.project_envelope(envelope);
                     emitted += 1;
                 }
-                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    if !output_unit.is_failed() {
+                        output_unit.set_complete();
+                    }
+                }
                 other => panic!("unexpected event: {other:?}"),
             }
         }
         assert_eq!(emitted, 3, "all say events cross the UI bus");
-        assert_eq!(work_unit.content(), "onetwothree");
-        assert_eq!(work_unit.status(), MessageStatus::Complete);
+        assert_eq!(
+            work_unit.content(),
+            "onetwothree",
+            "ordered say events must preserve exact emitted content"
+        );
+        assert_eq!(
+            work_unit.status(),
+            MessageStatus::Complete,
+            "VmOutputComplete must terminalize the reachable say projection"
+        );
+        let row = work_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("completed say output must project a transcript row");
+        assert_eq!(
+            row.kind,
+            crate::cli::messages::TranscriptRowKind::Response,
+            "typed Emit producers must explicitly project successful say output as prose: {row:?}"
+        );
         assert!(runtime
             .pending_typed_execution(complete.execution_id)
             .unwrap()
@@ -2747,6 +2782,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_wire_marks_source_collapsible_and_say_as_prose() {
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
+
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = "(say \"successful output\")".to_string();
+        let source_unit = output.start_work_unit("provider source");
+        source_unit.set_program_source("lisp");
+        source_unit.set_response(source.clone());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        let execution = execute_wire_with_single_repair(
+            &runtime,
+            Arc::clone(&output),
+            Arc::clone(&source_unit),
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            generator.clone(),
+            &[crate::claude::Message::user("reply")],
+            source,
+            None,
+            None,
+        )
+        .await;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    projection.project_envelope(envelope);
+                }
+                ReplEvent::VmOutputComplete { output_unit } => {
+                    if !output_unit.is_failed() {
+                        output_unit.set_complete();
+                    }
+                }
+                other => panic!("unexpected successful wire event: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            0,
+            "valid wire source must not invoke the repair provider"
+        );
+        assert_eq!(
+            source_unit.status(),
+            MessageStatus::Complete,
+            "successful reachable execution must terminalize its source as complete"
+        );
+        let source_row = source_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("successful source must project a transcript row");
+        assert!(
+            !source_row.default_expanded,
+            "successful source must be collapsed by default: {source_row:?}"
+        );
+        let output_row = execution
+            .output_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("successful say must project a transcript row");
+        assert_eq!(
+            output_row.kind,
+            TranscriptRowKind::Response,
+            "reachable successful say must project as assistant prose: {output_row:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fenced_wire_response_is_repaired_once_without_executing_its_body() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -2755,6 +2864,9 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let source_unit = output.start_work_unit("provider source");
+        source_unit.set_program_source("lisp");
+        source_unit.set_response(source.clone());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let metrics_dir = tempfile::tempdir().unwrap();
         let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
@@ -2762,6 +2874,7 @@ mod tests {
         let execution = execute_wire_with_single_repair(
             &runtime,
             Arc::clone(&output),
+            source_unit,
             event_tx,
             tokio_util::sync::CancellationToken::new(),
             generator.clone(),
@@ -2802,14 +2915,34 @@ mod tests {
         assert!(recorded[0].repaired_successfully);
         assert!(!recorded[0].terminal_failure);
         let messages = output.get_messages();
+        let message_diagnostics = messages
+            .iter()
+            .map(|message| {
+                (
+                    message.status(),
+                    message.format(&crate::config::ColorScheme::default()),
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             messages.len(),
-            3,
-            "source, failed output, repaired source/output"
+            4,
+            "initial source/output and repaired source/output must remain distinct: {message_diagnostics:?}"
         );
-        assert!(messages.iter().all(|message| !message
-            .format(&crate::config::ColorScheme::default())
-            .contains("must not run")));
+        assert_eq!(
+            messages[0].status(),
+            crate::cli::messages::MessageStatus::Failed,
+            "rejected initial source must remain expanded through failed status: {message_diagnostics:?}"
+        );
+        assert_eq!(
+            messages[2].status(),
+            crate::cli::messages::MessageStatus::Complete,
+            "successful repaired source must reach completed/collapsible status: {message_diagnostics:?}"
+        );
+        assert_eq!(
+            execution.response, "repaired",
+            "rejected source must stay visible for diagnosis without executing its say body: {message_diagnostics:?}"
+        );
     }
 
     #[tokio::test]
@@ -2824,10 +2957,14 @@ mod tests {
         cancel.cancel();
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let source_unit = output.start_work_unit("provider source");
+        source_unit.set_program_source("lisp");
+        source_unit.set_response(source.clone());
 
         let execution = execute_wire_with_single_repair(
             &runtime,
             output,
+            source_unit,
             event_tx,
             cancel,
             generator.clone(),
@@ -2854,6 +2991,9 @@ mod tests {
         });
         let cancel = tokio_util::sync::CancellationToken::new();
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let source_unit = output.start_work_unit("provider source");
+        source_unit.set_program_source("lisp");
+        source_unit.set_response(source.clone());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let execution = {
             let runtime = Arc::clone(&runtime);
@@ -2861,10 +3001,12 @@ mod tests {
             let generator = Arc::clone(&generator);
             let cancel = cancel.clone();
             let source = source.clone();
+            let source_unit = Arc::clone(&source_unit);
             tokio::spawn(async move {
                 execute_wire_with_single_repair(
                     runtime.as_ref(),
                     output,
+                    source_unit,
                     event_tx,
                     cancel,
                     generator,

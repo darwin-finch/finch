@@ -120,12 +120,20 @@ pub enum WorkUnitPresentation {
     ProgramSource {
         language: String,
     },
-    /// Plain `say` output has no title or conversational chrome. Explicit
-    /// VM output handles retain their title while independently tracking a
-    /// body, transient status, and progress.
+    /// VM output with optional handle chrome. A private producer-owned state
+    /// distinguishes successful `say` prose from ordinary or failed output
+    /// without expanding this public presentation API.
     ProgramOutput {
         title: Option<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProgramOutputSemantics {
+    Pending,
+    AssistantSay,
+    #[default]
+    Ordinary,
 }
 
 /// A single tool-call sub-item rendered below the WorkUnit header
@@ -163,6 +171,7 @@ struct WorkUnitInner {
     /// Elapsed time captured when the unit completed (stable for scrollback display)
     elapsed_at_finish: Option<std::time::Duration>,
     presentation: WorkUnitPresentation,
+    program_output_semantics: ProgramOutputSemantics,
     /// Host/UI state distinct from the output body. A VM `output-status`
     /// must not erase prior `output-append`/`output-replace` content.
     transient_status: Option<String>,
@@ -222,6 +231,7 @@ impl WorkUnit {
                 status: MessageStatus::InProgress,
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
+                program_output_semantics: ProgramOutputSemantics::Ordinary,
                 transient_status: None,
                 progress: None,
             })),
@@ -299,22 +309,66 @@ impl WorkUnit {
     /// Render this unit as output emitted by a VM program, not an assistant
     /// message. `say` itself remains append-only; this only chooses UI chrome.
     pub fn set_program_output(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+    }
+
+    /// Start an unresolved VM response port. Its producer will explicitly
+    /// classify the first effect; renderers never inspect response content.
+    pub(crate) fn set_pending_program_output(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Pending;
+    }
+
+    /// Present output emitted through the program's conversational `say`
+    /// channel as assistant prose. The VM output projection owns this choice;
+    /// renderers must not infer it from response text.
+    pub(crate) fn set_assistant_output(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: None }
+        ) && matches!(
+            inner.program_output_semantics,
+            ProgramOutputSemantics::Pending | ProgramOutputSemantics::AssistantSay
+        ) {
+            inner.program_output_semantics = ProgramOutputSemantics::AssistantSay;
+        }
+    }
+
+    /// Resolve a pending response port as host lifecycle output while leaving
+    /// ordinary assistant/tool work units in their existing presentation.
+    pub(crate) fn set_host_output(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: None }
+        ) {
+            inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        }
+    }
+
+    /// Terminalize a program output as a diagnostic, replacing any provisional
+    /// `say` presentation from effects emitted before the failure.
+    pub(crate) fn set_program_failed(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        inner.status = MessageStatus::Failed;
+        inner.elapsed_at_finish = Some(self.started_at.elapsed());
     }
 
     /// Render this unit as an independently addressable VM output handle.
     /// The title is presentation metadata supplied by `output-open`, not an
     /// emitted response fragment.
     pub fn set_output_handle(&self, title: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput {
             title: Some(title.into()),
         };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
     }
 
     /// Update transient status independently from the durable visible body.
@@ -483,6 +537,11 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         inner.elapsed_at_finish = Some(elapsed);
         inner.status = MessageStatus::Failed;
+    }
+
+    /// Whether this unit has reached the failed terminal state.
+    pub(crate) fn is_failed(&self) -> bool {
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).status == MessageStatus::Failed
     }
 }
 
@@ -736,7 +795,7 @@ impl Message for WorkUnit {
                 inner.status != MessageStatus::Complete,
             ),
             WorkUnitPresentation::ProgramOutput { title: None }
-                if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+                if program_output_is_assistant(&inner) =>
             {
                 (
                     TranscriptRowKind::Response,
@@ -773,7 +832,7 @@ impl Message for WorkUnit {
         let band = match &inner.presentation {
             WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
             WorkUnitPresentation::ProgramOutput { title: None }
-                if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+                if program_output_is_assistant(&inner) =>
             {
                 MessageBand::Assistant
             }
@@ -796,7 +855,7 @@ impl Message for WorkUnit {
             let band = match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
                 WorkUnitPresentation::ProgramOutput { title: None }
-                    if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+                    if program_output_is_assistant(&inner) =>
                 {
                     MessageBand::Assistant
                 }
@@ -836,7 +895,7 @@ impl Message for WorkUnit {
             match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
                 WorkUnitPresentation::ProgramOutput { title: None }
-                    if !program_output_is_failure(&inner) && !inner.response_text.is_empty() =>
+                    if program_output_is_assistant(&inner) =>
                 {
                     MessageBand::Assistant
                 }
@@ -864,16 +923,14 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
         )
 }
 
-/// Provider wire failures historically share the untitled output presentation
-/// with successful `say` effects. Keep their diagnostic chrome inspectable
-/// instead of projecting an error as assistant prose.
-fn program_output_is_failure(inner: &WorkUnitInner) -> bool {
-    inner.status == MessageStatus::Failed
-        || inner
-            .response_text
-            .trim_start()
-            .starts_with("VM wire error:")
-        || inner.response_text.trim_start().starts_with("VM error:")
+fn program_output_is_assistant(inner: &WorkUnitInner) -> bool {
+    matches!(
+        (&inner.presentation, inner.program_output_semantics),
+        (
+            WorkUnitPresentation::ProgramOutput { title: None },
+            ProgramOutputSemantics::AssistantSay
+        )
+    )
 }
 
 fn lines(text: &str) -> Vec<String> {
