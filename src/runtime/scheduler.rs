@@ -495,6 +495,19 @@ struct TaskRecord {
     notify: Arc<Notify>,
 }
 
+enum AgentLoopExit {
+    Completed { message: String, turns: usize },
+    Failed { diagnostic: String },
+    Cancelled,
+    Deadline,
+}
+
+#[derive(Clone, Copy)]
+enum AgentTerminalIntent {
+    Cancelled,
+    Deadline,
+}
+
 pub struct AgentScheduler {
     resolver: ProviderResolver,
     runtime: Arc<ProgramRuntime>,
@@ -506,6 +519,8 @@ pub struct AgentScheduler {
     active_brain_parent: RwLock<Option<AgentBrainContext>>,
     #[cfg(test)]
     wait_after_initial_check: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(test)]
+    wait_after_tool_completion: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl AgentScheduler {
@@ -530,6 +545,8 @@ impl AgentScheduler {
             active_brain_parent: RwLock::new(None),
             #[cfg(test)]
             wait_after_initial_check: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            wait_after_tool_completion: tokio::sync::Mutex::new(None),
         });
         runtime.attach_agent_scheduler(&scheduler);
         scheduler
@@ -775,28 +792,33 @@ impl AgentScheduler {
             }
         }
 
-        let execution = tokio::time::timeout(
-            std::time::Duration::from_millis(spec.budget.timeout_ms),
-            self.agent_loop(&identity, &spec, &resolved_context, provider, &cancellation),
-        )
-        .await;
-        drop(permit);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(spec.budget.timeout_ms);
+        let execution = self
+            .agent_loop(
+                &identity,
+                &spec,
+                &resolved_context,
+                provider,
+                &cancellation,
+                deadline,
+            )
+            .await;
 
         let (status, message, diagnostics, turns) = match execution {
-            Ok(Ok((message, turns))) => (AgentTaskStatus::Completed, message, Vec::new(), turns),
-            Ok(Err(error)) if cancellation.is_cancelled() => (
+            AgentLoopExit::Completed { message, turns } => {
+                (AgentTaskStatus::Completed, message, Vec::new(), turns)
+            }
+            AgentLoopExit::Cancelled => (
                 AgentTaskStatus::Cancelled,
                 String::new(),
-                vec![error.to_string()],
+                vec!["agent cancelled".to_string()],
                 0,
             ),
-            Ok(Err(error)) => (
-                AgentTaskStatus::Failed,
-                String::new(),
-                vec![error.to_string()],
-                0,
-            ),
-            Err(_) => (
+            AgentLoopExit::Failed { diagnostic } => {
+                (AgentTaskStatus::Failed, String::new(), vec![diagnostic], 0)
+            }
+            AgentLoopExit::Deadline => (
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec!["agent deadline exceeded".to_string()],
@@ -812,6 +834,7 @@ impl AgentScheduler {
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         };
         self.store_result(result).await;
+        drop(permit);
     }
 
     async fn finish_cancelled(&self, identity: AgentIdentity, started: Instant) {
@@ -888,7 +911,8 @@ impl AgentScheduler {
         resolved_context: &[ResolvedAgentContext],
         provider: Arc<dyn Generator>,
         cancellation: &CancellationToken,
-    ) -> Result<(String, usize)> {
+        deadline: tokio::time::Instant,
+    ) -> AgentLoopExit {
         let tools = self.child_tools(identity);
         let definitions = tools
             .iter()
@@ -917,38 +941,75 @@ impl AgentScheduler {
 
         for turn in 1..=spec.budget.max_turns.clamp(1, MAX_TURNS) {
             let response = tokio::select! {
-                response = provider.generate(messages.clone(), Some(definitions.clone())) => response?,
-                _ = cancellation.cancelled() => bail!("agent cancelled"),
+                biased;
+                _ = cancellation.cancelled() => return AgentLoopExit::Cancelled,
+                _ = tokio::time::sleep_until(deadline) => return AgentLoopExit::Deadline,
+                response = provider.generate(messages.clone(), Some(definitions.clone())) => {
+                    match response {
+                        Ok(response) => response,
+                        Err(error) => return AgentLoopExit::Failed {
+                            diagnostic: error.to_string(),
+                        },
+                    }
+                },
             };
             if response.tool_uses.is_empty() {
-                return Ok((response.text, turn));
+                return AgentLoopExit::Completed {
+                    message: response.text,
+                    turns: turn,
+                };
             }
             messages.push(Message::with_content("assistant", response.content_blocks));
             let mut results = Vec::with_capacity(response.tool_uses.len());
             for tool_use in response.tool_uses {
+                if let Some(terminal) = terminal_intent(cancellation, deadline) {
+                    return terminal.into_loop_exit();
+                }
+                let tool_name = tool_use.name.clone();
                 let _ = self.events.send(AgentEvent::ToolStarted {
                     task_id: identity.task_id,
-                    name: tool_use.name.clone(),
+                    name: tool_name.clone(),
                 });
-                let execution = execute_child_tool(&tools, &tool_use.name, tool_use.input).await;
+                let (execution, terminal) = {
+                    let execution = execute_child_tool(&tools, &tool_name, tool_use.input);
+                    tokio::pin!(execution);
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => (execution.await, Some(AgentTerminalIntent::Cancelled)),
+                        _ = tokio::time::sleep_until(deadline) => (execution.await, Some(AgentTerminalIntent::Deadline)),
+                        execution = &mut execution => (execution, None),
+                    }
+                };
                 let (content, is_error) = match execution {
                     Ok(content) => (content, false),
                     Err(error) => (format!("Error: {error}"), true),
                 };
                 let _ = self.events.send(AgentEvent::ToolCompleted {
                     task_id: identity.task_id,
-                    name: tool_use.name,
+                    name: tool_name.clone(),
                     is_error,
                 });
+                #[cfg(test)]
+                if let Some((completed, resume)) =
+                    self.wait_after_tool_completion.lock().await.take()
+                {
+                    completed.notify_one();
+                    resume.notified().await;
+                }
                 results.push(ContentBlock::tool_result(
                     tool_use.id,
                     content,
                     is_error.then_some(true),
                 ));
+                if let Some(terminal) = terminal {
+                    return terminal.into_loop_exit();
+                }
             }
             messages.push(Message::with_content("user", results));
         }
-        bail!("agent reached its turn limit without a final response")
+        AgentLoopExit::Failed {
+            diagnostic: "agent reached its turn limit without a final response".to_string(),
+        }
     }
 
     fn child_tools(self: &Arc<Self>, identity: &AgentIdentity) -> Vec<Box<dyn Tool>> {
@@ -963,6 +1024,25 @@ impl AgentScheduler {
             Box::new(InspectWordTool::new(Arc::clone(&self.runtime), None)),
         ]
     }
+}
+
+impl AgentTerminalIntent {
+    fn into_loop_exit(self) -> AgentLoopExit {
+        match self {
+            Self::Cancelled => AgentLoopExit::Cancelled,
+            Self::Deadline => AgentLoopExit::Deadline,
+        }
+    }
+}
+
+fn terminal_intent(
+    cancellation: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Option<AgentTerminalIntent> {
+    if cancellation.is_cancelled() {
+        return Some(AgentTerminalIntent::Cancelled);
+    }
+    (tokio::time::Instant::now() >= deadline).then_some(AgentTerminalIntent::Deadline)
 }
 
 fn starting_context_hash(
@@ -1073,6 +1153,7 @@ mod tests {
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     struct AccountResolver;
@@ -1244,6 +1325,20 @@ mod tests {
         started: Arc<Notify>,
     }
 
+    struct ToolBatchGenerator {
+        calls: AtomicUsize,
+        tool_uses: Vec<crate::generators::ToolUse>,
+    }
+
+    impl ToolBatchGenerator {
+        fn new(tool_uses: Vec<crate::generators::ToolUse>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                tool_uses,
+            }
+        }
+    }
+
     #[async_trait]
     impl Generator for EchoGenerator {
         async fn generate(
@@ -1326,6 +1421,496 @@ mod tests {
         fn name(&self) -> &str {
             "blocking"
         }
+    }
+
+    #[async_trait]
+    impl Generator for ToolBatchGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let tool_uses = if call == 0 {
+                self.tool_uses.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(GeneratorResponse {
+                text: if tool_uses.is_empty() {
+                    "done".to_string()
+                } else {
+                    String::new()
+                },
+                content_blocks: tool_uses
+                    .iter()
+                    .map(crate::generators::ToolUse::to_content_block)
+                    .collect(),
+                tool_uses,
+                metadata: ResponseMetadata {
+                    generator: "tool-batch".to_string(),
+                    model: "tool-batch".to_string(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "tool-batch"
+        }
+    }
+
+    fn submit_program_tool_use(
+        id: &str,
+        source: String,
+        intent: &str,
+        manifest_generation: u64,
+        declared_capabilities: Vec<CapabilityRequirement>,
+    ) -> crate::generators::ToolUse {
+        crate::generators::ToolUse {
+            id: id.to_string(),
+            name: "submit_program".to_string(),
+            input: serde_json::json!({
+                "language": "lisp",
+                "source": source,
+                "intent": intent,
+                "manifest_generation": manifest_generation,
+                "declared_capabilities": declared_capabilities,
+            }),
+        }
+    }
+
+    async fn wait_for_host_rendezvous(
+        rendezvous: &crate::runtime::HostEffectTestRendezvous,
+        diagnostic: &str,
+    ) {
+        for _ in 0..10_000 {
+            if rendezvous.entered() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{diagnostic}");
+    }
+
+    fn terminal_fence_fixture(
+        timeout_ms: u64,
+    ) -> (
+        Arc<ProgramRuntime>,
+        Arc<AgentScheduler>,
+        Arc<ToolBatchGenerator>,
+        AgentTaskSpec,
+        Arc<crate::runtime::HostEffectTestRendezvous>,
+        std::net::TcpListener,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("terminal-fence regression must bind a loopback endpoint");
+        let port = listener
+            .local_addr()
+            .expect("terminal-fence loopback endpoint must have an address")
+            .port();
+        let runtime = Arc::new(ProgramRuntime::new());
+        let network = CapabilityRequirement {
+            capability: CapabilityKind::NetworkConnect,
+            selector: ResourceSelector::Network {
+                host: "127.0.0.1".to_string(),
+                ports: vec![port],
+            },
+        };
+        runtime
+            .grant_typed_capability(network.clone())
+            .expect("terminal-fence regression must grant its loopback endpoint");
+        let identity = format!("terminal-fence-{}", Uuid::new_v4());
+        let rendezvous = crate::runtime::register_host_effect_test_rendezvous(identity.clone());
+        let generation = runtime.manifest_generation();
+        let generator = Arc::new(ToolBatchGenerator::new(vec![
+            submit_program_tool_use(
+                "tool-1",
+                format!("(network-connect \"127.0.0.1\" {port})"),
+                &identity,
+                generation,
+                vec![network],
+            ),
+            submit_program_tool_use(
+                "tool-2",
+                "(+ 1 1)".to_string(),
+                "later sibling must not start",
+                generation,
+                Vec::new(),
+            ),
+        ]));
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(generator.clone()),
+            Arc::clone(&runtime),
+        );
+        let spec = AgentTaskSpec {
+            task: "exercise terminal fence".to_string(),
+            role: AgentRole::General,
+            background: None,
+            provider: None,
+            model: None,
+            context: Vec::new(),
+            capability_grant_ids: None,
+            budget: AgentBudget {
+                timeout_ms,
+                max_turns: 3,
+                ..AgentBudget::default()
+            },
+        };
+        (runtime, scheduler, generator, spec, rendezvous, listener)
+    }
+
+    fn event_summary(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                AgentEvent::TaskQueued { .. } => "task_queued".to_string(),
+                AgentEvent::TaskStarted { .. } => "task_started".to_string(),
+                AgentEvent::ToolStarted { name, .. } => format!("tool_started:{name}"),
+                AgentEvent::ToolCompleted { name, .. } => format!("tool_completed:{name}"),
+                AgentEvent::TaskFinished { result } => {
+                    format!("task_finished:{:?}", result.status)
+                }
+            })
+            .collect()
+    }
+
+    async fn collect_through_terminal(
+        events: &mut broadcast::Receiver<AgentEvent>,
+    ) -> Vec<AgentEvent> {
+        let mut collected = Vec::new();
+        for _ in 0..16 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("terminal-fence event stream timed out before TaskFinished")
+                .expect("terminal-fence event stream closed before TaskFinished");
+            let terminal = matches!(event, AgentEvent::TaskFinished { .. });
+            collected.push(event);
+            if terminal {
+                return collected;
+            }
+        }
+        panic!(
+            "terminal-fence event stream exceeded its bound without TaskFinished: {:?}",
+            event_summary(&collected)
+        );
+    }
+
+    async fn assert_no_post_terminal_events(
+        events: &mut broadcast::Receiver<AgentEvent>,
+        result: &AgentTaskResult,
+        summary: &[String],
+    ) {
+        tokio::task::yield_now().await;
+        match events.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty) => {}
+            Err(broadcast::error::TryRecvError::Closed) => panic!(
+                "terminal-fence event source closed unexpectedly; result={result:?}; events={summary:?}"
+            ),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => panic!(
+                "terminal-fence event receiver lagged after TaskFinished by {skipped} events; result={result:?}; events={summary:?}"
+            ),
+            Ok(event) => panic!(
+                "terminal-fence scheduler emitted an event after TaskFinished: {event:?}; result={result:?}; events={summary:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_cancellation_drains_started_typed_tool_and_skips_siblings() {
+        let (_runtime, scheduler, generator, spec, rendezvous, _listener) =
+            terminal_fence_fixture(10_000);
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spec, None)
+            .await
+            .expect("terminal-fence child must spawn");
+        wait_for_host_rendezvous(
+            &rendezvous,
+            "submit_program never reached ProgramRuntime spawn_blocking and TypedHostHandler",
+        )
+        .await;
+
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("terminal-fence child cancellation must be accepted");
+        rendezvous.release();
+        let result = scheduler
+            .wait(identity.task_id)
+            .await
+            .expect("terminal-fence child must publish a result");
+        let collected = collect_through_terminal(&mut events).await;
+        let summary = event_summary(&collected);
+
+        assert_eq!(
+            result.status,
+            AgentTaskStatus::Cancelled,
+            "cancellation during a started tool must own terminal status; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            result.turns, 0,
+            "terminal fencing must preserve the scheduler's existing cancellation turn count; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            1,
+            "cancellation after provider attempt one must not invoke the provider again; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_started:submit_program")
+                .count(),
+            1,
+            "cancellation must not start the second tool in the provider batch; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary.last().map(String::as_str),
+            Some("task_finished:Cancelled"),
+            "TaskFinished must be the last lifecycle event after the matching ToolCompleted; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_completed:submit_program")
+                .count(),
+            1,
+            "the started submit_program must emit exactly one matching ToolCompleted before cancellation; result={result:?}; events={summary:?}"
+        );
+        assert_no_post_terminal_events(&mut events, &result, &summary).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_fence_deadline_waits_for_started_tool_before_terminal_and_permit_release() {
+        let (_runtime, scheduler, generator, spec, rendezvous, _listener) =
+            terminal_fence_fixture(10);
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spec, None)
+            .await
+            .expect("terminal-fence child must spawn");
+        wait_for_host_rendezvous(
+            &rendezvous,
+            "deadline regression never reached ProgramRuntime spawn_blocking and TypedHostHandler",
+        )
+        .await;
+
+        tokio::time::advance(std::time::Duration::from_millis(11)).await;
+        tokio::task::yield_now().await;
+        let premature = scheduler
+            .poll(identity.task_id)
+            .await
+            .expect("deadline child must remain inspectable")
+            .result;
+        let permits_before_release = scheduler.concurrency.available_permits();
+        rendezvous.release();
+
+        assert!(
+            premature.is_none(),
+            "deadline must not publish TaskFinished while submit_program is still executing; premature={premature:?}; permits={permits_before_release}"
+        );
+        assert_eq!(
+            permits_before_release, 3,
+            "deadline must retain the child permit until the started tool quiesces; premature={premature:?}"
+        );
+
+        let result = scheduler
+            .wait(identity.task_id)
+            .await
+            .expect("deadline child must publish a result after tool quiescence");
+        let collected = collect_through_terminal(&mut events).await;
+        let summary = event_summary(&collected);
+        assert_eq!(
+            result.status,
+            AgentTaskStatus::Failed,
+            "deadline must retain its public failed status after draining the tool; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            result.turns, 0,
+            "terminal fencing must preserve the scheduler's existing deadline turn count; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            1,
+            "deadline after provider attempt one must not invoke the provider again; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_started:submit_program")
+                .count(),
+            1,
+            "deadline must not start the later sibling tool; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_completed:submit_program")
+                .count(),
+            1,
+            "deadline must emit exactly one matching ToolCompleted for the started tool; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary.last().map(String::as_str),
+            Some("task_finished:Failed"),
+            "deadline TaskFinished must be last after exact-one ToolCompleted; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            scheduler.concurrency.available_permits(),
+            4,
+            "deadline terminal publication must release the child permit; result={result:?}; events={summary:?}"
+        );
+        assert_no_post_terminal_events(&mut events, &result, &summary).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_late_cancellation_prevents_later_sibling_start() {
+        let (_runtime, scheduler, generator, spec, rendezvous, _listener) =
+            terminal_fence_fixture(10_000);
+        let completed = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *scheduler.wait_after_tool_completion.lock().await =
+            Some((Arc::clone(&completed), Arc::clone(&resume)));
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spec, None)
+            .await
+            .expect("late-cancellation child must spawn");
+        wait_for_host_rendezvous(
+            &rendezvous,
+            "late-cancellation regression never reached TypedHostHandler",
+        )
+        .await;
+        rendezvous.release();
+        tokio::time::timeout(std::time::Duration::from_secs(5), completed.notified())
+            .await
+            .expect("late-cancellation regression did not reach the post-ToolCompleted fence");
+
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("late cancellation must be accepted");
+        resume.notify_one();
+        let result = scheduler
+            .wait(identity.task_id)
+            .await
+            .expect("late-cancellation child must publish a result");
+        let collected = collect_through_terminal(&mut events).await;
+        let summary = event_summary(&collected);
+        assert_eq!(
+            result.status,
+            AgentTaskStatus::Cancelled,
+            "cancellation observed after ToolCompleted must still own terminal status; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            result.turns, 0,
+            "late cancellation must preserve the existing cancellation turn count; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            1,
+            "late cancellation must stop before another provider attempt; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_started:submit_program")
+                .count(),
+            1,
+            "late cancellation must stop before the later sibling tool; result={result:?}; events={summary:?}"
+        );
+        assert_no_post_terminal_events(&mut events, &result, &summary).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_fence_simultaneous_cancel_and_deadline_prefer_cancellation() {
+        let (_runtime, scheduler, generator, spec, rendezvous, _listener) =
+            terminal_fence_fixture(10);
+        let mut events = scheduler.subscribe();
+        let identity = scheduler
+            .spawn(spec, None)
+            .await
+            .expect("simultaneous-terminal child must spawn");
+        wait_for_host_rendezvous(
+            &rendezvous,
+            "simultaneous-terminal regression never reached TypedHostHandler",
+        )
+        .await;
+
+        scheduler
+            .cancel(identity.task_id)
+            .await
+            .expect("simultaneous-terminal cancellation must be accepted");
+        tokio::time::advance(std::time::Duration::from_millis(11)).await;
+        rendezvous.release();
+        let result = scheduler
+            .wait(identity.task_id)
+            .await
+            .expect("simultaneous-terminal child must publish a result");
+        let collected = collect_through_terminal(&mut events).await;
+        let summary = event_summary(&collected);
+        assert_eq!(
+            result.status,
+            AgentTaskStatus::Cancelled,
+            "when cancellation and deadline are both ready, biased cancellation must win; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            result.turns, 0,
+            "simultaneous terminal intent must preserve existing cancellation turn reporting; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            generator.calls.load(Ordering::SeqCst),
+            1,
+            "simultaneous terminal intent must not re-enter the provider; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_started:submit_program")
+                .count(),
+            1,
+            "simultaneous terminal intent must not start the later sibling tool; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .filter(|event| event.as_str() == "tool_completed:submit_program")
+                .count(),
+            1,
+            "simultaneous terminal intent must emit exactly one matching ToolCompleted; result={result:?}; events={summary:?}"
+        );
+        assert_eq!(
+            summary.last().map(String::as_str),
+            Some("task_finished:Cancelled"),
+            "simultaneous cancellation must drain exact-one ToolCompleted before final TaskFinished; result={result:?}; events={summary:?}"
+        );
+        assert_no_post_terminal_events(&mut events, &result, &summary).await;
     }
 
     #[tokio::test]

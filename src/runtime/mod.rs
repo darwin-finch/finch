@@ -38,6 +38,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{mpsc, Mutex, RwLock, Weak};
+#[cfg(test)]
+use std::sync::{Condvar, OnceLock};
 use std::time::Instant;
 
 const LOCAL_CAPABILITY_POLICY_HASH: &str = "finch-local-runtime-v1";
@@ -340,6 +342,81 @@ pub struct ResourceRootAuditEntry {
 struct ResourceRootState {
     bindings: BTreeMap<crate::vm::ResourceRoot, Arc<ResourceRootBindingRecord>>,
     audit: Vec<ResourceRootAuditEntry>,
+}
+
+#[cfg(test)]
+pub(super) struct HostEffectTestRendezvous {
+    entered: std::sync::atomic::AtomicBool,
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+#[cfg(test)]
+impl HostEffectTestRendezvous {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::atomic::AtomicBool::new(false),
+            released: Mutex::new(false),
+            release: Condvar::new(),
+        }
+    }
+
+    pub(super) fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn release(&self) {
+        let mut released = self.released.lock().expect("host test gate lock poisoned");
+        *released = true;
+        self.release.notify_all();
+    }
+
+    fn wait(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        let mut released = self.released.lock().expect("host test gate lock poisoned");
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .expect("host test gate lock poisoned while waiting");
+        }
+    }
+}
+
+#[cfg(test)]
+fn host_effect_test_rendezvous_registry(
+) -> &'static Mutex<HashMap<String, Arc<HostEffectTestRendezvous>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<HostEffectTestRendezvous>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(super) fn register_host_effect_test_rendezvous(
+    identity: impl Into<String>,
+) -> Arc<HostEffectTestRendezvous> {
+    let identity = identity.into();
+    let rendezvous = Arc::new(HostEffectTestRendezvous::new());
+    let previous = host_effect_test_rendezvous_registry()
+        .lock()
+        .expect("host test rendezvous registry lock poisoned")
+        .insert(identity.clone(), Arc::clone(&rendezvous));
+    assert!(
+        previous.is_none(),
+        "host test rendezvous identity must be unique: {identity}"
+    );
+    rendezvous
+}
+
+#[cfg(test)]
+fn wait_at_host_effect_test_rendezvous(identity: &str) {
+    let rendezvous = host_effect_test_rendezvous_registry()
+        .lock()
+        .expect("host test rendezvous registry lock poisoned")
+        .remove(identity);
+    if let Some(rendezvous) = rendezvous {
+        rendezvous.wait();
+    }
 }
 
 /// One session's persistent language runtimes.
@@ -4400,6 +4477,9 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 Some(effect.origin.clone()),
             ));
         };
+
+        #[cfg(test)]
+        wait_at_host_effect_test_rendezvous(&self.authorization.reason);
 
         // Named-Brain execution receives a daemon-owned audit proxy. Reserve
         // the immutable intent, then fsync AwaitingHostResult immediately
