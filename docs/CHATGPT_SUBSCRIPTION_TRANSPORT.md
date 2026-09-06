@@ -102,6 +102,17 @@ visible prefix payloads therefore keep identity across retries without putting
 a username, Brain, account, credential, or host identifier on the wire. The
 pin must be re-audited if OpenAI changes the prefix identity contract.
 
+ChatGPT reserves unprefixed collaboration names such as `spawn_agent` for its
+own native namespace. Finch advertises its corresponding local primitives with
+application-owned wire aliases (`finch_spawn_agent`, `finch_await_agent`,
+`finch_poll_agent`, and `finch_cancel_agent`) and maps a validated response back
+to the local name. A returned custom function may identify the advertised
+`functions` namespace, use `collaboration` only with one of those aliases, or
+omit the namespace as permitted by the observed Responses-Lite shape. Other
+namespaces, raw native collaboration names, malformed namespace values,
+unadvertised tools, and attempts to advertise a reserved Finch alias fail
+closed.
+
 The audited client also sends fields tied to Codex-owned thread and client
 state, including `prompt_cache_key` and `client_metadata`. Finch does not
 fabricate those values: they remain absent until Finch has an independently
@@ -141,6 +152,12 @@ to 256 KiB; extra remains bounded by the enclosing stream-event limit. Neither
 can alter Finch's validated input/output token accounting, and other usage
 siblings remain fail-closed.
 
+A separate Finch-owned live acceptance run on 2026-09-05 requested one
+`spawn_agent` custom function call. The service response passed the namespace
+and advertised-tool checks and rebound to exactly one local `spawn_agent` call
+with the requested arguments. The acceptance test parses the call but never
+executes it.
+
 Non-success bodies are consumed only to a small bound and discarded. A
 Responses-Lite rejection retains a typed HTTP status and a compatibility or
 entitlement hint, never the response body. Tokens,
@@ -178,3 +195,17 @@ provenance plus the exact requested static response text. It does not print
 tokens or response bodies. Until that opt-in test is run, live-service
 acceptance—including current account entitlement and server-side compatibility
 with the pinned revision—remains intentionally unverified.
+
+The same reviewed environment can verify the collaboration-tool binding without
+executing the returned tool:
+
+```sh
+FINCH_LIVE_CHATGPT_ACCEPTANCE=1 \
+FINCH_LIVE_CHATGPT_CONFIG="$HOME/.finch/config.toml" \
+FINCH_LIVE_CHATGPT_OAUTH_ROOT="$HOME/.finch/oauth" \
+CARGO_BUILD_JOBS=2 \
+./.agents/skills/finch-backlog/scripts/with-cargo-slot \
+  ./scripts/test_brains.sh cargo test --lib \
+  providers::chatgpt_subscription::tests::live_chatgpt_subscription_collaboration_tool_is_explicitly_opt_in \
+  -- --ignored --exact
+```
