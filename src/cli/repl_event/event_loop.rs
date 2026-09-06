@@ -62,6 +62,19 @@ type PendingApprovalsMap = Arc<
     >,
 >;
 
+fn is_outputless_forth_say_mismatch(outcome: &crate::runtime::outcome::ExecutionOutcome) -> bool {
+    outcome.status == crate::runtime::outcome::ExecutionStatus::Failed
+        && outcome
+            .vm_diagnostics
+            .iter()
+            .any(crate::vm::VmDiagnostic::is_forth_say_int_mismatch)
+        && outcome.output.is_empty()
+        && outcome.output_chunks.is_empty()
+        && outcome.side_effects.is_empty()
+        && outcome.vm_side_effects.is_empty()
+        && outcome.effect_journal.is_empty()
+}
+
 async fn commit_tool_round_and_continue(
     conversation: &Arc<RwLock<ConversationHistory>>,
     query_id: Uuid,
@@ -3577,9 +3590,15 @@ Rules:\n\
                 envelope,
             });
         });
+        let source_id = format!("interactive.{}", language.as_str());
+        let diagnostic_source_id = source_id.clone();
+        // The diagnostic path must not retain another unbounded copy of an
+        // interactive program. The reported reproduction is tiny; oversized
+        // input keeps the existing concise fallback without a source excerpt.
+        let diagnostic_source = (source.len() <= 4 * 1024).then(|| source.clone());
         let submission = crate::runtime::ProgramSubmission {
             language,
-            source_id: Some(format!("interactive.{}", language.as_str())),
+            source_id: Some(source_id),
             source,
             intent: "interactive typed source".into(),
             effect: crate::programs::ExecutionEffect::Unclassified,
@@ -3603,6 +3622,20 @@ Rules:\n\
                 .await
             }
             .await
+            .map(|mut outcome| {
+                if is_outputless_forth_say_mismatch(&outcome) {
+                    if let Some(rendered) = outcome.vm_diagnostics.iter().find_map(|diagnostic| {
+                        crate::vm::diagnostic::render_interactive_forth_say_mismatch(
+                            diagnostic,
+                            &diagnostic_source_id,
+                            diagnostic_source.as_deref().unwrap_or(""),
+                        )
+                    }) {
+                        outcome.diagnostics.insert(0, rendered);
+                    }
+                }
+                outcome
+            })
             .map_err(|error: anyhow::Error| error.to_string());
             let _ = event_tx.send(ReplEvent::TypedProgramComplete {
                 output_unit,
@@ -4421,6 +4454,24 @@ Rules:\n\
                     Ok(outcome)
                         if outcome.status
                             == crate::runtime::outcome::ExecutionStatus::Completed => {}
+                    Ok(outcome)
+                        if is_outputless_forth_say_mismatch(&outcome)
+                            && crate::cli::messages::Message::content(output_unit.as_ref())
+                                .is_empty() =>
+                    {
+                        let detail =
+                            outcome.diagnostics.first().cloned().unwrap_or_else(|| {
+                                format!("VM program ended as {:?}", outcome.status)
+                            });
+                        self.output_manager.write_error(detail);
+                        output_unit.set_complete();
+                        self.output_manager
+                            .remove_message(crate::cli::messages::Message::id(
+                                output_unit.as_ref(),
+                            ));
+                        self.render_tui().await?;
+                        return Ok(());
+                    }
                     Ok(outcome) => {
                         let detail =
                             outcome.diagnostics.first().cloned().unwrap_or_else(|| {
@@ -8819,6 +8870,177 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    struct UnusedInteractiveDiagnosticGenerator;
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for UnusedInteractiveDiagnosticGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            anyhow::bail!("interactive diagnostic regression must not invoke a provider")
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            anyhow::bail!("interactive diagnostic regression must not stream from a provider")
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: false,
+                    max_context_messages: None,
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "unused-interactive-diagnostic-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interactive_forth_say_mismatch_is_one_standalone_source_cited_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                use crate::cli::messages::{Message, TranscriptRowKind};
+
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                runtime
+                    .grant_typed_capability(crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    })
+                    .expect("diagnostic fixture should grant only session output");
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(UnusedInteractiveDiagnosticGenerator);
+                let temp = tempfile::tempdir()
+                    .expect("interactive diagnostic test root should be created");
+                let permissions = crate::tools::permissions::PermissionManager::new()
+                    .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        crate::tools::registry::ToolRegistry::new(),
+                        permissions,
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .expect("empty diagnostic tool executor should be created"),
+                ));
+                let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    runtime,
+                );
+                event_loop.output_manager.disable_stdout();
+
+                event_loop
+                    .handle_event(super::ReplEvent::UserInput {
+                        input: "/forth 3 4 + say".into(),
+                    })
+                    .await
+                    .expect("real /forth input boundary should accept the command");
+                let completion = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    event_loop.event_rx.recv(),
+                )
+                .await
+                .expect("real typed-program path did not publish completion")
+                .expect("typed-program event channel closed before completion");
+                let output_unit = match &completion {
+                    super::ReplEvent::TypedProgramComplete { output_unit, .. } => {
+                        std::sync::Arc::clone(output_unit)
+                    }
+                    unexpected => panic!(
+                        "compile-time /forth mismatch published {unexpected:?} before completion"
+                    ),
+                };
+                let output_id = output_unit.id();
+                event_loop
+                    .handle_event(completion)
+                    .await
+                    .expect("typed completion handler should publish the standalone error");
+
+                let messages = event_loop.output_manager.get_messages();
+                let matching = messages
+                    .iter()
+                    .filter(|message| message.content().contains("E-TYPE-002"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "typed mismatch must publish exactly one visible diagnostic; messages={:?}",
+                    messages
+                        .iter()
+                        .map(|message| (message.id(), message.status(), message.content()))
+                        .collect::<Vec<_>>()
+                );
+                let diagnostic = matching[0].content();
+                for required in [
+                    "E-TYPE-002 · verification error at interactive.forth:1:7",
+                    "3 4 + say",
+                    "      ^^^",
+                    "`say` expected string, but received int produced by `+` at interactive.forth:1:5.",
+                    "Hint: convert the integer with `int-to-string` before `say`.",
+                ] {
+                    assert!(
+                        diagnostic.contains(required),
+                        "interactive diagnostic omitted {required:?}; full_render={diagnostic:?} messages={:?}",
+                        messages
+                            .iter()
+                            .map(|message| (message.id(), message.status(), message.content()))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                assert!(
+                    messages.iter().all(|message| message.id() != output_id),
+                    "empty ProgramOutput unit survived beside its standalone diagnostic; output_id={output_id} full_render={diagnostic:?}"
+                );
+                assert_eq!(
+                    output_unit.status(),
+                    crate::cli::messages::MessageStatus::Complete,
+                    "removed output unit did not reach a terminal state; full_render={diagnostic:?}"
+                );
+                assert_eq!(
+                    matching[0].status(),
+                    crate::cli::messages::MessageStatus::Complete,
+                    "standalone diagnostic was not immediately terminal; full_render={diagnostic:?}"
+                );
+                assert!(
+                    matching[0].transcript_row(&crate::config::ColorScheme::default()).is_none(),
+                    "standalone StaticMessage unexpectedly claimed an ordinary transcript row; full_render={diagnostic:?}"
+                );
+                assert!(
+                    messages.iter().all(|message| {
+                        message
+                            .transcript_row(&crate::config::ColorScheme::default())
+                            .is_none_or(|row| {
+                                row.kind != TranscriptRowKind::Output
+                                    || !row.body.iter().any(|line| line.contains("E-TYPE-002"))
+                            })
+                    }),
+                    "typed diagnostic remained nested under ordinary Program output; full_render={diagnostic:?}"
+                );
+                assert!(
+                    matches!(
+                        event_loop.event_rx.try_recv(),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    ),
+                    "compile-time mismatch queued a duplicate or post-terminal event; full_render={diagnostic:?}"
+                );
+            })
+            .await;
+    }
+
     /// Every systemic condition this runner can report must declare itself with
     /// `RUNNER_UNAVAILABLE_PREFIX`, so a replay pass aborts instead of paying a
     /// round trip per completed run. #254.

@@ -20,6 +20,12 @@ struct LocalBinding {
 }
 
 #[derive(Debug, Clone)]
+struct ImmediatePlusProducer {
+    stack_len: usize,
+    origin: SourceOrigin,
+}
+
+#[derive(Debug, Clone)]
 struct Token {
     value: TokenValue,
     start: usize,
@@ -467,6 +473,10 @@ fn lower_forth_ast_body_with_locals(
         .map(|(index, capture)| (capture.name.as_str(), (index as u32, capture.ty.clone())))
         .collect::<BTreeMap<_, _>>();
     let mut available_functions = linked_functions.clone();
+    // Issue #353's narrow provenance contract covers only the immediately
+    // preceding, compiler-proven integer result of `+`. Every intervening
+    // token clears it, so control flow or a stack shuffle cannot be guessed.
+    let mut immediate_plus_producer: Option<ImmediatePlusProducer> = None;
 
     let emit = |blocks: &mut BTreeMap<u32, BasicBlock>,
                 current: u32,
@@ -520,6 +530,7 @@ fn lower_forth_ast_body_with_locals(
     }
     while token_index < tokens.len() {
         let token = tokens[token_index].clone();
+        let previous_plus_producer = immediate_plus_producer.take();
         if let ForthBodyNode::Quotation(quotation) = &body.nodes[token_index] {
             let origin = origin(source_id, source, token.start, quotation.end);
             let (declared_signature, declares_pure) =
@@ -2320,11 +2331,42 @@ fn lower_forth_ast_body_with_locals(
                             Some(origin),
                         )]);
                     };
-                    let concrete_signature =
-                        instantiate_signature_types(signature, &stack, &origin)
-                            .map_err(|diagnostic| vec![diagnostic])?;
-                    apply_signature_types(signature, &mut stack, &origin)
-                        .map_err(|diagnostic| vec![diagnostic])?;
+                    let concrete_signature = instantiate_signature_types(
+                        signature, &stack, &origin,
+                    )
+                    .map_err(|diagnostic| {
+                        vec![enrich_immediate_plus_say_mismatch(
+                            diagnostic,
+                            &word,
+                            &stack,
+                            previous_plus_producer.as_ref(),
+                            vocabulary,
+                        )]
+                    })?;
+                    apply_signature_types(signature, &mut stack, &origin).map_err(
+                        |diagnostic| {
+                            vec![enrich_immediate_plus_say_mismatch(
+                                diagnostic,
+                                &word,
+                                &stack,
+                                previous_plus_producer.as_ref(),
+                                vocabulary,
+                            )]
+                        },
+                    )?;
+                    if word == "+"
+                        && concrete_signature.output.values.last() == Some(&Type::Int)
+                        && origin.expansion.is_none()
+                        && origin
+                            .span
+                            .as_ref()
+                            .is_some_and(|span| span.source_id.len() <= 128)
+                    {
+                        immediate_plus_producer = Some(ImmediatePlusProducer {
+                            stack_len: stack.len(),
+                            origin: origin.clone(),
+                        });
+                    }
                     effects = effects.union(&signature.effects);
                     merge_suspension_contract(
                         &mut suspension,
@@ -2460,6 +2502,27 @@ fn output_operation(word: &str) -> Option<UiOperation> {
         "output-fail" => Some(UiOperation::Fail),
         _ => None,
     }
+}
+
+fn enrich_immediate_plus_say_mismatch(
+    mut diagnostic: VmDiagnostic,
+    word: &str,
+    stack: &[Type],
+    producer: Option<&ImmediatePlusProducer>,
+    vocabulary: &Vocabulary,
+) -> VmDiagnostic {
+    if word != "say" || !diagnostic.is_forth_say_int_mismatch() {
+        return diagnostic;
+    }
+    if let Some(producer) = producer.filter(|producer| producer.stack_len == stack.len()) {
+        diagnostic.set_forth_plus_value_origin(producer.origin.clone());
+    }
+    if vocabulary.get("int-to-string").is_some_and(|signature| {
+        signature.input.values == [Type::Int] && signature.output.values == [Type::String]
+    }) {
+        diagnostic.add_supported_forth_int_to_string_hint();
+    }
+    diagnostic
 }
 
 fn merge_suspension_contract(
@@ -3382,6 +3445,68 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(11)]);
+    }
+
+    #[test]
+    fn test_say_mismatch_retains_only_immediate_plus_origin_and_supported_hint() {
+        let source = "3 4 + say";
+        let errors = compile_forth("provenance.forth", source, Vec::new(), &core_vocabulary())
+            .expect_err("integer output from + cannot satisfy say's string input");
+        let diagnostic = errors
+            .first()
+            .expect("say mismatch should return one structured diagnostic");
+        let primary = diagnostic
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("say mismatch should retain its consumer span");
+        let producer = diagnostic
+            .cause
+            .as_deref()
+            .filter(|cause| cause.code == "N-VALUE-ORIGIN-001")
+            .and_then(|cause| cause.primary.as_ref())
+            .and_then(|origin| origin.span.as_ref())
+            .expect("immediately preceding + should be retained as proven provenance");
+        assert!(
+            &source[primary.start_byte..primary.end_byte] == "say"
+                && &source[producer.start_byte..producer.end_byte] == "+"
+                && diagnostic.expected_types == [Type::String]
+                && diagnostic.found_types == [Type::Int],
+            "say mismatch lost its consumer, producer, or typed facts; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.hints,
+            ["convert the integer with `int-to-string` before `say`"],
+            "core vocabulary should author one bounded, supported correction; diagnostic={diagnostic:#?}"
+        );
+
+        let intervening = compile_forth(
+            "intervening.forth",
+            "3 4 + dup say",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("dup leaves an integer for say but breaks immediate + provenance");
+        assert!(
+            intervening[0].cause.is_none(),
+            "an intervening word must clear immediate + provenance; diagnostic={:#?}",
+            intervening[0]
+        );
+
+        let mut without_conversion = core_vocabulary();
+        without_conversion.remove("int-to-string");
+        let unsupported = compile_forth(
+            "unsupported-hint.forth",
+            source,
+            Vec::new(),
+            &without_conversion,
+        )
+        .expect_err("say mismatch remains invalid without a conversion word");
+        assert!(
+            unsupported[0].hints.is_empty(),
+            "frontend suggested an unavailable int-to-string word; diagnostic={:#?}",
+            unsupported[0]
+        );
     }
 
     #[test]
