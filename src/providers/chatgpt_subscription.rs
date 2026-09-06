@@ -899,9 +899,13 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
         bail!("ChatGPT subscription request advertised too many tools");
     }
     let mut names = BTreeSet::new();
+    let mut wire_names = BTreeSet::new();
     let mut functions = Vec::with_capacity(tools.len());
     for tool in tools {
         validate_identifier(&tool.name, 128, "tool name")?;
+        if is_chatgpt_agent_wire_alias(&tool.name) {
+            bail!("ChatGPT subscription request used a reserved wire tool name");
+        }
         validate_bounded_text(
             &tool.description,
             MAX_TOOL_ARGUMENT_BYTES,
@@ -910,9 +914,14 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
         if !names.insert(tool.name.clone()) {
             bail!("ChatGPT subscription request repeated a tool name");
         }
+        let wire_name = chatgpt_wire_tool_name(&tool.name);
+        validate_identifier(wire_name, 128, "ChatGPT wire tool name")?;
+        if !wire_names.insert(wire_name.to_string()) {
+            bail!("ChatGPT subscription request repeated a wire tool name");
+        }
         functions.push(json!({
             "type":"function",
-            "name":tool.name,
+            "name":wire_name,
             "description":tool.description,
             "strict":false,
             "parameters": {
@@ -928,6 +937,46 @@ fn map_tools(tools: &[ToolDefinition]) -> Result<Vec<Value>> {
     } else {
         vec![json!({"type":"namespace","name":"functions","description":"","tools":functions})]
     })
+}
+
+fn chatgpt_wire_tool_name(name: &str) -> &str {
+    match name {
+        "spawn_agent" => "finch_spawn_agent",
+        "await_agent" => "finch_await_agent",
+        "poll_agent" => "finch_poll_agent",
+        "cancel_agent" => "finch_cancel_agent",
+        _ => name,
+    }
+}
+
+fn is_chatgpt_agent_wire_alias(name: &str) -> bool {
+    matches!(
+        name,
+        "finch_spawn_agent" | "finch_await_agent" | "finch_poll_agent" | "finch_cancel_agent"
+    )
+}
+
+fn chatgpt_local_tool_name(name: &str) -> Option<&str> {
+    match name {
+        "finch_spawn_agent" => Some("spawn_agent"),
+        "finch_await_agent" => Some("await_agent"),
+        "finch_poll_agent" => Some("poll_agent"),
+        "finch_cancel_agent" => Some("cancel_agent"),
+        // ChatGPT owns these unprefixed names in its native collaboration
+        // namespace. Finch advertises application-owned aliases instead.
+        "spawn_agent" | "await_agent" | "poll_agent" | "cancel_agent" => None,
+        _ => Some(name),
+    }
+}
+
+fn chatgpt_wire_namespace_is_valid(name: &str, namespace: Option<&str>) -> bool {
+    match namespace {
+        // Responses-Lite may omit the namespace on a returned custom function
+        // call. Omission denotes the request's advertised `functions` group.
+        None | Some("functions") => true,
+        Some("collaboration") => is_chatgpt_agent_wire_alias(name),
+        Some(_) => false,
+    }
 }
 
 fn advertised_tool_names(request: &ProviderRequest) -> HashSet<String> {
@@ -1010,7 +1059,7 @@ fn map_message(
                     .context("Failed to serialize ChatGPT function arguments")?;
                 validate_bounded_text(&arguments, MAX_TOOL_ARGUMENT_BYTES, "tool arguments")?;
                 input.push(json!({
-                    "type":"function_call","call_id":id,"name":name,
+                    "type":"function_call","call_id":id,"name":chatgpt_wire_tool_name(name),
                     "namespace":"functions","arguments":arguments
                 }));
             }
@@ -1872,6 +1921,12 @@ fn canonical_output_item(item: &Value) -> Value {
             }
         }
     }
+    if object.get("type").and_then(Value::as_str) == Some("function_call") {
+        // Validation has already established that omitted `functions` and the
+        // aliased `collaboration` spelling denote the same advertised custom
+        // function. Compare that meaning, not the provider's projection form.
+        object.insert("namespace".to_string(), json!("functions"));
+    }
     canonical
 }
 
@@ -2003,11 +2058,21 @@ fn parse_output_item(
             )?;
             validate_optional_item_fields(object)?;
             let call_id = required_identifier(object, "call_id", 256)?;
-            let name = required_identifier(object, "name", 128)?;
-            if object.get("namespace").and_then(Value::as_str) != Some("functions") {
+            let wire_name = required_identifier(object, "name", 128)?;
+            let namespace = object
+                .get("namespace")
+                .map(|namespace| {
+                    namespace
+                        .as_str()
+                        .context("ChatGPT function call namespace was invalid")
+                })
+                .transpose()?;
+            if !chatgpt_wire_namespace_is_valid(&wire_name, namespace) {
                 bail!("ChatGPT function call namespace was invalid");
             }
-            if !allowed_tools.contains(&name) {
+            let name = chatgpt_local_tool_name(&wire_name)
+                .context("ChatGPT requested a reserved native function name")?;
+            if !allowed_tools.contains(name) {
                 bail!("ChatGPT requested a function Finch did not advertise");
             }
             let arguments = object
@@ -2043,7 +2108,7 @@ fn parse_output_item(
             }
             blocks.push(ContentBlock::ToolUse {
                 id: call_id,
-                name,
+                name: name.to_string(),
                 input,
             });
         }
@@ -2789,6 +2854,89 @@ family = "chatgpt_subscription"
         completed_sse_with_model_provenance(Some(model))
     }
 
+    fn completed_sse_with_function_call(
+        model: &str,
+        wire_name: &str,
+        namespace: Option<&str>,
+    ) -> String {
+        completed_sse(model)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                if event["item"]["type"] != "function_call" {
+                    return line.to_string();
+                }
+                event["item"]["name"] = json!(wire_name);
+                event["item"]["arguments"] = json!("{\"task\":\"say your name\"}");
+                match namespace {
+                    Some(namespace) => event["item"]["namespace"] = json!(namespace),
+                    None => {
+                        event["item"]
+                            .as_object_mut()
+                            .expect("function-call fixture item must be an object")
+                            .remove("namespace");
+                    }
+                }
+                format!("data: {event}\n")
+            })
+            .collect()
+    }
+
+    fn completed_sse_with_function_namespace_projection(
+        model: &str,
+        streamed_namespace: Option<&str>,
+        terminal_namespace: Option<&str>,
+    ) -> String {
+        let mut terminal_call = json!({
+            "type":"function_call",
+            "call_id":"call-2",
+            "name":"finch_spawn_agent",
+            "arguments":"{\"task\":\"say your name\"}"
+        });
+        if let Some(namespace) = terminal_namespace {
+            terminal_call["namespace"] = json!(namespace);
+        }
+        completed_sse_with_function_call(model, "finch_spawn_agent", streamed_namespace)
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .and_then(|data| data.strip_suffix('\n'))
+                else {
+                    return line.to_string();
+                };
+                let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+                    return line.to_string();
+                };
+                if event["type"] != "response.completed" {
+                    return line.to_string();
+                }
+                event["response"]["output"] = json!([
+                    {
+                        "type":"reasoning",
+                        "summary":[],
+                        "encrypted_content":"opaque-1"
+                    },
+                    {
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"hello"}]
+                    },
+                    terminal_call
+                ]);
+                format!("data: {event}\n")
+            })
+            .collect()
+    }
+
     fn completed_sse_with_audited_passive_fields(model: &str) -> String {
         let mut response = json!({
             "id":"resp-passive-fields",
@@ -3106,6 +3254,254 @@ family = "chatgpt_subscription"
         }
     }
 
+    fn named_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("Run {name}"),
+            input_schema: ToolInputSchema {
+                schema_type: "object".to_string(),
+                properties: json!({"task":{"type":"string"}}),
+                required: vec!["task".to_string()],
+            },
+        }
+    }
+
+    async fn run_function_call_boundary(
+        wire_name: &str,
+        namespace: Option<&str>,
+        advertise_spawn_agent: bool,
+        response_body: Option<String>,
+    ) -> (
+        Result<ProviderResponse, String>,
+        Vec<Result<StreamChunk, String>>,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let models = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "client_version".into(),
+                CHATGPT_CATALOG_CLIENT_VERSION.into(),
+            ))
+            .with_status(200)
+            .with_body(catalog_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let inference = server
+            .mock("POST", RESPONSES_PATH)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_header("openai-model", DEFAULT_MODEL)
+            .with_body(response_body.unwrap_or_else(|| {
+                completed_sse_with_function_call(DEFAULT_MODEL, wire_name, namespace)
+            }))
+            .expect(2)
+            .create_async()
+            .await;
+        let provider = ChatGptSubscriptionProvider::for_test(
+            Arc::new(StaticSource::new()),
+            &format!("{}/backend-api/codex", server.url()),
+            DEFAULT_MODEL,
+        )
+        .expect("function-call fixture must construct a provider");
+        let tools = if advertise_spawn_agent {
+            vec![named_tool("spawn_agent"), tool()]
+        } else {
+            vec![tool()]
+        };
+        let request = ProviderRequest::new(vec![Message::user("delegate")]).with_tools(tools);
+
+        let (buffered, streaming) = tokio::join!(
+            provider.send_message(&request),
+            provider.send_message_stream(&request)
+        );
+
+        models.assert_async().await;
+        inference.assert_async().await;
+        let buffered = buffered.map_err(|error| error.to_string());
+        let mut receiver = streaming.expect("stream setup must consume the function-call fixture");
+        let mut outcome = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            outcome.push(chunk.map_err(|error| error.to_string()));
+        }
+        (buffered, outcome)
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_bind_chatgpt_collaboration_function_calls() {
+        for namespace in [None, Some("functions"), Some("collaboration")] {
+            let (buffered, streaming) =
+                run_function_call_boundary("finch_spawn_agent", namespace, true, None).await;
+            let buffered = buffered.unwrap_or_else(|error| {
+                panic!(
+                    "advertised collaboration function failed at the buffered boundary for \
+                     namespace {namespace:?}: {error}"
+                )
+            });
+            assert!(
+                buffered.content.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolUse { id, name, input }
+                        if id == "call-2"
+                            && name == "spawn_agent"
+                            && input == &json!({"task":"say your name"})
+                )),
+                "buffered collaboration function was not rebound to the advertised local tool; \
+                 namespace={namespace:?}, response={buffered:?}"
+            );
+            assert!(
+                streaming.iter().any(|chunk| matches!(
+                    chunk,
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                    })) if id == "call-2"
+                        && name == "spawn_agent"
+                        && input == &json!({"task":"say your name"})
+                )),
+                "streaming collaboration function was not rebound to the advertised local tool; \
+                 namespace={namespace:?}, outcome={streaming:?}"
+            );
+            assert!(
+                streaming.iter().all(Result::is_ok),
+                "accepted collaboration function emitted a stream error; namespace={namespace:?}, \
+                 outcome={streaming:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_terminal_reconciliation_accepts_equivalent_function_namespaces() {
+        for (streamed_namespace, terminal_namespace) in [
+            (None, Some("functions")),
+            (Some("functions"), None),
+            (Some("collaboration"), Some("functions")),
+            (Some("functions"), Some("collaboration")),
+        ] {
+            let response_body = completed_sse_with_function_namespace_projection(
+                DEFAULT_MODEL,
+                streamed_namespace,
+                terminal_namespace,
+            );
+            let (buffered, streaming) = run_function_call_boundary(
+                "finch_spawn_agent",
+                streamed_namespace,
+                true,
+                Some(response_body),
+            )
+            .await;
+            let buffered = buffered.unwrap_or_else(|error| {
+                panic!(
+                    "equivalent streamed and terminal function namespaces failed buffered \
+                     reconciliation; streamed={streamed_namespace:?}, \
+                     terminal={terminal_namespace:?}, error={error}"
+                )
+            });
+            assert!(
+                buffered.content.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolUse { id, name, input }
+                        if id == "call-2"
+                            && name == "spawn_agent"
+                            && input == &json!({"task":"say your name"})
+                )),
+                "equivalent namespace reconciliation changed buffered tool semantics; \
+                 streamed={streamed_namespace:?}, terminal={terminal_namespace:?}, \
+                 response={buffered:?}"
+            );
+            assert!(
+                streaming.iter().all(Result::is_ok),
+                "equivalent namespace reconciliation emitted a streaming error; \
+                 streamed={streamed_namespace:?}, terminal={terminal_namespace:?}, \
+                 outcome={streaming:?}"
+            );
+            assert!(
+                streaming.iter().any(|chunk| matches!(
+                    chunk,
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                    })) if id == "call-2"
+                        && name == "spawn_agent"
+                        && input == &json!({"task":"say your name"})
+                )),
+                "equivalent namespace reconciliation did not complete the local tool call; \
+                 streamed={streamed_namespace:?}, terminal={terminal_namespace:?}, \
+                 outcome={streaming:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffered_and_streaming_reject_invalid_chatgpt_function_namespaces() {
+        for (wire_name, namespace, advertise_spawn_agent, expected_error) in [
+            (
+                "finch_spawn_agent",
+                Some("other"),
+                true,
+                "ChatGPT function call namespace was invalid",
+            ),
+            (
+                "spawn_agent",
+                Some("functions"),
+                true,
+                "ChatGPT requested a reserved native function name",
+            ),
+            (
+                "read",
+                Some("collaboration"),
+                true,
+                "ChatGPT function call namespace was invalid",
+            ),
+            (
+                "finch_spawn_agent",
+                Some("functions"),
+                false,
+                "ChatGPT requested a function Finch did not advertise",
+            ),
+        ] {
+            let (buffered, streaming) =
+                run_function_call_boundary(wire_name, namespace, advertise_spawn_agent, None).await;
+            let buffered_error = buffered.expect_err(
+                "invalid ChatGPT function namespace unexpectedly crossed the buffered boundary",
+            );
+            assert!(
+                buffered_error.contains(expected_error),
+                "buffered invalid function call returned the wrong diagnostic; wire_name={wire_name}, \
+                 namespace={namespace:?}, expected={expected_error:?}, actual={buffered_error:?}"
+            );
+            let stream_errors = streaming
+                .iter()
+                .filter_map(|chunk| chunk.as_ref().err())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                stream_errors.len(),
+                1,
+                "invalid function call did not terminate with exactly one streaming error; \
+                 wire_name={wire_name}, namespace={namespace:?}, outcome={streaming:?}"
+            );
+            assert!(
+                stream_errors[0].contains(expected_error),
+                "streaming invalid function call returned the wrong diagnostic; \
+                 wire_name={wire_name}, namespace={namespace:?}, expected={expected_error:?}, \
+                 actual={stream_errors:?}"
+            );
+            assert!(
+                streaming.iter().all(|chunk| !matches!(
+                    chunk,
+                    Ok(StreamChunk::ResponseMetadata { .. }
+                        | StreamChunk::Usage { .. }
+                        | StreamChunk::Allowance { .. }
+                        | StreamChunk::ContentBlockComplete(_))
+                )),
+                "invalid function call published terminal state or completed content; \
+                 wire_name={wire_name}, namespace={namespace:?}, outcome={streaming:?}"
+            );
+        }
+    }
+
     async fn stalling_subscription_server(
         send_stream_headers: bool,
     ) -> (String, tokio::sync::oneshot::Receiver<()>) {
@@ -3305,6 +3701,84 @@ family = "chatgpt_subscription"
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("prompt_cache_key").is_none());
         assert!(body.get("client_metadata").is_none());
+    }
+
+    #[test]
+    fn collaboration_tools_use_reserved_wire_aliases_and_replay_symmetrically() {
+        let request = ProviderRequest::new(vec![
+            Message::user("delegate"),
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call-agent".to_string(),
+                    name: "spawn_agent".to_string(),
+                    input: json!({"task":"say your name"}),
+                }],
+            ),
+        ])
+        .with_model(DEFAULT_MODEL)
+        .with_tools(vec![named_tool("spawn_agent"), tool()]);
+        let body = responses_lite_request(&request, ReasoningEffort::High)
+            .expect("advertised collaboration tool should map to a safe wire alias");
+        let tools = body["input"][0]["tools"][0]["tools"]
+            .as_array()
+            .expect("additional-tools item should contain a function array");
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["name"] == "finch_spawn_agent")
+                .count(),
+            1,
+            "spawn_agent was not advertised exactly once under its reserved Finch wire alias; \
+             tools={tools:?}"
+        );
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "read"),
+            "ordinary tools should retain their local name on the wire; tools={tools:?}"
+        );
+        let replay = body["input"]
+            .as_array()
+            .expect("request input should be an array")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("assistant tool history should produce a function-call replay item");
+        assert_eq!(
+            replay["name"], "finch_spawn_agent",
+            "collaboration tool history did not replay with the advertised wire alias; replay={replay:?}"
+        );
+        assert_eq!(
+            replay["namespace"], "functions",
+            "collaboration tool history did not replay in the advertised functions namespace; replay={replay:?}"
+        );
+
+        let collision = ProviderRequest::new(vec![Message::user("delegate")])
+            .with_model(DEFAULT_MODEL)
+            .with_tools(vec![named_tool("finch_spawn_agent")]);
+        let error = responses_lite_request(&collision, ReasoningEffort::High)
+            .expect_err("a local tool must not claim Finch's reserved collaboration wire alias");
+        assert!(
+            error.to_string().contains("reserved wire tool name"),
+            "reserved wire alias collision returned the wrong diagnostic: {error:#}"
+        );
+
+        let malformed_namespace = parse_output_item(
+            &json!({
+                "type":"function_call",
+                "call_id":"malformed-namespace",
+                "name":"read",
+                "namespace":false,
+                "arguments":"{\"path\":\"README.md\"}"
+            }),
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &HashSet::from(["read".to_string()]),
+        )
+        .expect_err("a non-string function namespace must be rejected");
+        assert_eq!(
+            malformed_namespace.to_string(),
+            "ChatGPT function call namespace was invalid",
+            "malformed function namespace returned the wrong diagnostic"
+        );
     }
 
     #[test]
@@ -5973,11 +6447,7 @@ family = "chatgpt_subscription"
         assert!(sse_data(b"future: attacker-secret").is_err());
     }
 
-    /// Opt-in live acceptance uses Finch's own named device credential. It is
-    /// ignored by default and intentionally never prints tokens or bodies.
-    #[tokio::test]
-    #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
-    async fn live_chatgpt_subscription_acceptance_is_explicitly_opt_in() -> Result<()> {
+    fn live_chatgpt_subscription_provider() -> Result<ChatGptSubscriptionProvider> {
         if std::env::var("FINCH_LIVE_CHATGPT_ACCEPTANCE").as_deref() != Ok("1") {
             bail!("Set FINCH_LIVE_CHATGPT_ACCEPTANCE=1 after security review");
         }
@@ -6006,12 +6476,20 @@ family = "chatgpt_subscription"
             .context("Finch ChatGPT subscription profile references a missing credential")?;
         let oauth_root = std::env::var_os("FINCH_LIVE_CHATGPT_OAUTH_ROOT")
             .context("Set FINCH_LIVE_CHATGPT_OAUTH_ROOT to Finch's oauth directory")?;
-        let provider = ChatGptSubscriptionProvider::production_in_oauth_root(
+        ChatGptSubscriptionProvider::production_in_oauth_root(
             credential,
             configured_model,
             configured_reasoning,
             oauth_root,
-        )?;
+        )
+    }
+
+    /// Opt-in live acceptance uses Finch's own named device credential. It is
+    /// ignored by default and intentionally never prints tokens or bodies.
+    #[tokio::test]
+    #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
+    async fn live_chatgpt_subscription_acceptance_is_explicitly_opt_in() -> Result<()> {
+        let provider = live_chatgpt_subscription_provider()?;
         const EXPECTED_TEXT: &str = "Finch native subscription transport accepted";
         let response = provider
             .send_message(&ProviderRequest::new(vec![Message::user(format!(
@@ -6023,6 +6501,51 @@ family = "chatgpt_subscription"
         }
         if response.text().trim() != EXPECTED_TEXT {
             bail!("Live ChatGPT subscription acceptance returned unexpected text");
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+
+    /// Opt-in live acceptance for Finch's collaboration-tool wire binding.
+    /// The provider parses the call but intentionally does not execute it.
+    #[tokio::test]
+    #[ignore = "requires FINCH_LIVE_CHATGPT_ACCEPTANCE=1 and reviewed Finch device login"]
+    async fn live_chatgpt_subscription_collaboration_tool_is_explicitly_opt_in() -> Result<()> {
+        let provider = live_chatgpt_subscription_provider()?;
+        let request = ProviderRequest::new(vec![Message::user(
+            "Call the spawn_agent function exactly once with task exactly `say your name`. Do not answer in text.",
+        )])
+        .with_tools(vec![named_tool("spawn_agent")]);
+        let response = provider.send_message(&request).await?;
+        if response.model.trim().is_empty() {
+            bail!("Live ChatGPT collaboration-tool acceptance returned incompatible provenance");
+        }
+        let calls = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if calls.len() != 1 {
+            bail!(
+                "Live ChatGPT collaboration-tool acceptance returned an unexpected call count: actual_count={}",
+                calls.len()
+            );
+        }
+        let (id, name, input) = calls[0];
+        let id_present = !id.trim().is_empty();
+        let local_name_matched = name == "spawn_agent";
+        let arguments_matched = input == &json!({"task":"say your name"});
+        if !id_present || !local_name_matched || !arguments_matched {
+            bail!(
+                "Live ChatGPT collaboration-tool acceptance returned an incompatible call: \
+                 id_present={id_present}, local_name_matched={local_name_matched}, \
+                 arguments_matched={arguments_matched}"
+            );
+        }
+        if !response.text().trim().is_empty() {
+            bail!("Live ChatGPT collaboration-tool acceptance returned unexpected text");
         }
         Ok::<(), anyhow::Error>(())
     }
