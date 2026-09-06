@@ -194,14 +194,16 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 # rewrites source mtimes/Cargo fingerprints, even if interrupted.
 phase=launcher-rebuilds-stale-cached-supervisor
 launcher_target="$scratch/stale-supervisor-target"
-launcher_built="$launcher_target/debug/finch-test-supervisor"
-launcher_pinned="$launcher_target/debug/finch-test-supervisor-pinned"
+launcher_host_target="$(rustc -vV | sed -n 's/^host: //p')"
+launcher_profile="$launcher_target/$launcher_host_target/debug"
+launcher_built="$launcher_profile/finch-test-supervisor"
+launcher_pinned="$launcher_profile/finch-test-supervisor-pinned"
 launcher_fake_bin="$scratch/launcher-fake-bin"
 fresh_supervisor_source="$(dirname "$supervisor")/finch-test-supervisor"
 stale_supervisor_ran="$scratch/stale-supervisor-ran"
 stale_launcher_diagnostic="$scratch/stale-launcher-diagnostic"
 observed_stale_launcher="$scratch/stale-launcher-observed"
-mkdir -p "$launcher_target/debug" "$launcher_fake_bin"
+mkdir -p "$launcher_profile" "$launcher_fake_bin"
 [[ -x "$fresh_supervisor_source" ]] || {
   echo "fresh supervisor source is not executable: $fresh_supervisor_source" >&2
   exit 1
@@ -211,16 +213,16 @@ printf '%s\n' '#!/usr/bin/env bash' \
   'case "$1" in' \
   '  metadata) printf '\''{"target_directory":"%s"}\n'\'' "$FINCH_LAUNCHER_TARGET" ;;' \
   '  build)' \
-  '    [[ "$#" -eq 7 && "$2" == --quiet && "$3" == --target-dir && "$4" == "$FINCH_LAUNCHER_TARGET" && "$5" == --bin && "$6" == finch-test-supervisor && "$7" == --message-format=json-render-diagnostics ]] || {' \
+  '    [[ "$#" -eq 9 && "$2" == --quiet && "$3" == --target-dir && "$4" == "$FINCH_LAUNCHER_TARGET" && "$5" == --target && "$6" == "$FINCH_LAUNCHER_HOST_TARGET" && "$7" == --bin && "$8" == finch-test-supervisor && "$9" == --message-format=json-render-diagnostics ]] || {' \
   '      printf "unexpected Cargo supervisor build arguments:" >&2; printf " <%s>" "$@" >&2; printf "\n" >&2; exit 64;' \
   '    }' \
-  '    staging="$FINCH_LAUNCHER_TARGET/debug/.fake-cargo-supervisor.$$"' \
+  '    profile="$FINCH_LAUNCHER_TARGET/$FINCH_LAUNCHER_HOST_TARGET/debug"' \
+  '    staging="$profile/.fake-cargo-supervisor.$$"' \
   '    trap '\''rm -f "$staging"'\'' EXIT' \
   '    install -m 0755 "$FINCH_FRESH_SUPERVISOR_SOURCE" "$staging"' \
-  '    mv -f "$staging" "$FINCH_LAUNCHER_TARGET/debug/finch-test-supervisor"' \
+  '    mv -f "$staging" "$profile/finch-test-supervisor"' \
   '    trap - EXIT' \
-  '    printf '\''{"reason":"compiler-artifact","target":{"name":"finch-test-supervisor","kind":["bin"]},"executable":"%s"}\n'\'' "$FINCH_LAUNCHER_TARGET/debug/finch-test-supervisor"' \
-  '    printf '\''{"reason":"compiler-artifact","target":{"name":"finch-test-supervisor","kind":["bin"]},"executable":"%s"}\n'\'' "$FINCH_LAUNCHER_TARGET/debug/finch-test-supervisor"' \
+  '    printf '\''{"reason":"compiler-artifact","target":{"name":"finch-test-supervisor","kind":["bin"]},"executable":"%s"}\n'\'' "$profile/finch-test-supervisor"' \
   '    ;;' \
   '  *) echo "unexpected Cargo command: $1" >&2; exit 64 ;;' \
   'esac' \
@@ -236,6 +238,7 @@ env -u FINCH_TEST_SUPERVISOR_BIN \
   PATH="$launcher_fake_bin:$PATH" \
   FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
   FINCH_LAUNCHER_TARGET="$launcher_target" \
+  FINCH_LAUNCHER_HOST_TARGET="$launcher_host_target" \
   FINCH_FRESH_SUPERVISOR_SOURCE="$fresh_supervisor_source" \
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
   FINCH_STALE_SUPERVISOR_RAN="$stale_supervisor_ran" FINCH_LAUNCHER_OBSERVED="$observed_stale_launcher" \
@@ -254,7 +257,7 @@ if [[ -e "$stale_supervisor_ran" ]]; then
 fi
 observed_supervisor="$(cat "$observed_stale_launcher" 2>/dev/null || true)"
 case "$observed_supervisor" in
-  "$launcher_target/debug/finch-test-supervisor-pinned-sha256-"*) ;;
+  "$launcher_profile/finch-test-supervisor-pinned-sha256-"*) ;;
   *)
     echo "maintained launcher did not execute an isolated content-addressed supervisor; observed ${observed_supervisor:-<none>}" >&2
     exit 1
@@ -290,7 +293,7 @@ actual_observed_digest="$(shasum -a 256 "$observed_supervisor" | awk '{print $1}
 if [[ "$false_supervisor_digest" == "$actual_observed_digest" ]]; then
   false_supervisor_digest="$(printf '%s-different' "$scratch" | shasum -a 256 | awk '{print $1}')"
 fi
-wrong_digest_supervisor="$launcher_target/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
+wrong_digest_supervisor="$launcher_profile/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
 install -m 0555 "$observed_supervisor" "$wrong_digest_supervisor"
 phase=rust-rejects-wrong-content-addressed-supervisor-name
 rust_wrong_digest_diagnostic="$scratch/rust-wrong-digest-diagnostic"
@@ -351,6 +354,7 @@ run_concurrent_launcher() {
     PATH="$launcher_fake_bin:$PATH" \
     FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
     FINCH_LAUNCHER_TARGET="$launcher_target" \
+    FINCH_LAUNCHER_HOST_TARGET="$launcher_host_target" \
     FINCH_FRESH_SUPERVISOR_SOURCE="$fresh_supervisor_source" \
     FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
     FINCH_PIN_RESULT="$result_file" "$repo_root/scripts/test_brains.sh" bash -c '

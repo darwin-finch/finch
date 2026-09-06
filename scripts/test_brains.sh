@@ -81,13 +81,41 @@ brain_test_resolve_target_dir() {
 }
 
 brain_test_build_and_pin_supervisor() {
-  local cargo_target_dir="$1" build_messages built_supervisor publication_dir
-  local staging built_digest pinned_supervisor
+  local cargo_target_dir="$1" build_messages built_supervisor canonical_publication_dir canonical_supervisor
+  local host_target publication_dir profile_dir staging staging_quoted built_digest pinned_supervisor
+
+  host_target="$(rustc -vV | sed -n 's/^host: //p')" || {
+    echo 'could not determine the host target for the Brain test supervisor' >&2
+    return 74
+  }
+  [[ "$host_target" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "rustc reported an invalid host target for the Brain test supervisor: ${host_target:-<empty>}" >&2
+    return 74
+  }
+  profile_dir="$cargo_target_dir/$host_target/debug"
+  for publication_dir in "$cargo_target_dir/$host_target" "$profile_dir"; do
+    if [[ -L "$publication_dir" ]]; then
+      echo "Brain test supervisor publication directory must not be a symlink: $publication_dir" >&2
+      return 74
+    fi
+    if [[ ! -e "$publication_dir" ]]; then
+      if ! (umask 077 && mkdir "$publication_dir") 2>/dev/null && \
+        [[ ! -d "$publication_dir" || -L "$publication_dir" ]]; then
+        echo "Brain test supervisor publication directory could not be privately claimed: $publication_dir" >&2
+        return 74
+      fi
+    fi
+    [[ -d "$publication_dir" && ! -L "$publication_dir" ]] || {
+      echo "Brain test supervisor publication path must be a non-symlink directory: $publication_dir" >&2
+      return 74
+    }
+    brain_isolation_require_private_path "$publication_dir" strict
+  done
 
   build_messages="$(
     umask 077
-    cargo build --quiet --target-dir "$cargo_target_dir" --bin finch-test-supervisor \
-      --message-format=json-render-diagnostics
+    env -u CARGO_BUILD_TARGET cargo build --quiet --target-dir "$cargo_target_dir" \
+      --target "$host_target" --bin finch-test-supervisor --message-format=json-render-diagnostics
   )" || {
     echo "Cargo failed to build the Brain test supervisor in $cargo_target_dir" >&2
     return 74
@@ -111,11 +139,21 @@ brain_test_build_and_pin_supervisor() {
       return 74
       ;;
   esac
+  canonical_publication_dir="$(cd "$(dirname "$built_supervisor")" 2>/dev/null && pwd -P)" || {
+    echo "Cargo-reported Brain test supervisor path could not be canonicalized: $built_supervisor" >&2
+    return 74
+  }
+  canonical_supervisor="$canonical_publication_dir/$(basename "$built_supervisor")"
+  [[ "$canonical_supervisor" == "$built_supervisor" && \
+    "$canonical_supervisor" == "$profile_dir/finch-test-supervisor" ]] || {
+    echo "Cargo reported the Brain test supervisor outside its canonical host profile: expected=$profile_dir/finch-test-supervisor actual=$built_supervisor canonical=$canonical_supervisor" >&2
+    return 74
+  }
   [[ -f "$built_supervisor" && ! -L "$built_supervisor" ]] || {
     echo "Cargo did not produce a regular, non-symlink supervisor image: $built_supervisor" >&2
     return 74
   }
-  publication_dir="$(dirname "$built_supervisor")"
+  publication_dir="$(dirname "$canonical_supervisor")"
   [[ "$(basename "$publication_dir")" == debug && ! -L "$publication_dir" ]] || {
     echo "Cargo reported the Brain test supervisor outside a non-symlink debug profile: $built_supervisor" >&2
     return 74
@@ -123,11 +161,30 @@ brain_test_build_and_pin_supervisor() {
   brain_isolation_require_private_path "$publication_dir" strict
   brain_isolation_require_private_path "$built_supervisor" strict
 
+  if [[ -n "${FINCH_TEST_SUPERVISOR_BUILD_READY_FILE:-}" || \
+    -n "${FINCH_TEST_SUPERVISOR_BUILD_CONTINUE_FILE:-}" ]]; then
+    if [[ -z "${FINCH_TEST_SUPERVISOR_BUILD_READY_FILE:-}" || \
+      -z "${FINCH_TEST_SUPERVISOR_BUILD_CONTINUE_FILE:-}" ]]; then
+      echo 'supervisor post-build probe requires ready and continuation files' >&2
+      return 64
+    fi
+    : >"$FINCH_TEST_SUPERVISOR_BUILD_READY_FILE"
+    for _ in {1..1000}; do
+      [[ -e "$FINCH_TEST_SUPERVISOR_BUILD_CONTINUE_FILE" ]] && break
+      sleep 0.01
+    done
+    if [[ ! -e "$FINCH_TEST_SUPERVISOR_BUILD_CONTINUE_FILE" ]]; then
+      echo "supervisor post-build probe timed out before pinning $built_supervisor" >&2
+      return 70
+    fi
+  fi
+
   # Prepare a private complete copy before naming or publishing it. The build
   # lock remains held until publication, so another worktree cannot replace
   # the shared Cargo artifact between Cargo's freshness decision and this copy.
   staging="$publication_dir/.finch-test-supervisor-staging.$$"
-  trap 'rm -f "$staging"' EXIT
+  printf -v staging_quoted '%q' "$staging"
+  trap "rm -f -- $staging_quoted" EXIT
   install -m 0755 "$built_supervisor" "$staging"
   if [[ "$(uname -s)" == Linux ]]; then
     strip "$staging"
@@ -197,23 +254,17 @@ brain_test_build_with_lock() {
   esac
 }
 
+# The lock holder sources this file only to call the build-and-pin function.
+# Sourcing must never enter the public launcher or consume its requested argv.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 if [[ "$#" -eq 0 ]]; then
   set -- cargo test --lib
 fi
 
 cd "$repo_root"
-
-if [[ -n "${FINCH_TEST_SUPERVISOR_INTERNAL_TARGET:-}" ]]; then
-  internal_target="$FINCH_TEST_SUPERVISOR_INTERNAL_TARGET"
-  [[ "$internal_target" == "${CARGO_TARGET_DIR:-}" && \
-    "$(cd "$internal_target" 2>/dev/null && pwd -P)" == "$internal_target" ]] || {
-    echo "invalid internal Brain test supervisor target: $internal_target" >&2
-    exit 64
-  }
-  brain_isolation_require_private_path "$internal_target" strict
-  brain_test_build_and_pin_supervisor "$internal_target"
-  exit
-fi
 
 # Pin the supervisor image before running anything under it.
 #
@@ -266,6 +317,23 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
         exit 74
       }
       cargo_target_next="$cargo_target_current/$cargo_target_component"
+      if [[ -n "${FINCH_TEST_TARGET_COMPONENT_READY_DIR:-}" || \
+        -n "${FINCH_TEST_TARGET_COMPONENT_CONTINUE_FILE:-}" ]]; then
+        if [[ ! -d "${FINCH_TEST_TARGET_COMPONENT_READY_DIR:-}" || \
+          -z "${FINCH_TEST_TARGET_COMPONENT_CONTINUE_FILE:-}" ]]; then
+          echo 'target-component creation probe requires a ready directory and continuation file' >&2
+          exit 64
+        fi
+        printf '%s\n' "$cargo_target_next" >"$FINCH_TEST_TARGET_COMPONENT_READY_DIR/$$"
+        for _ in {1..1000}; do
+          [[ -e "$FINCH_TEST_TARGET_COMPONENT_CONTINUE_FILE" ]] && break
+          sleep 0.01
+        done
+        if [[ ! -e "$FINCH_TEST_TARGET_COMPONENT_CONTINUE_FILE" ]]; then
+          echo "target-component creation probe timed out before claiming $cargo_target_next" >&2
+          exit 70
+        fi
+      fi
       if ! (umask 077 && mkdir "$cargo_target_next") 2>/dev/null; then
         if [[ ! -d "$cargo_target_next" || -L "$cargo_target_next" ]]; then
           echo "Brain test supervisor target component could not be privately claimed: $cargo_target_next" >&2
@@ -283,22 +351,11 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
   }
   cargo_target_dir="$(cd "$cargo_target_dir" && pwd -P)"
   brain_isolation_require_private_path "$cargo_target_dir" strict
-  if [[ -L "$cargo_target_dir/debug" ]]; then
-    echo "Brain test supervisor publication directory must not be a symlink: $cargo_target_dir/debug" >&2
-    exit 74
-  fi
-  if [[ -e "$cargo_target_dir/debug" ]]; then
-    [[ -d "$cargo_target_dir/debug" ]] || {
-      echo "Brain test supervisor publication path must be a directory: $cargo_target_dir/debug" >&2
-      exit 74
-    }
-    brain_isolation_require_private_path "$cargo_target_dir/debug" strict
-  fi
   export CARGO_TARGET_DIR="$cargo_target_dir"
   supervisor="$(brain_test_build_with_lock "$cargo_target_dir" \
     env CARGO_TARGET_DIR="$cargo_target_dir" \
-      FINCH_TEST_SUPERVISOR_INTERNAL_TARGET="$cargo_target_dir" \
-      "$repo_root/scripts/test_brains.sh")" || {
+      /bin/bash -c 'set -euo pipefail; source "$1"; brain_test_build_and_pin_supervisor "$2"' \
+      finch-test-supervisor-build "$repo_root/scripts/test_brains.sh" "$cargo_target_dir")" || {
     echo "failed to build and pin the Brain test supervisor in $cargo_target_dir" >&2
     exit 74
   }
