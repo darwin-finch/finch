@@ -5,6 +5,81 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/brain_test_isolation.sh
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
 
+brain_test_require_private_lexical_path() {
+  perl -MFcntl=:mode -e '
+    use strict;
+    use warnings;
+    my ($input) = @ARGV;
+    die "Brain test supervisor target must be absolute before lexical validation: $input\n"
+      unless $input =~ m{^/};
+    my @pending = grep { $_ ne "" } split m{/+}, $input;
+    my $euid = $<;
+    my $path = "/";
+    my $symlink_count = 0;
+    while (@pending) {
+      my $part = shift @pending;
+      next if $part eq ".";
+      if ($part eq "..") {
+        $path =~ s{/+$}{};
+        $path =~ s{/[^/]+$}{};
+        $path = "/" if $path eq "";
+        next;
+      }
+      my $next = $path eq "/" ? "/$part" : "$path/$part";
+      my @metadata = lstat($next);
+      last unless @metadata;
+      my $owner = $metadata[4];
+      my $mode = $metadata[2] & 07777;
+      my $symlink = S_ISLNK($metadata[2]);
+      my $sticky_directory = S_ISDIR($metadata[2]) && ($mode & 01000);
+      my $wrong_owner = $owner != 0 && $owner != $euid;
+      my $unsafe_write = !$symlink && ($mode & 0022) && !$sticky_directory;
+      if ($wrong_owner || $unsafe_write) {
+        printf STDERR "Brain test supervisor target is not private: path=%s owner=%d mode=%04o expected_owner=%d\n",
+          $next, $owner, $mode, $euid;
+        exit 1;
+      }
+      if ($symlink) {
+        die "Brain test supervisor target has too many symlink expansions: $next\n"
+          if ++$symlink_count > 40;
+        my $target = readlink($next);
+        die "Brain test supervisor target symlink could not be read: $next\n"
+          unless defined $target;
+        my @target_parts = grep { $_ ne "" } split m{/+}, $target;
+        $path = "/" if $target =~ m{^/};
+        unshift @pending, @target_parts;
+      } else {
+        $path = $next;
+      }
+    }
+  ' "$1"
+}
+
+brain_test_resolve_target_dir() {
+  local metadata target_override="${FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR:-}"
+  if [[ -n "$target_override" ]]; then
+    metadata="$(CARGO_TARGET_DIR="$target_override" cargo metadata --format-version 1 --no-deps)" || {
+      echo "could not resolve the explicit Brain test supervisor target with Cargo metadata: $target_override" >&2
+      return 74
+    }
+  else
+    metadata="$(cargo metadata --format-version 1 --no-deps)" || {
+      echo 'could not resolve Cargo effective target directory for the Brain test supervisor' >&2
+      return 74
+    }
+  fi
+  printf '%s' "$metadata" | perl -MJSON::PP -0777 -e '
+    use strict;
+    use warnings;
+    my $metadata = eval { decode_json(<STDIN>) };
+    die "Cargo metadata was not valid JSON: $@" unless defined $metadata;
+    my $target = $metadata->{target_directory};
+    die "Cargo metadata did not report an absolute target_directory\n"
+      unless defined($target) && $target =~ m{^/};
+    print "$target\n";
+  '
+}
+
 if [[ "$#" -eq 0 ]]; then
   set -- cargo test --lib
 fi
@@ -37,14 +112,70 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
   # checkout's supervisor. In particular, that stale image can predate proof
   # fields or other authority fixes. Never fall back to it when the current
   # supervisor does not build; fail before granting test authority instead.
-  # The private target override exists only so the maintained regression can
-  # seed a hostile cache without mutating the shared workspace target. Normal
-  # callers, including callers that set Cargo's own target variable for the
-  # command being supervised, retain the repository's attested target root.
-  cargo_target_dir="${FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR:-$repo_root/target}"
-  cargo build --quiet --target-dir "$cargo_target_dir" --bin finch-test-supervisor
+  # Ask Cargo for its effective target directory so environment variables and
+  # user/workspace configuration are interpreted with Cargo's own precedence
+  # and relative-path rules. The private override remains available to the
+  # maintained stale-cache regression and takes precedence when supplied.
+  cargo_target_dir="$(brain_test_resolve_target_dir)"
+  brain_test_require_private_lexical_path "$cargo_target_dir"
+  if [[ ! -e "$cargo_target_dir" ]]; then
+    cargo_target_parent="$cargo_target_dir"
+    while [[ ! -e "$cargo_target_parent" ]]; do
+      next_parent="$(dirname "$cargo_target_parent")"
+      [[ "$next_parent" != "$cargo_target_parent" ]] || break
+      cargo_target_parent="$next_parent"
+    done
+    brain_isolation_require_private_path "$cargo_target_parent"
+    cargo_target_current="$(cd "$cargo_target_parent" && pwd -P)"
+    cargo_target_missing="${cargo_target_dir#"$cargo_target_parent"}"
+    cargo_target_missing="${cargo_target_missing#/}"
+    IFS='/' read -r -a cargo_target_components <<<"$cargo_target_missing"
+    for cargo_target_component in "${cargo_target_components[@]}"; do
+      [[ -n "$cargo_target_component" && "$cargo_target_component" != . ]] || continue
+      [[ "$cargo_target_component" != .. ]] || {
+        echo "Cargo metadata returned an unresolved parent component: $cargo_target_dir" >&2
+        exit 74
+      }
+      cargo_target_next="$cargo_target_current/$cargo_target_component"
+      if ! (umask 077 && mkdir "$cargo_target_next") 2>/dev/null; then
+        echo "Brain test supervisor target component could not be privately claimed: $cargo_target_next" >&2
+        exit 74
+      fi
+      brain_isolation_require_private_path "$cargo_target_next" strict
+      cargo_target_current="$(cd "$cargo_target_next" && pwd -P)"
+    done
+    cargo_target_dir="$cargo_target_current"
+  fi
+  [[ -d "$cargo_target_dir" && ! -L "$cargo_target_dir" ]] || {
+    echo "Brain test supervisor target must be a non-symlink directory: $cargo_target_dir" >&2
+    exit 74
+  }
   cargo_target_dir="$(cd "$cargo_target_dir" && pwd -P)"
+  brain_isolation_require_private_path "$cargo_target_dir" strict
+  if [[ -L "$cargo_target_dir/debug" ]]; then
+    echo "Brain test supervisor publication directory must not be a symlink: $cargo_target_dir/debug" >&2
+    exit 74
+  fi
+  if [[ -e "$cargo_target_dir/debug" ]]; then
+    [[ -d "$cargo_target_dir/debug" ]] || {
+      echo "Brain test supervisor publication path must be a directory: $cargo_target_dir/debug" >&2
+      exit 74
+    }
+    brain_isolation_require_private_path "$cargo_target_dir/debug" strict
+  fi
+  export CARGO_TARGET_DIR="$cargo_target_dir"
+  (umask 077 && cargo build --quiet --target-dir "$cargo_target_dir" --bin finch-test-supervisor)
+  [[ -d "$cargo_target_dir/debug" && ! -L "$cargo_target_dir/debug" ]] || {
+    echo "Cargo did not produce a non-symlink debug directory: $cargo_target_dir/debug" >&2
+    exit 74
+  }
+  brain_isolation_require_private_path "$cargo_target_dir/debug" strict
   built_supervisor="$cargo_target_dir/debug/finch-test-supervisor"
+  [[ -f "$built_supervisor" && ! -L "$built_supervisor" ]] || {
+    echo "Cargo did not produce a regular, non-symlink supervisor image: $built_supervisor" >&2
+    exit 74
+  }
+  brain_isolation_require_private_path "$built_supervisor" strict
 
   # Prepare a private complete copy before naming or publishing it. Hashing the
   # running image remains mandatory and detects replacement or in-place
@@ -95,7 +226,9 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
   if ln "$staging" "$pinned_supervisor" 2>/dev/null; then
     rm -f "$staging"
   elif [[ -f "$pinned_supervisor" && ! -L "$pinned_supervisor" && \
-    -x "$pinned_supervisor" ]] && cmp -s "$staging" "$pinned_supervisor"; then
+    -x "$pinned_supervisor" ]] && \
+    brain_isolation_require_private_path "$pinned_supervisor" strict immutable && \
+    cmp -s "$staging" "$pinned_supervisor"; then
     rm -f "$staging"
   else
     echo "content-addressed supervisor path is not the expected immutable image: $pinned_supervisor" >&2
