@@ -211,7 +211,7 @@ printf '%s\n' '#!/usr/bin/env bash' \
   'case "$1" in' \
   '  metadata) printf '\''{"target_directory":"%s"}\n'\'' "$FINCH_LAUNCHER_TARGET" ;;' \
   '  build)' \
-  '    [[ "$#" -eq 6 && "$2" == --quiet && "$3" == --target-dir && "$4" == "$FINCH_LAUNCHER_TARGET" && "$5" == --bin && "$6" == finch-test-supervisor ]] || {' \
+  '    [[ "$#" -eq 7 && "$2" == --quiet && "$3" == --target-dir && "$4" == "$FINCH_LAUNCHER_TARGET" && "$5" == --bin && "$6" == finch-test-supervisor && "$7" == --message-format=json-render-diagnostics ]] || {' \
   '      printf "unexpected Cargo supervisor build arguments:" >&2; printf " <%s>" "$@" >&2; printf "\n" >&2; exit 64;' \
   '    }' \
   '    staging="$FINCH_LAUNCHER_TARGET/debug/.fake-cargo-supervisor.$$"' \
@@ -219,6 +219,8 @@ printf '%s\n' '#!/usr/bin/env bash' \
   '    install -m 0755 "$FINCH_FRESH_SUPERVISOR_SOURCE" "$staging"' \
   '    mv -f "$staging" "$FINCH_LAUNCHER_TARGET/debug/finch-test-supervisor"' \
   '    trap - EXIT' \
+  '    printf '\''{"reason":"compiler-artifact","target":{"name":"finch-test-supervisor","kind":["bin"]},"executable":"%s"}\n'\'' "$FINCH_LAUNCHER_TARGET/debug/finch-test-supervisor"' \
+  '    printf '\''{"reason":"compiler-artifact","target":{"name":"finch-test-supervisor","kind":["bin"]},"executable":"%s"}\n'\'' "$FINCH_LAUNCHER_TARGET/debug/finch-test-supervisor"' \
   '    ;;' \
   '  *) echo "unexpected Cargo command: $1" >&2; exit 64 ;;' \
   'esac' \
@@ -335,20 +337,14 @@ if [[ -n "$(find "$temp_parent" -mindepth 1 -print -quit)" ]]; then
   exit 1
 fi
 
-# Two launchers that publish the same freshly built image concurrently must
-# converge on one immutable inode. The maintained hook pauses both after their
-# complete private staging copy exists and before atomic publication; the old
-# compare/rename design let both decide to replace the fixed path, so the later
-# rename unlinked the executable already running in the first supervisor.
+# Two launchers selecting the same shared target concurrently must serialize
+# Cargo freshness through immutable publication and converge on one inode.
 phase=concurrent-launchers-share-immutable-supervisor-image
 rm -f -- "$observed_supervisor"
-pin_ready_dir="$scratch/pin-publication-ready"
-pin_continue_file="$scratch/pin-publication-continue"
 pin_result_one="$scratch/pin-result-one"
 pin_result_two="$scratch/pin-result-two"
 pin_diagnostic_one="$scratch/pin-diagnostic-one"
 pin_diagnostic_two="$scratch/pin-diagnostic-two"
-mkdir "$pin_ready_dir"
 run_concurrent_launcher() {
   local result_file="$1" diagnostic_file="$2"
   env -u FINCH_TEST_SUPERVISOR_BIN \
@@ -356,8 +352,6 @@ run_concurrent_launcher() {
     FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR="$launcher_target" \
     FINCH_LAUNCHER_TARGET="$launcher_target" \
     FINCH_FRESH_SUPERVISOR_SOURCE="$fresh_supervisor_source" \
-    FINCH_TEST_SUPERVISOR_PIN_READY_DIR="$pin_ready_dir" \
-    FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE="$pin_continue_file" \
     FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
     FINCH_PIN_RESULT="$result_file" "$repo_root/scripts/test_brains.sh" bash -c '
       case "$(uname -s)" in
@@ -370,18 +364,6 @@ run_concurrent_launcher() {
 }
 run_concurrent_launcher "$pin_result_one" "$pin_diagnostic_one" & pin_pid_one=$!
 run_concurrent_launcher "$pin_result_two" "$pin_diagnostic_two" & pin_pid_two=$!
-for _ in {1..1000}; do
-  ready_count="$(find "$pin_ready_dir" -type f | wc -l | tr -d ' ')"
-  [[ "$ready_count" -eq 2 ]] && break
-  sleep 0.01
-done
-if [[ "${ready_count:-0}" -ne 2 ]]; then
-  echo "concurrent maintained launchers did not both reach immutable publication; ready=${ready_count:-0}" >&2
-  sed 's/^/launcher one: /' "$pin_diagnostic_one" >&2 || true
-  sed 's/^/launcher two: /' "$pin_diagnostic_two" >&2 || true
-  exit 1
-fi
-: >"$pin_continue_file"
 pin_status_one=0
 pin_status_two=0
 wait "$pin_pid_one" || pin_status_one=$?

@@ -80,11 +80,140 @@ brain_test_resolve_target_dir() {
   '
 }
 
+brain_test_build_and_pin_supervisor() {
+  local cargo_target_dir="$1" build_messages built_supervisor publication_dir
+  local staging built_digest pinned_supervisor
+
+  build_messages="$(
+    umask 077
+    cargo build --quiet --target-dir "$cargo_target_dir" --bin finch-test-supervisor \
+      --message-format=json-render-diagnostics
+  )" || {
+    echo "Cargo failed to build the Brain test supervisor in $cargo_target_dir" >&2
+    return 74
+  }
+  built_supervisor="$(printf '%s\n' "$build_messages" | perl -MJSON::PP -ne '
+    my $message = eval { decode_json($_) };
+    next unless defined($message) && ($message->{reason} // "") eq "compiler-artifact";
+    next unless (($message->{target} // {})->{name} // "") eq "finch-test-supervisor";
+    next unless grep { $_ eq "bin" } @{($message->{target} // {})->{kind} // []};
+    $found = $message->{executable} if defined $message->{executable};
+    END {
+      die "Cargo build did not report the finch-test-supervisor executable artifact\n"
+        unless defined $found;
+      print "$found\n";
+    }
+  ')" || return 74
+  case "$built_supervisor" in
+    "$cargo_target_dir/"*) ;;
+    *)
+      echo "Cargo reported the Brain test supervisor outside its target: target=$cargo_target_dir artifact=$built_supervisor" >&2
+      return 74
+      ;;
+  esac
+  [[ -f "$built_supervisor" && ! -L "$built_supervisor" ]] || {
+    echo "Cargo did not produce a regular, non-symlink supervisor image: $built_supervisor" >&2
+    return 74
+  }
+  publication_dir="$(dirname "$built_supervisor")"
+  [[ "$(basename "$publication_dir")" == debug && ! -L "$publication_dir" ]] || {
+    echo "Cargo reported the Brain test supervisor outside a non-symlink debug profile: $built_supervisor" >&2
+    return 74
+  }
+  brain_isolation_require_private_path "$publication_dir" strict
+  brain_isolation_require_private_path "$built_supervisor" strict
+
+  # Prepare a private complete copy before naming or publishing it. The build
+  # lock remains held until publication, so another worktree cannot replace
+  # the shared Cargo artifact between Cargo's freshness decision and this copy.
+  staging="$publication_dir/.finch-test-supervisor-staging.$$"
+  trap 'rm -f "$staging"' EXIT
+  install -m 0755 "$built_supervisor" "$staging"
+  if [[ "$(uname -s)" == Linux ]]; then
+    strip "$staging"
+  fi
+  chmod 0555 "$staging"
+  built_digest="$(shasum -a 256 "$staging" | awk '{print $1}')"
+  if [[ ! "$built_digest" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute the selected supervisor image digest for $staging" >&2
+    return 74
+  fi
+  pinned_supervisor="$publication_dir/finch-test-supervisor-pinned-sha256-$built_digest"
+
+  # Deterministic production-boundary concurrency probe. It is inert unless
+  # the maintained isolation regression supplies both private paths.
+  if [[ -n "${FINCH_TEST_SUPERVISOR_PIN_READY_DIR:-}" || \
+    -n "${FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE:-}" ]]; then
+    if [[ ! -d "${FINCH_TEST_SUPERVISOR_PIN_READY_DIR:-}" || \
+      -z "${FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE:-}" ]]; then
+      echo 'supervisor pin publication probe requires a ready directory and continuation file' >&2
+      return 64
+    fi
+    printf '%s\n' "$pinned_supervisor" >"$FINCH_TEST_SUPERVISOR_PIN_READY_DIR/$$"
+    for _ in {1..500}; do
+      [[ -e "$FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE" ]] && break
+      sleep 0.01
+    done
+    if [[ ! -e "$FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE" ]]; then
+      echo "supervisor pin publication probe timed out for $pinned_supervisor" >&2
+      return 70
+    fi
+  fi
+
+  if ln "$staging" "$pinned_supervisor" 2>/dev/null; then
+    rm -f "$staging"
+  elif [[ -f "$pinned_supervisor" && ! -L "$pinned_supervisor" && \
+    -x "$pinned_supervisor" ]] && \
+    brain_isolation_require_private_path "$pinned_supervisor" strict immutable && \
+    cmp -s "$staging" "$pinned_supervisor"; then
+    rm -f "$staging"
+  else
+    echo "content-addressed supervisor path is not the expected immutable image: $pinned_supervisor" >&2
+    return 74
+  fi
+  trap - EXIT
+  printf '%s\n' "$pinned_supervisor"
+}
+
+brain_test_build_with_lock() {
+  local cargo_target_dir="$1" lock_path="$1/.finch-test-supervisor-build.lock"
+  shift
+  (umask 077 && : >>"$lock_path")
+  brain_isolation_require_private_path "$lock_path" strict
+  case "$(uname -s)" in
+    Darwin) /usr/bin/lockf -k "$lock_path" "$@" ;;
+    Linux)
+      local flock_path
+      flock_path="$(command -v flock)" || {
+        echo 'Brain test supervisor build lock requires flock on Linux' >&2
+        return 69
+      }
+      "$flock_path" "$lock_path" "$@"
+      ;;
+    *)
+      echo "Brain test supervisor build lock does not support $(uname -s)" >&2
+      return 69
+      ;;
+  esac
+}
+
 if [[ "$#" -eq 0 ]]; then
   set -- cargo test --lib
 fi
 
 cd "$repo_root"
+
+if [[ -n "${FINCH_TEST_SUPERVISOR_INTERNAL_TARGET:-}" ]]; then
+  internal_target="$FINCH_TEST_SUPERVISOR_INTERNAL_TARGET"
+  [[ "$internal_target" == "${CARGO_TARGET_DIR:-}" && \
+    "$(cd "$internal_target" 2>/dev/null && pwd -P)" == "$internal_target" ]] || {
+    echo "invalid internal Brain test supervisor target: $internal_target" >&2
+    exit 64
+  }
+  brain_isolation_require_private_path "$internal_target" strict
+  brain_test_build_and_pin_supervisor "$internal_target"
+  exit
+fi
 
 # Pin the supervisor image before running anything under it.
 #
@@ -138,8 +267,10 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
       }
       cargo_target_next="$cargo_target_current/$cargo_target_component"
       if ! (umask 077 && mkdir "$cargo_target_next") 2>/dev/null; then
-        echo "Brain test supervisor target component could not be privately claimed: $cargo_target_next" >&2
-        exit 74
+        if [[ ! -d "$cargo_target_next" || -L "$cargo_target_next" ]]; then
+          echo "Brain test supervisor target component could not be privately claimed: $cargo_target_next" >&2
+          exit 74
+        fi
       fi
       brain_isolation_require_private_path "$cargo_target_next" strict
       cargo_target_current="$(cd "$cargo_target_next" && pwd -P)"
@@ -164,78 +295,13 @@ if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
     brain_isolation_require_private_path "$cargo_target_dir/debug" strict
   fi
   export CARGO_TARGET_DIR="$cargo_target_dir"
-  (umask 077 && cargo build --quiet --target-dir "$cargo_target_dir" --bin finch-test-supervisor)
-  [[ -d "$cargo_target_dir/debug" && ! -L "$cargo_target_dir/debug" ]] || {
-    echo "Cargo did not produce a non-symlink debug directory: $cargo_target_dir/debug" >&2
+  supervisor="$(brain_test_build_with_lock "$cargo_target_dir" \
+    env CARGO_TARGET_DIR="$cargo_target_dir" \
+      FINCH_TEST_SUPERVISOR_INTERNAL_TARGET="$cargo_target_dir" \
+      "$repo_root/scripts/test_brains.sh")" || {
+    echo "failed to build and pin the Brain test supervisor in $cargo_target_dir" >&2
     exit 74
   }
-  brain_isolation_require_private_path "$cargo_target_dir/debug" strict
-  built_supervisor="$cargo_target_dir/debug/finch-test-supervisor"
-  [[ -f "$built_supervisor" && ! -L "$built_supervisor" ]] || {
-    echo "Cargo did not produce a regular, non-symlink supervisor image: $built_supervisor" >&2
-    exit 74
-  }
-  brain_isolation_require_private_path "$built_supervisor" strict
-
-  # Prepare a private complete copy before naming or publishing it. Hashing the
-  # running image remains mandatory and detects replacement or in-place
-  # rewriting exactly as before. Linux strips sections the supervisor never
-  # executes; macOS keeps deterministic byte identity between concurrent
-  # launchers.
-  staging="$cargo_target_dir/debug/.finch-test-supervisor-staging.$$"
-  trap 'rm -f "$staging"' EXIT
-  install -m 0755 "$built_supervisor" "$staging"
-  if [[ "$(uname -s)" == Linux ]]; then
-    strip "$staging"
-  fi
-  chmod 0555 "$staging"
-  built_digest="$(shasum -a 256 "$staging" | awk '{print $1}')"
-  if [[ ! "$built_digest" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "could not compute the selected supervisor image digest for $staging" >&2
-    exit 74
-  fi
-  pinned_supervisor="$cargo_target_dir/debug/finch-test-supervisor-pinned-sha256-$built_digest"
-
-  # Publish at a content-addressed path that is never replaced. A fixed pinned
-  # pathname still has a compare/rename race: two launchers can both compare
-  # old bytes, then the second rename unlinks the executable after the first
-  # has exec'd it. The first process then appears as a deleted or different
-  # image when its child verifies the proof. Hard-link creation is one atomic
-  # create-if-absent operation; concurrent launchers either create this exact
-  # digest path or verify the already-published identical immutable image.
-  # Deterministic production-boundary concurrency probe. It is inert unless
-  # the maintained isolation regression supplies both private paths.
-  if [[ -n "${FINCH_TEST_SUPERVISOR_PIN_READY_DIR:-}" || \
-    -n "${FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE:-}" ]]; then
-    if [[ ! -d "${FINCH_TEST_SUPERVISOR_PIN_READY_DIR:-}" || \
-      -z "${FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE:-}" ]]; then
-      echo 'supervisor pin publication probe requires a ready directory and continuation file' >&2
-      exit 64
-    fi
-    printf '%s\n' "$pinned_supervisor" >"$FINCH_TEST_SUPERVISOR_PIN_READY_DIR/$$"
-    for _ in {1..500}; do
-      [[ -e "$FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE" ]] && break
-      sleep 0.01
-    done
-    if [[ ! -e "$FINCH_TEST_SUPERVISOR_PIN_CONTINUE_FILE" ]]; then
-      echo "supervisor pin publication probe timed out for $pinned_supervisor" >&2
-      exit 70
-    fi
-  fi
-
-  if ln "$staging" "$pinned_supervisor" 2>/dev/null; then
-    rm -f "$staging"
-  elif [[ -f "$pinned_supervisor" && ! -L "$pinned_supervisor" && \
-    -x "$pinned_supervisor" ]] && \
-    brain_isolation_require_private_path "$pinned_supervisor" strict immutable && \
-    cmp -s "$staging" "$pinned_supervisor"; then
-    rm -f "$staging"
-  else
-    echo "content-addressed supervisor path is not the expected immutable image: $pinned_supervisor" >&2
-    exit 74
-  fi
-  trap - EXIT
-  supervisor="$pinned_supervisor"
   unset FINCH_TEST_SUPERVISOR_BUILD_TARGET_DIR
 else
   # Explicit callers retain the established plain or fixed-pinned launcher
