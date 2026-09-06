@@ -20,6 +20,12 @@ struct LocalBinding {
 }
 
 #[derive(Debug, Clone)]
+struct KnownStackTop {
+    stack_len: usize,
+    origin: SourceOrigin,
+}
+
+#[derive(Debug, Clone)]
 struct Token {
     value: TokenValue,
     start: usize,
@@ -467,6 +473,10 @@ fn lower_forth_ast_body_with_locals(
         .map(|(index, capture)| (capture.name.as_str(), (index as u32, capture.ty.clone())))
         .collect::<BTreeMap<_, _>>();
     let mut available_functions = linked_functions.clone();
+    // This is intentionally not a second type stack. It records only a top
+    // value whose producer is unambiguous across the immediately preceding
+    // straight-line lowering step; every unsupported/control path clears it.
+    let mut known_top: Option<KnownStackTop> = None;
 
     let emit = |blocks: &mut BTreeMap<u32, BasicBlock>,
                 current: u32,
@@ -520,6 +530,7 @@ fn lower_forth_ast_body_with_locals(
     }
     while token_index < tokens.len() {
         let token = tokens[token_index].clone();
+        let previous_known_top = known_top.take();
         if let ForthBodyNode::Quotation(quotation) = &body.nodes[token_index] {
             let origin = origin(source_id, source, token.start, quotation.end);
             let (declared_signature, declares_pure) =
@@ -613,6 +624,10 @@ fn lower_forth_ast_body_with_locals(
                 effects: signature.effects.clone(),
                 suspension: signature.suspension.clone(),
             });
+            known_top = Some(KnownStackTop {
+                stack_len: stack.len(),
+                origin: origin.clone(),
+            });
             emit(
                 &mut blocks,
                 current,
@@ -629,6 +644,10 @@ fn lower_forth_ast_body_with_locals(
         if let ForthBodyNode::Literal(literal) = &body.nodes[token_index] {
             let origin = origin(source_id, source, literal.token.start, literal.token.end);
             stack.push(literal.value.value_type());
+            known_top = Some(KnownStackTop {
+                stack_len: stack.len(),
+                origin: origin.clone(),
+            });
             emit(
                 &mut blocks,
                 current,
@@ -2320,11 +2339,39 @@ fn lower_forth_ast_body_with_locals(
                             Some(origin),
                         )]);
                     };
-                    let concrete_signature =
-                        instantiate_signature_types(signature, &stack, &origin)
-                            .map_err(|diagnostic| vec![diagnostic])?;
-                    apply_signature_types(signature, &mut stack, &origin)
-                        .map_err(|diagnostic| vec![diagnostic])?;
+                    let concrete_signature = instantiate_signature_types(
+                        signature, &stack, &origin,
+                    )
+                    .map_err(|diagnostic| {
+                        vec![enrich_forth_word_mismatch(
+                            diagnostic,
+                            signature,
+                            &stack,
+                            previous_known_top.as_ref(),
+                            vocabulary,
+                            source,
+                            &origin,
+                        )]
+                    })?;
+                    apply_signature_types(signature, &mut stack, &origin).map_err(
+                        |diagnostic| {
+                            vec![enrich_forth_word_mismatch(
+                                diagnostic,
+                                signature,
+                                &stack,
+                                previous_known_top.as_ref(),
+                                vocabulary,
+                                source,
+                                &origin,
+                            )]
+                        },
+                    )?;
+                    if !concrete_signature.output.values.is_empty() {
+                        known_top = Some(KnownStackTop {
+                            stack_len: stack.len(),
+                            origin: origin.clone(),
+                        });
+                    }
                     effects = effects.union(&signature.effects);
                     merge_suspension_contract(
                         &mut suspension,
@@ -2460,6 +2507,61 @@ fn output_operation(word: &str) -> Option<UiOperation> {
         "output-fail" => Some(UiOperation::Fail),
         _ => None,
     }
+}
+
+fn enrich_forth_word_mismatch(
+    mut diagnostic: VmDiagnostic,
+    signature: &StackSignature,
+    stack: &[Type],
+    known_top: Option<&KnownStackTop>,
+    vocabulary: &Vocabulary,
+    source: &str,
+    operation: &SourceOrigin,
+) -> VmDiagnostic {
+    if diagnostic.code != "E-TYPE-002" || signature.input.values.len() != 1 {
+        return diagnostic;
+    }
+    if known_top.is_some_and(|known| known.stack_len == stack.len()) {
+        diagnostic.found_value_origin = known_top.map(|known| known.origin.clone());
+    }
+    if diagnostic.expected_types == [Type::String]
+        && diagnostic.found_types == [Type::Int]
+        && supports_int_to_string(vocabulary)
+    {
+        diagnostic.hints.push(
+            forth_int_to_string_hint(source, operation)
+                .unwrap_or_else(|| "convert the integer with `int-to-string`".into()),
+        );
+    }
+    diagnostic
+}
+
+fn supports_int_to_string(vocabulary: &Vocabulary) -> bool {
+    vocabulary.get("int-to-string").is_some_and(|signature| {
+        signature.input.values == [Type::Int] && signature.output.values == [Type::String]
+    })
+}
+
+fn forth_int_to_string_hint(source: &str, operation: &SourceOrigin) -> Option<String> {
+    let span = operation.span.as_ref()?;
+    if span.start_byte > span.end_byte
+        || span.end_byte > source.len()
+        || !source.is_char_boundary(span.start_byte)
+        || !source.is_char_boundary(span.end_byte)
+    {
+        return None;
+    }
+    let line_start = source[..span.start_byte]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = source[span.end_byte..]
+        .find('\n')
+        .map_or(source.len(), |index| span.end_byte + index);
+    Some(format!(
+        "convert it first: {}int-to-string {}",
+        &source[line_start..span.start_byte],
+        &source[span.start_byte..line_end]
+    ))
 }
 
 fn merge_suspension_contract(
@@ -4226,6 +4328,61 @@ mod tests {
                 .unwrap()
                 .start_line,
             1
+        );
+    }
+
+    #[test]
+    fn test_say_type_mismatch_retains_proven_integer_origin_and_supported_hint() {
+        let source = "3 4 + say";
+        let errors = compile_forth("provenance.forth", source, Vec::new(), &core_vocabulary())
+            .expect_err("integer output from + cannot satisfy say's string input");
+        let diagnostic = errors
+            .first()
+            .expect("typed mismatch should return one structured diagnostic");
+        let primary = diagnostic
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("say mismatch should retain its exact source span");
+        let producer = diagnostic
+            .found_value_origin
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("straight-line + output should retain its proven producer span");
+        assert_eq!(
+            &source[primary.start_byte..primary.end_byte],
+            "say",
+            "type mismatch primary span should name the consuming word; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            &source[producer.start_byte..producer.end_byte],
+            "+",
+            "type mismatch provenance should name the producer; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.expected_types,
+            [Type::String],
+            "say mismatch lost its expected string type; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.found_types,
+            [Type::Int],
+            "say mismatch lost the producer's integer type; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.hints,
+            ["convert it first: 3 4 + int-to-string say"],
+            "core vocabulary should author one evidence-backed correction; diagnostic={diagnostic:#?}"
+        );
+
+        let mut no_conversion = core_vocabulary();
+        no_conversion.remove("int-to-string");
+        let unsupported = compile_forth("no-conversion.forth", source, Vec::new(), &no_conversion)
+            .expect_err("say mismatch remains invalid without a conversion word");
+        assert!(
+            unsupported[0].hints.is_empty(),
+            "frontend invented an unavailable int-to-string correction; diagnostic={:#?}",
+            unsupported[0]
         );
     }
 

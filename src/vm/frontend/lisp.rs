@@ -3624,6 +3624,14 @@ impl Compiler<'_> {
                 Some(origin),
             )]);
         };
+        let unary_found_value_origin = (arguments.len() == 1)
+            .then(|| {
+                self.expression_producer_origin(
+                    &arguments[0],
+                    argument_sources.and_then(|sources| sources.first()),
+                )
+            })
+            .flatten();
         if word == "str-cat" && arguments.len() > signature.input.values.len() {
             // Lisp knows the complete call arity at compile time. Lower its
             // natural variadic spelling to the same binary `str-cat` word
@@ -3674,9 +3682,24 @@ impl Compiler<'_> {
             )?;
         }
         let concrete_signature = instantiate_signature_types(&signature, &builder.stack, &origin)
-            .map_err(|diagnostic| vec![diagnostic])?;
-        apply_signature_types(&signature, &mut builder.stack, &origin)
-            .map_err(|diagnostic| vec![diagnostic])?;
+            .map_err(|diagnostic| {
+            vec![self.enrich_named_call_mismatch(
+                diagnostic,
+                word,
+                &signature,
+                unary_found_value_origin.as_ref(),
+                argument_sources.and_then(|sources| sources.first()),
+            )]
+        })?;
+        apply_signature_types(&signature, &mut builder.stack, &origin).map_err(|diagnostic| {
+            vec![self.enrich_named_call_mismatch(
+                diagnostic,
+                word,
+                &signature,
+                unary_found_value_origin.as_ref(),
+                argument_sources.and_then(|sources| sources.first()),
+            )]
+        })?;
         builder.effects = builder.effects.union(&signature.effects);
         builder.merge_suspension(concrete_signature.suspension.as_ref(), &origin)?;
         if word == "yield" {
@@ -3732,6 +3755,57 @@ impl Compiler<'_> {
             return Ok(Type::Unit);
         }
         Ok(builder.stack.pop().expect("call signature leaves result"))
+    }
+
+    fn expression_producer_origin(
+        &self,
+        expression: &Val,
+        source: Option<&SpannedVal>,
+    ) -> Option<SourceOrigin> {
+        let source = source?;
+        let Val::List(items) = expression else {
+            return None;
+        };
+        let Val::Symbol(operator) = items.first()? else {
+            return None;
+        };
+        let operator_source = source.children.first()?;
+        let mut origin = source_origin_in_range(
+            self.source_id,
+            self.source,
+            operator_source.span.clone(),
+            operator,
+        );
+        origin.expansion = self.current_expansion.clone().map(Box::new);
+        Some(origin)
+    }
+
+    fn enrich_named_call_mismatch(
+        &self,
+        mut diagnostic: VmDiagnostic,
+        word: &str,
+        signature: &StackSignature,
+        found_value_origin: Option<&SourceOrigin>,
+        argument_source: Option<&SpannedVal>,
+    ) -> VmDiagnostic {
+        if diagnostic.code != "E-TYPE-002" || signature.input.values.len() != 1 {
+            return diagnostic;
+        }
+        diagnostic.found_value_origin = found_value_origin.cloned();
+        if word == "say"
+            && diagnostic.expected_types == [Type::String]
+            && diagnostic.found_types == [Type::Int]
+            && supports_int_to_string(&self.vocabulary)
+        {
+            let hint = argument_source
+                .and_then(|source| self.source.get(source.span.clone()))
+                .map_or_else(
+                    || "convert the integer with `int-to-string` before `say`".into(),
+                    |argument| format!("convert it first: (say (int-to-string {argument}))"),
+                );
+            diagnostic.hints.push(hint);
+        }
+        diagnostic
     }
 
     fn compile_closure_call(
@@ -3871,6 +3945,12 @@ fn output_operation(word: &str) -> Option<UiOperation> {
         "output-fail" => Some(UiOperation::Fail),
         _ => None,
     }
+}
+
+fn supports_int_to_string(vocabulary: &Vocabulary) -> bool {
+    vocabulary.get("int-to-string").is_some_and(|signature| {
+        signature.input.values == [Type::Int] && signature.output.values == [Type::String]
+    })
 }
 
 fn is_definition(expression: &Val) -> bool {
@@ -5151,6 +5231,41 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors[0].code, "E-TYPE-002");
+    }
+
+    #[test]
+    fn test_say_type_mismatch_retains_nested_operator_origin_and_supported_hint() {
+        let source = "(say (+ 3 4))";
+        let errors = compile_lisp("provenance.lisp", source, Vec::new(), &core_vocabulary())
+            .expect_err("integer result from + cannot satisfy say's string argument");
+        let diagnostic = errors
+            .first()
+            .expect("typed mismatch should return one structured diagnostic");
+        let primary = diagnostic
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("say mismatch should retain its exact operator span");
+        let producer = diagnostic
+            .found_value_origin
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("nested + call should retain its reader-owned operator span");
+        assert_eq!(
+            &source[primary.start_byte..primary.end_byte],
+            "say",
+            "Lisp mismatch primary span should name the consuming form; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            &source[producer.start_byte..producer.end_byte],
+            "+",
+            "Lisp mismatch provenance should name the nested producer; diagnostic={diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.hints,
+            ["convert it first: (say (int-to-string (+ 3 4)))"],
+            "core vocabulary should author one structural Lisp correction; diagnostic={diagnostic:#?}"
+        );
     }
 
     #[test]

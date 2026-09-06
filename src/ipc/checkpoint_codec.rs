@@ -2001,6 +2001,14 @@ fn encode_diagnostic(
         &value.found_types,
         depth + 1,
     )?;
+    builder.set_has_found_value_origin(value.found_value_origin.is_some());
+    if let Some(origin) = &value.found_value_origin {
+        encode_origin(
+            builder.reborrow().init_found_value_origin(),
+            origin,
+            depth + 1,
+        )?;
+    }
     encode_effects(
         builder
             .reborrow()
@@ -2053,6 +2061,10 @@ fn decode_diagnostic(
             .collect::<Result<Vec<_>>>()?,
         expected_types: decode_type_list(reader.get_expected_types()?, depth + 1)?,
         found_types: decode_type_list(reader.get_found_types()?, depth + 1)?,
+        found_value_origin: reader
+            .get_has_found_value_origin()
+            .then(|| decode_origin(reader.get_found_value_origin()?, depth + 1))
+            .transpose()?,
         expected_effects: decode_effects(reader.get_expected_effects()?)?,
         found_effects: decode_effects(reader.get_found_effects()?)?,
         capability: reader
@@ -2425,6 +2437,21 @@ mod tests {
         decode_instruction(reader.get_root::<wire::instruction::Reader<'_>>()?, 0)
     }
 
+    fn round_trip_diagnostic(value: &VmDiagnostic) -> Result<VmDiagnostic> {
+        let mut message = capnp::message::Builder::new_default();
+        encode_diagnostic(
+            message.init_root::<wire::vm_diagnostic::Builder<'_>>(),
+            value,
+            0,
+        )?;
+        let words = capnp::serialize::write_message_to_words(&message);
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut words.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )?;
+        decode_diagnostic(reader.get_root::<wire::vm_diagnostic::Reader<'_>>()?, 0)
+    }
+
     fn sample_requirement() -> CapabilityRequirement {
         CapabilityRequirement {
             capability: CapabilityKind::FileRead,
@@ -2446,6 +2473,32 @@ mod tests {
             control: ControlEffect::MaySuspend,
             suspension: Some(SuspensionSignature::one_way(Type::String)),
         }
+    }
+
+    #[test]
+    fn test_vm_diagnostic_found_value_origin_round_trips_without_json() -> Result<()> {
+        let primary = SourceOrigin {
+            language: SourceLanguage::Forth,
+            span: Some(SourceSpan::bytes("input.forth", 6, 9)),
+            word: Some("say".into()),
+            expansion: None,
+        };
+        let producer = SourceOrigin {
+            language: SourceLanguage::Forth,
+            span: Some(SourceSpan::bytes("input.forth", 4, 5)),
+            word: Some("+".into()),
+            expansion: None,
+        };
+        let mut diagnostic = VmDiagnostic::type_mismatch(Type::String, Type::Int, Some(primary));
+        diagnostic.found_value_origin = Some(producer);
+
+        let decoded = round_trip_diagnostic(&diagnostic)?;
+        assert_eq!(
+            decoded, diagnostic,
+            "Cap'n Proto checkpoint codec lost structured found-value provenance; \
+             decoded={decoded:#?}; original={diagnostic:#?}"
+        );
+        Ok(())
     }
 
     #[test]

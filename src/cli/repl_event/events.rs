@@ -127,6 +127,8 @@ pub enum ReplEvent {
     /// owns final status/error projection and the corresponding redraw.
     TypedProgramComplete {
         output_unit: Arc<WorkUnit>,
+        source_id: String,
+        source: String,
         result: std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
     },
 
@@ -436,15 +438,33 @@ mod tests {
         let unit = Arc::new(WorkUnit::new("typed program output"));
         let event = ReplEvent::TypedProgramComplete {
             output_unit: Arc::clone(&unit),
+            source_id: "interactive.forth".to_string(),
+            source: "3 4 + say".to_string(),
             result: Err("cancelled before completion".to_string()),
         };
         match event {
             ReplEvent::TypedProgramComplete {
                 output_unit,
+                source_id,
+                source,
                 result: Err(error),
             } => {
-                assert!(Arc::ptr_eq(&unit, &output_unit));
-                assert_eq!(error, "cancelled before completion");
+                assert!(
+                    Arc::ptr_eq(&unit, &output_unit),
+                    "typed completion event replaced its owning output unit"
+                );
+                assert_eq!(
+                    source_id, "interactive.forth",
+                    "typed completion event lost the diagnostic source identity"
+                );
+                assert_eq!(
+                    source, "3 4 + say",
+                    "typed completion event lost the authored source needed for diagnostic excerpts"
+                );
+                assert_eq!(
+                    error, "cancelled before completion",
+                    "typed completion event changed its terminal error"
+                );
             }
             _ => panic!("Wrong variant"),
         }

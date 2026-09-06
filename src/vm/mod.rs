@@ -22,7 +22,8 @@ pub use capability::{
     GrantScope, GrantSet,
 };
 pub use diagnostic::{
-    DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
+    render_vm_diagnostics, DiagnosticPhase, DiagnosticSource, Severity, SourceLanguage,
+    SourceOrigin, SourceSpan, VmDiagnostic,
 };
 pub use effects::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileOperation, FileSelector,

@@ -393,6 +393,11 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("read Finch script '{}'", path.display()))?;
     let script = finch::programs::parse_finch_script(&path, &contents)?;
+    let source_id = path.display().to_string();
+    // Preserve the stripped shebang's physical line in every runtime span.
+    // A leading newline is inert in both typed languages while keeping source
+    // excerpts and machine-readable locations aligned with the authored file.
+    let diagnostic_source = format!("\n{}", script.source);
     let runtime = finch::runtime::ProgramRuntime::new();
     // Executing a local script is the user's explicit request to receive its
     // response.  Grant only that presentation capability here; every resource
@@ -405,8 +410,8 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
     let outcome = runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language: script.language,
-            source_id: Some(path.display().to_string()),
-            source: script.source,
+            source_id: Some(source_id.clone()),
+            source: diagnostic_source.clone(),
             intent: format!("execute Finch script {}", path.display()),
             // The typed verifier and broker derive the concrete capabilities.
             // This legacy coarse field is intentionally not used to authorize
@@ -434,10 +439,7 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
         finch::runtime::outcome::ExecutionStatus::Completed
     ) {
         let detail = if outcome.required_capabilities.is_empty() {
-            outcome
-                .diagnostics
-                .first()
-                .cloned()
+            render_outcome_diagnostics(&outcome, &source_id, &diagnostic_source)
                 .unwrap_or_else(|| "no diagnostic".to_string())
         } else {
             format!(
@@ -492,10 +494,11 @@ async fn run_direct_typed_source_with_json(
         capability: finch::vm::CapabilityKind::SessionEmit,
         selector: finch::vm::ResourceSelector::None,
     })?;
+    let source_id = format!("direct-cli.{}", language.as_str());
     let outcome = runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language,
-            source_id: Some(format!("direct-cli.{}", language.as_str())),
+            source_id: Some(source_id.clone()),
             source: source.to_string(),
             intent: "direct typed command-line program".to_string(),
             effect: finch::programs::ExecutionEffect::Unclassified,
@@ -514,15 +517,26 @@ async fn run_direct_typed_source_with_json(
     if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
         return Ok(());
     }
-    let detail = outcome
-        .diagnostics
-        .first()
-        .cloned()
+    let detail = render_outcome_diagnostics(&outcome, &source_id, source)
         .unwrap_or_else(|| format!("program ended as {:?}", outcome.status));
     anyhow::bail!(
         "typed {} program did not complete: {detail}",
         language.as_str()
     )
+}
+
+fn render_outcome_diagnostics(
+    outcome: &finch::runtime::outcome::ExecutionOutcome,
+    source_id: &str,
+    source: &str,
+) -> Option<String> {
+    if !outcome.vm_diagnostics.is_empty() {
+        return Some(finch::vm::render_vm_diagnostics(
+            &outcome.vm_diagnostics,
+            &[finch::vm::DiagnosticSource { source_id, source }],
+        ));
+    }
+    (!outcome.diagnostics.is_empty()).then(|| outcome.diagnostics.join("\n"))
 }
 
 #[cfg(test)]
