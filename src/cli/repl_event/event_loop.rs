@@ -3621,22 +3621,51 @@ Rules:\n\
                 )
                 .await
             }
-            .await
-            .map(|mut outcome| {
-                if is_outputless_forth_say_mismatch(&outcome) {
-                    if let Some(rendered) = outcome.vm_diagnostics.iter().find_map(|diagnostic| {
-                        crate::vm::diagnostic::render_interactive_forth_say_mismatch(
-                            diagnostic,
-                            &diagnostic_source_id,
-                            diagnostic_source.as_deref().unwrap_or(""),
-                        )
-                    }) {
-                        outcome.diagnostics.insert(0, rendered);
+            .await;
+            let result = match result {
+                Ok(mut outcome) => {
+                    if is_outputless_forth_say_mismatch(&outcome) {
+                        let active_signatures = runtime
+                            .inspect()
+                            .await
+                            .ok()
+                            .map(|snapshot| {
+                                snapshot
+                                    .typed_vocabulary
+                                    .into_iter()
+                                    .filter(|entry| {
+                                        matches!(entry.name.as_str(), "+" | "int-to-string")
+                                    })
+                                    .filter_map(|entry| {
+                                        entry.signature.map(|signature| (entry.name, signature))
+                                    })
+                                    .collect::<std::collections::BTreeMap<_, _>>()
+                            })
+                            .unwrap_or_default();
+                        for diagnostic in &mut outcome.vm_diagnostics {
+                            crate::vm::frontend::forth::enrich_interactive_say_mismatch(
+                                &diagnostic_source_id,
+                                diagnostic_source.as_deref().unwrap_or(""),
+                                diagnostic,
+                                &active_signatures,
+                            );
+                        }
+                        if let Some(rendered) =
+                            outcome.vm_diagnostics.iter().find_map(|diagnostic| {
+                                crate::vm::diagnostic::render_interactive_forth_say_mismatch(
+                                    diagnostic,
+                                    &diagnostic_source_id,
+                                    diagnostic_source.as_deref().unwrap_or(""),
+                                )
+                            })
+                        {
+                            outcome.diagnostics.insert(0, rendered);
+                        }
                     }
+                    Ok(outcome)
                 }
-                outcome
-            })
-            .map_err(|error: anyhow::Error| error.to_string());
+                Err(error) => Err(error.to_string()),
+            };
             let _ = event_tx.send(ReplEvent::TypedProgramComplete {
                 output_unit,
                 result,
@@ -9015,6 +9044,13 @@ mod tests {
                     crate::cli::messages::MessageStatus::Complete,
                     "standalone diagnostic was not immediately terminal; full_render={diagnostic:?}"
                 );
+                let formatted = matching[0].format(&crate::config::ColorScheme::default());
+                assert!(
+                    formatted.contains(&format!("❌ {diagnostic}"))
+                        && formatted.starts_with("\u{1b}[")
+                        && formatted.ends_with("\u{1b}[0m"),
+                    "standalone diagnostic lost StaticMessage::error marker/styling; formatted={formatted:?} full_render={diagnostic:?}"
+                );
                 assert!(
                     matching[0].transcript_row(&crate::config::ColorScheme::default()).is_none(),
                     "standalone StaticMessage unexpectedly claimed an ordinary transcript row; full_render={diagnostic:?}"
@@ -9036,6 +9072,118 @@ mod tests {
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
                     ),
                     "compile-time mismatch queued a duplicate or post-terminal event; full_render={diagnostic:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_interactive_noneligible_forth_failure_keeps_program_output() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                use crate::cli::messages::Message;
+
+                let runtime = std::sync::Arc::new(crate::runtime::ProgramRuntime::new());
+                runtime
+                    .grant_typed_capability(crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    })
+                    .expect("noneligible diagnostic fixture should grant only session output");
+                let generator: std::sync::Arc<dyn crate::generators::Generator> =
+                    std::sync::Arc::new(UnusedInteractiveDiagnosticGenerator);
+                let temp = tempfile::tempdir()
+                    .expect("noneligible interactive diagnostic root should be created");
+                let permissions = crate::tools::permissions::PermissionManager::new()
+                    .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
+                let executor = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::tools::executor::ToolExecutor::new(
+                        crate::tools::registry::ToolRegistry::new(),
+                        permissions,
+                        temp.path().join("tool-patterns.json"),
+                    )
+                    .expect("empty noneligible diagnostic tool executor should be created"),
+                ));
+                let mut event_loop = super::EventLoop::new_named_brain_test_runner(
+                    generator,
+                    Vec::new(),
+                    executor,
+                    runtime,
+                );
+                event_loop.output_manager.disable_stdout();
+
+                event_loop
+                    .handle_event(super::ReplEvent::UserInput {
+                        input: "/forth true say".into(),
+                    })
+                    .await
+                    .expect("real noneligible /forth input boundary should accept the command");
+                let completion = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    event_loop.event_rx.recv(),
+                )
+                .await
+                .expect("real noneligible typed-program path did not publish completion")
+                .expect("typed-program event channel closed before noneligible completion");
+                let output_unit = match &completion {
+                    super::ReplEvent::TypedProgramComplete { output_unit, .. } => {
+                        std::sync::Arc::clone(output_unit)
+                    }
+                    unexpected => panic!(
+                        "noneligible /forth mismatch published {unexpected:?} before completion"
+                    ),
+                };
+                let output_id = output_unit.id();
+                event_loop
+                    .handle_event(completion)
+                    .await
+                    .expect("noneligible completion should retain fallback ProgramOutput");
+
+                let messages = event_loop.output_manager.get_messages();
+                let retained = messages
+                    .iter()
+                    .find(|message| message.id() == output_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "noneligible failure removed its ProgramOutput; messages={:?}",
+                            messages
+                                .iter()
+                                .map(|message| (message.id(), message.status(), message.content()))
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                let content = retained.content();
+                assert!(
+                    content.contains("VM error: E-TYPE-002: expected string, found bool"),
+                    "noneligible failure lost the original VM-error fallback; output={content:?} messages={:?}",
+                    messages
+                        .iter()
+                        .map(|message| (message.id(), message.status(), message.content()))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    retained.status(),
+                    crate::cli::messages::MessageStatus::Complete,
+                    "noneligible ProgramOutput did not complete; output={content:?}"
+                );
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| message.content().contains("E-TYPE-002"))
+                        .count(),
+                    1,
+                    "noneligible failure emitted a standalone duplicate; output={content:?} messages={:?}",
+                    messages
+                        .iter()
+                        .map(|message| (message.id(), message.status(), message.content()))
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    matches!(
+                        event_loop.event_rx.try_recv(),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                    ),
+                    "noneligible failure queued a duplicate or post-terminal event; output={content:?}"
                 );
             })
             .await;
