@@ -2024,6 +2024,184 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    async fn dispatch_canonical_enter_plan_mode(
+        initial_mode: ReplMode,
+    ) -> (usize, anyhow::Result<String>, Vec<String>, ReplMode) {
+        use crate::tools::executor::ToolExecutor;
+        use crate::tools::implementations::EnterPlanModeTool;
+        use crate::tools::permissions::{PermissionManager, PermissionRule};
+        use crate::tools::registry::ToolRegistry;
+
+        let temp = tempfile::tempdir().expect("create isolated plan-tool test directory");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(EnterPlanModeTool));
+        registry.register_alias("EnterPlanMode", "enter_plan_mode");
+        let executor = ToolExecutor::new(
+            registry,
+            PermissionManager::new().with_default_rule(PermissionRule::Ask),
+            temp.path().join("tool-patterns.json"),
+        )
+        .expect("create real tool executor for plan-mode dispatch regression");
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let output_manager = Arc::new(OutputManager::new(
+            crate::config::ColorScheme::default(),
+        ));
+        output_manager.disable_stdout();
+        let status_bar = Arc::new(StatusBar::new());
+        let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output_manager),
+            Arc::clone(&status_bar),
+            crate::config::ColorScheme::default(),
+        )));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let mode = Arc::new(RwLock::new(initial_mode));
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            Arc::clone(&output_manager),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states.create_query(Vec::new()).await;
+        let tool_use = ToolUse {
+            id: "canonical-enter-plan-mode".to_string(),
+            name: "enter_plan_mode".to_string(),
+            input: serde_json::json!({"reason": "production boundary regression"}),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::claude::Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: tool_use.id.clone(),
+                        name: tool_use.name.clone(),
+                        input: tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("stage canonical enter_plan_mode tool round");
+        let work_unit = Arc::new(crate::cli::messages::WorkUnit::new("Testing"));
+
+        dispatch_tool_uses(
+            vec![tool_use],
+            query_id,
+            round_token,
+            &work_unit,
+            &mode,
+            &Arc::new(RwLock::new(std::collections::HashMap::new())),
+            &event_tx,
+            &Arc::new(RwLock::new(std::collections::HashMap::new())),
+            &tui_renderer,
+            &output_manager,
+            &query_states,
+            &coordinator,
+            &None,
+            crate::memory_status::Recall::none(),
+            "plan-alias-test",
+            "/workspace",
+            &status_bar,
+            1,
+        )
+        .await;
+
+        let mut approvals = 0;
+        let mut observed = Vec::new();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await.expect("tool event channel stayed open") {
+                    ReplEvent::ToolCallsStarted { tool_uses, .. } => {
+                        observed.push(format!("ToolCallsStarted({})", tool_uses[0].name));
+                    }
+                    ReplEvent::ToolApprovalNeeded {
+                        tool_use,
+                        response_tx,
+                        ..
+                    } => {
+                        approvals += 1;
+                        observed.push(format!("ToolApprovalNeeded({})", tool_use.name));
+                        let _ = response_tx.send(super::super::events::ConfirmationResult::Deny);
+                    }
+                    ReplEvent::ToolResult { result, .. } => {
+                        observed.push(format!("ToolResult({result:?})"));
+                        break result;
+                    }
+                    other => observed.push(format!("{other:?}")),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "canonical enter_plan_mode did not reach a terminal tool result; approvals={approvals}, events={observed:?}"
+            )
+        });
+
+        tokio::task::yield_now().await;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::ToolApprovalNeeded {
+                    tool_use,
+                    response_tx,
+                    ..
+                } => {
+                    approvals += 1;
+                    observed.push(format!("late ToolApprovalNeeded({})", tool_use.name));
+                    let _ = response_tx.send(super::super::events::ConfirmationResult::Deny);
+                }
+                other => observed.push(format!("late {other:?}")),
+            }
+        }
+
+        let final_mode = mode.read().await.clone();
+        (approvals, result, observed, final_mode)
+    }
+
+    #[tokio::test]
+    async fn canonical_enter_plan_mode_is_approval_free_at_dispatch_boundary() {
+        let cases = [
+            ("normal", ReplMode::Normal, "Entered planning mode"),
+            (
+                "planning",
+                ReplMode::Planning {
+                    task: "manually entered with /plan".to_string(),
+                    plan_path: std::path::PathBuf::from("/tmp/manual-plan.md"),
+                    created_at: chrono::Utc::now(),
+                },
+                "Already in planning mode",
+            ),
+        ];
+
+        for (starting_mode, initial_mode, expected_result) in cases {
+            let (approvals, result, events, final_mode) =
+                dispatch_canonical_enter_plan_mode(initial_mode).await;
+            assert_eq!(
+                approvals, 0,
+                "canonical enter_plan_mode must reduce capability without approval; starting_mode={starting_mode}, final_mode={final_mode:?}, events={events:?}"
+            );
+            let result = result.unwrap_or_else(|error| {
+                panic!(
+                    "canonical enter_plan_mode failed at dispatch boundary; starting_mode={starting_mode}, final_mode={final_mode:?}, events={events:?}, error={error:#}"
+                )
+            });
+            assert!(
+                result.contains(expected_result),
+                "canonical enter_plan_mode returned the wrong result; starting_mode={starting_mode}, expected={expected_result:?}, result={result:?}, final_mode={final_mode:?}, events={events:?}"
+            );
+            assert!(
+                matches!(final_mode, ReplMode::Planning { .. }),
+                "canonical enter_plan_mode must leave the session planning; starting_mode={starting_mode}, final_mode={final_mode:?}, result={result:?}, events={events:?}"
+            );
+        }
+    }
+
     #[test]
     fn streaming_requires_both_user_opt_in_and_provider_support() {
         assert!(should_stream_responses(true, true));

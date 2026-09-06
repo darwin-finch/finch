@@ -467,20 +467,10 @@ impl ToolExecutor {
         if let Some(ref mode) = repl_mode {
             let current_mode = mode.read().await;
             if let crate::cli::ReplMode::Planning { .. } = &*current_mode {
-                // In planning mode, only allow read-only tools
-                let allowed_tools = [
-                    "read",
-                    "glob",
-                    "grep",
-                    "web_fetch",
-                    "enter_plan_mode",
-                    "EnterPlanMode",
-                    "present_plan",
-                    "PresentPlan",
-                    "ask_user_question",
-                    "AskUserQuestion",
-                ];
-                if !allowed_tools.contains(&tool_use.name.as_str()) {
+                if !crate::cli::repl_event::plan_handler::is_tool_allowed_in_mode(
+                    &tool_use.name,
+                    &current_mode,
+                ) {
                     drop(current_mode);
                     warn!("Tool '{}' blocked in planning mode", tool_use.name);
                     return Ok(ToolResult::error(

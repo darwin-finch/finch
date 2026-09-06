@@ -456,12 +456,31 @@ fn is_readonly_bash(command: &str) -> bool {
     readonly_prefixes.iter().any(|p| trimmed.starts_with(p))
 }
 
+/// Return the one policy identity shared by canonical plan tools and their
+/// dispatch-only legacy spellings.
+pub(crate) fn canonical_plan_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "EnterPlanMode" | "enter_plan_mode" => "enter_plan_mode",
+        "PresentPlan" | "present_plan" => "present_plan",
+        "AskUserQuestion" | "ask_user_question" => "ask_user_question",
+        "TodoRead" | "todo_read" => "todo_read",
+        "TodoWrite" | "todo_write" => "todo_write",
+        // ExitPlanMode is not a registered provider tool. Normalize its two
+        // historical spellings only so both fail through the same policy.
+        "ExitPlanMode" | "exit_plan_mode" => "exit_plan_mode",
+        _ => tool_name,
+    }
+}
+
 /// Effect declaration for legacy tool adapters.
 ///
 /// New VM programs carry this in their language-level signature. This table is
 /// the compatibility boundary while provider-native tools are still exposed.
 pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
-    match tool_name.to_ascii_lowercase().as_str() {
+    match canonical_plan_tool_name(tool_name)
+        .to_ascii_lowercase()
+        .as_str()
+    {
         // Transitional adapter only: invoking the typed broker is VM-local.
         // The program's model-supplied coarse effect label is deliberately
         // ignored; verified capability requirements govern host authority.
@@ -476,9 +495,9 @@ pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
         | "inspect_program"
         | "search_memory"
         | "list_recent_memories"
-        | "todoread" => ExecutionEffect::VmRead,
-        "todowrite" | "push" | "pop" | "clear" | "enterplanmode" | "presentplan"
-        | "askuserquestion" | "create_memory" => ExecutionEffect::VmWrite,
+        | "todo_read" => ExecutionEffect::VmRead,
+        "todo_write" | "push" | "pop" | "clear" | "enter_plan_mode" | "present_plan"
+        | "ask_user_question" | "create_memory" => ExecutionEffect::VmWrite,
         "read" | "glob" | "grep" | "hash_compare" | "excel_read" | "excel_range"
         | "excel_sheets" | "gui_inspect" => ExecutionEffect::WorkspaceRead,
         "web_fetch" => ExecutionEffect::ExternalRead,
@@ -830,6 +849,48 @@ mod tests {
         assert!(legacy_tool_effect("read", &serde_json::json!({})).runs_autonomously());
         assert!(!legacy_tool_effect("write", &serde_json::json!({})).runs_autonomously());
         assert!(!legacy_tool_effect("unknown", &serde_json::json!({})).runs_autonomously());
+    }
+
+    #[test]
+    fn plan_tool_aliases_share_one_effect_policy() {
+        let cases = [
+            ("EnterPlanMode", "enter_plan_mode", ExecutionEffect::VmWrite),
+            ("PresentPlan", "present_plan", ExecutionEffect::VmWrite),
+            (
+                "AskUserQuestion",
+                "ask_user_question",
+                ExecutionEffect::VmWrite,
+            ),
+            ("TodoRead", "todo_read", ExecutionEffect::VmRead),
+            ("TodoWrite", "todo_write", ExecutionEffect::VmWrite),
+        ];
+        for (legacy, canonical, expected) in cases {
+            let legacy_effect = legacy_tool_effect(legacy, &serde_json::json!({}));
+            let canonical_effect = legacy_tool_effect(canonical, &serde_json::json!({}));
+            assert_eq!(
+                (legacy_effect, canonical_effect),
+                (expected, expected),
+                "registered plan-tool aliases must share one effect policy; legacy={legacy}, canonical={canonical}, legacy_effect={legacy_effect:?}, canonical_effect={canonical_effect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_restoration_and_mutation_remain_fail_closed() {
+        for tool in ["ExitPlanMode", "exit_plan_mode", "unknown_plan_tool"] {
+            let effect = legacy_tool_effect(tool, &serde_json::json!({}));
+            assert!(
+                !effect.runs_autonomously(),
+                "unregistered capability-restoring or unknown tool must not run autonomously; tool={tool}, effect={effect:?}"
+            );
+        }
+        for tool in ["write", "edit", "patch"] {
+            let effect = legacy_tool_effect(tool, &serde_json::json!({}));
+            assert!(
+                !effect.runs_autonomously(),
+                "workspace mutation must remain approval-gated; tool={tool}, effect={effect:?}"
+            );
+        }
     }
 
     #[test]

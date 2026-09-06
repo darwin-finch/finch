@@ -33,6 +33,7 @@ use crate::tools::types::ToolUse;
 /// and plan-completion tools are allowed; `Write`, `Edit`, and similar
 /// destructive tools are blocked to enforce read-only exploration.
 pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool {
+    let tool_name = crate::tools::permissions::canonical_plan_tool_name(tool_name);
     match mode {
         ReplMode::Normal | ReplMode::Executing { .. } => {
             // All tools allowed (subject to normal confirmation)
@@ -51,18 +52,13 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
                     | "bash"
                     | "Bash"
                     | "present_plan"
-                    | "PresentPlan"
                     | "ask_user_question"
-                    | "AskUserQuestion"
                     // Session-local plan visibility is not a workspace or
                     // host mutation. Keep the familiar checklist usable
                     // while the model is deliberately planning.
                     | "todo_read"
                     | "todo_write"
-                    | "TodoRead"
-                    | "TodoWrite"
-                    | "EnterPlanMode"
-                    | "ExitPlanMode"
+                    | "enter_plan_mode"
             )
         }
     }
@@ -526,16 +522,20 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_mode_allows_enter_exit_plan_mode() {
+    fn test_plan_mode_allows_enter_but_not_exit_plan_mode() {
         let mode = planning_mode();
-        assert!(
-            is_tool_allowed_in_mode("EnterPlanMode", &mode),
-            "EnterPlanMode must be allowed in planning mode"
-        );
-        assert!(
-            is_tool_allowed_in_mode("ExitPlanMode", &mode),
-            "ExitPlanMode must be allowed in planning mode"
-        );
+        for tool in ["EnterPlanMode", "enter_plan_mode"] {
+            assert!(
+                is_tool_allowed_in_mode(tool, &mode),
+                "entering plan mode is an idempotent capability reduction; tool={tool}, mode={mode:?}"
+            );
+        }
+        for tool in ["ExitPlanMode", "exit_plan_mode"] {
+            assert!(
+                !is_tool_allowed_in_mode(tool, &mode),
+                "an unregistered capability-restoring tool must fail closed; tool={tool}, mode={mode:?}"
+            );
+        }
     }
 
     #[test]
