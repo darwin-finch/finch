@@ -1668,11 +1668,18 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);
-                output_status!("   Will forward all queries to teacher APIs");
+                let failure_state = GeneratorState::from_load_error(&e);
+                let no_cloud_fallback =
+                    matches!(&failure_state, GeneratorState::FailedNoCloudFallback { .. });
+                if no_cloud_fallback {
+                    output_status!(
+                        "   Local requests will fail explicitly; configured cloud profiles remain available when selected"
+                    );
+                } else {
+                    output_status!("   Will forward eligible queries to teacher APIs");
+                }
                 let mut state = state_clone.write().await;
-                *state = GeneratorState::Failed {
-                    error: format!("{}", e),
-                };
+                *state = failure_state;
             }
         });
     } else {
@@ -1706,7 +1713,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 break; // Stop monitoring once injected
             } else if matches!(
                 *state,
-                GeneratorState::Failed { .. } | GeneratorState::NotAvailable
+                GeneratorState::Failed { .. }
+                    | GeneratorState::FailedNoCloudFallback { .. }
+                    | GeneratorState::NotAvailable
             ) {
                 break; // Stop monitoring on failure
             }
