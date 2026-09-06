@@ -129,7 +129,10 @@ impl VmOutputProjection {
 
     fn project_for_execution(&self, execution_id: Option<uuid::Uuid>, effect: &VmSideEffect) {
         match &effect.event {
-            HostSideEffect::Emit { text } => self.default_response.append_response(text),
+            HostSideEffect::Emit { text } => {
+                self.default_response.set_assistant_output();
+                self.default_response.append_response(text);
+            }
             HostSideEffect::Request { .. } => {}
             HostSideEffect::Ui {
                 operation,
@@ -151,6 +154,7 @@ impl VmOutputProjection {
     /// from `project`: the portable VM event remains unchanged and another
     /// embedder may choose a different presentation for it.
     pub fn append_default(&self, text: &str) {
+        self.default_response.set_host_output();
         self.default_response.append_response(text);
     }
 
@@ -566,6 +570,92 @@ mod tests {
             },
             output: Vec::new(),
             origin: crate::vm::SourceOrigin::generated("test"),
+        }
+    }
+
+    fn emit_effect(text: &str) -> VmSideEffect {
+        VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit { text: text.into() },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("issue-350-say-prose-regression"),
+        }
+    }
+
+    #[test]
+    fn vm_output_producers_classify_say_lifecycle_and_failures_without_text_sniffing() {
+        use crate::cli::messages::{MessageStatus, TranscriptRowKind};
+
+        let manager = Arc::new(silent_manager());
+        let colors = crate::config::ColorScheme::default();
+
+        let prose = manager.start_work_unit("say");
+        prose.set_pending_program_output();
+        let prose_projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&prose));
+        prose_projection.project(&emit_effect("VM error: this is valid prose"));
+        prose.set_complete();
+        let prose_row = prose
+            .transcript_row(&colors)
+            .expect("successful say must project a transcript row");
+        assert_eq!(
+            prose_row.kind,
+            TranscriptRowKind::Response,
+            "an error-like prefix emitted by say must remain assistant prose: {prose_row:?}"
+        );
+        assert_eq!(
+            prose.background_style(&colors),
+            Some(colors.message_band_style(crate::config::MessageBand::Assistant)),
+            "successful say must use the assistant semantic band: {prose_row:?}"
+        );
+
+        let lifecycle = manager.start_work_unit("lifecycle");
+        lifecycle.set_pending_program_output();
+        let lifecycle_projection =
+            VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&lifecycle));
+        lifecycle_projection.append_default("Proposal awaiting review");
+        lifecycle.set_complete();
+        let lifecycle_row = lifecycle
+            .transcript_row(&colors)
+            .expect("host lifecycle output must project a transcript row");
+        assert_eq!(
+            lifecycle_row.kind,
+            TranscriptRowKind::Output,
+            "host append_default must remain ordinary Program output: {lifecycle_row:?}"
+        );
+
+        for diagnostic in [
+            "\nVM error: direct failure",
+            "\nVM wire error: provider failure",
+        ] {
+            let failed = manager.start_work_unit("later failure");
+            failed.set_pending_program_output();
+            let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&failed));
+            projection.project(&emit_effect("visible before failure"));
+            failed.append_program_diagnostic(diagnostic);
+            failed.set_complete();
+            let row = failed
+                .transcript_row(&colors)
+                .expect("direct/provider failure must project a transcript row");
+            assert_eq!(
+                row.kind,
+                TranscriptRowKind::Output,
+                "a later direct/provider failure must override provisional say semantics: diagnostic={diagnostic:?} row={row:?}"
+            );
+            assert_eq!(
+                failed.status(),
+                MessageStatus::Complete,
+                "the semantic-only slice must preserve the base completion status: diagnostic={diagnostic:?} row={row:?}"
+            );
+            assert_eq!(
+                failed.content(),
+                format!("visible before failure{diagnostic}"),
+                "failure projection must retain earlier say text and the diagnostic"
+            );
         }
     }
 

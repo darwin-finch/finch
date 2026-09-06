@@ -402,7 +402,7 @@ async fn execute_wire_with_single_repair(
         &source,
     );
     let output_unit = output_manager.start_work_unit("VM program output");
-    output_unit.set_program_output();
+    output_unit.set_pending_program_output();
     let initial = execute_direct_wire_response(
         runtime,
         Arc::clone(&output_manager),
@@ -453,7 +453,7 @@ async fn execute_wire_with_single_repair(
     metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
     metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
 
-    output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+    output_unit.append_program_diagnostic(&format!("VM wire error: {diagnostic}"));
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
@@ -557,7 +557,7 @@ async fn execute_wire_with_single_repair(
     repair_source_unit.set_complete();
 
     let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
-    repair_output_unit.set_program_output();
+    repair_output_unit.set_pending_program_output();
     match execute_direct_wire_response(
         runtime,
         output_manager,
@@ -594,7 +594,7 @@ async fn execute_wire_with_single_repair(
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            repair_output_unit.append_response(&format!("VM wire error: {detail}"));
+            repair_output_unit.append_program_diagnostic(&format!("VM wire error: {detail}"));
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -609,7 +609,7 @@ async fn execute_wire_with_single_repair(
         }
         Err(error) => {
             let detail = format!("VM wire error: {error}");
-            repair_output_unit.append_response(&detail);
+            repair_output_unit.append_program_diagnostic(&detail);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&repair_output_unit),
             });
@@ -2481,12 +2481,13 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_wire_scheduler_resumes_only_cooperative_yields() {
-        use crate::cli::messages::{Message, MessageStatus};
+        use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind};
 
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
         let work_unit = output.start_work_unit("VM output");
+        work_unit.set_pending_program_output();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let complete = execute_direct_wire_response(
             &runtime,
@@ -2494,16 +2495,20 @@ mod tests {
             Arc::clone(&work_unit),
             event_tx.clone(),
             tokio_util::sync::CancellationToken::new(),
-            "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
+            "(begin (say \"VM error: valid prose\\n\") (yield) (say \"second line\\n\") (yield) (say \"third line\"))".to_string(),
             None,
         )
         .await
         .unwrap();
         assert_eq!(
             complete.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "the live say program must complete before transcript projection: outcome={complete:?}"
         );
-        assert_eq!(complete.output, "onetwothree");
+        assert_eq!(
+            complete.output, "VM error: valid prose\nsecond line\nthird line",
+            "the runtime must retain multiline say output exactly once: outcome={complete:?}"
+        );
         event_tx
             .send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&work_unit),
@@ -2525,13 +2530,48 @@ mod tests {
                 other => panic!("unexpected event: {other:?}"),
             }
         }
-        assert_eq!(emitted, 3, "all say events cross the UI bus");
-        assert_eq!(work_unit.content(), "onetwothree");
-        assert_eq!(work_unit.status(), MessageStatus::Complete);
-        assert!(runtime
+        assert_eq!(
+            emitted,
+            3,
+            "all say events must cross the UI bus exactly once: content={:?}",
+            work_unit.content()
+        );
+        assert_eq!(
+            work_unit.content(),
+            "VM error: valid prose\nsecond line\nthird line",
+            "the live projection must retain multiline say output exactly once"
+        );
+        assert_eq!(
+            work_unit.status(),
+            MessageStatus::Complete,
+            "the live say projection must preserve completion status: content={:?}",
+            work_unit.content()
+        );
+        let row = work_unit
+            .transcript_row(&crate::config::ColorScheme::default())
+            .expect("completed multiline say output must produce a transcript row");
+        assert_eq!(
+            row.kind,
+            TranscriptRowKind::Response,
+            "successful say output must project as assistant prose even when it starts with an error-like prefix: {row:?}"
+        );
+        assert_eq!(
+            row.body,
+            [
+                "VM error: valid prose".to_string(),
+                "second line".to_string(),
+                "third line".to_string(),
+            ],
+            "the transcript must preserve multiline live say output exactly once: {row:?}"
+        );
+        let pending = runtime
             .pending_typed_execution(complete.execution_id)
-            .unwrap()
-            .is_none());
+            .unwrap();
+        assert!(
+            pending.is_none(),
+            "the completed live say execution must not remain suspended: execution_id={} pending={pending:?}",
+            complete.execution_id
+        );
     }
 
     #[tokio::test]
@@ -2776,13 +2816,18 @@ mod tests {
         // the WorkUnit mutation, so apply the queued projection exactly as it
         // would on the live REPL task.
         let mut projected = 0;
-        while let Ok(ReplEvent::VmEffect {
-            projection,
-            envelope,
-        }) = event_rx.try_recv()
-        {
-            if !projection.project_envelope(envelope).is_empty() {
-                projected += 1;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    if !projection.project_envelope(envelope).is_empty() {
+                        projected += 1;
+                    }
+                }
+                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                other => panic!("wire execution emitted an unexpected event: {other:?}"),
             }
         }
 
@@ -2806,6 +2851,23 @@ mod tests {
             messages.len(),
             3,
             "source, failed output, repaired source/output"
+        );
+        let rows = messages
+            .iter()
+            .map(|message| {
+                message
+                    .transcript_row(&crate::config::ColorScheme::default())
+                    .expect("each wire attempt artifact must project a transcript row")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            [
+                crate::cli::messages::TranscriptRowKind::Output,
+                crate::cli::messages::TranscriptRowKind::Program,
+                crate::cli::messages::TranscriptRowKind::Response,
+            ],
+            "the rejected wire diagnostic must remain Program output while only the repaired say becomes assistant prose: {rows:?}"
         );
         assert!(messages.iter().all(|message| !message
             .format(&crate::config::ColorScheme::default())

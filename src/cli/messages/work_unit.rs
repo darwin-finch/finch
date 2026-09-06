@@ -128,6 +128,14 @@ pub enum WorkUnitPresentation {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProgramOutputSemantics {
+    Pending,
+    AssistantSay,
+    #[default]
+    Ordinary,
+}
+
 /// A single tool-call sub-item rendered below the WorkUnit header
 #[derive(Clone, Debug)]
 pub struct WorkRow {
@@ -163,6 +171,7 @@ struct WorkUnitInner {
     /// Elapsed time captured when the unit completed (stable for scrollback display)
     elapsed_at_finish: Option<std::time::Duration>,
     presentation: WorkUnitPresentation,
+    program_output_semantics: ProgramOutputSemantics,
     /// Host/UI state distinct from the output body. A VM `output-status`
     /// must not erase prior `output-append`/`output-replace` content.
     transient_status: Option<String>,
@@ -222,6 +231,7 @@ impl WorkUnit {
                 status: MessageStatus::InProgress,
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
+                program_output_semantics: ProgramOutputSemantics::Ordinary,
                 transient_status: None,
                 progress: None,
             })),
@@ -299,22 +309,64 @@ impl WorkUnit {
     /// Render this unit as output emitted by a VM program, not an assistant
     /// message. `say` itself remains append-only; this only chooses UI chrome.
     pub fn set_program_output(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+    }
+
+    /// Start an untitled VM response port whose producer will classify the
+    /// first semantic output event.
+    pub(crate) fn set_pending_program_output(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Pending;
+    }
+
+    /// Mark a pending response port as conversational `say` output. Ordinary
+    /// output cannot later be reclassified by an unrelated emit.
+    pub(crate) fn set_assistant_output(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: None }
+        ) && matches!(
+            inner.program_output_semantics,
+            ProgramOutputSemantics::Pending | ProgramOutputSemantics::AssistantSay
+        ) {
+            inner.program_output_semantics = ProgramOutputSemantics::AssistantSay;
+        }
+    }
+
+    /// Append a direct/provider diagnostic as ordinary program output,
+    /// replacing provisional `say` semantics without changing terminal status.
+    pub(crate) fn append_program_diagnostic(&self, text: &str) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput { title: None };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        inner.response_text.push_str(text);
+    }
+
+    /// Resolve a pending response port as host lifecycle output while leaving
+    /// ordinary assistant/tool units in their existing presentation.
+    pub(crate) fn set_host_output(&self) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: None }
+        ) {
+            inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
+        }
     }
 
     /// Render this unit as an independently addressable VM output handle.
     /// The title is presentation metadata supplied by `output-open`, not an
     /// emitted response fragment.
     pub fn set_output_handle(&self, title: impl Into<String>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.presentation = WorkUnitPresentation::ProgramOutput {
             title: Some(title.into()),
         };
+        inner.program_output_semantics = ProgramOutputSemantics::Ordinary;
     }
 
     /// Update transient status independently from the durable visible body.
@@ -736,6 +788,16 @@ impl Message for WorkUnit {
                 inner.status == MessageStatus::InProgress
                     || inner.response_text.lines().count() <= 3,
             ),
+            WorkUnitPresentation::ProgramOutput { title: None }
+                if program_output_is_assistant(&inner) =>
+            {
+                (
+                    TranscriptRowKind::Response,
+                    "Assistant response".to_string(),
+                    program_output_lines(&inner),
+                    true,
+                )
+            }
             WorkUnitPresentation::ProgramOutput { title } => (
                 TranscriptRowKind::Output,
                 title
@@ -763,6 +825,11 @@ impl Message for WorkUnit {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let band = match &inner.presentation {
             WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+            WorkUnitPresentation::ProgramOutput { title: None }
+                if program_output_is_assistant(&inner) =>
+            {
+                MessageBand::Assistant
+            }
             WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
             WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
                 MessageBand::Assistant
@@ -781,6 +848,11 @@ impl Message for WorkUnit {
         if inner.rows.is_empty() {
             let band = match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { title: None }
+                    if program_output_is_assistant(&inner) =>
+                {
+                    MessageBand::Assistant
+                }
                 WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
                 WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
                     MessageBand::Assistant
@@ -816,6 +888,11 @@ impl Message for WorkUnit {
         } else {
             match &inner.presentation {
                 WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { title: None }
+                    if program_output_is_assistant(&inner) =>
+                {
+                    MessageBand::Assistant
+                }
                 WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
                 WorkUnitPresentation::Assistant | WorkUnitPresentation::Activity { .. } => {
                     MessageBand::Assistant
@@ -838,6 +915,16 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
             &inner.presentation,
             WorkUnitPresentation::ProgramOutput { title: Some(_) }
         )
+}
+
+fn program_output_is_assistant(inner: &WorkUnitInner) -> bool {
+    matches!(
+        (&inner.presentation, inner.program_output_semantics),
+        (
+            WorkUnitPresentation::ProgramOutput { title: None },
+            ProgramOutputSemantics::AssistantSay
+        )
+    )
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -1247,6 +1334,34 @@ mod tests {
 
     fn colors() -> ColorScheme {
         ColorScheme::default()
+    }
+
+    #[test]
+    fn public_work_unit_presentation_variants_remain_source_compatible() {
+        fn variant_name(presentation: WorkUnitPresentation) -> &'static str {
+            match presentation {
+                WorkUnitPresentation::Assistant => "assistant",
+                WorkUnitPresentation::Activity { .. } => "activity",
+                WorkUnitPresentation::ProgramSource { .. } => "source",
+                WorkUnitPresentation::ProgramOutput { .. } => "output",
+            }
+        }
+
+        let observed = [
+            variant_name(WorkUnitPresentation::Assistant),
+            variant_name(WorkUnitPresentation::Activity {
+                title: "activity".into(),
+            }),
+            variant_name(WorkUnitPresentation::ProgramSource {
+                language: "forth".into(),
+            }),
+            variant_name(WorkUnitPresentation::ProgramOutput { title: None }),
+        ];
+        assert_eq!(
+            observed,
+            ["assistant", "activity", "source", "output"],
+            "producer-owned say metadata must not expand the public presentation enum: {observed:?}"
+        );
     }
 
     // ── Construction ─────────────────────────────────────────────────────────

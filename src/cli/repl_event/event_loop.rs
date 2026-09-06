@@ -3567,7 +3567,7 @@ Rules:\n\
         source_unit.set_response(source.clone());
         source_unit.set_complete();
         let output_unit = self.output_manager.start_work_unit("VM program output");
-        output_unit.set_program_output();
+        output_unit.set_pending_program_output();
         let projection =
             VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
         let event_tx = self.event_tx.clone();
@@ -4426,9 +4426,11 @@ Rules:\n\
                             outcome.diagnostics.first().cloned().unwrap_or_else(|| {
                                 format!("VM program ended as {:?}", outcome.status)
                             });
-                        output_unit.append_response(&format!("VM error: {detail}"));
+                        output_unit.append_program_diagnostic(&format!("VM error: {detail}"));
                     }
-                    Err(error) => output_unit.append_response(&format!("VM error: {error}")),
+                    Err(error) => {
+                        output_unit.append_program_diagnostic(&format!("VM error: {error}"));
+                    }
                 }
                 output_unit.set_complete();
                 self.render_tui().await?;
