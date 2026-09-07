@@ -187,16 +187,17 @@ pub(crate) async fn handle_present_plan(
     }
 
     let dialog_result: crate::cli::tui::DialogResult = tokio::select! {
-        result = dialog_rx => match result {
-            Ok(r) => r,
-            Err(_) => crate::cli::tui::DialogResult::Cancelled,
-        },
+        biased;
         _ = cancel.cancelled() => {
             // Clean up active dialog on cancellation
             let mut tui = tui_renderer.lock().await;
             tui.active_dialog = None;
             crate::cli::tui::DialogResult::Cancelled
-        }
+        },
+        result = dialog_rx => match result {
+            Ok(r) => r,
+            Err(_) => crate::cli::tui::DialogResult::Cancelled,
+        },
     };
 
     // Handle dialog result
@@ -207,7 +208,17 @@ pub(crate) async fn handle_present_plan(
             // the ToolResult message (referencing the assistant's ToolUse block) after
             // we return.  Adding extra user messages here would create consecutive user
             // messages that the Claude API rejects, causing a silent hang.
-            *mode.write().await = crate::cli::ReplMode::Executing {
+            //
+            // Acquire the same mode lock that CancelQuery takes after atomically
+            // cancelling the query.  Rechecking the token while holding this lock
+            // establishes the approval commit point: cancellation that won first
+            // leaves Normal untouched and cannot be followed by approval output;
+            // cancellation that starts later waits to restore Normal.
+            let mut current_mode = mode.write().await;
+            if cancel.is_cancelled() {
+                return Some(Ok(dismissed_plan_msg()));
+            }
+            *current_mode = crate::cli::ReplMode::Executing {
                 task: task.clone(),
                 plan_path: plan_path.clone(),
                 approved_at: Utc::now(),

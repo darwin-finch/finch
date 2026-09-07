@@ -855,7 +855,7 @@ pub(super) async fn dispatch_tool_uses(
         .get_metadata(query_id)
         .await
         .and_then(|metadata| metadata.effect_audit);
-    let current_mode = mode.read().await;
+    let current_mode = mode.read().await.clone();
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
         // the model is stuck; return a terminal error so it breaks out.
@@ -981,8 +981,6 @@ pub(super) async fn dispatch_tool_uses(
             );
         }
     }
-    drop(current_mode);
-
     // Update memory status bar now that tools are queued
     if let Some(ref mem) = memory_system {
         status_bar.update_line(
@@ -2023,6 +2021,400 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn test_present_plan_approval_returns_from_real_dispatch_without_deadlock() {
+        let temp = tempfile::tempdir().expect("plan approval fixture needs a temporary directory");
+        let colors = crate::config::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let tui = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "repair plan approval".into(),
+            plan_path: temp.path().join("plan.md"),
+            created_at: chrono::Utc::now(),
+        }));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states.create_query(Vec::new()).await;
+        let plan_tool_use = ToolUse {
+            id: "present-plan-1".into(),
+            name: "present_plan".into(),
+            input: serde_json::json!({"plan": "Implement the approved change."}),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::claude::Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: plan_tool_use.id.clone(),
+                        name: plan_tool_use.name.clone(),
+                        input: plan_tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("fixture must stage the provider's present_plan call");
+        assert!(
+            query_states.begin_tool_execution(query_id, 1).await,
+            "fixture must enter ExecutingTools before dispatch; state={:?}",
+            query_states.get_state(query_id).await
+        );
+        let initial_state = query_states.get_state(query_id).await;
+        assert!(
+            matches!(initial_state, Some(QueryState::ExecutingTools { .. })),
+            "real dispatch regression requires ExecutingTools; mode={:?}, state={initial_state:?}",
+            mode.read().await
+        );
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let executor = Arc::new(tokio::sync::Mutex::new(
+            crate::tools::executor::ToolExecutor::new(
+                crate::tools::registry::ToolRegistry::new(),
+                crate::tools::permissions::PermissionManager::new(),
+                temp.path().join("tool-patterns.json"),
+            )
+            .expect("fixture tool executor must initialize"),
+        ));
+        let coordinator = super::super::tool_execution::ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            executor,
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+        let work_unit = output.start_work_unit("planning");
+        let active_tool_uses = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let tool_call_history = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let mut dispatch = tokio::spawn({
+            let mode = Arc::clone(&mode);
+            let work_unit = Arc::clone(&work_unit);
+            let tui = Arc::clone(&tui);
+            let output = Arc::clone(&output);
+            let query_states = Arc::clone(&query_states);
+            let active_tool_uses = Arc::clone(&active_tool_uses);
+            let tool_call_history = Arc::clone(&tool_call_history);
+            let status = Arc::clone(&status);
+            async move {
+                dispatch_tool_uses(
+                    vec![plan_tool_use],
+                    query_id,
+                    round_token,
+                    &work_unit,
+                    &mode,
+                    &tool_call_history,
+                    &event_tx,
+                    &active_tool_uses,
+                    &tui,
+                    &output,
+                    &query_states,
+                    &coordinator,
+                    &None,
+                    crate::memory_status::Recall::none(),
+                    "plan-test",
+                    "/workspace",
+                    &status,
+                    0,
+                )
+                .await;
+            }
+        });
+
+        let mut event_diagnostics = Vec::new();
+        let mut result_events = Vec::new();
+        let response_tx = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = event_rx
+                    .recv()
+                    .await
+                    .expect("real dispatch event channel closed before plan dialog");
+                event_diagnostics.push(format!("{event:?}"));
+                match event {
+                    ReplEvent::ShowDialog { response_tx, .. } => break response_tx,
+                    ReplEvent::ToolResult {
+                        query_id,
+                        tool_id,
+                        result,
+                        ..
+                    } => result_events.push((query_id, tool_id, result)),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "real dispatch did not publish the plan dialog within one second; events={event_diagnostics:?}"
+            )
+        });
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("plan dialog receiver disappeared before approval");
+
+        let dispatch_result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut dispatch).await;
+        if dispatch_result.is_err() {
+            dispatch.abort();
+            let abort_result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut dispatch).await;
+            let mode_diagnostic = mode.read().await.clone();
+            let state_diagnostic = query_states.get_state(query_id).await;
+            panic!(
+                "approved present_plan deadlocked in dispatch; mode read/write ownership never released; abort={abort_result:?}, mode={mode_diagnostic:?}, state={state_diagnostic:?}, events={event_diagnostics:?}"
+            );
+        }
+        dispatch_result
+            .expect("dispatch completion was checked above")
+            .expect("dispatch task panicked");
+
+        while let Ok(event) = event_rx.try_recv() {
+            event_diagnostics.push(format!("{event:?}"));
+            if let ReplEvent::ToolResult {
+                query_id,
+                tool_id,
+                result,
+                ..
+            } = event
+            {
+                result_events.push((query_id, tool_id, result));
+            }
+        }
+        let final_mode = mode.read().await.clone();
+        let final_state = query_states.get_state(query_id).await;
+        assert!(
+            matches!(final_mode, ReplMode::Executing { .. }),
+            "approval must transition Planning to Executing; mode={final_mode:?}, state={final_state:?}, events={event_diagnostics:?}"
+        );
+
+        assert_eq!(
+            result_events.len(),
+            1,
+            "one present_plan must emit exactly one ToolResult; mode={final_mode:?}, state={final_state:?}, events={event_diagnostics:?}"
+        );
+        assert!(
+            result_events[0].0 == query_id
+                && result_events[0].1 == "present-plan-1"
+                && result_events[0].2.is_ok(),
+            "the sole ToolResult must succeed with the original query/tool ids; mode={final_mode:?}, state={final_state:?}, results={result_events:?}, events={event_diagnostics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_present_plan_cannot_publish_late_approval_from_real_dispatch() {
+        let temp =
+            tempfile::tempdir().expect("plan cancellation fixture needs a temporary directory");
+        let colors = crate::config::ColorScheme::default();
+        let output = Arc::new(OutputManager::new(colors.clone()));
+        let status = Arc::new(StatusBar::new());
+        let tui = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            colors,
+        )));
+        let mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "cancel plan approval".into(),
+            plan_path: temp.path().join("plan.md"),
+            created_at: chrono::Utc::now(),
+        }));
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let query_states = Arc::new(QueryStateManager::new());
+        let query_id = query_states.create_query(Vec::new()).await;
+        let plan_tool_use = ToolUse {
+            id: "cancelled-present-plan-1".into(),
+            name: "present_plan".into(),
+            input: serde_json::json!({"plan": "This approval must not survive cancellation."}),
+        };
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(
+                query_id,
+                crate::claude::Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: plan_tool_use.id.clone(),
+                        name: plan_tool_use.name.clone(),
+                        input: plan_tool_use.input.clone(),
+                    }],
+                },
+            )
+            .expect("fixture must stage the provider's present_plan call");
+        assert!(
+            query_states.begin_tool_execution(query_id, 1).await,
+            "fixture must enter ExecutingTools before cancellation; state={:?}",
+            query_states.get_state(query_id).await
+        );
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let executor = Arc::new(tokio::sync::Mutex::new(
+            crate::tools::executor::ToolExecutor::new(
+                crate::tools::registry::ToolRegistry::new(),
+                crate::tools::permissions::PermissionManager::new(),
+                temp.path().join("tool-patterns.json"),
+            )
+            .expect("fixture tool executor must initialize"),
+        ));
+        let coordinator = super::super::tool_execution::ToolExecutionCoordinator::new(
+            event_tx.clone(),
+            executor,
+            Arc::clone(&output),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            Arc::clone(&mode),
+            Arc::new(RwLock::new(None)),
+        );
+        let work_unit = output.start_work_unit("planning cancellation");
+        let active_tool_uses = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let tool_call_history = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let mut dispatch = tokio::spawn({
+            let mode = Arc::clone(&mode);
+            let work_unit = Arc::clone(&work_unit);
+            let tui = Arc::clone(&tui);
+            let output = Arc::clone(&output);
+            let query_states = Arc::clone(&query_states);
+            let active_tool_uses = Arc::clone(&active_tool_uses);
+            let tool_call_history = Arc::clone(&tool_call_history);
+            let status = Arc::clone(&status);
+            async move {
+                dispatch_tool_uses(
+                    vec![plan_tool_use],
+                    query_id,
+                    round_token,
+                    &work_unit,
+                    &mode,
+                    &tool_call_history,
+                    &event_tx,
+                    &active_tool_uses,
+                    &tui,
+                    &output,
+                    &query_states,
+                    &coordinator,
+                    &None,
+                    crate::memory_status::Recall::none(),
+                    "cancel-plan-test",
+                    "/workspace",
+                    &status,
+                    0,
+                )
+                .await;
+            }
+        });
+
+        let mut event_diagnostics = Vec::new();
+        let response_tx = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = event_rx
+                    .recv()
+                    .await
+                    .expect("real dispatch event channel closed before cancellation dialog");
+                event_diagnostics.push(format!("{event:?}"));
+                if let ReplEvent::ShowDialog { response_tx, .. } = event {
+                    break response_tx;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "real dispatch did not publish the cancellation dialog within one second; events={event_diagnostics:?}"
+            )
+        });
+
+        // Reproduce the reviewed hostile order exactly. CancelQuery sets the
+        // query token and terminal state before it takes the mode lock to
+        // restore Normal. Holding that lock lets the selected approval reach
+        // its commit point first and wait there; cancellation then wins before
+        // the approval writer is released.
+        let mut cancel_mode = mode.write().await;
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("plan dialog receiver disappeared before hostile approval");
+        tokio::task::yield_now().await;
+        assert!(
+            query_states.cancel_query(query_id).await,
+            "hostile fixture must terminally cancel the active query; mode={cancel_mode:?}, state={:?}, events={event_diagnostics:?}",
+            query_states.get_state(query_id).await
+        );
+        *cancel_mode = ReplMode::Normal;
+        drop(cancel_mode);
+
+        let dispatch_result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut dispatch).await;
+        if dispatch_result.is_err() {
+            dispatch.abort();
+            let abort_result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut dispatch).await;
+            panic!(
+                "cancelled present_plan did not leave the approval commit promptly; abort={abort_result:?}, mode={:?}, state={:?}, events={event_diagnostics:?}",
+                mode.read().await,
+                query_states.get_state(query_id).await
+            );
+        }
+        dispatch_result
+            .expect("dispatch completion was checked above")
+            .expect("dispatch task panicked");
+
+        let mut result_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            event_diagnostics.push(format!("{event:?}"));
+            if let ReplEvent::ToolResult {
+                query_id,
+                tool_id,
+                result,
+                ..
+            } = event
+            {
+                result_events.push((query_id, tool_id, result));
+            }
+        }
+        let final_mode = mode.read().await.clone();
+        let final_state = query_states.get_state(query_id).await;
+        let rendered_output = output
+            .get_messages()
+            .iter()
+            .map(|message| message.content())
+            .collect::<Vec<_>>();
+
+        assert!(
+            matches!(final_state, Some(QueryState::Cancelled))
+                && matches!(final_mode, ReplMode::Normal),
+            "terminal cancellation must remain Normal and may not be overwritten by late approval; mode={final_mode:?}, state={final_state:?}, results={result_events:?}, events={event_diagnostics:?}, output={rendered_output:?}"
+        );
+        assert_eq!(
+            result_events.len(),
+            1,
+            "cancelled present_plan must emit exactly one non-approval ToolResult; mode={final_mode:?}, state={final_state:?}, events={event_diagnostics:?}, output={rendered_output:?}"
+        );
+        let cancelled_result = result_events[0]
+            .2
+            .as_ref()
+            .expect("cancellation is a handled dialog outcome, not a tool error");
+        assert!(
+            result_events[0].0 == query_id
+                && result_events[0].1 == "cancelled-present-plan-1"
+                && cancelled_result.contains("Plan approval cancelled")
+                && !cancelled_result.contains("Plan approved by user"),
+            "late ToolResult must describe cancellation, never approval; mode={final_mode:?}, state={final_state:?}, results={result_events:?}, events={event_diagnostics:?}, output={rendered_output:?}"
+        );
+        assert!(
+            rendered_output
+                .iter()
+                .all(|message| !message.contains("Plan approved!")),
+            "terminal cancellation must suppress visible approval success; mode={final_mode:?}, state={final_state:?}, results={result_events:?}, events={event_diagnostics:?}, output={rendered_output:?}"
+        );
+    }
 
     #[test]
     fn streaming_requires_both_user_opt_in_and_provider_support() {
