@@ -3,11 +3,20 @@
 # Repeatable before/after startup benchmark for #364 ("Instrument and reduce
 # Finch interactive TUI time-to-ready").
 #
-# This is NOT a correctness gate and must never become one. `AGENTS.md` forbids
-# asserting a wall-clock startup property, and the lesson is concrete:
-# `a0ea2c64` ("assert hydration state, not a wall-clock ratio") replaced the
-# last of four such assertions on #242, one of which reached green CI while
-# depending on the machine being busy. The gate is
+# This is NOT a correctness gate and must never become one. #364 asks for the
+# benchmark to be "kept separate from the correctness gates", and requires of
+# this work's coverage "Synchronization and structural assertions, not absolute
+# wall-clock thresholds". The precedent it cites is `a0ea2c64` ("assert
+# hydration state, not a wall-clock ratio"), which replaced the last of four
+# attempts at a timing assertion on #242 ("Make ordinary TUI startup
+# prompt-first and lazily hydrate MemTree"), one of which reached green CI
+# while depending on the machine being busy.
+#
+# That requirement is written in #364 and its precedent is `a0ea2c64`; it is
+# not a rule in `AGENTS.md`. PR #391 ("docs(agents): write down the
+# no-wall-clock-assertion rule") proposed adding it and was closed DO NOT
+# MERGE. Earlier revisions of this file cited it to `AGENTS.md` anyway; a
+# reader who greps for it there will not find it. The gate is
 # `tests/startup_time_to_ready.rs`, which asserts structure and never a
 # duration. This answers "did it get faster", which is a question about a
 # machine and has to be reported with the machine attached.

@@ -5,7 +5,9 @@
 //! the path from `main` to the first interactive frame, no tracing span, and no
 //! diagnostic that reported a duration -- only two `SHAMMAH_DEBUG` `eprintln!`s
 //! bracketing the entire event loop. Every latency claim about startup was
-//! therefore unfalsifiable, which is the failure mode `AGENTS.md` names first.
+//! therefore unfalsifiable -- which is `AGENTS.md`'s first key principle,
+//! "Evidence before claims: configuration or design intent is not
+//! conformance", applied to latency.
 //!
 //! # What "time-to-ready" means here
 //!
@@ -54,6 +56,23 @@
 //! prompt, a path, or a credential, so a report cannot leak one by mistake
 //! rather than merely by convention.
 //!
+//! # Two phases have no `warn` sink yet
+//!
+//! [`PHASE_ARGS`] and the first [`PHASE_CONFIG`] (`category=debug_logging_probe`)
+//! both open **and close** before [`PHASE_TRACING`] installs a subscriber, so
+//! when their guards drop there is nothing to receive a `tracing` event. They
+//! are recorded in the timeline and appear in the report exactly like every
+//! other phase; what they cannot do is emit the over-budget `warn!` that #364
+//! requires of a phase that exceeds its budget, because no subscriber exists
+//! to render it. This is a real, named gap rather than a silent one.
+//!
+//! It is not fixable by moving the boundary: what verbosity to install is
+//! decided by the parsed arguments and by that first configuration read, so
+//! initialising tracing before them would mean initialising it before knowing
+//! what to initialise it to. The two phases sit at 0.272 ms and 0.419 ms on
+//! the reference host; a regression in either shows up in the report's
+//! `at_ms` column, which is the surface that still works.
+//!
 //! # Cost when nobody asked
 //!
 //! `FINCH_STARTUP_TIMINGS` unset is the common case and must be nearly free:
@@ -69,80 +88,167 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Phase names. `&'static str` so no caller can smuggle content into one.
-pub const PHASE_ARGS: &str = "args_parse";
-pub const PHASE_CONFIG: &str = "config_load";
-pub const PHASE_TRACING: &str = "tracing_init";
-pub const PHASE_THRESHOLD_ROUTER: &str = "threshold_router_load";
-pub const PHASE_PROVIDER_GRAPH: &str = "provider_graph_build";
-pub const PHASE_METRICS: &str = "metrics_logger_init";
-pub const PHASE_DAEMON_CONNECT: &str = "daemon_http_connect";
-pub const PHASE_REPL_NEW: &str = "repl_construct";
-pub const PHASE_SESSION_RESTORE: &str = "session_restore";
-pub const PHASE_IPC_CONNECT: &str = "ipc_connect";
-pub const PHASE_TERMINAL_INIT: &str = "terminal_init";
-pub const PHASE_MEMORY_OPEN: &str = "memory_open";
-pub const PHASE_PROGRAM_SYNC: &str = "program_sync";
-pub const PHASE_TOOL_REGISTRY: &str = "tool_registry";
-/// Typed-runtime construction and, on macOS, the Accessibility availability
-/// probe. Separate from tool registration because it is the one phase here
-/// that can stall on an OS permission check, and attributing that to registry
-/// construction sends a reader to the wrong code.
-pub const PHASE_PROGRAM_RUNTIME: &str = "program_runtime";
-pub const PHASE_MCP_CONNECT: &str = "mcp_connect";
-pub const PHASE_BRAIN_REGISTER: &str = "brain_register";
-pub const PHASE_BRAIN_ATTACH: &str = "brain_attach";
+/// Declare phase or mark names, and the slice of every name declared.
+///
+/// The slice and the constants are generated from one list, so they cannot
+/// drift apart. That is the point: `tests/startup_time_to_ready.rs` derives
+/// what it expects the report to contain from [`ALL_PHASES`] and
+/// [`ALL_MARKS`], so deleting an instrumented phase can no longer be made to
+/// pass by also deleting the line that expected it. Before this existed, a
+/// mutant that dropped `program_runtime` from both the production guard and
+/// the test's expected order left the suite entirely green: nothing tied the
+/// expected set to the instrumented set.
+macro_rules! declare_names {
+    ($slice:ident: $($(#[$attribute:meta])* $konst:ident = $name:literal;)*) => {
+        $($(#[$attribute])* pub const $konst: &str = $name;)*
+        /// Every name declared above, in declaration order.
+        pub const $slice: &[&str] = &[$($name),*];
+    };
+}
 
-// The phases below cover what the first report measured and could not name: at
-// that tip 6.4 ms of a 13.99 ms total sat between `input_captured` and
-// `brain_register` with nothing over it, and the commit message attributed the
-// gap to serial daemon IPC. That was wrong -- `register_home_brain` is wholly
-// inside `brain_register`, at 0.003 ms, and runs *after* the gap. This is what
-// was actually in there.
+// Phase names. `&'static str` so no caller can smuggle content into one.
+declare_names! {
+    ALL_PHASES:
 
-/// Selecting and constructing the generators the event loop will use, which
-/// includes the second full provider-graph build of the process.
-pub const PHASE_GENERATOR_SELECT: &str = "generator_select";
-/// `ProviderResolver` and `AgentScheduler` construction.
-pub const PHASE_SCHEDULER_INIT: &str = "scheduler_init";
-/// Registering the agent tools and materialising the model-visible tool list.
-pub const PHASE_TOOL_DEFINITIONS: &str = "tool_definitions";
-/// `EventLoop::new`: channels, watcher tasks, the terminal reader, the tool
-/// coordinator and the memtree console. Encloses [`MARK_INPUT_CAPTURED`].
-pub const PHASE_EVENT_LOOP_NEW: &str = "event_loop_construct";
-/// Handing the terminal to the TUI and clearing accumulated startup noise out
-/// of the output manager.
-pub const PHASE_TUI_HANDOFF: &str = "tui_handoff";
-/// Resolving the selected generator through the provider handle so the header
-/// can name the model.
-pub const PHASE_GENERATOR_RESOLVE: &str = "generator_resolve";
-/// The weekly licence notice, which performs the third full `config.toml` read
-/// and TOML parse of the process (#76).
-pub const PHASE_LICENSE_NOTICE: &str = "license_notice";
-/// Priming the status bar: compaction state, plan mode, memory engine and the
-/// context strip.
-pub const PHASE_STATUS_PRIME: &str = "status_prime";
-/// Projecting the home-runner state onto the session label and building the
-/// startup header. Ends at [`MARK_HEADER_QUEUED`].
-pub const PHASE_STARTUP_HEADER: &str = "startup_header";
-/// Spawning the LLM worker task and creating the render/cleanup intervals.
-pub const PHASE_LLM_WORKER: &str = "llm_worker_spawn";
+    PHASE_ARGS = "args_parse";
+    PHASE_CONFIG = "config_load";
+    PHASE_TRACING = "tracing_init";
+    PHASE_THRESHOLD_ROUTER = "threshold_router_load";
+    PHASE_PROVIDER_GRAPH = "provider_graph_build";
+    PHASE_METRICS = "metrics_logger_init";
+    /// The whole `DaemonClient::connect`, including everything below it.
+    PHASE_DAEMON_CONNECT = "daemon_http_connect";
+    /// One `GET /health` probe under its 500 ms client timeout.
+    ///
+    /// Nested inside [`PHASE_DAEMON_CONNECT`]. Issue #364, "Instrument and
+    /// reduce Finch interactive TUI time-to-ready", requires the daemon
+    /// connect to separate "probe latency from the `sleep(2s)` fallback",
+    /// because the two need different fixes and an undivided
+    /// `daemon_http_connect ms=2503.1` tells a maintainer which one it was.
+    /// `category` says how the probe ended: `healthy`, `unhealthy` (a reply
+    /// that was not 2xx) or `unreachable` (no reply inside the timeout).
+    PHASE_DAEMON_HEALTH_PROBE = "daemon_health_probe";
+    /// The unconditional `sleep(2s)` between a failed first probe and the one
+    /// retry, taken whenever the daemon pid file names a live process.
+    ///
+    /// Nested inside [`PHASE_DAEMON_CONNECT`]. This is the flat two-second
+    /// floor #364 names as the plausible per-launch amplifier: a cold
+    /// `load_all` that overruns the 500 ms probe timeout costs the *next*
+    /// launch this wait rather than its own duration. It is a constant, so a
+    /// report that shows it is telling the reader the daemon was not slow --
+    /// it was merely late once.
+    PHASE_DAEMON_RETRY_BACKOFF = "daemon_retry_backoff";
+    PHASE_REPL_NEW = "repl_construct";
+    PHASE_SESSION_RESTORE = "session_restore";
+    PHASE_IPC_CONNECT = "ipc_connect";
+    PHASE_TERMINAL_INIT = "terminal_init";
+    PHASE_MEMORY_OPEN = "memory_open";
+    PHASE_PROGRAM_SYNC = "program_sync";
+    PHASE_TOOL_REGISTRY = "tool_registry";
+    /// Typed-runtime construction and, on macOS, the Accessibility availability
+    /// probe. Separate from tool registration because it is the one phase here
+    /// that can stall on an OS permission check, and attributing that to registry
+    /// construction sends a reader to the wrong code.
+    PHASE_PROGRAM_RUNTIME = "program_runtime";
+    PHASE_MCP_CONNECT = "mcp_connect";
+    PHASE_BRAIN_REGISTER = "brain_register";
+    PHASE_BRAIN_ATTACH = "brain_attach";
 
-/// Instant marks, recorded as zero-duration entries in timeline order.
-pub const MARK_TERMINAL_OWNED: &str = "terminal_owned";
-pub const MARK_INPUT_CAPTURED: &str = "input_captured";
-pub const MARK_HEADER_QUEUED: &str = "header_queued";
-pub const MARK_INPUT_READY: &str = "input_ready";
+    // The phases below cover what the first report measured and could not name: at
+    // that tip 6.4 ms of a 13.99 ms total sat between `input_captured` and
+    // `brain_register` with nothing over it, and the commit message attributed the
+    // gap to serial daemon IPC. That was wrong -- `register_home_brain` is wholly
+    // inside `brain_register`, at 0.003 ms, and runs *after* the gap. This is what
+    // was actually in there.
+
+    /// Selecting and constructing the generators the event loop will use, which
+    /// includes the second full provider-graph build of the process.
+    PHASE_GENERATOR_SELECT = "generator_select";
+    /// `ProviderResolver` and `AgentScheduler` construction.
+    PHASE_SCHEDULER_INIT = "scheduler_init";
+    /// Registering the agent tools and materialising the model-visible tool list.
+    PHASE_TOOL_DEFINITIONS = "tool_definitions";
+    /// `EventLoop::new`: channels, watcher tasks, the terminal reader, the tool
+    /// coordinator and the memtree console. Encloses [`MARK_INPUT_CAPTURED`].
+    PHASE_EVENT_LOOP_NEW = "event_loop_construct";
+    /// Handing the terminal to the TUI and clearing accumulated startup noise out
+    /// of the output manager.
+    PHASE_TUI_HANDOFF = "tui_handoff";
+    /// Resolving the selected generator through the provider handle so the header
+    /// can name the model.
+    PHASE_GENERATOR_RESOLVE = "generator_resolve";
+    /// The weekly licence notice, which performs the third full `config.toml` read
+    /// and TOML parse of the process (#76, "Keep ordinary Finch startup
+    /// byte-for-byte read-only on user configuration").
+    PHASE_LICENSE_NOTICE = "license_notice";
+    /// Priming the status bar: compaction state, plan mode, memory engine and the
+    /// context strip.
+    PHASE_STATUS_PRIME = "status_prime";
+    /// Projecting the home-runner state onto the session label and building the
+    /// startup header. Ends at [`MARK_HEADER_QUEUED`].
+    PHASE_STARTUP_HEADER = "startup_header";
+    /// Spawning the LLM worker task and creating the render/cleanup intervals.
+    PHASE_LLM_WORKER = "llm_worker_spawn";
+}
+
+// Instant marks, recorded as zero-duration entries in timeline order.
+declare_names! {
+    ALL_MARKS:
+
+
+    MARK_TERMINAL_OWNED = "terminal_owned";
+    MARK_INPUT_CAPTURED = "input_captured";
+    MARK_HEADER_QUEUED = "header_queued";
+    MARK_INPUT_READY = "input_ready";
+}
 
 /// A phase slower than this is reported as `SLOW` and logged at `warn`.
 ///
-/// This governs *reporting only*. No test asserts on it, and none should:
-/// `AGENTS.md` forbids wall-clock threshold assertions, and the lesson is
-/// concrete -- `a0ea2c64` ("assert hydration state, not a wall-clock ratio")
-/// replaced the last of four such assertions, one of which reached green CI
-/// while depending on the machine being busy. A budget makes a slow phase
-/// visible and nameable; it is not a gate.
-const SLOW_PHASE: Duration = Duration::from_millis(150);
+/// This governs *reporting only*, and no test asserts that a phase came in
+/// under it. Issue #364, "Instrument and reduce Finch interactive TUI
+/// time-to-ready", requires of this work's coverage: "Synchronization and
+/// structural assertions, not absolute wall-clock thresholds." The precedent
+/// it cites is `a0ea2c64` ("assert hydration state, not a wall-clock ratio"),
+/// which replaced the last of four attempts at a timing assertion on #242,
+/// "Make ordinary TUI startup prompt-first and lazily hydrate MemTree" -- one
+/// of which reached 35/35 green CI while depending on the machine being busy.
+///
+/// Note what is and is not being cited. That requirement is written in #364
+/// and the precedent is in `a0ea2c64`; it is **not** a rule in `AGENTS.md`.
+/// PR #391, "docs(agents): write down the no-wall-clock-assertion rule",
+/// proposed adding it and was closed DO NOT MERGE on the ground that a
+/// blanket prohibition is not what `a0ea2c64` established and conflicts with
+/// coarse liveness bounds Finch does accept elsewhere. Two earlier revisions
+/// of this module cited this rule to a document that does not contain it,
+/// which in the one module whose subject is falsifiability is worth saying
+/// out loud rather than quietly correcting a third time.
+///
+/// A budget makes a slow phase visible and nameable; it is not a gate.
+const DEFAULT_SLOW_PHASE: Duration = Duration::from_millis(150);
+
+/// The budget in force, honouring `FINCH_STARTUP_SLOW_BUDGET_MS`.
+///
+/// The override exists so the over-budget warning -- a user-visible terminal
+/// surface that #364 requires to say "which phase", by name -- can be driven
+/// at the production boundary instead of only in a unit test. Without it the
+/// only way to make a real `finch` launch exceed 150 ms in a phase is to load
+/// the machine, which is precisely the load-dependent test this module
+/// refuses to write. Read once: an environment lookup per phase drop would be
+/// the measurement becoming a startup cost.
+fn slow_phase_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let Some(value) = std::env::var_os("FINCH_STARTUP_SLOW_BUDGET_MS") else {
+            return DEFAULT_SLOW_PHASE;
+        };
+        value
+            .to_string_lossy()
+            .trim()
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_SLOW_PHASE)
+    })
+}
 
 /// How many times a report has been rendered in this process.
 ///
@@ -258,7 +364,7 @@ impl PhaseRecord {
     }
 
     pub fn is_slow(&self) -> bool {
-        self.duration >= SLOW_PHASE
+        self.duration >= slow_phase_budget()
     }
 
     fn ends_at(&self) -> Duration {
@@ -320,7 +426,10 @@ impl Timeline {
         ordered.sort_by_key(|record| (record.started_at, std::cmp::Reverse(record.ends_at())));
 
         let mut out = String::with_capacity(128 * (self.records.len() + 6));
-        out.push_str("finch startup timings (#364)\n");
+        out.push_str(
+            "finch startup timings -- #364, instrument and reduce interactive TUI \
+             time-to-ready\n",
+        );
         out.push_str(
             "t0 is the first statement of main's async body; pre-main loader \
              work and the tokio runtime construction that #[tokio::main] \
@@ -507,7 +616,7 @@ impl Drop for PhaseGuard {
             // reaches the operator as "startup phase exceeded its budget" --
             // "startup was slow", which is what #364 exists to stop. The
             // fields stay for structured sinks that do read them.
-            let budget_ms = SLOW_PHASE.as_secs_f64() * 1000.0;
+            let budget_ms = slow_phase_budget().as_secs_f64() * 1000.0;
             tracing::warn!(
                 target: "finch::startup",
                 phase = phase_name,
@@ -590,6 +699,17 @@ pub fn ready() {
     );
 }
 
+/// A snapshot of everything recorded so far.
+///
+/// Test-facing. Used by `src/daemon/spawn.rs` to assert that the daemon
+/// connect records the health probe and the two-second fallback as separate
+/// phases, which the report string alone cannot show without also depending
+/// on whatever else the test binary has pushed.
+#[cfg(test)]
+pub(crate) fn recorded() -> Vec<PhaseRecord> {
+    with_timeline(|timeline| timeline.records.clone())
+}
+
 /// The current report, whether or not [`ready`] has been reached.
 pub fn report() -> String {
     with_timeline(|timeline| timeline.report())
@@ -645,6 +765,26 @@ fn publish(report: &str) {
     publish_to(&destination, report);
 }
 
+/// The scratch path `publish_to` writes before renaming onto `path`.
+///
+/// **Per-process, and it has to be.** A fixed `<path>.partial` is shared the
+/// moment two `finch` processes inherit one `FINCH_STARTUP_TIMINGS` from a
+/// shell profile: one truncates the other's half-written buffer, and the
+/// survivor's rename publishes that torn buffer as a complete report. Nothing
+/// downstream can detect this, because the result parses -- it is simply a
+/// different process's startup, or half of one.
+///
+/// A process killed between the write and the rename leaves its scratch file
+/// behind, and nothing inside a dead process can clean that up. The leak is
+/// bounded rather than removed: the name is per-pid and `fs::write`
+/// truncates, so the next process handed that pid reuses the file instead of
+/// adding another.
+fn temporary_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut temporary = path.to_path_buf().into_os_string();
+    temporary.push(format!(".{}.partial", std::process::id()));
+    std::path::PathBuf::from(temporary)
+}
+
 fn publish_to(destination: &Destination, report: &str) {
     let path = match destination {
         Destination::Stderr => {
@@ -662,19 +802,7 @@ fn publish_to(destination: &Destination, report: &str) {
     // Best effort otherwise: a diagnostic that cannot write its file must not
     // break the startup it is measuring, but it must not fail silently either.
     //
-    // Per-process temporary. A fixed `.partial` name is shared the moment two
-    // `finch` processes inherit one `FINCH_STARTUP_TIMINGS` from a profile:
-    // one truncates the other's half-written buffer, and the survivor's rename
-    // publishes it as a complete report.
-    //
-    // A process killed between the write and the rename leaves its `.partial`
-    // behind; nothing here can clean that up from inside the dead process.
-    // The leak is bounded rather than removed: the name is per-pid and
-    // `fs::write` truncates, so the next process to be handed that pid reuses
-    // the file instead of adding another.
-    let mut temporary = path.clone().into_os_string();
-    temporary.push(format!(".{}.partial", std::process::id()));
-    let temporary = std::path::PathBuf::from(temporary);
+    let temporary = temporary_path(path);
     if let Err(error) =
         std::fs::write(&temporary, report).and_then(|()| std::fs::rename(&temporary, path))
     {
@@ -863,7 +991,7 @@ mod tests {
             &mut timeline,
             PHASE_DAEMON_CONNECT,
             4,
-            SLOW_PHASE.as_millis() as u64 + 5,
+            slow_phase_budget().as_millis() as u64 + 5,
             PhaseDetail::default(),
         );
 
@@ -878,7 +1006,8 @@ mod tests {
             vec![PHASE_DAEMON_CONNECT],
             "a phase over budget must be visible and named -- 'startup was \
              slow' is not actionable, 'daemon_http_connect was slow' is; \
-             budget is {SLOW_PHASE:?} and the report was:\n{report}"
+             budget is {:?} and the report was:\n{report}",
+            slow_phase_budget(),
         );
     }
 
@@ -917,7 +1046,8 @@ mod tests {
             }
         }
 
-        let overrun = SLOW_PHASE + Duration::from_millis(61);
+        let budget = slow_phase_budget();
+        let overrun = budget + Duration::from_millis(61);
         let captured = Captured::default();
         let subscriber = tracing_subscriber::registry().with(captured.clone());
         tracing::subscriber::with_default(subscriber, || {
@@ -953,7 +1083,7 @@ mod tests {
                 .any(|ms| *ms >= overrun.as_secs_f64() * 1000.0),
             "and it must carry how long the phase took, or the operator is \
              told a phase was slow without being told how slow. The phase ran \
-             {overrun:?} against a {SLOW_PHASE:?} budget; durations parsed out \
+             {overrun:?} against a {budget:?} budget; durations parsed out \
              of the messages were {reported:?} and the messages were {named:?}"
         );
         assert!(
@@ -1358,5 +1488,119 @@ mod tests {
             "and no bare LF may survive the conversion; converted form was \
              {converted:?}"
         );
+    }
+
+    /// N5's mutant: a fixed `<path>.partial` instead of a per-pid one.
+    ///
+    /// Neither suite could catch it before. The unit tests write to their own
+    /// destinations and the integration fixtures each get their own
+    /// `FINCH_STARTUP_TIMINGS` path, so nothing ever had two writers on one
+    /// destination -- which is exactly the situation the per-pid name exists
+    /// for, and exactly the situation a test cannot stage without spawning a
+    /// second process racing the first. Asserting the name is the property
+    /// that survives review: two processes cannot collide on a scratch file
+    /// whose name contains their pid.
+    #[test]
+    fn test_the_scratch_file_is_named_per_process_so_two_finches_cannot_collide() {
+        let destination = std::path::Path::new("/tmp/finch-startup-timings.txt");
+        let scratch = temporary_path(destination);
+        let rendered = scratch.to_string_lossy().into_owned();
+        let pid = std::process::id();
+
+        assert!(
+            rendered.contains(&pid.to_string()),
+            "the scratch file `publish_to` writes before renaming must carry \
+             this process's pid ({pid}). Two `finch` processes that inherit \
+             one FINCH_STARTUP_TIMINGS from a shell profile otherwise share \
+             one scratch path: `fs::write` truncates the other's half-written \
+             buffer and the survivor's rename publishes that torn buffer as a \
+             complete report, which parses, so nothing downstream can detect \
+             it. Scratch path was {rendered:?}"
+        );
+        assert_ne!(
+            rendered,
+            format!("{}.partial", destination.display()),
+            "a fixed `.partial` name is the collision above; the name must \
+             be per-process"
+        );
+        assert!(
+            rendered.starts_with(&*destination.to_string_lossy()),
+            "the scratch file must sit beside its destination so the publish \
+             is a rename within one filesystem rather than a copy that can \
+             tear. Scratch path was {rendered:?}"
+        );
+    }
+
+    /// N1b's mutant deleted an instrumented phase from the production guard
+    /// and from the test's expected order, and left the suite green because
+    /// nothing tied the two together. `ALL_PHASES` is now generated from the
+    /// same list as the constants, and the integration suite derives what it
+    /// expects from it. This holds up the generated list itself.
+    #[test]
+    fn test_every_declared_phase_and_mark_name_is_unique_and_non_empty() {
+        for (label, names) in [("ALL_PHASES", ALL_PHASES), ("ALL_MARKS", ALL_MARKS)] {
+            let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                names.len(),
+                "{label} has a duplicate name. Report entries are matched by \
+                 name, so two phases sharing one would make the expected-order \
+                 assertion satisfiable by the wrong entry. {label} was {names:?}"
+            );
+            assert!(
+                names.iter().all(|name| !name.is_empty()),
+                "{label} contains an empty name, which renders as a report \
+                 line with no subject. {label} was {names:?}"
+            );
+        }
+        let overlap: Vec<&&str> = ALL_PHASES
+            .iter()
+            .filter(|name| ALL_MARKS.contains(name))
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "a name cannot be both a phase and a mark: the report's first \
+             token distinguishes them and a reader would see the same name \
+             under both kinds. Overlapping names were {overlap:?}"
+        );
+        assert!(
+            ALL_PHASES.contains(&PHASE_DAEMON_HEALTH_PROBE)
+                && ALL_PHASES.contains(&PHASE_DAEMON_RETRY_BACKOFF),
+            "the daemon connect's sub-phases must be declared through the \
+             same list as every other phase, or the integration suite's \
+             derivation cannot see them. ALL_PHASES was {ALL_PHASES:?}"
+        );
+    }
+
+    /// The budget override that lets the over-budget warning -- a user-visible
+    /// terminal surface -- be driven at the production boundary instead of
+    /// only here. `slow_phase_budget` caches on first read, so this asserts
+    /// the parse rather than re-reading the environment.
+    #[test]
+    fn test_an_unparseable_budget_override_falls_back_rather_than_disabling_the_warning() {
+        // The parse `slow_phase_budget` performs, applied to the values a
+        // profile can realistically hold. A `0` means "warn about everything",
+        // which is what the production-boundary test uses; anything
+        // unparseable must leave the default in force rather than silently
+        // becoming zero (warn about everything) or `u64::MAX` (warn about
+        // nothing).
+        fn parse(value: &str) -> Duration {
+            value
+                .trim()
+                .parse::<u64>()
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_SLOW_PHASE)
+        }
+        assert_eq!(parse("0"), Duration::ZERO);
+        assert_eq!(parse(" 250 "), Duration::from_millis(250));
+        assert_eq!(
+            parse("soon"),
+            DEFAULT_SLOW_PHASE,
+            "an unparseable FINCH_STARTUP_SLOW_BUDGET_MS must leave the \
+             default budget in force. Reading it as zero would warn on every \
+             phase of every launch, and reading it as no budget at all would \
+             silently remove the one startup line #364 requires a user to see."
+        );
+        assert_eq!(parse(""), DEFAULT_SLOW_PHASE);
     }
 }

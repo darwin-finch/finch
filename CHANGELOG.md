@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs the measurement repeatedly and reports median, p90, min and max with the
   machine and commit attached. (#364, "Instrument and reduce Finch interactive
   TUI time-to-ready")
+- **A slow daemon and the flat two-second fallback are now told apart.** The
+  `daemon_http_connect` phase used to cover the 500 ms `GET /health` probe, the
+  unconditional `sleep(2s)` taken when a live daemon misses that window, and
+  the retry, all as one number — so a 2.5 second launch reported
+  `daemon_http_connect ms=2503.1` and left a maintainer unable to tell a slow
+  daemon from a healthy one that was late once. Those need different fixes.
+  Each probe now reports as `daemon_health_probe` with `category=healthy`,
+  `unhealthy` (answered, but not 2xx) or `unreachable` (no answer inside the
+  timeout), and the wait reports as `daemon_retry_backoff`. (#364, "Instrument
+  and reduce Finch interactive TUI time-to-ready")
+- **`FINCH_STARTUP_SLOW_BUDGET_MS` lowers the per-phase budget.** A phase over
+  budget (150 ms by default) is marked `SLOW` in the report and warns on the
+  terminal naming the phase and its duration. Lowering the budget is how that
+  warning is exercised without loading the machine; an unparseable value leaves
+  the default in force rather than warning about everything or nothing. (#364,
+  "Instrument and reduce Finch interactive TUI time-to-ready")
 
 ### Security
 

@@ -262,7 +262,22 @@ default and costs nothing when unset.
 FINCH_STARTUP_TIMINGS=~/startup.txt finch     # write the report to a file
 FINCH_STARTUP_TIMINGS=1 finch                 # write it to stderr (also: stderr)
 RUST_LOG=finch::startup=debug finch           # per-phase tracing events instead
+FINCH_STARTUP_SLOW_BUDGET_MS=25 finch         # warn about any phase over 25 ms
 ```
+
+A phase over its budget (150 ms by default) is marked `SLOW` in the report and
+warns on the terminal, naming the phase and how long it took.
+`FINCH_STARTUP_SLOW_BUDGET_MS` lowers that budget, which is how the warning
+gets exercised without loading the machine; an unparseable value leaves the
+default in force.
+
+When the daemon is in use, the `daemon_http_connect` phase now nests the
+`GET /health` probes (`daemon_health_probe`, with `category=healthy`,
+`unhealthy` or `unreachable`) and the unconditional two-second wait before the
+one retry (`daemon_retry_backoff`) as separate entries — so a slow launch says
+whether the daemon was slow or whether a healthy daemon merely missed one
+500 ms probe window and cost this launch the flat floor. They need different
+fixes.
 
 The report lists each phase and instant mark in start order with its offset
 from t0, its duration, and how many phases enclose it (`depth` — phases nest,

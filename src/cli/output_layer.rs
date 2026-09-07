@@ -137,7 +137,8 @@ where
 /// the whole reason it is `pub(crate)`: any warning whose actionable content
 /// lives in a structured field reaches the user's terminal with that content
 /// gone, so code that emits one has to be able to assert on what survives
-/// this visitor rather than on what it passed to `tracing` (#364).
+/// this visitor rather than on what it passed to `tracing` (#364,
+/// "Instrument and reduce Finch interactive TUI time-to-ready").
 pub(crate) struct MessageVisitor {
     message: Option<String>,
 }

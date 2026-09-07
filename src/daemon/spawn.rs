@@ -44,6 +44,9 @@ fn ensure_daemon_access_allowed() -> Result<()> {
     );
 }
 
+/// Client timeout on one `GET /health` probe.
+pub(crate) const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) -> Result<()> {
     let bind = bind_address.unwrap_or(DEFAULT_BIND);
     let base_url = format!("http://{}", bind);
@@ -60,7 +63,7 @@ async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) 
         // Daemon process exists but not responding yet
         // Wait a bit and retry (it might be starting up)
         info!("Daemon process exists, waiting for health check...");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        retry_backoff().await;
 
         if health_check_succeeds(&base_url).await {
             info!("Daemon now healthy");
@@ -255,10 +258,38 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     Ok(())
 }
 
+/// The unconditional wait between a failed first probe and the one retry.
+pub(crate) const RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Wait `RETRY_BACKOFF`, recorded as its own startup phase.
+///
+/// Issue #364, "Instrument and reduce Finch interactive TUI time-to-ready",
+/// requires the daemon connect to separate "probe latency from the
+/// `sleep(2s)` fallback". Undivided, a 2.5 s launch reports
+/// `daemon_http_connect ms=2503.1` and a maintainer cannot tell a slow daemon
+/// -- fix the daemon -- from this flat constant, which is reached whenever a
+/// live daemon pid simply missed one 500 ms probe window -- fix the probe
+/// timeout, or the thing that made the daemon miss it. The two have different
+/// fixes, so the report has to name which one happened.
+async fn retry_backoff() {
+    let _phase = crate::startup::phase(crate::startup::PHASE_DAEMON_RETRY_BACKOFF);
+    tokio::time::sleep(RETRY_BACKOFF).await;
+}
+
 /// Check if daemon health endpoint responds
+///
+/// Recorded as [`crate::startup::PHASE_DAEMON_RETRY_BACKOFF`]'s sibling,
+/// [`crate::startup::PHASE_DAEMON_HEALTH_PROBE`], nested inside
+/// `daemon_http_connect`. Instrumented here rather than at the three call
+/// sites so that every probe is timed -- the first one, the retry after the
+/// back-off, and each poll of the spawn wait -- and so that the category
+/// distinguishes "the daemon answered and said no" from "nothing answered
+/// inside the 500 ms timeout", which are different failures with different
+/// fixes and were previously indistinguishable in the report.
 pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
+    let mut phase = crate::startup::phase(crate::startup::PHASE_DAEMON_HEALTH_PROBE);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
+        .timeout(HEALTH_PROBE_TIMEOUT)
         .build()
         .expect("Failed to build HTTP client");
 
@@ -267,14 +298,17 @@ pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
     match client.get(&url).send().await {
         Ok(response) if response.status().is_success() => {
             debug!(url = %url, "Health check succeeded");
+            phase.detail(crate::startup::PhaseDetail::category("healthy"));
             true
         }
         Ok(response) => {
             debug!(url = %url, status = %response.status(), "Health check failed");
+            phase.detail(crate::startup::PhaseDetail::category("unhealthy"));
             false
         }
         Err(e) => {
             debug!(url = %url, error = %e, "Health check request failed");
+            phase.detail(crate::startup::PhaseDetail::category("unreachable"));
             false
         }
     }
@@ -353,13 +387,166 @@ mod tests {
         );
     }
 
-    use super::*;
-
     #[tokio::test]
     async fn test_health_check_fails_for_invalid_url() {
+        let _serialised = timeline_lock().await;
         // Non-existent server should fail health check
         let result = health_check_succeeds("http://127.0.0.1:99999").await;
         assert!(!result);
+    }
+
+    /// Serialise the tests that read the process-global startup timeline.
+    ///
+    /// The timeline is one `Mutex<Timeline>` for the process and libtest runs
+    /// these on parallel threads, so a test that asserts "no fallback phase
+    /// was recorded while I probed" needs the test that records one not to be
+    /// running. Without this the two below fail each other roughly at random,
+    /// which is worse than either being absent.
+    /// A tokio mutex, not a `std` one: these are async tests and the guard is
+    /// held across `.await`, which a blocking guard must never be.
+    async fn timeline_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    /// Categories of the `daemon_health_probe` phases recorded so far, in
+    /// order. Only the probe emits that name; `timeline_lock` keeps the other
+    /// timeline test from interleaving.
+    fn probe_categories() -> Vec<Option<&'static str>> {
+        crate::startup::recorded()
+            .iter()
+            .filter(|record| record.name == crate::startup::PHASE_DAEMON_HEALTH_PROBE)
+            .map(|record| record.detail.category)
+            .collect()
+    }
+
+    fn backoff_count() -> usize {
+        crate::startup::recorded()
+            .iter()
+            .filter(|record| record.name == crate::startup::PHASE_DAEMON_RETRY_BACKOFF)
+            .count()
+    }
+
+    /// Answer one request with `status`, then close. Returns the base URL.
+    async fn one_shot_health_endpoint(
+        status: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a kernel-assigned loopback port");
+        let address = listener.local_addr().expect("bound address");
+        let server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut scratch = [0u8; 1024];
+            let _ = stream.read(&mut scratch).await;
+            let _ = stream
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+            let _ = stream.flush().await;
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// #364, "Instrument and reduce Finch interactive TUI time-to-ready",
+    /// enumerates "daemon HTTP connect, separating probe latency from the
+    /// `sleep(2s)` fallback". Undivided, both live inside one
+    /// `daemon_http_connect` phase and a 2.5 s launch reports
+    /// `daemon_http_connect ms=2503.1 SLOW category=unavailable` -- which does
+    /// not tell a maintainer whether the daemon was slow or whether a healthy
+    /// daemon merely missed one 500 ms probe window and cost this launch the
+    /// flat two-second floor. Those need different fixes.
+    ///
+    /// Structural, with no duration asserted: what is checked is that a probe
+    /// records a probe phase and no fallback phase, that the phase says how
+    /// the probe ended, and that the fallback records a phase of its own.
+    #[tokio::test]
+    async fn test_the_health_probe_records_its_own_phase_and_says_how_it_ended() {
+        let _serialised = timeline_lock().await;
+        let before_backoffs = backoff_count();
+
+        let (healthy_url, healthy) = one_shot_health_endpoint("200 OK").await;
+        assert!(
+            health_check_succeeds(&healthy_url).await,
+            "a 200 from /health is a healthy daemon"
+        );
+        let _ = healthy.await;
+
+        let (unhealthy_url, unhealthy) =
+            one_shot_health_endpoint("500 Internal Server Error").await;
+        assert!(
+            !health_check_succeeds(&unhealthy_url).await,
+            "a 500 from /health is not a healthy daemon"
+        );
+        let _ = unhealthy.await;
+
+        // A port nothing is listening on: the probe gets no reply at all,
+        // which is a different failure from a daemon answering 500.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a kernel-assigned loopback port");
+        let closed_address = closed.local_addr().expect("bound address");
+        drop(closed);
+        assert!(!health_check_succeeds(&format!("http://{closed_address}")).await);
+
+        let categories = probe_categories();
+        let tail: Vec<Option<&'static str>> =
+            categories.iter().rev().take(3).rev().copied().collect();
+        assert_eq!(
+            tail,
+            vec![Some("healthy"), Some("unhealthy"), Some("unreachable")],
+            "each `GET /health` probe must record a `{}` phase naming how it \
+             ended, so a report can distinguish a daemon that answered \
+             negatively from one that did not answer inside the {} ms \
+             timeout. Recorded probe categories were {categories:?}",
+            crate::startup::PHASE_DAEMON_HEALTH_PROBE,
+            HEALTH_PROBE_TIMEOUT.as_millis(),
+        );
+        assert_eq!(
+            backoff_count(),
+            before_backoffs,
+            "probing must not record a `{}` phase: the fallback wait is a \
+             separate span and folding the two together is the conflation \
+             #364 asks this split to end. Probe categories were {categories:?}",
+            crate::startup::PHASE_DAEMON_RETRY_BACKOFF,
+        );
+    }
+
+    /// The fallback wait is its own phase, so a report can show that the two
+    /// seconds were a constant rather than a slow daemon.
+    ///
+    /// The tokio clock is paused, so the wait itself is free; nothing here
+    /// asserts how long anything took.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_retry_fallback_is_recorded_as_a_phase_of_its_own() {
+        let _serialised = timeline_lock().await;
+        let before_backoffs = backoff_count();
+        let before_probes = probe_categories().len();
+
+        retry_backoff().await;
+
+        assert_eq!(
+            backoff_count(),
+            before_backoffs + 1,
+            "the unconditional {:?} wait between the failed first probe and \
+             the retry must record a `{}` phase. Without it the wait is \
+             absorbed into `daemon_http_connect` and a maintainer reading \
+             `ms=2503.1` cannot tell a slow daemon from this flat floor.",
+            RETRY_BACKOFF,
+            crate::startup::PHASE_DAEMON_RETRY_BACKOFF,
+        );
+        assert_eq!(
+            probe_categories().len(),
+            before_probes,
+            "waiting is not probing: the fallback must not record a `{}` \
+             phase, or the report double-counts probes that never happened.",
+            crate::startup::PHASE_DAEMON_HEALTH_PROBE,
+        );
     }
 
     #[test]

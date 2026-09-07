@@ -34,15 +34,29 @@
 //!
 //! # Why the assertions have no clock in them
 //!
-//! `AGENTS.md` forbids wall-clock threshold assertions, and the lesson is
-//! concrete: `a0ea2c64` ("assert hydration state, not a wall-clock ratio")
-//! replaced the last of four such assertions on #242, one of which reached
-//! 35/35 green CI while depending on the machine being busy. So nothing here
-//! asserts a duration, a ratio, or a deadline as a *property*. The timings are
-//! recorded and reported; what is asserted is structure -- which phases ran, in
-//! what order, how they nest, how many things each carried to completion, and
-//! that the set does not change with the size or the sanity of the Brain
-//! inventory on disk.
+//! Issue #364, "Instrument and reduce Finch interactive TUI time-to-ready",
+//! states it under Required coverage: "Synchronization and structural
+//! assertions, not absolute wall-clock thresholds." The precedent it cites is
+//! `a0ea2c64` ("assert hydration state, not a wall-clock ratio"), which
+//! replaced the last of four attempts at a timing assertion on #242, "Make
+//! ordinary TUI startup prompt-first and lazily hydrate MemTree" -- one of
+//! which reached 35/35 green CI while depending on the machine being busy.
+//!
+//! Cited precisely, because two earlier revisions of this file did not. This
+//! requirement is written in #364 and its precedent is `a0ea2c64`. It is
+//! **not** a rule in `AGENTS.md`: PR #391, "docs(agents): write down the
+//! no-wall-clock-assertion rule", proposed adding it and was closed DO NOT
+//! MERGE, on the ground that a blanket prohibition is not what `a0ea2c64`
+//! established and conflicts with the coarse liveness and resource bounds
+//! Finch accepts elsewhere -- including in the deadlines below. A reader who
+//! greps `AGENTS.md` for this rule will not find it, and should not have been
+//! told to look there.
+//!
+//! So nothing here asserts a duration, a ratio, or a deadline as a
+//! *property*. The timings are recorded and reported; what is asserted is
+//! structure -- which phases ran, in what order, how they nest, how many
+//! things each carried to completion, and that the set does not change with
+//! the size or the sanity of the Brain inventory on disk.
 //!
 //! Waiting is on artifacts, never on sleeps-as-synchronisation: the harness
 //! waits for the report file the process writes at readiness. The timeouts
@@ -110,6 +124,20 @@ impl Entry {
                  the benchmark; a field that does not parse is a broken \
                  report, not a zero. Report was:\n{report}",
                 self.name, self.at_ms
+            )
+        })
+    }
+
+    /// The duration the report states, or a failure that names the garbled
+    /// line. Never a default, for the reason [`Entry::at_ms`] gives.
+    fn ms(&self, report: &str) -> f64 {
+        self.ms.parse::<f64>().unwrap_or_else(|error| {
+            panic!(
+                "the {:?} entry's ms field is {:?}, which is not a number \
+                 ({error}). The coverage assertion recomputes accounted_ms \
+                 from these, so a field that does not parse is a broken \
+                 report, not a zero. Report was:\n{report}",
+                self.name, self.ms
             )
         })
     }
@@ -290,6 +318,10 @@ impl Session {
     }
 
     fn spawn_with_args(fixture: &Fixture, args: &[&str]) -> Self {
+        Self::spawn_with_env(fixture, args, &[])
+    }
+
+    fn spawn_with_env(fixture: &Fixture, args: &[&str], extra_env: &[(&str, &str)]) -> Self {
         let winsize = nix::pty::Winsize {
             ws_row: 40,
             ws_col: 120,
@@ -347,6 +379,9 @@ impl Session {
             .env_remove("FINCH_TEST_SOCKET_ROOT")
             .env_remove("FINCH_TEST_DAEMON_ADDR")
             .env_remove("FINCH_TEST_BRAIN_ADDR");
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
 
         let child = command.spawn().expect("spawn finch under a pty");
         // Close this side's copy of the slave, so the master sees EOF when the
@@ -386,11 +421,9 @@ impl Session {
         String::from_utf8_lossy(&self.transcript.lock().expect("transcript poisoned")).into_owned()
     }
 
-    /// The transcript with terminal control sequences removed and runs of
-    /// whitespace collapsed, so an assertion about what a user can *read* is
-    /// not defeated by the renderer having placed a colour escape or a cursor
-    /// move between two words of the same message.
-    fn readable_transcript(&self) -> String {
+    /// The transcript with terminal control sequences removed, line structure
+    /// intact.
+    fn stripped_transcript(&self) -> String {
         let raw = self.transcript();
         let mut out = String::with_capacity(raw.len());
         let mut chars = raw.chars().peekable();
@@ -429,7 +462,33 @@ impl Session {
                 None => {}
             }
         }
-        out.split_whitespace().collect::<Vec<_>>().join(" ")
+        out
+    }
+
+    /// The stripped transcript with *all* whitespace collapsed to single
+    /// spaces, so a `contains` assertion about what a user can read is not
+    /// defeated by the renderer having placed a cursor move or a line wrap
+    /// between two words of the same message.
+    fn readable_transcript(&self) -> String {
+        self.stripped_transcript()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// One entry per terminal line, spaces within a line collapsed, blank
+    /// lines dropped.
+    ///
+    /// [`Session::readable_transcript`] joins on *all* whitespace, which folds
+    /// the whole terminal into one string -- so calling `.lines()` on it
+    /// yields a single item and a loop meant to inspect each message inspects
+    /// one enormous line instead. A per-line assertion needs this.
+    fn readable_lines(&self) -> Vec<String> {
+        self.stripped_transcript()
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|line| !line.is_empty())
+            .collect()
     }
 
     /// Wait for the process to publish its startup report.
@@ -551,13 +610,18 @@ impl Drop for Session {
 /// be deleted outright with the suite at `4 passed; 0 failed`. Anything
 /// instrumented on the fixture's path belongs here, or it is not covered.
 ///
-/// Three phases the code contains are deliberately absent because this fixture
+/// Some phases the code contains are deliberately absent because this fixture
 /// does not reach them, and adding them would assert a machine rather than the
-/// code: `session_restore` (no `--restore-session`), `brain_attach` and the
-/// fourth `config_load`, `category=daemon_api_key` (both need a daemon, and
-/// every fixture sets `use_daemon = false`). `daemon_http_connect` *is* here
-/// and reports `category=disabled`, which is the point: the phase set is a
-/// property of the code, not of whether a daemon happens to be running.
+/// code. They are enumerated once, in [`NOT_ON_THE_FIXTURE_PATH`], and
+/// [`test_the_expected_order_names_every_instrumented_phase`] holds this list
+/// to `finch::startup::ALL_PHASES` minus exactly those -- so an instrumented
+/// phase can no longer be dropped from the production guard *and* from this
+/// list and leave the suite green, which is how `program_runtime` could be
+/// deleted at the previous tip.
+///
+/// `daemon_http_connect` *is* here and reports `category=disabled`, which is
+/// the point: the phase set is a property of the code, not of whether a
+/// daemon happens to be running.
 fn expected_order() -> Vec<&'static str> {
     vec![
         "args_parse",
@@ -594,6 +658,115 @@ fn expected_order() -> Vec<&'static str> {
         "llm_worker_spawn",
         "input_ready",
     ]
+}
+
+/// Instrumented phases this fixture cannot reach, and why.
+///
+/// Every entry needs a reason that is about the fixture, not about the phase
+/// being inconvenient to assert. An exclusion is how a real gap gets
+/// laundered into a documented one, so the reason is the whole content of
+/// this list.
+const NOT_ON_THE_FIXTURE_PATH: &[(&str, &str)] = &[
+    (
+        "session_restore",
+        "reached only with `--restore-session`, which no fixture passes",
+    ),
+    (
+        "brain_attach",
+        "needs a daemon; every fixture sets `use_daemon = false`",
+    ),
+    (
+        "daemon_health_probe",
+        "the `GET /health` probe inside `DaemonClient::connect`, which \
+         `use_daemon = false` never enters. #364, instrument and reduce \
+         interactive TUI time-to-ready, requires this sub-phase; it is \
+         covered at its own boundary by \
+         `test_the_health_probe_records_its_own_phase_and_says_how_it_ended` \
+         in `src/daemon/spawn.rs`, because the supervisor's isolation gate \
+         (`FINCH_BRAIN_TEST_ISOLATED=1`) refuses daemon discovery outright, \
+         so no PTY fixture here can reach it",
+    ),
+    (
+        "daemon_retry_backoff",
+        "the unconditional two-second wait before the retry probe; \
+         unreachable here for the same reason, and covered by \
+         `test_the_retry_fallback_is_recorded_as_a_phase_of_its_own` in \
+         `src/daemon/spawn.rs`",
+    ),
+];
+
+/// [`expected_order`] must name every instrumented phase but the excluded few.
+///
+/// This is the tie that was missing. At the previous tip a mutant could delete
+/// `program_runtime` from its production guard *and* from `expected_order`
+/// and the whole suite stayed green, because the expected list was a hand-kept
+/// copy accountable to nothing. `finch::startup::ALL_PHASES` is generated from
+/// the same declarations as the `PHASE_*` constants, so the list and the
+/// instrumentation cannot drift without this failing.
+///
+/// Note what this does *not* do: it does not derive the privacy allowlist in
+/// `test_the_startup_report_leaks_no_private_content`, which stays hand-kept
+/// on purpose. Deriving that one would make a newly added phase name
+/// self-approving, and catching new names is the whole job it does.
+#[test]
+fn test_the_expected_order_names_every_instrumented_phase() {
+    use finch::startup::{ALL_MARKS, ALL_PHASES};
+
+    let excluded: BTreeSet<&str> = NOT_ON_THE_FIXTURE_PATH
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+
+    for (name, reason) in NOT_ON_THE_FIXTURE_PATH {
+        assert!(
+            ALL_PHASES.contains(name),
+            "{name:?} is excluded from the expected order with the reason \
+             {reason:?}, but no phase by that name is instrumented at all. An \
+             exclusion naming a phase that does not exist excuses nothing and \
+             hides the renaming of a phase that does. Instrumented phases are \
+             {ALL_PHASES:?}"
+        );
+    }
+
+    let expected: BTreeSet<&str> = expected_order().into_iter().collect();
+    let should_appear: BTreeSet<&str> = ALL_PHASES
+        .iter()
+        .copied()
+        .filter(|name| !excluded.contains(name))
+        .collect();
+
+    let missing: Vec<&&str> = should_appear.difference(&expected).collect();
+    assert!(
+        missing.is_empty(),
+        "every instrumented phase this fixture reaches must appear in \
+         `expected_order`, or it has no presence assertion anywhere and can be \
+         deleted from production with this suite green. Missing {missing:?}. If \
+         one of these is genuinely off the fixture's path, add it to \
+         NOT_ON_THE_FIXTURE_PATH with the reason -- do not delete it from \
+         `expected_order`. Instrumented phases are {ALL_PHASES:?}"
+    );
+
+    let phantom: Vec<&&str> = expected
+        .difference(&should_appear)
+        .filter(|name| !ALL_MARKS.contains(name))
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "`expected_order` names {phantom:?}, which is neither an instrumented \
+         phase nor a mark. A misspelling here is satisfied by nothing and \
+         asserts nothing. Instrumented phases are {ALL_PHASES:?} and marks are \
+         {ALL_MARKS:?}"
+    );
+
+    for mark in ALL_MARKS {
+        assert!(
+            expected.contains(mark),
+            "every instant mark must appear in `expected_order`; {mark:?} does \
+             not. Marks are the instants that define what time-to-ready is \
+             measured against, so an unasserted one can be moved or dropped \
+             silently. Marks are {ALL_MARKS:?}"
+        );
+    }
 }
 
 /// Assert `expected` appears in `actual` in order, allowing other entries
@@ -644,16 +817,34 @@ fn assert_reaches_ready(report: &Report, context: &str) {
          report was:\n{}",
         report.raw
     );
+    // This is the assertion that does the work, and the only one here that
+    // has ever fired: a `startup::ready()` moved earlier publishes a report
+    // that names none of the work which had not happened yet, and this fails
+    // on the first phase it cannot find. Everything below is cheaper and
+    // weaker, and says so.
     assert_in_order(&expected_order(), &names, &report.raw);
+
+    // A rendering invariant, not an independent check on when `ready()` ran.
+    // `Timeline::report` sorts by `started_at`, and `input_ready` is pushed at
+    // the largest `started_at` in the timeline under the same lock that then
+    // renders, so the sort key already puts it last in every tie. Kept because
+    // it pins that rendering contract -- a future change to the sort key that
+    // buried the readiness mark mid-report would break every reader of this
+    // format -- but it cannot catch a mis-stamped `ready()`, and did not fire
+    // once across fourteen mutant runs.
     assert_eq!(
         report.position("input_ready"),
         Some(report.entries.len() - 1),
-        "{context}: input_ready must be the last entry in the report. It is \
-         stamped immediately before the loop that consumes keys, so anything \
-         recorded after it is startup work the total does not include. \
-         Recorded {names:?} and the report was:\n{}",
+        "{context}: input_ready must render as the last entry. It is stamped \
+         at the largest offset in the timeline, so anything sorting after it \
+         means the report's start-order rendering is broken, not that startup \
+         did more work. Recorded {names:?} and the report was:\n{}",
         report.raw
     );
+
+    // Likewise weak, and kept only as a guard on the printed field: `at_ms`
+    // parses (or `Entry::at_ms` panics naming the line), and the one value
+    // that parses while meaning nothing is exactly 0.
     let ready_at = report
         .find("input_ready")
         .expect("input_ready present")
@@ -797,20 +988,72 @@ fn test_the_startup_report_states_how_much_time_no_phase_covers() {
         )
     });
 
-    // Structural, not a threshold: the two figures must partition the total.
-    // No assertion here on how *large* the unaccounted share is -- that is a
-    // wall-clock property of a machine, and `AGENTS.md` forbids asserting one.
+    // `accounted_ms` must be the sum of the *depth-0* phases and nothing
+    // else. Recomputed here from the entries the report itself printed, which
+    // is the only form of this check that can fail.
+    //
+    // The obvious assertion cannot. Production computes `unaccounted_ms` as
+    // `total_ms - accounted_ms`, so `accounted + unaccounted == total` is an
+    // identity: it holds for any `accounted_ms` whatsoever, including one
+    // computed from the wrong set of phases. A mutant that made `accounted_ms`
+    // count nested phases as well (`depth <= 1`) -- double-counting every
+    // child inside `repl_construct` and `event_loop_construct`, and reporting
+    // a coverage figure larger than the total it is a fraction of -- passed
+    // this whole file with that identity as the only coverage assertion.
+    //
+    // Recomputing is structural, not a threshold: it compares two numbers the
+    // report printed against each other, and holds equally on an idle machine
+    // and a loaded one.
+    let recomputed: f64 = report
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "phase" && entry.depth == Some(0))
+        .map(|entry| entry.ms(&report.raw))
+        .sum();
+    let outermost: Vec<&str> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "phase" && entry.depth == Some(0))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    // Each `ms` is printed to three decimals, so the recomputed sum can differ
+    // from the internally-summed figure by half a unit in the last place per
+    // term. A tolerance, not a threshold: it bounds the printing, not the
+    // machine.
+    let rounding = 0.001 * (outermost.len() as f64 + 1.0);
+    assert!(
+        (recomputed - accounted).abs() <= rounding,
+        "accounted_ms must be the sum of the phases the report marks depth=0, \
+         and nothing else. The report says accounted_ms={accounted} but its \
+         own {} depth-0 phases sum to {recomputed} (tolerance {rounding} for \
+         three-decimal printing). The depth-0 phases were {outermost:?}. A \
+         coverage figure that counts nested phases double-counts every child \
+         and can exceed the total it claims to be part of. Report was:\n{}",
+        outermost.len(),
+        report.raw
+    );
+    // And the printed arithmetic must be self-consistent. Weak on its own --
+    // production derives `unaccounted_ms` by subtraction, so this can only
+    // catch a formatting or parsing fault, never a wrong `accounted_ms`. It
+    // is kept for that, and claims nothing more.
     assert!(
         (accounted + unaccounted - total).abs() < 0.01,
-        "accounted_ms + unaccounted_ms must be the reported total, or the \
-         coverage figure is not a coverage figure: {accounted} + \
-         {unaccounted} != {total}. Report was:\n{}",
+        "the two printed figures must add back to the printed total, or one \
+         of the three was mangled on the way out: {accounted} + {unaccounted} \
+         != {total}. Report was:\n{}",
         report.raw
     );
     assert!(
         accounted > 0.0,
         "the phases must account for something; accounted_ms was {accounted} \
          and the report was:\n{}",
+        report.raw
+    );
+    assert!(
+        !outermost.is_empty(),
+        "the report must mark at least one phase depth=0, or the depth column \
+         is not reporting nesting and accounted_ms is the sum of nothing. \
+         Report was:\n{}",
         report.raw
     );
 
@@ -874,12 +1117,13 @@ fn test_startup_instrumentation_says_nothing_on_the_user_s_terminal() {
          and the terminal read:\n{readable}"
     );
 
-    // The one startup line a user may legitimately see is an over-budget
-    // warning, and #364 requires that it "says so, by name". This does not
-    // usually fire; when a loaded machine makes it fire, it must be
-    // actionable rather than being "startup was slow".
+    // Nothing at all from this module reaches the terminal on an ordinary
+    // launch -- not "nothing bad": nothing. The over-budget warning is the
+    // sole exception, it does not fire on this fixture, and it is asserted on
+    // its own in the test below with the budget forced. This loop is a
+    // belt-and-braces sweep, and on this fixture it inspects an empty set.
     let phase_names: Vec<&str> = expected_order();
-    for line in readable.split(" ⚠️ ").chain(readable.lines()) {
+    for line in session.readable_lines() {
         if !line.contains("[startup]") {
             continue;
         }
@@ -891,6 +1135,99 @@ fn test_startup_instrumentation_says_nothing_on_the_user_s_terminal() {
              terminal read:\n{readable}"
         );
     }
+}
+
+/// #364, "Instrument and reduce Finch interactive TUI time-to-ready": "Slow
+/// phases must be visible and actionable, not silently absorbed. A phase that
+/// exceeds its budget says so, by name."
+///
+/// That requirement is about the operator's terminal, and until now nothing
+/// drove it there. The sweep in the test above is vacuous on an ordinary
+/// launch: no phase on this fixture comes near the 150 ms budget, so there is
+/// no `[startup]` line to inspect and the assertion passes over an empty set.
+/// Reverting the warning to the contentless "startup phase exceeded its
+/// budget" it originally shipped as left this whole file green.
+///
+/// The honest way to make a real phase exceed a real budget is to lower the
+/// budget, not to load the machine: `FINCH_STARTUP_SLOW_BUDGET_MS=0` puts
+/// every phase over budget, so the warning fires from the production path,
+/// through the real `OutputManagerLayer`, onto a real terminal. Nothing here
+/// asserts how long anything took -- only that what the user is shown names
+/// the phase and states its duration.
+#[test]
+fn test_an_over_budget_phase_names_itself_on_the_user_s_terminal() {
+    let fixture = Fixture::new(2);
+    let mut session =
+        Session::spawn_with_env(&fixture, &[], &[("FINCH_STARTUP_SLOW_BUDGET_MS", "0")]);
+    let report = session.wait_for_report(&fixture);
+
+    // Every phase is over a zero budget, so the report must mark them SLOW. If
+    // it does not, the override never reached the binary and the terminal
+    // assertions below would be vacuous for that reason instead.
+    let slow_in_report: Vec<&str> = report
+        .entries
+        .iter()
+        .filter(|entry| entry.slow)
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert!(
+        !slow_in_report.is_empty(),
+        "with FINCH_STARTUP_SLOW_BUDGET_MS=0 every phase is over budget and \
+         the report must mark them SLOW. None were, so the override did not \
+         take effect and this test would prove nothing about the warning. \
+         Report was:\n{}",
+        report.raw
+    );
+
+    session.send_line("/exit");
+    let status = session.wait_for_exit();
+    let lines = session.readable_lines();
+    let readable = session.readable_transcript();
+
+    let startup_lines: Vec<&String> = lines.iter().filter(|l| l.contains("[startup]")).collect();
+    assert!(
+        !startup_lines.is_empty(),
+        "an over-budget phase must be visible to the operator, not silently \
+         absorbed. With every phase over budget the terminal carried no \
+         [startup] line at all. Exit status was {status:?}; the report marked \
+         {slow_in_report:?} SLOW and the terminal read:\n{readable}"
+    );
+
+    let known: Vec<&str> = expected_order();
+    let named: Vec<&&String> = startup_lines
+        .iter()
+        .filter(|line| known.iter().any(|phase| line.contains(phase)))
+        .collect();
+    assert!(
+        !named.is_empty(),
+        "#364 requires that a phase exceeding its budget 'says so, by name'. \
+         None of the {} startup lines on the terminal named a phase; \
+         'startup phase exceeded its budget' tells an operator only that \
+         startup was slow, and that is what shipped. The lines were \
+         {startup_lines:?} and the terminal read:\n{readable}",
+        startup_lines.len()
+    );
+
+    // And the duration, parsed rather than substring-matched, so a line that
+    // merely happens to contain digits does not pass. "Slow" without "how
+    // slow" is not actionable either.
+    let with_duration: Vec<&&&String> = named
+        .iter()
+        .filter(|line| {
+            line.split_once(" ms, over its ")
+                .and_then(|(head, _)| head.rsplit(' ').next())
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some()
+        })
+        .collect();
+    assert!(
+        !with_duration.is_empty(),
+        "the over-budget warning must carry how long the phase took, in the \
+         message -- MessageVisitor drops every other field, so a duration \
+         recorded only as a structured field never reaches this terminal. \
+         Lines that named a phase were {named:?} and the terminal \
+         read:\n{readable}"
+    );
 }
 
 #[test]
@@ -1161,8 +1498,12 @@ fn test_the_startup_report_leaks_no_private_content() {
 
 /// The repeatable before/after benchmark #364 asks for.
 ///
-/// `#[ignore]`, so it is never a correctness gate: `AGENTS.md` forbids
-/// asserting a wall-clock startup property, and this asserts none. It reports.
+/// `#[ignore]`, so it is never a correctness gate. #364, "Instrument and
+/// reduce Finch interactive TUI time-to-ready", asks for the benchmark to be
+/// "kept separate from the correctness gates" and for this suite's assertions
+/// to be structural rather than absolute wall-clock thresholds; this reports
+/// timings and asserts none. (That requirement lives in #364 and in the
+/// precedent `a0ea2c64`, not in `AGENTS.md` -- see this file's header.)
 ///
 /// It lives here rather than in a shell script because the shell version
 /// launched the TUI itself through `script(1)` and cleaned up with

@@ -668,8 +668,11 @@ impl Repl {
         let memory_system = if config.memory.enabled {
             // `memory_open` covers the synchronous prologue only -- SQLite
             // open, schema batch, migrations, the embedding-cache probe.
-            // MemTree hydration runs in the background from here (#242), so
-            // its cost is deliberately not inside this phase (#364).
+            // MemTree hydration runs in the background from here (#242,
+            // "Make ordinary TUI startup prompt-first and lazily hydrate
+            // MemTree"), so
+            // its cost is deliberately not inside this phase (#364,
+            // "Instrument and reduce Finch interactive TUI time-to-ready").
             let memory_open = crate::startup::phase(crate::startup::PHASE_MEMORY_OPEN);
             let opened = crate::memory::MemorySystem::new(config.memory.clone());
             drop(memory_open);
@@ -1111,7 +1114,9 @@ impl Repl {
         // Moved to global for Phase 5 native ratatui dialogs
         if config.tui_enabled && is_interactive {
             // Timed from here rather than inside `TuiRenderer::new` so that
-            // `src/cli/tui/` is untouched; #264 owns terminal lifecycle.
+            // `src/cli/tui/` is untouched; #264 ("Make terminal-session
+            // cleanup bounded, signal-complete, and embedding-safe") owns
+            // terminal lifecycle.
             let mut phase = crate::startup::phase(crate::startup::PHASE_TERMINAL_INIT);
             match TuiRenderer::new(
                 Arc::new(output_manager.clone()),

@@ -90,7 +90,8 @@ impl DaemonClient {
             // The fourth full read and TOML parse of `config.toml` on an
             // interactive start. Timed under the same `config_load` name as
             // the other three so the report shows all four rather than
-            // absorbing this one into `daemon_http_connect` (#364).
+            // absorbing this one into `daemon_http_connect` (#364,
+            // "Instrument and reduce Finch interactive TUI time-to-ready").
             let mut phase = crate::startup::phase(crate::startup::PHASE_CONFIG);
             phase.detail(crate::startup::PhaseDetail::category("daemon_api_key"));
             config.api_key = crate::config::load_config()

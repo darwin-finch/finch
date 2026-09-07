@@ -2364,7 +2364,9 @@ impl EventLoop {
                     // This runs on every start, and writing the user's config
                     // to remember that a notice was shown rewrote a file they
                     // never asked to change -- reformatting it, dropping
-                    // comments, moving its mtime (#76).
+                    // comments, moving its mtime (#76, "Keep ordinary Finch
+                    // startup byte-for-byte read-only on user
+                    // configuration").
                     let should_show = crate::config::claim_notice_showing_now(
                         cfg.license.notice_suppress_until.as_deref(),
                         today,
@@ -2376,7 +2378,8 @@ impl EventLoop {
                     // `tests/startup_is_readonly_on_config.rs` proves
                     // `claim_notice_showing_now` writes no config. It does NOT
                     // cover this block: a `cfg.save()` added anywhere in here
-                    // reships #76 with a green suite, because nothing calls
+                    // reships #76 -- the read-only-startup guarantee --
+                    // with a green suite, because nothing calls
                     // `EventLoop::run` outside production. So do not add one.
                     // If this block ever needs to persist something, put it
                     // behind a function the integration test can call.
