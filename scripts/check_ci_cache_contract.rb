@@ -2,118 +2,99 @@
 # frozen_string_literal: true
 
 # Semantic production-boundary contract for Finch's canonical Cargo caches.
-# It parses the checked-in YAML so comments and inactive text cannot satisfy a
-# requirement, then validates authority, ordering, paths, pins, and matrices.
 
 require "shellwords"
 require "yaml"
 
 ROOT = File.expand_path("..", __dir__)
 CACHE_SHA = "0057852bfaa89a56745cba8c7296529d2fc39830"
-SCCACHE_SHA = "fc920bf0ec8de6ee65d409111f7ec508035751ba"
+CHECKOUT_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+TOOLCHAIN_SHA = "62ae3a85dbdd2bedbb5819da8ce45635129289a1"
+UPLOAD_SHA = "ea165f8d65b6e75b540449e92b4886f43607fa02"
+DOWNLOAD_SHA = "d3f86a106a0bac45b974a628896c90dbdf5c8093"
 CACHE_RESTORE = "actions/cache/restore@#{CACHE_SHA}"
 CACHE_SAVE = "actions/cache/save@#{CACHE_SHA}"
-SCCACHE_ACTION = "mozilla-actions/sccache-action@#{SCCACHE_SHA}"
+CHECKOUT = "actions/checkout@#{CHECKOUT_SHA}"
+APPROVED_ACTIONS = [
+  CACHE_RESTORE,
+  CACHE_SAVE,
+  CHECKOUT,
+  "dtolnay/rust-toolchain@#{TOOLCHAIN_SHA}",
+  "actions/upload-artifact@#{UPLOAD_SHA}",
+  "actions/download-artifact@#{DOWNLOAD_SHA}"
+].freeze
 TRUSTED_MAIN = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
 DOWNLOAD_PATHS = [
   "${{ runner.temp }}/finch-cargo-home/git/db",
   "${{ runner.temp }}/finch-cargo-home/registry/cache"
 ].freeze
-AUDIT_PATHS = ["${{ runner.temp }}/finch-cargo-home/bin/cargo-audit"].freeze
-KNOWN_CONSUMERS = {
+OBJECT_PATH = "${{ runner.temp }}/finch-sccache-cache"
+CONSUMERS = {
   ".github/workflows/ci.yml" => %w[test runtime-authority build security],
   ".github/workflows/release.yml" => %w[build-release]
 }.freeze
-SCCACHE_CONSUMERS = {
-  ".github/workflows/ci.yml" => %w[test runtime-authority build],
-  ".github/workflows/release.yml" => %w[build-release]
-}.freeze
-COMPILE_SUBCOMMANDS = %w[bench build check clippy doc install run rustc test].freeze
-
-def disabled?(item)
-  condition = item["if"]
-  return false if condition.nil?
-  return true if condition == false
-
-  normalized = condition.to_s.gsub(/\s+/, " ").strip
-  normalized == "false" || normalized == "${{ false }}"
-end
+COMPILE_SUBCOMMANDS = %w[audit bench build check clippy doc install metadata run rustc test tree].freeze
 
 def steps(job)
-  value = job["steps"]
-  value.is_a?(Array) ? value.select { |step| step.is_a?(Hash) } : []
+  Array(job["steps"]).select { |step| step.is_a?(Hash) }
 end
 
-def step_label(step)
-  step["name"] || step["uses"] || step["run"]&.lines&.first&.strip || "unnamed step"
-end
+def disabled?(step)
+  condition = step["if"]
+  return true if condition == false
 
-def active_steps(job)
-  steps(job).reject { |step| disabled?(step) }
+  %w[false ${{false}}].include?(condition.to_s.gsub(/\s+/, "").downcase)
 end
 
 def paths(step)
   step.dig("with", "path").to_s.lines.map(&:strip).reject(&:empty?).sort
 end
 
-def exact_download_key?(key)
-  text = key.to_s
-  text.start_with?("cargo-downloads-v1-${{ runner.os }}-rust-1.98.0-config-") &&
-    text.include?("hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml')") &&
-    text.end_with?("-lock-${{ hashFiles('**/Cargo.lock') }}")
-end
-
-def cache_action?(step)
-  step["uses"].to_s.downcase.include?("cache")
+def error(errors, workflow, job, message)
+  errors << "#{workflow} job '#{job}': #{message}"
 end
 
 def split_shell(script)
   script.to_s.lines.flat_map { |line| line.split(/\s*(?:&&|\|\||;|\|)\s*/) }
 end
 
-def resolved_executable(token, variables)
-  match = token.match(/\A\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\z/)
-  return variables[match[1]] if match
-
-  token
-end
-
 def cargo_compile_script?(script)
-  variables = {}
-  split_shell(script).any? do |statement|
-    stripped = statement.strip
-    next false if stripped.empty? || stripped.start_with?("#")
-
-    tokens = Shellwords.shellsplit(stripped)
-    while tokens.first&.match?(/\A[A-Za-z_][A-Za-z0-9_]*=.*/)
-      name, value = tokens.shift.split("=", 2)
-      variables[name] = value
+  text = script.to_s
+  text.scan(/\$\(([^()]*)\)/).any? { |match| cargo_compile_script?(match.first) } || begin
+    variables = {}
+    split_shell(text).any? do |statement|
+      stripped = statement.strip
+      next false if stripped.empty? || stripped.start_with?("#")
+      tokens = Shellwords.shellsplit(stripped)
+      while tokens.first&.match?(/\A[A-Za-z_][A-Za-z0-9_]*=.*/)
+        name, value = tokens.shift.split("=", 2)
+        variables[name] = value
+      end
+      next false if tokens.empty?
+      executable = tokens.first
+      variable = executable.match(/\A\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\z/)
+      executable = variables[variable[1]] if variable
+      shell = File.basename(executable.to_s)
+      if %w[bash sh zsh].include?(shell) && tokens[1].to_s.match?(/\A-[a-z]*c[a-z]*\z/)
+        next cargo_compile_script?(tokens[2].to_s)
+      end
+      next false if %w[echo printf].include?(executable)
+      cargo_at = if executable == "cargo"
+                   0
+                 elsif %w[command env sudo timeout].include?(executable) || executable.to_s.end_with?("test_brains.sh")
+                   tokens.index("cargo")
+                 elsif executable.nil? || executable.to_s.start_with?("$")
+                   0
+                 end
+      next false if cargo_at.nil?
+      tokens[(cargo_at + 1)..].to_a.any? { |token| COMPILE_SUBCOMMANDS.include?(token) }
+    rescue ArgumentError
+      stripped.match?(/\bcargo\b.*\b(?:#{COMPILE_SUBCOMMANDS.join('|')})\b/)
     end
-    next false if tokens.empty?
-
-    executable = resolved_executable(tokens.first, variables)
-    if executable == "echo" || executable == "printf"
-      next false
-    end
-
-    cargo_at = if executable == "cargo"
-                 0
-               elsif %w[command env sudo timeout].include?(executable) || executable.end_with?("test_brains.sh")
-                 tokens.index("cargo")
-               elsif executable.start_with?("$")
-                 0
-               end
-    next false if cargo_at.nil?
-
-    tokens[(cargo_at + 1)..].to_a.any? { |token| COMPILE_SUBCOMMANDS.include?(token) }
-  rescue ArgumentError
-    # A malformed/opaque shell command is not silently accepted when it looks
-    # like it might invoke a compiling Cargo subcommand indirectly.
-    stripped.match?(/\bcargo\b.*\b(?:#{COMPILE_SUBCOMMANDS.join('|')})\b/)
   end
 end
 
-def first_compile_index(job)
+def first_compile(job)
   steps(job).each_with_index do |step, index|
     next if disabled?(step)
     return index if cargo_compile_script?(step["run"])
@@ -121,346 +102,383 @@ def first_compile_index(job)
   nil
 end
 
-def find_steps(job, &block)
+def selected(job, &block)
   steps(job).each_with_index.select { |step, _index| block.call(step) }
 end
 
-def actionable(errors, workflow, job, message)
-  errors << "#{workflow} job '#{job}': #{message}"
+def exact_download_key?(key)
+  value = key.to_s
+  value.start_with?("cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-") &&
+    value.include?("hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml')") &&
+    value.end_with?("-lock-${{ hashFiles('Cargo.lock') }}")
 end
 
-def validate_cache_action(step, errors, workflow, job)
-  uses = step["uses"].to_s
-  return unless cache_action?(step)
-  if [CACHE_RESTORE, CACHE_SAVE, SCCACHE_ACTION].include?(uses)
-    if uses == CACHE_RESTORE && step.fetch("with", {}).key?("restore-keys")
-      actionable(errors, workflow, job, "exact cache restore must not have cumulative restore-keys")
+def validate_actions(documents, errors)
+  documents.each do |workflow, document|
+    (document["jobs"] || {}).each do |job_name, job|
+      steps(job).each do |step|
+        uses = step["uses"].to_s
+        unless uses.empty? || APPROVED_ACTIONS.include?(uses)
+          error(errors, workflow, job_name, "external action #{uses.inspect} is not an approved immutable full-SHA pin")
+        end
+        next unless uses.start_with?("actions/checkout@")
+        error(errors, workflow, job_name, "checkout must use immutable #{CHECKOUT}") unless uses == CHECKOUT
+        unless step.dig("with", "persist-credentials") == false
+          error(errors, workflow, job_name, "checkout must set persist-credentials: false before build scripts")
+        end
+      end
     end
-    return
-  end
-
-  actionable(errors, workflow, job,
-             "cache-like action #{uses.inspect} is not an approved full-SHA-pinned cache action")
-end
-
-def validate_download_restore(step, errors, workflow, job)
-  actionable(errors, workflow, job, "dependency restore must use #{CACHE_RESTORE}") unless step["uses"] == CACHE_RESTORE
-  actionable(errors, workflow, job, "dependency restore must be nonfatal") unless step["continue-on-error"] == true
-  actionable(errors, workflow, job,
-             "dependency restore paths must be exactly #{DOWNLOAD_PATHS.inspect}; found #{paths(step).inspect}") unless paths(step) == DOWNLOAD_PATHS
-  actionable(errors, workflow, job, "dependency restore key is missing an exact compatible lock identity") unless exact_download_key?(step.dig("with", "key"))
-  if step.fetch("with", {}).key?("restore-keys")
-    actionable(errors, workflow, job, "exact dependency restore must not have cumulative restore-keys")
-  end
-  actionable(errors, workflow, job, "dependency restore is disabled") if disabled?(step)
-  actionable(errors, workflow, job, "dependency restore must be unconditional") unless step["if"].nil?
-end
-
-def validate_sccache(job_value, errors, workflow, job_name, writer)
-  setup = find_steps(job_value) { |step| step["uses"].to_s.include?("sccache-action") }
-  if setup.length != 1
-    actionable(errors, workflow, job_name, "needs exactly one pinned sccache setup; found #{setup.length}")
-    return
-  end
-  setup_step, setup_at = setup.first
-  actionable(errors, workflow, job_name, "sccache setup must use #{SCCACHE_ACTION}") unless setup_step["uses"] == SCCACHE_ACTION
-  actionable(errors, workflow, job_name, "sccache setup must pin binary v0.17.0") unless setup_step.dig("with", "version") == "v0.17.0"
-  actionable(errors, workflow, job_name, "sccache setup must be nonfatal") unless setup_step["continue-on-error"] == true
-  actionable(errors, workflow, job_name, "sccache setup is disabled") if disabled?(setup_step)
-  actionable(errors, workflow, job_name, "sccache setup must be unconditional") unless setup_step["if"].nil?
-
-  configure = find_steps(job_value) { |step| step["run"].to_s.strip == "scripts/configure_ci_sccache.sh" }
-  if configure.length != 1
-    actionable(errors, workflow, job_name, "needs exactly one compiler-cache authority configuration; found #{configure.length}")
-    return
-  end
-  configure_step, configure_at = configure.first
-  actual_writer = configure_step.dig("env", "FINCH_SCCACHE_WRITER")
-  actionable(errors, workflow, job_name,
-             "compiler-cache writer marker must be #{writer.inspect}; found #{actual_writer.inspect}") unless actual_writer == writer
-  actionable(errors, workflow, job_name, "compiler-cache authority configuration is disabled") if disabled?(configure_step)
-  actionable(errors, workflow, job_name, "compiler-cache authority configuration must be unconditional") unless configure_step["if"].nil?
-
-  compile_at = first_compile_index(job_value)
-  return if compile_at.nil?
-  unless setup_at < configure_at && configure_at < compile_at
-    actionable(errors, workflow, job_name,
-               "must install and authorize sccache before the first compiling Cargo command")
-  end
-end
-
-def validate_consumer(job_value, errors, workflow, job_name)
-  compile_at = first_compile_index(job_value)
-  if compile_at.nil?
-    actionable(errors, workflow, job_name, "is contracted as expensive but no active compiling Cargo command was found")
-    return
-  end
-
-  cargo_home = find_steps(job_value) { |step| step["run"].to_s.strip == "scripts/configure_ci_cargo_home.sh" }
-  lock = find_steps(job_value) { |step| step["run"].to_s.strip == "cargo generate-lockfile" }
-  restores = find_steps(job_value) do |step|
-    step["uses"].to_s.start_with?("actions/cache/restore@") &&
-      step.dig("with", "key").to_s.start_with?("cargo-downloads-")
-  end
-  actionable(errors, workflow, job_name, "needs exactly one active isolated Cargo home setup; found #{cargo_home.length}") unless cargo_home.length == 1 && !disabled?(cargo_home.first.first)
-  actionable(errors, workflow, job_name, "needs exactly one active lock resolution; found #{lock.length}") unless lock.length == 1 && !disabled?(lock.first.first)
-  actionable(errors, workflow, job_name, "needs exactly one exact dependency restore; found #{restores.length}") unless restores.length == 1
-  return unless cargo_home.length == 1 && lock.length == 1 && restores.length == 1
-
-  actionable(errors, workflow, job_name, "isolated Cargo home setup must be unconditional") unless cargo_home.first.first["if"].nil?
-  actionable(errors, workflow, job_name, "lock resolution must be unconditional") unless lock.first.first["if"].nil?
-  validate_download_restore(restores.first.first, errors, workflow, job_name)
-  unless cargo_home.first.last < lock.first.last && lock.first.last < restores.first.last && restores.first.last < compile_at
-    actionable(errors, workflow, job_name,
-               "must isolate Cargo home, resolve the lock, restore exact downloads, then run the first Cargo compile")
-  end
-end
-
-def validate_matrix(errors, ci_jobs)
-  producer_os = ci_jobs.dig("cargo-download-cache", "strategy", "matrix", "os")
-  unless producer_os == %w[ubuntu-24.04 macos-14]
-    actionable(errors, ".github/workflows/ci.yml", "cargo-download-cache",
-               "active OS matrix must be [ubuntu-24.04, macos-14]; found #{producer_os.inspect}")
-  end
-
-  test_rows = ci_jobs.dig("test", "strategy", "matrix", "include")
-  expected_test = [
-    ["ubuntu-24.04", "default", "", true],
-    ["ubuntu-24.04", "no-default-features", "--no-default-features", false],
-    ["macos-14", "default", "", true],
-    ["macos-14", "no-default-features", "--no-default-features", false]
-  ]
-  actual_test = Array(test_rows).map do |row|
-    [row["os"], row["feature_name"], row["cargo_args"], row["sccache_writer"]]
-  end
-  actionable(errors, ".github/workflows/ci.yml", "test",
-             "matrix must bind the two trusted writer lanes to default features; found #{actual_test.inspect}") unless actual_test == expected_test
-
-  build_rows = ci_jobs.dig("build", "strategy", "matrix", "include")
-  expected_build = [
-    ["ubuntu-24.04", "x86_64-unknown-linux-gnu", true],
-    ["macos-14", "aarch64-apple-darwin", true]
-  ]
-  actual_build = Array(build_rows).map { |row| [row["os"], row["target"], row["sccache_writer"]] }
-  actionable(errors, ".github/workflows/ci.yml", "build",
-             "matrix must bind one trusted release-profile writer per supported OS; found #{actual_build.inspect}") unless actual_build == expected_build
-end
-
-def validate_release_matrix(errors, release_jobs)
-  rows = release_jobs.dig("build-release", "strategy", "matrix", "include")
-  expected = [
-    ["macos-14", "aarch64-apple-darwin", "finch-macos-arm64"],
-    ["ubuntu-24.04", "x86_64-unknown-linux-gnu", "finch-linux-x86_64"]
-  ]
-  actual = Array(rows).map { |row| [row["os"], row["target"], row["asset_name"]] }
-  actionable(errors, ".github/workflows/release.yml", "build-release",
-             "active release matrix must bind each supported OS, target, and asset; found #{actual.inspect}") unless actual == expected
-end
-
-def validate_download_producer(job, errors)
-  workflow = ".github/workflows/ci.yml"
-  name = "cargo-download-cache"
-  actionable(errors, workflow, name, "job must be active only on trusted main pushes") unless job["if"] == TRUSTED_MAIN
-
-  cargo_home = find_steps(job) { |step| step["run"].to_s.strip == "scripts/configure_ci_cargo_home.sh" }
-  lock = find_steps(job) { |step| step["run"].to_s.strip == "cargo generate-lockfile" }
-  restores = find_steps(job) { |step| step["uses"] == CACHE_RESTORE }
-  fetches = find_steps(job) do |step|
-    run = step["run"].to_s
-    run.strip == "cargo fetch --locked --verbose"
-  end
-  saves = find_steps(job) { |step| step["uses"] == CACHE_SAVE }
-  actionable(errors, workflow, name, "needs one isolated Cargo home, lock resolution, exact restore, complete fetch, and save") unless [cargo_home.length, lock.length, restores.length, fetches.length, saves.length] == [1, 1, 1, 1, 1]
-  return unless [cargo_home.length, lock.length, restores.length, fetches.length, saves.length] == [1, 1, 1, 1, 1]
-
-  validate_download_restore(restores.first.first, errors, workflow, name)
-  fetch_step, fetch_at = fetches.first
-  save_step, save_at = saves.first
-  actionable(errors, workflow, name, "clean complete fetch is disabled") if disabled?(fetch_step)
-  unless fetch_step["if"] == "steps.cargo-downloads.outputs.cache-hit != 'true'"
-    actionable(errors, workflow, name, "clean complete fetch must run on an exact-cache miss")
-  end
-  actionable(errors, workflow, name, "save must be nonfatal") unless save_step["continue-on-error"] == true
-  expected_save = "steps.cargo-downloads.outputs.cache-hit != 'true' && #{TRUSTED_MAIN}"
-  unless save_step["if"] == expected_save && !disabled?(save_step)
-    actionable(errors, workflow, name, "save must be executable only after a trusted-main cache miss")
-  end
-  actionable(errors, workflow, name,
-             "save paths must be exactly #{DOWNLOAD_PATHS.inspect}; found #{paths(save_step).inspect}") unless paths(save_step) == DOWNLOAD_PATHS
-  unless save_step.dig("with", "key") == "${{ steps.cargo-downloads.outputs.cache-primary-key }}"
-    actionable(errors, workflow, name, "save must reuse the exact restore primary key")
-  end
-  unless cargo_home.first.last < lock.first.last && lock.first.last < restores.first.last && restores.first.last < fetch_at && fetch_at < save_at
-    actionable(errors, workflow, name, "must isolate Cargo home, resolve, restore, fetch, then save in that order")
-  end
-end
-
-def validate_audit(job, errors)
-  workflow = ".github/workflows/ci.yml"
-  name = "security"
-  restores = find_steps(job) { |step| step["uses"] == CACHE_RESTORE && paths(step) == AUDIT_PATHS }
-  installs = find_steps(job) { |step| step["run"].to_s.strip == "cargo install cargo-audit --version 0.22.2 --locked" }
-  saves = find_steps(job) { |step| step["uses"] == CACHE_SAVE }
-  actionable(errors, workflow, name, "needs one pinned cargo-audit restore/install/save path") unless [restores.length, installs.length, saves.length] == [1, 1, 1]
-  return unless [restores.length, installs.length, saves.length] == [1, 1, 1]
-
-  restore, restore_at = restores.first
-  install, install_at = installs.first
-  save, save_at = saves.first
-  actionable(errors, workflow, name, "cargo-audit restore must be nonfatal") unless restore["continue-on-error"] == true
-  expected_key = "cargo-tool-v1-${{ runner.os }}-ubuntu-24.04-rust-1.98.0-cargo-audit-0.22.2"
-  actionable(errors, workflow, name, "cargo-audit key must pin OS, runner, Rust, and tool version") unless restore.dig("with", "key") == expected_key
-  actionable(errors, workflow, name, "cargo-audit install must run only on a cache miss") unless install["if"] == "steps.cargo-audit.outputs.cache-hit != 'true'"
-  actionable(errors, workflow, name, "cargo-audit save must be nonfatal") unless save["continue-on-error"] == true
-  expected_save = "steps.cargo-audit.outputs.cache-hit != 'true' && #{TRUSTED_MAIN}"
-  unless save["if"] == expected_save && !disabled?(save)
-    actionable(errors, workflow, name, "cargo-audit save must be executable only after a trusted-main miss")
-  end
-  actionable(errors, workflow, name,
-             "cargo-audit save paths must be exactly #{AUDIT_PATHS.inspect}; found #{paths(save).inspect}") unless paths(save) == AUDIT_PATHS
-  actionable(errors, workflow, name, "cargo-audit save must reuse the restore primary key") unless save.dig("with", "key") == "${{ steps.cargo-audit.outputs.cache-primary-key }}"
-  unless restore_at < install_at && install_at < save_at
-    actionable(errors, workflow, name, "must restore, install on miss, verify, then save")
-  end
-  full_job = steps(job).map { |step| step["run"].to_s }.join("\n")
-  unless full_job.include?("actual=$(cargo-audit --version)") && full_job.include?('[[ "$actual" != "cargo-audit 0.22.2" ]]')
-    actionable(errors, workflow, name, "must verify the direct cached cargo-audit executable is exactly 0.22.2")
   end
 end
 
 def validate_permissions(documents, errors)
   ci = documents.fetch(".github/workflows/ci.yml")
   unless ci["permissions"] == { "contents" => "read" }
-    errors << ".github/workflows/ci.yml: workflow permissions must be exactly contents: read"
+    errors << ".github/workflows/ci.yml: default permissions must be exactly contents: read"
   end
-  (ci["jobs"] || {}).each do |job_name, job|
-    next unless job.fetch("permissions", {}).values.include?("write")
-    actionable(errors, ".github/workflows/ci.yml", job_name, "must not elevate token permissions")
+  (ci["jobs"] || {}).each do |name, job|
+    error(errors, ".github/workflows/ci.yml", name, "must not elevate workflow permissions") if job.key?("permissions")
   end
+end
+
+def validate_matrices(documents, errors)
+  ci = documents.fetch(".github/workflows/ci.yml").fetch("jobs")
+  release = documents.fetch(".github/workflows/release.yml").fetch("jobs")
+  producer_os = ci.dig("cargo-download-cache", "strategy", "matrix", "os")
+  unless producer_os == %w[ubuntu-24.04 macos-14]
+    error(errors, ".github/workflows/ci.yml", "cargo-download-cache",
+          "download producer matrix must be exactly the two supported runner families; found #{producer_os.inspect}")
+  end
+  expected_tests = [
+    { "os" => "ubuntu-24.04", "feature_name" => "default", "cargo_args" => "" },
+    { "os" => "ubuntu-24.04", "feature_name" => "no-default-features", "cargo_args" => "--no-default-features" },
+    { "os" => "macos-14", "feature_name" => "default", "cargo_args" => "" },
+    { "os" => "macos-14", "feature_name" => "no-default-features", "cargo_args" => "--no-default-features" }
+  ]
+  actual_tests = ci.dig("test", "strategy", "matrix", "include")
+  unless actual_tests == expected_tests
+    error(errors, ".github/workflows/ci.yml", "test",
+          "matrix must preserve two OSes and exactly one compiler-cache writer lane per OS; found #{actual_tests.inspect}")
+  end
+  expected_builds = [
+    { "os" => "ubuntu-24.04", "target" => "x86_64-unknown-linux-gnu" },
+    { "os" => "macos-14", "target" => "aarch64-apple-darwin" }
+  ]
+  actual_builds = ci.dig("build", "strategy", "matrix", "include")
+  unless actual_builds == expected_builds
+    error(errors, ".github/workflows/ci.yml", "build",
+          "release writer matrix must be exactly the two supported target families; found #{actual_builds.inspect}")
+  end
+  expected_releases = [
+    { "os" => "macos-14", "target" => "aarch64-apple-darwin", "asset_name" => "finch-macos-arm64" },
+    { "os" => "ubuntu-24.04", "target" => "x86_64-unknown-linux-gnu", "asset_name" => "finch-linux-x86_64" }
+  ]
+  actual_releases = release.dig("build-release", "strategy", "matrix", "include")
+  unless actual_releases == expected_releases
+    error(errors, ".github/workflows/release.yml", "build-release",
+          "release matrix must match the two trusted-main producer targets; found #{actual_releases.inspect}")
+  end
+end
+
+def validate_download_restore(step, errors, workflow, job, producer: false)
+  error(errors, workflow, job, "download restore must use #{CACHE_RESTORE}") unless step["uses"] == CACHE_RESTORE
+  error(errors, workflow, job, "download restore must be nonfatal") unless step["continue-on-error"] == true
+  error(errors, workflow, job,
+        "download paths must be exactly #{DOWNLOAD_PATHS.inspect}; found #{paths(step).inspect}") unless paths(step) == DOWNLOAD_PATHS
+  key = step.dig("with", "key")
+  error(errors, workflow, job, "wrong download key #{key.inspect}") unless exact_download_key?(key)
+  if producer
+    error(errors, workflow, job, "producer restore must be lookup-only") unless step.dig("with", "lookup-only") == true
+    error(errors, workflow, job, "producer must not restore a fallback union") if step.fetch("with", {}).key?("restore-keys")
+  else
+    expected = key.to_s.sub(/\$\{\{ hashFiles\('Cargo.lock'\) \}\}\z/, "")
+    actual = step.dig("with", "restore-keys").to_s.strip
+    error(errors, workflow, job,
+          "consumer conservative restore prefix is wrong: #{actual.inspect}") unless actual == expected
+    error(errors, workflow, job, "consumer download restore must be unconditional") unless step["if"].nil?
+  end
+end
+
+def validate_consumers(documents, errors)
+  CONSUMERS.each do |workflow, names|
+    jobs = documents.fetch(workflow).fetch("jobs")
+    names.each do |name|
+      job = jobs[name]
+      unless job
+        error(errors, workflow, name, "required canonical expensive job is missing")
+        next
+      end
+      compile_at = first_compile(job)
+      unless compile_at
+        error(errors, workflow, name, "has no active compiling Cargo command")
+        next
+      end
+      homes = selected(job) { |step| step["run"].to_s.strip == "scripts/configure_ci_cargo_home.sh" }
+      restores = selected(job) do |step|
+        step.dig("with", "key").to_s.start_with?("cargo-downloads-")
+      end
+      error(errors, workflow, name, "needs exactly one isolated Cargo home setup; found #{homes.length}") unless homes.length == 1
+      error(errors, workflow, name, "needs exactly one download restore; found #{restores.length}") unless restores.length == 1
+      next unless homes.length == 1 && restores.length == 1
+      validate_download_restore(restores.first.first, errors, workflow, name)
+      unless homes.first.last < restores.first.last && restores.first.last < compile_at
+        error(errors, workflow, name, "must configure Cargo home and restore downloads before compilation")
+      end
+      if steps(job).any? { |step| step["run"].to_s.include?("cargo generate-lockfile") }
+        error(errors, workflow, name, "must use tracked Cargo.lock rather than online lock generation")
+      end
+    end
+
+    jobs.each do |name, job|
+      next if names.include?(name) || name == "cargo-download-cache"
+      error(errors, workflow, name, "new compiling Cargo job is outside the cache contract") if first_compile(job)
+    end
+  end
+end
+
+def validate_download_producer(job, errors)
+  workflow = ".github/workflows/ci.yml"
+  name = "cargo-download-cache"
+  error(errors, workflow, name, "must run only on trusted main") unless job["if"] == TRUSTED_MAIN
+  restores = selected(job) { |step| step["uses"] == CACHE_RESTORE }
+  fetches = selected(job) { |step| step["run"].to_s.strip == "cargo fetch --locked --verbose" }
+  saves = selected(job) { |step| step["uses"] == CACHE_SAVE }
+  unless [restores.length, fetches.length, saves.length] == [1, 1, 1]
+    error(errors, workflow, name, "needs one lookup-only restore, complete fetch, and exact save")
+    return
+  end
+  restore, restore_at = restores.first
+  fetch, fetch_at = fetches.first
+  save, save_at = saves.first
+  validate_download_restore(restore, errors, workflow, name, producer: true)
+  error(errors, workflow, name, "fetch must run exactly on lookup miss") unless fetch["if"] == "steps.cargo-downloads.outputs.cache-hit != 'true'"
+  expected_save = "steps.cargo-downloads.outputs.cache-hit != 'true' && #{TRUSTED_MAIN}"
+  error(errors, workflow, name, "save trust/miss condition is wrong: #{save['if'].inspect}") unless save["if"] == expected_save
+  error(errors, workflow, name, "save must be nonfatal") unless save["continue-on-error"] == true
+  error(errors, workflow, name, "save paths are wrong: #{paths(save).inspect}") unless paths(save) == DOWNLOAD_PATHS
+  unless save.dig("with", "key") == "${{ steps.cargo-downloads.outputs.cache-primary-key }}"
+    error(errors, workflow, name, "save must reuse lookup primary key")
+  end
+  error(errors, workflow, name, "must lookup before fetching and save only afterward") unless restore_at < fetch_at && fetch_at < save_at
+end
+
+def object_condition(name)
+  return TRUSTED_MAIN unless name == "test-save"
+  "success() && #{TRUSTED_MAIN} && matrix.feature_name == 'default' && steps.sccache-local.outputs.cache-hit != 'true' && steps.sccache-stop.outputs.save-ready == 'true'"
+end
+
+def validate_object_job(job, errors, name, profile:, target: false, save: false)
+  workflow = ".github/workflows/ci.yml"
+  native = selected(job) { |step| step["run"].to_s.strip == "python3 scripts/ci_native_cache_key.py" }
+  restore = selected(job) { |step| paths(step) == [OBJECT_PATH] && step["uses"] == CACHE_RESTORE }
+  configure = selected(job) { |step| step["run"].to_s.strip == "scripts/configure_ci_sccache.sh" }
+  stop = selected(job) { |step| step["run"].to_s.strip == "scripts/stop_ci_sccache.sh" }
+  unless [native.length, restore.length, configure.length, stop.length] == [1, 1, 1, 1]
+    error(errors, workflow, name, "needs one native identity, local object restore, fixed-digest setup, and stop/measure")
+    return
+  end
+  [native.first.first, restore.first.first, configure.first.first, stop.first.first].each do |step|
+    error(errors, workflow, name, "compiler-object step #{step['name'].inspect} must be trusted-main-only") unless step["if"] == TRUSTED_MAIN
+  end
+  cache = restore.first.first
+  error(errors, workflow, name, "object restore must be nonfatal") unless cache["continue-on-error"] == true
+  key = cache.dig("with", "key").to_s
+  required = ["sccache-local-v3-${{ runner.os }}", "profile-#{profile}", "cap-256m", "sccache-0.17.0", "rust-1.98.0", "native-${{ steps.native-cache.outputs.digest }}", "hashFiles('Cargo.lock')", ".cargo/config", ".cargo/config.toml"]
+  required << "target-${{ matrix.target }}" if target
+  missing = required.reject { |part| key.include?(part) }
+  error(errors, workflow, name, "object key #{key.inspect} misses #{missing.inspect}") unless missing.empty?
+  prefix = cache.dig("with", "restore-keys").to_s.strip
+  error(errors, workflow, name, "object fallback must stay inside the exact compatible family") unless prefix == key.sub(/\$\{\{ hashFiles\('Cargo.lock'\) \}\}\z/, "")
+  compile_at = first_compile(job)
+  unless native.first.last < restore.first.last && restore.first.last < configure.first.last && configure.first.last < compile_at && compile_at < stop.first.last
+    error(errors, workflow, name, "compiler cache setup/compile/stop ordering is wrong")
+  end
+
+  saves = selected(job) { |step| paths(step) == [OBJECT_PATH] && step["uses"] == CACHE_SAVE }
+  expected_count = save ? 1 : 0
+  error(errors, workflow, name, "expected #{expected_count} compiler-object save; found #{saves.length}") unless saves.length == expected_count
+  return unless save && saves.length == 1
+  save_step, save_at = saves.first
+  expected = name == "test" ? object_condition("test-save") : "success() && #{TRUSTED_MAIN} && steps.sccache-local.outputs.cache-hit != 'true' && steps.sccache-stop.outputs.save-ready == 'true'"
+  error(errors, workflow, name, "object save trust/order predicate is wrong: #{save_step['if'].inspect}") unless save_step["if"] == expected
+  error(errors, workflow, name, "object save must be nonfatal") unless save_step["continue-on-error"] == true
+  error(errors, workflow, name, "object save must reuse restore primary key") unless save_step.dig("with", "key") == "${{ steps.sccache-local.outputs.cache-primary-key }}"
+  error(errors, workflow, name, "object save must follow successful stop/measure") unless stop.first.last < save_at
+end
+
+def validate_objects(documents, errors)
+  ci = documents.dig(".github/workflows/ci.yml", "jobs")
+  validate_object_job(ci.fetch("test"), errors, "test", profile: "debug", save: true)
+  validate_object_job(ci.fetch("runtime-authority"), errors, "runtime-authority", profile: "debug")
+  validate_object_job(ci.fetch("build"), errors, "build", profile: "release-lto-false-codegen-16", target: true, save: true)
+  release_steps = documents.dig(".github/workflows/release.yml", "jobs", "build-release").then { |job| steps(job) }
+  if release_steps.any? { |step| paths(step).include?(OBJECT_PATH) || step["run"].to_s.include?("sccache") }
+    error(errors, ".github/workflows/release.yml", "build-release", "tag builds must not restore or execute compiler caches")
+  end
+  all_steps = documents.values.flat_map { |doc| (doc["jobs"] || {}).values.flat_map { |job| steps(job) } }
+  if all_steps.any? { |step| step["uses"].to_s.include?("sccache-action") || step["run"].to_s.include?("SCCACHE_GHA") || (step["env"] || {}).keys.any? { |key| key.start_with?("SCCACHE_GHA") } }
+    errors << "canonical workflows must not expose GitHub cache credentials to sccache"
+  end
+  injections = all_steps.select do |step|
+    run = step["run"].to_s
+    run.include?("GITHUB_ENV") || run.match?(/(?:RUSTC_WRAPPER|SCCACHE_(?:DIR|CACHE|LOCAL|GHA))/)
+  end
+  errors << "canonical workflows must configure compiler authority only inside reviewed helpers" unless injections.empty?
+  object_saves = all_steps.count { |step| paths(step) == [OBJECT_PATH] && step["uses"] == CACHE_SAVE }
+  errors << "canonical workflows must have exactly two compiler save definitions; found #{object_saves}" unless object_saves == 2
+end
+
+def validate_audit(job, errors)
+  workflow = ".github/workflows/ci.yml"
+  name = "security"
+  install = selected(job) { |step| step["run"].to_s.strip == "scripts/configure_ci_cargo_audit.sh" }
+  verify = selected(job) { |step| step["run"].to_s.include?("actual=$(cargo-audit --version)") }
+  audit = selected(job) { |step| step["run"].to_s.strip == "cargo audit" }
+  forbidden = steps(job).any? do |step|
+    step["run"].to_s.include?("cargo install cargo-audit") ||
+      step.dig("with", "path").to_s.include?("cargo-audit") ||
+      step.dig("with", "key").to_s.include?("cargo-audit")
+  end
+  error(errors, workflow, name, "must not compile or cache the cargo-audit executable") if forbidden
+  unless [install.length, verify.length, audit.length] == [1, 1, 1]
+    error(errors, workflow, name, "needs one active fixed-digest audit install/verify/run sequence")
+    return
+  end
+  install_step, install_at = install.first
+  verify_step, verify_at = verify.first
+  _audit_step, audit_at = audit.first
+  error(errors, workflow, name, "fixed-digest audit install must be unconditional") unless install_step["if"].nil?
+  error(errors, workflow, name, "audit verification must be unconditional") unless verify_step["if"].nil?
+  unless verify_step["run"].to_s.include?('[[ "$actual" != "cargo-audit 0.22.2" ]]')
+    error(errors, workflow, name, "audit verification must require exact version 0.22.2")
+  end
+  error(errors, workflow, name, "audit install/verify/run ordering is wrong") unless install_at < verify_at && verify_at < audit_at
+end
+
+def validate_release(documents, errors)
   release = documents.fetch(".github/workflows/release.yml")
-  unless release["permissions"] == { "contents" => "read" }
-    errors << ".github/workflows/release.yml: workflow permissions must be exactly contents: read"
+  error(errors, ".github/workflows/release.yml", "workflow", "default permissions must be contents: read") unless release["permissions"] == { "contents" => "read" }
+  build = release.dig("jobs", "build-release")
+  unless build["env"] == nil && release["env"]["CARGO_PROFILE_RELEASE_LTO"] == "false" && release["env"]["CARGO_PROFILE_RELEASE_CODEGEN_UNITS"] == "16"
+    error(errors, ".github/workflows/release.yml", "build-release", "release profile must be lto=false/codegen-units=16")
   end
-  create = release.dig("jobs", "create-release") || {}
-  unless create["permissions"] == { "contents" => "write" }
-    actionable(errors, ".github/workflows/release.yml", "create-release",
-               "must be the only job elevated to contents: write")
-  end
-  steps(create).each do |step|
-    next unless step["uses"]
-    ref = step["uses"].to_s.split("@").last
-    actionable(errors, ".github/workflows/release.yml", "create-release",
-               "action #{step['uses'].inspect} executes with release authority and must use a full commit SHA") unless ref&.match?(/\A[0-9a-f]{40}\z/)
-  end
-  (release["jobs"] || {}).each do |job_name, job|
-    next if job_name == "create-release"
-    next unless job.fetch("permissions", {}).values.include?("write")
-    actionable(errors, ".github/workflows/release.yml", job_name,
-               "must not receive release write authority")
+  ci_build = documents.dig(".github/workflows/ci.yml", "jobs", "build", "env")
+  expected_profile = { "CARGO_PROFILE_RELEASE_LTO" => "false", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS" => "16" }
+  error(errors, ".github/workflows/ci.yml", "build", "trusted release writer profile does not match tag build: #{ci_build.inspect}") unless ci_build == expected_profile
+  create = release.dig("jobs", "create-release")
+  error(errors, ".github/workflows/release.yml", "create-release", "must alone hold contents: write") unless create["permissions"] == { "contents" => "write" }
+  release_step = steps(create).find { |step| step["run"].to_s.include?("gh release create") }
+  unless release_step && release_step.dig("env", "GH_REPO") == "${{ github.repository }}"
+    error(errors, ".github/workflows/release.yml", "create-release", "no-checkout release creation must set GH_REPO to github.repository")
   end
 end
 
 def validate_helpers(root, errors)
-  sccache_path = File.join(root, "scripts/configure_ci_sccache.sh")
-  cargo_home_path = File.join(root, "scripts/configure_ci_cargo_home.sh")
-  unless File.executable?(sccache_path) && File.executable?(cargo_home_path)
-    errors << "CI cache helpers must both exist and be executable"
-    return
+  required = %w[configure_ci_cargo_home.sh configure_ci_sccache.sh stop_ci_sccache.sh ci_native_cache_key.py configure_ci_cargo_audit.sh ci_rustc_cache_wrapper.sh]
+  required.each do |name|
+    path = File.join(root, "scripts", name)
+    errors << "scripts/#{name}: helper must exist and be executable" unless File.executable?(path)
+  end
+  return unless required.all? { |name| File.file?(File.join(root, "scripts", name)) }
+  setup = File.read(File.join(root, "scripts/configure_ci_sccache.sh"))
+  stop = File.read(File.join(root, "scripts/stop_ci_sccache.sh"))
+  native = File.read(File.join(root, "scripts/ci_native_cache_key.py"))
+  audit = File.read(File.join(root, "scripts/configure_ci_cargo_audit.sh"))
+  wrapper = File.read(File.join(root, "scripts/ci_rustc_cache_wrapper.sh"))
+  required_setup = [
+    "67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006",
+    "0c560bfba31aef5bdfb4fb3d2677f6e61d71c5c00952f2a83344f47aa31f00f1",
+    "SCCACHE_CACHE_SIZE=256M", "SCCACHE_LOCAL_RW_MODE=READ_WRITE",
+    '"${GITHUB_EVENT_NAME:-}" != "push"', '"${GITHUB_REF:-}" != "refs/heads/main"',
+    "archive has unexpected members", "contains a link or special file", "--max-filesize 8388608",
+    "scripts/ci_rustc_cache_wrapper.sh"
+  ]
+  required_setup.each { |part| errors << "scripts/configure_ci_sccache.sh: missing #{part.inspect}" unless setup.include?(part) }
+  errors << "scripts/configure_ci_sccache.sh: remote GHA backend is forbidden" if setup.include?("SCCACHE_GHA")
+  %w[--show-stats --stop-server 262144 save-ready=true].each do |part|
+    errors << "scripts/stop_ci_sccache.sh: missing stop/cap proof #{part.inspect}" unless stop.include?(part)
+  end
+  %w[RUNNER_OS RUNNER_ARCH GITHUB_OUTPUT capnp clang xcrun cc ld sha256].each do |part|
+    errors << "scripts/ci_native_cache_key.py: missing native identity input #{part.inspect}" unless native.include?(part)
+  end
+  required_audit = [
+    "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39",
+    "cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz", "shasum -a 256 --check --status",
+    "archive has unexpected members", "contains a link or special file", "--max-filesize 8388608"
+  ]
+  required_audit.each { |part| errors << "scripts/configure_ci_cargo_audit.sh: missing #{part.inspect}" unless audit.include?(part) }
+  %w[--test|build_script_build|build-script-build --crate-type=*bin* SCCACHE_PATH].each do |part|
+    errors << "scripts/ci_rustc_cache_wrapper.sh: missing executable exclusion #{part.inspect}" unless wrapper.include?(part)
+  end
+end
+
+def validate_tracked_lock_dependents(root, errors)
+  issue_185 = File.read(File.join(root, ".github/workflows/issue-185-spreadsheet-advisories.yml"))
+  if issue_185.include?("Cargo.lock is gitignored") || !issue_185.include?("cargo tree --locked")
+    errors << ".github/workflows/issue-185-spreadsheet-advisories.yml: must consume the tracked lock with cargo tree --locked"
   end
 
-  sccache = File.read(sccache_path)
-  required_sccache = [
-    '-z "${SCCACHE_PATH:-}" || ! -x "${SCCACHE_PATH}"',
-    'cache_mode=READ_ONLY',
-    '"${GITHUB_EVENT_NAME:-}" == "push"',
-    '"${GITHUB_REF:-}" == "refs/heads/main"',
-    '"${FINCH_SCCACHE_WRITER:-false}" == "true"',
-    'echo "CARGO_INCREMENTAL=0"',
-    'echo "SCCACHE_GHA_RW_MODE=${cache_mode}"'
-  ]
-  required_sccache.each do |fragment|
-    errors << "scripts/configure_ci_sccache.sh: missing authority/fallback contract #{fragment.inspect}" unless sccache.include?(fragment)
+  issue_186 = File.read(File.join(root, ".github/workflows/issue-186-ssh-removal.yml"))
+  required = ["cargo metadata --locked", "cargo tree --locked", "git diff --exit-code -- Cargo.lock"]
+  missing = required.reject { |part| issue_186.include?(part) }
+  unless missing.empty?
+    errors << ".github/workflows/issue-186-ssh-removal.yml: tracked-lock validation misses #{missing.inspect}"
+  end
+  if issue_186.include?("cargo generate-lockfile")
+    errors << ".github/workflows/issue-186-ssh-removal.yml: must validate rather than rewrite the tracked lock"
+  end
+  unlocked = issue_186.scan(/cargo (?:metadata|tree|test|build)\b[^\n]*/).reject { |command| command.include?("--locked") }
+  unless unlocked.empty?
+    errors << ".github/workflows/issue-186-ssh-removal.yml: Cargo graph/build commands must use --locked; found #{unlocked.inspect}"
   end
 
-  cargo_home = File.read(cargo_home_path)
-  required_cargo_home = [
-    '"${RUNNER_TEMP:-}"',
-    'cargo_home="${RUNNER_TEMP}/finch-cargo-home"',
-    'mkdir -p "${cargo_home}/bin"',
-    'echo "CARGO_HOME=${cargo_home}"',
-    'echo "${cargo_home}/bin"'
-  ]
-  required_cargo_home.each do |fragment|
-    errors << "scripts/configure_ci_cargo_home.sh: missing isolated-home contract #{fragment.inspect}" unless cargo_home.include?(fragment)
-  end
-  if cargo_home.include?("rm -rf") || sccache.include?("rm -rf")
-    errors << "CI cache helpers must not recursively delete paths derived from HOME or runner state"
+  Dir.glob(File.join(root, ".github/workflows/*.{yml,yaml}")).sort.each do |path|
+    next unless File.read(path).include?("cargo install cargo-audit")
+
+    errors << "#{path.delete_prefix("#{root}/")}: must use the fixed-digest cargo-audit helper rather than compile cargo-audit"
   end
 end
 
 def validate(root)
   errors = []
   documents = {}
-  KNOWN_CONSUMERS.each_key do |workflow|
-    path = File.join(root, workflow)
+  CONSUMERS.each_key do |workflow|
     begin
-      documents[workflow] = YAML.safe_load(File.read(path), aliases: true)
-    rescue StandardError => error
-      errors << "#{workflow}: cannot parse workflow YAML: #{error.message}"
+      documents[workflow] = YAML.safe_load(File.read(File.join(root, workflow)), aliases: true)
+    rescue StandardError => exception
+      errors << "#{workflow}: cannot parse YAML: #{exception.message}"
     end
   end
   return errors unless errors.empty?
-
-  documents.each do |workflow, document|
-    jobs = document["jobs"] || {}
-    jobs.each do |job_name, job|
-      steps(job).each { |step| validate_cache_action(step, errors, workflow, job_name) }
-      if !KNOWN_CONSUMERS.fetch(workflow).include?(job_name) && job_name != "cargo-download-cache" && first_compile_index(job)
-        actionable(errors, workflow, job_name,
-                   "new compiling Cargo job is outside the explicit cache-consumer contract")
-      end
-    end
-    KNOWN_CONSUMERS.fetch(workflow).each do |job_name|
-      job = jobs[job_name]
-      if job.nil?
-        actionable(errors, workflow, job_name, "required canonical expensive job is missing")
-        next
-      end
-      validate_consumer(job, errors, workflow, job_name)
-      if SCCACHE_CONSUMERS.fetch(workflow).include?(job_name)
-        writer = %w[test build].include?(job_name) ? "${{ matrix.sccache_writer }}" : "false"
-        validate_sccache(job, errors, workflow, job_name, writer)
-      end
-    end
+  unless File.file?(File.join(root, "Cargo.lock"))
+    errors << "Cargo.lock must be tracked for restore-before-resolution correctness"
+  end
+  ignore_lines = File.readlines(File.join(root, ".gitignore"), chomp: true).map(&:strip).reject { |line| line.empty? || line.start_with?("#") }
+  if ignore_lines.any? { |line| %w[Cargo.lock /Cargo.lock **/Cargo.lock].include?(line) }
+    errors << "Cargo.lock must not be ignored"
   end
 
-  ci_jobs = documents.dig(".github/workflows/ci.yml", "jobs") || {}
-  validate_matrix(errors, ci_jobs)
-  validate_release_matrix(errors, documents.dig(".github/workflows/release.yml", "jobs") || {})
-  producer = ci_jobs["cargo-download-cache"]
-  producer ? validate_download_producer(producer, errors) : actionable(errors, ".github/workflows/ci.yml", "cargo-download-cache", "trusted producer is missing")
-  validate_audit(ci_jobs["security"] || {}, errors)
+  validate_actions(documents, errors)
   validate_permissions(documents, errors)
+  validate_matrices(documents, errors)
+  validate_consumers(documents, errors)
+  ci_jobs = documents.dig(".github/workflows/ci.yml", "jobs") || {}
+  producer = ci_jobs["cargo-download-cache"]
+  producer ? validate_download_producer(producer, errors) : error(errors, ".github/workflows/ci.yml", "cargo-download-cache", "producer is missing")
+  validate_objects(documents, errors)
+  validate_audit(ci_jobs.fetch("security", {}), errors)
+  validate_release(documents, errors)
   validate_helpers(root, errors)
-
-  all_steps = documents.values.flat_map { |doc| (doc["jobs"] || {}).values.flat_map { |job| steps(job) } }
-  saves = all_steps.select { |step| step["uses"] == CACHE_SAVE }
-  errors << "canonical workflows: expected exactly two trusted cache save steps; found #{saves.length}" unless saves.length == 2
-  audit_compiles = all_steps.count { |step| step["run"].to_s.include?("cargo install cargo-audit") }
-  errors << "canonical workflows: cargo-audit must have exactly one cold compiler; found #{audit_compiles}" unless audit_compiles == 1
-  forbidden_env = all_steps.flat_map { |step| (step["env"] || {}).keys }.grep(/\A(?:RUSTC_WRAPPER|SCCACHE_)/)
-  errors << "canonical workflows: sccache authority must come only from configure_ci_sccache.sh; found #{forbidden_env.inspect}" unless forbidden_env.empty?
-
+  validate_tracked_lock_dependents(root, errors)
   errors
 end
 
 root = ARGV.fetch(0, ROOT)
 errors = validate(root)
 if errors.empty?
-  puts "CI cache contract passed: exact downloads, four trusted sccache writer lanes, PR/release read-only"
+  puts "CI cache contract passed: tracked lock, authenticated PR downloads, trusted-main-only 4x256MiB compiler families"
   exit 0
 end
-
 warn "CI cache contract failed:"
-errors.each { |error| warn "- #{error}" }
+errors.each { |entry| warn "- #{entry}" }
 exit 1

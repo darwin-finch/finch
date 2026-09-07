@@ -20,10 +20,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
       with:
         components: rustfmt
 
@@ -40,10 +42,12 @@ jobs:
     runs-on: windows-2025
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
       with:
         components: rustfmt
 
@@ -59,7 +63,8 @@ jobs:
   # GitHub's repository cache quota is 10 GiB. Four former target-tree caches
   # already measured 10,965,750,437 bytes and took 66-72 seconds to transfer.
   # Keep only Cargo's compressed crate archives and bare git databases here.
-  # Each lock generation is exact-only: there are no cumulative restore keys.
+  # Cargo.lock is tracked, so an exact lookup happens before any online Cargo
+  # operation. Producers never restore a fallback or save a cumulative union.
   cargo-download-cache:
     name: Populate exact Cargo downloads (${{ matrix.os }})
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -71,17 +76,16 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
 
     - name: Configure isolated Cargo download home
       run: scripts/configure_ci_cargo_home.sh
 
-    - name: Resolve exact Cargo dependency graph
-      run: cargo generate-lockfile
-
-    - name: Restore exact Cargo downloads
+    - name: Look up exact Cargo downloads
       id: cargo-downloads
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       continue-on-error: true
@@ -89,7 +93,8 @@ jobs:
         path: |
           ${{ runner.temp }}/finch-cargo-home/registry/cache
           ${{ runner.temp }}/finch-cargo-home/git/db
-        key: cargo-downloads-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        key: cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        lookup-only: true
 
     # RUNNER_TEMP starts empty, so a new exact key cannot inherit removed
     # crates from an older dependency generation.
@@ -118,23 +123,21 @@ jobs:
           - os: ubuntu-24.04
             feature_name: default
             cargo_args: ""
-            sccache_writer: true
           - os: ubuntu-24.04
             feature_name: no-default-features
             cargo_args: --no-default-features
-            sccache_writer: false
           - os: macos-14
             feature_name: default
             cargo_args: ""
-            sccache_writer: true
           - os: macos-14
             feature_name: no-default-features
             cargo_args: --no-default-features
-            sccache_writer: false
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install capnproto (Ubuntu)
       if: runner.os == 'Linux'
@@ -145,15 +148,12 @@ jobs:
       run: brew install capnp
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
       with:
         components: clippy
 
     - name: Configure isolated Cargo download home
       run: scripts/configure_ci_cargo_home.sh
-
-    - name: Resolve exact Cargo dependency graph
-      run: cargo generate-lockfile
 
     - name: Restore exact Cargo downloads
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -162,39 +162,64 @@ jobs:
         path: |
           ${{ runner.temp }}/finch-cargo-home/registry/cache
           ${{ runner.temp }}/finch-cargo-home/git/db
-        key: cargo-downloads-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        key: cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    # sccache has no Finch-set byte cap. GitHub's shared 10 GiB LRU quota is
-    # the hard ceiling; only four trusted-main matrix lanes may add objects.
-    - name: Install optional quota-LRU sccache
-      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+    # Compiler objects are never restored into PR jobs. Trusted main test lanes
+    # may reuse this local cache, but only the default-feature lane saves it.
+    - name: Identify native compiler inputs
+      id: native-cache
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: python3 scripts/ci_native_cache_key.py
+
+    - name: Restore bounded local compiler objects
+      id: sccache-local
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       continue-on-error: true
       with:
-        version: v0.17.0
+        path: ${{ runner.temp }}/finch-sccache-cache
+        key: sccache-local-v3-${{ runner.os }}-profile-debug-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          sccache-local-v3-${{ runner.os }}-profile-debug-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    - name: Configure compiler cache authority
-      env:
-        FINCH_SCCACHE_WRITER: ${{ matrix.sccache_writer }}
+    - name: Configure fixed-digest local compiler cache
+      id: sccache-config
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: scripts/configure_ci_sccache.sh
 
     - name: Run clippy (binary only, warnings allowed for now)
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
-      run: cargo clippy --bin finch --all-features
+      run: cargo clippy --locked --bin finch --all-features
       continue-on-error: true
 
     - name: Build binary
-      run: cargo build --bin finch ${{ matrix.cargo_args }} --verbose
+      run: cargo build --locked --bin finch ${{ matrix.cargo_args }} --verbose
 
     - name: Compile all targets
-      run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
+      run: cargo test --locked --all-targets ${{ matrix.cargo_args }} --no-run
 
     - name: Test all targets
-      run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+      run: cargo test --locked --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
     - name: Verify binary reports its version
       # Exercise Cargo's default binary selection so adding a test-only binary
       # cannot silently break the documented `cargo run -- <args>` workflow.
-      run: cargo run ${{ matrix.cargo_args }} -- --version
+      run: cargo run --locked ${{ matrix.cargo_args }} -- --version
+
+    - name: Stop and measure local compiler cache
+      id: sccache-stop
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: scripts/stop_ci_sccache.sh
+
+    - name: Save bounded local compiler objects
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.feature_name == 'default' && steps.sccache-local.outputs.cache-hit != 'true' && steps.sccache-stop.outputs.save-ready == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/finch-sccache-cache
+        key: ${{ steps.sccache-local.outputs.cache-primary-key }}
 
   runtime-authority:
     name: Runtime Authority (Ubuntu)
@@ -202,19 +227,18 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install capnproto
       run: sudo apt-get update && sudo apt-get install -y capnproto
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
 
     - name: Configure isolated Cargo download home
       run: scripts/configure_ci_cargo_home.sh
-
-    - name: Resolve exact Cargo dependency graph
-      run: cargo generate-lockfile
 
     - name: Restore exact Cargo downloads
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -223,56 +247,77 @@ jobs:
         path: |
           ${{ runner.temp }}/finch-cargo-home/registry/cache
           ${{ runner.temp }}/finch-cargo-home/git/db
-        key: cargo-downloads-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        key: cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    - name: Install optional quota-LRU sccache
-      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+    - name: Identify native compiler inputs
+      id: native-cache
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: python3 scripts/ci_native_cache_key.py
+
+    - name: Restore bounded local compiler objects
+      id: sccache-local
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       continue-on-error: true
       with:
-        version: v0.17.0
+        path: ${{ runner.temp }}/finch-sccache-cache
+        key: sccache-local-v3-${{ runner.os }}-profile-debug-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          sccache-local-v3-${{ runner.os }}-profile-debug-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    - name: Configure read-only compiler cache
-      env:
-        FINCH_SCCACHE_WRITER: "false"
+    - name: Configure fixed-digest local compiler cache
+      id: sccache-config
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: scripts/configure_ci_sccache.sh
 
     - name: Run runtime authority regressions
-      run: cargo test --lib runtime::tests -- --nocapture
+      run: cargo test --locked --lib runtime::tests -- --nocapture
 
     - name: Compile all targets
-      run: cargo test --all-targets --no-run
+      run: cargo test --locked --all-targets --no-run
 
     - name: Regress scheduler and authority-use concurrency
       run: |
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::wait_rechecks_completion_after_registering_notification -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::tests::deferred_effect_sink_can_reenter_authority_without_deadlock -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::tests::public_revocation_winning_before_host_use_prevents_file_mutation -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::tests::in_flight_deferred_use_blocks_public_revoke_and_root_mutation -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::scheduler::tests::wait_rechecks_completion_after_registering_notification -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::tests::deferred_effect_sink_can_reenter_authority_without_deadlock -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::tests::public_revocation_winning_before_host_use_prevents_file_mutation -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::tests::in_flight_deferred_use_blocks_public_revoke_and_root_mutation -- --exact --nocapture
 
     - name: Test all targets
-      run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
+      run: timeout --signal=TERM --kill-after=30s 15m cargo test --locked --all-targets -- --nocapture
+
+    - name: Stop and measure local compiler cache
+      id: sccache-stop
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: scripts/stop_ci_sccache.sh
 
   build:
     name: Build Release (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    env:
+      # Match the tag workflow's release compiler arguments.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            sccache_writer: true
           - os: macos-14
             target: aarch64-apple-darwin
-            sccache_writer: true
           # x86_64-apple-darwin is unsupported: ort has no prebuilt binary,
           # and GitHub no longer provides Intel macOS runners.
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install capnproto (Ubuntu)
       if: runner.os == 'Linux'
@@ -283,15 +328,12 @@ jobs:
       run: brew install capnp
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
       with:
         targets: ${{ matrix.target }}
 
     - name: Configure isolated Cargo download home
       run: scripts/configure_ci_cargo_home.sh
-
-    - name: Resolve exact Cargo dependency graph
-      run: cargo generate-lockfile
 
     - name: Restore exact Cargo downloads
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -300,24 +342,49 @@ jobs:
         path: |
           ${{ runner.temp }}/finch-cargo-home/registry/cache
           ${{ runner.temp }}/finch-cargo-home/git/db
-        key: cargo-downloads-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        key: cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    - name: Install optional quota-LRU sccache
-      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+    - name: Identify native compiler inputs
+      id: native-cache
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: python3 scripts/ci_native_cache_key.py
+
+    - name: Restore bounded local compiler objects
+      id: sccache-local
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       continue-on-error: true
       with:
-        version: v0.17.0
+        path: ${{ runner.temp }}/finch-sccache-cache
+        key: sccache-local-v3-${{ runner.os }}-profile-release-lto-false-codegen-16-target-${{ matrix.target }}-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          sccache-local-v3-${{ runner.os }}-profile-release-lto-false-codegen-16-target-${{ matrix.target }}-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    - name: Configure compiler cache authority
-      env:
-        FINCH_SCCACHE_WRITER: ${{ matrix.sccache_writer }}
+    - name: Configure fixed-digest local compiler cache
+      id: sccache-config
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: scripts/configure_ci_sccache.sh
 
     - name: Build release binary
-      run: cargo build --release --target ${{ matrix.target }}
+      run: cargo build --locked --release --target ${{ matrix.target }}
+
+    - name: Stop and measure local compiler cache
+      id: sccache-stop
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: scripts/stop_ci_sccache.sh
+
+    - name: Save bounded local compiler objects
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.sccache-local.outputs.cache-hit != 'true' && steps.sccache-stop.outputs.save-ready == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      continue-on-error: true
+      with:
+        path: ${{ runner.temp }}/finch-sccache-cache
+        key: ${{ steps.sccache-local.outputs.cache-primary-key }}
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: finch-${{ matrix.target }}
         path: target/${{ matrix.target }}/release/finch
@@ -327,16 +394,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
 
     - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@1.98.0
+      uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
 
     - name: Configure isolated Cargo download home
       run: scripts/configure_ci_cargo_home.sh
-
-    - name: Resolve exact Cargo dependency graph
-      run: cargo generate-lockfile
 
     - name: Restore exact Cargo downloads
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -345,22 +411,14 @@ jobs:
         path: |
           ${{ runner.temp }}/finch-cargo-home/registry/cache
           ${{ runner.temp }}/finch-cargo-home/git/db
-        key: cargo-downloads-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        key: cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          cargo-downloads-v2-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
-    # Security is the sole cargo-audit compiler. On a trusted main miss it
-    # saves the pinned executable; PRs can restore but never write this cache.
-    - name: Restore pinned cargo-audit
-      id: cargo-audit
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-      continue-on-error: true
-      with:
-        path: |
-          ${{ runner.temp }}/finch-cargo-home/bin/cargo-audit
-        key: cargo-tool-v1-${{ runner.os }}-ubuntu-24.04-rust-1.98.0-cargo-audit-0.22.2
-
-    - name: Install pinned cargo-audit on cache miss
-      if: steps.cargo-audit.outputs.cache-hit != 'true'
-      run: cargo install cargo-audit --version 0.22.2 --locked
+    # The fixed-digest 6.55 MB RustSec release avoids compiling cargo-audit in
+    # every PR without exposing any cache-service write credential.
+    - name: Install fixed-digest cargo-audit
+      run: scripts/configure_ci_cargo_audit.sh
 
     - name: Verify pinned cargo-audit executable
       run: |
@@ -369,15 +427,6 @@ jobs:
           echo "expected cargo-audit 0.22.2, found: $actual" >&2
           exit 1
         fi
-
-    - name: Save pinned cargo-audit
-      if: steps.cargo-audit.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-      continue-on-error: true
-      with:
-        path: |
-          ${{ runner.temp }}/finch-cargo-home/bin/cargo-audit
-        key: ${{ steps.cargo-audit.outputs.cache-primary-key }}
 
     - name: Verify resolved HTTP dependency contract
       run: |

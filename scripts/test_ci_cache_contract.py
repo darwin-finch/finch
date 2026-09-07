@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Mutation-sensitive tests for the canonical CI cache production contract."""
+"""Mutation-sensitive regressions for Finch's canonical CI cache boundary."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -13,53 +14,52 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_cache_contract.rb"
+FIXTURES = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/issue-185-spreadsheet-advisories.yml",
+    ".github/workflows/issue-186-ssh-removal.yml",
+    ".gitignore",
+    "Cargo.lock",
+    "scripts/configure_ci_cargo_home.sh",
+    "scripts/configure_ci_sccache.sh",
+    "scripts/stop_ci_sccache.sh",
+    "scripts/ci_native_cache_key.py",
+    "scripts/configure_ci_cargo_audit.sh",
+    "scripts/ci_rustc_cache_wrapper.sh",
+)
 
 
-class ContractRepository:
+class Repository:
     def __init__(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        for relative in (
-            ".github/workflows/ci.yml",
-            ".github/workflows/release.yml",
-            "scripts/configure_ci_cargo_home.sh",
-            "scripts/configure_ci_sccache.sh",
-        ):
-            destination = self.root / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(ROOT / relative, destination)
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        for relative in FIXTURES:
+            target = self.root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, target)
 
     def close(self) -> None:
-        self.temporary.cleanup()
+        self.temp.cleanup()
 
     def replace(self, relative: str, old: str, new: str) -> None:
         path = self.root / relative
         contents = path.read_text(encoding="utf-8")
         if old not in contents:
-            raise AssertionError(f"mutation source {old!r} is absent from {relative}")
+            raise AssertionError(f"missing mutation source {old!r} in {relative}")
         path.write_text(contents.replace(old, new, 1), encoding="utf-8")
 
-    def mutate_job(self, workflow: str, job: str, old: str, new: str) -> None:
-        path = self.root / ".github/workflows" / workflow
-        contents = path.read_text(encoding="utf-8")
-        marker = f"  {job}:\n"
-        start = contents.index(marker)
-        next_job = contents.find("\n  ", start + len(marker))
-        while next_job != -1:
-            candidate = contents[next_job + 3 :].split(":", 1)[0]
-            if candidate and not candidate.startswith(" ") and "\n" not in candidate:
-                break
-            next_job = contents.find("\n  ", next_job + 3)
-        end = len(contents) if next_job == -1 else next_job + 1
-        block = contents[start:end]
-        if old not in block:
-            raise AssertionError(f"mutation source {old!r} is absent from {workflow}:{job}")
-        path.write_text(contents[:start] + block.replace(old, new, 1) + contents[end:], encoding="utf-8")
-
-    def append_job(self, body: str) -> None:
+    def append_ci_job(self, run: str) -> None:
         path = self.root / ".github/workflows/ci.yml"
         with path.open("a", encoding="utf-8") as workflow:
-            workflow.write(body)
+            workflow.write(
+                "\n  unexpected-cargo:\n"
+                "    runs-on: ubuntu-24.04\n"
+                "    steps:\n"
+                "    - run: |\n"
+                + "\n".join(f"        {line}" for line in run.splitlines())
+                + "\n"
+            )
 
     def run(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -70,322 +70,436 @@ class ContractRepository:
         )
 
 
-class CiCacheContractTests(unittest.TestCase):
+class WorkflowContractTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.repo = ContractRepository()
+        self.repo = Repository()
 
     def tearDown(self) -> None:
         self.repo.close()
 
-    def assert_rejected(self, diagnostic: str) -> None:
+    def reject(self, message: str) -> None:
         result = self.repo.run()
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 1, output)
-        self.assertIn(diagnostic, output, output)
+        self.assertIn(message, output, output)
 
-    def test_current_workflows_pass_semantic_contract(self) -> None:
+    def test_current_contract_passes(self) -> None:
         result = self.repo.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("four trusted sccache writer lanes", result.stdout)
-        self.assertIn("PR/release read-only", result.stdout)
+        self.assertIn("trusted-main-only 4x256MiB", result.stdout)
 
-    def test_rejects_cumulative_dependency_restore_prefix(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
-            "        key: cargo-downloads-v1-",
-            "        restore-keys: cargo-downloads-v1-\n        key: cargo-downloads-v1-",
+    def test_requires_tracked_lock(self) -> None:
+        (self.repo.root / "Cargo.lock").unlink()
+        self.reject("Cargo.lock must be tracked")
+
+    def test_tracked_lock_cannot_be_ignored(self) -> None:
+        with (self.repo.root / ".gitignore").open("a", encoding="utf-8") as ignore:
+            ignore.write("\nCargo.lock\n")
+        self.reject("Cargo.lock must not be ignored")
+
+    def test_rejects_online_lock_generation_before_restore(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "    - name: Restore exact Cargo downloads\n",
+            "    - run: cargo generate-lockfile\n\n    - name: Restore exact Cargo downloads\n",
         )
-        self.assert_rejected("must not have cumulative restore-keys")
+        self.reject("tracked Cargo.lock rather than online lock generation")
 
-    def test_rejects_second_cold_cargo_audit_compiler(self) -> None:
-        self.repo.append_job(
-            "\n  duplicate-audit:\n"
-            "    runs-on: ubuntu-24.04\n"
-            "    steps:\n"
-            "    - run: cargo install cargo-audit --version 0.22.2 --locked\n"
+    def test_producer_restore_is_lookup_only(self) -> None:
+        self.repo.replace(".github/workflows/ci.yml", "        lookup-only: true\n", "")
+        self.reject("producer restore must be lookup-only")
+
+    def test_producer_never_restores_fallback_union(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "        lookup-only: true",
+            "        lookup-only: true\n        restore-keys: cargo-downloads-v2-",
         )
-        self.assert_rejected("cargo-audit must have exactly one cold compiler; found 2")
+        self.reject("producer must not restore a fallback union")
 
-    def test_rejects_mutable_cache_action_reference(self) -> None:
+    def test_consumer_requires_safe_trusted_fallback(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "        restore-keys: |\n          cargo-downloads-v2-",
+            "        restore-keys: |\n          cargo-downloads-unsafe-",
+        )
+        self.reject("consumer conservative restore prefix is wrong")
+
+    def test_wrong_download_key_prints_offending_key(self) -> None:
+        self.repo.replace(".github/workflows/ci.yml", "cargo-downloads-v2-", "cargo-downloads-wrong-")
+        self.reject('wrong download key "cargo-downloads-wrong-')
+
+    def test_dependency_restore_failure_is_nonfatal(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "      continue-on-error: true\n      with:\n        path: |\n          ${{ runner.temp }}/finch-cargo-home/registry/cache",
+            "      continue-on-error: false\n      with:\n        path: |\n          ${{ runner.temp }}/finch-cargo-home/registry/cache",
+        )
+        self.reject("download restore must be nonfatal")
+
+    def test_producer_save_requires_exact_trusted_predicate(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "steps.cargo-downloads.outputs.cache-hit != 'true' && github.event_name == 'push'",
+            "github.event_name == 'pull_request' && steps.cargo-downloads.outputs.cache-hit != 'true' && github.event_name == 'push'",
+        )
+        self.reject("save trust/miss condition is wrong")
+
+    def test_alternate_cache_action_is_rejected(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "    - name: Build binary\n",
+            "    - uses: Swatinem/rust-cache@v2\n\n    - name: Build binary\n",
+        )
+        self.reject("Swatinem/rust-cache@v2")
+
+    def test_unreviewed_local_action_is_rejected(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "    - name: Build binary\n",
+            "    - uses: ./unreviewed-build-action\n\n    - name: Build binary\n",
+        )
+        self.reject("./unreviewed-build-action")
+
+    def test_mutable_cache_action_is_rejected(self) -> None:
         self.repo.replace(
             ".github/workflows/ci.yml",
             "actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830",
             "actions/cache/restore@v4",
         )
-        self.assert_rejected("not an approved full-SHA-pinned cache action")
+        self.reject("not an approved immutable full-SHA pin")
 
-    def test_rejects_workflow_wide_release_write_permission(self) -> None:
+    def test_mutable_toolchain_action_is_rejected(self) -> None:
         self.repo.replace(
-            ".github/workflows/release.yml", "permissions:\n  contents: read", "permissions:\n  contents: write"
+            ".github/workflows/ci.yml",
+            "dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1",
+            "dtolnay/rust-toolchain@1.98.0",
         )
-        self.assert_rejected("workflow permissions must be exactly contents: read")
+        self.reject("not an approved immutable full-SHA pin")
 
-    def test_rejects_mutable_action_with_release_authority(self) -> None:
+    def test_checkout_credentials_are_not_persisted(self) -> None:
+        self.repo.replace(".github/workflows/ci.yml", "        persist-credentials: false", "        persist-credentials: true")
+        self.reject("checkout must set persist-credentials: false")
+
+    def test_pr_never_restores_compiler_objects(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "      if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n      uses: actions/cache/restore@",
+            "      if: github.event_name == 'pull_request'\n      uses: actions/cache/restore@",
+        )
+        self.reject("must be trusted-main-only")
+
+    def test_release_never_restores_compiler_objects(self) -> None:
         self.repo.replace(
             ".github/workflows/release.yml",
-            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
-            "actions/download-artifact@v4",
+            "      - name: Build release binary\n",
+            "      - run: scripts/configure_ci_sccache.sh\n\n      - name: Build release binary\n",
         )
-        self.assert_rejected("executes with release authority and must use a full commit SHA")
+        self.reject("tag builds must not restore or execute compiler caches")
 
-    def test_rejects_alternate_writable_cache_action(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
+    def test_remote_sccache_backend_is_rejected(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
             "    - name: Build binary\n",
-            "    - name: Hidden target writer\n"
-            "      uses: Swatinem/rust-cache@v2\n"
+            "    - run: echo SCCACHE_GHA_ENABLED=true\n\n    - name: Build binary\n",
+        )
+        self.reject("must not expose GitHub cache credentials to sccache")
+
+    def test_github_env_authority_injection_is_rejected(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
             "    - name: Build binary\n",
+            '    - run: echo "RUSTC_WRAPPER=evil" >> "$GITHUB_ENV"\n\n    - name: Build binary\n',
         )
-        self.assert_rejected("Swatinem/rust-cache@v2")
+        self.reject("configure compiler authority only inside reviewed helpers")
 
-    def test_rejects_disabled_required_restore(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "runtime-authority",
-            "    - name: Restore exact Cargo downloads\n",
-            "    - name: Restore exact Cargo downloads\n      if: false\n",
-        )
-        self.assert_rejected("dependency restore is disabled")
+    def test_object_key_requires_256m_cap(self) -> None:
+        self.repo.replace(".github/workflows/ci.yml", "cap-256m", "cap-unbounded")
+        self.reject("object key")
 
-    def test_rejects_disabled_complete_fetch(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "cargo-download-cache",
-            "      if: steps.cargo-downloads.outputs.cache-hit != 'true'\n      run: cargo fetch",
-            "      if: false\n      run: cargo fetch",
+    def test_object_key_requires_native_identity(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "native-${{ steps.native-cache.outputs.digest }}",
+            "native-unknown",
         )
-        self.assert_rejected("clean complete fetch is disabled")
+        self.reject("object key")
 
-    def test_rejects_disabled_dependency_save(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "cargo-download-cache",
-            "    - name: Save complete exact Cargo downloads\n      if:",
-            "    - name: Save complete exact Cargo downloads\n      if: false #",
+    def test_object_save_requires_successful_stop_measurement(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            " && steps.sccache-stop.outputs.save-ready == 'true'",
+            "",
         )
-        self.assert_rejected("save must be executable only after a trusted-main cache miss")
+        self.reject("object save trust/order predicate is wrong")
 
-    def test_rejects_logically_impossible_dependency_save(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "cargo-download-cache",
-            "      if: steps.cargo-downloads.outputs.cache-hit != 'true' && github.event_name == 'push'",
-            "      if: github.event_name == 'pull_request' && steps.cargo-downloads.outputs.cache-hit != 'true' && github.event_name == 'push'",
+    def test_runtime_consumer_cannot_save_compiler_objects(self) -> None:
+        marker = "  build:\n"
+        insertion = (
+            "    - name: Illicit runtime save\n"
+            "      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830\n"
+            "      with:\n"
+            "        path: ${{ runner.temp }}/finch-sccache-cache\n\n"
         )
-        self.assert_rejected("save must be executable only after a trusted-main cache miss")
+        self.repo.replace(".github/workflows/ci.yml", marker, insertion + marker)
+        self.reject("expected 0 compiler-object save; found 1")
 
-    def test_comments_cannot_mask_missing_macos_producer(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "cargo-download-cache",
-            "        os: [ubuntu-24.04, macos-14]",
-            "        # os: [ubuntu-24.04, macos-14]\n        os: [ubuntu-24.04]",
+    def test_test_matrix_preserves_bounded_writer_cardinality(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "            feature_name: no-default-features\n            cargo_args: --no-default-features",
+            "            feature_name: default\n            cargo_args: --no-default-features",
         )
-        self.assert_rejected("active OS matrix must be [ubuntu-24.04, macos-14]")
+        self.reject("exactly one compiler-cache writer lane per OS")
 
-    def test_discovers_variable_indirect_cargo_compilation(self) -> None:
-        self.repo.append_job(
-            "\n  indirect-compile:\n"
-            "    runs-on: ubuntu-24.04\n"
-            "    steps:\n"
-            "    - run: |\n"
-            "        runner=cargo\n"
-            "        \"$runner\" test --all-targets\n"
+    def test_release_matrix_matches_trusted_main_targets(self) -> None:
+        self.repo.replace(
+            ".github/workflows/release.yml",
+            "            target: aarch64-apple-darwin",
+            "            target: x86_64-apple-darwin",
         )
-        self.assert_rejected("new compiling Cargo job is outside the explicit cache-consumer contract")
+        self.reject("release matrix must match")
 
-    def test_harmless_echo_of_cargo_text_is_not_a_compile(self) -> None:
-        self.repo.append_job(
-            "\n  harmless-text:\n"
-            "    runs-on: ubuntu-24.04\n"
-            "    steps:\n"
-            "    - run: echo cargo test --all-targets\n"
+    def test_ci_jobs_cannot_elevate_permissions(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "  security:\n    name: Security Audit",
+            "  security:\n    permissions:\n      contents: write\n    name: Security Audit",
         )
+        self.reject("must not elevate workflow permissions")
+
+    def test_release_writer_profile_matches_tag(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            '      CARGO_PROFILE_RELEASE_LTO: "false"',
+            '      CARGO_PROFILE_RELEASE_LTO: "true"',
+        )
+        self.reject("trusted release writer profile does not match tag build")
+
+    def test_sccache_linux_asset_digest_is_fixed(self) -> None:
+        self.repo.replace(
+            "scripts/configure_ci_sccache.sh",
+            "67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006",
+            "0" * 64,
+        )
+        self.reject("67c4a96d")
+
+    def test_sccache_macos_asset_digest_is_fixed(self) -> None:
+        self.repo.replace(
+            "scripts/configure_ci_sccache.sh",
+            "0c560bfba31aef5bdfb4fb3d2677f6e61d71c5c00952f2a83344f47aa31f00f1",
+            "f" * 64,
+        )
+        self.reject("0c560bfb")
+
+    def test_sccache_archive_member_validation_is_required(self) -> None:
+        self.repo.replace("scripts/configure_ci_sccache.sh", "archive has unexpected members", "archive accepted")
+        self.reject("archive has unexpected members")
+
+    def test_sccache_download_is_size_bounded(self) -> None:
+        self.repo.replace("scripts/configure_ci_sccache.sh", "--max-filesize 8388608", "")
+        self.reject("--max-filesize 8388608")
+
+    def test_sccache_local_cap_is_required(self) -> None:
+        self.repo.replace("scripts/configure_ci_sccache.sh", "SCCACHE_CACHE_SIZE=256M", "SCCACHE_CACHE_SIZE=10G")
+        self.reject("SCCACHE_CACHE_SIZE=256M")
+
+    def test_sccache_excludes_executable_outputs(self) -> None:
+        self.repo.replace(
+            "scripts/ci_rustc_cache_wrapper.sh",
+            "--test|build_script_build|build-script-build",
+            "build_script_build",
+        )
+        self.reject("--test|build_script_build|build-script-build")
+
+    def test_stop_helper_must_enforce_256m_bound(self) -> None:
+        self.repo.replace("scripts/stop_ci_sccache.sh", "262144", "1048576")
+        self.reject("262144")
+
+    def test_audit_fixed_digest_install_cannot_be_disabled(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "    - name: Install fixed-digest cargo-audit\n      run:",
+            "    - name: Install fixed-digest cargo-audit\n      if: false\n      run:",
+        )
+        self.reject("fixed-digest audit install must be unconditional")
+
+    def test_audit_verification_cannot_be_disabled(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "    - name: Verify pinned cargo-audit executable\n      run:",
+            "    - name: Verify pinned cargo-audit executable\n      if: false\n      run:",
+        )
+        self.reject("audit verification must be unconditional")
+
+    def test_audit_executable_cannot_be_compiled(self) -> None:
+        self.repo.replace(
+            ".github/workflows/ci.yml",
+            "      run: scripts/configure_ci_cargo_audit.sh",
+            "      run: cargo install cargo-audit --version 0.22.2 --locked",
+        )
+        self.reject("must not compile or cache the cargo-audit executable")
+
+    def test_audit_binary_digest_is_fixed(self) -> None:
+        self.repo.replace(
+            "scripts/configure_ci_cargo_audit.sh",
+            "ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39",
+            "0" * 64,
+        )
+        self.reject("ab28a1bd")
+
+    def test_audit_archive_member_validation_is_required(self) -> None:
+        self.repo.replace(
+            "scripts/configure_ci_cargo_audit.sh",
+            "archive has unexpected members",
+            "archive accepted",
+        )
+        self.reject("archive has unexpected members")
+
+    def test_audit_download_is_size_bounded(self) -> None:
+        self.repo.replace("scripts/configure_ci_cargo_audit.sh", "--max-filesize 8388608", "")
+        self.reject("--max-filesize 8388608")
+
+    def test_release_creation_selects_repository_without_checkout(self) -> None:
+        self.repo.replace(".github/workflows/release.yml", "          GH_REPO: ${{ github.repository }}\n", "")
+        self.reject("must set GH_REPO to github.repository")
+
+    def test_issue_185_uses_tracked_lock(self) -> None:
+        self.repo.replace(
+            ".github/workflows/issue-185-spreadsheet-advisories.yml",
+            "cargo tree --locked",
+            "cargo tree",
+        )
+        self.reject("must consume the tracked lock")
+
+    def test_issue_186_cannot_rewrite_tracked_lock(self) -> None:
+        self.repo.replace(
+            ".github/workflows/issue-186-ssh-removal.yml",
+            "          git diff --exit-code -- Cargo.lock\n",
+            "          cargo generate-lockfile\n",
+        )
+        self.reject("must validate rather than rewrite the tracked lock")
+
+    def test_issue_186_builds_cannot_update_tracked_lock(self) -> None:
+        self.repo.replace(
+            ".github/workflows/issue-186-ssh-removal.yml",
+            "cargo build --locked --release",
+            "cargo build --release",
+        )
+        self.reject("Cargo graph/build commands must use --locked")
+
+    def test_issue_workflows_cannot_compile_cargo_audit(self) -> None:
+        self.repo.replace(
+            ".github/workflows/issue-185-spreadsheet-advisories.yml",
+            "scripts/configure_ci_cargo_audit.sh",
+            "cargo install cargo-audit --locked",
+        )
+        self.reject("must use the fixed-digest cargo-audit helper")
+
+    def test_discovers_bash_wrapped_cargo(self) -> None:
+        self.repo.append_ci_job('bash -c "cargo test --all-targets"')
+        self.reject("new compiling Cargo job is outside the cache contract")
+
+    def test_discovers_login_shell_wrapped_cargo(self) -> None:
+        self.repo.append_ci_job('/bin/bash -lc "cargo test --all-targets"')
+        self.reject("new compiling Cargo job is outside the cache contract")
+
+    def test_discovers_command_substitution_cargo(self) -> None:
+        self.repo.append_ci_job('echo "$(cargo test --all-targets)"')
+        self.reject("new compiling Cargo job is outside the cache contract")
+
+    def test_harmless_cargo_metadata_text_is_not_compile(self) -> None:
+        self.repo.append_ci_job('echo "cargo test is the documented test command"')
         result = self.repo.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_rejects_missing_cache_on_canonical_expensive_job(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "build",
-            "          ${{ runner.temp }}/finch-cargo-home/registry/cache\n",
-            "",
-        )
-        self.assert_rejected("dependency restore paths must be exactly")
 
-    def test_rejects_compile_before_dependency_restore(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
-            "    - name: Resolve exact Cargo dependency graph\n",
-            "    - name: Premature compile\n      run: cargo test --no-run\n\n"
-            "    - name: Resolve exact Cargo dependency graph\n",
-        )
-        self.assert_rejected("then run the first Cargo compile")
-
-    def test_rejects_key_without_both_cargo_config_names(self) -> None:
-        self.repo.mutate_job("ci.yml", "test", ", '.cargo/config.toml'", "")
-        self.assert_rejected("missing an exact compatible lock identity")
-
-    def test_rejects_target_tree_in_dependency_archive(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
-            "          ${{ runner.temp }}/finch-cargo-home/git/db\n",
-            "          ${{ runner.temp }}/finch-cargo-home/git/db\n          target\n",
-        )
-        self.assert_rejected("dependency restore paths must be exactly")
-
-    def test_rejects_target_tree_in_dependency_save(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "cargo-download-cache",
-            "        key: ${{ steps.cargo-downloads.outputs.cache-primary-key }}",
-            "        path: target\n        key: ${{ steps.cargo-downloads.outputs.cache-primary-key }}",
-        )
-        self.assert_rejected("save paths must be exactly")
-
-    def test_rejects_mutable_sccache_action(self) -> None:
-        self.repo.replace(
-            ".github/workflows/ci.yml",
-            "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba",
-            "mozilla-actions/sccache-action@v0.0.11",
-        )
-        self.assert_rejected("not an approved full-SHA-pinned cache action")
-
-    def test_rejects_disabled_sccache_setup(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "runtime-authority",
-            "    - name: Install optional quota-LRU sccache\n",
-            "    - name: Install optional quota-LRU sccache\n      if: false\n",
-        )
-        self.assert_rejected("sccache setup is disabled")
-
-    def test_rejects_extra_no_default_feature_writer_lane(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
-            "            feature_name: no-default-features\n            cargo_args: --no-default-features\n            sccache_writer: false",
-            "            feature_name: no-default-features\n            cargo_args: --no-default-features\n            sccache_writer: true",
-        )
-        self.assert_rejected("two trusted writer lanes to default features")
-
-    def test_rejects_feature_name_not_bound_to_cargo_arguments(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
-            "            feature_name: no-default-features\n            cargo_args: --no-default-features",
-            '            feature_name: no-default-features\n            cargo_args: ""',
-        )
-        self.assert_rejected("two trusted writer lanes to default features")
-
-    def test_rejects_release_platform_hidden_in_comment(self) -> None:
-        self.repo.mutate_job(
-            "release.yml",
-            "build-release",
-            "          - os: macos-14\n            target: aarch64-apple-darwin\n            asset_name: finch-macos-arm64",
-            "          # - os: macos-14\n"
-            "          #   target: aarch64-apple-darwin\n"
-            "          #   asset_name: finch-macos-arm64",
-        )
-        self.assert_rejected("active release matrix must bind each supported OS")
-
-    def test_rejects_release_compiler_cache_writer(self) -> None:
-        self.repo.mutate_job(
-            "release.yml",
-            "build-release",
-            '          FINCH_SCCACHE_WRITER: "false"',
-            '          FINCH_SCCACHE_WRITER: "true"',
-        )
-        self.assert_rejected('compiler-cache writer marker must be "false"')
-
-    def test_rejects_sccache_without_incremental_disabled(self) -> None:
-        self.repo.replace(
-            "scripts/configure_ci_sccache.sh", '  echo "CARGO_INCREMENTAL=0"\n', ""
-        )
-        self.assert_rejected("CARGO_INCREMENTAL=0")
-
-    def test_rejects_sccache_helper_without_pull_request_default_read_only(self) -> None:
-        self.repo.replace(
-            "scripts/configure_ci_sccache.sh", "cache_mode=READ_ONLY", "cache_mode=READ_WRITE"
-        )
-        self.assert_rejected("cache_mode=READ_ONLY")
-
-    def test_rejects_dependency_cache_failure_as_fatal(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml", "test", "      continue-on-error: true", "      continue-on-error: false"
-        )
-        self.assert_rejected("dependency restore must be nonfatal")
-
-    def test_rejects_direct_sccache_authority_override(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "test",
-            "      env:\n        FINCH_SCCACHE_WRITER:",
-            "      env:\n        SCCACHE_GHA_RW_MODE: READ_WRITE\n        FINCH_SCCACHE_WRITER:",
-        )
-        self.assert_rejected("sccache authority must come only from configure_ci_sccache.sh")
-
-    def test_rejects_extra_ci_job_write_permission(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "build",
-            "    runs-on: ${{ matrix.os }}\n",
-            "    runs-on: ${{ matrix.os }}\n    permissions:\n      contents: write\n",
-        )
-        self.assert_rejected("must not elevate token permissions")
-
-    def test_rejects_release_build_write_permission(self) -> None:
-        self.repo.mutate_job(
-            "release.yml",
-            "build-release",
-            "    runs-on: ${{ matrix.os }}\n",
-            "    runs-on: ${{ matrix.os }}\n    permissions:\n      contents: write\n",
-        )
-        self.assert_rejected("must not receive release write authority")
-
-    def test_rejects_cargo_home_derived_from_home(self) -> None:
-        self.repo.replace(
-            "scripts/configure_ci_cargo_home.sh",
-            'cargo_home="${RUNNER_TEMP}/finch-cargo-home"',
-            'cargo_home="${HOME}/.cargo"',
-        )
-        self.assert_rejected("missing isolated-home contract")
-
-    def test_rejects_unpinned_cargo_audit_install(self) -> None:
-        self.repo.mutate_job(
-            "ci.yml",
-            "security",
-            "cargo install cargo-audit --version 0.22.2 --locked",
-            "cargo install cargo-audit --locked",
-        )
-        self.assert_rejected("needs one pinned cargo-audit restore/install/save path")
-
-
-class CacheAuthorityHelperTests(unittest.TestCase):
-    def run_sccache_helper(
-        self, *, event: str, ref: str, writer: str, available: bool = True
-    ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+class HelperBoundaryTests(unittest.TestCase):
+    def test_rustc_wrapper_bypasses_executables_and_caches_reusable_objects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            github_env = root / "github-env"
-            binary = root / "sccache"
-            if available:
-                binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                binary.chmod(0o755)
-            env = os.environ.copy()
-            env.update(
-                {
-                    "SCCACHE_PATH": str(binary),
-                    "GITHUB_ENV": str(github_env),
-                    "GITHUB_EVENT_NAME": event,
-                    "GITHUB_REF": ref,
-                    "FINCH_SCCACHE_WRITER": writer,
-                }
+            fake_rustc = root / "rustc"
+            fake_sccache = root / "sccache"
+            fake_rustc.write_text("#!/bin/sh\nprintf 'rustc\\n'\n", encoding="utf-8")
+            fake_sccache.write_text("#!/bin/sh\nprintf 'sccache\\n'\n", encoding="utf-8")
+            fake_rustc.chmod(0o755)
+            fake_sccache.chmod(0o755)
+            env = os.environ | {"SCCACHE_PATH": str(fake_sccache)}
+            wrapper = ROOT / "scripts/ci_rustc_cache_wrapper.sh"
+
+            for arguments in (["--crate-type", "bin"], ["--test"], ["--crate-name", "build_script_build"]):
+                result = subprocess.run(
+                    [str(wrapper), str(fake_rustc), *arguments],
+                    env=env,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "rustc\n", f"executable arguments were cached: {arguments!r}")
+
+            reusable = subprocess.run(
+                [str(wrapper), str(fake_rustc), "--crate-type", "rlib"],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
             )
+            self.assertEqual(reusable.returncode, 0, reusable.stdout + reusable.stderr)
+            self.assertEqual(reusable.stdout, "sccache\n", "reusable rlib did not pass through sccache")
+
+    def test_native_identity_hashes_runner_and_native_tool_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            identities = {
+                "capnp": "Cap'n Proto version 1.2.3",
+                "cc": "Finch test cc 4.5.6",
+                "ld": "Finch test ld 7.8.9",
+            }
+            for name, identity in identities.items():
+                executable = fake_bin / name
+                executable.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "{identity}"\n', encoding="utf-8")
+                executable.chmod(0o755)
+            output = root / "output"
+            env = os.environ | {
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "RUNNER_OS": "Linux",
+                "RUNNER_ARCH": "X64",
+                "GITHUB_OUTPUT": str(output),
+            }
+            result = subprocess.run(
+                [str(ROOT / "scripts/ci_native_cache_key.py")],
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            expected = hashlib.sha256(
+                "\0".join(["Linux", "X64", *identities.values()]).encode()
+            ).hexdigest()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"), f"digest={expected}\n")
+            self.assertIn(f"Linux/X64 {expected}", result.stdout)
+
+    def test_pr_setup_exits_before_download_or_environment_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            github_env = root / "env"
+            github_path = root / "path"
+            github_output = root / "output"
+            env = os.environ | {
+                "RUNNER_TEMP": temporary,
+                "GITHUB_WORKSPACE": str(ROOT),
+                "GITHUB_ENV": str(github_env),
+                "GITHUB_PATH": str(github_path),
+                "GITHUB_OUTPUT": str(github_output),
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_REF": "refs/pull/384/merge",
+                "RUNNER_OS": "Linux",
+                "RUNNER_ARCH": "X64",
+            }
             result = subprocess.run(
                 [str(ROOT / "scripts/configure_ci_sccache.sh")],
                 env=env,
@@ -393,78 +507,63 @@ class CacheAuthorityHelperTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            values = {}
-            if github_env.exists():
-                values = dict(
-                    line.split("=", 1)
-                    for line in github_env.read_text(encoding="utf-8").splitlines()
-                )
-            return result, values
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(github_env.exists(), github_env)
+            self.assertFalse(github_output.exists(), github_output)
 
-    def test_pull_request_writer_lane_is_actually_read_only(self) -> None:
-        result, values = self.run_sccache_helper(
-            event="pull_request", ref="refs/pull/384/merge", writer="true"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(values["SCCACHE_GHA_RW_MODE"], "READ_ONLY", values)
-        self.assertEqual(values["CARGO_INCREMENTAL"], "0", values)
-
-    def test_trusted_main_writer_lane_is_read_write(self) -> None:
-        result, values = self.run_sccache_helper(
-            event="push", ref="refs/heads/main", writer="true"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(values["SCCACHE_GHA_RW_MODE"], "READ_WRITE", values)
-
-    def test_nonwriter_main_lane_is_read_only(self) -> None:
-        result, values = self.run_sccache_helper(
-            event="push", ref="refs/heads/main", writer="false"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(values["SCCACHE_GHA_RW_MODE"], "READ_ONLY", values)
-
-    def test_writer_lane_on_non_main_branch_is_read_only(self) -> None:
-        result, values = self.run_sccache_helper(
-            event="push", ref="refs/heads/feature", writer="true"
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(values["SCCACHE_GHA_RW_MODE"], "READ_ONLY", values)
-
-    def test_missing_sccache_preserves_ordinary_compilation(self) -> None:
-        result, values = self.run_sccache_helper(
-            event="push", ref="refs/heads/main", writer="true", available=False
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(values, {}, values)
-        self.assertIn("continuing with ordinary rustc compilation", result.stdout)
-
-    def test_cargo_home_is_scoped_to_runner_temp_and_adds_bin_path(self) -> None:
+    def test_stop_helper_reports_save_ready_only_below_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            github_env = root / "github-env"
-            github_path = root / "github-path"
-            runner_temp = root / "runner-temp"
-            runner_temp.mkdir()
-            env = os.environ.copy()
-            env.update(
-                {
-                    "RUNNER_TEMP": str(runner_temp),
-                    "GITHUB_ENV": str(github_env),
-                    "GITHUB_PATH": str(github_path),
-                }
-            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            sccache = fake_bin / "sccache"
+            sccache.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            sccache.chmod(0o755)
+            du = fake_bin / "du"
+            du.write_text("#!/bin/sh\necho '42 cache'\n", encoding="utf-8")
+            du.chmod(0o755)
+            cache = root / "cache"
+            cache.mkdir()
+            output = root / "output"
+            env = os.environ | {
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "SCCACHE_PATH": str(sccache),
+                "SCCACHE_DIR": str(cache),
+                "GITHUB_OUTPUT": str(output),
+            }
             result = subprocess.run(
-                [str(ROOT / "scripts/configure_ci_cargo_home.sh")],
-                env=env,
-                check=False,
-                capture_output=True,
-                text=True,
+                [str(ROOT / "scripts/stop_ci_sccache.sh")], env=env, check=False, capture_output=True, text=True
             )
-            expected = runner_temp / "finch-cargo-home"
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(github_env.read_text().strip(), f"CARGO_HOME={expected}")
-            self.assertEqual(github_path.read_text().strip(), str(expected / "bin"))
-            self.assertTrue((expected / "bin").is_dir(), expected)
+            self.assertIn("save-ready=true", output.read_text(encoding="utf-8"))
+            self.assertIn("cache-size-kib=42", output.read_text(encoding="utf-8"))
+
+    def test_stop_helper_refuses_cache_over_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            for name, body in {
+                "sccache": "#!/bin/sh\nexit 0\n",
+                "du": "#!/bin/sh\necho '262145 cache'\n",
+            }.items():
+                path = fake_bin / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            cache = root / "cache"
+            cache.mkdir()
+            output = root / "output"
+            env = os.environ | {
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "SCCACHE_PATH": str(fake_bin / "sccache"),
+                "SCCACHE_DIR": str(cache),
+                "GITHUB_OUTPUT": str(output),
+            }
+            result = subprocess.run(
+                [str(ROOT / "scripts/stop_ci_sccache.sh")], env=env, check=False, capture_output=True, text=True
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("save-ready=true", output.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

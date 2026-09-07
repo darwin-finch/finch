@@ -69,28 +69,28 @@ jobs:
       - name: Resolve metadata for the target without compiling it
         shell: bash
         run: |
-          cargo metadata --format-version 1 --filter-platform '${{ matrix.target }}' \
+          cargo metadata --locked --format-version 1 --filter-platform '${{ matrix.target }}' \
             ${{ matrix.cargo_args }} > metadata.json
           jq -e '
             [.packages[].name]
             | all(. != "rsa" and . != "russh" and . != "russh-cryptovec" and . != "russh-keys")
           ' metadata.json
-      - name: Prove the generated lock and feature graph exclude SSH and RSA packages
+      - name: Prove the tracked lock and feature graph exclude SSH and RSA packages
         shell: bash
         run: |
-          cargo generate-lockfile
           if grep -Eq '^name = "(rsa|russh|russh-cryptovec|russh-keys)"$' Cargo.lock; then
             echo 'A removed SSH or RSA package returned to Cargo.lock' >&2
             grep -nE '^name = "(rsa|russh|russh-cryptovec|russh-keys)"$' Cargo.lock >&2
             exit 1
           fi
-          cargo tree --edges normal --prefix none --format '{p}' \
+          cargo tree --locked --edges normal --prefix none --format '{p}' \
             --target '${{ matrix.target }}' ${{ matrix.cargo_args }} > dependency-tree.txt
           if grep -Eq '^(rsa|russh|russh-cryptovec|russh-keys) v' dependency-tree.txt; then
             echo 'A removed SSH or RSA package returned to the resolved feature graph' >&2
             grep -E '^(rsa|russh|russh-cryptovec|russh-keys) v' dependency-tree.txt >&2
             exit 1
           fi
+          git diff --exit-code -- Cargo.lock
       - name: Explain Windows scope
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: echo 'Windows is dependency-resolution and static-contract probe-only; Finch native Windows runtime support is not claimed.'
@@ -153,9 +153,9 @@ jobs:
       - name: Install repository Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.0
       - name: Compile all targets
-        run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
+        run: cargo test --locked --all-targets ${{ matrix.cargo_args }} --no-run
       - name: Test all targets
-        run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+        run: cargo test --locked --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
   release-builds:
     name: Release build (${{ matrix.target }})
@@ -185,7 +185,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
   ssh-advisory-audit:
     name: SSH advisory audit
@@ -198,8 +198,8 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       - name: Install repository Rust toolchain
         uses: dtolnay/rust-toolchain@1.98.0
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Install fixed-digest cargo-audit
+        run: scripts/configure_ci_cargo_audit.sh
       - name: Run full audit and retain independent batch findings
         id: full-audit
         shell: bash
