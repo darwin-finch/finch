@@ -198,6 +198,12 @@ jobs:
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
+    - name: Check reviewed workflow bytes and fixture inventories
+      run: python3 scripts/check_ci_workflow_manifest.py
+
+    - name: Run workflow inventory mutation regressions
+      run: python3 scripts/test_ci_workflow_manifest.py
+
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
 
