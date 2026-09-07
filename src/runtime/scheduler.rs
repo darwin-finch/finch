@@ -506,6 +506,12 @@ pub struct AgentScheduler {
     active_brain_parent: RwLock<Option<AgentBrainContext>>,
     #[cfg(test)]
     wait_after_initial_check: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// Test-only rendezvous taken once, after the per-turn cancellation
+    /// precheck and before the provider future is first polled. It exists so a
+    /// regression can drive the exact window in which a naive implementation
+    /// would bill an attempt the provider never observed.
+    #[cfg(test)]
+    wait_before_provider_poll: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl AgentScheduler {
@@ -530,6 +536,8 @@ impl AgentScheduler {
             active_brain_parent: RwLock::new(None),
             #[cfg(test)]
             wait_after_initial_check: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            wait_before_provider_poll: tokio::sync::Mutex::new(None),
         });
         runtime.attach_agent_scheduler(&scheduler);
         scheduler
@@ -775,32 +783,45 @@ impl AgentScheduler {
             }
         }
 
+        // `agent_loop` owns the turn walk but not the terminal result, and the
+        // deadline arm below drops that future mid-attempt. Counting through a
+        // handle owned by `run_task` is what lets every terminal arm - success,
+        // provider error, cancellation, deadline, and turn exhaustion - report
+        // the attempts the provider actually started.
+        let mut attempts = 0usize;
         let execution = tokio::time::timeout(
             std::time::Duration::from_millis(spec.budget.timeout_ms),
-            self.agent_loop(&identity, &spec, &resolved_context, provider, &cancellation),
+            self.agent_loop(
+                &identity,
+                &spec,
+                &resolved_context,
+                provider,
+                &cancellation,
+                &mut attempts,
+            ),
         )
         .await;
         drop(permit);
 
-        let (status, message, diagnostics, turns) = match execution {
-            Ok(Ok((message, turns))) => (AgentTaskStatus::Completed, message, Vec::new(), turns),
+        let (status, message, diagnostics) = match execution {
+            Ok(Ok(message)) => (AgentTaskStatus::Completed, message, Vec::new()),
             Ok(Err(error)) if cancellation.is_cancelled() => (
                 AgentTaskStatus::Cancelled,
                 String::new(),
                 vec![error.to_string()],
-                0,
             ),
             Ok(Err(error)) => (
                 AgentTaskStatus::Failed,
                 String::new(),
                 vec![error.to_string()],
-                0,
             ),
             Err(_) => (
                 AgentTaskStatus::Failed,
                 String::new(),
-                vec!["agent deadline exceeded".to_string()],
-                0,
+                vec![format!(
+                    "agent deadline exceeded: configured timeout_ms={}, consumed provider attempts={attempts}",
+                    spec.budget.timeout_ms
+                )],
             ),
         };
         let result = AgentTaskResult {
@@ -808,7 +829,7 @@ impl AgentScheduler {
             status,
             final_message: truncate(message, spec.budget.max_output_bytes),
             diagnostics,
-            turns,
+            turns: attempts,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         };
         self.store_result(result).await;
@@ -819,7 +840,12 @@ impl AgentScheduler {
             identity,
             status: AgentTaskStatus::Cancelled,
             final_message: String::new(),
-            diagnostics: vec!["cancelled before execution".to_string()],
+            // Zero is the contract here, not a placeholder: this path is only
+            // reached when cancellation won the concurrency-permit race, so no
+            // provider invocation was ever started.
+            diagnostics: vec![
+                "cancelled before execution: consumed provider attempts=0".to_string()
+            ],
             turns: 0,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })
@@ -888,7 +914,8 @@ impl AgentScheduler {
         resolved_context: &[ResolvedAgentContext],
         provider: Arc<dyn Generator>,
         cancellation: &CancellationToken,
-    ) -> Result<(String, usize)> {
+        attempts: &mut usize,
+    ) -> Result<String> {
         let tools = self.child_tools(identity);
         let definitions = tools
             .iter()
@@ -915,13 +942,32 @@ impl AgentScheduler {
         );
         let mut messages = vec![Message::user(preamble)];
 
-        for turn in 1..=spec.budget.max_turns.clamp(1, MAX_TURNS) {
+        let turn_limit = spec.budget.max_turns.clamp(1, MAX_TURNS);
+        for _ in 0..turn_limit {
+            if cancellation.is_cancelled() {
+                bail!("agent cancelled after consuming {attempts} provider attempts");
+            }
+            #[cfg(test)]
+            if let Some((waiting, resume)) = self.wait_before_provider_poll.lock().await.take() {
+                waiting.notify_one();
+                resume.notified().await;
+            }
+            // `biased` plus the increment inside the provider branch linearizes
+            // the accounting: cancellation that is already signalled wins before
+            // the generator future is ever polled, so an attempt is billed only
+            // once the provider invocation has actually begun.
             let response = tokio::select! {
-                response = provider.generate(messages.clone(), Some(definitions.clone())) => response?,
-                _ = cancellation.cancelled() => bail!("agent cancelled"),
+                biased;
+                _ = cancellation.cancelled() => {
+                    bail!("agent cancelled after consuming {attempts} provider attempts")
+                }
+                response = async {
+                    *attempts += 1;
+                    provider.generate(messages.clone(), Some(definitions.clone())).await
+                } => response?,
             };
             if response.tool_uses.is_empty() {
-                return Ok((response.text, turn));
+                return Ok(response.text);
             }
             messages.push(Message::with_content("assistant", response.content_blocks));
             let mut results = Vec::with_capacity(response.tool_uses.len());
@@ -948,7 +994,9 @@ impl AgentScheduler {
             }
             messages.push(Message::with_content("user", results));
         }
-        bail!("agent reached its turn limit without a final response")
+        bail!(
+            "agent reached its turn limit without a final response: configured max_turns={turn_limit}, consumed provider attempts={attempts}"
+        )
     }
 
     fn child_tools(self: &Arc<Self>, identity: &AgentIdentity) -> Vec<Box<dyn Tool>> {
@@ -1068,11 +1116,12 @@ mod tests {
         CredentialProvider, CredentialResolver, ProviderCredential, ProviderEntry,
         ResolvedCredential, ResolvedSecret,
     };
-    use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata};
+    use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata, ToolUse};
     use crate::tools::types::ToolDefinition;
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     struct AccountResolver;
@@ -1592,6 +1641,11 @@ mod tests {
         assert!(result.final_message.contains("verified report"));
         assert_eq!(result.identity.depth, 0);
         assert_eq!(result.identity.starting_context_hash.len(), 64);
+        assert_eq!(
+            result.turns, 1,
+            "invariant: a joined success reports the provider attempts it started; status={:?} turns={} diagnostics={:?} task_id={}",
+            result.status, result.turns, result.diagnostics, result.identity.task_id
+        );
     }
 
     #[tokio::test]
@@ -2654,5 +2708,728 @@ mod tests {
             name == "complete" && matches!(value, crate::programs::ProgramValue::Bool(_))
         }));
         assert_eq!(scheduler.tasks.read().await.len(), 1);
+    }
+
+    // ---- provider attempt accounting through every terminal arm (#359) ----
+
+    /// One scripted provider invocation.
+    enum AttemptAction {
+        /// Answer with a tool call, forcing the loop to consume another turn.
+        ToolTurn,
+        /// Answer with a final message and no tool calls.
+        Final(&'static str),
+        /// Fail this provider invocation.
+        Fail(&'static str),
+        /// Enter the invocation, announce that it started, and never return.
+        BlockForever(Arc<Notify>),
+    }
+
+    /// Scripted generator that records how many invocations the provider itself
+    /// entered. That count is the ground truth every reported turn count is
+    /// compared against, so a bookkeeping-only regression cannot pass.
+    struct AttemptGenerator {
+        script: Vec<AttemptAction>,
+        entered: AtomicUsize,
+    }
+
+    impl AttemptGenerator {
+        fn new(script: Vec<AttemptAction>) -> Arc<Self> {
+            Arc::new(Self {
+                script,
+                entered: AtomicUsize::new(0),
+            })
+        }
+
+        /// Provider invocations observed starting, from inside the provider.
+        fn provider_calls(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+    }
+
+    fn attempt_response(text: String, tool_use: Option<ToolUse>) -> GeneratorResponse {
+        let (content_blocks, tool_uses) = match tool_use {
+            Some(tool_use) => (vec![tool_use.to_content_block()], vec![tool_use]),
+            None => (vec![ContentBlock::text("done")], Vec::new()),
+        };
+        GeneratorResponse {
+            text,
+            content_blocks,
+            tool_uses,
+            metadata: ResponseMetadata {
+                generator: "attempt-script".to_string(),
+                model: "attempt-script".to_string(),
+                confidence: None,
+                stop_reason: None,
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
+                primary_allowance_used_percent: None,
+                secondary_allowance_used_percent: None,
+            },
+        }
+    }
+
+    #[async_trait]
+    impl Generator for AttemptGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            let attempt = self.entered.fetch_add(1, Ordering::SeqCst) + 1;
+            match self.script.get(attempt - 1) {
+                Some(AttemptAction::ToolTurn) => Ok(attempt_response(
+                    String::new(),
+                    Some(ToolUse {
+                        id: format!("attempt-{attempt}"),
+                        name: "unavailable-test-tool".to_string(),
+                        input: serde_json::json!({}),
+                    }),
+                )),
+                Some(AttemptAction::Final(message)) => {
+                    Ok(attempt_response((*message).to_string(), None))
+                }
+                Some(AttemptAction::Fail(message)) => bail!("{message}"),
+                Some(AttemptAction::BlockForever(entered)) => {
+                    entered.notify_one();
+                    std::future::pending().await
+                }
+                None => bail!("scripted provider received unscripted attempt {attempt}"),
+            }
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "attempt-script"
+        }
+    }
+
+    fn typed_agent_await_source(max_turns: usize, timeout_ms: u64) -> String {
+        format!(
+            r#"(agent-await
+                (agent-spawn-with {{
+                    :task "exercise provider attempt accounting"
+                    :role "explore"
+                    :background ""
+                    :provider ""
+                    :model ""
+                    :context-refs (empty-list record{{kind:string,id:string,sha256:string}})
+                    :capabilities (empty-list resource<capability-grant>)
+                    :max-turns {max_turns}
+                    :timeout-ms {timeout_ms}
+                    :max-output-bytes 4096 }}))"#
+        )
+    }
+
+    /// Drive the real typed `agent-spawn-with` -> `agent-await` production
+    /// boundary. The outer timeout is a liveness guard for a hung regression,
+    /// never an assertion about elapsed time.
+    async fn submit_typed_agent_await(
+        runtime: Arc<ProgramRuntime>,
+        max_turns: usize,
+        timeout_ms: u64,
+    ) -> crate::runtime::outcome::ExecutionOutcome {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            runtime.submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: typed_agent_await_source(max_turns, timeout_ms),
+                intent: "report provider attempts through typed agent-await".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            }),
+        )
+        .await
+        .expect("typed agent-await never reached a terminal result")
+        .expect("typed agent-spawn-with/agent-await submission was rejected")
+    }
+
+    fn typed_result_fields(
+        outcome: &crate::runtime::outcome::ExecutionOutcome,
+    ) -> Vec<(String, crate::programs::ProgramValue)> {
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "invariant: agent-await completes the typed program even when the child terminates unsuccessfully; outcome_status={:?} outcome_diagnostics={:?} values={:?}",
+            outcome.status,
+            outcome.diagnostics,
+            outcome.values
+        );
+        match outcome.values.first() {
+            Some(crate::programs::ProgramValue::Record(fields)) => fields.clone(),
+            other => panic!(
+                "invariant: agent-await returns one typed child result record; first_value={other:?} outcome_diagnostics={:?}",
+                outcome.diagnostics
+            ),
+        }
+    }
+
+    /// Assert the typed child record reports `expected_turns` provider attempts
+    /// alongside `expected_status`, and that its diagnostics name the accounting
+    /// an operator needs.
+    fn assert_typed_child_accounting(
+        outcome: &crate::runtime::outcome::ExecutionOutcome,
+        expected_status: &str,
+        expected_turns: usize,
+        diagnostic_fragments: &[&str],
+    ) {
+        let fields = typed_result_fields(outcome);
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(field_name, _)| field_name == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            field("status"),
+            Some(crate::programs::ProgramValue::String(
+                expected_status.to_string()
+            )),
+            "invariant: the typed child record preserves the child terminal status; expected_status={expected_status} expected_turns={expected_turns} fields={fields:?} outcome_diagnostics={:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(
+            field("turns"),
+            Some(crate::programs::ProgramValue::Int(
+                i64::try_from(expected_turns).expect("attempt count must fit the typed integer")
+            )),
+            "invariant: reported turns equal the provider attempts started, on every terminal arm; expected_turns={expected_turns} status={expected_status} fields={fields:?} outcome_diagnostics={:?}",
+            outcome.diagnostics
+        );
+        let Some(crate::programs::ProgramValue::List(diagnostics)) = field("diagnostics") else {
+            panic!(
+                "invariant: the typed child record carries a diagnostics list; fields={fields:?} outcome_diagnostics={:?}",
+                outcome.diagnostics
+            );
+        };
+        for fragment in diagnostic_fragments {
+            assert!(
+                diagnostics.iter().any(|diagnostic| matches!(
+                    diagnostic,
+                    crate::programs::ProgramValue::String(message) if message.contains(fragment)
+                )),
+                "invariant: child diagnostics distinguish configured budget from consumed attempts; missing_fragment={fragment:?} expected_status={expected_status} expected_turns={expected_turns} child_diagnostics={diagnostics:?} outcome_diagnostics={:?}",
+                outcome.diagnostics
+            );
+        }
+    }
+
+    fn event_task_id(event: &AgentEvent) -> Uuid {
+        match event {
+            AgentEvent::TaskQueued { snapshot } | AgentEvent::TaskStarted { snapshot } => {
+                snapshot.identity.task_id
+            }
+            AgentEvent::ToolStarted { task_id, .. } | AgentEvent::ToolCompleted { task_id, .. } => {
+                *task_id
+            }
+            AgentEvent::TaskFinished { result } => result.identity.task_id,
+        }
+    }
+
+    /// Move every currently buffered lifecycle event into `observed`. A lagged
+    /// or closed stream is a test-fixture failure, not a silent skip.
+    fn drain_events(events: &mut broadcast::Receiver<AgentEvent>, observed: &mut Vec<AgentEvent>) {
+        loop {
+            match events.try_recv() {
+                Ok(event) => observed.push(event),
+                Err(broadcast::error::TryRecvError::Empty) => return,
+                Err(error) => panic!(
+                    "the child lifecycle stream must retain every event for this regression; error={error:?} observed={observed:?}"
+                ),
+            }
+        }
+    }
+
+    fn terminal_results(observed: &[AgentEvent]) -> Vec<&AgentTaskResult> {
+        observed
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TaskFinished { result } => Some(result),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Yield repeatedly so a terminal effect that a mutant defers by one or
+    /// several scheduler turns still has to run before the quiescence checks.
+    async fn settle_scheduler() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_reports_consumed_attempts_on_turn_exhaustion() {
+        let provider = AttemptGenerator::new(vec![
+            AttemptAction::ToolTurn,
+            AttemptAction::ToolTurn,
+            AttemptAction::ToolTurn,
+            AttemptAction::ToolTurn,
+        ]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let mut events = scheduler.subscribe();
+
+        let outcome = submit_typed_agent_await(Arc::clone(&runtime), 4, 10_000).await;
+
+        assert_typed_child_accounting(
+            &outcome,
+            "failed",
+            4,
+            &["configured max_turns=4", "consumed provider attempts=4"],
+        );
+        let mut observed = Vec::new();
+        drain_events(&mut events, &mut observed);
+        let finished = terminal_results(&observed);
+        assert_eq!(
+            finished.len(),
+            1,
+            "invariant: exhausting the turn budget publishes exactly one terminal event; terminal_count={} events={observed:?} outcome_diagnostics={:?}",
+            finished.len(),
+            outcome.diagnostics
+        );
+        assert_eq!(
+            (finished[0].status, finished[0].turns),
+            (AgentTaskStatus::Failed, 4),
+            "invariant: the broadcast terminal result and the typed record agree on status and consumed attempts; terminal={:?} provider_calls={} outcome_diagnostics={:?}",
+            finished[0],
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
+        assert_eq!(
+            provider.provider_calls(),
+            4,
+            "invariant: the reported count is the count the provider observed; configured_max_turns=4 reported_turns={} events={observed:?}",
+            finished[0].turns
+        );
+        assert!(
+            matches!(observed.last(), Some(AgentEvent::TaskFinished { .. })),
+            "invariant: TaskFinished is terminal, so no child event follows it; events={observed:?}"
+        );
+
+        settle_scheduler().await;
+        let mut late = Vec::new();
+        drain_events(&mut events, &mut late);
+        assert!(
+            late.is_empty() && provider.provider_calls() == 4,
+            "invariant: no lifecycle event or provider call occurs after the terminal result; late_events={late:?} provider_calls={} events={observed:?}",
+            provider.provider_calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_reports_two_attempts_on_provider_error() {
+        let provider = AttemptGenerator::new(vec![
+            AttemptAction::ToolTurn,
+            AttemptAction::Fail("scripted provider failure on attempt two"),
+        ]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let _scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+
+        let outcome = submit_typed_agent_await(runtime, 4, 10_000).await;
+
+        assert_typed_child_accounting(
+            &outcome,
+            "failed",
+            2,
+            &["scripted provider failure on attempt two"],
+        );
+        assert_eq!(
+            provider.provider_calls(),
+            2,
+            "invariant: an error returned by attempt two still bills both started attempts; provider_calls={} outcome_diagnostics={:?}",
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_reports_two_attempts_when_cancelled_inside_attempt_two() {
+        let second_entered = Arc::new(Notify::new());
+        let provider = AttemptGenerator::new(vec![
+            AttemptAction::ToolTurn,
+            AttemptAction::BlockForever(Arc::clone(&second_entered)),
+        ]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let mut submission =
+            tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 60_000));
+
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            second_entered.notified(),
+        );
+        tokio::pin!(entered);
+        tokio::select! {
+            entered = &mut entered => entered.expect(
+                "invariant: the scripted provider must enter attempt two before cancellation is observable"
+            ),
+            completed = &mut submission => panic!(
+                "invariant: the child must still be inside attempt two when cancelled; the submission terminated first: completed={completed:?} provider_calls={}",
+                provider.provider_calls()
+            ),
+        }
+        let task_id = {
+            let tasks = scheduler.tasks.read().await;
+            assert_eq!(
+                tasks.len(),
+                1,
+                "invariant: the typed spawn registers exactly one child; registered={} provider_calls={}",
+                tasks.len(),
+                provider.provider_calls()
+            );
+            tasks.values().next().unwrap().snapshot.identity.task_id
+        };
+        scheduler
+            .cancel(task_id)
+            .await
+            .expect("a running child must accept cooperative cancellation");
+        let outcome = submission
+            .await
+            .expect("the typed agent-await submission panicked during cancellation");
+
+        assert_typed_child_accounting(&outcome, "cancelled", 2, &["agent cancelled"]);
+        assert_eq!(
+            provider.provider_calls(),
+            2,
+            "invariant: cancellation inside attempt two preserves both started attempts; task_id={task_id} provider_calls={} outcome_diagnostics={:?}",
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_reports_zero_attempts_when_cancelled_before_the_provider_poll() {
+        let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let waiting = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *scheduler.wait_before_provider_poll.lock().await =
+            Some((Arc::clone(&waiting), Arc::clone(&resume)));
+        let mut events = scheduler.subscribe();
+        let submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 60_000));
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), waiting.notified())
+            .await
+            .expect(
+                "the child never reached the window after its cancellation precheck and before the provider future is polled",
+            );
+        let task_id = {
+            let tasks = scheduler.tasks.read().await;
+            assert_eq!(
+                tasks.len(),
+                1,
+                "invariant: the typed spawn registers exactly one child; registered={}",
+                tasks.len()
+            );
+            tasks.values().next().unwrap().snapshot.identity.task_id
+        };
+        scheduler
+            .cancel(task_id)
+            .await
+            .expect("a child paused before its provider poll must accept cancellation");
+        resume.notify_one();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), submission)
+            .await
+            .expect("the child never terminalized after boundary cancellation")
+            .expect("the typed agent-await submission panicked during boundary cancellation");
+
+        assert_typed_child_accounting(&outcome, "cancelled", 0, &["agent cancelled"]);
+        assert_eq!(
+            provider.provider_calls(),
+            0,
+            "invariant: an attempt is billed only once the provider invocation begins, so cancellation before the first poll bills none; task_id={task_id} provider_calls={} outcome_diagnostics={:?}",
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
+        let mut observed = Vec::new();
+        drain_events(&mut events, &mut observed);
+        let finished = terminal_results(&observed);
+        assert_eq!(
+            finished.len(),
+            1,
+            "invariant: boundary cancellation publishes exactly one terminal event; task_id={task_id} terminal_count={} events={observed:?}",
+            finished.len()
+        );
+        assert_eq!(
+            (finished[0].status, finished[0].turns),
+            (AgentTaskStatus::Cancelled, 0),
+            "invariant: the broadcast terminal result agrees with the typed record; task_id={task_id} terminal={:?} provider_calls={}",
+            finished[0],
+            provider.provider_calls()
+        );
+
+        settle_scheduler().await;
+        let mut late = Vec::new();
+        drain_events(&mut events, &mut late);
+        assert!(
+            late.is_empty() && provider.provider_calls() == 0,
+            "invariant: no lifecycle event or provider call occurs after boundary cancellation terminalizes; task_id={task_id} late_events={late:?} provider_calls={} events={observed:?}",
+            provider.provider_calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typed_agent_await_reports_two_attempts_when_the_deadline_elapses_in_attempt_two() {
+        let second_entered = Arc::new(Notify::new());
+        let provider = AttemptGenerator::new(vec![
+            AttemptAction::ToolTurn,
+            AttemptAction::BlockForever(Arc::clone(&second_entered)),
+        ]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let _scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let mut submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 100));
+
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            second_entered.notified(),
+        );
+        tokio::pin!(entered);
+        tokio::select! {
+            entered = &mut entered => entered.expect(
+                "invariant: the scripted provider must enter attempt two before the child deadline elapses"
+            ),
+            completed = &mut submission => panic!(
+                "invariant: the child must still be inside attempt two when its deadline elapses; the submission terminated first: completed={completed:?} provider_calls={}",
+                provider.provider_calls()
+            ),
+        }
+        tokio::time::advance(std::time::Duration::from_millis(101)).await;
+        let outcome = submission
+            .await
+            .expect("the typed agent-await submission panicked when the child deadline elapsed");
+
+        assert_typed_child_accounting(
+            &outcome,
+            "failed",
+            2,
+            &[
+                "agent deadline exceeded",
+                "configured timeout_ms=100",
+                "consumed provider attempts=2",
+            ],
+        );
+        assert_eq!(
+            provider.provider_calls(),
+            2,
+            "invariant: a deadline that drops the loop inside attempt two preserves both started attempts; provider_calls={} outcome_diagnostics={:?}",
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_queued_cancellation_publishes_one_zero_attempt_terminal() {
+        let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        // Hold every scheduler permit so the child cannot leave the queue and
+        // cancellation is guaranteed to win the permit race.
+        let held_permits = Arc::clone(&scheduler.concurrency)
+            .acquire_many_owned(4)
+            .await
+            .expect("the regression must reserve every scheduler permit before spawning");
+        let mut events = scheduler.subscribe();
+        let submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 60_000));
+
+        let mut observed = Vec::new();
+        let task_id = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("the lifecycle stream closed before the child was queued");
+                let queued = match &event {
+                    AgentEvent::TaskQueued { snapshot } => Some(snapshot.identity.task_id),
+                    _ => None,
+                };
+                observed.push(event);
+                if let Some(task_id) = queued {
+                    break task_id;
+                }
+            }
+        })
+        .await
+        .expect("the typed spawn never queued while every scheduler permit was held");
+        scheduler
+            .cancel(task_id)
+            .await
+            .expect("a queued child must accept cooperative cancellation");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), submission)
+            .await
+            .expect("the queued child never terminalized after cancellation")
+            .expect("the typed agent-await submission panicked during queued cancellation");
+
+        assert_typed_child_accounting(
+            &outcome,
+            "cancelled",
+            0,
+            &["cancelled before execution", "consumed provider attempts=0"],
+        );
+        drain_events(&mut events, &mut observed);
+        assert!(
+            observed
+                .iter()
+                .all(|event| event_task_id(event) == task_id),
+            "invariant: the regression observes only its own child's lifecycle; task_id={task_id} events={observed:?}"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TaskStarted { .. }))
+                .count(),
+            0,
+            "invariant: a child cancelled while queued never starts, so it publishes no TaskStarted; task_id={task_id} events={observed:?}"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::ToolStarted { .. } | AgentEvent::ToolCompleted { .. }
+                ))
+                .count(),
+            0,
+            "invariant: a child cancelled while queued performs no tool effect; task_id={task_id} events={observed:?}"
+        );
+        let finished = terminal_results(&observed);
+        assert_eq!(
+            finished.len(),
+            1,
+            "invariant: queued cancellation publishes exactly one terminal event; task_id={task_id} terminal_count={} events={observed:?}",
+            finished.len()
+        );
+        assert_eq!(
+            (finished[0].status, finished[0].turns),
+            (AgentTaskStatus::Cancelled, 0),
+            "invariant: a child cancelled before execution reports cancelled with zero consumed attempts; task_id={task_id} terminal={:?} provider_calls={}",
+            finished[0],
+            provider.provider_calls()
+        );
+        assert!(
+            matches!(
+                observed.as_slice(),
+                [AgentEvent::TaskQueued { .. }, AgentEvent::TaskFinished { .. }]
+            ),
+            "invariant: queued cancellation publishes exactly TaskQueued then the terminal event, in that order; task_id={task_id} events={observed:?}"
+        );
+
+        // Releasing the permits after terminalization gives any post-terminal
+        // continuation the resource it would need to run, then several
+        // scheduler turns in which to reveal itself.
+        drop(held_permits);
+        settle_scheduler().await;
+        let mut late = Vec::new();
+        drain_events(&mut events, &mut late);
+        assert!(
+            late.is_empty(),
+            "invariant: no lifecycle event occurs after the queued-cancellation terminal event, even once permits are free; task_id={task_id} late_events={late:?} events={observed:?}"
+        );
+        assert_eq!(
+            provider.provider_calls(),
+            0,
+            "invariant: waiting for scheduler concurrency is not a provider attempt, and none may start after cancellation; task_id={task_id} provider_calls={} events={observed:?}",
+            provider.provider_calls()
+        );
+        let snapshot = scheduler
+            .poll(task_id)
+            .await
+            .expect("the cancelled child must remain addressable after terminalization");
+        let stored = snapshot
+            .result
+            .as_ref()
+            .expect("the cancelled child must retain exactly one stored terminal result");
+        assert_eq!(
+            (snapshot.status, stored.status, stored.turns),
+            (
+                AgentTaskStatus::Cancelled,
+                AgentTaskStatus::Cancelled,
+                0
+            ),
+            "invariant: the stored terminal state matches the published terminal event and does not change afterwards; task_id={task_id} snapshot_status={:?} stored={stored:?}",
+            snapshot.status
+        );
+        let rejoined =
+            tokio::time::timeout(std::time::Duration::from_secs(30), scheduler.wait(task_id))
+                .await
+                .expect("rejoining a terminalized child must return immediately")
+                .expect("rejoining a terminalized child must succeed");
+        assert_eq!(
+            (rejoined.status, rejoined.turns),
+            (AgentTaskStatus::Cancelled, 0),
+            "invariant: rejoining a terminalized child replays the same terminal result; task_id={task_id} rejoined={rejoined:?} stored={stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_success_reports_each_started_attempt() {
+        let provider = AttemptGenerator::new(vec![
+            AttemptAction::ToolTurn,
+            AttemptAction::Final("final answer after one tool turn"),
+        ]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let _scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+
+        let outcome = submit_typed_agent_await(runtime, 4, 10_000).await;
+
+        assert_typed_child_accounting(&outcome, "completed", 2, &[]);
+        assert_eq!(
+            provider.provider_calls(),
+            2,
+            "invariant: success reports every started attempt, including the one that returned the final answer; provider_calls={} outcome_diagnostics={:?}",
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
     }
 }
