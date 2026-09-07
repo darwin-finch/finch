@@ -75,7 +75,14 @@ const STREAM_CHANNEL_CAPACITY: usize = STREAM_BUFFER_CAPACITY + 1;
 #[derive(Clone, Debug)]
 enum StreamProducerEvent {
     SendAttempt(StreamChunk),
-    Finished,
+    /// The producer task's frame was destroyed. `panicking` distinguishes a
+    /// clean return from an unwind: tokio swallows a panic inside a spawned
+    /// task, and the transport is released either way, so without this flag a
+    /// panicking producer is indistinguishable from a terminating one for any
+    /// test that does not drain the channel.
+    Finished {
+        panicking: bool,
+    },
 }
 
 #[cfg(test)]
@@ -88,7 +95,9 @@ struct StreamProducerFinishGuard(Option<StreamProducerObserver>);
 impl Drop for StreamProducerFinishGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.0.as_ref() {
-            observer(StreamProducerEvent::Finished);
+            observer(StreamProducerEvent::Finished {
+                panicking: std::thread::panicking(),
+            });
         }
     }
 }
@@ -3871,10 +3880,14 @@ family = "chatgpt_subscription"
     ) -> Vec<StreamChunk> {
         let mut attempts = Vec::new();
         let mut observer_closed = false;
+        let mut panicked = false;
         let finished = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 match events.recv().await {
-                    Some(StreamProducerEvent::Finished) => return,
+                    Some(StreamProducerEvent::Finished { panicking }) => {
+                        panicked = panicking;
+                        return;
+                    }
                     Some(StreamProducerEvent::SendAttempt(chunk)) => attempts.push(chunk),
                     None => {
                         observer_closed = true;
@@ -3892,6 +3905,15 @@ family = "chatgpt_subscription"
         assert!(
             !observer_closed,
             "{case}: producer observer closed before the task reported termination; observed_send_attempts={}; attempts={attempts:?}",
+            attempts.len()
+        );
+        // A panicking producer releases the transport and fires this guard
+        // exactly as a clean one does, so on the paths that never drain the
+        // receiver -- where no `outcome` vector exists to contradict it --
+        // termination alone is not evidence of correct termination.
+        assert!(
+            !panicked,
+            "{case}: the streaming producer task unwound instead of returning; the transport was released by a panic, not by the cancellation path under test; observed_send_attempts={}; attempts={attempts:?}",
             attempts.len()
         );
         attempts
@@ -6735,8 +6757,10 @@ family = "chatgpt_subscription"
                             break;
                         }
                         Some(StreamProducerEvent::SendAttempt(_)) => {}
-                        Some(StreamProducerEvent::Finished) => {
-                            panic!("{target} producer finished before attempting its blocked send")
+                        Some(StreamProducerEvent::Finished { panicking }) => {
+                            panic!(
+                                "{target} producer finished before attempting its blocked send; unwound={panicking}"
+                            )
                         }
                         None => panic!("{target} observer closed before its blocked send"),
                     }
