@@ -390,7 +390,8 @@ def validate_helpers(root, errors)
     "0c560bfba31aef5bdfb4fb3d2677f6e61d71c5c00952f2a83344f47aa31f00f1",
     "SCCACHE_CACHE_SIZE=256M", "SCCACHE_LOCAL_RW_MODE=READ_WRITE",
     '"${GITHUB_EVENT_NAME:-}" != "push"', '"${GITHUB_REF:-}" != "refs/heads/main"',
-    "archive has unexpected members", "contains a link or special file", "--max-filesize 8388608",
+    "archive has unexpected members", "contains a link or special file", "--max-filesize 12582912",
+    "reviewed Linux v0.17.0 archive is 9,561,816 bytes",
     "scripts/ci_rustc_cache_wrapper.sh"
   ]
   required_setup.each { |part| errors << "scripts/configure_ci_sccache.sh: missing #{part.inspect}" unless setup.include?(part) }

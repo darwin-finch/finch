@@ -37,7 +37,9 @@ install_root="${RUNNER_TEMP}/finch-sccache-bin-${version}"
 member="sccache-${version}-${platform}/sccache"
 url="https://github.com/mozilla/sccache/releases/download/${version}/${asset}"
 
-if ! curl --fail --location --retry 3 --max-filesize 8388608 --proto '=https' --tlsv1.2 --output "${archive}" "${url}"; then
+# The reviewed Linux v0.17.0 archive is 9,561,816 bytes. Keep a narrow 12 MiB
+# transport ceiling while leaving enough room for that larger platform asset.
+if ! curl --fail --location --retry 3 --max-filesize 12582912 --proto '=https' --tlsv1.2 --output "${archive}" "${url}"; then
   echo "fixed-digest sccache download failed; using ordinary rustc" >&2
   exit 0
 fi

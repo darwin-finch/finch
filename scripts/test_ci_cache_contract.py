@@ -297,8 +297,12 @@ class WorkflowContractTests(unittest.TestCase):
         self.reject("archive has unexpected members")
 
     def test_sccache_download_is_size_bounded(self) -> None:
-        self.repo.replace("scripts/configure_ci_sccache.sh", "--max-filesize 8388608", "")
-        self.reject("--max-filesize 8388608")
+        self.repo.replace("scripts/configure_ci_sccache.sh", "--max-filesize 12582912", "")
+        self.reject("--max-filesize 12582912")
+
+    def test_sccache_download_ceiling_accepts_reviewed_linux_asset(self) -> None:
+        self.repo.replace("scripts/configure_ci_sccache.sh", "--max-filesize 12582912", "--max-filesize 9000000")
+        self.reject("--max-filesize 12582912")
 
     def test_sccache_local_cap_is_required(self) -> None:
         self.repo.replace("scripts/configure_ci_sccache.sh", "SCCACHE_CACHE_SIZE=256M", "SCCACHE_CACHE_SIZE=10G")
