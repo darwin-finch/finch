@@ -10,6 +10,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, BinaryIO
 
 
@@ -19,6 +20,7 @@ MANIFEST_PATH = Path("scripts/ci_workflow_manifest.json")
 SCHEMA = "finch-ci-workflow-manifest:v2"
 MAX_WORKFLOW_BYTES = 128 * 1024
 MAX_TOTAL_WORKFLOW_BYTES = 1024 * 1024
+MAX_WORKFLOW_FILES = 64
 MAX_MANIFEST_BYTES = 512 * 1024
 HASH_CHUNK_BYTES = 64 * 1024
 
@@ -263,7 +265,7 @@ def exact_digest(path: Path, root: Path, maximum: int) -> tuple[str, int]:
     return digest, opened.st_size
 
 
-def workflow_records(root: Path) -> dict[str, dict[str, Any]]:
+def workflow_paths(root: Path) -> tuple[tuple[int, int], list[Path]]:
     directory = root / WORKFLOW_DIRECTORY
     try:
         directory_metadata = directory.lstat()
@@ -271,9 +273,30 @@ def workflow_records(root: Path) -> dict[str, dict[str, Any]]:
         raise ContractError(f"{WORKFLOW_DIRECTORY}: directory metadata failed: {error}") from error
     if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode):
         raise ContractError(f"{WORKFLOW_DIRECTORY}: must be a real directory, not a link")
-    paths = sorted((*directory.glob("*.yml"), *directory.glob("*.yaml")))
+    paths: list[Path] = []
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not entry.name.endswith((".yml", ".yaml")):
+                    continue
+                paths.append(directory / entry.name)
+                if len(paths) > MAX_WORKFLOW_FILES:
+                    raise ContractError(
+                        f"{WORKFLOW_DIRECTORY}: workflow count exceeds the reviewed "
+                        f"{MAX_WORKFLOW_FILES}-file bound"
+                    )
+    except OSError as error:
+        raise ContractError(f"{WORKFLOW_DIRECTORY}: enumeration failed: {error}") from error
+    paths.sort()
     if not paths:
         raise ContractError(f"{WORKFLOW_DIRECTORY}: no workflow documents were found")
+    return (directory_metadata.st_dev, directory_metadata.st_ino), paths
+
+
+def workflow_records(
+    root: Path, phase_hook: Callable[[], None] | None = None
+) -> dict[str, dict[str, Any]]:
+    directory_identity, paths = workflow_paths(root)
     metadata_by_path = {
         path: regular_file_metadata(
             path, path.relative_to(root).as_posix(), MAX_WORKFLOW_BYTES
@@ -286,14 +309,33 @@ def workflow_records(root: Path) -> dict[str, dict[str, Any]]:
             f"{WORKFLOW_DIRECTORY}: {total_bytes} aggregate bytes exceeds the reviewed "
             f"{MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
         )
+    if phase_hook is not None:
+        phase_hook()
     records: dict[str, dict[str, Any]] = {}
+    opened_total_bytes = 0
     for path in paths:
         digest, size = exact_digest(path, root, MAX_WORKFLOW_BYTES)
+        opened_total_bytes += size
+        if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
+            raise ContractError(
+                f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
+                f"the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
+            )
         records[path.name] = {
             "sha256": digest,
             "bytes": size,
             "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),
         }
+    final_directory_identity, final_paths = workflow_paths(root)
+    if final_directory_identity != directory_identity:
+        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
+    initial_names = [path.name for path in paths]
+    final_names = [path.name for path in final_paths]
+    if final_names != initial_names:
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: workflow entry set changed while checking; "
+            f"before={initial_names!r} after={final_names!r}"
+        )
     return records
 
 
@@ -305,7 +347,14 @@ def load_manifest(root: Path) -> dict[str, Any]:
         with stream:
             contents = read_exact_bytes(stream, metadata.st_size, display).decode("utf-8")
         manifest = json.loads(contents, object_pairs_hook=json_object)
-    except (OSError, UnicodeError, json.JSONDecodeError, ContractError, RecursionError) as error:
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        ContractError,
+        RecursionError,
+    ) as error:
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
@@ -375,6 +424,7 @@ def compare_contract(root: Path) -> list[str]:
     expected_limits = {
         "max_workflow_bytes": MAX_WORKFLOW_BYTES,
         "max_total_workflow_bytes": MAX_TOTAL_WORKFLOW_BYTES,
+        "max_workflow_files": MAX_WORKFLOW_FILES,
         "max_manifest_bytes": MAX_MANIFEST_BYTES,
     }
     if manifest.get("limits") != expected_limits:

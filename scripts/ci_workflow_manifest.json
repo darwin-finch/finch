@@ -3,6 +3,7 @@
   "limits": {
     "max_workflow_bytes": 131072,
     "max_total_workflow_bytes": 1048576,
+    "max_workflow_files": 64,
     "max_manifest_bytes": 524288
   },
   "pr_active_workflows": [

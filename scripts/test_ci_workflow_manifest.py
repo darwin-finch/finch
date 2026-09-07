@@ -12,9 +12,12 @@ import unittest
 from pathlib import Path
 
 from check_ci_workflow_manifest import (
+    ContractError,
     MAX_MANIFEST_BYTES,
     MAX_TOTAL_WORKFLOW_BYTES,
     MAX_WORKFLOW_BYTES,
+    MAX_WORKFLOW_FILES,
+    workflow_records,
 )
 
 
@@ -182,6 +185,60 @@ class WorkflowManifestTests(unittest.TestCase):
         finally:
             repository.close()
 
+    def test_workflow_count_is_bounded_before_inventory_comparison(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            current_count = len(list((repository.root / ".github/workflows").glob("*.y*ml")))
+            for index in range(MAX_WORKFLOW_FILES - current_count + 1):
+                repository.workflow(f"empty-{index}.yml").touch()
+            self.assert_rejected(
+                repository,
+                "workflow count exceeds",
+                str(MAX_WORKFLOW_FILES),
+            )
+        finally:
+            repository.close()
+
+    def test_entry_added_after_enumeration_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            def add_workflow() -> None:
+                repository.workflow("surprise.yml").write_text(
+                    "name: surprise\n", encoding="utf-8"
+                )
+
+            with self.assertRaisesRegex(ContractError, "entry set changed"):
+                workflow_records(repository.root, phase_hook=add_workflow)
+        finally:
+            repository.close()
+
+    def test_workflow_directory_replaced_after_enumeration_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            directory = repository.root / ".github/workflows"
+            target = repository.root / "workflow-target"
+
+            def replace_directory() -> None:
+                directory.rename(target)
+                directory.symlink_to("../workflow-target")
+
+            with self.assertRaisesRegex(ContractError, "real directory"):
+                workflow_records(repository.root, phase_hook=replace_directory)
+        finally:
+            repository.close()
+
+    def test_authoritative_opened_sizes_enforce_aggregate_bound(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            def grow_workflows() -> None:
+                for path in (repository.root / ".github/workflows").glob("*.y*ml"):
+                    path.write_bytes(b"x" * 70_000)
+
+            with self.assertRaisesRegex(ContractError, "aggregate opened bytes exceeds"):
+                workflow_records(repository.root, phase_hook=grow_workflows)
+        finally:
+            repository.close()
+
     def test_symlinked_manifest_is_rejected(self) -> None:
         repository = WorkflowRepository()
         try:
@@ -229,6 +286,27 @@ class WorkflowManifestTests(unittest.TestCase):
         finally:
             repository.close()
 
+    def test_large_manifest_integer_has_actionable_diagnostic(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            path = repository.manifest_path()
+            contents = path.read_text(encoding="utf-8")
+            path.write_text(
+                contents.replace(
+                    '"max_workflow_bytes": 131072',
+                    '"max_workflow_bytes": ' + "9" * 5_000,
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assert_rejected(
+                repository,
+                "ci_workflow_manifest.json",
+                "reviewed manifest could not be loaded",
+            )
+        finally:
+            repository.close()
+
     def test_manifest_root_and_schema_are_exact(self) -> None:
         mutations = (
             ("schema", "finch-ci-workflow-manifest:v999", "schema must be"),
@@ -264,6 +342,29 @@ class WorkflowManifestTests(unittest.TestCase):
                     manifest["workflows"]["ci.yml"][field] = value
                     repository.write_manifest(manifest)
                     self.assert_rejected(repository, "ci.yml", f"reviewed {field} changed")
+                finally:
+                    repository.close()
+
+    def test_workflow_record_schema_is_exact(self) -> None:
+        mutations = (
+            ("extra", {"approved_override": True}),
+            ("missing", {"sha256": None}),
+            ("non-object", "invalid"),
+        )
+        for name, mutation in mutations:
+            with self.subTest(mutation=name):
+                repository = WorkflowRepository()
+                try:
+                    manifest = repository.manifest()
+                    record = manifest["workflows"]["ci.yml"]
+                    if name == "extra":
+                        record.update(mutation)
+                    elif name == "missing":
+                        record.pop("sha256")
+                    else:
+                        manifest["workflows"]["ci.yml"] = mutation
+                    repository.write_manifest(manifest)
+                    self.assert_rejected(repository, "workflow record", "ci.yml")
                 finally:
                     repository.close()
 
