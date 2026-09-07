@@ -1,7 +1,8 @@
 use super::*;
 use crate::config::EndpointFamily;
 use crate::providers::chatgpt_oauth::{
-    OpenAiChatGptOAuthDialect, OpenAiTokenVerifier, VerifiedOpenAiClaims,
+    ChatGptDeviceEndpointError, OpenAiChatGptOAuthDialect, OpenAiTokenVerifier,
+    VerifiedOpenAiClaims,
 };
 use anyhow::{bail, Result};
 use axum::body::Body;
@@ -122,6 +123,10 @@ impl FakeServer {
     }
 
     fn push_raw(&self, path: &str, status: StatusCode, body: String) {
+        self.push_raw_delayed(path, status, body, Duration::ZERO);
+    }
+
+    fn push_raw_delayed(&self, path: &str, status: StatusCode, body: String, delay: Duration) {
         self.state
             .replies
             .lock()
@@ -131,7 +136,7 @@ impl FakeServer {
             .push_back(FakeReply {
                 status,
                 body,
-                delay: Duration::ZERO,
+                delay,
             });
     }
 
@@ -474,24 +479,35 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
     let sentinels = [
         "html-secret-sentinel",
         "json-secret-sentinel",
-        "empty-body-sentinel",
         "scalar-secret-sentinel",
+        "terminal-secret-sentinel",
     ];
-    for index in 0..12 {
-        let (status, body) = match index % 4 {
-            0 => (
-                StatusCode::FORBIDDEN,
-                format!("<html>{}</html>", sentinels[0]),
-            ),
-            1 => (
-                StatusCode::NOT_FOUND,
-                json!({"error": sentinels[1]}).to_string(),
-            ),
-            2 => (StatusCode::FORBIDDEN, String::new()),
-            _ => (StatusCode::NOT_FOUND, format!("\"{}\"", sentinels[3])),
-        };
-        server.push_raw("/api/accounts/deviceauth/token", status, body);
-    }
+    server.push_raw_delayed(
+        "/api/accounts/deviceauth/token",
+        StatusCode::FORBIDDEN,
+        format!("<html>{}</html>", sentinels[0]),
+        Duration::from_millis(100),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::NOT_FOUND,
+        format!("{{invalid-json:{}", sentinels[1]),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::FORBIDDEN,
+        String::new(),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::NOT_FOUND,
+        format!("\"{}\"", sentinels[2]),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{{invalid-json:{}", sentinels[3]),
+    );
     let dialect = Arc::new(
         OpenAiChatGptOAuthDialect::for_test(&server.origin, Arc::new(NeverReachedOpenAiVerifier))
             .unwrap(),
@@ -503,22 +519,49 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
         "ABCD-EFGH".into(),
         format!("{}/codex/device", server.origin),
         None,
-        Duration::from_millis(70),
+        Duration::from_secs(30 * 60),
         Duration::ZERO,
     )
     .unwrap();
-    let error = client
-        .finish_device_authorization("chatgpt:status-first", &pending, CancellationToken::new())
-        .await
-        .unwrap_err();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.finish_device_authorization(
+            "chatgpt:status-first",
+            &pending,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "OAuth polling production boundary hung or its executor was starved before the scripted terminal response; requests={}",
+            server.request_count("/api/accounts/deviceauth/token")
+        )
+    });
+    let error = result.unwrap_err();
     let diagnostic = format!("{error:#}");
-    assert!(diagnostic.contains("expired"), "{diagnostic}");
+    assert_eq!(
+        error.downcast_ref::<ChatGptDeviceEndpointError>(),
+        Some(&ChatGptDeviceEndpointError::PollRejected(500)),
+        "four status-only pending responses must reach the scripted HTTP 500 terminal cause; diagnostic={diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("ChatGPT device polling ended (HTTP 500)"),
+        "terminal polling failure must identify the rejected stage and HTTP status; diagnostic={diagnostic}"
+    );
     assert!(
         sentinels.iter().all(|secret| !diagnostic.contains(secret)),
-        "{diagnostic}"
+        "OAuth polling diagnostics must not retain hostile provider bodies; diagnostic={diagnostic}"
     );
-    assert!(server.request_count("/api/accounts/deviceauth/token") >= 2);
-    assert!(store.0.lock().unwrap().is_empty());
+    assert_eq!(
+        server.request_count("/api/accounts/deviceauth/token"),
+        5,
+        "OAuth polling must discard all four 403/404 bodies before reaching the scripted HTTP 500 terminal response; diagnostic={diagnostic}"
+    );
+    assert!(
+        store.0.lock().unwrap().is_empty(),
+        "terminal device-poll rejection must not persist a credential; diagnostic={diagnostic}"
+    );
 }
 
 #[tokio::test]
