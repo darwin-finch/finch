@@ -123,6 +123,10 @@ impl FakeServer {
     }
 
     fn push_raw(&self, path: &str, status: StatusCode, body: String) {
+        self.push_raw_delayed(path, status, body, Duration::ZERO);
+    }
+
+    fn push_raw_delayed(&self, path: &str, status: StatusCode, body: String, delay: Duration) {
         self.state
             .replies
             .lock()
@@ -132,7 +136,7 @@ impl FakeServer {
             .push_back(FakeReply {
                 status,
                 body,
-                delay: Duration::ZERO,
+                delay,
             });
     }
 
@@ -478,15 +482,16 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
         "scalar-secret-sentinel",
         "terminal-secret-sentinel",
     ];
-    server.push_raw(
+    server.push_raw_delayed(
         "/api/accounts/deviceauth/token",
         StatusCode::FORBIDDEN,
         format!("<html>{}</html>", sentinels[0]),
+        Duration::from_millis(100),
     );
     server.push_raw(
         "/api/accounts/deviceauth/token",
         StatusCode::NOT_FOUND,
-        json!({"error": sentinels[1]}).to_string(),
+        format!("{{invalid-json:{}", sentinels[1]),
     );
     server.push_raw(
         "/api/accounts/deviceauth/token",
@@ -501,7 +506,7 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
     server.push_raw(
         "/api/accounts/deviceauth/token",
         StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"error": sentinels[3]}).to_string(),
+        format!("{{invalid-json:{}", sentinels[3]),
     );
     let dialect = Arc::new(
         OpenAiChatGptOAuthDialect::for_test(&server.origin, Arc::new(NeverReachedOpenAiVerifier))
@@ -514,14 +519,26 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
         "ABCD-EFGH".into(),
         format!("{}/codex/device", server.origin),
         None,
-        Duration::from_secs(30),
+        Duration::from_secs(30 * 60),
         Duration::ZERO,
     )
     .unwrap();
-    let error = client
-        .finish_device_authorization("chatgpt:status-first", &pending, CancellationToken::new())
-        .await
-        .unwrap_err();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.finish_device_authorization(
+            "chatgpt:status-first",
+            &pending,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "OAuth polling production boundary hung or its executor was starved before the scripted terminal response; requests={}",
+            server.request_count("/api/accounts/deviceauth/token")
+        )
+    });
+    let error = result.unwrap_err();
     let diagnostic = format!("{error:#}");
     assert_eq!(
         error.downcast_ref::<ChatGptDeviceEndpointError>(),
