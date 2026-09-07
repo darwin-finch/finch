@@ -61,6 +61,15 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
                     | "todo_write"
                     | "TodoRead"
                     | "TodoWrite"
+                    // Re-entering planning mode while already planning is
+                    // idempotent (`EnterPlanModeTool::execute` returns the
+                    // "already in planning mode" result and changes nothing),
+                    // so blocking it only wastes a provider round. The
+                    // canonical name is the ONLY spelling the provider is ever
+                    // shown: `ToolRegistry::definitions()` omits aliases.
+                    // Commit 42e1ee70 canonicalized present_plan and
+                    // ask_user_question here and left this one behind (#26).
+                    | "enter_plan_mode"
                     | "EnterPlanMode"
                     | "ExitPlanMode"
             )
@@ -484,6 +493,29 @@ mod tests {
                 tool
             );
         }
+    }
+
+    /// Regression for #26's headline symptom: after `/plan`, the provider
+    /// emits canonical `enter_plan_mode` — the only spelling it is ever shown,
+    /// because `ToolRegistry::definitions()` omits dispatch-only aliases — and
+    /// the gate answered "Tool 'enter_plan_mode' is not allowed in planning
+    /// mode". The name is read from the tool, not written as a literal.
+    #[test]
+    fn test_plan_mode_allows_canonical_enter_plan_mode() {
+        use crate::tools::implementations::EnterPlanModeTool;
+        use crate::tools::registry::Tool;
+
+        let mode = planning_mode();
+        let registered = EnterPlanModeTool.name();
+
+        assert!(
+            is_tool_allowed_in_mode(registered, &mode),
+            "invariant: the canonical registered name {registered:?} is the only spelling the \
+             provider is shown, and re-entering planning mode while already planning is an \
+             idempotent no-op — it must not be refused as a state-changing tool (#26). \
+             Legacy alias \"EnterPlanMode\" allowed = {}.",
+            is_tool_allowed_in_mode("EnterPlanMode", &mode),
+        );
     }
 
     #[test]

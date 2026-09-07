@@ -387,41 +387,94 @@ mod tests {
         /// `ReplEvent::ToolApprovalNeeded` was emitted for this tool.
         DemandedApproval(String),
         /// A terminal `ReplEvent::ToolResult` arrived for this tool call.
-        Terminal,
+        Terminal { ok: bool, detail: String },
         /// The event channel closed before either.
         ChannelClosed,
     }
 
-    /// The VM-local tools that #26 and #426 showed were misclassified, each with
-    /// the mode that lets its real implementation reach a terminal result
-    /// without touching the filesystem.
+    /// One dispatch case: the tool, the mode it runs under, an input its real
+    /// implementation accepts, and a fragment of output only that
+    /// implementation produces.
+    ///
+    /// The fragment is what keeps this test from being vacuous in the one way
+    /// that matters for a change about name drift. A renamed or unregistered
+    /// tool comes back as a terminal `Err("Tool 'x' not found")`, and a tool
+    /// reached with the wrong input comes back as
+    /// `Ok("Execution error: Missing required parameter ...")`. Either would
+    /// otherwise read as "dispatched without approval" while proving nothing.
+    struct DispatchCase {
+        tool_name: String,
+        mode: ReplMode,
+        input: serde_json::Value,
+        /// Required: terminal `Ok` whose content contains this.
+        expect_ok_containing: &'static str,
+    }
+
+    /// The Finch-internal tools that #26 and #426 showed were misclassified.
     ///
     /// Names come from the `Tool` implementations, not from literals repeated
     /// here: the original defect was exactly a literal drifting from the name a
     /// tool registers.
-    fn vm_local_dispatch_cases() -> Vec<(String, ReplMode)> {
+    ///
+    /// Each mode/input pair is chosen so the real implementation reaches a
+    /// terminal state without touching the workspace: `enter_plan_mode` runs
+    /// while already planning, so it returns its idempotent result instead of
+    /// creating `$HOME/.finch/plans`; `present_plan` runs outside planning
+    /// mode, so it returns early instead of writing a plan file; `todo_write`
+    /// is unjournaled here, so it mutates only the in-memory list.
+    fn vm_local_dispatch_cases() -> Vec<DispatchCase> {
         let todo_list = Arc::new(RwLock::new(TodoList::default()));
         let todo_write = TodoWriteTool::new(Arc::clone(&todo_list));
         let todo_read = TodoReadTool::new(todo_list);
 
         vec![
-            (todo_write.name().to_string(), ReplMode::Normal),
-            (todo_read.name().to_string(), ReplMode::Normal),
-            // Already planning: `enter_plan_mode` returns its idempotent
-            // "already in planning mode" result instead of creating a plan file.
-            (
-                EnterPlanModeTool.name().to_string(),
-                ReplMode::Planning {
+            DispatchCase {
+                tool_name: todo_write.name().to_string(),
+                mode: ReplMode::Normal,
+                input: serde_json::json!({
+                    "todos": [{
+                        "id": "1",
+                        "content": "issue-26 dispatch regression",
+                        "status": "pending",
+                        "priority": "high",
+                    }]
+                }),
+                expect_ok_containing: "Todo list updated",
+            },
+            DispatchCase {
+                tool_name: todo_read.name().to_string(),
+                mode: ReplMode::Normal,
+                input: serde_json::json!({}),
+                expect_ok_containing: "[]",
+            },
+            DispatchCase {
+                tool_name: EnterPlanModeTool.name().to_string(),
+                mode: ReplMode::Planning {
                     task: "issue-26 dispatch regression".to_string(),
                     plan_path: std::env::temp_dir()
                         .join(format!("finch-issue-26-{}-unused-plan.md", Uuid::new_v4())),
                     created_at: chrono::Utc::now(),
                 },
-            ),
-            // Not planning: `present_plan` returns its "not in planning mode"
-            // result instead of writing a plan file.
-            (PresentPlanTool.name().to_string(), ReplMode::Normal),
-            (AskUserQuestionTool.name().to_string(), ReplMode::Normal),
+                input: serde_json::json!({"reason": "issue-26 dispatch regression"}),
+                expect_ok_containing: "Already in planning mode",
+            },
+            DispatchCase {
+                tool_name: PresentPlanTool.name().to_string(),
+                mode: ReplMode::Normal,
+                input: serde_json::json!({"plan": "issue-26 dispatch regression"}),
+                expect_ok_containing: "Not in planning mode",
+            },
+            DispatchCase {
+                tool_name: AskUserQuestionTool.name().to_string(),
+                mode: ReplMode::Normal,
+                input: serde_json::json!({}),
+                // This tool is meant to be intercepted by the event loop, so
+                // its executor path deliberately refuses. The executor reports
+                // that refusal as `Ok("Execution error: ...")`, and the wording
+                // is unique to this implementation — proof the call reached the
+                // tool rather than falling out as "not found".
+                expect_ok_containing: "intercepted by event loop",
+            },
         ]
     }
 
@@ -443,7 +496,11 @@ mod tests {
             .expect("test tool executor")
     }
 
-    async fn dispatch_once(tool_name: &str, mode: ReplMode) -> DispatchOutcome {
+    async fn dispatch_once(
+        tool_name: &str,
+        mode: ReplMode,
+        input: serde_json::Value,
+    ) -> DispatchOutcome {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
         let coordinator = ToolExecutionCoordinator::new(
@@ -458,7 +515,7 @@ mod tests {
         );
 
         let query_id = Uuid::new_v4();
-        let tool_use = ToolUse::new(tool_name.to_string(), serde_json::json!({}));
+        let tool_use = ToolUse::new(tool_name.to_string(), input);
         let assistant = Message::with_content(
             "assistant",
             vec![ContentBlock::ToolUse {
@@ -492,8 +549,21 @@ mod tests {
                     Some(ReplEvent::ToolApprovalNeeded {
                         tool_use: asked, ..
                     }) => return DispatchOutcome::DemandedApproval(asked.name),
-                    Some(ReplEvent::ToolResult { tool_id: id, .. }) if id == tool_id => {
-                        return DispatchOutcome::Terminal
+                    Some(ReplEvent::ToolResult {
+                        tool_id: id,
+                        result,
+                        ..
+                    }) if id == tool_id => {
+                        return match result {
+                            Ok(content) => DispatchOutcome::Terminal {
+                                ok: true,
+                                detail: content,
+                            },
+                            Err(error) => DispatchOutcome::Terminal {
+                                ok: false,
+                                detail: error.to_string(),
+                            },
+                        }
                     }
                     Some(_) => continue,
                     None => return DispatchOutcome::ChannelClosed,
@@ -514,25 +584,45 @@ mod tests {
         }
     }
 
-    /// Production-boundary regression for #26 (`/plan` prompts for permission to
-    /// reduce capability) and #426 (`todo_write` reports a 30-second timeout
-    /// because its approval never resolves).
+    /// Production-boundary regression for #26 (entering plan mode asked
+    /// permission to *reduce* capability) and #426 (writing a session task list
+    /// raised an approval dialog nobody intended).
     ///
     /// `spawn_tool_execution` is the real path that turns a classification into
-    /// an approval dialog. A misclassified VM-local tool emits
-    /// `ReplEvent::ToolApprovalNeeded` here and then waits — which is what the
-    /// user experienced as a permission prompt, or as a timeout.
+    /// an approval dialog. A misclassified Finch-internal tool emits
+    /// `ReplEvent::ToolApprovalNeeded` here and then waits on an answer the
+    /// user never expected to give.
+    ///
+    /// The test asserts two things, not one: no approval event, *and* that the
+    /// tool actually ran. Without the second, a renamed or unregistered tool
+    /// would return `Tool 'x' not found` and still read as a pass — which in a
+    /// change about name drift is the exact failure the test exists to catch.
     #[tokio::test]
     async fn test_vm_local_tools_dispatch_without_an_approval_event() {
         let cases = vm_local_dispatch_cases();
         let total = cases.len();
         let mut violations = Vec::new();
 
-        for (tool_name, mode) in cases {
-            let effect =
-                crate::tools::permissions::legacy_tool_effect(&tool_name, &serde_json::json!({}));
-            match dispatch_once(&tool_name, mode).await {
-                DispatchOutcome::Terminal => {}
+        for case in cases {
+            let effect = crate::tools::permissions::legacy_tool_effect(
+                &case.tool_name,
+                &serde_json::json!({}),
+            );
+            let tool_name = &case.tool_name;
+            let fragment = case.expect_ok_containing;
+
+            match dispatch_once(tool_name, case.mode, case.input).await {
+                DispatchOutcome::Terminal { ok, detail } => {
+                    if !ok || !detail.contains(fragment) {
+                        violations.push(format!(
+                            "  tool {tool_name:?} raised no approval but did not run: terminal \
+                             result was {} {detail:?}; expected Ok containing {fragment:?}. \
+                             A \"not found\" or missing-parameter result here means the call never \
+                             reached the tool, so the no-approval assertion proves nothing.",
+                            if ok { "Ok" } else { "Err" },
+                        ));
+                    }
+                }
                 DispatchOutcome::DemandedApproval(asked) => violations.push(format!(
                     "  tool {tool_name:?} emitted ReplEvent::ToolApprovalNeeded (for {asked:?}); \
                      legacy_tool_effect computed {} (runs_autonomously={})",
@@ -549,10 +639,11 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "invariant: a VM-local tool must reach a terminal ToolResult through \
+            "invariant: a Finch-internal tool must run to a terminal result through \
              ToolExecutionCoordinator::spawn_tool_execution without ever opening an approval \
              dialog — entering plan mode is a capability *reduction*, and a session task list is \
-             not a host effect (#26, #426). {} of {} dispatched tools violated it:\n{}",
+             not a workspace or external effect (#26, #426). {} of {} dispatched tools violated \
+             it:\n{}",
             violations.len(),
             total,
             violations.join("\n"),

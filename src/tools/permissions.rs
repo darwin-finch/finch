@@ -477,10 +477,10 @@ fn is_readonly_bash(command: &str) -> bool {
 ///
 /// Getting this wrong is not a cosmetic miss: an unlisted name falls to
 /// [`ExecutionEffect::Unclassified`], which demands user approval. That is how
-/// `enter_plan_mode` came to ask permission to *reduce* capability (#26) and how
-/// `todo_write` came to report a 30-second timeout while waiting on an approval
-/// nobody expected to answer (#426). `tests::vm_local_tools_by_registered_name`
-/// reads the names from the tools themselves so a drifting literal fails loudly.
+/// `enter_plan_mode` came to ask permission to *reduce* capability (#26), and
+/// why `todo_write` raised an approval dialog for a session task list (#426).
+/// `tests::vm_local_tools_by_registered_name` reads the names from the tools
+/// themselves so a drifting literal fails loudly.
 pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
     match tool_name.to_ascii_lowercase().as_str() {
         // Transitional adapter only: invoking the typed broker is VM-local.
@@ -943,14 +943,21 @@ mod tests {
     // `legacy_tool_effect` lowercases the tool name but never stripped
     // underscores, while five of its arms were spelled without them. Every
     // canonical snake_case name fell through to `Unclassified`, and
-    // `Unclassified` demands user approval: `/plan` asked permission to
-    // *reduce* capability (#26), and `todo_write` waited on an approval that
-    // never resolved until the 30-second executor deadline reported it as a
-    // timeout (#426).
+    // `Unclassified` demands user approval: entering plan mode asked permission
+    // to *reduce* capability (#26), and writing a session task list raised an
+    // approval dialog nobody intended (#426).
+    //
+    // These tools are Finch-internal, not effect-free. `enter_plan_mode`
+    // creates `$HOME/.finch/plans`, `present_plan` writes a plan file, and a
+    // journaled `todo_write` pushes `TaskListReplaced` to an attached Brain.
+    // What the classification asserts is narrower and is what matters at this
+    // boundary: no workspace edit and no external effect, so the operation is
+    // not one a user is asked to authorise. `create_memory` sits in the same
+    // arm and also persists.
 
-    /// The VM-local tools whose declared classification #26 and #426 showed to
-    /// be unreachable, paired with the effect `legacy_tool_effect` already
-    /// declares for them.
+    /// The Finch-internal tools whose declared classification #26 and #426
+    /// showed to be unreachable, paired with the effect `legacy_tool_effect`
+    /// already declares for them.
     ///
     /// Names are read from the `Tool` implementations themselves rather than
     /// written as literals. The defect *was* a literal in a match arm drifting
@@ -1007,7 +1014,7 @@ mod tests {
             "invariant: legacy_tool_effect must classify a tool by the exact name that tool \
              registers, so a VM-local operation never degrades to Unclassified and demands \
              approval (#26 — /plan prompts for permission to reduce capability; #426 — todo_write \
-             reports a 30-second timeout because its approval never resolves).\n\
+             raises an approval dialog for a session task list).\n\
              {} of {} registered names misclassified:\n{}",
             misclassified.len(),
             table.len(),
@@ -1034,8 +1041,10 @@ mod tests {
 
         assert!(
             prompting.is_empty(),
-            "invariant: a VM-local tool touches no filesystem, network, or process and must never \
-             open an approval dialog. {} of {} registered names would prompt (#26, #426):\n{}",
+            "invariant: a Finch-internal tool has no workspace edit and no external effect, so it \
+             must never open an approval dialog — these five touch only Finch's own state \
+             (plan file, session task list, dialog), not the user's workspace or any external \
+             system. {} of {} registered names would prompt (#26, #426):\n{}",
             prompting.len(),
             table.len(),
             prompting.join("\n"),
@@ -1079,6 +1088,33 @@ mod tests {
             divergent.len(),
             alias_pairs.len(),
             divergent.join("\n"),
+        );
+    }
+
+    /// The fallback must stay closed.
+    ///
+    /// This file's most dangerous single-character regression is
+    /// `_ => ExecutionEffect::Unclassified` becoming any autonomous effect:
+    /// every unregistered, misspelled or hallucinated name the provider emits
+    /// would then execute with no approval. Fixing #26 by widening the match
+    /// is exactly the shape of change that could do it, so assert the closed
+    /// default explicitly rather than leaving it to a bare boolean elsewhere.
+    #[test]
+    fn test_legacy_tool_effect_leaves_an_unregistered_name_unclassified() {
+        // Deliberately not a registered tool, an alias, or a near-miss of one.
+        let unregistered = "no_such_tool_xyz";
+        let effect = legacy_tool_effect(unregistered, &serde_json::json!({}));
+
+        assert_eq!(
+            effect,
+            ExecutionEffect::Unclassified,
+            "invariant: a name no tool registers must fall to Unclassified so it cannot run \
+             without approval. legacy_tool_effect({unregistered:?}) computed {} \
+             (runs_autonomously={}); expected {} (runs_autonomously=false). A permissive default \
+             would let every hallucinated or misspelled provider tool name execute unapproved.",
+            effect.as_str(),
+            effect.runs_autonomously(),
+            ExecutionEffect::Unclassified.as_str(),
         );
     }
 }

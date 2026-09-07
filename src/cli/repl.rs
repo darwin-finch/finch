@@ -2916,6 +2916,10 @@ impl Repl {
                         | "PresentPlan"
                         | "ask_user_question"
                         | "AskUserQuestion"
+                        // Canonical spelling: the only one the provider is
+                        // shown, since aliases are omitted from
+                        // `ToolRegistry::definitions()` (#26).
+                        | "enter_plan_mode"
                         | "EnterPlanMode"
                         | "ExitPlanMode"
                 )
