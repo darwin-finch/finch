@@ -54,6 +54,41 @@ impl HydrationCompletionPause {
     }
 }
 
+/// Holds the pending-projection sweep BETWEEN two rows of its backlog.
+///
+/// Distinct from `HydrationCompletionPause`, which sits at the end of
+/// `hydrate_batches` — that is strictly *before* `hydrate_in_background` calls
+/// the sweep at all, so a cancellation landing there cannot say anything about
+/// the sweep. This one is inside the loop body, so a test that cancels here
+/// cancels a sweep that has already committed `after_repaired` rows and is
+/// about to start the next: the only place a partially-applied backlog could
+/// exist.
+#[cfg(test)]
+#[derive(Debug)]
+struct ProjectionSweepPause {
+    /// Fires when the sweep is about to project the row at this zero-based
+    /// index, i.e. once exactly this many rows have committed.
+    after_repaired: usize,
+    reached: watch::Sender<bool>,
+    release: watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+impl ProjectionSweepPause {
+    async fn before_row(&self, repaired: usize) {
+        if repaired != self.after_repaired {
+            return;
+        }
+        self.reached.send_replace(true);
+        let mut release = self.release.clone();
+        while !*release.borrow_and_update() {
+            if release.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 impl HydrationBatchPause {
     async fn after_batch(&self, loaded: usize) {
@@ -82,6 +117,11 @@ static HYDRATION_COMPLETION_PAUSES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[cfg(test)]
+static PROJECTION_SWEEP_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<ProjectionSweepPause>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
 pub(crate) struct HydrationBatchPauseRegistration {
     path: PathBuf,
     pause: Arc<HydrationBatchPause>,
@@ -91,6 +131,12 @@ pub(crate) struct HydrationBatchPauseRegistration {
 struct HydrationCompletionPauseRegistration {
     path: PathBuf,
     pause: Arc<HydrationCompletionPause>,
+}
+
+#[cfg(test)]
+struct ProjectionSweepPauseRegistration {
+    path: PathBuf,
+    pause: Arc<ProjectionSweepPause>,
 }
 
 #[cfg(test)]
@@ -112,6 +158,21 @@ impl Drop for HydrationBatchPauseRegistration {
 impl Drop for HydrationCompletionPauseRegistration {
     fn drop(&mut self) {
         let mut pauses = HYDRATION_COMPLETION_PAUSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pauses
+            .get(&self.path)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.pause))
+        {
+            pauses.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProjectionSweepPauseRegistration {
+    fn drop(&mut self) {
+        let mut pauses = PROJECTION_SWEEP_PAUSES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pauses
@@ -188,6 +249,40 @@ fn register_hydration_completion_pause(
     )
 }
 
+/// Hold the pending-projection sweep once `after_repaired` rows have committed,
+/// so a test can cancel it with a backlog genuinely half-applied.
+#[cfg(test)]
+fn register_projection_sweep_pause(
+    path: PathBuf,
+    after_repaired: usize,
+) -> (
+    ProjectionSweepPauseRegistration,
+    watch::Receiver<bool>,
+    watch::Sender<bool>,
+) {
+    let (reached, reached_rx) = watch::channel(false);
+    let (release, release_rx) = watch::channel(false);
+    let pause = Arc::new(ProjectionSweepPause {
+        after_repaired,
+        reached,
+        release: release_rx,
+    });
+    let mut pauses = PROJECTION_SWEEP_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses.insert(path.clone(), Arc::clone(&pause)).is_none(),
+        "a projection sweep pause is already registered for {}",
+        path.display()
+    );
+    drop(pauses);
+    (
+        ProjectionSweepPauseRegistration { path, pause },
+        reached_rx,
+        release,
+    )
+}
+
 #[cfg(test)]
 fn take_hydration_batch_pause(path: &std::path::Path) -> Option<Arc<HydrationBatchPause>> {
     HYDRATION_BATCH_PAUSES
@@ -201,6 +296,14 @@ fn take_hydration_completion_pause(
     path: &std::path::Path,
 ) -> Option<Arc<HydrationCompletionPause>> {
     HYDRATION_COMPLETION_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path)
+}
+
+#[cfg(test)]
+fn take_projection_sweep_pause(path: &std::path::Path) -> Option<Arc<ProjectionSweepPause>> {
+    PROJECTION_SWEEP_PAUSES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(path)
@@ -287,6 +390,11 @@ struct HydrationState {
     batch_pause: std::sync::Mutex<Option<Arc<HydrationBatchPause>>>,
     #[cfg(test)]
     completion_pause: std::sync::Mutex<Option<Arc<HydrationCompletionPause>>>,
+    /// Carried here rather than on `ProjectionContext` only because this is
+    /// where the other two seams already live and `ProjectionContext` holds
+    /// this `Arc`; the sweep is not part of hydration.
+    #[cfg(test)]
+    sweep_pause: std::sync::Mutex<Option<Arc<ProjectionSweepPause>>>,
 }
 
 /// Opens the write gate if the loader ends without finishing.
@@ -327,6 +435,8 @@ impl HydrationState {
             batch_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             completion_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sweep_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -367,6 +477,26 @@ impl HydrationState {
             .clone();
         if let Some(pause) = pause {
             pause.after_completion().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn install_sweep_pause(&self, pause: Option<Arc<ProjectionSweepPause>>) {
+        *self
+            .sweep_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
+    }
+
+    #[cfg(test)]
+    async fn pause_in_projection_sweep(&self, repaired: usize) {
+        let pause = self
+            .sweep_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(pause) = pause {
+            pause.before_row(repaired).await;
         }
     }
 
@@ -552,10 +682,29 @@ struct PendingConversation {
 ///
 /// `?1` excludes one conversation id, and NULL excludes nothing — `IS NOT`
 /// rather than `<>` precisely so a NULL parameter keeps every row. The write
-/// path binds the turn it is about to project, because a named-Brain retry of a
-/// turn whose first projection failed would otherwise have that turn repaired
-/// by the sweep and then report itself a no-op, changing what
-/// `insert_brain_conversation` returns to its caller.
+/// path binds the turn it is about to project.
+///
+/// What that earns is error attribution, not de-duplication. Double projection
+/// is already impossible without it: an ordinary write mints a fresh UUID that
+/// is not in `conversations` yet, so it cannot be in this set at all, and a
+/// named-Brain retry whose row a sweep had just repaired would take the
+/// `already_classified` short-circuit rather than project a second time.
+///
+/// The difference is what the caller is told when that projection FAILS.
+/// `sweep_pending_projections_if_owed` deliberately swallows a sweep error into
+/// a `tracing::warn!`, because a live turn must not be refused over an
+/// unrelated older row. So without the exclusion, a named-Brain retry whose own
+/// row failed to project *inside the sweep* would return `Ok(false)` — read as
+/// "identical retry, nothing to do" — for a turn that was in fact never
+/// indexed. With the exclusion the retry projects its own row and the failure
+/// propagates as `Err`.
+///
+/// An earlier version of this comment claimed omitting `?1` would "silently
+/// change the count reported at `event_loop.rs:5376`". That was wrong. The
+/// count is summed there, but no consumer reads the number: one call site in
+/// `server/handlers.rs` inspects only the `Err` arm, and the other counts runs
+/// rather than rows. The boolean is a contract on a `pub` method, not a
+/// quantity anything acts on today.
 const PENDING_PROJECTION_SQL: &str = "SELECT c.id, c.role, c.content, c.timestamp
      FROM conversations c
      LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
@@ -822,6 +971,7 @@ impl MemorySystem {
         {
             hydration.install_batch_pause(take_hydration_batch_pause(&config.db_path));
             hydration.install_completion_pause(take_hydration_completion_pause(&config.db_path));
+            hydration.install_sweep_pause(take_projection_sweep_pause(&config.db_path));
         }
         let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
@@ -1012,15 +1162,19 @@ impl MemorySystem {
             .context("Brain request sequence exceeds SQLite INTEGER range")?;
 
         // Repair the backlog BEFORE this turn's own `INSERT INTO
-        // conversations`, and never this turn itself.
+        // conversations`, and exclude this turn from it.
         //
-        // Both halves matter. After the insert, this turn is itself pending, so
-        // a sweep would project it and the tail of this function would then
-        // project it a second time — the `already_classified` short-circuit is
-        // below, and would already have been passed. And a named-Brain retry of
-        // a turn whose first projection failed has its row in place already, so
-        // the sweep is excluded from it explicitly; otherwise the retry reports
-        // itself a no-op and its caller counts nothing inserted.
+        // Before the insert, because after it this turn is itself pending: a
+        // sweep sitting below the `already_classified` query would project it
+        // and then the tail of this function would project it again.
+        //
+        // Excluded, because a named-Brain retry of a turn whose first
+        // projection failed already HAS its `conversations` row, so it is in
+        // the pending set. Letting the sweep repair it changes nothing when the
+        // repair succeeds and hides the failure when it does not: the sweep
+        // logs its error and returns, and this function would then hit the
+        // `already_classified` short-circuit and report `Ok(false)` for a turn
+        // that was never indexed. See `PENDING_PROJECTION_SQL`.
         //
         // Here as well as in the loader because the current-thread arm of `new`
         // completes hydration synchronously and has no task to hang the sweep
@@ -1149,7 +1303,37 @@ impl MemorySystem {
     ///
     /// The caller holds `insert_lock` and has already established that
     /// hydration is usable.
+    ///
+    /// EVERY error exit re-arms the pending-projection sweep, which is the
+    /// whole reason this wrapper exists rather than the flag being stored at
+    /// each failure site. A failed projection leaves the conversation row with
+    /// no `memory_sources` row — the exact durable shape #339 is about — so the
+    /// sweep is owed again by definition, whatever the cause.
+    ///
+    /// Storing it only at the two failure sites that used to have it was a
+    /// live defect. `sweep_pending_projections_locked` clears the flag when the
+    /// pending set comes back empty, and the set can be empty *because the `?1`
+    /// exclusion removed the caller's own row*. The caller then failed at
+    /// `ctx.embedding_engine.embed()` — the neural engine returns `Err` on a
+    /// tokenizer or ONNX fault, and `use_neural_embeddings` defaults on — whose
+    /// `?` returned above both of those sites. The row stayed pending with the
+    /// flag disarmed, so no automatic sweep ran again for the life of the
+    /// process. The same asymmetry hit an ordinary first-time write that failed
+    /// at `embed`.
     async fn project_stored_conversation(
+        ctx: &ProjectionContext,
+        pending: &PendingConversation,
+    ) -> Result<()> {
+        let result = Self::project_stored_conversation_inner(ctx, pending).await;
+        if result.is_err() {
+            ctx.needs_projection_sweep.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// The body of `project_stored_conversation`. Call the wrapper: this one
+    /// does not re-arm the sweep.
+    async fn project_stored_conversation_inner(
         ctx: &ProjectionContext,
         pending: &PendingConversation,
     ) -> Result<()> {
@@ -1190,10 +1374,10 @@ impl MemorySystem {
                     // produce, and replacing it with a generic SQLite error
                     // would leave a structurally corrupt store looking like a
                     // transient I/O problem.
-                    // This turn is now stranded exactly as #339 describes, so
-                    // re-arm the sweep rather than leaving the repair to the
-                    // next process start.
-                    ctx.needs_projection_sweep.store(true, Ordering::SeqCst);
+                    //
+                    // This turn is now stranded exactly as #339 describes. The
+                    // sweep is re-armed by the wrapper on the way out, for
+                    // every error exit rather than just this one.
                     if let Err(reload_error) = Self::reload_tree(ctx).await {
                         // `?`, not `%`: `Display` on an `anyhow::Error` prints
                         // only the outermost message and drops the source chain,
@@ -1229,7 +1413,8 @@ impl MemorySystem {
                 // the same reason as the branch above: replacing the error the
                 // caller actually needs with a second, coincidental one hides
                 // what went wrong.
-                ctx.needs_projection_sweep.store(true, Ordering::SeqCst);
+                //
+                // The sweep is re-armed by the wrapper, not here.
                 if let Err(reload_error) = Self::reload_tree(ctx).await {
                     tracing::error!(
                         ?reload_error,
@@ -1330,6 +1515,12 @@ impl MemorySystem {
         );
         let mut repaired = 0usize;
         for conversation in &pending {
+            // The only point at which a backlog can be partially applied, and
+            // therefore the only cancellation point worth testing. It is inside
+            // the loop rather than around it precisely because a seam outside
+            // the loop proves nothing about the loop.
+            #[cfg(test)]
+            ctx.hydration.pause_in_projection_sweep(repaired).await;
             Self::project_stored_conversation(ctx, conversation)
                 .await
                 .with_context(|| {
@@ -4496,17 +4687,517 @@ mod tests {
         Ok(())
     }
 
-    /// Shutting down at the point the repair runs must leave nothing half-done,
-    /// and must not consume the repair.
+    /// Written straight into `conversations` with a timestamp this test picks,
+    /// so a backlog's replay order is observable rather than incidental.
+    const BACKLOG_EARLY_ID: &str = "zzz-spoken-first";
+    const BACKLOG_MIDDLE_ID: &str = "mmm-spoken-second";
+    const BACKLOG_LATE_ID: &str = "aaa-spoken-third";
+    /// Deliberately the reverse of the id ordering above.
+    const BACKLOG_EARLY_AT: i64 = 1_000;
+    const BACKLOG_MIDDLE_AT: i64 = 2_000;
+    const BACKLOG_LATE_AT: i64 = 3_000;
+
+    const BACKLOG_EARLY_TURN: &str = "Intel macOS is not a supported release \
+                                      target because the ort crate ships no \
+                                      prebuilt binaries for it.";
+    const BACKLOG_MIDDLE_TURN: &str = "Dialogs in the terminal interface are \
+                                       drawn full width with no side borders, \
+                                       and that keeps regressing.";
+    const BACKLOG_LATE_TURN: &str = "Feedback is private durable data: a rating \
+                                     is never consent to train anything on it.";
+
+    /// A second stranded turn for the cancellation case, timestamped after the
+    /// one `strand_a_conversation` leaves behind so the sweep's ordering fixes
+    /// which of the two it repairs first.
+    const SECOND_STRANDED_ID: &str = "second-stranded-turn";
+    const SECOND_STRANDED_AT: i64 = 9_000_000_000_000_000_000;
+    const SECOND_STRANDED_TURN: &str = "This turn was still waiting in the \
+                                        backlog when the loader was cancelled \
+                                        part way through repairing it.";
+
+    /// A live turn written after the store reopened, so a repair and an
+    /// ordinary projection can be told apart.
+    const FRESH_TURN: &str = "Every bug fix needs a regression test that fails \
+                              before the fix and passes after it.";
+
+    /// The turn used for the named-Brain cases, which have a deterministic
+    /// conversation id and can therefore address the row a previous attempt
+    /// stranded.
+    const BRAIN_TURN: &str = "The named-Brain runner retried this turn after a \
+                              broken semantic index refused its first placement.";
+
+    fn brain_provenance() -> BrainConversationProvenance {
+        BrainConversationProvenance {
+            brain_id: "reproject-brain".to_string(),
+            run_id: "run-339".to_string(),
+            request_seq: 1,
+        }
+    }
+
+    /// The text of one semantic leaf, read durably.
+    fn node_text(db_path: &std::path::Path, node_id: i64) -> Result<String> {
+        let conn = Connection::open(db_path)?;
+        Ok(conn.query_row(
+            "SELECT text FROM tree_nodes WHERE node_id = ?1",
+            [node_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Write raw `conversations` rows with no `memory_sources` row — the exact
+    /// durable shape a failed hydration leaves behind — with ids and timestamps
+    /// this test chooses.
     ///
-    /// The loader's completion pause sits immediately before the sweep, so
-    /// aborting there is a causal shutdown at the repair, not a timing guess.
-    /// Nothing partial is possible below it either: the semantic leaf and its
-    /// `memory_sources` row commit in one SQLite transaction inside a
-    /// synchronous `write_nodes`, so there is no await point at which
-    /// cancellation could land between them.
+    /// `insert_conversation` cannot produce that shape to order: it mints a
+    /// UUID and stamps `Utc::now()`, so id order and timestamp order always
+    /// agree and neither can be made to disagree with the other. Pinning
+    /// `ORDER BY c.timestamp ASC` needs them to disagree.
+    fn strand_rows_directly(db_path: &std::path::Path, rows: &[(&str, i64, &str)]) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        for &(id, timestamp, content) in rows {
+            conn.execute(
+                "INSERT INTO conversations
+                 (id, timestamp, role, content, tokens, model, session_id,
+                  brain_id, run_id, request_seq, created_at)
+                 VALUES (?1, ?2, 'user', ?3, NULL, NULL, NULL, NULL, NULL, NULL, ?2)",
+                params![id, timestamp, content],
+            )?;
+            let mapped: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memory_sources WHERE conversation_id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                mapped, 0,
+                "a directly stranded row must carry no memory_sources row, or it \
+                 is not pending projection at all and this fixture proves nothing; \
+                 id={id}, timestamp={timestamp}"
+            );
+        }
+        Ok(())
+    }
+
+    /// As `strand_a_conversation`, for a turn with a DETERMINISTIC identity.
+    ///
+    /// An ordinary retry mints a fresh UUID and so can never address the row a
+    /// previous attempt stranded. A named-Brain retry can, and that is the only
+    /// case in which the `?1` exclusion in `PENDING_PROJECTION_SQL` does
+    /// anything at all. Returns the stranded conversation id.
+    async fn strand_a_brain_conversation(config: &MemoryConfig) -> Result<String> {
+        let memory = MemorySystem::new(config.clone())?;
+        memory
+            .insert_conversation("user", SEED_TURN, None, Some("seed"))
+            .await
+            .context("the seeding turn must project normally")?;
+        memory
+            .hydration
+            .fail("loader ended without finishing".to_string());
+        let provenance = brain_provenance();
+        let refused = memory
+            .insert_brain_conversation("user", BRAIN_TURN, None, Some("brain"), &provenance)
+            .await
+            .expect_err("precondition: a broken index must refuse the placement");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "precondition: the refusal must come from the hydration gate; got {refused}"
+        );
+        let id = format!(
+            "brain:{}:run:{}:role:user",
+            provenance.brain_id, provenance.run_id
+        );
+        let counts = store_counts(&config.db_path)?;
+        assert_eq!(
+            source_row(&config.db_path, &id)?,
+            None,
+            "precondition: the stranded Brain turn must have NO memory_sources \
+             row, which is what makes it pending; id={id}, \
+             counts=(conversations, memory_sources, tree_nodes)={counts:?}"
+        );
+        assert_eq!(
+            (counts.0, counts.1),
+            (2, 1),
+            "precondition: both raw turns stored, only the seeded one projected; \
+             id={id}, counts={counts:?}"
+        );
+        Ok(id)
+    }
+
+    /// An embedding engine that can be switched to failing.
+    ///
+    /// `NeuralEmbeddingEngine::embed` returns `Err` on a tokenizer or ONNX
+    /// fault and `use_neural_embeddings` defaults on, so the `?` at the top of
+    /// `project_stored_conversation` is a reachable production exit. Nothing
+    /// else in this suite can reach it.
+    struct FailableEmbedding {
+        inner: TfIdfEmbedding,
+        fail: AtomicBool,
+    }
+
+    impl EmbeddingEngine for FailableEmbedding {
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("embedding engine unavailable");
+            }
+            self.inner.embed(text)
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+    }
+
+    /// Cancelling the loader WHILE THE SWEEP IS RUNNING must leave the backlog
+    /// exactly-once: what committed stays committed, nothing is half-applied,
+    /// and what had not run is still pending for the next start.
+    ///
+    /// The seam is inside the sweep loop, and that is the point of this
+    /// version. The previous one aborted at `pause_after_completion`, which is
+    /// the last statement of `hydrate_batches` — strictly before
+    /// `hydrate_in_background` calls the sweep at all. Its three cancellation
+    /// assertions therefore held for every possible implementation, including
+    /// one with no sweep: deleting `Self::sweep_pending_projections(&projection)`
+    /// left the test passing. It now hangs the loader between the first and
+    /// second rows of a two-row backlog, so a missing sweep, or one that stops
+    /// after a single row, never reaches the pause.
+    ///
+    /// What cancellation can and cannot split. `write_nodes` is synchronous, so
+    /// a semantic leaf and its `memory_sources` row are one SQLite transaction
+    /// and cannot be split from each other. But there ARE two await points
+    /// between `tree.insert_with_effect` — which mutates the shared in-memory
+    /// tree — and that commit: `db.lock()` and `tree_lock.lock()` in
+    /// `save_all_nodes_to_db`. A cancellation landing on either leaves the tree
+    /// holding a leaf nothing durable records. An earlier version of this
+    /// comment claimed no such await point existed; it was wrong. The
+    /// conclusion survives for a reason outside `project_stored_conversation`:
+    /// the only cancellation of the sweep in production is `Drop for
+    /// MemorySystem` aborting the loader, and that drop tears the tree down
+    /// along with the task, so the orphan leaf dies with it and nothing durable
+    /// was written. Anyone adding an await between those two points for some
+    /// other caller has to revisit that.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_cancelling_the_loader_at_its_sweep_leaves_no_partial_projection() -> Result<()> {
+    async fn test_cancelling_the_loader_mid_sweep_leaves_no_partial_projection() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        strand_a_conversation(&config).await?;
+        let first_stranded = conversation_id_for_session(temp.path(), "stranded")?;
+        strand_rows_directly(
+            temp.path(),
+            &[(SECOND_STRANDED_ID, SECOND_STRANDED_AT, SECOND_STRANDED_TURN)],
+        )?;
+        let before = store_counts(temp.path())?;
+        assert_eq!(
+            (before.0, before.1),
+            (3, 1),
+            "precondition: three raw turns with only the seeded one projected, so \
+             the sweep has a two-row backlog to be interrupted in the middle of; \
+             counts=(conversations, memory_sources, tree_nodes)={before:?}, \
+             first_stranded={first_stranded}"
+        );
+
+        // Hang the sweep once exactly one backlog row has committed.
+        let (_sweep_registration, mut sweep_reached, release_sweep) =
+            register_projection_sweep_pause(temp.path().to_path_buf(), 1);
+        let mut reopened = MemorySystem::new(config)?;
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !*sweep_reached.borrow_and_update() {
+                sweep_reached
+                    .changed()
+                    .await
+                    .expect("the production sweep dropped its pause signal");
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the loader's sweep never began a second backlog row, so nothing below \
+             is a statement about cancelling a sweep: either the loader does not \
+             sweep at all, or the sweep stops after one row; status={:?}, \
+             before={before:?}, counts={:?}, first_stranded={first_stranded}",
+            reopened.hydration_status(),
+            store_counts(temp.path())?
+        );
+
+        let loader = reopened.hydration_task.take().expect(
+            "a reopened store with persisted nodes must spawn a loader on a \
+             multi-threaded runtime",
+        );
+        loader.abort();
+        let join_error = tokio::time::timeout(std::time::Duration::from_secs(10), loader)
+            .await
+            .expect("the cancelled loader must finish")
+            .expect_err("the paused loader must terminate through the cancellation");
+        assert!(
+            join_error.is_cancelled(),
+            "the loader must report cancellation rather than a panic; \
+             join_error={join_error}"
+        );
+        // Nothing is parked on the pause any more. Release it so the resumed
+        // sweep below cannot block on a seam this test is finished with.
+        release_sweep.send_replace(true);
+
+        let after_abort = store_counts(temp.path())?;
+        let first_row = source_row(temp.path(), &first_stranded)?;
+        let second_row = source_row(temp.path(), SECOND_STRANDED_ID)?;
+        assert!(
+            matches!(first_row, Some(Some(_))),
+            "the backlog row the sweep committed BEFORE the cancellation must stay \
+             committed — its leaf and its mapping are one transaction, so a \
+             cancellation cannot unpick it; first_row={first_row:?}, \
+             second_row={second_row:?}, before={before:?}, after_abort={after_abort:?}"
+        );
+        assert_eq!(
+            second_row, None,
+            "and the row the sweep had not reached must be left wholly pending, \
+             not half-attributed; second_row={second_row:?}, \
+             first_row={first_row:?}, before={before:?}, after_abort={after_abort:?}"
+        );
+        assert_eq!(
+            (after_abort.0, after_abort.1),
+            (before.0, before.1 + 1),
+            "exactly one mapping may exist for the one row the sweep finished, and \
+             no raw conversation may be duplicated: (conversations, \
+             memory_sources); before={before:?}, after_abort={after_abort:?}, \
+             first_row={first_row:?}, second_row={second_row:?}"
+        );
+
+        // Restart. The repair the cancellation interrupted must resume, exactly
+        // once, without redoing the row that already committed.
+        let repaired = reopened.recover_pending_projections().await?;
+        let after_repair = store_counts(temp.path())?;
+        assert_eq!(
+            repaired, 1,
+            "the restart must repair exactly the row the cancellation left pending; \
+             after_abort={after_abort:?}, after_repair={after_repair:?}, \
+             first_row={first_row:?}"
+        );
+        let second_after_repair = source_row(temp.path(), SECOND_STRANDED_ID)?;
+        assert!(
+            matches!(second_after_repair, Some(Some(_))),
+            "and must attribute it to a leaf; second_row={second_after_repair:?}, \
+             after_repair={after_repair:?}"
+        );
+        // Not "the node id is unchanged": inserting the second turn may promote
+        // the first one's leaf, and `write_nodes` deliberately carries the
+        // mapping to the leaf that still holds the words
+        // (`test_promotion_moves_provenance_to_the_leaf_holding_the_text`). What
+        // must hold is that the turn still resolves to its own text through
+        // exactly one mapping — the count assertion below covers the "exactly
+        // one" half.
+        let first_after_repair = source_row(temp.path(), &first_stranded)?;
+        let first_leaf_text = first_after_repair
+            .flatten()
+            .map(|node| node_text(temp.path(), node))
+            .transpose()?;
+        assert_eq!(
+            first_leaf_text.as_deref(),
+            Some(STRANDED_TURN),
+            "and the already-committed row must still resolve to the leaf holding \
+             its own text, rather than being re-placed as a second memory; \
+             at_abort={first_row:?}, after_repair_row={first_after_repair:?}, \
+             after_repair={after_repair:?}, first_stranded={first_stranded}"
+        );
+        assert_eq!(
+            (after_repair.0, after_repair.1),
+            (before.0, before.1 + 2),
+            "with one mapping per stranded turn and no duplicate raw rows; \
+             before={before:?}, after_abort={after_abort:?}, \
+             after_repair={after_repair:?}"
+        );
+
+        let again = reopened.recover_pending_projections().await?;
+        assert_eq!(
+            again,
+            0,
+            "with no post-terminal effect from running the repair once more; \
+             after_repair={after_repair:?}, now={:?}",
+            store_counts(temp.path())?
+        );
+        assert_eq!(
+            store_counts(temp.path())?,
+            after_repair,
+            "and no rows added by that second pass; after_repair={after_repair:?}"
+        );
+        Ok(())
+    }
+
+    /// The sweep walks the WHOLE backlog, in the order the turns were spoken,
+    /// mapping each row onto its own leaf.
+    ///
+    /// Nothing pinned any of that. `strand_a_conversation` strands exactly one
+    /// row, so the loop body never ran twice: `ORDER BY c.timestamp ASC`, the
+    /// `repaired` counter, and per-row mapping were all free to be anything.
+    /// Replacing the loop with `pending.iter().take(1)` changed no test.
+    ///
+    /// Three rows whose id order is deliberately the reverse of their timestamp
+    /// order, so ordering by timestamp is observable rather than incidental.
+    /// The sweep is held between its first and second rows and what has
+    /// committed at that instant is read through a fresh connection.
+    #[tokio::test]
+    async fn test_a_backlog_is_reprojected_in_timestamp_order_row_by_row() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let (_sweep_registration, mut sweep_reached, release_sweep) =
+            register_projection_sweep_pause(temp.path().to_path_buf(), 1);
+        let memory = MemorySystem::new(config)?;
+        assert!(
+            memory.hydration_task.is_none(),
+            "precondition: the current-thread arm spawns no loader, so every sweep \
+             here is one this test asked for"
+        );
+        memory
+            .insert_conversation("user", SEED_TURN, None, Some("seed"))
+            .await
+            .context("the seeding turn must project normally")?;
+        strand_rows_directly(
+            temp.path(),
+            &[
+                (BACKLOG_LATE_ID, BACKLOG_LATE_AT, BACKLOG_LATE_TURN),
+                (BACKLOG_EARLY_ID, BACKLOG_EARLY_AT, BACKLOG_EARLY_TURN),
+                (BACKLOG_MIDDLE_ID, BACKLOG_MIDDLE_AT, BACKLOG_MIDDLE_TURN),
+            ],
+        )?;
+        let before = store_counts(temp.path())?;
+        assert_eq!(
+            (before.0, before.1),
+            (4, 1),
+            "precondition: four raw turns with only the seeded one projected; \
+             counts=(conversations, memory_sources, tree_nodes)={before:?}"
+        );
+
+        // The sweep and an observer of it, on one task: `join!` polls the probe
+        // while the sweep is parked at its seam. The timeout is a liveness
+        // bound on reaching a second row, never an assertion about how long
+        // anything takes.
+        let sweep = memory.recover_pending_projections();
+        let probe = async {
+            let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !*sweep_reached.borrow_and_update() {
+                    sweep_reached
+                        .changed()
+                        .await
+                        .expect("the production sweep dropped its pause signal");
+                }
+            })
+            .await
+            .is_ok();
+            let midpoint = if reached {
+                Some((
+                    source_row(temp.path(), BACKLOG_EARLY_ID),
+                    source_row(temp.path(), BACKLOG_MIDDLE_ID),
+                    source_row(temp.path(), BACKLOG_LATE_ID),
+                ))
+            } else {
+                None
+            };
+            release_sweep.send_replace(true);
+            (reached, midpoint)
+        };
+        let (repaired, (reached, midpoint)) = tokio::join!(sweep, probe);
+        assert!(
+            reached,
+            "the sweep never began a second backlog row, so it does not walk a \
+             backlog at all; repaired={repaired:?}, before={before:?}, counts={:?}",
+            store_counts(temp.path())?
+        );
+        let (early_mid, middle_mid, late_mid) =
+            midpoint.expect("the midpoint snapshot is taken whenever the pause is reached");
+        let (early_mid, middle_mid, late_mid) = (early_mid?, middle_mid?, late_mid?);
+        assert!(
+            matches!(early_mid, Some(Some(_))),
+            "the EARLIEST-spoken turn must be the row the sweep projects first: \
+             `ORDER BY c.timestamp ASC` is what replays a backlog in the order it \
+             was actually spoken, and the ids here sort the other way round; \
+             early={early_mid:?}, middle={middle_mid:?}, late={late_mid:?}, \
+             before={before:?}"
+        );
+        assert_eq!(
+            (middle_mid, late_mid),
+            (None, None),
+            "and it must be the only row committed at that instant, or the sweep \
+             is not committing row by row; early={early_mid:?}, \
+             middle={middle_mid:?}, late={late_mid:?}, before={before:?}"
+        );
+
+        let repaired = repaired?;
+        let after = store_counts(temp.path())?;
+        assert_eq!(
+            repaired, 3,
+            "every stranded row must be repaired and counted, not just the first; \
+             before={before:?}, after=(conversations, memory_sources, \
+             tree_nodes)={after:?}"
+        );
+        assert_eq!(
+            (after.0, after.1),
+            (before.0, before.1 + 3),
+            "one new mapping per stranded turn and no duplicated raw rows; \
+             repaired={repaired}, before={before:?}, after={after:?}"
+        );
+
+        let mut placed: Vec<(&str, i64)> = Vec::new();
+        for (id, content) in [
+            (BACKLOG_EARLY_ID, BACKLOG_EARLY_TURN),
+            (BACKLOG_MIDDLE_ID, BACKLOG_MIDDLE_TURN),
+            (BACKLOG_LATE_ID, BACKLOG_LATE_TURN),
+        ] {
+            let row = source_row(temp.path(), id)?;
+            let Some(Some(node)) = row else {
+                panic!(
+                    "every stranded row must end mapped to a semantic leaf, not \
+                     only the first one the loop reached; id={id}, \
+                     source_row={row:?}, repaired={repaired}, after={after:?}, \
+                     placed={placed:?}"
+                );
+            };
+            assert_eq!(
+                node_text(temp.path(), node)?,
+                content,
+                "and each row must be mapped to the leaf holding ITS OWN text, so \
+                 the loop carries its row through rather than reusing one; \
+                 id={id}, node={node}, repaired={repaired}, after={after:?}, \
+                 placed={placed:?}"
+            );
+            placed.push((id, node));
+        }
+        assert_eq!(
+            placed
+                .iter()
+                .map(|(_, node)| *node)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "three distinct turns must not collapse onto one leaf; placed={placed:?}, \
+             after={after:?}"
+        );
+
+        let again = memory.recover_pending_projections().await?;
+        assert_eq!(
+            again,
+            0,
+            "and the whole repaired backlog must have left the pending set; \
+             after={after:?}, now={:?}, placed={placed:?}",
+            store_counts(temp.path())?
+        );
+        Ok(())
+    }
+
+    /// The write path's own hook repairs the backlog.
+    ///
+    /// The loader's hook covers reopening the store. This covers the other one,
+    /// which is the only hook the current-thread arm of `new` has at all: that
+    /// arm hydrates synchronously and spawns no task to hang a sweep on. No
+    /// test reached `sweep_pending_projections_if_owed` through
+    /// `insert_conversation` before this one — deleting the call from
+    /// `insert_conversation_record` changed nothing.
+    #[tokio::test]
+    async fn test_the_next_ordinary_write_reprojects_a_stranded_conversation() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -4517,81 +5208,214 @@ mod tests {
         let stranded = conversation_id_for_session(temp.path(), "stranded")?;
         let before = store_counts(temp.path())?;
 
-        let (_pause_registration, mut completion_reached, _release_completion) =
-            register_hydration_completion_pause(temp.path().to_path_buf());
-        let mut reopened = MemorySystem::new(config)?;
-        let reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !*completion_reached.borrow_and_update() {
-                completion_reached
-                    .changed()
-                    .await
-                    .expect("the production loader dropped its completion signal");
-            }
-        })
-        .await;
+        let reopened = MemorySystem::new(config)?;
         assert!(
-            reached.is_ok(),
-            "the production loader did not reach the pause that sits at the repair \
-             point; status={:?}, counts={:?}",
-            reopened.hydration_status(),
-            store_counts(temp.path())?
+            reopened.hydration_task.is_none(),
+            "precondition: the current-thread arm spawns no loader, so the only \
+             sweep that can run here is the write path's own"
         );
-
-        let loader = reopened
-            .hydration_task
-            .take()
-            .expect("a paused loader handle must be retained");
-        loader.abort();
-        let join_error = tokio::time::timeout(std::time::Duration::from_secs(5), loader)
+        reopened
+            .insert_conversation("user", FRESH_TURN, None, Some("fresh"))
             .await
-            .expect("the cancelled loader must finish")
-            .expect_err("the paused loader must terminate through the cancellation");
+            .context("the live turn must be accepted")?;
+
+        let after = store_counts(temp.path())?;
+        let repaired = source_row(temp.path(), &stranded)?;
+        let fresh = conversation_id_for_session(temp.path(), "fresh")?;
+        let fresh_row = source_row(temp.path(), &fresh)?;
         assert!(
-            join_error.is_cancelled(),
-            "the loader must report cancellation rather than a panic; \
-             join_error={join_error}"
-        );
-
-        let after_abort = store_counts(temp.path())?;
-        let row_after_abort = source_row(temp.path(), &stranded)?;
-        assert_eq!(
-            after_abort, before,
-            "cancelling at the repair point must write nothing at all: \
-             (conversations, memory_sources, tree_nodes); stranded={stranded}"
-        );
-        assert_eq!(
-            row_after_abort, None,
-            "and must leave the turn pending rather than half-attributed; \
-             got {row_after_abort:?}, counts={after_abort:?}, stranded={stranded}"
-        );
-
-        // The repair was not consumed by the cancellation, and is still
-        // exactly-once when it does run.
-        let repaired = reopened.recover_pending_projections().await?;
-        let after_repair = store_counts(temp.path())?;
-        assert_eq!(
-            repaired, 1,
-            "the cancelled sweep must not have consumed the repair; \
-             after_abort={after_abort:?}, after_repair={after_repair:?}, \
+            matches!(repaired, Some(Some(_))),
+            "an ordinary write must repair the turns stranded before it — this is \
+             the only repair a process that never reopens its store ever gets; \
+             stranded_row={repaired:?}, fresh_row={fresh_row:?}, before={before:?}, \
+             after=(conversations, memory_sources, tree_nodes)={after:?}, \
              stranded={stranded}"
         );
         assert!(
-            matches!(source_row(temp.path(), &stranded)?, Some(Some(_))),
-            "and the resumed repair must attribute the turn to a leaf; \
-             counts={after_repair:?}, stranded={stranded}"
+            matches!(fresh_row, Some(Some(_))),
+            "and must still project its own turn; fresh_row={fresh_row:?}, \
+             stranded_row={repaired:?}, after={after:?}, fresh={fresh}"
+        );
+        assert_ne!(
+            repaired.flatten(),
+            fresh_row.flatten(),
+            "onto a leaf of its own rather than the repaired turn's; \
+             after={after:?}, stranded={stranded}, fresh={fresh}"
+        );
+        assert_eq!(
+            (after.0, after.1),
+            (before.0 + 1, before.1 + 2),
+            "one new raw turn, and two new mappings — the repair and the live \
+             turn; before={before:?}, after={after:?}"
         );
         let again = reopened.recover_pending_projections().await?;
         assert_eq!(
             again,
             0,
-            "with no post-terminal effect from running it once more; \
-             after_repair={after_repair:?}, now={:?}, stranded={stranded}",
+            "with nothing left pending afterwards; after={after:?}, now={:?}",
             store_counts(temp.path())?
         );
+        Ok(())
+    }
+
+    /// A named-Brain retry projects its OWN stranded row rather than letting
+    /// the sweep do it, and reports that it did.
+    ///
+    /// This is the only thing the `?1` exclusion in `PENDING_PROJECTION_SQL`
+    /// buys, and nothing pinned it. Without the exclusion the sweep repairs the
+    /// row first, the retry then takes the `already_classified` short-circuit,
+    /// and `insert_brain_conversation` returns `Ok(false)` — read as "identical
+    /// retry, nothing to do" — for the call that actually caused the turn to be
+    /// indexed. The consequence that matters is the failing case: the sweep
+    /// swallows its errors into a `tracing::warn!`, so without the exclusion a
+    /// projection that FAILED would reach the caller as `Ok(false)` rather than
+    /// as an error.
+    #[tokio::test]
+    async fn test_a_brain_retry_projects_its_own_stranded_turn() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let brain_turn_id = strand_a_brain_conversation(&config).await?;
+        let before = store_counts(temp.path())?;
+
+        let reopened = MemorySystem::new(config)?;
+        assert!(
+            reopened.hydration_task.is_none(),
+            "precondition: the current-thread arm spawns no loader, so the retry's \
+             own sweep is the only one that can run"
+        );
+        let performed = reopened
+            .insert_brain_conversation("user", BRAIN_TURN, None, Some("brain"), &brain_provenance())
+            .await
+            .context("the retry must be accepted once the index is usable")?;
+
+        let after = store_counts(temp.path())?;
+        let row = source_row(temp.path(), &brain_turn_id)?;
+        assert!(
+            performed,
+            "the retry must report that IT projected the turn: the sweep it runs \
+             first has to exclude the very row the caller is about to project, or \
+             a projection that failed inside that sweep is reported to the caller \
+             as a successful no-op; source_row={row:?}, before={before:?}, \
+             after=(conversations, memory_sources, tree_nodes)={after:?}, \
+             id={brain_turn_id}"
+        );
+        assert!(
+            matches!(row, Some(Some(_))),
+            "and the stranded turn must actually be indexed, whichever path did \
+             it; source_row={row:?}, after={after:?}, id={brain_turn_id}"
+        );
         assert_eq!(
-            store_counts(temp.path())?,
-            after_repair,
-            "and no rows added by the second pass; stranded={stranded}"
+            (after.0, after.1),
+            (before.0, before.1 + 1),
+            "with no duplicate raw turn and exactly one new mapping; \
+             before={before:?}, after={after:?}, id={brain_turn_id}"
+        );
+
+        let second = reopened
+            .insert_brain_conversation("user", BRAIN_TURN, None, Some("brain"), &brain_provenance())
+            .await?;
+        let after_second = store_counts(temp.path())?;
+        assert!(
+            !second,
+            "a second identical retry, with nothing left to project, must report \
+             no work; after={after:?}, after_second={after_second:?}, \
+             id={brain_turn_id}"
+        );
+        assert_eq!(
+            after_second, after,
+            "and must change no row counts; id={brain_turn_id}"
+        );
+        assert_eq!(
+            source_row(temp.path(), &brain_turn_id)?,
+            row,
+            "nor re-point the turn at a second leaf; after_second={after_second:?}, \
+             id={brain_turn_id}"
+        );
+        Ok(())
+    }
+
+    /// A projection that FAILS must leave the pending-projection sweep armed.
+    ///
+    /// The asymmetry this pins is #339 reintroduced by its own fix.
+    /// `sweep_pending_projections_locked` clears the flag when the pending set
+    /// comes back empty — and with one pending row and a named-Brain retry for
+    /// that same identity, the set is empty only because the `?1` exclusion
+    /// removed it. The caller then reaches `project_stored_conversation`, where
+    /// `ctx.embedding_engine.embed(&key_content)?` returns above BOTH sites
+    /// that used to re-arm the flag (the `insert_with_effect` and
+    /// `save_all_nodes_to_db` error paths). The row stayed pending with the
+    /// sweep disarmed, so no automatic sweep ran again for the life of the
+    /// process. The same asymmetry hit an ordinary first-time write that failed
+    /// at `embed`.
+    #[tokio::test]
+    async fn test_a_failed_projection_rearms_the_pending_sweep() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let brain_turn_id = strand_a_brain_conversation(&config).await?;
+
+        let mut reopened = MemorySystem::new(config)?;
+        assert!(
+            reopened.hydration_task.is_none(),
+            "precondition: the current-thread arm spawns no loader, so no sweep \
+             runs behind this test's back"
+        );
+        let engine = Arc::new(FailableEmbedding {
+            inner: TfIdfEmbedding::new(),
+            fail: AtomicBool::new(true),
+        });
+        reopened.embedding_engine = Arc::clone(&engine) as Arc<dyn EmbeddingEngine>;
+
+        let error = reopened
+            .insert_brain_conversation("user", BRAIN_TURN, None, Some("brain"), &brain_provenance())
+            .await
+            .expect_err("precondition: a failing embedder must refuse the projection");
+        assert!(
+            error.to_string().contains("embedding engine unavailable"),
+            "precondition: the failure must be the embed call itself, not \
+             something earlier; got {error}"
+        );
+        let row = source_row(temp.path(), &brain_turn_id)?;
+        assert_eq!(
+            row,
+            None,
+            "precondition: the failed projection must leave the turn stranded, \
+             with its raw row and no memory_sources row; source_row={row:?}, \
+             id={brain_turn_id}, counts={:?}",
+            store_counts(temp.path())?
+        );
+        assert!(
+            reopened.needs_projection_sweep.load(Ordering::SeqCst),
+            "a failed projection must leave the sweep OWED. Its own sweep found \
+             an empty pending set — empty only because the `?1` exclusion removed \
+             this very row — and cleared the flag, so with the flag left down \
+             nothing automatic ever looks at this row again; id={brain_turn_id}, \
+             counts=(conversations, memory_sources, tree_nodes)={:?}",
+            store_counts(temp.path())?
+        );
+
+        // The production consequence, not merely the flag: the next ordinary
+        // write must repair the turn the failure stranded.
+        engine.fail.store(false, Ordering::SeqCst);
+        reopened
+            .insert_conversation("user", FRESH_TURN, None, Some("fresh"))
+            .await
+            .context("the next live turn must be accepted")?;
+        let repaired = source_row(temp.path(), &brain_turn_id)?;
+        assert!(
+            matches!(repaired, Some(Some(_))),
+            "and the next write's automatic sweep must repair it; a disarmed flag \
+             makes the turn permanently invisible to semantic recall, which is \
+             exactly the loss #339 is about; source_row={repaired:?}, \
+             id={brain_turn_id}, counts={:?}",
+            store_counts(temp.path())?
         );
         Ok(())
     }
