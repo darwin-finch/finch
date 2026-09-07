@@ -65,6 +65,17 @@ enum ConfirmationChoice {
     Deny,
 }
 
+/// The identity line printed at the top of an interactive session, and in the
+/// non-interactive banner.
+///
+/// The version is read from the crate rather than written out, because the
+/// literal it replaced (`"Shammah v0.1.0 - Constitutional AI Proxy"`) had gone
+/// stale by several minor versions without anyone noticing — a hardcoded
+/// version has no way to stay correct.
+pub fn startup_identity_line() -> String {
+    format!("finch {} - {}", env!("CARGO_PKG_VERSION"), crate::ABOUT)
+}
+
 #[cfg(test)]
 mod disabled_training_tests {
     use super::*;
@@ -2366,7 +2377,7 @@ impl Repl {
     pub async fn run(&mut self) -> Result<()> {
         if self.is_interactive {
             // Fancy startup for interactive mode
-            self.output_status("Shammah v0.1.0 - Constitutional AI Proxy");
+            self.output_status(startup_identity_line());
             self.output_status("Using API key from: ~/.finch/config.toml ✓");
             self.output_status("Loaded crisis detection keywords ✓");
             self.output_status("Online learning: ENABLED (threshold models) ✓");
@@ -2375,7 +2386,7 @@ impl Repl {
             self.print_status_line().await;
         } else {
             // Minimal output for non-interactive mode (pipes, scripts)
-            output_status!("# Shammah v0.1.0 - Non-interactive mode");
+            output_status!("# {} - non-interactive mode", startup_identity_line());
         }
 
         // Register Ctrl+C handler for graceful shutdown
@@ -4565,5 +4576,73 @@ impl Repl {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod identity_string_tests {
+    use super::startup_identity_line;
+
+    /// Phrases that describe a capability Finch has not evidenced, or a product
+    /// it is not. Each is a claim the project has explicitly retracted or never
+    /// established: `AGENTS.md` says not to repeat offline or local-model claims
+    /// without dated evidence (#74, #98, #120), "constitutional" names a
+    /// training-time method Finch does not perform (LoRA training is disabled
+    /// under #139), Finch is not a proxy, and "Shammah" is not the product name.
+    const FORBIDDEN: &[&str] = &[
+        "proxy",
+        "constitutional",
+        "local-first",
+        "local first",
+        "offline",
+        "shammah",
+    ];
+
+    fn assert_makes_no_unevidenced_claim(label: &str, text: &str) {
+        let lowered = text.to_ascii_lowercase();
+        for forbidden in FORBIDDEN {
+            assert!(
+                !lowered.contains(forbidden),
+                "invariant: a user-visible identity string must not advertise a capability the \
+                 project has not evidenced, or name a product Finch is not (#448). \
+                 source={label} string={text:?} forbidden_claim={forbidden:?}. \
+                 This is the exact class that shipped `finch --help` describing Finch as a \
+                 \"Local-first Constitutional AI Proxy\": constitutional AI modifies a model's \
+                 weights and Finch modifies none, and local routing parity is still open."
+            );
+        }
+    }
+
+    #[test]
+    fn test_about_makes_no_unevidenced_capability_claim() {
+        assert!(
+            !crate::ABOUT.trim().is_empty(),
+            "invariant: `finch --help` must describe what Finch is; ABOUT was empty (#448)"
+        );
+        assert_makes_no_unevidenced_claim("finch::ABOUT (clap --help)", crate::ABOUT);
+    }
+
+    #[test]
+    fn test_startup_identity_line_makes_no_unevidenced_capability_claim() {
+        assert_makes_no_unevidenced_claim("startup_identity_line()", &startup_identity_line());
+    }
+
+    /// The literal this replaced said `v0.1.0` while the crate was past 0.7. A
+    /// version that is written out cannot stay correct, so pin that it is read.
+    #[test]
+    fn test_startup_identity_line_reports_the_crates_real_version() {
+        let line = startup_identity_line();
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            line.contains(version),
+            "invariant: the startup banner must report the version the binary actually is, read \
+             from the crate rather than written out, because the literal it replaced said \
+             \"v0.1.0\" for several minor versions (#448). \
+             line={line:?} expected_to_contain={version:?}"
+        );
+        assert!(
+            line.starts_with("finch "),
+            "invariant: the startup banner must name the product `finch`; line={line:?}"
+        );
     }
 }

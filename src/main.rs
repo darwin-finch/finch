@@ -1,4 +1,4 @@
-// Shammah - Local-first Constitutional AI Proxy
+// finch - terminal coding assistant
 // Main entry point
 
 use anyhow::{Context, Result};
@@ -18,7 +18,7 @@ use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "finch")]
-#[command(about = "Local-first Constitutional AI Proxy", version)]
+#[command(about = finch::ABOUT, version)]
 struct Args {
     /// Run mode
     #[command(subcommand)]
