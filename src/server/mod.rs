@@ -266,6 +266,148 @@ fn supervised_state_root(
     Ok(SupervisedStateRoot { directory, path })
 }
 
+/// The two timing decisions the schedule delivery loop makes.
+///
+/// Extracted as free functions because the loop body lives inside a
+/// `tokio::spawn` closure and is otherwise unreachable from a test. Both are
+/// pure -- they take the clock as a parameter -- so their tests assert
+/// behaviour with no clock of their own (#374, and #242's lesson about
+/// wall-clock assertions).
+pub(crate) mod schedule_delivery {
+    use tokio::time::Duration;
+
+    /// Ceiling on one sleep. A clock jump or a missed notification then costs
+    /// one idle wake rather than an unbounded stall. It is a backstop, not the
+    /// mechanism: with nothing due the loop wakes once a minute, not sixty
+    /// times.
+    pub(crate) const MAX_SLEEP: Duration = Duration::from_secs(60);
+
+    /// How long to wait after a pass that delivered nothing and advanced
+    /// nothing. Matches the cadence of the fixed one-second tick this loop
+    /// replaced.
+    pub(crate) const UNDELIVERED_RETRY: Duration = Duration::from_secs(1);
+
+    /// How often the Brain root is re-enumerated, so a Brain that could not be
+    /// loaded earlier is picked up once it is repaired. The fixed one-second
+    /// tick gave that recovery for free; the index pays for it once a minute
+    /// instead of once a second.
+    pub(crate) const REWARM_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// How long to sleep given the earliest indexed due time and the clock.
+    pub(crate) fn sleep_for(head: Option<u64>, now_ms: u64) -> Duration {
+        match head {
+            Some(due) if due <= now_ms => Duration::ZERO,
+            Some(due) => Duration::from_millis(due - now_ms).min(MAX_SLEEP),
+            None => MAX_SLEEP,
+        }
+    }
+
+    /// Whether a delivery pass that changed nothing should back off.
+    ///
+    /// `queue_due_schedules` skips a schedule whose previous occurrence is
+    /// still `Running` or `AwaitingApproval`, leaving `next_due_ms` where it
+    /// was. The head then stays due and the next `sleep_for` is zero. Without
+    /// this the loop spins hot; the fixed tick it replaced was safe from that
+    /// only because it always slept a second.
+    ///
+    /// An earlier version of this note blamed an offline runner. That is not
+    /// the mechanism: `deliver_due_named_brain_schedules` calls
+    /// `queue_due_schedules`, which advances, *before* it checks runner
+    /// readiness.
+    pub(crate) fn should_back_off(
+        head_before: Option<u64>,
+        head_after: Option<u64>,
+        now_ms: u64,
+    ) -> bool {
+        head_after == head_before && head_after.is_some_and(|due| due <= now_ms)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_nothing_scheduled_sleeps_the_ceiling_rather_than_polling() {
+            assert_eq!(
+                sleep_for(None, 5_000),
+                MAX_SLEEP,
+                "an empty index must wait, not poll; this is the whole point of \
+         replacing the fixed one-second tick"
+            );
+        }
+
+        #[test]
+        fn test_a_due_head_does_not_sleep() {
+            assert_eq!(
+                sleep_for(Some(5_000), 5_000),
+                Duration::ZERO,
+                "a schedule due at exactly now must be delivered on this pass, \
+         not after another sleep"
+            );
+            assert_eq!(
+                sleep_for(Some(4_000), 5_000),
+                Duration::ZERO,
+                "and one already overdue must not sleep at all"
+            );
+        }
+
+        #[test]
+        fn test_sleep_is_the_distance_to_the_head() {
+            assert_eq!(
+                sleep_for(Some(5_250), 5_000),
+                Duration::from_millis(250),
+                "the loop must wake when the head comes due, not on a fixed \
+         cadence; inverting the due comparison would return ZERO here \
+         and spin"
+            );
+        }
+
+        #[test]
+        fn test_a_distant_head_is_capped_at_the_ceiling() {
+            assert_eq!(
+                sleep_for(Some(u64::MAX), 0),
+                MAX_SLEEP,
+                "a head far in the future must still be bounded, so a clock \
+         jump or a dropped notification costs one idle wake rather than \
+         an unbounded stall. Raising MAX_SLEEP raises that worst case"
+            );
+        }
+
+        #[test]
+        fn test_back_off_when_a_due_head_did_not_move() {
+            assert!(
+                should_back_off(Some(1_000), Some(1_000), 2_000),
+                "a due schedule that was not delivered leaves the head due and \
+         the next sleep zero. Without backing off, the delivery task \
+         spins hot on a Brain whose runner is offline -- which is \
+         exactly the state an idle machine sits in"
+            );
+        }
+
+        #[test]
+        fn test_do_not_back_off_when_the_head_advanced() {
+            assert!(
+                !should_back_off(Some(1_000), Some(2_000), 1_500),
+                "a delivered schedule advanced the head; sleeping a second here \
+         would delay work that is already selectable"
+            );
+        }
+
+        #[test]
+        fn test_do_not_back_off_when_the_head_is_not_yet_due() {
+            assert!(
+                !should_back_off(Some(9_000), Some(9_000), 1_000),
+                "an unchanged head that is not due is the ordinary idle case; \
+         the loop sleeps toward it rather than backing off"
+            );
+            assert!(
+                !should_back_off(None, None, 1_000),
+                "and an empty index is not a failed delivery"
+            );
+        }
+    }
+}
+
 impl AgentServer {
     #[cfg(test)]
     pub(crate) fn for_brain_http_test(
@@ -452,21 +594,66 @@ impl AgentServer {
         let addr = listener.local_addr()?;
 
         // The daemon owns only due-time calculation and durable queueing.
+
         // Actual ProgramRuns remain on each Brain's leased environment runner.
         let schedule_store = self.brain_store.clone();
         let schedule_runners = self.brain_runners.clone();
         let schedule_task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Warm the due index. Schedules only become known when a Brain is
+            // loaded, so the index covers exactly the resident Brains and starts
+            // empty. Steady state then selects from the index and hydrates
+            // nothing it does not need (#374).
+            //
+            // Re-warmed periodically, not once. Warming once meant a Brain that
+            // happened to be unloadable at daemon start -- a volume not yet
+            // mounted, a journal being repaired -- was never scheduled again for
+            // the life of the daemon, silently, because a scheduled Brain is
+            // precisely the Brain nothing else touches by name to hydrate it.
+            // The loop this replaced re-enumerated every second and recovered
+            // within a second; losing that was a regression. The enumeration is
+            // now bounded by this interval rather than by the tick, which is the
+            // cost actually being removed.
+            schedule_store.warm_schedule_index();
+            let mut last_warm = tokio::time::Instant::now();
+
+            let wakeup = schedule_store.schedule_wakeup();
+            // A due schedule whose Brain has no ready runner is not delivered
+            // and its `next_due_ms` is not advanced, so the index head stays
+            // due. Without a floor the loop would then spin: the old code was
+            // safe from this only because it slept a second unconditionally.
+            const UNDELIVERED_RETRY: tokio::time::Duration = schedule_delivery::UNDELIVERED_RETRY;
             loop {
-                tick.tick().await;
-                let names = match schedule_store.list() {
-                    Ok(names) => names,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not list Brains for schedule delivery");
-                        continue;
+                // Register the waiter *before* sampling the head. A writer that
+                // blocks on the index lock resumes the instant this loop
+                // releases it, so a notification sent between reading the head
+                // and registering would land in that window. Enabling the
+                // future first makes the window empty rather than merely narrow.
+                let notified = wakeup.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                if last_warm.elapsed() >= schedule_delivery::REWARM_INTERVAL {
+                    schedule_store.warm_schedule_index();
+                    last_warm = tokio::time::Instant::now();
+                }
+
+                let now = crate::brain::store::unix_millis();
+                let sleep_for =
+                    schedule_delivery::sleep_for(schedule_store.next_schedule_due_ms(), now);
+                if !sleep_for.is_zero() {
+                    // Wake early when a schedule appears that is due sooner
+                    // than the head this sleep was computed against.
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep_for) => {}
+                        _ = notified.as_mut() => {}
                     }
-                };
+                }
+
+                let now = crate::brain::store::unix_millis();
+                let head_before = schedule_store.next_schedule_due_ms();
+                // Selection by due time, not by Brain: this names only the
+                // Brains that actually have work, without hydrating any.
+                let names = schedule_store.due_schedule_brains(now);
                 for name in names {
                     if let Err(error) = handlers::deliver_due_named_brain_schedules(
                         schedule_store.clone(),
@@ -478,6 +665,18 @@ impl AgentServer {
                     {
                         tracing::warn!(brain = %name, %error, "could not deliver due Brain schedule");
                     }
+                }
+
+                // If the head did not move, nothing advanced -- typically a due
+                // Brain with no ready runner. Back off to the old cadence
+                // rather than re-selecting the same entry immediately.
+                let head_after = schedule_store.next_schedule_due_ms();
+                if schedule_delivery::should_back_off(
+                    head_before,
+                    head_after,
+                    crate::brain::store::unix_millis(),
+                ) {
+                    tokio::time::sleep(UNDELIVERED_RETRY).await;
                 }
             }
         });
