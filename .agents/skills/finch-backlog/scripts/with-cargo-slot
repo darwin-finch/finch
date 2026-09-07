@@ -16,31 +16,105 @@ if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
     exit 64
 fi
 
+slots="${FINCH_CARGO_SLOTS:-2}"
+if [[ ! "$slots" =~ ^[1-9][0-9]*$ ]]; then
+    echo "with-cargo-slot: FINCH_CARGO_SLOTS must be a positive integer" >&2
+    exit 64
+fi
+
+# What the 16 GB host can afford is the PRODUCT slots x CARGO_BUILD_JOBS, because
+# one rustc peaks near 3 GB compiling the finch lib crate. Neither factor is a
+# budget on its own: 2 slots at -j2 is four rustc and swaps. Hold the product
+# constant however the slots are cut, so raising FINCH_CARGO_SLOTS trades
+# within-build parallelism for across-agent parallelism instead of adding load.
+rustc_budget="${FINCH_CARGO_RUSTC_BUDGET:-2}"
+if [[ ! "$rustc_budget" =~ ^[1-9][0-9]*$ ]]; then
+    echo "with-cargo-slot: FINCH_CARGO_RUSTC_BUDGET must be a positive integer" >&2
+    exit 64
+fi
+default_jobs=$(( rustc_budget / slots ))
+if [[ "$default_jobs" -lt 1 ]]; then
+    default_jobs=1
+fi
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$default_jobs}"
+
 if ! git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
     echo "with-cargo-slot: run from a Finch Git worktree" >&2
     exit 69
 fi
 
-lock_path="$git_common_dir/finch-cargo-slot.lock"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+lock_base="$git_common_dir/finch-cargo-slot.lock"
 
-case "$(uname -s)" in
+# Slot 1 keeps the historical single-slot path so a process still running the
+# previous version of this script contends for the same lock as this one. During
+# a rollout the two versions therefore still bound total concurrency.
+slot_path() {
+    if [[ "$1" -eq 1 ]]; then
+        echo "$lock_base"
+    else
+        echo "$lock_base.$1"
+    fi
+}
+
+os="$(uname -s)"
+case "$os" in
     Darwin)
         if ! command -v lockf >/dev/null 2>&1; then
             echo "with-cargo-slot: macOS requires lockf; refusing an unlocked build" >&2
             exit 69
         fi
-        exec lockf -k -t "$timeout_seconds" "$lock_path" "$@"
         ;;
     Linux)
         if ! command -v flock >/dev/null 2>&1; then
             echo "with-cargo-slot: Linux requires flock; refusing an unlocked build" >&2
             exit 69
         fi
-        exec flock -w "$timeout_seconds" "$lock_path" "$@"
         ;;
     *)
-        echo "with-cargo-slot: unsupported platform $(uname -s); refusing an unlocked build" >&2
+        echo "with-cargo-slot: unsupported platform $os; refusing an unlocked build" >&2
         exit 69
         ;;
 esac
+
+marker="$(mktemp "${TMPDIR:-/tmp}/with-cargo-slot.XXXXXX")"
+trap 'rm -f "$marker"' EXIT
+
+# The marker is written inside the lock and before exec, so it distinguishes "the
+# slot was busy" from "the command ran and chose this exit status". Without it a
+# command exiting 75 is indistinguishable from lockf's EX_TEMPFAIL, and a build
+# that genuinely failed would be silently retried in another slot.
+runner='printf ready > "$1"; shift; exec "$@"'
+
+try_slot() {
+    local path="$1"
+    shift
+    : > "$marker"
+    local status=0
+    set +e
+    case "$os" in
+        Darwin) lockf -k -s -t 0 "$path" /bin/sh -c "$runner" with-cargo-slot "$marker" "$@" ;;
+        Linux) flock -n "$path" /bin/sh -c "$runner" with-cargo-slot "$marker" "$@" ;;
+    esac
+    status=$?
+    set -e
+    if [[ -s "$marker" ]]; then
+        exit "$status"
+    fi
+    return 1
+}
+
+deadline=$(( $(date +%s) + timeout_seconds ))
+while :; do
+    slot=1
+    while [[ "$slot" -le "$slots" ]]; do
+        try_slot "$(slot_path "$slot")" "$@" || true
+        slot=$(( slot + 1 ))
+    done
+    if [[ "$(date +%s)" -ge "$deadline" ]]; then
+        break
+    fi
+    sleep $(( 1 + RANDOM % 3 ))
+done
+
+echo "with-cargo-slot: all $slots cargo slots busy after ${timeout_seconds}s; refusing an unlocked build" >&2
+exit 75

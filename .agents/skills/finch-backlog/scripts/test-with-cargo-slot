@@ -1,127 +1,156 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Regressions for the cargo build semaphore in with-cargo-slot.
+#
+# Run: .agents/skills/finch-backlog/scripts/test-with-cargo-slot
+# Needs no cargo, no rustc, and no network; every "build" here is a sleep.
+set -uo pipefail
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-wrapper="$script_dir/with-cargo-slot"
-fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch cargo slot [test].XXXXXX")"
-holder_pid=""
-holder_command_pid=""
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+under_test="${FINCH_CARGO_SLOT_UNDER_TEST:-$script_dir/with-cargo-slot}"
+failures=0
+this_repo="$(cd "$script_dir/../../../.." && pwd)"
 
-cleanup() {
-    if [[ -n "$holder_pid" ]]; then
-        kill "$holder_pid" 2>/dev/null || true
-        wait "$holder_pid" 2>/dev/null || true
-    fi
-    if [[ -n "$holder_command_pid" ]]; then
-        kill "$holder_command_pid" 2>/dev/null || true
-    fi
-    rm -rf "$fixture_root"
+fail() {
+    echo "FAIL: $*" >&2
+    failures=$(( failures + 1 ))
 }
-trap cleanup EXIT
 
-repo="$fixture_root/repo"
-worktree="$fixture_root/worktree"
-ready="$fixture_root/holder-ready"
-command_pid_file="$fixture_root/holder-command-pid"
-git init -q "$repo"
-printf 'fixture\n' >"$repo/README"
-git -C "$repo" add README
-git -C "$repo" -c user.name=Finch -c user.email=finch@example.invalid commit -qm fixture
-git -C "$repo" worktree add -q "$worktree" -b second-worktree
+new_repo() {
+    local dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/cargo-slot-test.XXXXXX")"
+    git -C "$dir" init --quiet
+    echo "$dir"
+}
 
-jobs="$(cd "$repo" && env -u CARGO_BUILD_JOBS "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
-if [[ "$jobs" != "2" ]]; then
-    echo "expected default CARGO_BUILD_JOBS=2, got $jobs" >&2
-    exit 1
+# A "build": announce presence, hold the slot, sample how many builds are live,
+# release. The peak sample is the observed concurrency, measured rather than
+# inferred from the lock implementation.
+holder='d="$1"; : > "$d/live/$2"; sleep 2; ls "$d/live" | wc -l | tr -d " " >> "$d/observed"; rm -f "$d/live/$2"'
+
+peak_concurrency() {
+    local slots="$1" workers="$2" repo obs i
+    repo="$(new_repo)"
+    mkdir -p "$repo/live"
+    : > "$repo/observed"
+    for (( i = 1; i <= workers; i++ )); do
+        (
+            cd "$repo" || exit 1
+            FINCH_CARGO_SLOTS="$slots" FINCH_CARGO_SLOT_TIMEOUT_SECONDS=90 \
+                "$under_test" /bin/sh -c "$holder" holder "$repo" "$i"
+        ) >/dev/null 2>&1 &
+    done
+    wait
+    obs="$(sort -rn "$repo/observed" 2>/dev/null | head -1)"
+    rm -rf "$repo"
+    echo "${obs:-0}"
+}
+
+echo "test_semaphore_admits_exactly_the_configured_slot_count"
+observed="$(peak_concurrency 2 5)"
+if [[ "$observed" != "2" ]]; then
+    fail "invariant: FINCH_CARGO_SLOTS=N must admit exactly N concurrent builds, no more and no fewer;" \
+         "5 workers against 2 slots reached a peak of $observed concurrent." \
+         "A peak of 1 means the wrapper is still a mutex and agents are serialized behind one rustc;" \
+         "a peak above 2 means the memory budget is unenforced."
 fi
 
-jobs="$(cd "$repo" && CARGO_BUILD_JOBS=1 "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
-if [[ "$jobs" != "1" ]]; then
-    echo "wrapper replaced an explicit CARGO_BUILD_JOBS value" >&2
-    exit 1
+echo "test_single_slot_still_serializes"
+observed="$(peak_concurrency 1 4)"
+if [[ "$observed" != "1" ]]; then
+    fail "invariant: FINCH_CARGO_SLOTS=1 must reproduce the historical mutex exactly;" \
+         "4 workers against 1 slot reached a peak of $observed concurrent."
 fi
 
-set +e
-(cd "$repo" && "$wrapper" sh -c 'exit 23')
+echo "test_command_exit_status_is_reported_not_mistaken_for_a_busy_slot"
+# 75 is lockf's EX_TEMPFAIL. A command that chooses 75 itself must be reported as
+# a finished failing build, never retried in the next slot as though the lock had
+# been unavailable.
+repo="$(new_repo)"
+attempts="$repo/attempts"
+: > "$attempts"
+(
+    cd "$repo" || exit 1
+    FINCH_CARGO_SLOTS=3 FINCH_CARGO_SLOT_TIMEOUT_SECONDS=10 \
+        "$under_test" /bin/sh -c 'echo x >> "$1"; exit 75' marker "$attempts"
+) >/dev/null 2>&1
 status=$?
-set -e
-if [[ $status -ne 23 ]]; then
-    echo "expected wrapped exit status 23, got $status" >&2
-    exit 1
+ran="$(wc -l < "$attempts" | tr -d ' ')"
+if [[ "$status" != "75" || "$ran" != "1" ]]; then
+    fail "invariant: a command's own exit status must survive the wrapper and must not be read as a busy slot;" \
+         "a command exiting 75 was run $ran time(s) and the wrapper returned $status." \
+         "Expected exactly 1 run and status 75; more than one run means EX_TEMPFAIL and a real build failure are conflated."
 fi
+rm -rf "$repo"
 
-(cd "$repo" && "$wrapper" sh -c 'touch "$1"; sleep 2' sh "$ready") &
-holder_pid=$!
-for _ in {1..100}; do
-    [[ -e "$ready" ]] && break
-    sleep 0.02
+echo "test_rustc_budget_is_held_constant_across_slot_counts"
+repo="$(new_repo)"
+for pair in "1 2" "2 1" "4 1"; do
+    set -- $pair
+    got="$( cd "$repo" && FINCH_CARGO_SLOTS="$1" "$under_test" /bin/sh -c 'echo "$CARGO_BUILD_JOBS"' j 2>/dev/null )"
+    if [[ "$got" != "$2" ]]; then
+        fail "invariant: slots x CARGO_BUILD_JOBS is the memory budget, so raising the slot count must lower jobs;" \
+             "FINCH_CARGO_SLOTS=$1 produced CARGO_BUILD_JOBS=$got, expected $2." \
+             "One rustc peaks near 3 GB on the finch crate, so a product above 2 swaps a 16 GB host."
+    fi
 done
-if [[ ! -e "$ready" ]]; then
-    echo "lock holder did not start" >&2
-    exit 1
+got="$( cd "$repo" && FINCH_CARGO_SLOTS=2 CARGO_BUILD_JOBS=7 "$under_test" /bin/sh -c 'echo "$CARGO_BUILD_JOBS"' j 2>/dev/null )"
+if [[ "$got" != "7" ]]; then
+    fail "invariant: an explicit CARGO_BUILD_JOBS from the caller must win over the derived default; got '$got', expected 7."
 fi
+rm -rf "$repo"
 
-if (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true); then
-    echo "a second worktree acquired the repository-wide slot concurrently" >&2
-    exit 1
+echo "test_slot_one_interlocks_with_the_previous_single_lock_version"
+# During a rollout, an agent still running the pre-semaphore script must contend
+# with this one. Slot 1 therefore has to keep the historical lock path.
+repo="$(new_repo)"
+previous="$repo/with-cargo-slot.previous"
+if git -C "$this_repo" show "main:.agents/skills/finch-backlog/scripts/with-cargo-slot" > "$previous" 2>/dev/null; then
+    chmod +x "$previous"
+    mkdir -p "$repo/live"
+    : > "$repo/observed"
+    ( cd "$repo" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=90 "$previous" /bin/sh -c "$holder" h "$repo" old ) >/dev/null 2>&1 &
+    sleep 0.4
+    ( cd "$repo" && FINCH_CARGO_SLOTS=1 FINCH_CARGO_SLOT_TIMEOUT_SECONDS=90 "$under_test" /bin/sh -c "$holder" h "$repo" new ) >/dev/null 2>&1 &
+    wait
+    observed="$(sort -rn "$repo/observed" | head -1)"
+    if [[ "$observed" != "1" ]]; then
+        fail "invariant: slot 1 must use the historical lock path so a process running the previous single-lock" \
+             "version of this script still contends with this one; peak concurrency across versions was $observed, expected 1."
+    fi
+else
+    echo "  skipped: main:.agents/skills/finch-backlog/scripts/with-cargo-slot is not readable from $this_repo"
 fi
+rm -rf "$repo"
 
-wait "$holder_pid"
-holder_pid=""
-(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true)
-
-# A killed wrapped command must release the kernel-owned slot without leaving a
-# stale lock file that excludes later work.
-rm -f "$ready" "$command_pid_file"
-(cd "$repo" && "$wrapper" sh -c 'printf %s "$$" >"$1"; touch "$2"; exec sleep 30' sh "$command_pid_file" "$ready") &
-holder_pid=$!
-for _ in {1..100}; do
-    [[ -s "$command_pid_file" && -e "$ready" ]] && break
-    sleep 0.02
-done
-if [[ ! -s "$command_pid_file" || ! -e "$ready" ]]; then
-    echo "crash-recovery lock holder did not start" >&2
-    exit 1
-fi
-holder_command_pid="$(<"$command_pid_file")"
-kill "$holder_command_pid"
-set +e
-wait "$holder_pid"
-set -e
-holder_pid=""
-holder_command_pid=""
-(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true)
-
-# Resolve the current platform normally but hide its required lock utility.
-# Keeping only explicit symlinks also proves the wrapper does not silently fall
-# through to some other locking mechanism.
-no_lock_bin="$fixture_root/no-lock-bin"
-mkdir "$no_lock_bin"
-ln -s "$(command -v bash)" "$no_lock_bin/bash"
-ln -s "$(command -v git)" "$no_lock_bin/git"
-ln -s "$(command -v uname)" "$no_lock_bin/uname"
-set +e
-(cd "$repo" && PATH="$no_lock_bin" /bin/bash "$wrapper" true >/dev/null 2>&1)
+echo "test_every_slot_busy_fails_closed_rather_than_building_unlocked"
+repo="$(new_repo)"
+mkdir -p "$repo/live"
+: > "$repo/observed"
+( cd "$repo" && FINCH_CARGO_SLOTS=1 FINCH_CARGO_SLOT_TIMEOUT_SECONDS=90 "$under_test" /bin/sh -c 'sleep 4' h ) >/dev/null 2>&1 &
+sleep 0.5
+out="$( cd "$repo" && FINCH_CARGO_SLOTS=1 FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$under_test" /bin/sh -c 'echo RAN_UNLOCKED' h 2>&1 )"
 status=$?
-set -e
-if [[ $status -ne 69 ]]; then
-    echo "expected missing lock utility to fail closed with status 69, got $status" >&2
-    exit 1
+wait
+if [[ "$status" == "0" || "$out" == *RAN_UNLOCKED* ]]; then
+    fail "invariant: when no slot frees before the timeout the wrapper must refuse, never run the build unlocked;" \
+         "exit=$status output='$out'."
 fi
+rm -rf "$repo"
 
-unsupported_bin="$fixture_root/unsupported-bin"
-mkdir "$unsupported_bin"
-ln -s "$(command -v bash)" "$unsupported_bin/bash"
-ln -s "$(command -v git)" "$unsupported_bin/git"
-printf '#!/usr/bin/env bash\nprintf "Plan9\\n"\n' >"$unsupported_bin/uname"
-chmod +x "$unsupported_bin/uname"
-set +e
-(cd "$repo" && PATH="$unsupported_bin" /bin/bash "$wrapper" true >/dev/null 2>&1)
+echo "test_invalid_slot_count_is_refused"
+repo="$(new_repo)"
+out="$( cd "$repo" && FINCH_CARGO_SLOTS=0 "$under_test" /bin/sh -c 'echo RAN' h 2>&1 )"
 status=$?
-set -e
-if [[ $status -ne 69 ]]; then
-    echo "expected unsupported platform to fail closed with status 69, got $status" >&2
-    exit 1
+if [[ "$status" != "64" || "$out" == *RAN* ]]; then
+    fail "invariant: an unusable FINCH_CARGO_SLOTS must be refused with a usage error, not defaulted;" \
+         "FINCH_CARGO_SLOTS=0 gave exit=$status output='$out', expected exit 64 and no run."
 fi
+rm -rf "$repo"
 
-echo "with-cargo-slot regression passed"
+echo
+if [[ "$failures" -eq 0 ]]; then
+    echo "with-cargo-slot: all tests passed"
+    exit 0
+fi
+echo "with-cargo-slot: $failures test(s) failed"
+exit 1
