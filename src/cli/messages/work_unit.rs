@@ -716,7 +716,7 @@ impl Message for WorkUnit {
             }
             WorkUnitPresentation::Assistant => (
                 TranscriptRowKind::Response,
-                "Assistant response".to_string(),
+                assistant_prose_glyph(inner.status).to_string(),
                 lines(&inner.response_text),
                 true,
             ),
@@ -733,8 +733,12 @@ impl Message for WorkUnit {
                 TranscriptRowKind::Program,
                 format!("Program source ({language})"),
                 lines(&inner.response_text),
-                inner.status == MessageStatus::InProgress
-                    || inner.response_text.lines().count() <= 3,
+                // A generated program that ran successfully is implementation
+                // detail: collapse it whatever its length, including one-line
+                // `(say ...)` programs. Source that is still streaming stays
+                // visible so it does not look eaten, and a failed program stays
+                // expanded so the failure remains actionable.
+                inner.status != MessageStatus::Complete,
             ),
             WorkUnitPresentation::ProgramOutput { title } => (
                 TranscriptRowKind::Output,
@@ -838,6 +842,19 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
             &inner.presentation,
             WorkUnitPresentation::ProgramOutput { title: Some(_) }
         )
+}
+
+/// Compact activity glyph standing in for a plain assistant prose row.
+///
+/// The row's own words are the content; a literal `Assistant response` label
+/// named Finch's message plumbing rather than anything the assistant said, so
+/// a simple turn read as program internals instead of prose (#350). Hollow
+/// while the turn is still arriving, filled once it is terminal.
+fn assistant_prose_glyph(status: MessageStatus) -> &'static str {
+    match status {
+        MessageStatus::InProgress => "\u{25cb}",
+        MessageStatus::Complete | MessageStatus::Failed => "\u{23fa}",
+    }
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -1616,6 +1633,75 @@ mod tests {
         assert_eq!(canonical.matches("catalog validation failed").count(), 2);
         assert!(canonical.contains("Speculative run 1234 · status"));
         assert!(canonical.contains("result"));
+    }
+
+    #[test]
+    fn test_assistant_prose_projects_status_glyph_without_placeholder_label() {
+        let unit = WorkUnit::new("Channeling");
+        unit.append_response("partial prose");
+
+        let pending = unit.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            pending.kind,
+            TranscriptRowKind::Response,
+            "invariant: a plain assistant turn projects as a Response row; \
+             projected row: {pending:?}"
+        );
+        assert_eq!(
+            pending.label, "\u{25cb}",
+            "invariant: a pending assistant prose row is labelled with the compact \
+             hollow activity glyph, not the internal `Assistant response` \
+             placeholder (#350); projected row: {pending:?}"
+        );
+
+        unit.set_complete();
+        let completed = unit.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            completed.label, "\u{23fa}",
+            "invariant: a completed assistant prose row is labelled with the \
+             corresponding filled glyph; projected row: {completed:?}"
+        );
+        assert_eq!(
+            completed.body,
+            vec!["partial prose".to_string()],
+            "invariant: the assistant's own words remain the row body and are not \
+             duplicated into the label; projected row: {completed:?}"
+        );
+    }
+
+    #[test]
+    fn test_successful_program_source_collapses_while_failure_and_stream_expand() {
+        let succeeded = WorkUnit::new("program");
+        succeeded.set_program_source("lisp");
+        succeeded.set_response("(say \"hi\")");
+        succeeded.set_complete();
+        let projected = succeeded.transcript_row(&colors()).unwrap();
+        assert!(
+            !projected.default_expanded,
+            "invariant: successful generated program source defaults collapsed, \
+             including one-line `(say ...)` programs (#350); projected row: {projected:?}"
+        );
+
+        let failed = WorkUnit::new("program");
+        failed.set_program_source("lisp");
+        failed.set_response("(say \"hi\")");
+        failed.set_failed();
+        let projected = failed.transcript_row(&colors()).unwrap();
+        assert!(
+            projected.default_expanded,
+            "invariant: a failed generated program stays expanded and actionable; \
+             projected row: {projected:?}"
+        );
+
+        let streaming = WorkUnit::new("program");
+        streaming.set_program_source("lisp");
+        streaming.append_response("(say ");
+        let projected = streaming.transcript_row(&colors()).unwrap();
+        assert!(
+            projected.default_expanded,
+            "invariant: in-flight wire source stays visible while it streams; \
+             projected row: {projected:?}"
+        );
     }
 
     #[test]

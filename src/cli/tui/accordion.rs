@@ -408,6 +408,150 @@ mod tests {
     }
 
     #[test]
+    fn test_completed_assistant_prose_renders_without_implementation_label() {
+        let work = Arc::new(WorkUnit::new("Channeling"));
+        work.set_response("Hello, Shammah! How can I help you today?");
+        work.set_complete();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Assistant response")),
+            "invariant: a plain assistant turn is projected as the assistant's prose, \
+             never as Finch's internal `Assistant response` placeholder (#350); \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].contains('\u{23fa}'),
+            "invariant: a completed assistant prose row carries the filled activity \
+             glyph; header was {:?}; rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Hello, Shammah! How can I help you today?")),
+            "invariant: the assistant's own words stay visible by default; \
+             rendered transcript:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn test_pending_assistant_prose_uses_hollow_activity_glyph() {
+        let work = Arc::new(WorkUnit::new("Channeling"));
+        work.append_response("Hello, Sha");
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Assistant response")),
+            "invariant: a pending assistant prose row shows a compact activity glyph, \
+             not the internal `Assistant response` placeholder (#350); \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].contains('\u{25cb}') && !rendered[0].contains('\u{23fa}'),
+            "invariant: a pending assistant prose row uses the hollow glyph and the \
+             filled glyph is reserved for the completed row; header was {:?}; \
+             rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+    }
+
+    #[test]
+    fn test_successful_one_line_program_source_collapses_but_stays_inspectable() {
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("lisp");
+        work.set_response("(say \"Hello, Shammah!\")");
+        work.set_complete();
+        let message: MessageRef = work.clone();
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert_eq!(
+            rendered.len(),
+            1,
+            "invariant: a successfully executed one-line generated program collapses to \
+             a single disclosure row instead of stacking its source (#350); \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            !transcript.contains("(say"),
+            "invariant: successful program source is implementation detail behind the \
+             disclosure control; rendered transcript:\n{transcript}"
+        );
+
+        let expanded = state
+            .render_message_fully_expanded(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            expanded.contains("(say \"Hello, Shammah!\")"),
+            "invariant: the exact program source stays inspectable through disclosure; \
+             expanded transcript:\n{expanded}"
+        );
+        let canonical = work.complete_transcript(&colors);
+        assert!(
+            canonical.contains("(say \"Hello, Shammah!\")"),
+            "invariant: presentation-only collapsing never removes source from the \
+             canonical transcript; canonical transcript:\n{canonical}"
+        );
+    }
+
+    #[test]
+    fn test_failed_program_source_stays_expanded_and_actionable() {
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("lisp");
+        work.set_response("(say \"boom\")");
+        work.set_failed();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert!(
+            transcript.contains("(say \"boom\")"),
+            "invariant: a failed generated program stays source-oriented and expanded so \
+             the failure is actionable (#350); rendered transcript:\n{transcript}"
+        );
+    }
+
+    #[test]
     fn test_semantic_defaults_collapse_long_completed_source_but_not_output() {
         let source = Arc::new(WorkUnit::new("program"));
         source.set_program_source("forth");
