@@ -15,7 +15,7 @@
   ],
   "workflows": {
     "ci.yml": {
-      "digest": "41d618bd39c8068fd3adbd187ea280f893fd7b8a3fd1ab35f6da6237f26972c2",
+      "digest": "a646ee6ba74795904a0fc50f59104ee521b382673bd7821cedb32752b74552f7",
       "activated_fixtures": [
         "brain_effect",
         "manifest_dependency",

@@ -218,6 +218,9 @@ jobs:
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
 
+    - name: Prove repository aliases cannot intercept the audit executable
+      run: python3 scripts/test_cargo_audit_contract.py
+
     - name: Verify resolved HTTP dependency contract
       run: |
         cargo generate-lockfile
@@ -247,18 +250,23 @@ jobs:
     - name: Prove the quick-xml floor excludes both historical advisories
       shell: bash
       run: |
-        cargo tree --invert quick-xml --edges normal,build,dev --prefix none --format '{p}' \
+        cargo tree --all-features --target all --invert quick-xml \
+          --edges normal,build,dev --prefix none --format '{p}' \
           | sort -u | tee quick-xml-tree.txt
         printf '%s\n' \
           'RUSTSEC-2026-0194 is excluded by quick-xml >= 0.41.0' \
           'RUSTSEC-2026-0195 is excluded by quick-xml >= 0.41.0'
         minimum=0.41.0
-        found=$(sed -n 's/^quick-xml v\([0-9][0-9.]*\).*/\1/p' quick-xml-tree.txt | sort -u)
+        found=$(sed -n 's/^quick-xml v\([^ ]*\)$/\1/p' quick-xml-tree.txt | sort -u)
         if [[ -z "$found" ]]; then
           echo 'no quick-xml in the graph; the advisory assertion would be vacuous' >&2
           exit 1
         fi
         for version in $found; do
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "quick-xml has a non-stable or malformed version '$version'; cannot prove the fixed floor" >&2
+            exit 1
+          fi
           oldest=$(printf '%s\n%s\n' "$version" "$minimum" | sort -V | head -n1)
           if [[ "$oldest" == "$version" && "$version" != "$minimum" ]]; then
             echo "quick-xml $version is below the fixed $minimum and is still reachable" >&2
@@ -267,46 +275,5 @@ jobs:
           echo "quick-xml $version is at or above the fixed $minimum"
         done
 
-    - name: Run the one full Cargo audit and retain named advisory diagnostics
-      shell: bash
-      run: |
-        set +e
-        cargo audit --json > audit.json
-        audit_status=$?
-        set -e
-        if (( audit_status != 0 && audit_status != 1 )); then
-          echo "cargo-audit exited unexpectedly with status ${audit_status}" >&2
-          exit 1
-        fi
-        if [[ ! -s audit.json ]]; then
-          echo 'cargo-audit did not produce a non-empty JSON report' >&2
-          exit 1
-        fi
-        audit_bytes=$(wc -c < audit.json)
-        if (( audit_bytes > 10485760 )); then
-          echo "cargo-audit JSON exceeded the 10 MiB inspection bound: ${audit_bytes}" >&2
-          exit 1
-        fi
-        if ! jq -e 'type == "object" and (.vulnerabilities.list | type == "array")' audit.json >/dev/null; then
-          echo 'cargo-audit JSON did not contain the expected vulnerabilities list' >&2
-          exit 1
-        fi
-        jq -r '.vulnerabilities.list[]? | [.advisory.id, .package.name, .package.version] | @tsv' audit.json
-        jq -e '
-          [.vulnerabilities.list[]?]
-          | all(
-              .advisory.id != "RUSTSEC-2026-0194"
-              and .advisory.id != "RUSTSEC-2026-0195"
-              and .advisory.id != "RUSTSEC-2026-0154"
-              and .advisory.id != "RUSTSEC-2026-0153"
-              and .advisory.id != "RUSTSEC-2023-0071"
-              and .package.name != "rsa"
-              and .package.name != "russh"
-              and .package.name != "russh-cryptovec"
-              and .package.name != "russh-keys"
-            )
-        ' audit.json
-        if (( audit_status != 0 )); then
-          echo 'cargo audit found advisories outside the five permanent focused guards' >&2
-          exit "$audit_status"
-        fi
+    - name: Run the one full Cargo audit through the exact installed executable
+      run: python3 scripts/check_cargo_audit_contract.py

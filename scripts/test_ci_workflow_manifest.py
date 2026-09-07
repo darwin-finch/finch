@@ -154,10 +154,100 @@ class WorkflowManifestMutationTests(unittest.TestCase):
         finally:
             repository.close()
 
+    def test_duplicate_job_mapping_key_is_rejected_with_location(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace(
+                "ci.yml",
+                "    runs-on: ubuntu-24.04\n",
+                "    runs-on: ubuntu-24.04\n    runs-on: macos-14\n",
+            )
+            self.assert_rejected(repository, "ci.yml", "duplicate mapping key 'runs-on'", "line")
+        finally:
+            repository.close()
+
+    def test_duplicate_matrix_mapping_key_is_rejected_with_location(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace(
+                "repository-hygiene.yml",
+                "        os: [ubuntu-24.04, macos-14]\n",
+                "        os: [ubuntu-24.04, macos-14]\n        os: [ubuntu-24.04]\n",
+            )
+            self.assert_rejected(
+                repository, "repository-hygiene.yml", "duplicate mapping key 'os'", "line"
+            )
+        finally:
+            repository.close()
+
+    def test_duplicate_step_mapping_key_is_rejected_with_location(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace(
+                "repository-hygiene.yml",
+                "      - uses: actions/checkout@v4\n",
+                "      - uses: actions/checkout@v4\n        uses: actions/checkout@v3\n",
+            )
+            self.assert_rejected(
+                repository, "repository-hygiene.yml", "duplicate mapping key 'uses'", "line"
+            )
+        finally:
+            repository.close()
+
     def test_trigger_change_is_digest_rejected(self) -> None:
         repository = WorkflowRepository()
         try:
             repository.replace("ci.yml", "  pull_request:\n", "  pull_request_target:\n")
+            self.assert_rejected(repository, "ci.yml", "semantic digest changed")
+        finally:
+            repository.close()
+
+    def test_existing_root_environment_change_is_digest_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace("ci.yml", "  CARGO_BUILD_JOBS: 1\n", "  CARGO_BUILD_JOBS: 2\n")
+            self.assert_rejected(repository, "ci.yml", "semantic digest changed")
+        finally:
+            repository.close()
+
+    def test_existing_concurrency_change_is_digest_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace(
+                "issue-56-brain-isolation.yml",
+                "  cancel-in-progress: true\n",
+                "  cancel-in-progress: false\n",
+            )
+            self.assert_rejected(
+                repository, "issue-56-brain-isolation.yml", "semantic digest changed"
+            )
+        finally:
+            repository.close()
+
+    def test_existing_timeout_change_is_digest_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace(
+                "repository-hygiene.yml", "    timeout-minutes: 5\n", "    timeout-minutes: 6\n"
+            )
+            self.assert_rejected(repository, "repository-hygiene.yml", "semantic digest changed")
+        finally:
+            repository.close()
+
+    def test_existing_runner_change_is_digest_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace("ci.yml", "    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n")
+            self.assert_rejected(repository, "ci.yml", "semantic digest changed")
+        finally:
+            repository.close()
+
+    def test_existing_action_version_change_is_digest_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            repository.replace(
+                "ci.yml", "      uses: actions/checkout@v4\n", "      uses: actions/checkout@v3\n"
+            )
             self.assert_rejected(repository, "ci.yml", "semantic digest changed")
         finally:
             repository.close()
@@ -297,6 +387,56 @@ class WorkflowManifestMutationTests(unittest.TestCase):
             manifest["unreviewed_override"] = True
             repository.write_manifest(manifest)
             self.assert_rejected(repository, "root keys changed", "unreviewed_override")
+        finally:
+            repository.close()
+
+    def test_missing_schema_version_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            manifest = repository.manifest()
+            del manifest["schema"]
+            repository.write_manifest(manifest)
+            self.assert_rejected(repository, "root keys changed", "schema")
+        finally:
+            repository.close()
+
+    def test_wrong_schema_version_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            manifest = repository.manifest()
+            manifest["schema"] = "finch-ci-workflow-manifest:v2"
+            repository.write_manifest(manifest)
+            self.assert_rejected(repository, "schema must be", "v2")
+        finally:
+            repository.close()
+
+    def test_non_string_schema_version_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            manifest = repository.manifest()
+            manifest["schema"] = 1
+            repository.write_manifest(manifest)
+            self.assert_rejected(repository, "schema must be", "1")
+        finally:
+            repository.close()
+
+    def test_non_object_workflow_record_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            manifest = repository.manifest()
+            manifest["workflows"]["ci.yml"] = "not-an-object"
+            repository.write_manifest(manifest)
+            self.assert_rejected(repository, "ci.yml", "must be an object")
+        finally:
+            repository.close()
+
+    def test_non_string_workflow_digest_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            manifest = repository.manifest()
+            manifest["workflows"]["ci.yml"]["digest"] = 42
+            repository.write_manifest(manifest)
+            self.assert_rejected(repository, "ci.yml", "invalid SHA-256 digest", "42")
         finally:
             repository.close()
 
