@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import re
 import sys
@@ -31,10 +32,12 @@ class Fixture:
     expected: frozenset[str]
 
 
-def job(workflow: str, name: str, **matrix: str) -> str:
+def job(workflow: str, name: str, row: int | None = None, **matrix: str) -> str:
     suffix = ""
-    if matrix:
-        suffix = "[" + ",".join(f"{key}={matrix[key]}" for key in sorted(matrix)) + "]"
+    if row is not None:
+        fields = [f"row={row}"]
+        fields.extend(f"{key}={matrix[key]}" for key in sorted(matrix))
+        suffix = "[" + ",".join(fields) + "]"
     return f"{workflow}::{name}{suffix}"
 
 
@@ -44,18 +47,21 @@ CI = frozenset(
         job("ci.yml", "windows-format-contract"),
         job("ci.yml", "runtime-authority"),
         job("ci.yml", "security"),
-        *(job("ci.yml", "test", os=os, feature_name=feature) for os in ("ubuntu-24.04", "macos-14") for feature in ("default", "no-default-features")),
-        job("ci.yml", "build", os="ubuntu-24.04", target="x86_64-unknown-linux-gnu"),
-        job("ci.yml", "build", os="macos-14", target="aarch64-apple-darwin"),
+        job("ci.yml", "test", row=0, os="ubuntu-24.04", feature_name="default", cargo_args=""),
+        job("ci.yml", "test", row=1, os="ubuntu-24.04", feature_name="no-default-features", cargo_args="--no-default-features"),
+        job("ci.yml", "test", row=2, os="macos-14", feature_name="default", cargo_args=""),
+        job("ci.yml", "test", row=3, os="macos-14", feature_name="no-default-features", cargo_args="--no-default-features"),
+        job("ci.yml", "build", row=0, os="ubuntu-24.04", target="x86_64-unknown-linux-gnu"),
+        job("ci.yml", "build", row=1, os="macos-14", target="aarch64-apple-darwin"),
     }
 )
 BRAIN = frozenset(
-    job("issue-56-brain-isolation.yml", "isolation-boundaries", os=os)
-    for os in ("ubuntu-24.04", "macos-14")
+    job("issue-56-brain-isolation.yml", "isolation-boundaries", row=row, os=os)
+    for row, os in enumerate(("ubuntu-24.04", "macos-14"))
 )
 HYGIENE = frozenset(
-    job("repository-hygiene.yml", "tracked-tree", os=os)
-    for os in ("ubuntu-24.04", "macos-14")
+    job("repository-hygiene.yml", "tracked-tree", row=row, os=os)
+    for row, os in enumerate(("ubuntu-24.04", "macos-14"))
 )
 EFFECT = frozenset({job("issue-163-effect-audit.yml", "effect-audit")})
 DOCS = frozenset({job("docs.yml", "current-docs")})
@@ -65,7 +71,7 @@ OAUTH_105 = frozenset(
 AUTH_201 = frozenset(
     {
         job("issue-201-chatgpt-auth.yml", "windows-verifier-compile"),
-        *(job("issue-201-chatgpt-auth.yml", "focused-auth", os=os) for os in ("ubuntu-24.04", "macos-14")),
+        *(job("issue-201-chatgpt-auth.yml", "focused-auth", row=row, os=os) for row, os in enumerate(("ubuntu-24.04", "macos-14"))),
     }
 )
 
@@ -106,6 +112,120 @@ FIXTURES = (
         CI | HYGIENE,
     ),
 )
+
+REQUIRED_PR_EVENT_TYPES = {"opened", "reopened", "synchronize"}
+CANONICAL_JOB_WORKFLOWS = {
+    "ci.yml",
+    "issue-56-brain-isolation.yml",
+    "issue-163-effect-audit.yml",
+    "repository-hygiene.yml",
+}
+STEP_CONTRACTS = {
+    ("ci.yml", "security", "Install cargo-audit"): (
+        None,
+        None,
+        "188b5f08be3448fb097738a6932e476d72c2be5ad765135c1bfdcdf2f65e397b",
+    ),
+    (
+        "ci.yml",
+        "security",
+        "Prove removed SSH and RSA packages stay out of the resolved graph",
+    ): (
+        None,
+        None,
+        "02dbc02d5f567d0c871979ef5c7db47888d6313e0e13ffdf13d4cb43a00ecc7a",
+    ),
+    ("ci.yml", "security", "Prove the quick-xml floor excludes both historical advisories"): (
+        None,
+        None,
+        "0fcfd2876aa0f81253a1375ee794e0109b80022821f228abd959567f80cf930d",
+    ),
+    (
+        "ci.yml",
+        "security",
+        "Run the one full Cargo audit and retain named advisory diagnostics",
+    ): (
+        None,
+        None,
+        "ab79352de7d6a3b55bb297401ad15bb5f0958d58038174f3cf9505d3110578f8",
+    ),
+    ("ci.yml", "security", "Detect manifest and public-API changes"): (
+        "security-paths",
+        None,
+        "41bb9c34ef3419caa50bfa498cb7728f1ac9bf68a6b146334dcc99e1ba1bfdeb",
+    ),
+    (
+        "ci.yml",
+        "security",
+        "Install Cap'n Proto for the downstream removed-API probe",
+    ): (
+        None,
+        "steps.security-paths.outputs.removed_ssh_api == 'true'",
+        "e28080565f920b77a6cd1496403ceabe68e8b69de9e8c7d0ca479253ff76d7a8",
+    ),
+    (
+        "ci.yml",
+        "security",
+        "Compile downstream positive controls and require removed-API diagnostics",
+    ): (
+        None,
+        "steps.security-paths.outputs.removed_ssh_api == 'true'",
+        "bb32ab2e21e5d905480b04b3c8ec58f9c930d7493ecc091b84a9f2f099d75b65",
+    ),
+    ("repository-hygiene.yml", "tracked-tree", "Install workflow parser"): (
+        None,
+        None,
+        "98c37f93dd1883bfd9a5b1503c6dfdbaf6426a03200f484df880f2552d9c7ca3",
+    ),
+    ("repository-hygiene.yml", "tracked-tree", "Check the current tracked tree"): (
+        None,
+        None,
+        "de4214bf756c6e08d0e4afd810f29a49df948fb283c5116ff63960dbee838f74",
+    ),
+    ("repository-hygiene.yml", "tracked-tree", "Run repository hygiene regressions"): (
+        None,
+        None,
+        "0c275c736f4b45ff7bb6ab20e37b0b2568808bb3479329ccb4cbcfb4f8959067",
+    ),
+    (
+        "repository-hygiene.yml",
+        "tracked-tree",
+        "Reject restoration of the removed SSH surface",
+    ): (
+        None,
+        None,
+        "5e0b3034d9604333239df0a694f1c5f7b3dd461b6ee261a8c9935103720448a5",
+    ),
+    ("repository-hygiene.yml", "tracked-tree", "Run removed SSH surface regressions"): (
+        None,
+        None,
+        "68bb4534a4a312eaa3bcbc737f01f59cad1e81933546a6d7f9e5cf91473ca4fb",
+    ),
+    ("repository-hygiene.yml", "tracked-tree", "Check pull-request workflow fan-out"): (
+        None,
+        None,
+        "ee20773994b002b6bc4f51fbee99963d555b56e1004e940567fa30e61ce9f66a",
+    ),
+    (
+        "repository-hygiene.yml",
+        "tracked-tree",
+        "Run workflow fan-out mutation regressions",
+    ): (
+        None,
+        None,
+        "2a4393c20469ccce3439568a72b3806077ff52dde1edd1c6cd64929dacd1688a",
+    ),
+}
+EXPLICIT_BASH_STEPS = {
+    ("ci.yml", "security", "Prove removed SSH and RSA packages stay out of the resolved graph"),
+    ("ci.yml", "security", "Prove the quick-xml floor excludes both historical advisories"),
+    (
+        "ci.yml",
+        "security",
+        "Run the one full Cargo audit and retain named advisory diagnostics",
+    ),
+    ("ci.yml", "security", "Detect manifest and public-API changes"),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,6 +302,9 @@ def workflow_activates(workflow: dict[str, Any], changed: tuple[str, ...]) -> bo
         return False
     if not isinstance(trigger, dict):
         raise ValueError("pull_request trigger must be a mapping or null")
+    event_types = string_list(trigger.get("types"))
+    if "types" in trigger and "synchronize" not in event_types:
+        return False
     branches = string_list(trigger.get("branches"))
     if branches and not matches_patterns("main", branches):
         return False
@@ -234,6 +357,11 @@ def matrix_rows(job_definition: dict[str, Any]) -> list[dict[str, str]]:
     return rows or [{}]
 
 
+def has_matrix(job_definition: dict[str, Any]) -> bool:
+    strategy = job_definition.get("strategy")
+    return isinstance(strategy, dict) and isinstance(strategy.get("matrix"), dict)
+
+
 def active_jobs(workflow_name: str, workflow: dict[str, Any]) -> set[str]:
     jobs = workflow.get("jobs")
     if not isinstance(jobs, dict):
@@ -242,11 +370,18 @@ def active_jobs(workflow_name: str, workflow: dict[str, Any]) -> set[str]:
     for job_name, definition in jobs.items():
         if not isinstance(definition, dict):
             raise ValueError(f"{workflow_name}::{job_name}: job must be a mapping")
-        if inert(definition.get("if")):
+        if definition.get("if") is not None:
             continue
-        for row in matrix_rows(definition):
-            visible = {key: value for key, value in row.items() if not key.endswith("_args") and key not in {"probe_args"}}
-            expanded.add(job(workflow_name, str(job_name), **visible))
+        rows = matrix_rows(definition)
+        for row_number, matrix in enumerate(rows):
+            expanded.add(
+                job(
+                    workflow_name,
+                    str(job_name),
+                    row=row_number if has_matrix(definition) else None,
+                    **matrix,
+                )
+            )
     return expanded
 
 
@@ -258,6 +393,15 @@ def active_steps(definition: dict[str, Any]) -> list[dict[str, Any]]:
 def all_run_text(definition: dict[str, Any]) -> str:
     lines = "\n".join(str(step.get("run", "")) for step in active_steps(definition))
     return "\n".join(line for line in lines.splitlines() if not line.lstrip().startswith("#"))
+
+
+def normalized_run(step: dict[str, Any]) -> str:
+    run = str(step.get("run", ""))
+    return "\n".join(line.rstrip() for line in run.strip().splitlines())
+
+
+def run_digest(step: dict[str, Any]) -> str:
+    return hashlib.sha256(normalized_run(step).encode("utf-8")).hexdigest()
 
 
 def full_audit_jobs(workflows: dict[str, dict[str, Any]], active: set[str]) -> list[str]:
@@ -276,19 +420,140 @@ def validate_contract(root: Path) -> list[str]:
     workflow_dir = root / WORKFLOWS
     workflows: dict[str, dict[str, Any]] = {}
     try:
-        for path in sorted(workflow_dir.glob("*.yml")):
+        paths = sorted((*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")))
+        for path in paths:
             workflows[path.name] = load_workflow(path)
     except ValueError as error:
         return [str(error)]
 
-    for name in ("issue-185-spreadsheet-advisories.yml", "issue-186-ssh-removal.yml"):
-        if name in workflows:
+    for stem in ("issue-185-spreadsheet-advisories", "issue-186-ssh-removal"):
+        for suffix in (".yml", ".yaml"):
+            name = stem + suffix
+            if name not in workflows:
+                continue
             trigger = pull_request_trigger(workflows[name])
             trigger_detail = "no pull_request trigger" if trigger is None else repr(trigger)
             errors.append(
                 f"{name}: retired closed-issue workflow returned; permanent guards belong in "
                 f"canonical CI/repository hygiene (pull_request={trigger_detail})"
             )
+
+    for name, workflow in workflows.items():
+        trigger = pull_request_trigger(workflow)
+        if not isinstance(trigger, dict):
+            continue
+        event_types = set(string_list(trigger.get("types")))
+        if "types" in trigger and not REQUIRED_PR_EVENT_TYPES <= event_types:
+            missing = sorted(REQUIRED_PR_EVENT_TYPES - event_types)
+            errors.append(
+                f"{name}: pull_request.types={sorted(event_types)} omits required PR "
+                f"activation types {missing}"
+            )
+        if name in CANONICAL_JOB_WORKFLOWS and "types" in trigger:
+            errors.append(
+                f"{name}: canonical pull_request trigger must omit types so opened, "
+                "reopened, and synchronize remain enabled"
+            )
+
+    expected_triggers = {
+        "ci.yml": {"branches": ["main"]},
+        "repository-hygiene.yml": {},
+    }
+    for name, expected_trigger in expected_triggers.items():
+        actual_trigger = pull_request_trigger(workflows.get(name, {}))
+        if actual_trigger != expected_trigger:
+            errors.append(
+                f"{name}: canonical pull_request trigger changed; "
+                f"expected={expected_trigger!r}, actual={actual_trigger!r}"
+            )
+
+    for name in CANONICAL_JOB_WORKFLOWS:
+        workflow = workflows.get(name, {})
+        jobs = workflow.get("jobs", {}) if isinstance(workflow, dict) else {}
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, definition in jobs.items():
+            if isinstance(definition, dict) and definition.get("if") is not None:
+                errors.append(
+                    f"{name}::{job_name}: canonical job-level if is unsupported; "
+                    f"found {definition.get('if')!r}, expected no condition"
+                )
+
+    for (workflow_name, job_name, step_name), contract in STEP_CONTRACTS.items():
+        expected_id, expected_if, expected_digest = contract
+        workflow = workflows.get(workflow_name, {})
+        jobs = workflow.get("jobs", {}) if isinstance(workflow, dict) else {}
+        definition = jobs.get(job_name, {}) if isinstance(jobs, dict) else {}
+        steps = definition.get("steps", []) if isinstance(definition, dict) else []
+        matches = [
+            step
+            for step in steps
+            if isinstance(step, dict) and step.get("name") == step_name
+        ]
+        location = f"{workflow_name}::{job_name}::{step_name}"
+        if len(matches) != 1:
+            errors.append(
+                f"{location}: expected exactly one critical step, found {len(matches)}"
+            )
+            continue
+        step = matches[0]
+        actual_id = step.get("id")
+        if actual_id != expected_id:
+            errors.append(
+                f"{location}: id changed; expected={expected_id!r}, actual={actual_id!r}"
+            )
+        actual_if = step.get("if")
+        if actual_if != expected_if:
+            errors.append(
+                f"{location}: condition changed; expected={expected_if!r}, "
+                f"actual={actual_if!r}; inverted, constant-false, and push-only "
+                "conditions are unsupported"
+            )
+        expected_shell = "bash" if (workflow_name, job_name, step_name) in EXPLICIT_BASH_STEPS else None
+        actual_shell = step.get("shell")
+        if actual_shell != expected_shell:
+            errors.append(
+                f"{location}: shell changed; expected={expected_shell!r}, "
+                f"actual={actual_shell!r}"
+            )
+        if step.get("continue-on-error") is not None:
+            errors.append(
+                f"{location}: continue-on-error is unsupported for a required guard; "
+                f"found {step.get('continue-on-error')!r}"
+            )
+        actual_digest = run_digest(step)
+        if actual_digest != expected_digest:
+            errors.append(
+                f"{location}: normalized run block changed; expected sha256="
+                f"{expected_digest}, actual sha256={actual_digest}; restore the reviewed "
+                "command block or update this contract with matching mutation coverage"
+            )
+
+    allowed_audit_steps = {
+        ("ci.yml", "security", "Install cargo-audit"),
+        (
+            "ci.yml",
+            "security",
+            "Run the one full Cargo audit and retain named advisory diagnostics",
+        ),
+    }
+    audit_pattern = re.compile(r"\bcargo(?:-audit|\s+audit)\b")
+    for workflow_name, workflow in workflows.items():
+        jobs = workflow.get("jobs", {}) if isinstance(workflow, dict) else {}
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, definition in jobs.items():
+            steps = definition.get("steps", []) if isinstance(definition, dict) else []
+            for index, step in enumerate(steps):
+                if not isinstance(step, dict) or not audit_pattern.search(normalized_run(step)):
+                    continue
+                identity = (workflow_name, str(job_name), str(step.get("name", "")))
+                if identity not in allowed_audit_steps:
+                    errors.append(
+                        f"{workflow_name}::{job_name}::step[{index}]: cargo-audit invocation "
+                        f"is outside the two exact canonical install/audit steps: "
+                        f"{normalized_run(step)!r}"
+                    )
 
     activations: dict[str, set[str]] = {}
     for fixture in FIXTURES:
