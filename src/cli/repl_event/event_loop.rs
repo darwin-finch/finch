@@ -68,6 +68,9 @@ async fn commit_tool_round_and_continue(
     round_token: ToolRoundToken,
     llm_tx: &mpsc::UnboundedSender<LlmRequest>,
     checkpoint_path: Option<&std::path::Path>,
+    tool_history_to_clear: Option<
+        &Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    >,
 ) -> std::result::Result<(), crate::cli::conversation::ToolRoundError> {
     let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -112,7 +115,19 @@ async fn commit_tool_round_and_continue(
             );
         }
     }
+    let cleared_tool_history = if let Some(history) = tool_history_to_clear {
+        history.write().await.remove(&query_id)
+    } else {
+        None
+    };
     if publication_tx.send(()).is_err() {
+        *conversation.write().await = before_commit.clone();
+        if let Some(path) = checkpoint_path {
+            let _ = before_commit.save(path);
+        }
+        if let (Some(history), Some(cleared)) = (tool_history_to_clear, cleared_tool_history) {
+            history.write().await.insert(query_id, cleared);
+        }
         return Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable);
     }
     Ok(())
@@ -278,6 +293,9 @@ pub struct EventLoop {
     /// clear itself and making the UI appear frozen.  Queue textual turns so
     /// the single shared conversation and VM revision advance in order.
     pending_queries: std::collections::VecDeque<(String, bool, bool)>,
+    /// Query whose `present_plan` review owns the current plan/execution transition.
+    /// Kept outside `ReplMode` so stale terminal events cannot revoke a newer mode.
+    plan_mode_query_id: Option<Uuid>,
 
     /// Full turns requested by the daemon for the Brain whose runner lease
     /// this frontend owns. Completion is correlated to the ordinary query ID
@@ -2028,6 +2046,7 @@ impl EventLoop {
             provider_resolver,
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
+            plan_mode_query_id: None,
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
             local_brain_projections: std::collections::VecDeque::new(),
@@ -3670,12 +3689,13 @@ Rules:\n\
         }
 
         // Create a new query
-        let conversation_snapshot = self.conversation.read().await.snapshot();
+        let before_history = self.conversation.read().await.clone();
+        let conversation_snapshot = before_history.snapshot();
         let query_id = self.query_states.create_query(conversation_snapshot).await;
 
         // Build and durably checkpoint the next provider-visible history
         // before publishing it in memory or dispatching provider work.
-        let mut proposed_history = self.conversation.read().await.clone();
+        let mut proposed_history = before_history.clone();
         if pending_images.is_empty() {
             proposed_history.add_user_message(input.clone());
         } else {
@@ -3703,16 +3723,54 @@ Rules:\n\
         *self.active_query_id.write().await = Some(query_id);
 
         // Send query to the LLM worker loop (no tools for chat_only word-push responses)
-        let _ = self.llm_tx.send(LlmRequest::Query {
-            id: query_id,
-            text: input,
-            no_tools: chat_only,
-            admission: None,
-            admission_ready: None,
-            spawned: None,
-            publication: None,
-        });
+        if self
+            .llm_tx
+            .send(LlmRequest::Query {
+                id: query_id,
+                text: input,
+                no_tools: chat_only,
+                admission: None,
+                admission_ready: None,
+                spawned: None,
+                publication: None,
+            })
+            .is_err()
+        {
+            *self.conversation.write().await = before_history.clone();
+            if let Err(error) = self.checkpoint_history(&before_history) {
+                self.report_checkpoint_error(
+                    "Provider worker is unavailable and conversation rollback could not be checkpointed",
+                    &error,
+                );
+            }
+            if *self.active_query_id.read().await == Some(query_id) {
+                *self.active_query_id.write().await = None;
+            }
+            let error = "Provider worker is unavailable; query was not sent".to_string();
+            self.query_states
+                .update_state(
+                    query_id,
+                    QueryState::Failed {
+                        error: error.clone(),
+                    },
+                )
+                .await;
+            self.output_manager
+                .write_error(format!("Query failed: {error}"));
+            self.render_tui().await?;
+        }
 
+        Ok(())
+    }
+
+    /// Admit queued turns in order, skipping any that cannot reach the provider worker.
+    async fn drain_pending_queries_until_active(&mut self) -> Result<()> {
+        while self.active_query_id.read().await.is_none() {
+            let Some((next, echo, chat_only)) = self.pending_queries.pop_front() else {
+                break;
+            };
+            self.execute_query_inner(next, echo, chat_only).await?;
+        }
         Ok(())
     }
 
@@ -4203,6 +4261,16 @@ Rules:\n\
                         return Ok(());
                     }
                 }
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(
+                        QueryState::Cancelled
+                            | QueryState::Completed { .. }
+                            | QueryState::Failed { .. }
+                    )
+                ) {
+                    return Ok(());
+                }
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
 
@@ -4255,14 +4323,17 @@ Rules:\n\
                 // A terminal provider failure has no later StreamingComplete.
                 // Release the turn so queued user input cannot wedge behind it.
                 if *self.active_query_id.read().await == Some(query_id) {
-                    if matches!(self.mode.read().await.clone(), ReplMode::Executing { .. }) {
+                    if self.plan_mode_query_id == Some(query_id)
+                        && matches!(self.mode.read().await.clone(), ReplMode::Executing { .. })
+                    {
                         *self.mode.write().await = ReplMode::Normal;
                         self.update_plan_mode_indicator(&ReplMode::Normal);
                     }
-                    *self.active_query_id.write().await = None;
-                    if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
-                        self.execute_query_inner(next, echo, chat_only).await?;
+                    if self.plan_mode_query_id == Some(query_id) {
+                        self.plan_mode_query_id = None;
                     }
+                    *self.active_query_id.write().await = None;
+                    self.drain_pending_queries_until_active().await?;
                 }
             }
 
@@ -4348,6 +4419,11 @@ Rules:\n\
                 query_id,
                 tool_uses,
             } => {
+                if tool_uses.iter().any(|tool_use| {
+                    matches!(tool_use.name.as_str(), "present_plan" | "PresentPlan")
+                }) {
+                    self.plan_mode_query_id = Some(query_id);
+                }
                 if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
                     turn.observe_tool_calls(tool_uses);
                 }
@@ -4529,6 +4605,7 @@ Rules:\n\
                 let released_active_query = {
                     let owns_active_query = *self.active_query_id.read().await == Some(query_id);
                     if owns_active_query
+                        && self.plan_mode_query_id == Some(query_id)
                         && matches!(self.mode.read().await.clone(), ReplMode::Executing { .. })
                     {
                         *self.mode.write().await = ReplMode::Normal;
@@ -4537,15 +4614,16 @@ Rules:\n\
                     let mut active = self.active_query_id.write().await;
                     if *active == Some(query_id) {
                         *active = None;
+                        if self.plan_mode_query_id == Some(query_id) {
+                            self.plan_mode_query_id = None;
+                        }
                         true
                     } else {
                         false
                     }
                 };
                 if released_active_query {
-                    if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
-                        self.execute_query_inner(next, echo, chat_only).await?;
-                    }
+                    self.drain_pending_queries_until_active().await?;
                 }
                 // Record final response + save execution graph
                 if !is_executing_tools {
@@ -4653,9 +4731,15 @@ Rules:\n\
                     // user doesn't have to press Ctrl+C again to escape.
                     {
                         let mode = self.mode.read().await.clone();
-                        if !matches!(mode, ReplMode::Normal) {
+                        let owns_plan_mode = self.plan_mode_query_id == Some(qid);
+                        if matches!(mode, ReplMode::Planning { .. })
+                            || (owns_plan_mode && matches!(mode, ReplMode::Executing { .. }))
+                        {
                             *self.mode.write().await = ReplMode::Normal;
                             self.update_plan_mode_indicator(&ReplMode::Normal);
+                        }
+                        if owns_plan_mode {
+                            self.plan_mode_query_id = None;
                         }
                     }
 
@@ -4666,6 +4750,10 @@ Rules:\n\
                         "⚠️  Query cancelled by user (Ctrl+C)"
                     });
                     self.render_tui().await?;
+
+                    if !named_turn {
+                        self.drain_pending_queries_until_active().await?;
+                    }
 
                     tracing::info!("Query {} cancellation requested by user", qid);
                 } else {
@@ -7044,6 +7132,12 @@ Rules:\n\
                 (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
             })
         };
+        if self.plan_mode_query_id == Some(query_id)
+            && matches!(tool_name.as_str(), "present_plan" | "PresentPlan")
+            && !matches!(&result, Ok(content) if content.starts_with("Plan approved by user."))
+        {
+            self.plan_mode_query_id = None;
+        }
 
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
@@ -7159,7 +7253,8 @@ Rules:\n\
         let current_mode = self.mode.read().await.clone();
         self.update_plan_mode_indicator(&current_mode);
 
-        let approved_plan = matches!(current_mode, ReplMode::Executing { .. })
+        let approved_plan = self.plan_mode_query_id == Some(query_id)
+            && matches!(current_mode, ReplMode::Executing { .. })
             && results.iter().any(|result| {
                 !result.is_error && result.content.starts_with("Plan approved by user.")
             });
@@ -7171,6 +7266,7 @@ Rules:\n\
             round_token,
             &self.llm_tx,
             checkpoint_path.as_deref(),
+            approved_plan.then_some(&self.tool_call_history),
         )
         .await;
         if let Err(error) = committed {
@@ -7179,15 +7275,6 @@ Rules:\n\
                 error: format!("Tool continuation could not be admitted: {error}"),
             });
             return Ok(());
-        }
-
-        if approved_plan {
-            // Planning-phase inspections may legitimately be repeated while
-            // implementing. Reset only loop-detection metadata after the
-            // assistant ToolUse + user ToolResult pair is committed and the
-            // acknowledged continuation is published. Conversation history
-            // itself remains intact.
-            self.tool_call_history.write().await.remove(&query_id);
         }
 
         Ok(())
@@ -8851,7 +8938,101 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingPlanGenerator {
+        calls: std::sync::atomic::AtomicUsize,
+        messages: std::sync::Mutex<Vec<crate::claude::Message>>,
+        history_probe: std::sync::Mutex<
+            Option<(
+                Arc<
+                    tokio::sync::RwLock<
+                        std::collections::HashMap<
+                            uuid::Uuid,
+                            std::collections::HashMap<String, u32>,
+                        >,
+                    >,
+                >,
+                uuid::Uuid,
+            )>,
+        >,
+        history_was_clear_at_call: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for RecordingPlanGenerator {
+        async fn generate(
+            &self,
+            messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let history_probe = self
+                .history_probe
+                .lock()
+                .expect("history probe lock poisoned")
+                .clone();
+            if let Some((history, query_id)) = history_probe {
+                self.history_was_clear_at_call.store(
+                    !history.read().await.contains_key(&query_id),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            *self
+                .messages
+                .lock()
+                .expect("recording generator lock poisoned") = messages;
+            Ok(crate::generators::GeneratorResponse {
+                text: "(say \"implemented\")".into(),
+                content_blocks: vec![crate::claude::ContentBlock::text("(say \"implemented\")")],
+                tool_uses: Vec::new(),
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "issue-363-test".into(),
+                    model: "issue-363-test".into(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                    primary_allowance_used_percent: None,
+                    secondary_allowance_used_percent: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            panic!("non-streaming issue #363 generator must not stream")
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: true,
+                    supports_conversation: true,
+                    max_context_messages: None,
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "recording-plan-generator"
+        }
+    }
+
     fn plan_finalize_loop(temp: &tempfile::TempDir) -> super::EventLoop {
+        plan_finalize_loop_with_generator(temp, Arc::new(UnusedPlanGenerator))
+    }
+
+    fn plan_finalize_loop_with_generator(
+        temp: &tempfile::TempDir,
+        generator: Arc<dyn crate::generators::Generator>,
+    ) -> super::EventLoop {
         let executor = Arc::new(tokio::sync::Mutex::new(
             crate::tools::executor::ToolExecutor::new(
                 crate::tools::registry::ToolRegistry::new(),
@@ -8860,7 +9041,6 @@ mod tests {
             )
             .expect("plan finalize fixture must initialize its tool executor"),
         ));
-        let generator: Arc<dyn crate::generators::Generator> = Arc::new(UnusedPlanGenerator);
         let mut event_loop = super::EventLoop::new_named_brain_test_runner(
             generator,
             Vec::new(),
@@ -8915,6 +9095,7 @@ mod tests {
             plan_path: temp.path().join("plan.md"),
             approved_at: chrono::Utc::now(),
         };
+        event_loop.plan_mode_query_id = Some(query_id);
         *event_loop.active_query_id.write().await = Some(query_id);
         (query_id, token)
     }
@@ -8972,6 +9153,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_363_real_llm_loop_observes_committed_plan_round_after_publication() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().expect("LLM loop test needs a temp directory");
+                let generator = Arc::new(RecordingPlanGenerator::default());
+                let mut event_loop = plan_finalize_loop_with_generator(
+                    &temp,
+                    Arc::clone(&generator) as Arc<dyn crate::generators::Generator>,
+                );
+                let (query_id, token) = stage_approved_plan(&mut event_loop, &temp).await;
+                event_loop.tool_call_history.write().await.insert(
+                    query_id,
+                    std::collections::HashMap::from([("read:planning".into(), 1)]),
+                );
+                *generator
+                    .history_probe
+                    .lock()
+                    .expect("history probe lock poisoned") = Some((
+                    Arc::clone(&event_loop.tool_call_history),
+                    query_id,
+                ));
+                event_loop.start_llm_worker();
+                event_loop
+                    .finalize_tool_execution(query_id, token)
+                    .await
+                    .expect("approved plan must publish through the real LlmLoop");
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let event = event_loop
+                            .event_rx
+                            .recv()
+                            .await
+                            .expect("real LlmLoop event channel closed before completion");
+                        let completed = matches!(
+                            &event,
+                            super::ReplEvent::StreamingComplete { query_id: id, .. } if *id == query_id
+                        );
+                        event_loop
+                            .handle_event(event)
+                            .await
+                            .expect("real continuation event must remain handleable");
+                        if completed {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("real approved-plan continuation did not complete within two seconds");
+
+                assert_eq!(
+                    generator.calls.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "one approved plan must invoke the controlled provider exactly once"
+                );
+                assert!(
+                    generator
+                        .history_was_clear_at_call
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "planning tool-call history must clear before publication lets the real provider continuation run"
+                );
+                let observed = generator
+                    .messages
+                    .lock()
+                    .expect("recording generator lock poisoned")
+                    .clone();
+                assert!(
+                    observed.iter().any(|message| matches!(message.content.as_slice(), [crate::claude::ContentBlock::ToolUse { id, .. }] if id == "present-plan-1")),
+                    "real LlmLoop provider call did not observe committed plan ToolUse; messages={observed:?}"
+                );
+                assert!(
+                    observed.iter().any(|message| matches!(message.content.as_slice(), [crate::claude::ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "present-plan-1")),
+                    "real LlmLoop provider call did not observe matching plan ToolResult; messages={observed:?}"
+                );
+                assert!(
+                    matches!(event_loop.query_states.get_state(query_id).await, Some(super::QueryState::Completed { .. })),
+                    "real continuation did not reach Completed; state={:?}",
+                    event_loop.query_states.get_state(query_id).await
+                );
+                assert!(
+                    matches!(&*event_loop.mode.read().await, crate::cli::ReplMode::Normal),
+                    "owned plan continuation completion must normalize mode; mode={:?}",
+                    event_loop.mode.read().await
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn issue_363_unavailable_continuation_fails_visibly_and_drains_queue() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -9012,39 +9282,24 @@ mod tests {
         event_loop
             .pending_queries
             .push_back(("queued after plan".into(), false, false));
-        let (next_tx, mut next_rx) = tokio::sync::mpsc::unbounded_channel();
-        event_loop.llm_tx = next_tx;
         event_loop
             .handle_event(failure)
             .await
             .expect("terminal continuation failure must be renderable");
-        let next_request = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            next_rx.recv(),
-        )
-        .await
-        .expect("terminal plan failure did not drain the queued turn within one second")
-        .expect("queued-turn request channel closed unexpectedly");
-        let (next_id, next_text) = match next_request {
-            super::LlmRequest::Query { id, text, .. } => (id, text),
-        };
-        assert_ne!(
-            next_id, query_id,
-            "queued turn must receive a fresh query identity after terminal release"
-        );
-        assert_eq!(
-            next_text, "queued after plan",
-            "terminal release must drain the exact queued user turn"
-        );
         assert_eq!(
             *event_loop.active_query_id.read().await,
-            Some(next_id),
-            "old plan query must release exactly once before the queued turn becomes active"
+            None,
+            "a closed provider worker must not leave the drained queued turn permanently active"
         );
         assert!(
             event_loop.pending_queries.is_empty(),
             "queued turn must be removed exactly once after admission; queue={:?}",
             event_loop.pending_queries
+        );
+        assert!(
+            event_loop.conversation.read().await.get_messages().is_empty(),
+            "neither the failed plan continuation nor its unsent queued turn may remain provider-visible; history={:?}",
+            event_loop.conversation.read().await.get_messages()
         );
         assert!(
             matches!(&*event_loop.mode.read().await, crate::cli::ReplMode::Normal),
@@ -9066,6 +9321,139 @@ mod tests {
             visible.iter().any(|line| line.contains("Query failed") && line.contains("could not be admitted")),
             "continuation failure must be visible in transcript output; messages={visible:?}"
         );
+        assert!(
+            visible.iter().any(|line| line.contains("Provider worker is unavailable")),
+            "the unsent queued turn must also fail visibly instead of wedging; messages={visible:?}"
+        );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue_363_ctrl_c_releases_one_queued_turn_and_late_terminals_do_not_double_drain() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().expect("cancel test needs a temporary directory");
+                let mut event_loop = plan_finalize_loop(&temp);
+                let (query_id, _) = stage_approved_plan(&mut event_loop, &temp).await;
+                event_loop
+                    .pending_queries
+                    .push_back(("first queued".into(), false, false));
+                event_loop
+                    .pending_queries
+                    .push_back(("second queued".into(), false, false));
+                let (next_tx, mut next_rx) = tokio::sync::mpsc::unbounded_channel();
+                event_loop.llm_tx = next_tx;
+
+                event_loop
+                    .handle_event(super::ReplEvent::CancelQuery)
+                    .await
+                    .expect("Ctrl-C must terminalize and release an ordinary query");
+                let next_request =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), next_rx.recv())
+                        .await
+                        .expect("Ctrl-C did not release the first queued turn within one second")
+                        .expect("queued-turn channel closed after Ctrl-C");
+                let next_id = match next_request {
+                    super::LlmRequest::Query { id, text, .. } => {
+                        assert_eq!(text, "first queued", "Ctrl-C drained the wrong queued turn");
+                        id
+                    }
+                };
+                assert!(
+                    matches!(
+                        event_loop.query_states.get_state(query_id).await,
+                        Some(super::QueryState::Cancelled)
+                    ),
+                    "cancelled query must remain Cancelled; state={:?}",
+                    event_loop.query_states.get_state(query_id).await
+                );
+                assert_eq!(
+                    *event_loop.active_query_id.read().await,
+                    Some(next_id),
+                    "first queued turn must become the sole active query"
+                );
+                assert_eq!(
+                    event_loop.pending_queries.len(),
+                    1,
+                    "exactly one queued turn must remain after cancellation; queue={:?}",
+                    event_loop.pending_queries
+                );
+
+                event_loop
+                    .handle_event(super::ReplEvent::StreamingComplete {
+                        query_id,
+                        full_response: "late completion".into(),
+                    })
+                    .await
+                    .expect("late cancelled completion must be ignored");
+                event_loop
+                    .handle_event(super::ReplEvent::QueryFailed {
+                        query_id,
+                        error: "late failure".into(),
+                    })
+                    .await
+                    .expect("late cancelled failure must be ignored");
+                assert_eq!(
+                    *event_loop.active_query_id.read().await,
+                    Some(next_id),
+                    "late terminal events must not release the replacement query"
+                );
+                assert_eq!(
+                    event_loop.pending_queries.len(),
+                    1,
+                    "late terminal events must not double-drain; queue={:?}",
+                    event_loop.pending_queries
+                );
+                assert!(
+                    next_rx.try_recv().is_err(),
+                    "late terminal events published an unexpected second request"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn issue_363_stale_terminal_does_not_revoke_an_unrelated_executing_mode() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let temp = tempfile::tempdir().expect("ownership test needs a temp directory");
+                let mut event_loop = plan_finalize_loop(&temp);
+                let stale_id = event_loop.query_states.create_query(Vec::new()).await;
+                let active_id = event_loop.query_states.create_query(Vec::new()).await;
+                *event_loop.active_query_id.write().await = Some(active_id);
+                *event_loop.mode.write().await = crate::cli::ReplMode::Executing {
+                    task: "standalone approved plan".into(),
+                    plan_path: temp.path().join("standalone.md"),
+                    approved_at: chrono::Utc::now(),
+                };
+                event_loop.plan_mode_query_id = Some(active_id);
+
+                event_loop
+                    .handle_event(super::ReplEvent::QueryFailed {
+                        query_id: stale_id,
+                        error: "late stale failure".into(),
+                    })
+                    .await
+                    .expect("stale terminal event must remain harmless");
+                assert!(
+                    matches!(
+                        &*event_loop.mode.read().await,
+                        crate::cli::ReplMode::Executing { .. }
+                    ),
+                    "stale query terminalized another query's executing mode; mode={:?}",
+                    event_loop.mode.read().await
+                );
+                assert_eq!(
+                    *event_loop.active_query_id.read().await,
+                    Some(active_id),
+                    "stale terminal event released the current query"
+                );
+                assert_eq!(
+                    event_loop.plan_mode_query_id,
+                    Some(active_id),
+                    "stale terminal event erased current plan ownership"
+                );
             })
             .await;
     }
@@ -9085,7 +9473,9 @@ mod tests {
                     .await
                     .expect("approved plan must publish its continuation");
                 assert_eq!(
-                    admitted.recv().await,
+                    tokio::time::timeout(std::time::Duration::from_secs(1), admitted.recv())
+                        .await
+                        .expect("real continuation acknowledgement timed out"),
                     Some(query_id),
                     "fixture must observe the acknowledged plan continuation"
                 );
@@ -9297,6 +9687,7 @@ mod tests {
             query_id,
             token,
             &llm_tx,
+            None,
             None
         )
         .await
@@ -9322,6 +9713,7 @@ mod tests {
             token,
             &llm_tx,
             Some(&checkpoint),
+            None,
         )
         .await
         .unwrap();
@@ -9338,6 +9730,7 @@ mod tests {
             query_id,
             token,
             &llm_tx,
+            None,
             None
         )
         .await
@@ -9374,7 +9767,8 @@ mod tests {
         drop(rx);
 
         assert_eq!(
-            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx, None).await,
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx, None, None,)
+                .await,
             Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
         );
         assert!(conversation.read().await.get_messages().is_empty());
@@ -9434,6 +9828,7 @@ mod tests {
                 token,
                 &tx,
                 Some(&checkpoint),
+                None,
             )
             .await,
             Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
@@ -9446,6 +9841,76 @@ mod tests {
             .await
             .completed_tool_results(query_id, token)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn publication_drop_restores_live_and_checkpointed_tool_round() {
+        use crate::claude::{ContentBlock, Message};
+        let query_id = uuid::Uuid::new_v4();
+        let mut history = crate::cli::conversation::ConversationHistory::new();
+        let token = history
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "A".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+            )
+            .expect("fixture must stage tool call");
+        history
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .expect("fixture must complete tool result");
+        let conversation = Arc::new(tokio::sync::RwLock::new(history));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("continuation request was not sent")
+                .expect("continuation channel closed");
+            let super::LlmRequest::Query {
+                admission,
+                admission_ready,
+                spawned,
+                publication,
+                ..
+            } = request;
+            admission_ready.unwrap().send(()).ok();
+            admission.unwrap().await.ok();
+            spawned.unwrap().send(()).ok();
+            drop(publication);
+        });
+        let directory = tempfile::tempdir().expect("fixture needs a checkpoint directory");
+        let checkpoint = directory.path().join("session.json");
+        conversation.read().await.save(&checkpoint).unwrap();
+
+        assert_eq!(
+            super::commit_tool_round_and_continue(
+                &conversation,
+                query_id,
+                token,
+                &tx,
+                Some(&checkpoint),
+                None,
+            )
+            .await,
+            Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable),
+            "publication receiver loss must reject the continuation"
+        );
+        assert!(
+            conversation.read().await.get_messages().is_empty(),
+            "publication failure left a provider-invisible committed pair live"
+        );
+        assert!(
+            crate::cli::conversation::ConversationHistory::load(&checkpoint)
+                .expect("rollback checkpoint must remain readable")
+                .get_messages()
+                .is_empty(),
+            "publication failure left the rejected pair in the recovery checkpoint"
+        );
     }
 
     #[tokio::test]
@@ -9480,6 +9945,7 @@ mod tests {
                 token,
                 &tx,
                 Some(directory.path()),
+                None,
             )
             .await,
             Err(crate::cli::conversation::ToolRoundError::PersistenceUnavailable(_))

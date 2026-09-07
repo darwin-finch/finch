@@ -105,12 +105,14 @@ pub(crate) async fn handle_present_plan(
     };
 
     // Verify we're in planning mode and get plan path
-    let (task, plan_path) = {
+    let (task, plan_path, created_at) = {
         let current_mode = mode.read().await;
         match &*current_mode {
             crate::cli::ReplMode::Planning {
-                task, plan_path, ..
-            } => (task.clone(), plan_path.clone()),
+                task,
+                plan_path,
+                created_at,
+            } => (task.clone(), plan_path.clone(), *created_at),
             _ => {
                 return Some(Ok(
                     "⚠️  Not in planning mode. Use EnterPlanMode first.".to_string()
@@ -137,7 +139,7 @@ pub(crate) async fn handle_present_plan(
         vec![
             crate::cli::tui::DialogOption::with_description(
                 "Approve and execute",
-                "Clear context and proceed with implementation (all tools enabled)",
+                "Proceed with implementation (all tools enabled)",
             ),
             crate::cli::tui::DialogOption::with_description(
                 "Request changes",
@@ -187,16 +189,17 @@ pub(crate) async fn handle_present_plan(
     }
 
     let dialog_result: crate::cli::tui::DialogResult = tokio::select! {
-        result = dialog_rx => match result {
-            Ok(r) => r,
-            Err(_) => crate::cli::tui::DialogResult::Cancelled,
-        },
+        biased;
         _ = cancel.cancelled() => {
             // Clean up active dialog on cancellation
             let mut tui = tui_renderer.lock().await;
             tui.active_dialog = None;
             crate::cli::tui::DialogResult::Cancelled
         }
+        result = dialog_rx => match result {
+            Ok(r) => r,
+            Err(_) => crate::cli::tui::DialogResult::Cancelled,
+        },
     };
 
     // Handle dialog result
@@ -207,11 +210,29 @@ pub(crate) async fn handle_present_plan(
             // the ToolResult message (referencing the assistant's ToolUse block) after
             // we return.  Adding extra user messages here would create consecutive user
             // messages that the Claude API rejects, causing a silent hang.
-            *mode.write().await = crate::cli::ReplMode::Executing {
+            let mut current_mode = mode.write().await;
+            let still_owns_planning_mode = matches!(
+                &*current_mode,
+                crate::cli::ReplMode::Planning {
+                    task: current_task,
+                    plan_path: current_path,
+                    created_at: current_created_at,
+                } if current_task == &task
+                    && current_path == &plan_path
+                    && current_created_at == &created_at
+            );
+            if cancel.is_cancelled() || !still_owns_planning_mode {
+                return Some(Ok(
+                    "Plan approval was cancelled before execution authority was granted."
+                        .to_string(),
+                ));
+            }
+            *current_mode = crate::cli::ReplMode::Executing {
                 task: task.clone(),
                 plan_path: plan_path.clone(),
                 approved_at: Utc::now(),
             };
+            drop(current_mode);
 
             output_manager.write_info(format!(
                 "{}",
@@ -446,6 +467,65 @@ mod tests {
             plan_path: std::path::PathBuf::from("/tmp/plan.md"),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    async fn resolve_test_plan_dialog(
+        selection: crate::cli::tui::DialogResult,
+    ) -> (String, std::sync::Arc<tokio::sync::RwLock<ReplMode>>) {
+        let temp = tempfile::tempdir().expect("plan dialog fixture needs a temp directory");
+        let colors = crate::config::ColorScheme::default();
+        let output = std::sync::Arc::new(OutputManager::new(colors.clone()));
+        let status = std::sync::Arc::new(crate::cli::StatusBar::new());
+        let tui = std::sync::Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            std::sync::Arc::clone(&output),
+            status,
+            colors,
+        )));
+        let mode = std::sync::Arc::new(tokio::sync::RwLock::new(ReplMode::Planning {
+            task: "review plan".into(),
+            plan_path: temp.path().join("plan.md"),
+            created_at: chrono::Utc::now(),
+        }));
+        let work_unit = output.start_work_unit("planning");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = tokio::spawn({
+            let mode = std::sync::Arc::clone(&mode);
+            async move {
+                handle_present_plan(
+                    &ToolUse {
+                        id: "review-plan".into(),
+                        name: "present_plan".into(),
+                        input: serde_json::json!({"plan": "Review this exact plan."}),
+                    },
+                    tui,
+                    mode,
+                    output,
+                    tokio_util::sync::CancellationToken::new(),
+                    work_unit,
+                    &event_tx,
+                )
+                .await
+            }
+        });
+        let response_tx =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("plan handler did not publish dialog within one second")
+                .expect("plan handler event channel closed")
+            {
+                ReplEvent::ShowDialog { response_tx, .. } => response_tx,
+                event => panic!("expected ShowDialog, got {event:?}"),
+            };
+        response_tx
+            .send(selection)
+            .expect("plan handler stopped before dialog selection");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("plan dialog resolution timed out")
+            .expect("plan dialog task panicked")
+            .expect("present_plan handler did not recognize tool")
+            .expect("plan review should produce a normal tool result");
+        (result, mode)
     }
 
     #[test]
@@ -716,6 +796,91 @@ mod tests {
         assert!(
             has_consecutive_users,
             "expected the old buggy pattern to produce consecutive user messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_363_cancel_wins_over_ready_plan_approval() {
+        let temp = tempfile::tempdir().expect("plan cancellation fixture needs a temp directory");
+        let colors = crate::config::ColorScheme::default();
+        let output = std::sync::Arc::new(OutputManager::new(colors.clone()));
+        let status = std::sync::Arc::new(crate::cli::StatusBar::new());
+        let tui = std::sync::Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+            std::sync::Arc::clone(&output),
+            status,
+            colors,
+        )));
+        let mode = std::sync::Arc::new(tokio::sync::RwLock::new(ReplMode::Planning {
+            task: "cancel plan".into(),
+            plan_path: temp.path().join("plan.md"),
+            created_at: chrono::Utc::now(),
+        }));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let work_unit = output.start_work_unit("planning");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool_use = ToolUse {
+            id: "cancelled-plan".into(),
+            name: "present_plan".into(),
+            input: serde_json::json!({"plan": "Must not gain execution authority."}),
+        };
+        let handler = tokio::spawn({
+            let tui = std::sync::Arc::clone(&tui);
+            let mode = std::sync::Arc::clone(&mode);
+            let cancel = cancel.clone();
+            let event_tx = event_tx.clone();
+            async move {
+                handle_present_plan(&tool_use, tui, mode, output, cancel, work_unit, &event_tx)
+                    .await
+            }
+        });
+        let response_tx =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("plan handler did not publish its dialog within one second")
+                .expect("plan handler event channel closed before dialog")
+            {
+                ReplEvent::ShowDialog { response_tx, .. } => response_tx,
+                event => panic!("expected ShowDialog before cancellation, got {event:?}"),
+            };
+
+        // Make both branches ready without yielding. The biased select and the
+        // write-lock recheck must deterministically give cancellation authority.
+        cancel.cancel();
+        let _ = response_tx.send(crate::cli::tui::DialogResult::Selected(0));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handler)
+            .await
+            .expect("cancelled plan handler did not return within one second")
+            .expect("cancelled plan handler task panicked")
+            .expect("present_plan handler must recognize the tool")
+            .expect("cancellation should be a normal plan result");
+        assert!(
+            result.contains("cancelled"),
+            "cancelled approval must report cancellation, got {result:?}"
+        );
+        assert!(
+            matches!(&*mode.read().await, ReplMode::Planning { .. }),
+            "a ready approval must never overwrite cancellation with Executing; mode={:?}",
+            mode.read().await
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_363_request_changes_and_reject_preserve_distinct_modes() {
+        let (changes, planning) =
+            resolve_test_plan_dialog(crate::cli::tui::DialogResult::Selected(1)).await;
+        assert!(
+            changes.contains("request changes")
+                && matches!(&*planning.read().await, ReplMode::Planning { .. }),
+            "request changes must retain Planning and ask for revision; result={changes:?}, mode={:?}",
+            planning.read().await
+        );
+
+        let (rejected, normal) =
+            resolve_test_plan_dialog(crate::cli::tui::DialogResult::Selected(2)).await;
+        assert!(
+            rejected.contains("rejected") && matches!(&*normal.read().await, ReplMode::Normal),
+            "reject must return to Normal with an explicit result; result={rejected:?}, mode={:?}",
+            normal.read().await
         );
     }
 }

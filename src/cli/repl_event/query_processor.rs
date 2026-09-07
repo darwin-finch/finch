@@ -845,32 +845,60 @@ pub(super) async fn dispatch_tool_uses(
         handle_ask_user_question, handle_present_plan, is_tool_allowed_in_mode,
     };
     use super::tool_display::format_tool_label;
-    use tokio_util::sync::CancellationToken;
-
+    let Some(metadata) = query_states.get_metadata(query_id).await else {
+        return;
+    };
+    if metadata.cancellation_token.is_cancelled()
+        || !matches!(metadata.state, QueryState::ExecutingTools { .. })
+    {
+        return;
+    }
+    let cancellation_token = metadata.cancellation_token;
+    let effect_audit = metadata.effect_audit;
+    let round_mode = mode.read().await.clone();
+    let exclusive_plan_id = tool_uses
+        .iter()
+        .find(|tool_use| matches!(tool_use.name.as_str(), "present_plan" | "PresentPlan"))
+        .map(|tool_use| tool_use.id.clone());
     let _ = event_tx.send(ReplEvent::ToolCallsStarted {
         query_id,
         tool_uses: tool_uses.clone(),
     });
-    let effect_audit = query_states
-        .get_metadata(query_id)
-        .await
-        .and_then(|metadata| metadata.effect_audit);
-    let mut plan_boundary_crossed = false;
     for tool_use in tool_uses {
-        // `present_plan` is a control boundary, not an ordinary sibling tool.
-        // The model chose the remaining calls under the pre-review Planning
-        // authority, so they must receive results but must not execute after
-        // the user has changed (or declined to change) that authority.
-        if plan_boundary_crossed {
-            let label = format_tool_label(&tool_use.name, &tool_use.input);
-            let row_idx = work_unit.add_row(label);
-            work_unit.fail_row(row_idx, "superseded by plan review");
+        let state = query_states.get_state(query_id).await;
+        if cancellation_token.is_cancelled()
+            || !matches!(state, Some(QueryState::ExecutingTools { .. }))
+        {
+            break;
+        }
+
+        // Register every call before any synchronous result. The event loop uses
+        // this metadata to close the original row and record the real graph node.
+        let label = format_tool_label(&tool_use.name, &tool_use.input);
+        let row_idx = work_unit.add_row(&label);
+        active_tool_uses.write().await.insert(
+            tool_use.id.clone(),
+            (
+                tool_use.name.clone(),
+                tool_use.input.clone(),
+                Arc::clone(work_unit),
+                row_idx,
+            ),
+        );
+
+        // `present_plan` owns the complete provider batch. No sibling may start
+        // before or after the review dialog under the batch's stale authority.
+        if exclusive_plan_id
+            .as_ref()
+            .is_some_and(|plan_id| plan_id != &tool_use.id)
+        {
+            work_unit.fail_row(row_idx, "superseded by exclusive plan review");
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 round_token,
                 tool_id: tool_use.id,
                 result: Err(anyhow::anyhow!(
-                    "Tool was not executed because present_plan is a serialized control boundary; submit it in the next provider turn if the reviewed mode allows it"
+                    "Tool was not executed because present_plan must be the only call in its provider batch; submit this tool again in the next turn if the reviewed mode allows it"
                 )),
             });
             continue;
@@ -895,8 +923,6 @@ pub(super) async fn dispatch_tool_uses(
             *count
         };
         if !input_is_empty && call_count > 1 {
-            let label = format_tool_label(&tool_use.name, &tool_use.input);
-            let row_idx = work_unit.add_row(label);
             work_unit.fail_row(row_idx, "loop detected");
             let error_msg = format!(
                 "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
@@ -914,13 +940,9 @@ pub(super) async fn dispatch_tool_uses(
             continue;
         }
 
-        // Plan-mode gate: block destructive tools while exploring
-        // Never retain the mode guard across an interactive handler. In
-        // particular, approving/rejecting `present_plan` writes this lock.
-        let current_mode = mode.read().await.clone();
-        if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
-            let label = format_tool_label(&tool_use.name, &tool_use.input);
-            let row_idx = work_unit.add_row(label);
+        // Plan-mode authority is fixed for the complete provider round. The
+        // guard itself was released before any interactive handler awaited.
+        if !is_tool_allowed_in_mode(&tool_use.name, &round_mode) {
             work_unit.fail_row(row_idx, "blocked in plan mode");
             let error_msg = format!(
                 "Tool '{}' is not allowed in planning mode.\n\
@@ -938,28 +960,11 @@ pub(super) async fn dispatch_tool_uses(
             continue;
         }
 
-        // Add a running row for this tool in the shared WorkUnit
-        let label = format_tool_label(&tool_use.name, &tool_use.input);
-        let row_idx = work_unit.add_row(&label);
-        active_tool_uses.write().await.insert(
-            tool_use.id.clone(),
-            (
-                tool_use.name.clone(),
-                tool_use.input.clone(),
-                Arc::clone(work_unit),
-                row_idx,
-            ),
-        );
-
         // Inline handlers for interactive tools (block until dialog resolved)
         if let Some(result) = handle_ask_user_question(
             &tool_use,
             Arc::clone(tui_renderer),
-            query_states
-                .get_metadata(query_id)
-                .await
-                .map(|m| m.cancellation_token)
-                .unwrap_or_else(CancellationToken::new),
+            cancellation_token.clone(),
             event_tx,
         )
         .await
@@ -975,11 +980,7 @@ pub(super) async fn dispatch_tool_uses(
             Arc::clone(tui_renderer),
             Arc::clone(mode),
             Arc::clone(output_manager),
-            query_states
-                .get_metadata(query_id)
-                .await
-                .map(|m| m.cancellation_token)
-                .unwrap_or_else(CancellationToken::new),
+            cancellation_token.clone(),
             Arc::clone(work_unit),
             event_tx,
         )
@@ -991,7 +992,6 @@ pub(super) async fn dispatch_tool_uses(
                 tool_id: tool_use.id.clone(),
                 result,
             });
-            plan_boundary_crossed = true;
         } else {
             // Regular tool: run concurrently in a background task
             tool_coordinator.spawn_tool_execution(
@@ -2064,11 +2064,24 @@ mod tests {
         let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
         let query_states = Arc::new(QueryStateManager::new());
         let query_id = query_states.create_query(Vec::new()).await;
-        let tool_use = ToolUse {
+        let plan_tool_use = ToolUse {
             id: "present-plan-1".into(),
             name: "present_plan".into(),
             input: serde_json::json!({"plan": "Implement the approved change."}),
         };
+        let tool_uses = vec![
+            ToolUse {
+                id: "bash-before-plan".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "touch must-not-run"}),
+            },
+            plan_tool_use.clone(),
+            ToolUse {
+                id: "write-after-plan".into(),
+                name: "write".into(),
+                input: serde_json::json!({"path": "must-not-run", "content": "no"}),
+            },
+        ];
         let round_token = conversation
             .write()
             .await
@@ -2076,11 +2089,14 @@ mod tests {
                 query_id,
                 crate::claude::Message {
                     role: "assistant".into(),
-                    content: vec![ContentBlock::ToolUse {
-                        id: tool_use.id.clone(),
-                        name: tool_use.name.clone(),
-                        input: tool_use.input.clone(),
-                    }],
+                    content: tool_uses
+                        .iter()
+                        .map(|tool_use| ContentBlock::ToolUse {
+                            id: tool_use.id.clone(),
+                            name: tool_use.name.clone(),
+                            input: tool_use.input.clone(),
+                        })
+                        .collect(),
                 },
             )
             .expect("fixture must stage the provider's present_plan call");
@@ -2123,7 +2139,7 @@ mod tests {
             let status = Arc::clone(&status);
             async move {
                 dispatch_tool_uses(
-                    vec![tool_use],
+                    tool_uses,
                     query_id,
                     round_token,
                     &work_unit,
@@ -2146,13 +2162,18 @@ mod tests {
             }
         });
 
+        let mut result_events = Vec::new();
         let response_tx = loop {
             let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
                 .await
                 .expect("real dispatch did not publish the plan dialog within one second")
                 .expect("real dispatch event channel closed before plan dialog");
-            if let ReplEvent::ShowDialog { response_tx, .. } = event {
-                break response_tx;
+            match event {
+                ReplEvent::ShowDialog { response_tx, .. } => break response_tx,
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => result_events.push((tool_id, result)),
+                _ => {}
             }
         };
         response_tx
@@ -2170,12 +2191,33 @@ mod tests {
             "approval must transition Planning to Executing; mode={:?}",
             mode.read().await
         );
-        let result_events = std::iter::from_fn(|| event_rx.try_recv().ok())
-            .filter(|event| matches!(event, ReplEvent::ToolResult { .. }))
-            .count();
+        result_events.extend(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).filter_map(|event| match event {
+                ReplEvent::ToolResult {
+                    tool_id, result, ..
+                } => Some((tool_id, result)),
+                _ => None,
+            }),
+        );
         assert_eq!(
-            result_events, 1,
-            "one approved present_plan dispatch must publish exactly one ToolResult; remaining events produced {result_events} results"
+            result_events.len(), 3,
+            "an exclusive present_plan batch must publish one result per staged call; results={result_events:?}"
+        );
+        assert!(
+            result_events
+                .iter()
+                .any(|(id, result)| id == "present-plan-1" && result.is_ok()),
+            "the sole plan call must be approved; results={result_events:?}"
+        );
+        assert!(
+            result_events.iter().filter(|(id, result)| id != "present-plan-1" && result.is_err()).count() == 2,
+            "both pre- and post-plan siblings must be rejected without execution; results={result_events:?}"
+        );
+        assert_eq!(
+            active_tool_uses.read().await.len(),
+            3,
+            "every synchronous result needs original row metadata until EventLoop consumes it; metadata={:?}",
+            active_tool_uses.read().await.keys().collect::<Vec<_>>()
         );
     }
 
