@@ -2802,6 +2802,41 @@ impl BrainStore {
         }
     }
 
+    /// Drop the in-memory copy of a Brain without touching its durable state
+    /// or its index entries. Returns whether it was resident. Test-only.
+    ///
+    /// "Indexed but not resident" is the state the due index exists to make
+    /// possible -- selecting a Brain *without* hydrating it is the whole point
+    /// of the due-ordered index (#374, selecting due schedules from a
+    /// due-ordered index) -- and it is the state in which
+    /// `ensure_loaded` -> `load_or_create_metadata` actually runs, which is the
+    /// step that mints a new `BrainId` for a Brain whose `metadata.json` is
+    /// gone. `warm_schedule_index` happens to hydrate as a side effect of how
+    /// it discovers schedules, so without this the recreation half of #383
+    /// (schedules for a deleted Brain are delivered, and delivery recreates the
+    /// Brain) is
+    /// unreachable from a test and delivery would be silently relying on that
+    /// accident. Lives on the store rather than in one test module because the
+    /// production-boundary test in `src/server/handlers.rs` needs it too.
+    #[cfg(test)]
+    pub(crate) fn evict_resident_brain_for_tests(&self, name: &str) -> bool {
+        self.brains
+            .write()
+            .expect("shared brain lock poisoned")
+            .remove(name)
+            .is_some()
+    }
+
+    /// Whether a Brain's state is currently held in memory. Test-only; the
+    /// counterpart to `evict_resident_brain_for_tests`.
+    #[cfg(test)]
+    pub(crate) fn is_resident_for_tests(&self, name: &str) -> bool {
+        self.brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .contains_key(name)
+    }
+
     /// Drop everything the index knows about a Brain that no longer exists.
     fn forget_schedules_locked(&self, name: &str) {
         self.schedule_index
@@ -2835,6 +2870,12 @@ impl BrainStore {
     ///   exactly the failure those issues exist to surface, so this returns
     ///   `false` for it and lets `ensure_loaded`'s error propagate to the
     ///   delivery loop's warning (#380's transition logging).
+    /// - *Unknown* -- the existence check itself failed (EACCES on the Brain
+    ///   root, ESTALE from a stale network handle, EIO from a failing disk) --
+    ///   is not evidence of absence, so it is handled as unreadable rather than
+    ///   as gone. This is why the check is `try_exists` and not `exists`: the
+    ///   latter collapses every error into `false` and would prune a Brain that
+    ///   is sitting right there.
     ///
     /// A store with no root keeps no durable state at all, so durable absence
     /// is not a concept there and nothing is ever pruned for it.
@@ -2846,14 +2887,47 @@ impl BrainStore {
         let Some(root) = &self.root else {
             return false;
         };
-        if root.join(name).exists() {
-            return false;
-        }
         let forgotten = {
+            // The existence check runs *under* the index write guard, and the
+            // guard is taken first. `create_schedule` racing a prune would
+            // otherwise lose the schedule it had just created: prune stats
+            // `root/name` and sees nothing, `create_schedule` completes --
+            // recreating the directory and indexing the new schedule -- and
+            // prune then takes the lock and forgets the brand-new entry.
+            //
+            // Holding the guard across the `stat` orders the two. `push_locked`
+            // recreates the directory (`append_event` -> `append_journal_value`
+            // -> `create_dir_all_durable`) *before* it takes this same lock in
+            // `upsert_schedule_locked`, so whichever side wins the lock is
+            // correct: if prune wins, its `stat` runs either before the
+            // directory is back (it prunes, and the creation's `upsert` then
+            // re-adds the entry afterwards) or after (it does not prune at
+            // all); if the creation wins, the directory is already back and its
+            // entry already indexed when prune's `stat` runs. Nothing but a
+            // `stat` happens under the guard, and no other lock is taken while
+            // holding it, so the `brains` -> `schedule_index` order every other
+            // site follows is not inverted.
             let mut index = self
                 .schedule_index
                 .write()
                 .expect("schedule index lock poisoned");
+            match root.join(name).try_exists() {
+                // Nothing is there: the Brain is gone. Prune.
+                Ok(false) => {}
+                // Present, or *unknown*. `Path::exists` cannot tell those
+                // apart -- it is `metadata().is_ok()`, so EACCES on the Brain
+                // root, ESTALE from a stale NFS handle and EIO from a failing
+                // disk all read as "absent" and would silently retire the
+                // schedules of a Brain that is still on disk, which is the
+                // exact silencing this function was written to prevent.
+                // `try_exists` distinguishes them: an `Err` means the answer is
+                // unknown, so fall through to `ensure_loaded` and let its error
+                // propagate to the delivery loop's warning, the same handling
+                // an unreadable Brain already gets. `try_exists` follows
+                // symlinks exactly as `exists` does, so this changes nothing
+                // for them.
+                Ok(true) | Err(_) => return false,
+            }
             let was_indexed = index.by_brain.contains_key(name);
             index.forget(name);
             was_indexed
@@ -2909,6 +2983,11 @@ impl BrainStore {
     /// bounding its diagnostics, and picking a Brain up again once repaired --
     /// belong to #371, and this should consume that API rather than keep its
     /// own once it lands.
+    ///
+    /// It is also the repair for a pruned entry: a Brain that is already
+    /// resident is re-indexed here, because `ensure_loaded` short-circuits on
+    /// residency before it would do it (#383, schedules for a deleted Brain
+    /// are delivered, and delivery recreates the Brain).
     pub fn warm_schedule_index(&self) {
         // Infallible by construction: an absent root and a Brain that cannot be
         // replayed are both ordinary states, not errors. It previously returned
@@ -2942,6 +3021,28 @@ impl BrainStore {
                     "Brain could not be loaded while warming the schedule index; its \
                      schedules will not be delivered until it is repaired"
                 );
+                continue;
+            }
+            // Re-index unconditionally, not only for a Brain this warm loaded.
+            // `ensure_loaded` returns `Ok(())` at its first line for a Brain
+            // that is already resident, *before* the
+            // `reindex_schedules_locked` on its load path -- so entries enter
+            // the index only when a Brain becomes resident or when a schedule
+            // event fires, and `brains` entries are dropped only by
+            // `remove_if_unused` and `archive`, which forget the schedules too.
+            // "Indexed" therefore implied "resident", and
+            // `prune_schedules_if_brain_is_absent` broke that: a resident Brain
+            // whose directory blinked out is left resident-but-unindexed with
+            // no route back short of a restart. Because this warm hydrates
+            // every Brain at startup, every Brain is resident, so one blip of
+            // the Brain root -- a removable or network volume gone for two
+            // seconds -- would empty the whole index permanently and the daemon
+            // would silently deliver nothing again, ever. Reindexing here is
+            // that route back, and it is idempotent: an unchanged schedule set
+            // leaves the head where it was, so no spurious wake is sent.
+            let brains = self.brains.read().expect("shared brain lock poisoned");
+            if let Some(state) = brains.get(&name) {
+                self.reindex_schedules_locked(&name, state);
             }
         }
         if skipped > 0 {
@@ -7872,25 +7973,12 @@ mod tests {
     }
 
     /// Drop the in-memory copy of a Brain without touching its disk state or
-    /// its index entries.
-    ///
-    /// "Indexed but not resident" is the state the due index exists to make
-    /// possible -- #374's whole point is selecting a Brain *without* hydrating
-    /// it -- and it is the state in which `ensure_loaded` ->
-    /// `load_or_create_metadata` actually runs, which is the step that mints a
-    /// new `BrainId` for a Brain whose `metadata.json` is gone. Today
-    /// `warm_schedule_index` happens to hydrate as a side effect of how it
-    /// discovers schedules, so without this the recreation half of #383 is
-    /// unreachable from a test and delivery would be silently relying on that
-    /// accident.
+    /// its index entries, asserting it was resident first. See
+    /// `BrainStore::evict_resident_brain_for_tests` for why this state matters.
     fn evict_resident_brain(store: &BrainStore, name: &str) {
-        let evicted = store
-            .brains
-            .write()
-            .expect("shared brain lock poisoned")
-            .remove(name);
+        let evicted = store.evict_resident_brain_for_tests(name);
         assert!(
-            evicted.is_some(),
+            evicted,
             "test setup: '{name}' was expected to be resident before eviction, \
              so that what follows exercises the unhydrated delivery path; it \
              was not, which would make the test assert nothing about that path"
@@ -8199,6 +8287,213 @@ mod tests {
             original_id,
             "and it must come back as the same Brain, not as a new one minted \
              during its absence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_delivery_does_not_prune_a_brain_whose_existence_cannot_be_determined() {
+        // `Path::exists` is `fs::metadata(..).is_ok()`, so it answers `false`
+        // for *every* error, not only for ENOENT. An EACCES on the Brain root,
+        // an ESTALE from a stale NFS or SMB handle, an EIO from a failing disk
+        // -- each of those reads as "the Brain is gone" and would prune the
+        // schedules of a Brain that is sitting right there, silently, with the
+        // delivery returning `Ok`. That is the exact silencing this fix exists
+        // to prevent, produced by the branch written to prevent it. `absent`
+        // and `unreadable` is the distinction the whole design rests on, and an
+        // errored existence check belongs on the `unreadable` side: it is not
+        // evidence of absence.
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        seed_scheduled_brain(&store, "alpha", 1_000);
+        let original_id = store.snapshot("alpha").unwrap().brain_id;
+        let alpha_dir = temp.path().join("alpha");
+        // Unhydrated, so the load actually reaches the filesystem rather than
+        // answering from the resident copy.
+        evict_resident_brain(&store, "alpha");
+        assert_eq!(
+            store.due_schedule_brains(1_500),
+            vec!["alpha".to_string()],
+            "precondition: the Brain's schedule is indexed and due; index holds \
+             {:?}",
+            indexed_due_keys(&store)
+        );
+
+        let original_mode = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that is not subject to the mode (root, or a filesystem that
+        // does not enforce it) cannot reach the state under test at all.
+        let mode_is_enforced = std::fs::read_dir(temp.path()).is_err();
+        let outcome = mode_is_enforced.then(|| store.queue_due_schedules("alpha", 1_500));
+        let indexed_while_unreadable = indexed_due_keys(&store);
+        let selected_while_unreadable = store.due_schedule_brains(1_500);
+        // Restore before asserting: the assertions below have to read the root,
+        // and a panic must not leave an unreadable directory behind.
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(original_mode))
+            .unwrap();
+
+        let Some(outcome) = outcome else {
+            eprintln!(
+                "skipped: mode 0o000 on {} is not enforced for this process, so an \
+                 unreadable Brain root is unreachable here",
+                temp.path().display()
+            );
+            return;
+        };
+
+        let error = match outcome {
+            Err(error) => error,
+            Ok(queued) => panic!(
+                "an existence check that could not answer must not be read as \
+                 'the Brain is gone': the root was unreadable, not empty, and \
+                 {} was on disk the whole time. Delivery instead returned {} \
+                 run(s) and the index now holds {indexed_while_unreadable:?} -- \
+                 a Brain that still exists had its schedules retired with no \
+                 fault reported anywhere",
+                alpha_dir.display(),
+                queued.len()
+            ),
+        };
+
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("alpha"),
+            "the reported fault must name the Brain, or the delivery loop's \
+             warning is not actionable by whoever has to repair the permissions \
+             or remount the volume; it read: {reported}"
+        );
+        assert!(
+            alpha_dir.exists(),
+            "precondition still holding: nothing was deleted -- {} holds [{}]. \
+             The directory's presence throughout is the whole reason pruning it \
+             would have been wrong",
+            alpha_dir.display(),
+            directory_listing(&alpha_dir)
+        );
+        assert_eq!(
+            selected_while_unreadable,
+            vec!["alpha".to_string()],
+            "and its schedules must stay indexed and selectable while the root \
+             is unreadable, so the fault is reported again on the next pass \
+             instead of being forgotten. Index held {indexed_while_unreadable:?}"
+        );
+        assert_eq!(
+            indexed_while_unreadable.len(),
+            1,
+            "no entry may be dropped when the existence check itself failed; \
+             index held {indexed_while_unreadable:?}"
+        );
+        assert_eq!(
+            store.snapshot("alpha").unwrap().brain_id,
+            original_id,
+            "and once the root is readable again the Brain must still be the \
+             same one, not a fresh identity minted while it could not be stat'd"
+        );
+    }
+
+    #[test]
+    fn test_a_resident_brain_is_reindexed_by_the_next_warm_after_its_root_blinked_out() {
+        // Pruning removes index entries; nothing re-adds them for a Brain that
+        // is still *resident*. `ensure_loaded` returns `Ok(())` at its first
+        // line when `brains` already holds the key, before the
+        // `reindex_schedules_locked` on its load path, and `warm_schedule_index`
+        // did nothing but call `ensure_loaded` per directory. Entries entered
+        // the index only when a Brain became resident or when a schedule event
+        // fired, so a resident-but-unindexed Brain had no route back short of a
+        // process restart.
+        //
+        // That is not a corner: the warm hydrates every Brain at startup, so
+        // every Brain is resident. A Brain root on a removable or network
+        // volume that drops for two seconds would have every due Brain pruned,
+        // and when the volume returned the next warm would hydrate nothing new
+        // -- leaving the daemon delivering no scheduled work again, ever,
+        // silently, until it was restarted. On base a root blip costs nothing.
+        //
+        // The sibling test evicts before pruning; this one deliberately does
+        // not, because "still resident" is the case with no repair.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
+        seed_scheduled_brain(&store, "alpha", 1_000);
+        seed_scheduled_brain(&store, "beta", 1_200);
+        let alpha_id = store.snapshot("alpha").unwrap().brain_id;
+        let beta_id = store.snapshot("beta").unwrap().brain_id;
+        assert!(
+            store.is_resident_for_tests("alpha") && store.is_resident_for_tests("beta"),
+            "precondition: both Brains are resident, which is what the startup \
+             warm leaves behind and is exactly the case with no repair path"
+        );
+        assert_eq!(
+            store.indexed_schedule_count(),
+            2,
+            "precondition: both schedules are indexed; index holds {:?}",
+            indexed_due_keys(&store)
+        );
+
+        // The whole root goes away and comes back: a volume unmounted for a
+        // couple of seconds, which is the reported shape of this failure.
+        let stashed = temp.path().join("brains-unmounted");
+        std::fs::rename(&root, &stashed).unwrap();
+
+        for name in store.due_schedule_brains(1_500) {
+            let queued = store
+                .queue_due_schedules(&name, 1_500)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a pass over a vanished root must not fail: '{name}' failed \
+                     with {error:#}"
+                    )
+                });
+            assert!(
+                queued.is_empty(),
+                "'{name}' queued {} run(s) while the Brain root was gone",
+                queued.len()
+            );
+        }
+        assert_eq!(
+            store.indexed_schedule_count(),
+            0,
+            "precondition for what follows: the blip pruned every entry; index \
+             holds {:?}",
+            indexed_due_keys(&store)
+        );
+        assert!(
+            store.is_resident_for_tests("alpha") && store.is_resident_for_tests("beta"),
+            "and both Brains are still resident -- pruning drops index entries, \
+             not the in-memory state. This is precisely the state with no route \
+             back: `ensure_loaded` short-circuits on residency before it would \
+             reindex"
+        );
+
+        std::fs::rename(&stashed, &root).unwrap();
+        store.warm_schedule_index();
+
+        assert_eq!(
+            store.due_schedule_brains(u64::MAX),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the warm after the root returned must restore every pruned entry, \
+             resident or not. It holds {:?}; the Brain root holds [{}]. An empty \
+             index here is a daemon that has silently stopped delivering all \
+             scheduled work until it is restarted",
+            indexed_due_keys(&store),
+            directory_listing(&root)
+        );
+        assert_eq!(
+            store.indexed_schedule_count(),
+            2,
+            "both schedules, not merely one; index holds {:?}",
+            indexed_due_keys(&store)
+        );
+        assert_eq!(
+            (
+                store.snapshot("alpha").unwrap().brain_id,
+                store.snapshot("beta").unwrap().brain_id
+            ),
+            (alpha_id, beta_id),
+            "and both must come back as the same Brains, not as fresh \
+             identities minted while the root was away"
         );
     }
 
