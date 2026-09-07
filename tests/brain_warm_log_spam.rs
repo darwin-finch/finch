@@ -397,6 +397,76 @@ fn test_an_archived_brain_is_never_reported_as_recovered_when_its_name_is_reused
     assert_failure_line_is_actionable(failures[0], "reused", &events);
 }
 
+/// A Brain removed through `remove_if_unused` frees its name for a fresh
+/// failure.
+///
+/// This is the eviction on the per-name cleanup checklist, as opposed to the
+/// reconciliation that catches `rm -rf`. It is the narrow window the checklist
+/// exists for: a Brain fails, is repaired on disk, is removed through the API,
+/// and a *different* broken Brain is created under the same name before the
+/// next warm. Reconciliation cannot help — the directory is present at every
+/// enumeration — so without the eviction the new Brain inherits its
+/// predecessor's entry and its first failure is never reported.
+///
+/// Only the log can tell the two apart: the registry holds `["recycled"]`
+/// either way. That is exactly why a review mutant deleting this eviction
+/// survived 124 tests.
+#[test]
+fn test_a_brain_removed_through_the_api_frees_its_name_for_a_fresh_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("brains");
+    std::fs::create_dir_all(&root).unwrap();
+    let good = {
+        let seeding = BrainStore::with_root("box.local", Some(root.clone()));
+        seeding
+            .attach("recycled", "alice", AttachmentRole::Driver, None)
+            .expect("attach");
+        std::fs::read(root.join("recycled").join("metadata.json")).expect("read metadata")
+    };
+    let metadata = root.join("recycled").join("metadata.json");
+    std::fs::write(&metadata, "{not json").expect("corrupt metadata");
+
+    let store = BrainStore::with_root("box.local", Some(root.clone()));
+    let events = with_captured_events(|| {
+        store.warm_schedule_index();
+
+        // Repaired on disk, then removed through the API. `remove_if_unused`
+        // begins with `ensure_loaded`, so the repair is what makes the removal
+        // reachable at all for a Brain that was broken.
+        std::fs::write(&metadata, &good).expect("repair metadata");
+        assert!(
+            store
+                .remove_if_unused("recycled")
+                .expect("remove the repaired, unused Brain"),
+            "precondition: a repaired Brain with no substantive history is removable"
+        );
+
+        // A different Brain, same name, broken. Its first failure is the line
+        // #380 exists to guarantee.
+        create_broken_brain(&root, "recycled");
+        store.warm_schedule_index();
+    });
+
+    let failures = warm_failures(&events);
+    assert_eq!(
+        failures.len(),
+        2,
+        "two distinct Brains held this name and both failed, so both must be \
+         reported. One warn here means the removed Brain's entry outlived it \
+         and swallowed the first failure of its successor. Captured:\n{captured}",
+        captured = transcript(&events)
+    );
+    for failure in &failures {
+        assert_failure_line_is_actionable(failure, "recycled", &events);
+    }
+    assert!(
+        warm_recoveries(&events).is_empty(),
+        "neither Brain was ever repaired in place; the first was removed and \
+         the second is still broken. Captured:\n{captured}",
+        captured = transcript(&events)
+    );
+}
+
 /// A Brain removed outside the store is evicted, and its name starts fresh.
 ///
 /// `rm -rf` on the directory is the remediation an operator reaches for first
