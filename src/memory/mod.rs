@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
@@ -488,6 +488,12 @@ pub struct MemorySystem {
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
     hydration: Arc<HydrationState>,
+    /// Whether a pending-projection sweep is still owed.
+    ///
+    /// Shared with the background loader, which runs the sweep the moment
+    /// hydration completes — before `MemorySystem` itself exists. See
+    /// `ProjectionContext`.
+    needs_projection_sweep: Arc<AtomicBool>,
     /// Owned so the loader does not outlive the store it is loading.
     ///
     /// A discarded handle left the task decoding the whole database into a tree
@@ -503,6 +509,58 @@ impl Drop for MemorySystem {
         }
     }
 }
+
+/// Everything the pending-projection sweep needs, without a `MemorySystem`.
+///
+/// The background loader is spawned from inside `new`, before `Self` is
+/// constructed, so the sweep it runs on completion cannot be a `&self` method.
+/// These are the same `Arc`s the store then holds, so the loader's sweep and a
+/// later interactive one contend on one `insert_lock` and mutate one tree.
+#[derive(Clone)]
+struct ProjectionContext {
+    db: Arc<Mutex<Connection>>,
+    tree: Arc<Mutex<MemTree>>,
+    hydration: Arc<HydrationState>,
+    embedding_engine: Arc<dyn EmbeddingEngine>,
+    insert_lock: Arc<Mutex<()>>,
+    needs_projection_sweep: Arc<AtomicBool>,
+}
+
+/// A durably stored conversation with no `memory_sources` row: stored, never
+/// projected. See `PENDING_PROJECTION_SQL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingConversation {
+    id: String,
+    role: String,
+    content: String,
+    timestamp: i64,
+}
+
+/// The pending-projection predicate.
+///
+/// A conversation is pending exactly when it has no `memory_sources` row at
+/// all. That is unambiguous only because a classifier-discarded turn is
+/// recorded with `node_id = NULL` rather than with no row (see `schema.sql`),
+/// so "no row" means "projection never ran", never "projection ran and
+/// declined". Any change that stops writing the NULL row silently converts
+/// every discarded turn into a permanently pending one that this sweep would
+/// re-classify on every startup.
+///
+/// Ordered by `timestamp`, so a backlog is replayed in the order the turns were
+/// actually spoken; `MemTree` placement depends on what is already in the tree,
+/// so an arbitrary order would place a backlog differently on every run.
+///
+/// `?1` excludes one conversation id, and NULL excludes nothing — `IS NOT`
+/// rather than `<>` precisely so a NULL parameter keeps every row. The write
+/// path binds the turn it is about to project, because a named-Brain retry of a
+/// turn whose first projection failed would otherwise have that turn repaired
+/// by the sweep and then report itself a no-op, changing what
+/// `insert_brain_conversation` returns to its caller.
+const PENDING_PROJECTION_SQL: &str = "SELECT c.id, c.role, c.content, c.timestamp
+     FROM conversations c
+     LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
+     WHERE ms.conversation_id IS NULL AND c.id IS NOT ?1
+     ORDER BY c.timestamp ASC, c.id ASC";
 
 /// Canonical source identity for a conversation pair projected from one
 /// successful named-Brain run.
@@ -767,6 +825,20 @@ impl MemorySystem {
         }
         let db = Arc::new(Mutex::new(conn));
         let tree = Arc::new(Mutex::new(tree));
+        // Built before the loader is spawned, because the loader owns half of
+        // it: the sweep it runs on completion has to serialize against
+        // interactive writes on the SAME `insert_lock`, and clear the SAME
+        // flag, as the store this function is about to return.
+        let insert_lock = Arc::new(Mutex::new(()));
+        let needs_projection_sweep = Arc::new(AtomicBool::new(true));
+        let projection = ProjectionContext {
+            db: Arc::clone(&db),
+            tree: Arc::clone(&tree),
+            hydration: Arc::clone(&hydration),
+            embedding_engine: Arc::clone(&embedding_engine),
+            insert_lock: Arc::clone(&insert_lock),
+            needs_projection_sweep: Arc::clone(&needs_projection_sweep),
+        };
         let mut hydration_task = None;
 
         if node_count > 0 {
@@ -794,9 +866,8 @@ impl MemorySystem {
             match flavor {
                 Some(tokio::runtime::RuntimeFlavor::MultiThread) => {
                     let handle = tokio::runtime::Handle::current();
-                    let db = Arc::clone(&db);
-                    let tree = Arc::clone(&tree);
                     let state = Arc::clone(&hydration);
+                    let projection = projection.clone();
                     // Constructed HERE, outside the async block, and moved in.
                     //
                     // Building it inside the block means it does not exist
@@ -808,7 +879,7 @@ impl MemorySystem {
                     let guard = HydrationGuard(Arc::clone(&state));
                     hydration_task = Some(handle.spawn(async move {
                         let _guard = guard;
-                        Self::hydrate_in_background(db, tree, state).await;
+                        Self::hydrate_in_background(projection).await;
                     }));
                 }
                 _ => {
@@ -862,8 +933,9 @@ impl MemorySystem {
             db,
             tree,
             hydration,
+            needs_projection_sweep,
             hydration_task,
-            insert_lock: Arc::new(Mutex::new(())),
+            insert_lock,
             embedding_engine,
             config,
         })
@@ -938,6 +1010,24 @@ impl MemorySystem {
             .map(|source| i64::try_from(source.request_seq))
             .transpose()
             .context("Brain request sequence exceeds SQLite INTEGER range")?;
+
+        // Repair the backlog BEFORE this turn's own `INSERT INTO
+        // conversations`, and never this turn itself.
+        //
+        // Both halves matter. After the insert, this turn is itself pending, so
+        // a sweep would project it and the tail of this function would then
+        // project it a second time — the `already_classified` short-circuit is
+        // below, and would already have been passed. And a named-Brain retry of
+        // a turn whose first projection failed has its row in place already, so
+        // the sweep is excluded from it explicitly; otherwise the retry reports
+        // itself a no-op and its caller counts nothing inserted.
+        //
+        // Here as well as in the loader because the current-thread arm of `new`
+        // completes hydration synchronously and has no task to hang the sweep
+        // on; the flag keeps this to a single scan per process rather than one
+        // per turn. It never blocks a turn: a sweep is attempted only once
+        // hydration has already settled `Ready`.
+        Self::sweep_pending_projections_if_owed(&self.projection(), Some(id.as_str())).await;
 
         // Store in SQLite
         let inserted = {
@@ -1015,18 +1105,70 @@ impl MemorySystem {
         //
         // Refusing here leaves the conversation row written and no
         // `memory_sources` row. That preserves the irreplaceable raw turn for
-        // explicit inspection, but automatic re-projection of this pending
-        // state is not implemented yet and is tracked in #339.
+        // explicit inspection; the row is then *pending projection*, and
+        // `sweep_pending_projections` repairs it the next time a hydration
+        // completes cleanly (#339).
         self.ensure_hydrated().await?;
+
+        Self::project_stored_conversation(
+            &self.projection(),
+            &PendingConversation {
+                id: id.clone(),
+                role: role.to_string(),
+                content: content.to_string(),
+                timestamp,
+            },
+        )
+        .await?;
+
+        tracing::debug!("Inserted conversation into memory: {} chars", content.len());
+
+        Ok(true)
+    }
+
+    /// The `Arc`s the pending-projection sweep needs, as the loader holds them.
+    fn projection(&self) -> ProjectionContext {
+        ProjectionContext {
+            db: Arc::clone(&self.db),
+            tree: Arc::clone(&self.tree),
+            hydration: Arc::clone(&self.hydration),
+            embedding_engine: Arc::clone(&self.embedding_engine),
+            insert_lock: Arc::clone(&self.insert_lock),
+            needs_projection_sweep: Arc::clone(&self.needs_projection_sweep),
+        }
+    }
+
+    /// Project one already-stored conversation into the semantic index and
+    /// record its `memory_sources` row.
+    ///
+    /// Shared by the ordinary write path and the pending-projection sweep, so
+    /// a repaired turn is classified, placed, and attributed by exactly the
+    /// same code as a turn projected on the first attempt. A second
+    /// implementation would be free to drift on the one thing that makes the
+    /// pending predicate work: the `node_id = NULL` row for a discarded turn.
+    ///
+    /// The caller holds `insert_lock` and has already established that
+    /// hydration is usable.
+    async fn project_stored_conversation(
+        ctx: &ProjectionContext,
+        pending: &PendingConversation,
+    ) -> Result<()> {
+        let PendingConversation {
+            id,
+            role,
+            content,
+            timestamp,
+        } = pending;
+        let timestamp = *timestamp;
 
         // Quality filter: classify and extract key content before indexing.
         // Low-signal content (acks, greetings) is skipped in MemTree but still
         // written to the conversations table above for raw history.
         let classifier = MemoryClassifier::new();
         if let Some((key_content, importance)) = classifier.process(role, content) {
-            let embedding = self.embedding_engine.embed(&key_content)?;
+            let embedding = ctx.embedding_engine.embed(&key_content)?;
             let effect = {
-                let mut tree = self.tree.lock().await;
+                let mut tree = ctx.tree.lock().await;
                 tree.insert_with_effect(key_content, embedding, importance.as_u8())
             };
             let effect = match effect {
@@ -1048,7 +1190,11 @@ impl MemorySystem {
                     // produce, and replacing it with a generic SQLite error
                     // would leave a structurally corrupt store looking like a
                     // transient I/O problem.
-                    if let Err(reload_error) = self.reload_tree_from_db().await {
+                    // This turn is now stranded exactly as #339 describes, so
+                    // re-arm the sweep rather than leaving the repair to the
+                    // next process start.
+                    ctx.needs_projection_sweep.store(true, Ordering::SeqCst);
+                    if let Err(reload_error) = Self::reload_tree(ctx).await {
                         // `?`, not `%`: `Display` on an `anyhow::Error` prints
                         // only the outermost message and drops the source chain,
                         // which is where a restore failure's actual cause lives.
@@ -1066,9 +1212,13 @@ impl MemorySystem {
             // consistent across process restarts and FK constraints are satisfied.
             // The source mapping commits in the same SQLite transaction, so a
             // retry cannot create a second semantic leaf for the same turn.
-            if let Err(error) = self
-                .save_all_nodes_to_db(Some((node_id, &id, timestamp)), effect.promotion)
-                .await
+            if let Err(error) = Self::save_all_nodes_to_db(
+                &ctx.db,
+                &ctx.tree,
+                Some((node_id, id.as_str(), timestamp)),
+                effect.promotion,
+            )
+            .await
             {
                 // The SQLite transaction rolled back, but insertion already
                 // mutated the in-memory tree. Rebuild it from the durable
@@ -1079,7 +1229,8 @@ impl MemorySystem {
                 // the same reason as the branch above: replacing the error the
                 // caller actually needs with a second, coincidental one hides
                 // what went wrong.
-                if let Err(reload_error) = self.reload_tree_from_db().await {
+                ctx.needs_projection_sweep.store(true, Ordering::SeqCst);
+                if let Err(reload_error) = Self::reload_tree(ctx).await {
                     tracing::error!(
                         ?reload_error,
                         "could not restore the MemTree after a failed save; the \
@@ -1089,17 +1240,153 @@ impl MemorySystem {
                 return Err(error);
             }
         } else {
-            let conn = self.db.lock().await;
+            // A classifier-discarded turn is TERMINAL, not pending.
+            //
+            // This row, with its NULL `node_id`, is the only thing that lets
+            // "no `memory_sources` row" mean "never projected". Drop it and
+            // every low-signal turn becomes permanently pending, and the sweep
+            // re-classifies the whole backlog on every startup.
+            let conn = ctx.db.lock().await;
             conn.execute(
                 "INSERT INTO memory_sources (conversation_id, node_id, indexed_at)
                  VALUES (?1, NULL, ?2)",
-                params![&id, timestamp],
+                params![id, timestamp],
             )?;
         }
 
-        tracing::debug!("Inserted conversation into memory: {} chars", content.len());
+        Ok(())
+    }
 
-        Ok(true)
+    /// Every stored conversation that was never projected.
+    ///
+    /// Read in one shot rather than streamed: projecting mutates
+    /// `memory_sources`, which is the table the predicate reads, so holding a
+    /// cursor across the writes that invalidate it would be reading a moving
+    /// set.
+    async fn pending_projections(
+        db: &Mutex<Connection>,
+        exclude: Option<&str>,
+    ) -> Result<Vec<PendingConversation>> {
+        let conn = db.lock().await;
+        let mut stmt = conn
+            .prepare(PENDING_PROJECTION_SQL)
+            .context("Failed to prepare the pending-projection query")?;
+        let rows = stmt
+            .query_map(params![exclude], |row| {
+                Ok(PendingConversation {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    timestamp: row.get(3)?,
+                })
+            })
+            .context("Failed to read conversations pending projection")?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Project every pending conversation exactly once.
+    ///
+    /// Exactly-once is a property of the predicate, not of a counter: a row
+    /// leaves the pending set precisely when its `memory_sources` row commits,
+    /// and that row commits in the SAME SQLite transaction as the semantic leaf
+    /// (`write_nodes`). So a repeated sweep re-reads the predicate and finds
+    /// nothing, and a sweep interrupted between two rows resumes at the first
+    /// row that has not committed. There is no window in which a leaf exists
+    /// without its mapping, and therefore none in which a second sweep could
+    /// place the same turn twice.
+    ///
+    /// The caller holds `insert_lock`.
+    ///
+    /// Stops at the first row that fails rather than continuing, and leaves the
+    /// sweep flag armed. A failure here means the store itself is unwell —
+    /// embedding, placement, or commit — and grinding the rest of a backlog
+    /// through it would turn one diagnosable error into a log full of them.
+    async fn sweep_pending_projections_locked(
+        ctx: &ProjectionContext,
+        exclude: Option<&str>,
+    ) -> Result<usize> {
+        // `Ready` only.
+        //
+        // `Degraded` accepts interactive writes (#288) because refusing a live
+        // turn over one unreadable row is the larger harm. A backlog is not a
+        // live turn: nothing is lost by waiting for a clean load, and placing
+        // a whole backlog into a prefix of the tree would durably misplace
+        // every row in it. `Failed` and `Loading` are refusals for the reasons
+        // `ensure_hydrated` gives.
+        if !matches!(ctx.hydration.status(), HydrationStatus::Ready { .. }) {
+            return Ok(0);
+        }
+        let pending = Self::pending_projections(&ctx.db, exclude).await?;
+        if pending.is_empty() {
+            // Not "nothing is pending" when a row was excluded: the excluded
+            // turn is about to be projected by its own caller, so the sweep is
+            // still discharged either way.
+            ctx.needs_projection_sweep.store(false, Ordering::SeqCst);
+            return Ok(0);
+        }
+        tracing::info!(
+            pending = pending.len(),
+            "reprojecting conversations stranded by an earlier failed hydration"
+        );
+        let mut repaired = 0usize;
+        for conversation in &pending {
+            Self::project_stored_conversation(ctx, conversation)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to reproject stranded conversation {} \
+                         ({repaired} of {} repaired)",
+                        conversation.id,
+                        pending.len()
+                    )
+                })?;
+            repaired += 1;
+        }
+        ctx.needs_projection_sweep.store(false, Ordering::SeqCst);
+        Ok(repaired)
+    }
+
+    /// Run the sweep if one is still owed, reporting failure to the log.
+    ///
+    /// Used by the hooks that must not fail their caller: the background loader
+    /// has nobody to return to, and an interactive turn must not be refused
+    /// because an unrelated older turn could not be repaired.
+    async fn sweep_pending_projections(ctx: &ProjectionContext) {
+        if !ctx.needs_projection_sweep.load(Ordering::SeqCst) {
+            return;
+        }
+        let _guard = ctx.insert_lock.lock().await;
+        Self::sweep_pending_projections_if_owed(ctx, None).await;
+    }
+
+    /// As `sweep_pending_projections`, for a caller that already holds
+    /// `insert_lock`.
+    async fn sweep_pending_projections_if_owed(ctx: &ProjectionContext, exclude: Option<&str>) {
+        if !ctx.needs_projection_sweep.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Err(error) = Self::sweep_pending_projections_locked(ctx, exclude).await {
+            // The flag stays armed, so the next completed hydration or the next
+            // write tries again.
+            tracing::warn!(
+                ?error,
+                "could not reproject conversations stranded by a failed hydration"
+            );
+        }
+    }
+
+    /// Project every conversation that was stored but never indexed, and report
+    /// how many were repaired.
+    ///
+    /// Deliberately unconditional: it ignores the "sweep owed" flag the
+    /// automatic hooks consult, so a caller asking for recovery gets a real
+    /// pass over the predicate. Running it twice must report a second count of
+    /// zero and change nothing — that is the exactly-once property, and a flag
+    /// short-circuit would hide a violation of it rather than prevent one.
+    pub async fn recover_pending_projections(&self) -> Result<usize> {
+        let ctx = self.projection();
+        let _guard = ctx.insert_lock.lock().await;
+        Self::sweep_pending_projections_locked(&ctx, None).await
     }
 
     /// Structural summary of the semantic index: (leaf count, max depth,
@@ -1270,8 +1557,13 @@ impl MemorySystem {
     /// whole store: on the dogfood host, 16,782 rows and 131 MiB of embeddings
     /// rewritten per turn, which is why its write-ahead log matched its
     /// database at 142 MiB (#250).
+    /// Takes the locks rather than `&self`: the pending-projection sweep runs
+    /// inside the background loader, which is spawned before `MemorySystem`
+    /// exists, so it holds these `Arc`s and has no `&self`. One implementation,
+    /// same locks, same order.
     async fn save_all_nodes_to_db(
-        &self,
+        db: &Mutex<Connection>,
+        tree_lock: &Mutex<MemTree>,
         source: Option<(NodeId, &str, i64)>,
         promotion: Option<(NodeId, NodeId)>,
     ) -> Result<()> {
@@ -1296,8 +1588,8 @@ impl MemorySystem {
         // would have found it. There is no await between the copy and the
         // commit now, and the guard is held throughout, so correctness does
         // not depend on that.
-        let conn = self.db.lock().await;
-        let mut tree = self.tree.lock().await;
+        let conn = db.lock().await;
+        let mut tree = tree_lock.lock().await;
 
         // One cost worth naming: the tree guard now spans `tx.commit()`. The
         // store is a single well-known file and rusqlite defaults to a 5s busy
@@ -1411,9 +1703,19 @@ impl MemorySystem {
     }
 
     async fn reload_tree_from_db(&self) -> Result<()> {
-        let mut restored = MemTree::new_with_dim(self.embedding_engine.dimension());
+        // A store that has just been rebuilt may be a store whose failed
+        // hydration stranded turns, so re-arm the sweep: `clear_failure` below
+        // is exactly the transition from "writes refused" to "writes placed",
+        // and #339 is about that transition never being acted on.
+        self.needs_projection_sweep.store(true, Ordering::SeqCst);
+        Self::reload_tree(&self.projection()).await
+    }
+
+    /// The body of `reload_tree_from_db`, over the `Arc`s rather than `self`.
+    async fn reload_tree(ctx: &ProjectionContext) -> Result<()> {
+        let mut restored = MemTree::new_with_dim(ctx.embedding_engine.dimension());
         {
-            let conn = self.db.lock().await;
+            let conn = ctx.db.lock().await;
             Self::load_tree_from_db_conn(&conn, &mut restored)?;
         }
         let nodes = restored.all_nodes().len();
@@ -1421,13 +1723,13 @@ impl MemorySystem {
         // pending. `new_with_dim` marks the root dirty for the fresh-store
         // case; here that row already exists.
         restored.clear_dirty();
-        *self.tree.lock().await = restored;
+        *ctx.tree.lock().await = restored;
         // The tree now matches the durable snapshot, so whatever the loader
         // recorded no longer describes it. Leaving the failure set meant a
         // store that had been rebuilt successfully still refused every write,
         // with no way back short of a restart that would re-read the same rows
         // and fail again (#288).
-        self.hydration.clear_failure(nodes);
+        ctx.hydration.clear_failure(nodes);
         Ok(())
     }
 
@@ -1453,19 +1755,37 @@ impl MemorySystem {
     /// exists to remove. Every node is linked as its batch lands. The final
     /// pass stays, both as a safety net and to cover rows written after the
     /// edge query.
-    async fn hydrate_in_background(
-        db: Arc<Mutex<Connection>>,
-        tree: Arc<Mutex<MemTree>>,
-        state: Arc<HydrationState>,
-    ) {
+    async fn hydrate_in_background(projection: ProjectionContext) {
         // Every parent's child list, before any node lands. See the doc
         // comment: an unlinked node is indistinguishable from a leaf, and reads
         // are not gated on hydration.
         let edges = {
-            let conn = db.lock().await;
+            let conn = projection.db.lock().await;
             Self::load_child_edges(&conn)
         };
-        Self::hydrate_batches(db, tree, state, Self::edges_or_degraded(edges)).await;
+        Self::hydrate_batches(
+            Arc::clone(&projection.db),
+            Arc::clone(&projection.tree),
+            Arc::clone(&projection.hydration),
+            Self::edges_or_degraded(edges),
+        )
+        .await;
+
+        // The reopen half of #339.
+        //
+        // A turn stored while an earlier hydration was broken kept its
+        // `conversations` row and got no `memory_sources` row, and nothing ever
+        // looked at it again: ordinary retries mint a fresh UUID, so they
+        // cannot repair the original row. Sweeping here is what makes the
+        // stranding transient — the next successful load projects it.
+        //
+        // AFTER `hydrate_batches`, never inside it. The sweep takes
+        // `insert_lock`, and a writer holds that lock while awaiting hydration
+        // to finish; taking it before `complete()` fires would deadlock the two
+        // against each other. `hydrate_batches` has already completed (or
+        // failed) the hydration by the time it returns, so the writer can
+        // always make progress and release.
+        Self::sweep_pending_projections(&projection).await;
     }
 
     /// Degrade, do not abandon hydration.
@@ -3830,8 +4150,10 @@ mod tests {
     /// of the `INSERT INTO conversations`, so refusing dropped the raw turn as
     /// well as its index entry — worse than the misplacement it was
     /// preventing, because raw history is the thing a user cannot
-    /// reconstruct. It also leaves no `memory_sources` row, which is the state
-    /// a later re-projection repairs.
+    /// reconstruct. It also leaves no `memory_sources` row, which is the
+    /// pending-projection state
+    /// `test_a_stranded_conversation_is_reprojected_when_hydration_next_succeeds`
+    /// starts from.
     #[tokio::test]
     async fn test_a_refused_index_write_still_keeps_the_raw_conversation() -> Result<()> {
         let temp = NamedTempFile::new()?;
@@ -3872,7 +4194,404 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?;
         assert_eq!(
             sources, 0,
-            "and it must be left unindexed, so a re-projection can repair it"
+            "and it must be left unindexed, which is what makes it pending \
+             projection: no memory_sources row at all, as distinct from the \
+             NULL-node_id row a classifier-discarded turn gets; \
+             raw_conversations={rows}"
+        );
+        Ok(())
+    }
+
+    // ── #339: conversations stranded by a failed hydration ───────────────────
+
+    /// Projected successfully before hydration is broken, so the reopened store
+    /// has persisted nodes to hydrate and therefore spawns a loader.
+    const SEED_TURN: &str = "The Linux release runner must be ubuntu-24.04 or \
+                             newer, because the ort crate needs glibc 2.38.";
+
+    /// Stored raw while the index was unusable, and never projected.
+    const STRANDED_TURN: &str = "The hydration loader ended without finishing, \
+                                 so this turn was kept as raw history and never \
+                                 placed in the semantic index.";
+
+    /// `(conversations, memory_sources, tree_nodes)` read through a fresh
+    /// connection, so it reports what is durable rather than what some
+    /// in-memory tree believes.
+    fn store_counts(db_path: &std::path::Path) -> Result<(i64, i64, i64)> {
+        let conn = Connection::open(db_path)?;
+        Ok((
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM memory_sources", [], |row| row.get(0))?,
+            conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))?,
+        ))
+    }
+
+    /// The three states a stored conversation can be in, as the durable rows
+    /// report them.
+    ///
+    /// `None` — no `memory_sources` row at all: pending projection.
+    /// `Some(None)` — the classifier discarded it: terminal, never pending.
+    /// `Some(Some(node))` — projected onto that semantic leaf.
+    fn source_row(db_path: &std::path::Path, conversation_id: &str) -> Result<Option<Option<i64>>> {
+        let conn = Connection::open(db_path)?;
+        let mut stmt =
+            conn.prepare("SELECT node_id FROM memory_sources WHERE conversation_id = ?1")?;
+        let mut rows = stmt.query([conversation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, Option<i64>>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn conversation_id_for_session(db_path: &std::path::Path, session: &str) -> Result<String> {
+        let conn = Connection::open(db_path)?;
+        Ok(conn.query_row(
+            "SELECT id FROM conversations WHERE session_id = ?1",
+            [session],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Reproduce the #339 state and leave the store closed.
+    ///
+    /// One turn projected normally — which is what gives the reopened store
+    /// persisted nodes to hydrate — then hydration is failed the way a loader
+    /// that ended without finishing fails it, and a second substantive turn is
+    /// written. That second write keeps its raw `conversations` row (#276) and
+    /// gets no `memory_sources` row: stored, never projected, and before this
+    /// change nothing ever looked at it again.
+    async fn strand_a_conversation(config: &MemoryConfig) -> Result<()> {
+        let memory = MemorySystem::new(config.clone())?;
+        memory
+            .insert_conversation("user", SEED_TURN, None, Some("seed"))
+            .await
+            .context("the seeding turn must project normally")?;
+        memory
+            .hydration
+            .fail("loader ended without finishing".to_string());
+        let refused = memory
+            .insert_conversation("user", STRANDED_TURN, None, Some("stranded"))
+            .await
+            .expect_err("precondition: a broken index must refuse the placement");
+        assert!(
+            refused.to_string().contains("cannot be placed"),
+            "precondition: the refusal must come from the hydration gate; got {refused}"
+        );
+
+        let counts = store_counts(&config.db_path)?;
+        let stranded = conversation_id_for_session(&config.db_path, "stranded")?;
+        assert_eq!(
+            (counts.0, counts.1),
+            (2, 1),
+            "precondition: both raw turns stored, only the seeded one projected; \
+             counts=(conversations, memory_sources, tree_nodes)={counts:?}"
+        );
+        assert_eq!(
+            source_row(&config.db_path, &stranded)?,
+            None,
+            "precondition: the stranded turn must have NO memory_sources row, \
+             which is what distinguishes it from a discarded one; \
+             stranded={stranded}, counts={counts:?}"
+        );
+        Ok(())
+    }
+
+    /// The defect: a turn stored while hydration was broken stayed unprojected
+    /// forever.
+    ///
+    /// Nothing scanned for `conversations` rows without a `memory_sources` row,
+    /// and an ordinary retry mints a fresh UUID, so it cannot repair the
+    /// original row. Reopening the store is the moment the repair is possible,
+    /// and this asserts it now happens there.
+    ///
+    /// The loader's `JoinHandle` is the synchronisation: the sweep runs inside
+    /// the loader future, so the handle resolving means the sweep has finished.
+    /// No polling and no sleep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_stranded_conversation_is_reprojected_when_hydration_next_succeeds() -> Result<()>
+    {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        strand_a_conversation(&config).await?;
+        let stranded = conversation_id_for_session(temp.path(), "stranded")?;
+        let before = store_counts(temp.path())?;
+
+        let mut reopened = MemorySystem::new(config)?;
+        let loader = reopened.hydration_task.take().expect(
+            "a reopened store with persisted nodes must spawn a loader on a \
+             multi-threaded runtime",
+        );
+        loader
+            .await
+            .expect("the loader must finish rather than panic or be cancelled");
+
+        let after = store_counts(temp.path())?;
+        let projected = source_row(temp.path(), &stranded)?;
+        assert!(
+            matches!(projected, Some(Some(_))),
+            "the stranded turn must be projected onto a semantic leaf when \
+             hydration next succeeds; source_row={projected:?}, \
+             status={:?}, before=(conv, sources, nodes)={before:?}, after={after:?}, \
+             stranded={stranded}",
+            reopened.hydration_status()
+        );
+        assert_eq!(
+            after.0, before.0,
+            "recovery must not duplicate raw conversations; \
+             before={before:?}, after={after:?}, stranded={stranded}"
+        );
+        assert_eq!(
+            after.1,
+            before.1 + 1,
+            "exactly one source mapping must be added, for the one pending turn; \
+             before={before:?}, after={after:?}, stranded={stranded}"
+        );
+
+        let results = reopened.query(STRANDED_TURN, Some(8)).await?;
+        assert!(
+            results.iter().any(|result| result == STRANDED_TURN),
+            "the repaired turn must be reachable by semantic recall, not merely \
+             carry a database row; results={results:?}, source_row={projected:?}, \
+             status={:?}",
+            reopened.hydration_status()
+        );
+
+        let again = reopened.recover_pending_projections().await?;
+        assert_eq!(
+            again,
+            0,
+            "the repaired turn must have left the pending set, so a second sweep \
+             finds nothing; after={after:?}, now={:?}, stranded={stranded}",
+            store_counts(temp.path())?
+        );
+        Ok(())
+    }
+
+    /// Repair is exactly-once, and that is a property of the predicate rather
+    /// than of a flag.
+    ///
+    /// `recover_pending_projections` deliberately ignores the "sweep owed"
+    /// bookkeeping the automatic hooks consult, so this really re-runs the
+    /// query. A row leaves the pending set only when its `memory_sources` row
+    /// commits, and that commits in the same SQLite transaction as its semantic
+    /// leaf — so a second pass can neither re-place the turn nor mint a second
+    /// leaf for it.
+    ///
+    /// Current-thread on purpose: `new` hydrates synchronously and spawns no
+    /// loader, so every sweep here is one this test asked for.
+    #[tokio::test]
+    async fn test_reprojecting_a_stranded_conversation_happens_exactly_once() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        strand_a_conversation(&config).await?;
+        let stranded = conversation_id_for_session(temp.path(), "stranded")?;
+
+        let reopened = MemorySystem::new(config)?;
+        assert!(
+            reopened.hydration_task.is_none(),
+            "precondition: the current-thread arm loads synchronously and spawns \
+             no loader, so no sweep can run behind this test's back"
+        );
+        assert!(
+            matches!(reopened.hydration_status(), HydrationStatus::Ready { .. }),
+            "precondition: the reopened store must hydrate cleanly, or there is \
+             nothing to repair into; got {:?}",
+            reopened.hydration_status()
+        );
+
+        let first = reopened.recover_pending_projections().await?;
+        let after_first = store_counts(temp.path())?;
+        let node_after_first = source_row(temp.path(), &stranded)?;
+        assert_eq!(
+            first, 1,
+            "the one pending turn must be repaired; counts=(conv, sources, nodes)\
+             ={after_first:?}, source_row={node_after_first:?}, stranded={stranded}"
+        );
+        assert!(
+            matches!(node_after_first, Some(Some(_))),
+            "and repaired means attributed to a leaf; source_row={node_after_first:?}, \
+             counts={after_first:?}, stranded={stranded}"
+        );
+
+        let second = reopened.recover_pending_projections().await?;
+        let after_second = store_counts(temp.path())?;
+        let node_after_second = source_row(temp.path(), &stranded)?;
+        assert_eq!(
+            second, 0,
+            "a repeated sweep must find nothing pending; \
+             after_first={after_first:?}, after_second={after_second:?}, \
+             stranded={stranded}"
+        );
+        assert_eq!(
+            after_second, after_first,
+            "and must change no row counts: (conversations, memory_sources, \
+             tree_nodes); stranded={stranded}"
+        );
+        assert_eq!(
+            node_after_second, node_after_first,
+            "and must not re-point the repaired turn at a second leaf; \
+             counts={after_second:?}, stranded={stranded}"
+        );
+        Ok(())
+    }
+
+    /// A turn the quality classifier discarded is terminal, not pending.
+    ///
+    /// This is what makes the pending predicate unambiguous: a discarded turn
+    /// gets a `memory_sources` row with `node_id = NULL`, so "no row at all"
+    /// can only mean "projection never ran". Stop writing that row and every
+    /// low-signal turn becomes permanently pending, and the sweep re-classifies
+    /// the whole backlog on every startup.
+    #[tokio::test]
+    async fn test_a_classifier_discarded_conversation_is_not_pending_projection() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        // Under the classifier's 20-character floor, so it is discarded.
+        memory
+            .insert_conversation("user", "ok", None, Some("noise"))
+            .await?;
+        let discarded = conversation_id_for_session(temp.path(), "noise")?;
+
+        let row = source_row(temp.path(), &discarded)?;
+        let terminal: Option<Option<i64>> = Some(None);
+        assert_eq!(
+            row, terminal,
+            "a discarded turn must be recorded terminal, as a memory_sources row \
+             with a NULL node_id; got {row:?} for {discarded}"
+        );
+
+        let pending = MemorySystem::pending_projections(&memory.db, None).await?;
+        assert!(
+            pending.is_empty(),
+            "a discarded turn must not look pending, or every low-signal turn is \
+             reprojected on every startup; pending={pending:?}, discarded={discarded}"
+        );
+
+        let before = store_counts(temp.path())?;
+        let swept = memory.recover_pending_projections().await?;
+        let after = store_counts(temp.path())?;
+        assert_eq!(
+            swept, 0,
+            "and a sweep must repair nothing; before=(conv, sources, nodes)\
+             ={before:?}, after={after:?}, discarded={discarded}"
+        );
+        assert_eq!(
+            after, before,
+            "nor add a semantic leaf for content the classifier rejected; \
+             discarded={discarded}"
+        );
+        Ok(())
+    }
+
+    /// Shutting down at the point the repair runs must leave nothing half-done,
+    /// and must not consume the repair.
+    ///
+    /// The loader's completion pause sits immediately before the sweep, so
+    /// aborting there is a causal shutdown at the repair, not a timing guess.
+    /// Nothing partial is possible below it either: the semantic leaf and its
+    /// `memory_sources` row commit in one SQLite transaction inside a
+    /// synchronous `write_nodes`, so there is no await point at which
+    /// cancellation could land between them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelling_the_loader_at_its_sweep_leaves_no_partial_projection() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        };
+        strand_a_conversation(&config).await?;
+        let stranded = conversation_id_for_session(temp.path(), "stranded")?;
+        let before = store_counts(temp.path())?;
+
+        let (_pause_registration, mut completion_reached, _release_completion) =
+            register_hydration_completion_pause(temp.path().to_path_buf());
+        let mut reopened = MemorySystem::new(config)?;
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !*completion_reached.borrow_and_update() {
+                completion_reached
+                    .changed()
+                    .await
+                    .expect("the production loader dropped its completion signal");
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the production loader did not reach the pause that sits at the repair \
+             point; status={:?}, counts={:?}",
+            reopened.hydration_status(),
+            store_counts(temp.path())?
+        );
+
+        let loader = reopened
+            .hydration_task
+            .take()
+            .expect("a paused loader handle must be retained");
+        loader.abort();
+        let join_error = tokio::time::timeout(std::time::Duration::from_secs(5), loader)
+            .await
+            .expect("the cancelled loader must finish")
+            .expect_err("the paused loader must terminate through the cancellation");
+        assert!(
+            join_error.is_cancelled(),
+            "the loader must report cancellation rather than a panic; \
+             join_error={join_error}"
+        );
+
+        let after_abort = store_counts(temp.path())?;
+        let row_after_abort = source_row(temp.path(), &stranded)?;
+        assert_eq!(
+            after_abort, before,
+            "cancelling at the repair point must write nothing at all: \
+             (conversations, memory_sources, tree_nodes); stranded={stranded}"
+        );
+        assert_eq!(
+            row_after_abort, None,
+            "and must leave the turn pending rather than half-attributed; \
+             got {row_after_abort:?}, counts={after_abort:?}, stranded={stranded}"
+        );
+
+        // The repair was not consumed by the cancellation, and is still
+        // exactly-once when it does run.
+        let repaired = reopened.recover_pending_projections().await?;
+        let after_repair = store_counts(temp.path())?;
+        assert_eq!(
+            repaired, 1,
+            "the cancelled sweep must not have consumed the repair; \
+             after_abort={after_abort:?}, after_repair={after_repair:?}, \
+             stranded={stranded}"
+        );
+        assert!(
+            matches!(source_row(temp.path(), &stranded)?, Some(Some(_))),
+            "and the resumed repair must attribute the turn to a leaf; \
+             counts={after_repair:?}, stranded={stranded}"
+        );
+        let again = reopened.recover_pending_projections().await?;
+        assert_eq!(
+            again,
+            0,
+            "with no post-terminal effect from running it once more; \
+             after_repair={after_repair:?}, now={:?}, stranded={stranded}",
+            store_counts(temp.path())?
+        );
+        assert_eq!(
+            store_counts(temp.path())?,
+            after_repair,
+            "and no rows added by the second pass; stranded={stranded}"
         );
         Ok(())
     }
