@@ -182,6 +182,14 @@ fn load_config() -> Result<Config> {
 - **Test the hostile timing and restart cases** for concurrent or durable behavior: cancellation,
   disconnect, timeout, late completion, replacement connection, retry, restart, and replay as
   applicable. Assert exact-once terminal state and absence of post-terminal effects.
+- **Never assert a wall-clock duration** — a test may *report* a timing, and may use a
+  timeout as a liveness bound whose failure message says so, but no elapsed time,
+  ratio, or threshold may be the asserted property. Assert the structural fact the
+  timing was standing in for: hydration state, resident counts, phase order, event
+  sequence, exact-once terminal state. A timing assertion passes on a fast machine
+  with the defect present and fails on a loaded one without it, so it is not evidence
+  in either direction. Established by `a0ea2c64` ("assert hydration state, not a
+  wall-clock ratio"), which replaced exactly such a test.
 - **A green unrelated suite is not regression evidence** — name the test that reproduces the bug
   in the commit message and GitHub verification comment, and record why it failed before the fix.
 - **Manual verification does not replace regression coverage** — document any manual evidence, but
