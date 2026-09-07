@@ -1085,8 +1085,16 @@ pub struct BrainStore {
     run_connection_authority: Arc<RwLock<RunConnectionAuthority>>,
     disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
     effect_audit_storage: Arc<std::sync::Mutex<HashMap<String, EffectAuditStorage>>>,
+    /// Brains whose in-memory projection may disagree with the durable log,
+    /// because an append reported failure after possibly writing.
+    reload_required: Arc<std::sync::Mutex<HashSet<String>>>,
     #[cfg(test)]
     fail_event_batches: Arc<std::sync::atomic::AtomicUsize>,
+    /// Append the batch durably and *then* report failure, reproducing the
+    /// window in `append_journal_value` where `write_all` succeeds and
+    /// `sync_all` does not.
+    #[cfg(test)]
+    fail_batches_after_durable_write: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     fail_cancellation_terminal_appends: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -1319,8 +1327,11 @@ impl BrainStore {
             run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
             disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
             effect_audit_storage: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_required: Arc::new(std::sync::Mutex::new(HashSet::new())),
             #[cfg(test)]
             fail_event_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_batches_after_durable_write: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             fail_cancellation_terminal_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -5125,6 +5136,21 @@ impl BrainStore {
     }
 
     fn ensure_loaded(&self, name: &str) -> Result<()> {
+        // A prior append reported failure with its bytes possibly already in
+        // the log, so this projection cannot be trusted to know the next `seq`.
+        // Drop it and replay, which is the only source that knows what is
+        // actually durable (#377).
+        let invalidated = self
+            .reload_required
+            .lock()
+            .expect("Brain reload registry poisoned")
+            .remove(name);
+        if invalidated {
+            self.brains
+                .write()
+                .expect("shared brain lock poisoned")
+                .remove(name);
+        }
         if self
             .brains
             .read()
@@ -5961,6 +5987,27 @@ impl BrainStore {
         Ok(events)
     }
 
+    /// Record that this Brain's in-memory projection can no longer be trusted.
+    ///
+    /// `append_journal_value` writes with `write_all` and then `sync_all`. A
+    /// failure of the sync — or of the directory sync on a new log — returns
+    /// `Err` with the bytes already in the file, and every caller treats `Err`
+    /// as "nothing was written": the `?` propagates before `state.apply`, so
+    /// `state.revision` still describes the log as it was *before* the append.
+    /// The next writer then computes the same `revision + 1` and appends at a
+    /// `seq` the log already holds, which is unloadable forever after (#377).
+    ///
+    /// `BrainState` is derived entirely from the log, so the safe response to
+    /// "I do not know whether my write landed" is to stop trusting the
+    /// projection and re-derive it. [`BrainStore::ensure_loaded`] does that on
+    /// the next entry, and every mutating path goes through it.
+    fn mark_reload_required(&self, name: &str) {
+        self.reload_required
+            .lock()
+            .expect("Brain reload registry poisoned")
+            .insert(name.to_string());
+    }
+
     fn append_event(&self, name: &str, event: &BrainEvent) -> Result<()> {
         #[cfg(test)]
         if matches!(
@@ -5986,7 +6033,10 @@ impl BrainStore {
         {
             anyhow::bail!("injected reserved cancellation terminal append failure");
         }
-        self.append_journal_value(name, event)
+        self.append_journal_value(name, event).inspect_err(|_| {
+            // The write may have landed. See `mark_reload_required` (#377).
+            self.mark_reload_required(name);
+        })
     }
 
     fn append_event_batch(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
@@ -6010,14 +6060,43 @@ impl BrainStore {
             anyhow::bail!("injected Brain event batch append failure");
         }
         let payload = serde_json::to_vec(events)?;
-        self.append_journal_value(
+        let appended = self.append_journal_value(
             name,
             &BrainJournalRecord::EventBatch {
                 event_count: Some(events.len()),
                 payload_sha256: Some(hex::encode(Sha256::digest(payload))),
                 events: events.to_vec(),
             },
-        )
+        );
+        #[cfg(test)]
+        if appended.is_ok()
+            && self
+                .fail_batches_after_durable_write
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| {
+                        if remaining > 0 {
+                            Some(remaining - 1)
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .is_ok()
+        {
+            // Durably written, then reported as failed: the production window
+            // is `write_all` succeeding and `sync_all` not (#377).
+            self.mark_reload_required(name);
+            anyhow::bail!("injected durable-then-failed Brain event batch append");
+        }
+        appended.inspect_err(|_| self.mark_reload_required(name))
+    }
+
+    #[cfg(test)]
+    fn fail_batches_after_durable_write_for_test(&self, count: usize) {
+        self.fail_batches_after_durable_write
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Atomically replace the canonical journal with an equivalent sequence
@@ -7544,6 +7623,126 @@ mod tests {
                 })
                 .count()
                 <= 1
+        );
+    }
+
+    /// An append that reports failure *after* durably writing must not let the
+    /// next writer reuse its `seq` (#377).
+    ///
+    /// `append_journal_value` does `write_all` then `sync_all`. If the sync
+    /// fails, the bytes are already in the log but the caller sees `Err`, so
+    /// the `?` in `terminalize_run_with_result_if_active` propagates before
+    /// `state.apply` — leaving `state.revision` describing the log as it was
+    /// before the append. The next writer computes the same `revision + 1` and
+    /// appends at a `seq` the log already holds.
+    ///
+    /// That is not hypothetical. It happened on the reference host: two
+    /// `RunStatusChanged` events at `seq: 107`, one millisecond apart, byte
+    /// identical apart from `created_ms`, which made that Brain permanently
+    /// unloadable and took daemon-wide schedule delivery and Brain listing
+    /// down with it.
+    ///
+    /// The existing `fail_next_event_batch_for_test` hook cannot reproduce
+    /// this: it bails *before* writing, which is the benign case where nothing
+    /// landed. This uses a hook that writes and then reports failure.
+    #[test]
+    fn test_a_durable_append_reported_as_failed_does_not_let_the_next_writer_reuse_its_seq() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "crash".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+
+        // Durably append, then report failure — the production window.
+        store.fail_batches_after_durable_write_for_test(1);
+        let first = store.terminalize_run_with_result_if_active(
+            "shared",
+            "daemon",
+            run.run_id,
+            prompt.seq,
+            BrainRunStatus::Failed,
+            "initiating Brain connection disconnected".into(),
+        );
+        assert!(
+            first.is_err(),
+            "precondition: the append must report failure, which is what makes \
+             the caller believe nothing was written"
+        );
+
+        // Exactly what the disconnect retry, or any concurrent terminalizer,
+        // does next.
+        let _second = store.terminalize_run_with_result_if_active(
+            "shared",
+            "daemon",
+            run.run_id,
+            prompt.seq,
+            BrainRunStatus::Failed,
+            "initiating Brain connection disconnected".into(),
+        );
+
+        // The durable log is the thing that has to stay well formed. Read it
+        // from disk rather than from the projection, because the projection is
+        // precisely what was wrong.
+        let log = std::fs::read_to_string(temp.path().join("shared").join("events.jsonl"))
+            .expect("event log");
+        let mut seqs: Vec<u64> = Vec::new();
+        for line in log.lines().filter(|line| !line.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line).expect("journal record");
+            match value.get("events") {
+                Some(serde_json::Value::Array(events)) => {
+                    for event in events {
+                        seqs.push(event["seq"].as_u64().expect("event seq"));
+                    }
+                }
+                _ => seqs.push(value["seq"].as_u64().expect("event seq")),
+            }
+        }
+        let mut duplicates: Vec<u64> = seqs
+            .iter()
+            .filter(|seq| seqs.iter().filter(|other| other == seq).count() > 1)
+            .copied()
+            .collect();
+        duplicates.sort_unstable();
+        duplicates.dedup();
+        assert!(
+            duplicates.is_empty(),
+            "the durable log must never hold two events at one seq. Duplicated \
+             {duplicates:?} out of {seqs:?}. A Brain in this state is rejected \
+             by every later load, permanently, and on the reference host that \
+             stopped schedule delivery and Brain listing for every Brain"
+        );
+
+        // And the Brain must still be loadable, which is the consequence that
+        // actually reached the user.
+        let reopened = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = reopened.snapshot("shared").expect(
+            "a Brain that survived a failed append must still replay; failing \
+             here is the 'duplicate or reordered canonical event sequence' \
+             rejection that made the reference host's Brain unusable",
+        );
+        assert!(
+            snapshot.revision >= run.request_seq,
+            "and its revision must reflect the durable log; got {}",
+            snapshot.revision
         );
     }
 
