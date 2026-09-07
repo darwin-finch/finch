@@ -92,6 +92,15 @@ hand every process they are responsible for to a launcher that is isolated.
 - `tests/no_external_provider_binary_test.rs` is the independent #173
   binary-removal regression. It uses its own `tempfile` HOME and process group;
   it neither constructs a Brain nor reads the user's Finch state.
+- `tests/tui_scrollback_commit.rs` is non-Brain: it spawns one `finch` on a
+  pty with a disposable HOME whose config sets `use_daemon = false`, and with
+  `FINCH_BRAIN_TEST_NO_AUTO_SPAWN=1`, so daemon discovery, reuse and auto-spawn
+  are all refused. It constructs no Brain, binds no endpoint, and clears every
+  inherited supervisor descriptor and address from the child's environment. The
+  child is a plain `Command` spawn that creates no session or process group, so
+  it stays in the supervisor's owned group; `Session::drop` kills and reaps only
+  that child and signals no pid it did not create. The pty is deliberately not
+  made a controlling terminal.
 - `tests/live.rs` and `tests/live/{impcpd,parity,providers}.rs` are ignored,
   credentialed live-provider tests. They do not construct Brains, and their
   documented invocation still uses `scripts/test_brains.sh` so config/cache

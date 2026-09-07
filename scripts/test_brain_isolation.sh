@@ -956,6 +956,7 @@ tests/live/providers.rs
 tests/no_external_provider_binary_test.rs
 tests/service_discovery_test.rs
 tests/startup_time_to_ready.rs
+tests/tui_scrollback_commit.rs
 tests/worker_integration_test.rs
 EOF
 )"

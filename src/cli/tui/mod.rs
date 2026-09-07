@@ -1450,6 +1450,112 @@ fn prepare_canonical_commit_guarded(stdout: &mut impl Write) -> Result<()> {
     }
 }
 
+/// Mouse tracking, released for the duration of one canonical commit and
+/// restored when this value is dropped.
+///
+/// Issue #441, "Terminal scrollback is empty for the current session once
+/// mouse capture is on", is a regression with one known trigger: the
+/// transcript reached native history until mouse capture was enabled, and
+/// turning capture off restores it. The commit path's only interaction with
+/// native history is the linefeed spool in [`commit_complete_messages`], which
+/// scrolls completed rows off the top of the screen, so tracking is released
+/// for exactly that window. The escape sequences go to the same `stdout` as the
+/// transcript bytes, so their ordering against the committed rows is a property
+/// of the byte stream rather than a race.
+///
+/// Restoration is a `Drop` and not a paired call, deliberately. Issue #264,
+/// "Make terminal-session cleanup bounded, signal-complete, and
+/// embedding-safe", records that terminal-state restoration in this file is not
+/// currently reliable; a commit that returned early or panicked with tracking
+/// still off would silently change input handling for the rest of the session,
+/// the accordion's click-to-toggle would stop working, and nothing would say
+/// why. `Drop` covers the successful return, every `?`, and a panic unwind
+/// alike.
+///
+/// The cost is that a mouse event arriving inside the window is not reported.
+/// The window is one write of one committed batch, and a dropped wheel tick is
+/// not a correctness problem.
+struct SuspendedMouseCapture<'a, W: Write> {
+    out: &'a mut W,
+    /// Whether this renderer is the one that enabled mouse capture. False for a
+    /// headless renderer and after `shutdown`, and the guard is then inert in
+    /// both directions -- enabling tracking a renderer does not own would be a
+    /// worse defect than the one being fixed.
+    owns_capture: bool,
+}
+
+impl<'a, W: Write> SuspendedMouseCapture<'a, W> {
+    fn begin(out: &'a mut W, owns_capture: bool) -> Self {
+        if owns_capture {
+            // Best effort: a terminal that ignored the enable ignores this too,
+            // and neither is worth failing a transcript commit over.
+            let _ = execute!(out, crossterm::event::DisableMouseCapture);
+        }
+        Self { out, owns_capture }
+    }
+
+    fn writer(&mut self) -> &mut W {
+        self.out
+    }
+}
+
+impl<W: Write> Drop for SuspendedMouseCapture<'_, W> {
+    fn drop(&mut self) {
+        if !self.owns_capture {
+            return;
+        }
+        // Unconditional, including when the disable above failed: leaving
+        // tracking off is the harmful outcome, and re-enabling a mode that is
+        // already set is a no-op in every terminal that implements it.
+        let _ = execute!(self.out, crossterm::event::EnableMouseCapture);
+        let _ = self.out.flush();
+    }
+}
+
+/// How far a canonical commit attempt got.
+///
+/// The caller resets its live-area accounting only once the screen has actually
+/// been cleared, which is what `Prepared` reports. A failure before that leaves
+/// the accounting untouched, which is what the paired calls did before the
+/// guard was introduced.
+enum CanonicalCommit {
+    /// Preparation failed; the screen was not cleared.
+    NotPrepared(anyhow::Error),
+    /// The screen was cleared, and the batch then committed or failed.
+    Prepared(Result<()>),
+}
+
+/// One canonical commit -- screen preparation, the completed rows, and the
+/// linefeed spool that carries them into native history -- with mouse tracking
+/// released for its duration and restored before this function returns.
+///
+/// Extracted from [`TuiRenderer::flush_output_safe`] so the ordering property is
+/// assertable against a byte sink: tracking off, rows written, rows spooled,
+/// tracking on. An assertion on the renderer's own `printed_ids` can see none of
+/// that, which is why #441 survived the coverage that existed.
+fn commit_canonical_batch_with_capture_released(
+    stdout: &mut impl Write,
+    owns_capture: bool,
+    messages: &[MessageRef],
+    accordion: &mut AccordionState,
+    colors: &ColorScheme,
+    printed_ids: &mut HashSet<MessageId>,
+    terminal_height: usize,
+) -> CanonicalCommit {
+    let mut capture = SuspendedMouseCapture::begin(stdout, owns_capture);
+    if let Err(error) = prepare_canonical_commit_guarded(capture.writer()) {
+        return CanonicalCommit::NotPrepared(error);
+    }
+    CanonicalCommit::Prepared(commit_complete_messages(
+        capture.writer(),
+        messages,
+        accordion,
+        colors,
+        printed_ids,
+        terminal_height,
+    ))
+}
+
 // ─── Live area management ─────────────────────────────────────────────────────
 
 impl TuiRenderer {
@@ -2162,17 +2268,28 @@ impl TuiRenderer {
 
         if !to_commit.is_empty() {
             let mut stdout = io::stdout();
-            prepare_canonical_commit_guarded(&mut stdout)?;
-            self.active_rows = 0;
-            self.cursor_row_from_top = 0;
-            let commit_result = commit_complete_messages(
+            // Mouse tracking is released across the whole insert -- preparation,
+            // the completed rows, and the spool that carries them into native
+            // history -- and restored by the guard's `Drop` before anything else
+            // writes: on the success path, on an early return, and on a panic
+            // unwind (#441).
+            let outcome = commit_canonical_batch_with_capture_released(
                 &mut stdout,
+                self.is_active,
                 &to_commit,
                 &mut self.accordion,
                 &self.colors,
                 &mut self.printed_ids,
                 usize::from(crossterm::terminal::size().unwrap_or((80, 24)).1),
             );
+            let commit_result = match outcome {
+                CanonicalCommit::NotPrepared(error) => return Err(error),
+                CanonicalCommit::Prepared(result) => {
+                    self.active_rows = 0;
+                    self.cursor_row_from_top = 0;
+                    result
+                }
+            };
             if let Err(error) = commit_result {
                 let _ = execute!(stdout, EndSynchronizedUpdate);
                 return Err(error);
@@ -5890,6 +6007,293 @@ mod tests {
                 "rendering changed for node/edge shuffle seed {seed}"
             );
         }
+    }
+
+    // ─── #441: mouse tracking is released around the canonical commit ────────
+
+    /// Crossterm's exact byte sequences, spelled out so a change in the
+    /// dependency that stopped emitting them is a test failure rather than a
+    /// silent loss of the fix.
+    const MOUSE_TRACKING_OFF: &str = "\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+    const MOUSE_TRACKING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+
+    /// A completed message carrying `body`, ready to commit.
+    fn committable_message(body: &str) -> MessageRef {
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth");
+        work.set_response(body);
+        work.set_complete();
+        work
+    }
+
+    /// A canonical commit releases mouse tracking before it writes anything and
+    /// restores it after the linefeed spool that carries the rows into native
+    /// history — the window #441 identifies, and no wider.
+    ///
+    /// Asserting the byte order is the point: the escape sequences and the
+    /// transcript share one `stdout`, so ordering here *is* the guarantee the
+    /// terminal gets. Nothing about the renderer's `printed_ids` can express it.
+    #[test]
+    fn test_canonical_commit_releases_mouse_tracking_around_the_scrollback_spool() {
+        let message = committable_message("secret canonical body");
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let mut printed = HashSet::new();
+        let mut bytes = Vec::new();
+
+        let outcome = commit_canonical_batch_with_capture_released(
+            &mut bytes,
+            true,
+            std::slice::from_ref(&message),
+            &mut state,
+            &colors,
+            &mut printed,
+            6,
+        );
+        assert!(
+            matches!(outcome, CanonicalCommit::Prepared(Ok(()))),
+            "INVARIANT: a healthy sink commits the batch (#441). The commit \
+             reported {}",
+            match outcome {
+                CanonicalCommit::NotPrepared(ref error) => format!("NotPrepared({error})"),
+                CanonicalCommit::Prepared(Err(ref error)) => format!("Prepared(Err({error}))"),
+                CanonicalCommit::Prepared(Ok(())) => "Prepared(Ok)".to_string(),
+            }
+        );
+
+        let raw = String::from_utf8(bytes).expect("the commit emits valid UTF-8");
+        let off = raw.find(MOUSE_TRACKING_OFF);
+        let body = raw.find("secret canonical body");
+        let on = raw.rfind(MOUSE_TRACKING_ON);
+        assert!(
+            matches!((off, body, on), (Some(off), Some(body), Some(on)) if off < body && body < on),
+            "INVARIANT: mouse tracking is off for the whole canonical commit and \
+             restored after it, so the terminal is not in a tracking mode while \
+             completed rows are spooled into native history (#441).\n\
+             Expected order: disable at {off:?} < committed body at {body:?} < \
+             enable at {on:?}.\n\
+             What the terminal received was:\n{raw:?}"
+        );
+        assert_eq!(
+            raw.matches(MOUSE_TRACKING_OFF).count(),
+            1,
+            "INVARIANT: exactly one release per commit, so nested or repeated \
+             suspensions cannot leave tracking off (#441). Terminal received:\n{raw:?}"
+        );
+        assert_eq!(
+            raw.matches(MOUSE_TRACKING_ON).count(),
+            1,
+            "INVARIANT: exactly one restore per commit (#441). Terminal received:\n{raw:?}"
+        );
+
+        // The spool is what reaches native history, and it must be inside the
+        // window. Everything after the body up to the restore is the spool.
+        let after_body = &raw
+            [body.expect("body index") + "secret canonical body".len()..on.expect("restore index")];
+        assert!(
+            after_body.matches("\r\n").count() >= 6,
+            "INVARIANT: the linefeed spool that carries committed rows off the \
+             top of the screen happens while tracking is released (#441). \
+             Between the committed body and the restore there were only {} \
+             linefeeds, for a terminal {} rows high. Segment was:\n{after_body:?}",
+            after_body.matches("\r\n").count(),
+            6
+        );
+    }
+
+    /// A renderer that never enabled mouse tracking must not enable it.
+    ///
+    /// `new_headless` and any renderer past `shutdown` do not own the mode.
+    /// Turning tracking *on* underneath the shell, or underneath a full-screen
+    /// wizard that has taken the terminal, would be a worse defect than #441.
+    #[test]
+    fn test_canonical_commit_leaves_mouse_tracking_alone_when_it_is_not_owned() {
+        let message = committable_message("unowned terminal body");
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let mut printed = HashSet::new();
+        let mut bytes = Vec::new();
+
+        let _ = commit_canonical_batch_with_capture_released(
+            &mut bytes,
+            false,
+            std::slice::from_ref(&message),
+            &mut state,
+            &colors,
+            &mut printed,
+            6,
+        );
+
+        let raw = String::from_utf8(bytes).expect("the commit emits valid UTF-8");
+        assert!(
+            raw.contains("unowned terminal body"),
+            "INVARIANT: not owning mouse tracking does not stop the commit \
+             (#441). Terminal received:\n{raw:?}"
+        );
+        assert!(
+            !raw.contains(MOUSE_TRACKING_OFF) && !raw.contains(MOUSE_TRACKING_ON),
+            "INVARIANT: a renderer that did not enable mouse tracking neither \
+             disables nor enables it (#441). Terminal received:\n{raw:?}"
+        );
+    }
+
+    /// Mouse tracking is restored when the commit fails part-way.
+    ///
+    /// #264 ("Make terminal-session cleanup bounded, signal-complete, and
+    /// embedding-safe") is why this is asserted rather than assumed: terminal
+    /// restoration on this codebase is unreliable, and a commit that returned
+    /// early with tracking off would silently disable click-to-toggle for the
+    /// rest of the session with nothing to say why.
+    #[test]
+    fn test_mouse_tracking_is_restored_when_the_canonical_commit_fails() {
+        /// Refuses exactly the write carrying the transcript body -- the shape
+        /// of a terminal that goes away mid-commit -- and accepts everything
+        /// after it, so the guard's restore is observable rather than merely
+        /// attempted.
+        struct RefusesTheBodyWrite {
+            written: Vec<u8>,
+            armed: bool,
+        }
+        impl Write for RefusesTheBodyWrite {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.armed && String::from_utf8_lossy(bytes).contains("failing commit body") {
+                    self.armed = false;
+                    return Err(io::Error::other("hostile mid-commit write failure"));
+                }
+                self.written.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let message = committable_message("failing commit body");
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let mut printed = HashSet::new();
+        let mut sink = RefusesTheBodyWrite {
+            written: Vec::new(),
+            armed: true,
+        };
+
+        let outcome = commit_canonical_batch_with_capture_released(
+            &mut sink,
+            true,
+            std::slice::from_ref(&message),
+            &mut state,
+            &colors,
+            &mut printed,
+            6,
+        );
+        let described = match outcome {
+            CanonicalCommit::NotPrepared(ref error) => format!("NotPrepared({error})"),
+            CanonicalCommit::Prepared(Err(ref error)) => format!("Prepared(Err({error}))"),
+            CanonicalCommit::Prepared(Ok(())) => "Prepared(Ok)".to_string(),
+        };
+        let raw = String::from_utf8_lossy(&sink.written).into_owned();
+        assert!(
+            matches!(outcome, CanonicalCommit::Prepared(Err(_))),
+            "INVARIANT: this fixture refuses the write that carries the \
+             transcript body, after preparation has already succeeded, so the \
+             commit must report a prepared failure -- otherwise the restore \
+             path below is not the one a real mid-commit failure takes (#441). \
+             The commit reported {described}. Terminal received:\n{raw:?}"
+        );
+        assert!(
+            !raw.contains("failing commit body"),
+            "INVARIANT: the refused body must not have reached the terminal, or \
+             this fixture is not exercising a mid-commit failure (#441). \
+             Terminal received:\n{raw:?}"
+        );
+
+        let off = raw.find(MOUSE_TRACKING_OFF);
+        let on = raw.rfind(MOUSE_TRACKING_ON);
+        assert!(
+            matches!((off, on), (Some(off), Some(on)) if off < on),
+            "INVARIANT: mouse tracking is restored on the early return out of a \
+             failed canonical commit, so a terminal that goes away mid-commit \
+             does not leave the session with tracking off for the rest of its \
+             life (#441, #264).\n\
+             Expected a disable at {off:?} followed by an enable at {on:?}.\n\
+             The commit reported {described}.\n\
+             Terminal received:\n{raw:?}"
+        );
+    }
+
+    /// Mouse tracking is restored when the commit panics.
+    ///
+    /// A paired call cannot do this; the `Drop` is why the guard exists.
+    #[test]
+    fn test_mouse_tracking_is_restored_when_the_canonical_commit_panics() {
+        /// Records everything written into shared storage that outlives the
+        /// unwind, and panics exactly once — when the transcript body arrives.
+        /// Once only, because the guard's restore writes through this same sink
+        /// during the unwind, and a second panic there would abort the process
+        /// instead of proving anything.
+        struct PanicsOnceOnBody {
+            recorded: Arc<std::sync::Mutex<Vec<u8>>>,
+            armed: bool,
+        }
+        impl Write for PanicsOnceOnBody {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut held = self.recorded.lock().expect("sink poisoned");
+                held.extend_from_slice(bytes);
+                let reached_body = String::from_utf8_lossy(&held).contains("panicking commit body");
+                // Released before the panic so the guard's restore can lock it.
+                drop(held);
+                if self.armed && reached_body {
+                    self.armed = false;
+                    panic!("hostile panic inside the canonical commit");
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut sink = PanicsOnceOnBody {
+            recorded: Arc::clone(&recorded),
+            armed: true,
+        };
+        let message = committable_message("panicking commit body");
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let mut printed = HashSet::new();
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            commit_canonical_batch_with_capture_released(
+                &mut sink,
+                true,
+                std::slice::from_ref(&message),
+                &mut state,
+                &colors,
+                &mut printed,
+                6,
+            )
+        }));
+        std::panic::set_hook(previous);
+
+        assert!(
+            unwound.is_err(),
+            "INVARIANT: this fixture panics inside the commit, which is the path \
+             a paired enable/disable cannot cover (#441)."
+        );
+        let raw = String::from_utf8_lossy(&recorded.lock().expect("sink poisoned")).into_owned();
+        let off = raw.find(MOUSE_TRACKING_OFF);
+        let on = raw.rfind(MOUSE_TRACKING_ON);
+        assert!(
+            matches!((off, on), (Some(off), Some(on)) if off < on),
+            "INVARIANT: mouse tracking is restored during a panic unwind out of \
+             the canonical commit, so a crash mid-commit does not silently \
+             disable click-to-toggle for the rest of the session (#441, #264).\n\
+             Expected a disable at {off:?} followed by an enable at {on:?}.\n\
+             Terminal received:\n{raw:?}"
+        );
     }
 }
 
