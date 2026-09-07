@@ -8236,44 +8236,12 @@ mod handler_tests {
         }));
     }
 
-    /// Seed a Brain that owns one active, repeating schedule due at `due_ms`.
-    fn seed_scheduled_brain(store: &crate::brain::store::BrainStore, name: &str, due_ms: u64) {
-        let attachment = store
-            .attach(name, "alice@box.local", AttachmentRole::Driver, None)
-            .unwrap();
-        store
-            .create_schedule(
-                name,
-                &attachment.subject,
-                attachment.attachment_id,
-                ProgramLanguage::Lisp,
-                "(say \"tick\")",
-                crate::vm::EffectSet::pure(),
-                due_ms,
-                Some(1_000),
-                crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
-            )
-            .unwrap();
-    }
-
-    /// What is on disk under `path`, for assertion diagnostics.
-    fn directory_listing(path: &std::path::Path) -> String {
-        match std::fs::read_dir(path) {
-            Ok(entries) => {
-                let mut names = entries
-                    .flatten()
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>();
-                names.sort();
-                if names.is_empty() {
-                    "<empty directory>".to_string()
-                } else {
-                    names.join(", ")
-                }
-            }
-            Err(error) => format!("<not readable: {error}>"),
-        }
-    }
+    // Both fixtures are the store's own, shared rather than copied: verbatim
+    // duplicates of them drifted apart once already, and a boundary test that
+    // seeds a Brain differently from the store tests is not testing the same
+    // Brain.
+    use crate::brain::store::directory_listing_for_tests as directory_listing;
+    use crate::brain::store::seed_scheduled_brain_for_tests as seed_scheduled_brain;
 
     #[tokio::test]
     async fn deleted_brain_is_pruned_at_the_delivery_boundary_and_not_resurrected() {

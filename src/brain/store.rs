@@ -817,6 +817,18 @@ type DueKey = (u64, String, ScheduleId);
 struct ScheduleIndex {
     due: std::collections::BTreeMap<DueKey, ()>,
     by_brain: HashMap<String, HashMap<ScheduleId, u64>>,
+    /// Brains whose *whole* schedule set has been read into the index, whether
+    /// or not any of it is currently active.
+    ///
+    /// `by_brain` cannot answer this: `upsert` drops a Brain's entry the moment
+    /// its last active slot goes, so a Brain that has one thousand spent
+    /// one-shots and nothing active is absent from `by_brain` while being
+    /// perfectly well indexed. `warm_schedule_index` gates its repair on this
+    /// set so the gate is O(1) per Brain per warm; gating on `by_brain` would
+    /// rescan every such Brain's entire lifetime schedule map, once a minute,
+    /// forever — the growth curve `upsert`'s own doc comment exists to
+    /// describe.
+    indexed: HashSet<String>,
 }
 
 impl ScheduleIndex {
@@ -856,16 +868,31 @@ impl ScheduleIndex {
         for schedule in schedules.values().filter(|schedule| schedule.active) {
             self.upsert(name, schedule);
         }
+        // After `forget`, so the Brain ends up marked known rather than
+        // unknown. This is the only place a Brain becomes known: every other
+        // mutation either moves a single schedule of an already-known Brain
+        // (`upsert`) or makes it unknown again (`forget`).
+        self.indexed.insert(name.to_string());
     }
 
     /// Forget a Brain entirely, for removal and archival.
     fn forget(&mut self, name: &str) {
+        self.indexed.remove(name);
         if let Some(previous) = self.by_brain.remove(name) {
             for (schedule_id, next_due_ms) in previous {
                 self.due
                     .remove(&(next_due_ms, name.to_string(), schedule_id));
             }
         }
+    }
+
+    /// Whether this Brain's schedule set has been read into the index.
+    ///
+    /// `false` means the index holds nothing for it *and* has not established
+    /// that there is nothing to hold — the state a prune leaves behind, and the
+    /// only state `warm_schedule_index` has to repair.
+    fn is_indexed(&self, name: &str) -> bool {
+        self.indexed.contains(name)
     }
 
     /// When the earliest active schedule in the store comes due.
@@ -899,6 +926,87 @@ impl ScheduleIndex {
             }
         }
         brains
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs inside `prune_schedules_if_brain_is_absent`, in the window between
+    /// the existence check answering "absent" and the index write guard being
+    /// taken — the interval in which a concurrent `create_schedule` can index a
+    /// schedule that the prune then forgets.
+    ///
+    /// A hook rather than a two-thread race because that window has no lock and
+    /// no other observable boundary, so a `Barrier` alone cannot be placed
+    /// inside it. It fires on the pruning thread, which is why a thread-local
+    /// suffices: the racing creation runs on a *different* thread and must not
+    /// see it.
+    static PRUNE_GAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with `hook` armed for the next prune gap on this thread. The hook
+/// fires at most once; an unfired hook is disarmed when `body` returns.
+#[cfg(test)]
+pub(crate) fn run_with_prune_gap_hook<T>(hook: Box<dyn FnOnce()>, body: impl FnOnce() -> T) -> T {
+    PRUNE_GAP_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    let outcome = body();
+    PRUNE_GAP_HOOK.with(|slot| *slot.borrow_mut() = None);
+    outcome
+}
+
+/// A Brain with one recurring schedule, created through the real API so the
+/// index is populated the way production populates it.
+///
+/// Lives here rather than in a test module because the production-boundary
+/// tests for #383 (schedules for a deleted Brain are delivered, and delivery
+/// recreates the Brain) are in `src/server/handlers.rs` and need the identical
+/// fixture; two verbatim copies of it drifted apart once already.
+#[cfg(test)]
+pub(crate) fn seed_scheduled_brain_for_tests(
+    store: &BrainStore,
+    name: &str,
+    next_due_ms: u64,
+) -> (AttachmentId, ScheduleId) {
+    let attachment = store
+        .attach(name, "alice", AttachmentRole::Driver, None)
+        .unwrap();
+    let schedule = store
+        .create_schedule(
+            name,
+            "alice",
+            attachment.attachment_id,
+            ProgramLanguage::Lisp,
+            "(say \"tick\")",
+            crate::vm::EffectSet::pure(),
+            next_due_ms,
+            Some(1_000),
+            BrainScheduleDeliveryPolicy::Coalesce,
+        )
+        .unwrap();
+    (attachment.attachment_id, schedule.schedule_id)
+}
+
+/// What is actually on disk under `path`, for assertion diagnostics. A
+/// resurrection assertion has to say *what* it found, not merely that it found
+/// something. Shared with the `src/server/handlers.rs` boundary tests for the
+/// same reason as `seed_scheduled_brain_for_tests`.
+#[cfg(test)]
+pub(crate) fn directory_listing_for_tests(path: &std::path::Path) -> String {
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            let mut names = entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            if names.is_empty() {
+                "<empty directory>".to_string()
+            } else {
+                names.join(", ")
+            }
+        }
+        Err(error) => format!("<not readable: {error}>"),
     }
 }
 
@@ -2882,52 +2990,78 @@ impl BrainStore {
     ///
     /// Pruning is idempotent and loses nothing permanently: the index is
     /// derived from the log, so a directory that reappears is picked up by the
-    /// next `warm_schedule_index`.
+    /// next `warm_schedule_index`. That is also what bounds the one race this
+    /// leaves open — a `create_schedule` that lands between the existence check
+    /// and the forget has its brand-new index entry dropped, and gets it back on
+    /// the next warm rather than losing it. See the comment on the check itself
+    /// for why that trade is taken instead of holding the guard across a `stat`.
     fn prune_schedules_if_brain_is_absent(&self, name: &str) -> bool {
         let Some(root) = &self.root else {
             return false;
         };
+        // The `stat` runs *outside* the index write guard, deliberately, and
+        // this is the one decision here worth arguing.
+        //
+        // Under the guard it would order a prune against a concurrent
+        // `create_schedule` exactly: `push_locked` recreates the directory
+        // (`append_event` -> `append_journal_value` -> `create_dir_all_durable`)
+        // before it takes this same lock in `upsert_schedule_locked`, so
+        // whichever side won the lock would be right. That was tried, and
+        // rejected: it makes a filesystem call block the store.
+        //
+        // `stat` is not bounded. On a Brain root that is an unresponsive NFS or
+        // SMB mount it blocks for as long as the mount is wedged. Held across
+        // the index write guard, that stalls `warm_schedule_index` (which takes
+        // `brains.read()` and then this guard), and every `brains.write()`
+        // caller -- `push`, `create_schedule`, `attach`, `transition_run`, every
+        // mutating HTTP handler, for *every* Brain -- then queues behind that
+        // read guard. One unresponsive directory freezes the whole store, with
+        // no timeout to end it.
+        //
+        // This is a hazard the guard would *create*, not one it would widen:
+        // `ensure_loaded` does all of its filesystem work before it takes
+        // `brains.write()` at the end, so a hung mount there blocks only the
+        // calling task and holds no store lock at all. An earlier revision of
+        // this comment claimed the reverse; it was wrong.
+        //
+        // Outside the guard the interleaving [stat says absent] ->
+        // [create_schedule recreates and indexes] -> [prune forgets] can drop a
+        // just-created entry. That loss is **bounded**: the schedule is durable
+        // in the log either way, the creation has put the directory back on
+        // disk, and the next `warm_schedule_index` re-indexes the Brain and
+        // restores it -- 60 s at worst, once, with no operator action. Bounded
+        // index staleness in a rare race is the better trade against an
+        // unbounded, silent, process-wide freeze; a daemon must stay responsive
+        // when a mount does not.
+        // (`test_a_schedule_created_during_the_prune_gap_is_restored_by_the_next_warm`
+        // pins that bound.)
+        match root.join(name).try_exists() {
+            // Nothing is there: the Brain is gone. Prune.
+            Ok(false) => {}
+            // Present, or *unknown*. `Path::exists` cannot tell those apart --
+            // it is `metadata().is_ok()`, so EACCES on the Brain root, ESTALE
+            // from a stale NFS handle and EIO from a failing disk all read as
+            // "absent" and would silently retire the schedules of a Brain that
+            // is still on disk, which is the exact silencing this function was
+            // written to prevent. `try_exists` distinguishes them: an `Err`
+            // means the answer is unknown, so fall through to `ensure_loaded`
+            // and let its error propagate to the delivery loop's warning, the
+            // same handling an unreadable Brain already gets. `try_exists`
+            // follows symlinks exactly as `exists` does, so this changes
+            // nothing for them.
+            Ok(true) | Err(_) => return false,
+        }
+        // The prune gap: no lock is held here, which is the point above and the
+        // window the test hook reproduces.
+        #[cfg(test)]
+        if let Some(hook) = PRUNE_GAP_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         let forgotten = {
-            // The existence check runs *under* the index write guard, and the
-            // guard is taken first. `create_schedule` racing a prune would
-            // otherwise lose the schedule it had just created: prune stats
-            // `root/name` and sees nothing, `create_schedule` completes --
-            // recreating the directory and indexing the new schedule -- and
-            // prune then takes the lock and forgets the brand-new entry.
-            //
-            // Holding the guard across the `stat` orders the two. `push_locked`
-            // recreates the directory (`append_event` -> `append_journal_value`
-            // -> `create_dir_all_durable`) *before* it takes this same lock in
-            // `upsert_schedule_locked`, so whichever side wins the lock is
-            // correct: if prune wins, its `stat` runs either before the
-            // directory is back (it prunes, and the creation's `upsert` then
-            // re-adds the entry afterwards) or after (it does not prune at
-            // all); if the creation wins, the directory is already back and its
-            // entry already indexed when prune's `stat` runs. Nothing but a
-            // `stat` happens under the guard, and no other lock is taken while
-            // holding it, so the `brains` -> `schedule_index` order every other
-            // site follows is not inverted.
             let mut index = self
                 .schedule_index
                 .write()
                 .expect("schedule index lock poisoned");
-            match root.join(name).try_exists() {
-                // Nothing is there: the Brain is gone. Prune.
-                Ok(false) => {}
-                // Present, or *unknown*. `Path::exists` cannot tell those
-                // apart -- it is `metadata().is_ok()`, so EACCES on the Brain
-                // root, ESTALE from a stale NFS handle and EIO from a failing
-                // disk all read as "absent" and would silently retire the
-                // schedules of a Brain that is still on disk, which is the
-                // exact silencing this function was written to prevent.
-                // `try_exists` distinguishes them: an `Err` means the answer is
-                // unknown, so fall through to `ensure_loaded` and let its error
-                // propagate to the delivery loop's warning, the same handling
-                // an unreadable Brain already gets. `try_exists` follows
-                // symlinks exactly as `exists` does, so this changes nothing
-                // for them.
-                Ok(true) | Err(_) => return false,
-            }
             let was_indexed = index.by_brain.contains_key(name);
             index.forget(name);
             was_indexed
@@ -3023,9 +3157,9 @@ impl BrainStore {
                 );
                 continue;
             }
-            // Re-index unconditionally, not only for a Brain this warm loaded.
-            // `ensure_loaded` returns `Ok(())` at its first line for a Brain
-            // that is already resident, *before* the
+            // Re-index a Brain the index does not know about, not only one this
+            // warm loaded. `ensure_loaded` returns `Ok(())` at its first line
+            // for a Brain that is already resident, *before* the
             // `reindex_schedules_locked` on its load path -- so entries enter
             // the index only when a Brain becomes resident or when a schedule
             // event fires, and `brains` entries are dropped only by
@@ -3038,12 +3172,37 @@ impl BrainStore {
             // the Brain root -- a removable or network volume gone for two
             // seconds -- would empty the whole index permanently and the daemon
             // would silently deliver nothing again, ever. Reindexing here is
-            // that route back, and it is idempotent: an unchanged schedule set
+            // that route back, and it is the repair for the prune-gap race in
+            // `prune_schedules_if_brain_is_absent` as well.
+            //
+            // Gated on `is_indexed`, because `reindex` is O(every schedule the
+            // Brain has ever held): `BrainState::apply` only ever *inserts*
+            // into `state.schedules`, so cancelled schedules and spent
+            // one-shots stay there for the Brain's lifetime. Running it
+            // unconditionally would scan all of that for every Brain once a
+            // minute, under the index write guard -- the same unbounded curve
+            // `ScheduleIndex::upsert` was written to get off, at 1/60 Hz
+            // instead of once per schedule event. The gate is O(1) and exact:
+            // `reindex` is the only thing that marks a Brain known and `forget`
+            // the only thing that unmarks it, so "not indexed" is precisely
+            // "pruned, removed, or never loaded" -- the cases that need the
+            // scan -- and nothing else.
+            //
+            // Reindexing is idempotent regardless: an unchanged schedule set
             // leaves the head where it was, so no spurious wake is sent.
             let brains = self.brains.read().expect("shared brain lock poisoned");
-            if let Some(state) = brains.get(&name) {
-                self.reindex_schedules_locked(&name, state);
+            let Some(state) = brains.get(&name) else {
+                continue;
+            };
+            let already_indexed = self
+                .schedule_index
+                .read()
+                .expect("schedule index lock poisoned")
+                .is_indexed(&name);
+            if already_indexed {
+                continue;
             }
+            self.reindex_schedules_locked(&name, state);
         }
         if skipped > 0 {
             tracing::warn!(
@@ -6850,6 +7009,10 @@ const fn legacy_schedule_language() -> ProgramLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The two shared fixtures live at module scope so the `src/server/handlers.rs`
+    // boundary tests can use the same ones; aliased back to their local names here.
+    use super::directory_listing_for_tests as directory_listing;
+    use super::seed_scheduled_brain_for_tests as seed_scheduled_brain;
 
     // ── #364: the health/status Brain count must not hydrate the store ──────
     //
@@ -7655,32 +7818,6 @@ mod tests {
 
     // ── #374: due-ordered selection instead of per-Brain enumeration ────────
 
-    /// A Brain with one recurring schedule, created through the real API so the
-    /// index is populated the way production populates it.
-    fn seed_scheduled_brain(
-        store: &BrainStore,
-        name: &str,
-        next_due_ms: u64,
-    ) -> (AttachmentId, ScheduleId) {
-        let attachment = store
-            .attach(name, "alice", AttachmentRole::Driver, None)
-            .unwrap();
-        let schedule = store
-            .create_schedule(
-                name,
-                "alice",
-                attachment.attachment_id,
-                ProgramLanguage::Lisp,
-                "(say \"tick\")",
-                crate::vm::EffectSet::pure(),
-                next_due_ms,
-                Some(1_000),
-                BrainScheduleDeliveryPolicy::Coalesce,
-            )
-            .unwrap();
-        (attachment.attachment_id, schedule.schedule_id)
-    }
-
     #[test]
     fn test_due_selection_names_only_brains_with_work() {
         // The property the index exists for. Selecting by Brain meant
@@ -7949,27 +8086,6 @@ mod tests {
             .keys()
             .cloned()
             .collect()
-    }
-
-    /// What is actually on disk under `path`, for assertion diagnostics. A
-    /// resurrection assertion has to say *what* it found, not merely that it
-    /// found something.
-    fn directory_listing(path: &std::path::Path) -> String {
-        match std::fs::read_dir(path) {
-            Ok(entries) => {
-                let mut names = entries
-                    .flatten()
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>();
-                names.sort();
-                if names.is_empty() {
-                    "<empty directory>".to_string()
-                } else {
-                    names.join(", ")
-                }
-            }
-            Err(error) => format!("<not readable: {error}>"),
-        }
     }
 
     /// Drop the in-memory copy of a Brain without touching its disk state or
@@ -8321,27 +8437,40 @@ mod tests {
             indexed_due_keys(&store)
         );
 
+        // Restores the mode however this scope is left. Three statements run
+        // with the root at 0o000, one of them a hard assertion; a panic between
+        // them must not leave an unreadable directory behind for `tempfile` to
+        // fail to clean up.
+        struct RestoreMode<'a>(&'a std::path::Path, u32);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+
         let original_mode = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+        let restore = RestoreMode(temp.path(), original_mode);
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
-        // A process that is not subject to the mode (root, or a filesystem that
-        // does not enforce it) cannot reach the state under test at all.
-        let mode_is_enforced = std::fs::read_dir(temp.path()).is_err();
-        let outcome = mode_is_enforced.then(|| store.queue_due_schedules("alpha", 1_500));
+        // A process not subject to the mode -- root, or a filesystem that does
+        // not enforce permission bits -- cannot reach the state under test at
+        // all, and a green result here would then claim coverage that does not
+        // exist. Fail rather than return: a silent pass is the failure mode
+        // this whole fix is about.
+        assert!(
+            std::fs::read_dir(temp.path()).is_err(),
+            "this regression cannot exercise its subject here: {} is still \
+             readable at mode 0o000, so an unreadable Brain root -- the entire \
+             state under test -- is unreachable and passing would assert \
+             nothing. Run the suite as an unprivileged user on a filesystem \
+             that enforces permission bits; running as root, or on a mount \
+             without permission enforcement, makes this test vacuous",
+            temp.path().display()
+        );
+        let outcome = store.queue_due_schedules("alpha", 1_500);
         let indexed_while_unreadable = indexed_due_keys(&store);
         let selected_while_unreadable = store.due_schedule_brains(1_500);
-        // Restore before asserting: the assertions below have to read the root,
-        // and a panic must not leave an unreadable directory behind.
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(original_mode))
-            .unwrap();
-
-        let Some(outcome) = outcome else {
-            eprintln!(
-                "skipped: mode 0o000 on {} is not enforced for this process, so an \
-                 unreadable Brain root is unreachable here",
-                temp.path().display()
-            );
-            return;
-        };
+        // Restore before asserting: the assertions below have to read the root.
+        drop(restore);
 
         let error = match outcome {
             Err(error) => error,
@@ -8494,6 +8623,182 @@ mod tests {
             (alpha_id, beta_id),
             "and both must come back as the same Brains, not as fresh \
              identities minted while the root was away"
+        );
+    }
+
+    #[test]
+    fn test_a_schedule_created_during_the_prune_gap_is_restored_by_the_next_warm() {
+        // `prune_schedules_if_brain_is_absent` stats the Brain root *outside*
+        // the index write guard, so a `create_schedule` can land between the
+        // check and the forget and have its brand-new index entry dropped. That
+        // shape is deliberate -- holding the guard across an unbounded `stat`
+        // lets one wedged NFS mount freeze every `brains.write()` caller in the
+        // process -- and this test is the price: the loss must be **bounded**,
+        // repaired by the very next warm without operator action, or the trade
+        // is not the one the comment claims.
+        //
+        // The gap has no lock and no other observable boundary, so a `Barrier`
+        // cannot be placed inside it from outside; `run_with_prune_gap_hook` is
+        // a `#[cfg(test)]` hook in exactly that window, and the racing creation
+        // runs on a second thread while the pruning thread is parked in it.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
+        let (attachment_id, seeded_schedule) = seed_scheduled_brain(&store, "alpha", 1_000);
+        let alpha_id = store.snapshot("alpha").unwrap().brain_id;
+        let alpha_dir = root.join("alpha");
+
+        // The Brain's directory goes away underneath the daemon: the #383
+        // premise (schedules for a deleted Brain are delivered, and delivery
+        // recreates the Brain).
+        std::fs::remove_dir_all(&alpha_dir).unwrap();
+
+        // Channels rather than a `Barrier`, because every rendezvous needs a
+        // watchdog: a two-thread test whose interleaving stops happening must
+        // *fail*, not hang. If the existence check ever moves back under the
+        // index guard, the creation blocks on a lock the parked prune is
+        // holding and a `Barrier` would deadlock the whole suite -- the very
+        // stall this shape exists to avoid, reported as a timeout instead of a
+        // diagnosis. These durations are liveness watchdogs, never behavioural
+        // thresholds: nothing is asserted about how long anything took, and
+        // every instant fed to the store is a literal (#242, assert hydration
+        // state rather than a wall-clock ratio).
+        const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+        let (gap_tx, gap_rx) = std::sync::mpsc::channel::<()>();
+        let (created_tx, created_rx) = std::sync::mpsc::channel::<()>();
+
+        let creator = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                // The prune has stat'd, seen nothing, and parked before it takes
+                // the index guard. The gap is open.
+                let gap_observed = gap_rx.recv_timeout(WATCHDOG).is_ok();
+                let created = store
+                    .create_schedule(
+                        "alpha",
+                        "alice",
+                        attachment_id,
+                        ProgramLanguage::Lisp,
+                        "(say \"raced\")",
+                        crate::vm::EffectSet::pure(),
+                        2_000,
+                        Some(1_000),
+                        BrainScheduleDeliveryPolicy::Coalesce,
+                    )
+                    .expect(
+                        "the racing creation must succeed on its own terms: it \
+                         recreates the directory through `append_journal_value` \
+                         -> `create_dir_all_durable` before it indexes anything",
+                    );
+                // Durable and indexed. Only now does the prune take the guard,
+                // so it forgets an entry that provably existed.
+                let _ = created_tx.send(());
+                (gap_observed, created.schedule_id)
+            })
+        };
+
+        let queued = run_with_prune_gap_hook(
+            Box::new(move || {
+                let _ = gap_tx.send(());
+                created_rx.recv_timeout(WATCHDOG).expect(
+                    "the racing creation did not finish inside the prune gap. If \
+                     it is blocked rather than slow, the existence check is \
+                     holding a lock the creation needs -- which is exactly the \
+                     process-wide stall this shape was chosen to avoid",
+                );
+            }),
+            || store.queue_due_schedules("alpha", 1_500),
+        )
+        .expect("a pass over a Brain whose directory is gone must not fail");
+        let (gap_observed, raced_schedule) = creator.join().expect("the racing creation panicked");
+        assert!(
+            gap_observed,
+            "the prune gap never opened: `queue_due_schedules` did not reach the \
+             existence check in `prune_schedules_if_brain_is_absent`, so nothing \
+             below is testing the race it claims to test"
+        );
+
+        assert!(
+            queued.is_empty(),
+            "the pass must still prune rather than deliver: it queued {} run(s)",
+            queued.len()
+        );
+        assert!(
+            alpha_dir.exists(),
+            "precondition for the repair: the racing creation put the directory \
+             back, so the next warm can find it. {} holds [{}]",
+            alpha_dir.display(),
+            directory_listing(&alpha_dir)
+        );
+        let durable_schedules = store
+            .snapshot("alpha")
+            .unwrap()
+            .schedules
+            .iter()
+            .map(|schedule| schedule.schedule_id)
+            .collect::<Vec<_>>();
+        assert!(
+            durable_schedules.contains(&raced_schedule),
+            "and the raced schedule is durable regardless -- only the *index* \
+             entry is at stake here. The Brain holds {durable_schedules:?}"
+        );
+
+        // The cost of statting outside the guard, stated rather than hidden:
+        // the entry the creation had just indexed is gone.
+        assert_eq!(
+            indexed_due_keys(&store),
+            Vec::new(),
+            "the documented cost of the outside-the-guard check is exactly this \
+             and no more: the prune forgets the Brain wholesale, including the \
+             entry `create_schedule` had already inserted"
+        );
+
+        // The bound. One warm, no operator action, no restart.
+        store.warm_schedule_index();
+
+        let restored = indexed_due_keys(&store)
+            .into_iter()
+            .map(|(_, _, schedule_id)| schedule_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            restored.contains(&raced_schedule),
+            "the schedule created during the prune gap must be selectable again \
+             after a single warm -- otherwise the loss is unbounded and the \
+             trade the check's comment makes is not the one it describes. The \
+             index holds {:?}; the Brain root holds [{}]",
+            indexed_due_keys(&store),
+            directory_listing(&root)
+        );
+        assert!(
+            restored.contains(&seeded_schedule),
+            "and so must the schedule that was already there before the race; \
+             the index holds {:?}",
+            indexed_due_keys(&store)
+        );
+        assert_eq!(
+            store.due_schedule_brains(u64::MAX),
+            vec!["alpha".to_string()],
+            "and the Brain must be selectable by the delivery loop again, not \
+             merely present in the index; it holds {:?}",
+            indexed_due_keys(&store)
+        );
+
+        let delivered = store
+            .queue_due_schedules("alpha", 9_000)
+            .expect("delivery after the repair must succeed");
+        assert_eq!(
+            delivered.len(),
+            2,
+            "and delivery must actually run both schedules on the next due pass \
+             -- an index entry that never reaches `queue_due_schedules` is not a \
+             repair. Index holds {:?}",
+            indexed_due_keys(&store)
+        );
+        assert_eq!(
+            store.snapshot("alpha").unwrap().brain_id,
+            alpha_id,
+            "and none of this may mint a new identity: the Brain that was \
+             pruned and the Brain that was repaired must be the same one"
         );
     }
 
