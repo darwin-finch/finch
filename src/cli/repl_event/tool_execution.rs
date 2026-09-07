@@ -364,3 +364,198 @@ impl ToolExecutionCoordinator {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::{ContentBlock, Message};
+    use crate::tools::implementations::{
+        AskUserQuestionTool, EnterPlanModeTool, PresentPlanTool, TodoReadTool, TodoWriteTool,
+    };
+    use crate::tools::permissions::PermissionManager;
+    use crate::tools::registry::{Tool, ToolRegistry};
+    use crate::tools::todo::TodoList;
+    use std::time::Duration;
+
+    /// Liveness bound only — never a statement about how fast dispatch is.
+    /// Exceeding it means the tool task produced no terminal event at all.
+    const DISPATCH_LIVENESS_BOUND: Duration = Duration::from_secs(60);
+
+    /// What the boundary did with one dispatched tool call.
+    #[derive(Debug)]
+    enum DispatchOutcome {
+        /// `ReplEvent::ToolApprovalNeeded` was emitted for this tool.
+        DemandedApproval(String),
+        /// A terminal `ReplEvent::ToolResult` arrived for this tool call.
+        Terminal,
+        /// The event channel closed before either.
+        ChannelClosed,
+    }
+
+    /// The VM-local tools that #26 and #426 showed were misclassified, each with
+    /// the mode that lets its real implementation reach a terminal result
+    /// without touching the filesystem.
+    ///
+    /// Names come from the `Tool` implementations, not from literals repeated
+    /// here: the original defect was exactly a literal drifting from the name a
+    /// tool registers.
+    fn vm_local_dispatch_cases() -> Vec<(String, ReplMode)> {
+        let todo_list = Arc::new(RwLock::new(TodoList::default()));
+        let todo_write = TodoWriteTool::new(Arc::clone(&todo_list));
+        let todo_read = TodoReadTool::new(todo_list);
+
+        vec![
+            (todo_write.name().to_string(), ReplMode::Normal),
+            (todo_read.name().to_string(), ReplMode::Normal),
+            // Already planning: `enter_plan_mode` returns its idempotent
+            // "already in planning mode" result instead of creating a plan file.
+            (
+                EnterPlanModeTool.name().to_string(),
+                ReplMode::Planning {
+                    task: "issue-26 dispatch regression".to_string(),
+                    plan_path: std::env::temp_dir()
+                        .join(format!("finch-issue-26-{}-unused-plan.md", Uuid::new_v4())),
+                    created_at: chrono::Utc::now(),
+                },
+            ),
+            // Not planning: `present_plan` returns its "not in planning mode"
+            // result instead of writing a plan file.
+            (PresentPlanTool.name().to_string(), ReplMode::Normal),
+            (AskUserQuestionTool.name().to_string(), ReplMode::Normal),
+        ]
+    }
+
+    /// A `ToolExecutor` holding the real tools, with no cached approvals: the
+    /// only thing that can keep a dispatched tool out of the approval dialog is
+    /// its classification.
+    fn executor_with_real_vm_local_tools() -> ToolExecutor {
+        let todo_list = Arc::new(RwLock::new(TodoList::default()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
+        registry.register(Box::new(TodoReadTool::new(todo_list)));
+        registry.register(Box::new(EnterPlanModeTool));
+        registry.register(Box::new(PresentPlanTool));
+        registry.register(Box::new(AskUserQuestionTool));
+
+        let patterns_path =
+            std::env::temp_dir().join(format!("finch-issue-26-patterns-{}.json", Uuid::new_v4()));
+        ToolExecutor::new(registry, PermissionManager::new(), patterns_path)
+            .expect("test tool executor")
+    }
+
+    async fn dispatch_once(tool_name: &str, mode: ReplMode) -> DispatchOutcome {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx,
+            Arc::new(tokio::sync::Mutex::new(executor_with_real_vm_local_tools())),
+            Arc::new(OutputManager::new(crate::config::ColorScheme::default())),
+            Arc::clone(&conversation),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+            Arc::new(RwLock::new(mode)),
+            Arc::new(RwLock::new(None)),
+        );
+
+        let query_id = Uuid::new_v4();
+        let tool_use = ToolUse::new(tool_name.to_string(), serde_json::json!({}));
+        let assistant = Message::with_content(
+            "assistant",
+            vec![ContentBlock::ToolUse {
+                id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+                input: tool_use.input.clone(),
+            }],
+        );
+        let round_token = conversation
+            .write()
+            .await
+            .stage_assistant(query_id, assistant)
+            .expect("stage the provider assistant round");
+
+        let work_unit = Arc::new(WorkUnit::new("Channeling"));
+        let row_idx = work_unit.add_row(tool_name.to_string());
+        let tool_id = tool_use.id.clone();
+
+        coordinator.spawn_tool_execution(
+            query_id,
+            round_token,
+            tool_use,
+            Arc::clone(&work_unit),
+            row_idx,
+            None,
+        );
+
+        let observed = tokio::time::timeout(DISPATCH_LIVENESS_BOUND, async {
+            loop {
+                match event_rx.recv().await {
+                    Some(ReplEvent::ToolApprovalNeeded {
+                        tool_use: asked, ..
+                    }) => return DispatchOutcome::DemandedApproval(asked.name),
+                    Some(ReplEvent::ToolResult { tool_id: id, .. }) if id == tool_id => {
+                        return DispatchOutcome::Terminal
+                    }
+                    Some(_) => continue,
+                    None => return DispatchOutcome::ChannelClosed,
+                }
+            }
+        })
+        .await;
+
+        match observed {
+            Ok(outcome) => outcome,
+            Err(_) => panic!(
+                "the run hung: dispatching tool {tool_name:?} produced neither \
+                 ToolApprovalNeeded nor a terminal ToolResult within the liveness bound of {} s. \
+                 This bound is not a performance assertion; exceeding it means the tool task never \
+                 reached a terminal state.",
+                DISPATCH_LIVENESS_BOUND.as_secs()
+            ),
+        }
+    }
+
+    /// Production-boundary regression for #26 (`/plan` prompts for permission to
+    /// reduce capability) and #426 (`todo_write` reports a 30-second timeout
+    /// because its approval never resolves).
+    ///
+    /// `spawn_tool_execution` is the real path that turns a classification into
+    /// an approval dialog. A misclassified VM-local tool emits
+    /// `ReplEvent::ToolApprovalNeeded` here and then waits — which is what the
+    /// user experienced as a permission prompt, or as a timeout.
+    #[tokio::test]
+    async fn test_vm_local_tools_dispatch_without_an_approval_event() {
+        let cases = vm_local_dispatch_cases();
+        let total = cases.len();
+        let mut violations = Vec::new();
+
+        for (tool_name, mode) in cases {
+            let effect =
+                crate::tools::permissions::legacy_tool_effect(&tool_name, &serde_json::json!({}));
+            match dispatch_once(&tool_name, mode).await {
+                DispatchOutcome::Terminal => {}
+                DispatchOutcome::DemandedApproval(asked) => violations.push(format!(
+                    "  tool {tool_name:?} emitted ReplEvent::ToolApprovalNeeded (for {asked:?}); \
+                     legacy_tool_effect computed {} (runs_autonomously={})",
+                    effect.as_str(),
+                    effect.runs_autonomously(),
+                )),
+                DispatchOutcome::ChannelClosed => violations.push(format!(
+                    "  tool {tool_name:?} produced no terminal ToolResult before the event \
+                     channel closed; legacy_tool_effect computed {}",
+                    effect.as_str(),
+                )),
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "invariant: a VM-local tool must reach a terminal ToolResult through \
+             ToolExecutionCoordinator::spawn_tool_execution without ever opening an approval \
+             dialog — entering plan mode is a capability *reduction*, and a session task list is \
+             not a host effect (#26, #426). {} of {} dispatched tools violated it:\n{}",
+            violations.len(),
+            total,
+            violations.join("\n"),
+        );
+    }
+}

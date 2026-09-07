@@ -460,6 +460,27 @@ fn is_readonly_bash(command: &str) -> bool {
 ///
 /// New VM programs carry this in their language-level signature. This table is
 /// the compatibility boundary while provider-native tools are still exposed.
+///
+/// # Naming contract
+///
+/// Names are matched **verbatim** after ASCII-lowercasing; nothing else is
+/// normalised. A tool is therefore classified only by a spelling written out
+/// below, so every arm must list the canonical name the tool registers
+/// (`Tool::name`) *and* every legacy spelling registered for it through
+/// `ToolRegistry::register_alias`.
+///
+/// Matching verbatim is deliberate. `tool_name` arrives here straight from the
+/// provider's tool call, before any registry lookup, so a rule that accepted a
+/// family of spellings (stripping underscores, say) would let a name nobody
+/// registered reach a permissive arm and run without approval. Adding the exact
+/// registered spellings cannot reclassify anything that already matches.
+///
+/// Getting this wrong is not a cosmetic miss: an unlisted name falls to
+/// [`ExecutionEffect::Unclassified`], which demands user approval. That is how
+/// `enter_plan_mode` came to ask permission to *reduce* capability (#26) and how
+/// `todo_write` came to report a 30-second timeout while waiting on an approval
+/// nobody expected to answer (#426). `tests::vm_local_tools_by_registered_name`
+/// reads the names from the tools themselves so a drifting literal fails loudly.
 pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
     match tool_name.to_ascii_lowercase().as_str() {
         // Transitional adapter only: invoking the typed broker is VM-local.
@@ -476,9 +497,11 @@ pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
         | "inspect_program"
         | "search_memory"
         | "list_recent_memories"
-        | "todoread" => ExecutionEffect::VmRead,
-        "todowrite" | "push" | "pop" | "clear" | "enterplanmode" | "presentplan"
-        | "askuserquestion" | "create_memory" => ExecutionEffect::VmWrite,
+        | "todoread"
+        | "todo_read" => ExecutionEffect::VmRead,
+        "todowrite" | "todo_write" | "push" | "pop" | "clear" | "enterplanmode"
+        | "enter_plan_mode" | "presentplan" | "present_plan" | "askuserquestion"
+        | "ask_user_question" | "create_memory" => ExecutionEffect::VmWrite,
         "read" | "glob" | "grep" | "hash_compare" | "excel_read" | "excel_range"
         | "excel_sheets" | "gui_inspect" => ExecutionEffect::WorkspaceRead,
         "web_fetch" => ExecutionEffect::ExternalRead,
@@ -913,5 +936,149 @@ mod tests {
                 "{tool} must remain available for peer protocol discovery"
             );
         }
+    }
+
+    // ── #26 / #426: tool-name normalisation ──────────────────────────────────
+    //
+    // `legacy_tool_effect` lowercases the tool name but never stripped
+    // underscores, while five of its arms were spelled without them. Every
+    // canonical snake_case name fell through to `Unclassified`, and
+    // `Unclassified` demands user approval: `/plan` asked permission to
+    // *reduce* capability (#26), and `todo_write` waited on an approval that
+    // never resolved until the 30-second executor deadline reported it as a
+    // timeout (#426).
+
+    /// The VM-local tools whose declared classification #26 and #426 showed to
+    /// be unreachable, paired with the effect `legacy_tool_effect` already
+    /// declares for them.
+    ///
+    /// Names are read from the `Tool` implementations themselves rather than
+    /// written as literals. The defect *was* a literal in a match arm drifting
+    /// from the literal a tool registers; a table of literals here could drift
+    /// the same way and keep passing.
+    fn vm_local_tools_by_registered_name() -> Vec<(String, ExecutionEffect)> {
+        use crate::tools::implementations::{
+            AskUserQuestionTool, EnterPlanModeTool, PresentPlanTool, TodoReadTool, TodoWriteTool,
+        };
+        use crate::tools::registry::Tool;
+        use crate::tools::todo::TodoList;
+        use std::sync::Arc;
+
+        let todo_list = Arc::new(tokio::sync::RwLock::new(TodoList::default()));
+        let todo_write = TodoWriteTool::new(Arc::clone(&todo_list));
+        let todo_read = TodoReadTool::new(todo_list);
+
+        vec![
+            (todo_write.name().to_string(), ExecutionEffect::VmWrite),
+            (todo_read.name().to_string(), ExecutionEffect::VmRead),
+            (
+                EnterPlanModeTool.name().to_string(),
+                ExecutionEffect::VmWrite,
+            ),
+            (PresentPlanTool.name().to_string(), ExecutionEffect::VmWrite),
+            (
+                AskUserQuestionTool.name().to_string(),
+                ExecutionEffect::VmWrite,
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_legacy_tool_effect_classifies_vm_local_tools_by_registered_name() {
+        let table = vm_local_tools_by_registered_name();
+        let mut misclassified = Vec::new();
+
+        for (name, expected) in &table {
+            let actual = legacy_tool_effect(name, &serde_json::json!({}));
+            if actual != *expected {
+                misclassified.push(format!(
+                    "  tool {name:?} -> computed {} (runs_autonomously={}), expected {} \
+                     (runs_autonomously={})",
+                    actual.as_str(),
+                    actual.runs_autonomously(),
+                    expected.as_str(),
+                    expected.runs_autonomously(),
+                ));
+            }
+        }
+
+        assert!(
+            misclassified.is_empty(),
+            "invariant: legacy_tool_effect must classify a tool by the exact name that tool \
+             registers, so a VM-local operation never degrades to Unclassified and demands \
+             approval (#26 — /plan prompts for permission to reduce capability; #426 — todo_write \
+             reports a 30-second timeout because its approval never resolves).\n\
+             {} of {} registered names misclassified:\n{}",
+            misclassified.len(),
+            table.len(),
+            misclassified.join("\n"),
+        );
+    }
+
+    #[test]
+    fn test_vm_local_tools_run_without_approval_by_registered_name() {
+        let table = vm_local_tools_by_registered_name();
+        let mut prompting = Vec::new();
+
+        for (name, expected) in &table {
+            let actual = legacy_tool_effect(name, &serde_json::json!({}));
+            if !actual.runs_autonomously() {
+                prompting.push(format!(
+                    "  tool {name:?} -> computed {}, which requires approval; expected {} \
+                     (autonomous)",
+                    actual.as_str(),
+                    expected.as_str(),
+                ));
+            }
+        }
+
+        assert!(
+            prompting.is_empty(),
+            "invariant: a VM-local tool touches no filesystem, network, or process and must never \
+             open an approval dialog. {} of {} registered names would prompt (#26, #426):\n{}",
+            prompting.len(),
+            table.len(),
+            prompting.join("\n"),
+        );
+    }
+
+    #[test]
+    fn test_legacy_tool_effect_agrees_across_registered_aliases() {
+        // Dispatch-only legacy spellings wired by `ToolRegistry::register_alias`
+        // in src/cli/repl.rs. Both spellings reach the same tool, so both must
+        // reach the same effect and the same approval policy.
+        let alias_pairs = [
+            ("TodoWrite", "todo_write"),
+            ("TodoRead", "todo_read"),
+            ("EnterPlanMode", "enter_plan_mode"),
+            ("PresentPlan", "present_plan"),
+            ("AskUserQuestion", "ask_user_question"),
+        ];
+        let mut divergent = Vec::new();
+
+        for (alias, canonical) in alias_pairs {
+            let alias_effect = legacy_tool_effect(alias, &serde_json::json!({}));
+            let canonical_effect = legacy_tool_effect(canonical, &serde_json::json!({}));
+            if alias_effect != canonical_effect {
+                divergent.push(format!(
+                    "  alias {alias:?} -> {} (runs_autonomously={}) but canonical {canonical:?} \
+                     -> {} (runs_autonomously={})",
+                    alias_effect.as_str(),
+                    alias_effect.runs_autonomously(),
+                    canonical_effect.as_str(),
+                    canonical_effect.runs_autonomously(),
+                ));
+            }
+        }
+
+        assert!(
+            divergent.is_empty(),
+            "invariant: a registered alias and its canonical tool name are the same operation and \
+             must resolve to one typed effect and one approval policy (#26). {} of {} alias pairs \
+             diverge:\n{}",
+            divergent.len(),
+            alias_pairs.len(),
+            divergent.join("\n"),
+        );
     }
 }
