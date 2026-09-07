@@ -6,13 +6,15 @@
 # This is NOT a correctness gate and must never become one. #364 asks for the
 # benchmark to be "kept separate from the correctness gates", and requires of
 # this work's coverage "Synchronization and structural assertions, not absolute
-# wall-clock thresholds". The precedent it cites is `a0ea2c64` ("assert
-# hydration state, not a wall-clock ratio"), which replaced the last of four
-# attempts at a timing assertion on #242 ("Make ordinary TUI startup
-# prompt-first and lazily hydrate MemTree"), one of which reached green CI
-# while depending on the machine being busy.
+# wall-clock thresholds". The precedent it cites is the four attempts at a
+# timing assertion on #242 ("Make ordinary TUI startup prompt-first and lazily
+# hydrate MemTree"), one of which reached green CI while depending on the
+# machine being busy. `a0ea2c64` ("assert hydration state, not a wall-clock
+# ratio") is the commit that replaced the last of them; #364 names the issue,
+# and the commit is one step further out.
 #
-# That requirement is written in #364 and its precedent is `a0ea2c64`; it is
+# That requirement is written in #364 and its precedent is #242's four
+# attempts, the last repaired by `a0ea2c64`; it is
 # not a rule in `AGENTS.md`. PR #391 ("docs(agents): write down the
 # no-wall-clock-assertion rule") proposed adding it and was closed DO NOT
 # MERGE. Earlier revisions of this file cited it to `AGENTS.md` anyway; a

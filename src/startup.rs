@@ -208,13 +208,16 @@ declare_names! {
 /// under it. Issue #364, "Instrument and reduce Finch interactive TUI
 /// time-to-ready", requires of this work's coverage: "Synchronization and
 /// structural assertions, not absolute wall-clock thresholds." The precedent
-/// it cites is `a0ea2c64` ("assert hydration state, not a wall-clock ratio"),
-/// which replaced the last of four attempts at a timing assertion on #242,
-/// "Make ordinary TUI startup prompt-first and lazily hydrate MemTree" -- one
-/// of which reached 35/35 green CI while depending on the machine being busy.
+/// it cites is the four attempts at a timing assertion on #242, "Make
+/// ordinary TUI startup prompt-first and lazily hydrate MemTree" -- one of
+/// which reached 35/35 green CI while depending on the machine being busy.
+/// `a0ea2c64` ("assert hydration state, not a wall-clock ratio") is the
+/// commit that replaced the last of them; #364 names the issue, and this is
+/// where the commit comes from, one step further out.
 ///
 /// Note what is and is not being cited. That requirement is written in #364
-/// and the precedent is in `a0ea2c64`; it is **not** a rule in `AGENTS.md`.
+/// and its precedent is #242's four attempts, the last repaired by
+/// `a0ea2c64`; it is **not** a rule in `AGENTS.md`.
 /// PR #391, "docs(agents): write down the no-wall-clock-assertion rule",
 /// proposed adding it and was closed DO NOT MERGE on the ground that a
 /// blanket prohibition is not what `a0ea2c64` established and conflicts with
@@ -241,13 +244,26 @@ fn slow_phase_budget() -> Duration {
         let Some(value) = std::env::var_os("FINCH_STARTUP_SLOW_BUDGET_MS") else {
             return DEFAULT_SLOW_PHASE;
         };
-        value
-            .to_string_lossy()
-            .trim()
-            .parse::<u64>()
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_SLOW_PHASE)
+        parse_slow_phase_budget(&value)
     })
+}
+
+/// Read one `FINCH_STARTUP_SLOW_BUDGET_MS` value.
+///
+/// A separate function only so a test can call *this* one. Inline in the
+/// `OnceLock` initialiser it was unreachable -- the cache latches on first
+/// read, and no test can arrange to be that read -- so the test that covered
+/// it re-implemented the parse and asserted on its own copy. Widening the
+/// fallback to an hour, which is how an unparseable value would silently
+/// remove the over-budget warning the test's own message forbids removing,
+/// left the suite green.
+fn parse_slow_phase_budget(value: &std::ffi::OsStr) -> Duration {
+    value
+        .to_string_lossy()
+        .trim()
+        .parse::<u64>()
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SLOW_PHASE)
 }
 
 /// How many times a report has been rendered in this process.
@@ -1574,33 +1590,56 @@ mod tests {
 
     /// The budget override that lets the over-budget warning -- a user-visible
     /// terminal surface -- be driven at the production boundary instead of
-    /// only here. `slow_phase_budget` caches on first read, so this asserts
-    /// the parse rather than re-reading the environment.
+    /// only here.
+    ///
+    /// This calls the production parse. An earlier revision declared a private
+    /// `fn parse()` with the same body and asserted on that, which is a test
+    /// of the test: widening production's fallback to an hour -- an
+    /// unparseable value silently switching the over-budget warning off
+    /// entirely, the outcome the assertion message below forbids -- left it
+    /// green. `slow_phase_budget` itself caches in a `OnceLock` on first read,
+    /// so the parse is factored out to be callable rather than reached through
+    /// the environment.
     #[test]
     fn test_an_unparseable_budget_override_falls_back_rather_than_disabling_the_warning() {
-        // The parse `slow_phase_budget` performs, applied to the values a
-        // profile can realistically hold. A `0` means "warn about everything",
-        // which is what the production-boundary test uses; anything
-        // unparseable must leave the default in force rather than silently
-        // becoming zero (warn about everything) or `u64::MAX` (warn about
-        // nothing).
-        fn parse(value: &str) -> Duration {
-            value
-                .trim()
-                .parse::<u64>()
-                .map(Duration::from_millis)
-                .unwrap_or(DEFAULT_SLOW_PHASE)
-        }
-        assert_eq!(parse("0"), Duration::ZERO);
-        assert_eq!(parse(" 250 "), Duration::from_millis(250));
+        use std::ffi::OsStr;
+
+        // The values a profile can realistically hold. A `0` means "warn about
+        // everything", which is what the production-boundary test uses;
+        // anything unparseable must leave the default in force rather than
+        // silently becoming zero (warn about everything) or an hour (warn
+        // about nothing).
+        assert_eq!(parse_slow_phase_budget(OsStr::new("0")), Duration::ZERO);
         assert_eq!(
-            parse("soon"),
+            parse_slow_phase_budget(OsStr::new(" 250 ")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            parse_slow_phase_budget(OsStr::new("soon")),
             DEFAULT_SLOW_PHASE,
             "an unparseable FINCH_STARTUP_SLOW_BUDGET_MS must leave the \
              default budget in force. Reading it as zero would warn on every \
              phase of every launch, and reading it as no budget at all would \
              silently remove the one startup line #364 requires a user to see."
         );
-        assert_eq!(parse(""), DEFAULT_SLOW_PHASE);
+        assert_eq!(parse_slow_phase_budget(OsStr::new("")), DEFAULT_SLOW_PHASE);
+        assert_eq!(
+            parse_slow_phase_budget(OsStr::new("-1")),
+            DEFAULT_SLOW_PHASE,
+            "a negative override is not a budget of zero"
+        );
+
+        // The other half of the wiring: with nothing in the environment the
+        // budget in force is the default, not whatever the last caller cached.
+        // Guarded, because the override is real operator surface and a
+        // developer may have it set in the shell that ran this.
+        if std::env::var_os("FINCH_STARTUP_SLOW_BUDGET_MS").is_none() {
+            assert_eq!(
+                slow_phase_budget(),
+                DEFAULT_SLOW_PHASE,
+                "with no override set, the budget the warning is measured \
+                 against must be the {DEFAULT_SLOW_PHASE:?} default"
+            );
+        }
     }
 }

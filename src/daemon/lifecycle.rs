@@ -46,6 +46,17 @@ impl DaemonLifecycle {
         Ok(Self { pid_file })
     }
 
+    /// Manage the daemon whose PID file is at `pid_file`.
+    ///
+    /// Test-only. Production always derives the path from the home directory,
+    /// and `src/daemon/spawn.rs` cannot otherwise drive the connect path's
+    /// "a PID file exists, wait and retry" branch without depending on -- and
+    /// writing into -- the developer's real `~/.finch`.
+    #[cfg(test)]
+    pub(crate) fn with_pid_file(pid_file: PathBuf) -> Self {
+        Self { pid_file }
+    }
+
     /// Write current process PID to file
     pub fn write_pid(&self) -> Result<()> {
         let pid = std::process::id();

@@ -37,13 +37,17 @@
 //! Issue #364, "Instrument and reduce Finch interactive TUI time-to-ready",
 //! states it under Required coverage: "Synchronization and structural
 //! assertions, not absolute wall-clock thresholds." The precedent it cites is
-//! `a0ea2c64` ("assert hydration state, not a wall-clock ratio"), which
-//! replaced the last of four attempts at a timing assertion on #242, "Make
-//! ordinary TUI startup prompt-first and lazily hydrate MemTree" -- one of
-//! which reached 35/35 green CI while depending on the machine being busy.
+//! the four attempts at a timing assertion on #242, "Make ordinary TUI
+//! startup prompt-first and lazily hydrate MemTree" -- one of which reached
+//! 35/35 green CI while depending on the machine being busy. `a0ea2c64`
+//! ("assert hydration state, not a wall-clock ratio") is the commit that
+//! replaced the last of them; #364 names the issue, and the commit is one
+//! step further out.
 //!
-//! Cited precisely, because two earlier revisions of this file did not. This
-//! requirement is written in #364 and its precedent is `a0ea2c64`. It is
+//! Cited precisely, because two earlier revisions of this file did not, and
+//! because a third revision named the commit as though #364 had. This
+//! requirement is written in #364 and its precedent is #242's four attempts,
+//! the last of them repaired by `a0ea2c64`. It is
 //! **not** a rule in `AGENTS.md`: PR #391, "docs(agents): write down the
 //! no-wall-clock-assertion rule", proposed adding it and was closed DO NOT
 //! MERGE, on the ground that a blanket prohibition is not what `a0ea2c64`
@@ -689,9 +693,14 @@ const NOT_ON_THE_FIXTURE_PATH: &[(&str, &str)] = &[
     (
         "daemon_retry_backoff",
         "the unconditional two-second wait before the retry probe; \
-         unreachable here for the same reason, and covered by \
-         `test_the_retry_fallback_is_recorded_as_a_phase_of_its_own` in \
-         `src/daemon/spawn.rs`",
+         unreachable here for the same reason. Covered at its call site by \
+         `test_the_connect_path_records_the_backoff_between_its_two_probes` \
+         in `src/daemon/spawn.rs`, which drives the real connect path against \
+         a synthetic PID file and a dead loopback port and asserts the phase \
+         order probe/backoff/probe; and at the helper alone by \
+         `test_the_retry_fallback_is_recorded_as_a_phase_of_its_own`. The \
+         first is the load-bearing one: with only the second, inlining the \
+         sleep at the call site left every suite green",
     ),
 ];
 
@@ -1502,8 +1511,9 @@ fn test_the_startup_report_leaks_no_private_content() {
 /// reduce Finch interactive TUI time-to-ready", asks for the benchmark to be
 /// "kept separate from the correctness gates" and for this suite's assertions
 /// to be structural rather than absolute wall-clock thresholds; this reports
-/// timings and asserts none. (That requirement lives in #364 and in the
-/// precedent `a0ea2c64`, not in `AGENTS.md` -- see this file's header.)
+/// timings and asserts none. (That requirement lives in #364, whose precedent
+/// is #242's four timing attempts -- the last repaired by `a0ea2c64` -- and
+/// not in `AGENTS.md`; see this file's header.)
 ///
 /// It lives here rather than in a shell script because the shell version
 /// launched the TUI itself through `script(1)` and cleaned up with

@@ -30,6 +30,25 @@ The self-test invokes every launcher in proof-only mode, exercises both HTTP
 launchers past re-exec with an inherited-listener fixture, and proves an
 unrelated same-name process survives the TUI smoke.
 
+## Delegating shell entrypoints
+
+These match the enforced scan but call no
+`brain_test_isolation_reexec_launcher` themselves, which is why they are absent
+from the self-test's launcher-probe loop: they create nothing to isolate and
+hand every process they are responsible for to a launcher that is isolated.
+
+- `scripts/bench_startup_time_to_ready.sh` launches no Finch. It exports two
+  `FINCH_BENCH_STARTUP_*` variables and `exec`s the cargo slot wrapper onto
+  `scripts/test_brains.sh cargo test --release --test startup_time_to_ready`,
+  so the only processes it causes are created by the authenticated supervisor
+  and reaped with it. It constructs no Brain, binds no endpoint, performs no
+  daemon discovery, and touches no path under the user's `~/.finch`; the Brain
+  inventory it benchmarks is the synthetic one the test binary seeds in a
+  disposable HOME. It matches the scan on `brain`, `daemon` and `cargo test`
+  in its scope comments and in that one command line. An earlier revision did
+  launch a pty child directly and clean up with `pkill -f`, which is the
+  pid-signalling `AGENTS.md` forbids; the delegation is what replaced it.
+
 ## Rust test entrypoints
 
 - `tests/daemon_integration_test.rs` fails closed without authenticated
@@ -49,6 +68,27 @@ unrelated same-name process survives the TUI smoke.
   handlers in-process and never launches or contacts a daemon.
 - `tests/service_discovery_test.rs` is non-Brain and does not advertise a
   service. Its manual examples are not automated entrypoints.
+- `tests/startup_time_to_ready.rs` drives interactive startup through a real
+  pty. It constructs no Brain object: it writes `brains/<name>/events.jsonl`
+  directories by hand under a `tempfile` HOME, writes that HOME's
+  `config.toml` with `use_daemon = false`, and spawns one child, the built
+  `finch` binary, with `HOME`, `HF_HOME` and the three XDG variables repointed
+  into that directory, every provider credential removed by name, and every
+  inherited `FINCH_BRAIN_TEST_*`/`FINCH_TEST_*` variable removed so the child
+  cannot claim supervisor authority it was not given. It never reads or writes
+  the user's Finch state. Because `use_daemon = false` the child performs no
+  daemon discovery, spawns no daemon and issues no `GET /health`, and
+  `FINCH_BRAIN_TEST_NO_AUTO_SPAWN=1` is set as well so an auto-spawn would
+  fail closed rather than escape. The child is a plain `Command` spawn that
+  calls none of the allowlisted session- or group-creating APIs, so it stays
+  inside the supervisor's owned process group; `Session::drop` kills and reaps
+  that one child by handle and signals no pid it did not create. It is a
+  separate binary rather than a `src/` unit test because `Repl` takes its
+  interactive branch only when stdout `is_terminal()`, which requires a pty
+  slave on a child's three standard descriptors -- something a `#[cfg(test)]`
+  function inside the library process cannot arrange for itself. Its
+  `bench_startup_time_to_ready` case is `#[ignore]`d and runs only from the
+  benchmark script above.
 - `tests/no_external_provider_binary_test.rs` is the independent #173
   binary-removal regression. It uses its own `tempfile` HOME and process group;
   it neither constructs a Brain nor reads the user's Finch state.

@@ -48,7 +48,21 @@ fn ensure_daemon_access_allowed() -> Result<()> {
 pub(crate) const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) -> Result<()> {
-    let bind = bind_address.unwrap_or(DEFAULT_BIND);
+    connect_or_spawn(bind_address.unwrap_or(DEFAULT_BIND), DaemonLifecycle::new).await
+}
+
+/// The connect path proper: probe, then retry behind a PID file, then spawn.
+///
+/// `lifecycle` is a constructor rather than a `DaemonLifecycle` so the healthy
+/// path still does not create `~/.finch/daemon.pid`'s parent directory, and so
+/// the retry branch below can be driven from a test against a synthetic PID
+/// file instead of the developer's real one. #364, "Instrument and reduce
+/// Finch interactive TUI time-to-ready", is about what this function's phases
+/// say happened, so a test has to be able to run *this function*.
+async fn connect_or_spawn<F>(bind: &str, lifecycle: F) -> Result<()>
+where
+    F: FnOnce() -> Result<DaemonLifecycle>,
+{
     let base_url = format!("http://{}", bind);
 
     // Quick health check first
@@ -58,7 +72,7 @@ async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) 
     }
 
     // Check PID file
-    let lifecycle = DaemonLifecycle::new()?;
+    let lifecycle = lifecycle()?;
     if lifecycle.is_running() {
         // Daemon process exists but not responding yet
         // Wait a bit and retry (it might be starting up)
@@ -286,6 +300,21 @@ async fn retry_backoff() {
 /// distinguishes "the daemon answered and said no" from "nothing answered
 /// inside the 500 ms timeout", which are different failures with different
 /// fixes and were previously indistinguishable in the report.
+///
+/// The timeline this writes into is process-global, and one caller is not on
+/// the startup path: `upgrade::wait_for_shadow_health` polls here up to sixty
+/// times while a shadow daemon comes up. That is left instrumented rather than
+/// scoped to startup, deliberately. The cost is bounded (sixty records, once,
+/// in a process that is performing an upgrade), and nothing reads those
+/// records: [`crate::startup::ready`] is the only thing that renders a report
+/// and `finch daemon-upgrade` never reaches it, so the entries are accumulated
+/// and dropped with the process. The alternative -- a startup-only flag
+/// threaded through this function -- would add a parameter whose only purpose
+/// is to suppress records no one sees, and would let a future startup caller
+/// pass the wrong value and lose the probe from the report silently. What is
+/// true and worth stating plainly: the timeline is "phases this process
+/// recorded", not "phases of startup", and a reader who dumps it mid-upgrade
+/// will see upgrade probes in it.
 pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
     let mut phase = crate::startup::phase(crate::startup::PHASE_DAEMON_HEALTH_PROBE);
     let client = reqwest::Client::builder()
@@ -357,6 +386,19 @@ mod tests {
         crate::daemon::log::ensure_regular_file(&path).unwrap();
     }
 
+    /// NOT A REGRESSION TEST FOR `spawn_daemon`, despite its name. Pre-existing
+    /// (`65813dff`, #249) and left as it is by #364's work, but recorded here
+    /// because #364's round-3 sweep for "tests that assert on their own
+    /// re-implementation" found it: the body below performs the open and the
+    /// `fchmod` repair itself and asserts the mode it just set. `spawn_daemon`
+    /// is never called, so deleting the permission-repair block in it, or
+    /// changing its `mode(0o600)`, leaves this green and the daemon log
+    /// world-readable. What it does prove is the platform premise the repair
+    /// rests on -- that `OpenOptions::mode` does not apply to an existing file
+    /// -- which is the `assert_eq!(.., 0o644, "precondition")` line. Closing
+    /// the gap means extracting the open into a callable function, which is a
+    /// change to the daemon spawn path and does not belong in a startup
+    /// instrumentation change.
     #[test]
     #[cfg(unix)]
     fn test_frontend_open_repairs_a_world_readable_log() {
@@ -425,6 +467,20 @@ mod tests {
             .iter()
             .filter(|record| record.name == crate::startup::PHASE_DAEMON_RETRY_BACKOFF)
             .count()
+    }
+
+    /// The daemon connect's sub-phases recorded so far, in the order they
+    /// were recorded. `PhaseGuard` pushes on drop, so this is the order the
+    /// connect path actually closed them in.
+    fn daemon_phase_names() -> Vec<&'static str> {
+        crate::startup::recorded()
+            .iter()
+            .map(|record| record.name)
+            .filter(|name| {
+                *name == crate::startup::PHASE_DAEMON_HEALTH_PROBE
+                    || *name == crate::startup::PHASE_DAEMON_RETRY_BACKOFF
+            })
+            .collect()
     }
 
     /// Answer one request with `status`, then close. Returns the base URL.
@@ -546,6 +602,83 @@ mod tests {
             "waiting is not probing: the fallback must not record a `{}` \
              phase, or the report double-counts probes that never happened.",
             crate::startup::PHASE_DAEMON_HEALTH_PROBE,
+        );
+    }
+
+    /// The connect path itself, driven end to end.
+    ///
+    /// `test_the_retry_fallback_is_recorded_as_a_phase_of_its_own` calls
+    /// `retry_backoff()` directly, so it proves the helper records a phase and
+    /// nothing else. It does not prove the connect path calls the helper:
+    /// replacing the call in `connect_or_spawn` with a bare
+    /// `tokio::time::sleep(RETRY_BACKOFF).await` -- the pre-#364 shape, with
+    /// the flat two-second floor absorbed back into `daemon_http_connect` --
+    /// left the whole suite green. This test runs the real function, so the
+    /// phases it asserts on are recorded as a consequence of the code under
+    /// test rather than of the test.
+    ///
+    /// The fixture is the retry branch's exact precondition: a PID file naming
+    /// a process that is alive (this one), and an address nothing is listening
+    /// on. So the path probes, finds the PID file, waits, probes again, and
+    /// fails with the "running but not responding" diagnostic. Nothing is
+    /// spawned -- the spawn branch is only reached when no PID file is live --
+    /// and the PID file is inside a `tempfile` directory, so the developer's
+    /// `~/.finch` is neither read nor written.
+    ///
+    /// Structural, with no duration asserted; the clock is paused so the two
+    /// second wait costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn test_the_connect_path_records_the_backoff_between_its_two_probes() {
+        let _serialised = timeline_lock().await;
+
+        let home = tempfile::tempdir().expect("a disposable directory for the PID file");
+        let pid_file = home.path().join("daemon.pid");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write the PID file");
+
+        // A port the kernel just handed out and nothing is bound to: the probe
+        // gets no answer, which is the "daemon exists but is not responding"
+        // case this branch is for.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a kernel-assigned loopback port");
+        let dead_address = closed.local_addr().expect("bound address").to_string();
+        drop(closed);
+
+        let before = daemon_phase_names().len();
+
+        let error = connect_or_spawn(&dead_address, || {
+            Ok(DaemonLifecycle::with_pid_file(pid_file.clone()))
+        })
+        .await
+        .expect_err("nothing is listening on the address, so the connect must fail");
+
+        let recorded: Vec<&'static str> = daemon_phase_names().split_off(before);
+        assert_eq!(
+            recorded,
+            vec![
+                crate::startup::PHASE_DAEMON_HEALTH_PROBE,
+                crate::startup::PHASE_DAEMON_RETRY_BACKOFF,
+                crate::startup::PHASE_DAEMON_HEALTH_PROBE,
+            ],
+            "the connect path must record its {:?} fallback wait as a phase of \
+             its own, between the probe that failed and the retry it is \
+             waiting for. Absorbed back into `daemon_http_connect`, a 2.5 s \
+             launch reports one undivided `ms=2503.1` and a maintainer cannot \
+             tell a slow daemon from this flat floor -- the split #364 \
+             requires. Connect failed with: {error:#}",
+            RETRY_BACKOFF,
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("not responding to health checks"),
+            "the retry branch must be the branch that ran, or the phases above \
+             came from somewhere else. Error was: {error:#}"
+        );
+        assert!(
+            error.to_string().contains(&std::process::id().to_string()),
+            "the diagnostic must name the PID it found in the PID file, which \
+             is this test's own. Error was: {error:#}"
         );
     }
 
