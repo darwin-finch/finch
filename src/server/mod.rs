@@ -617,11 +617,6 @@ impl AgentServer {
             let mut last_warm = tokio::time::Instant::now();
 
             let wakeup = schedule_store.schedule_wakeup();
-            // A ceiling on the sleep, so a clock jump or a missed notification
-            // costs one idle wake rather than an unbounded stall. It is a
-            // backstop, not the mechanism: with nothing due, this loop wakes
-            // once a minute instead of sixty times.
-            const MAX_SLEEP: tokio::time::Duration = schedule_delivery::MAX_SLEEP;
             // A due schedule whose Brain has no ready runner is not delivered
             // and its `next_due_ms` is not advanced, so the index head stays
             // due. Without a floor the loop would then spin: the old code was

@@ -7856,6 +7856,63 @@ mod tests {
     /// hydrating all 65 Brains on every tick, the exact defect #374 removes --
     /// would have passed it.
     #[test]
+    fn test_a_repaired_brain_is_picked_up_by_a_later_warm() {
+        // The regression for round 2's worst finding. Warming once meant a
+        // Brain that happened to be unloadable at daemon start -- a volume not
+        // yet mounted, a journal mid-repair -- was never scheduled again for
+        // the life of the daemon, silently, because a scheduled Brain is
+        // precisely the one nothing else touches by name to hydrate it. The
+        // fixed one-second tick this replaced recovered within a second.
+        //
+        // Asserted at the store, with no clock and no loop: the property the
+        // periodic re-warm depends on is that warming again picks up a Brain
+        // that has since become loadable.
+        let temp = tempfile::tempdir().unwrap();
+        let good_metadata = {
+            let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+            seed_scheduled_brain(&seeding, "healthy", 1_000);
+            seed_scheduled_brain(&seeding, "repairable", 2_000);
+            std::fs::read(temp.path().join("repairable").join("metadata.json")).unwrap()
+        };
+
+        // Break it the way the reference host's Brain was broken: unreadable
+        // identity, so `ensure_loaded` refuses it.
+        std::fs::write(
+            temp.path().join("repairable").join("metadata.json"),
+            "{not json",
+        )
+        .unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        store.warm_schedule_index();
+        assert_eq!(
+            store.due_schedule_brains(5_000),
+            vec!["healthy".to_string()],
+            "precondition: the broken Brain is skipped and the healthy one is \
+             still scheduled, which is what keeps one bad Brain from stopping \
+             delivery for every Brain"
+        );
+
+        std::fs::write(
+            temp.path().join("repairable").join("metadata.json"),
+            good_metadata,
+        )
+        .unwrap();
+
+        store.warm_schedule_index();
+
+        assert_eq!(
+            store.due_schedule_brains(5_000),
+            vec!["healthy".to_string(), "repairable".to_string()],
+            "a Brain that has become loadable must be picked up by a later \
+             warm. Warming only once leaves it unscheduled until the daemon \
+             restarts, with a single startup warning as the only symptom -- \
+             and nothing else will index it, because a scheduled Brain is the \
+             one nothing touches by name"
+        );
+    }
+
+    #[test]
     fn test_selection_does_not_hydrate_brains_without_due_work() {
         const IDLE: usize = 64;
         let temp = tempfile::tempdir().unwrap();
