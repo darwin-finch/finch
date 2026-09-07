@@ -1,0 +1,202 @@
+{
+  "schema": "finch-ci-workflow-manifest:v1",
+  "pr_active_workflows": [
+    "ci.yml",
+    "docs.yml",
+    "issue-105-oauth.yml",
+    "issue-163-effect-audit.yml",
+    "issue-187-subagent-fanout.yml",
+    "issue-201-chatgpt-auth.yml",
+    "issue-227-setup-preservation.yml",
+    "issue-245-cargo-slot.yml",
+    "issue-46-atomic-conversation.yml",
+    "issue-56-brain-isolation.yml",
+    "repository-hygiene.yml"
+  ],
+  "workflows": {
+    "ci.yml": {
+      "digest": "41d618bd39c8068fd3adbd187ea280f893fd7b8a3fd1ab35f6da6237f26972c2",
+      "activated_fixtures": [
+        "brain_effect",
+        "manifest_dependency",
+        "ordinary_source",
+        "public_api",
+        "readme_only"
+      ]
+    },
+    "docs.yml": {
+      "digest": "401bc2d742263cb6f331ca291307b3d2d185e26860665e78a7b8850ee1dade90",
+      "activated_fixtures": ["readme_only"]
+    },
+    "issue-104-chooser-catalog.yml": {
+      "digest": "3b6b165940ef854110a409669de69024c8b3411ca1ddd8940cefc08edd4f37ea",
+      "activated_fixtures": []
+    },
+    "issue-105-oauth.yml": {
+      "digest": "36ad1a37882be44ca0fc210dc07769a80a9aaa6f5d4b6ab12d8b6eda032cc26e",
+      "activated_fixtures": ["manifest_dependency", "public_api"]
+    },
+    "issue-163-effect-audit.yml": {
+      "digest": "5247f2b9850e03d61552b45dd35cb3acc9bdc02f1d4fd03910e7ed7f36e34eb2",
+      "activated_fixtures": ["brain_effect"]
+    },
+    "issue-187-subagent-fanout.yml": {
+      "digest": "15d946fe582c84d811e6116a63a59146d6fce8ca2df56f2608dc4905a11fbb47",
+      "activated_fixtures": []
+    },
+    "issue-201-chatgpt-auth.yml": {
+      "digest": "8c9eba62b306a9007e3f40678e879a5a2d74150e8b8066c66f45babf197279a6",
+      "activated_fixtures": ["manifest_dependency"]
+    },
+    "issue-227-setup-preservation.yml": {
+      "digest": "2255148fb2cf80248f2945581f057e888cb2703e3789cd6e82dae958416a8788",
+      "activated_fixtures": []
+    },
+    "issue-245-cargo-slot.yml": {
+      "digest": "19f563f6aa9041cc43ffd5df88043499213983f0485f7a104c7a2f14b1470154",
+      "activated_fixtures": []
+    },
+    "issue-46-atomic-conversation.yml": {
+      "digest": "ac1f974695fb2933d7f6edefe83e58b33504b61aea2a482a1aecdb5b0c23f242",
+      "activated_fixtures": []
+    },
+    "issue-56-brain-isolation.yml": {
+      "digest": "096d8d111bbee0dd577dc37e9db326f8bc1df8a6afd94cbfdabeebcb141831d6",
+      "activated_fixtures": [
+        "brain_effect",
+        "manifest_dependency",
+        "ordinary_source",
+        "public_api"
+      ]
+    },
+    "issue-72-capability-contract.yml": {
+      "digest": "9c0111ca529c7c07d4e5e141a5d62c5b8a9759e670323403b2a4c99fd3437651",
+      "activated_fixtures": []
+    },
+    "release.yml": {
+      "digest": "db1fcdef527a827b47f0eed21218c7517486e76d6fd25715080f1d464359e112",
+      "activated_fixtures": []
+    },
+    "repository-hygiene.yml": {
+      "digest": "5086e2dc15882d9cc28f4407b9d511e2818e72abf89ab02ce32c569b78d72472",
+      "activated_fixtures": [
+        "brain_effect",
+        "manifest_dependency",
+        "ordinary_source",
+        "public_api",
+        "readme_only"
+      ]
+    }
+  },
+  "fixtures": {
+    "brain_effect": {
+      "changed_paths": ["src/brain/store.rs", "src/server/handlers.rs"],
+      "expected_checks": [
+        "Build Release (aarch64-apple-darwin)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (macos-14)",
+        "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)",
+        "Security Audit",
+        "Test (macos-14, default)",
+        "Test (macos-14, no-default-features)",
+        "Test (ubuntu-24.04, default)",
+        "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract",
+        "Toolchain and formatting contract (Windows)",
+        "Tracked tree (macos-14)",
+        "Tracked tree (ubuntu-24.04)",
+        "effect-audit"
+      ],
+      "expected_count": 15
+    },
+    "manifest_dependency": {
+      "changed_paths": ["Cargo.toml", "Cargo.lock"],
+      "expected_checks": [
+        "Build Release (aarch64-apple-darwin)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (macos-14)",
+        "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)",
+        "Security Audit",
+        "Test (macos-14, default)",
+        "Test (macos-14, no-default-features)",
+        "Test (ubuntu-24.04, default)",
+        "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract",
+        "Toolchain and formatting contract (Windows)",
+        "Tracked tree (macos-14)",
+        "Tracked tree (ubuntu-24.04)",
+        "focused-auth (macos-14)",
+        "focused-auth (ubuntu-24.04)",
+        "macos-oauth",
+        "oauth",
+        "windows-compile",
+        "windows-verifier-compile"
+      ],
+      "expected_count": 20
+    },
+    "ordinary_source": {
+      "changed_paths": ["src/models/mod.rs"],
+      "expected_checks": [
+        "Build Release (aarch64-apple-darwin)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (macos-14)",
+        "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)",
+        "Security Audit",
+        "Test (macos-14, default)",
+        "Test (macos-14, no-default-features)",
+        "Test (ubuntu-24.04, default)",
+        "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract",
+        "Toolchain and formatting contract (Windows)",
+        "Tracked tree (macos-14)",
+        "Tracked tree (ubuntu-24.04)"
+      ],
+      "expected_count": 14
+    },
+    "public_api": {
+      "changed_paths": ["src/lib.rs"],
+      "expected_checks": [
+        "Build Release (aarch64-apple-darwin)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (macos-14)",
+        "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)",
+        "Security Audit",
+        "Test (macos-14, default)",
+        "Test (macos-14, no-default-features)",
+        "Test (ubuntu-24.04, default)",
+        "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract",
+        "Toolchain and formatting contract (Windows)",
+        "Tracked tree (macos-14)",
+        "Tracked tree (ubuntu-24.04)",
+        "macos-oauth",
+        "oauth",
+        "windows-compile"
+      ],
+      "expected_count": 17
+    },
+    "readme_only": {
+      "changed_paths": ["README.md"],
+      "expected_checks": [
+        "Build Release (aarch64-apple-darwin)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Current docs links, claims, and shell syntax",
+        "Runtime Authority (Ubuntu)",
+        "Security Audit",
+        "Test (macos-14, default)",
+        "Test (macos-14, no-default-features)",
+        "Test (ubuntu-24.04, default)",
+        "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract",
+        "Toolchain and formatting contract (Windows)",
+        "Tracked tree (macos-14)",
+        "Tracked tree (ubuntu-24.04)"
+      ],
+      "expected_count": 13
+    }
+  }
+}

@@ -108,6 +108,9 @@ jobs:
     - name: Compile all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
 
+    - name: Prove the removed finch::ssh API stays absent downstream
+      run: python3 scripts/check_removed_ssh_api.py ${{ matrix.cargo_args }}
+
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
@@ -195,6 +198,20 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install workflow manifest parser
+      run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+    - name: Check reviewed workflow documents and fixture inventories
+      run: python3 scripts/check_ci_workflow_manifest.py
+
+    - name: Run workflow manifest mutation regressions
+      run: python3 scripts/test_ci_workflow_manifest.py
+
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
@@ -207,5 +224,89 @@ jobs:
         python3 scripts/test_http_dependency_contract.py
         python3 scripts/check_http_dependency_contract.py
 
-    - name: Run cargo audit
-      run: cargo audit
+    - name: Prove removed SSH and RSA packages stay out of the resolved graph
+      shell: bash
+      run: |
+        printf '%s\n' \
+          'RUSTSEC-2026-0154 remains unreachable because russh is absent' \
+          'RUSTSEC-2026-0153 remains unreachable because russh-cryptovec is absent' \
+          'RUSTSEC-2023-0071 remains unreachable because rsa is absent'
+        if grep -Eq '^name = "(rsa|russh|russh-cryptovec|russh-keys)"$' Cargo.lock; then
+          echo 'A removed SSH or RSA package returned to Cargo.lock' >&2
+          grep -nE '^name = "(rsa|russh|russh-cryptovec|russh-keys)"$' Cargo.lock >&2
+          exit 1
+        fi
+        cargo tree --all-features --target all --edges normal,build,dev \
+          --prefix none --format '{p}' | sort -u | tee dependency-tree.txt
+        if grep -Eq '^(rsa|russh|russh-cryptovec|russh-keys) v' dependency-tree.txt; then
+          echo 'A removed SSH or RSA package returned to the all-target feature graph' >&2
+          grep -E '^(rsa|russh|russh-cryptovec|russh-keys) v' dependency-tree.txt >&2
+          exit 1
+        fi
+
+    - name: Prove the quick-xml floor excludes both historical advisories
+      shell: bash
+      run: |
+        cargo tree --invert quick-xml --edges normal,build,dev --prefix none --format '{p}' \
+          | sort -u | tee quick-xml-tree.txt
+        printf '%s\n' \
+          'RUSTSEC-2026-0194 is excluded by quick-xml >= 0.41.0' \
+          'RUSTSEC-2026-0195 is excluded by quick-xml >= 0.41.0'
+        minimum=0.41.0
+        found=$(sed -n 's/^quick-xml v\([0-9][0-9.]*\).*/\1/p' quick-xml-tree.txt | sort -u)
+        if [[ -z "$found" ]]; then
+          echo 'no quick-xml in the graph; the advisory assertion would be vacuous' >&2
+          exit 1
+        fi
+        for version in $found; do
+          oldest=$(printf '%s\n%s\n' "$version" "$minimum" | sort -V | head -n1)
+          if [[ "$oldest" == "$version" && "$version" != "$minimum" ]]; then
+            echo "quick-xml $version is below the fixed $minimum and is still reachable" >&2
+            exit 1
+          fi
+          echo "quick-xml $version is at or above the fixed $minimum"
+        done
+
+    - name: Run the one full Cargo audit and retain named advisory diagnostics
+      shell: bash
+      run: |
+        set +e
+        cargo audit --json > audit.json
+        audit_status=$?
+        set -e
+        if (( audit_status != 0 && audit_status != 1 )); then
+          echo "cargo-audit exited unexpectedly with status ${audit_status}" >&2
+          exit 1
+        fi
+        if [[ ! -s audit.json ]]; then
+          echo 'cargo-audit did not produce a non-empty JSON report' >&2
+          exit 1
+        fi
+        audit_bytes=$(wc -c < audit.json)
+        if (( audit_bytes > 10485760 )); then
+          echo "cargo-audit JSON exceeded the 10 MiB inspection bound: ${audit_bytes}" >&2
+          exit 1
+        fi
+        if ! jq -e 'type == "object" and (.vulnerabilities.list | type == "array")' audit.json >/dev/null; then
+          echo 'cargo-audit JSON did not contain the expected vulnerabilities list' >&2
+          exit 1
+        fi
+        jq -r '.vulnerabilities.list[]? | [.advisory.id, .package.name, .package.version] | @tsv' audit.json
+        jq -e '
+          [.vulnerabilities.list[]?]
+          | all(
+              .advisory.id != "RUSTSEC-2026-0194"
+              and .advisory.id != "RUSTSEC-2026-0195"
+              and .advisory.id != "RUSTSEC-2026-0154"
+              and .advisory.id != "RUSTSEC-2026-0153"
+              and .advisory.id != "RUSTSEC-2023-0071"
+              and .package.name != "rsa"
+              and .package.name != "russh"
+              and .package.name != "russh-cryptovec"
+              and .package.name != "russh-keys"
+            )
+        ' audit.json
+        if (( audit_status != 0 )); then
+          echo 'cargo audit found advisories outside the five permanent focused guards' >&2
+          exit "$audit_status"
+        fi
