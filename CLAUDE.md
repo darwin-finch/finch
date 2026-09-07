@@ -224,6 +224,33 @@ async fn load_model(config: &Config) -> Result<Model> {
 }
 ```
 
+### Reporting status to a human
+
+**Never cite a bare issue or pull request number.** An identifier is meaningless to a
+reader who cannot look it up while reading. Every mention carries a short
+plain-language description of what the thing actually is.
+
+```text
+# ✅ Legible
+#381 (log spam — the daemon repeated one warning every minute)
+Fast launch (#372, merged): /health no longer hydrates every Brain
+
+# ❌ Unreadable
+#381 is in review, #364 is blocked on #377, and #371 is unclaimed.
+```
+
+Applies to status updates, tables, handoffs, commit messages, and passing
+references — to other agents' work as much as your own. In a table, give the
+description its own column rather than appending it to the number.
+
+Two related habits, for the same reason:
+
+- **Say what changed for the user, not only what the patch did.** "Startup went from
+  about three seconds to instant" tells a maintainer something; "replaced `list()`
+  with `count_unhydrated()`" tells them only where to look.
+- **Name the file or symbol, not just the layer.** `src/brain/store.rs:1528`
+  (`BrainStore::list`) is checkable; "the store" is not.
+
 ## Release Process
 
 ```bash
