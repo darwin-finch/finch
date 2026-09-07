@@ -506,10 +506,10 @@ pub struct AgentScheduler {
     active_brain_parent: RwLock<Option<AgentBrainContext>>,
     #[cfg(test)]
     wait_after_initial_check: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
-    /// Test-only rendezvous taken once, after the per-turn cancellation
-    /// precheck and before the provider future is first polled. It exists so a
-    /// regression can drive the exact window in which a naive implementation
-    /// would bill an attempt the provider never observed.
+    /// Test-only rendezvous taken once at the top of a turn, before the
+    /// provider future is first polled. It exists so a regression can drive the
+    /// exact window in which a naive implementation would bill an attempt the
+    /// provider never observed.
     #[cfg(test)]
     wait_before_provider_poll: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
@@ -725,9 +725,15 @@ impl AgentScheduler {
                 Arc::clone(&record.notify)
             };
             #[cfg(test)]
-            if let Some((checked, resume)) = self.wait_after_initial_check.lock().await.clone() {
-                checked.notify_one();
-                resume.notified().await;
+            {
+                // Clone the hook out of the guard's temporary scope before
+                // awaiting, for the same reason as `wait_before_provider_poll`:
+                // the mutex must not be held across the rendezvous.
+                let hook = self.wait_after_initial_check.lock().await.clone();
+                if let Some((checked, resume)) = hook {
+                    checked.notify_one();
+                    resume.notified().await;
+                }
             }
             // Register before rechecking the result so a fast child cannot
             // finish between the state check and the notification await.
@@ -944,13 +950,25 @@ impl AgentScheduler {
 
         let turn_limit = spec.budget.max_turns.clamp(1, MAX_TURNS);
         for _ in 0..turn_limit {
-            if cancellation.is_cancelled() {
-                bail!("agent cancelled after consuming {attempts} provider attempts");
-            }
+            // There is deliberately no cancellation precheck here. The `biased`
+            // select below polls `cancellation.cancelled()` first, and that
+            // latch is already Ready for a token cancelled at any earlier point
+            // in the turn - including during tool execution - so a precheck
+            // would be a production branch that bails with a byte-identical
+            // message and that no test could tell apart from the select's own
+            // cancellation arm.
             #[cfg(test)]
-            if let Some((waiting, resume)) = self.wait_before_provider_poll.lock().await.take() {
-                waiting.notify_one();
-                resume.notified().await;
+            {
+                // Take the hook out of the guard's temporary scope before
+                // awaiting: an `if let` scrutinee temporary lives to the end of
+                // the `if let`, which would hold the mutex across the rendezvous
+                // and deadlock a future test that armed the hook with two
+                // concurrent children in flight.
+                let hook = self.wait_before_provider_poll.lock().await.take();
+                if let Some((waiting, resume)) = hook {
+                    waiting.notify_one();
+                    resume.notified().await;
+                }
             }
             // `biased` plus the increment inside the provider branch linearizes
             // the accounting: cancellation that is already signalled wins before
@@ -3122,7 +3140,12 @@ mod tests {
             .await
             .expect("the typed agent-await submission panicked during cancellation");
 
-        assert_typed_child_accounting(&outcome, "cancelled", 2, &["agent cancelled"]);
+        assert_typed_child_accounting(
+            &outcome,
+            "cancelled",
+            2,
+            &["agent cancelled after consuming 2 provider attempts"],
+        );
         assert_eq!(
             provider.provider_calls(),
             2,
@@ -3132,8 +3155,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn typed_agent_await_reports_zero_attempts_when_cancelled_before_the_provider_poll() {
+    /// Repetitions of the cancel-at-the-boundary cycle performed by
+    /// `typed_agent_await_reports_zero_attempts_when_cancelled_before_the_provider_poll`.
+    ///
+    /// The property under test - cancellation that lands before the first poll
+    /// of the generator future bills no attempt - holds only because the
+    /// per-turn `select!` in `agent_loop` is `biased` with the cancellation arm
+    /// first. Drop `biased;` and tokio picks a random starting branch while both
+    /// arms are Ready at that poll, so a single cycle exposes the defect only
+    /// about half the time: a one-shot regression would go green on roughly
+    /// 45% of CI runs and let "an attempt billed for a provider call that was
+    /// never issued" back in. Repeating the whole cycle against a fresh
+    /// scheduler drives the false-pass probability to about 2^-N.
+    const CANCEL_BEFORE_PROVIDER_POLL_CYCLES: usize = 24;
+
+    /// One spawn, park-at-the-boundary, cancel, resume cycle against a freshly
+    /// built runtime, provider, and scheduler. `iteration` is carried into every
+    /// assertion message so a failure names the cycle that produced it; parallel
+    /// test output interleaves, so the test name alone is not enough context.
+    async fn cancel_before_provider_poll_cycle(iteration: usize) {
         let provider = AttemptGenerator::new(vec![AttemptAction::Final("must never run")]);
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
@@ -3150,15 +3190,15 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(30), waiting.notified())
             .await
-            .expect(
-                "the child never reached the window after its cancellation precheck and before the provider future is polled",
-            );
+            .unwrap_or_else(|_| panic!(
+                "the child never reached the window at the top of its turn, before the provider future is polled; iteration={iteration}"
+            ));
         let task_id = {
             let tasks = scheduler.tasks.read().await;
             assert_eq!(
                 tasks.len(),
                 1,
-                "invariant: the typed spawn registers exactly one child; registered={}",
+                "invariant: the typed spawn registers exactly one child; iteration={iteration} registered={}",
                 tasks.len()
             );
             tasks.values().next().unwrap().snapshot.identity.task_id
@@ -3166,18 +3206,29 @@ mod tests {
         scheduler
             .cancel(task_id)
             .await
-            .expect("a child paused before its provider poll must accept cancellation");
+            .unwrap_or_else(|error| panic!(
+                "a child paused before its provider poll must accept cancellation; iteration={iteration} error={error:?}"
+            ));
         resume.notify_one();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), submission)
             .await
-            .expect("the child never terminalized after boundary cancellation")
-            .expect("the typed agent-await submission panicked during boundary cancellation");
+            .unwrap_or_else(|_| panic!(
+                "the child never terminalized after boundary cancellation; iteration={iteration}"
+            ))
+            .unwrap_or_else(|error| panic!(
+                "the typed agent-await submission panicked during boundary cancellation; iteration={iteration} join_error={error:?}"
+            ));
 
-        assert_typed_child_accounting(&outcome, "cancelled", 0, &["agent cancelled"]);
+        assert_typed_child_accounting(
+            &outcome,
+            "cancelled",
+            0,
+            &["agent cancelled after consuming 0 provider attempts"],
+        );
         assert_eq!(
             provider.provider_calls(),
             0,
-            "invariant: an attempt is billed only once the provider invocation begins, so cancellation before the first poll bills none; task_id={task_id} provider_calls={} outcome_diagnostics={:?}",
+            "invariant: an attempt is billed only once the provider invocation begins, so cancellation before the first poll bills none; iteration={iteration} task_id={task_id} provider_calls={} outcome_diagnostics={:?}",
             provider.provider_calls(),
             outcome.diagnostics
         );
@@ -3187,13 +3238,13 @@ mod tests {
         assert_eq!(
             finished.len(),
             1,
-            "invariant: boundary cancellation publishes exactly one terminal event; task_id={task_id} terminal_count={} events={observed:?}",
+            "invariant: boundary cancellation publishes exactly one terminal event; iteration={iteration} task_id={task_id} terminal_count={} events={observed:?}",
             finished.len()
         );
         assert_eq!(
             (finished[0].status, finished[0].turns),
             (AgentTaskStatus::Cancelled, 0),
-            "invariant: the broadcast terminal result agrees with the typed record; task_id={task_id} terminal={:?} provider_calls={}",
+            "invariant: the broadcast terminal result agrees with the typed record; iteration={iteration} task_id={task_id} terminal={:?} provider_calls={}",
             finished[0],
             provider.provider_calls()
         );
@@ -3203,9 +3254,16 @@ mod tests {
         drain_events(&mut events, &mut late);
         assert!(
             late.is_empty() && provider.provider_calls() == 0,
-            "invariant: no lifecycle event or provider call occurs after boundary cancellation terminalizes; task_id={task_id} late_events={late:?} provider_calls={} events={observed:?}",
+            "invariant: no lifecycle event or provider call occurs after boundary cancellation terminalizes; iteration={iteration} task_id={task_id} late_events={late:?} provider_calls={} events={observed:?}",
             provider.provider_calls()
         );
+    }
+
+    #[tokio::test]
+    async fn typed_agent_await_reports_zero_attempts_when_cancelled_before_the_provider_poll() {
+        for iteration in 0..CANCEL_BEFORE_PROVIDER_POLL_CYCLES {
+            cancel_before_provider_poll_cycle(iteration).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
