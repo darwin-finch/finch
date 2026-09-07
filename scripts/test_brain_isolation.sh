@@ -7,6 +7,80 @@ trap 'status=$?; echo "Brain isolation regression failed in phase: $phase (line 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
 
+# --- errexit-blind assertion helpers (#401) ---
+# `#!/usr/bin/env bash` resolves to /bin/bash on macOS, which is GNU bash
+# 3.2.57. Under that shell `set -e` does NOT fire on a failing bare `[[ ... ]]`
+# or `(( ... ))` compound, and no bash version applies `set -e` to a
+# `!`-negated command. Assertions written that way are absorbed silently: this
+# gate ran to completion and printed success on macOS while the same commit
+# failed `brain-entrypoint-inventory` on ubuntu-24.04 through three review
+# rounds of "instrument and reduce interactive TUI time-to-ready" (#364, PR
+# #388). Every assertion below therefore reports its own failure and never
+# relies on errexit to notice. `errexit-blind-construct-scan` keeps it that
+# way.
+fail() {
+  echo "Brain isolation regression failed in phase: $phase: $*" >&2
+  exit 1
+}
+
+# Compare an enforced inventory against its expectation. On drift, name the
+# phase and print both sides, so a CI log explains the failure without a
+# re-run. `diff` is only a formatter here; the verdict is the string compare.
+assert_inventory() {
+  local label="$1" actual="$2" expected="$3"
+  if [[ "$actual" == "$expected" ]]; then
+    return 0
+  fi
+  fail "$label drift ('<' expected, '>' found):
+$(diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true)"
+}
+# --- end errexit-blind assertion helpers ---
+
+# Prove the gate can fail before trusting anything it reports. Until #401 this
+# script had no test that any of its assertions could fail, which is exactly
+# how a false green survived three review rounds. Runs first, costs nothing.
+phase=assertion-helper-selftest
+selftest_status=0
+( assert_inventory 'synthetic inventory' 'a
+b' 'a
+c' ) >/dev/null 2>&1 || selftest_status=$?
+if [[ "$selftest_status" -eq 0 ]]; then
+  echo "assert_inventory accepted a violated inventory: this gate cannot fail" >&2
+  exit 1
+fi
+selftest_message="$( ( assert_inventory 'synthetic inventory' 'a' 'b' ) 2>&1 || true )"
+case "$selftest_message" in
+  *"phase: $phase"*) : ;;
+  *)
+    echo "assert_inventory failure did not name its phase; got: $selftest_message" >&2
+    exit 1
+    ;;
+esac
+selftest_status=0
+( fail 'synthetic failure' ) >/dev/null 2>&1 || selftest_status=$?
+if [[ "$selftest_status" -eq 0 ]]; then
+  echo 'fail() did not exit non-zero: this gate cannot fail' >&2
+  exit 1
+fi
+
+# Statically forbid reintroducing the class. A statement that begins with
+# `[[`, `((`, or `!` and is not itself guarded by `||`/`&&` is invisible to
+# `set -e` on macOS bash 3.2 (the first two) or on every bash (the third).
+# The scan is line-based, so the guard must sit on the same physical line as
+# the condition it guards; break the line after `|| fail`, not before it.
+phase=errexit-blind-construct-scan
+blind_constructs="$(
+  grep -nE '^[[:space:]]*(![[:space:]]|\[\[|\(\()' \
+    "$repo_root/scripts/test_brain_isolation.sh" \
+    "$repo_root/scripts/lib/brain_test_isolation.sh" \
+    | grep -vE '(\|\||&&)' || true
+)"
+if [[ -n "$blind_constructs" ]]; then
+  fail "assertions whose failure \`set -e\` cannot see; give each an explicit
+\`|| fail ...\` or \`if ...; then fail ...; fi\`:
+$blind_constructs"
+fi
+
 # Direct callers, including the CI workflow, must cross the maintained
 # freshness boundary before this script selects an authority executable. A
 # fixed `-pinned` file can survive a cache restore from an older checkout and
@@ -88,7 +162,10 @@ exercise_supervisor_substitution() {
         [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
         sleep 0.01
       done
-      [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
+      [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] || {
+        echo "substitution continue sentinel never appeared" >&2
+        exit 1
+      }
       if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
         exit 1
       fi
@@ -394,11 +471,20 @@ FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated
   test "$FINCH_TEST_BRAIN_ADDR" != 127.0.0.1:11436
   test "$FINCH_TEST_DAEMON_ADDR" != 127.0.0.1:11435
   test "$FINCH_TEST_BRAIN_PASSWORD" != ambient-password
-  [[ "$FINCH_TEST_BRAIN_PASSWORD" =~ ^test-[0-9a-f]{32}$ ]]
-  ! printf attacker >&9
-  ! printf attacker >&108
-  ! sh -c ": >/dev/fd/9"
-  ! sh -c ": >/dev/fd/108"
+  [[ "$FINCH_TEST_BRAIN_PASSWORD" =~ ^test-[0-9a-f]{32}$ ]] || {
+    echo "sealed Brain password is not a per-run test password: $FINCH_TEST_BRAIN_PASSWORD" >&2
+    exit 1
+  }
+  for sealed_fd in 9 108; do
+    if printf attacker >&"$sealed_fd" 2>/dev/null; then
+      echo "sealed proof descriptor $sealed_fd was writable from the isolated child" >&2
+      exit 1
+    fi
+    if sh -c ": >/dev/fd/$sealed_fd" 2>/dev/null; then
+      echo "sealed proof descriptor $sealed_fd was reopenable via /dev/fd" >&2
+      exit 1
+    fi
+  done
   printf "%s\n" "$HOME" >"$FINCH_CREATED_HOME"
   printf test >"$FINCH_BRAIN_TEST_ROOT/test-created"
 '
@@ -495,7 +581,9 @@ FINCH_TEST_PANIC_HOME_FILE="$panic_home_file" \
   run_isolated "$supervisor" --child-panic-probe >/dev/null 2>&1 || panic_status=$?
 test "$panic_status" -ne 0
 panic_pid="$(cat "$panic_pid_file")"
-! /bin/ps -p "$panic_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
+if /bin/ps -p "$panic_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; then
+  fail "TERM-resistant descendant ${panic_pid} survived the panicking supervisor; /bin/ps still reports it"
+fi
 test ! -e "$(cat "$panic_home_file")"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
@@ -530,7 +618,9 @@ signaler_pid=''
 test "$signaler_status" -eq 0
 test "$timeout_status" -eq 143
 timeout_descendant_pid="$(cat "$timeout_descendant_pid_file")"
-! /bin/ps -p "$timeout_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
+if /bin/ps -p "$timeout_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; then
+  fail "TERM-resistant descendant ${timeout_descendant_pid} survived the timed-out supervisor; /bin/ps still reports it"
+fi
 test ! -e "$(cat "$timeout_home_file")"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
@@ -607,7 +697,9 @@ else
   test "$?" -eq 29
 fi
 normal_descendant_pid="$(cat "$normal_descendant_pid_file")"
-! /bin/ps -p "$normal_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
+if /bin/ps -p "$normal_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; then
+  fail "TERM-resistant descendant ${normal_descendant_pid} survived the normally-exiting supervisor; /bin/ps still reports it"
+fi
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=real-store-manifest-guard
@@ -911,7 +1003,9 @@ for launcher in "${launchers[@]}"; do
   FINCH_TEST_PROOF_DIAGNOSTICS=1 FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" \
     FINCH_TEST_LAUNCHER_PROBE_ONLY=1 \
     run_isolated "$repo_root/scripts/$launcher"
-  [[ "$(cat "$launcher_probe")" == "$temp_parent"/finch-brain-test-home.* ]]
+  launcher_probe_home="$(cat "$launcher_probe")"
+  [[ "$launcher_probe_home" == "$temp_parent"/finch-brain-test-home.* ]] || fail \
+    "launcher reported HOME '$launcher_probe_home', which is not an isolated home under '$temp_parent'"
 done
 
 # Keep the executable/integration inventory closed. Any newly added script or
@@ -938,7 +1032,8 @@ scripts/test_tool_passthrough.sh
 scripts/test_tui_debug.sh
 EOF
 )"
-[[ "$script_inventory" == "$expected_script_inventory" ]]
+assert_inventory 'supervised script inventory' \
+  "$script_inventory" "$expected_script_inventory"
 
 integration_inventory="$(
   cd "$repo_root"
@@ -959,7 +1054,8 @@ tests/startup_time_to_ready.rs
 tests/worker_integration_test.rs
 EOF
 )"
-[[ "$integration_inventory" == "$expected_integration_inventory" ]]
+assert_inventory 'integration entrypoint inventory' \
+  "$integration_inventory" "$expected_integration_inventory"
 
 # Exercise the maintained HTTP launchers beyond their re-exec probe. The
 # synthetic Finch consumes inherited FD 11, records the exact sealed bind
@@ -1023,14 +1119,29 @@ printf '\n' >&7
 wait "$sentinel_pid"
 sentinel_pid=''
 
-! rg -n 'pkill|killall|127\.0\.0\.1:[1-9][0-9]*|(^|[;&|[:space:]])kill[[:space:]]+-' \
-  "$repo_root/docs/AUTOMATIC_TRAINING.md" "$repo_root/docs/DEVELOPMENT.md" "$repo_root/tests/README.md"
+# Documentation must not teach signalling by name or pattern, and must not
+# hand out fixed ports. `rg` exits 1 for "no match"; anything above that is a
+# broken scan, not a clean one.
+phase=documentation-signal-hygiene
+doc_signal_status=0
+doc_signal_hits="$(
+  rg -n 'pkill|killall|127\.0\.0\.1:[1-9][0-9]*|(^|[;&|[:space:]])kill[[:space:]]+-' \
+    "$repo_root/docs/AUTOMATIC_TRAINING.md" "$repo_root/docs/DEVELOPMENT.md" \
+    "$repo_root/tests/README.md"
+)" || doc_signal_status=$?
+if [[ "$doc_signal_status" -gt 1 ]]; then
+  fail "documentation signal scan itself failed with status $doc_signal_status"
+fi
+if [[ -n "$doc_signal_hits" ]]; then
+  fail "documentation still names a signalling command or a fixed port:
+$doc_signal_hits"
+fi
 
 # Scan the full executable/test closure. Only the supervisor's group creation,
 # the production ambient-daemon detach (which the isolated gate denies first),
 # and the deliberate outside-peer adversary may use an escape API.
+phase=escape-api-allowlist
 escape_uses="$(
-  phase=escape-api-allowlist
   cd "$repo_root"
   rg --no-heading --no-line-number \
     --glob '*.rs' --glob '*.sh' --glob '!scripts/test_brain_isolation.sh' \
@@ -1045,6 +1156,6 @@ src/daemon/spawn.rs:if nix::libc::setsid() == -1 {
 tests/no_external_provider_binary_test.rs:.process_group(0);
 EOF
 )"
-[[ "$escape_uses" == "$expected_escape_uses" ]]
+assert_inventory 'escape-API allowlist' "$escape_uses" "$expected_escape_uses"
 
 echo 'Brain test isolation regression checks passed.'
