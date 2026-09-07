@@ -417,6 +417,39 @@ async fn propose_in_editor_with_suffix(
     .await
 }
 
+/// Open a read-only review artifact in `$EDITOR` and return what the user
+/// left behind, or `None` if they cleared it (abort).
+///
+/// A review artifact is a *document*, not a program. Nothing on this path
+/// executes it: the caller reads the user's decision out of the artifact's
+/// `#`-comment header and then performs the change itself through the tool
+/// layer. The `.diff` suffix is what makes an editor highlight the body as a
+/// diff, and `executable: false` keeps the temp file off the exec path.
+pub async fn open_review_artifact(artifact: &str) -> Result<Option<String>> {
+    open_review_artifact_with(artifact, run_editor).await
+}
+
+/// `open_review_artifact` with the editor process injected, so a regression
+/// can inspect the exact bytes a human's editor is given without launching
+/// the developer's real `$EDITOR`.
+pub(crate) async fn open_review_artifact_with<E>(
+    artifact: &str,
+    editor: E,
+) -> Result<Option<String>>
+where
+    E: FnOnce(&Path) -> Result<std::process::ExitStatus> + Send + 'static,
+{
+    let artifact = artifact.to_string();
+    let tui_mode = crate::is_tui_active();
+    run_editor_lifecycle(
+        tui_mode,
+        Duration::from_millis(50),
+        ProductionTerminalControl,
+        move || edit_artifact(&artifact, ".diff", false, "#", editor),
+    )
+    .await
+}
+
 /// Format the English description + code as a commented shell script.
 ///
 /// ```text
