@@ -716,7 +716,7 @@ impl Message for WorkUnit {
             }
             WorkUnitPresentation::Assistant => (
                 TranscriptRowKind::Response,
-                "Assistant response".to_string(),
+                assistant_prose_label(&self.verb, &inner),
                 lines(&inner.response_text),
                 true,
             ),
@@ -838,6 +838,46 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
             &inner.presentation,
             WorkUnitPresentation::ProgramOutput { title: Some(_) }
         )
+}
+
+/// Compact activity glyph standing in for a plain assistant prose row.
+///
+/// The row's own words are the content; a literal `Assistant response` label
+/// named Finch's message plumbing rather than anything the assistant said, so
+/// a simple turn read as program internals instead of prose (#350). Hollow
+/// while the turn is still arriving, filled once it completed, struck through
+/// when it failed — a turn that died must never look identical to one that
+/// answered. Enumerated with no wildcard so a new `MessageStatus` is a compile
+/// error here rather than a silently wrong glyph.
+fn assistant_prose_glyph(status: MessageStatus) -> &'static str {
+    match status {
+        MessageStatus::InProgress => "\u{25cb}",
+        MessageStatus::Complete => "\u{23fa}",
+        MessageStatus::Failed => "\u{2298}",
+    }
+}
+
+/// Label for a plain assistant prose row.
+///
+/// When the row carries the assistant's own words, the glyph alone is the
+/// label: the words follow immediately on the next line and are the row's real
+/// identity (#350). When it carries nothing, a bare glyph would leave the row
+/// with no readable text at all — and the wordless shapes are exactly the ones
+/// a user actually sees: the freshly created query unit that is on screen for
+/// the whole provider round trip, and a turn that failed before its first
+/// token. Those name their state in words as well as in a glyph, because a row
+/// that cannot be read aloud is not an accessible interface (Key Principle 5).
+fn assistant_prose_label(verb: &str, inner: &WorkUnitInner) -> String {
+    let glyph = assistant_prose_glyph(inner.status);
+    if !inner.response_text.is_empty() {
+        return glyph.to_string();
+    }
+    match inner.status {
+        MessageStatus::InProgress if !verb.trim().is_empty() => format!("{glyph} {verb}\u{2026}"),
+        MessageStatus::InProgress => format!("{glyph} Working\u{2026}"),
+        MessageStatus::Complete => format!("{glyph} No assistant text"),
+        MessageStatus::Failed => format!("{glyph} Assistant turn failed"),
+    }
 }
 
 fn lines(text: &str) -> Vec<String> {
@@ -1616,6 +1656,125 @@ mod tests {
         assert_eq!(canonical.matches("catalog validation failed").count(), 2);
         assert!(canonical.contains("Speculative run 1234 · status"));
         assert!(canonical.contains("result"));
+    }
+
+    #[test]
+    fn test_assistant_prose_with_words_is_labelled_by_status_glyph_alone() {
+        let unit = WorkUnit::new("Channeling");
+        unit.append_response("partial prose");
+
+        let pending = unit.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            pending.kind,
+            TranscriptRowKind::Response,
+            "invariant: a plain assistant turn projects as a Response row; \
+             projected row: {pending:?}"
+        );
+        assert_eq!(
+            pending.label, "\u{25cb}",
+            "invariant: once a turn has words of its own they are its identity, so the \
+             row is labelled with the compact hollow activity glyph rather than the \
+             internal `Assistant response` placeholder (#350); projected row: {pending:?}"
+        );
+
+        unit.set_complete();
+        let completed = unit.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            completed.label, "\u{23fa}",
+            "invariant: a completed assistant prose row is labelled with the \
+             corresponding filled glyph; projected row: {completed:?}"
+        );
+        assert_eq!(
+            completed.body,
+            vec!["partial prose".to_string()],
+            "invariant: the assistant's own words remain the row body and are not \
+             duplicated into the label; projected row: {completed:?}"
+        );
+    }
+
+    /// The wordless shapes are the ones production actually reaches. A query
+    /// unit is created empty and stays empty for the whole provider round trip
+    /// (`query_processor.rs` streaming and non-streaming entry), and a stream
+    /// that errors or a tool round that cannot be staged terminalises the same
+    /// empty unit. Dropping the label there would leave nothing to read aloud.
+    /// The wordless in-progress row keeps words even when the verb is useless.
+    ///
+    /// Both arms of the safety net are unreachable today — every
+    /// `start_work_unit` verb is a non-empty literal or `random_spinner_verb()`,
+    /// which is itself pinned non-empty. They exist so that a later caller
+    /// passing an empty or user-derived verb cannot silently reintroduce the
+    /// bare glyph this row was added to remove. Review mutants against both the
+    /// `Working…` fallback and the `trim()` guard survived the suite; these are
+    /// the assertions that kill them.
+    #[test]
+    fn test_a_wordless_row_with_a_useless_verb_still_names_its_state() {
+        for verb in ["", "   ", "\t"] {
+            let pending = WorkUnit::new(verb);
+            let row = pending.transcript_row(&colors()).unwrap();
+            assert_eq!(
+                row.label, "\u{25cb} Working\u{2026}",
+                "invariant: a verb that carries no words falls back to words, never \
+                 to a bare glyph — an unreadable row is the defect this label \
+                 exists to prevent (#350, Key Principle 5); verb={verb:?}; \
+                 projected row: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wordless_assistant_row_still_names_its_state_in_words() {
+        let pending = WorkUnit::new("Channeling");
+        let row = pending.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            row.label, "\u{25cb} Channeling\u{2026}",
+            "invariant: an assistant row with no words of its own yet keeps readable \
+             text naming what is happening — a bare glyph is not an accessible \
+             interface (#350, Key Principle 5); projected row: {row:?}"
+        );
+        assert!(
+            row.body.is_empty(),
+            "invariant: the wordless row has no body, so the accordion renders it as a \
+             non-expandable bullet with the label as its only text; projected row: {row:?}"
+        );
+
+        let failed = WorkUnit::new("Channeling");
+        failed.set_failed();
+        let failed_row = failed.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            failed_row.label, "\u{2298} Assistant turn failed",
+            "invariant: a turn that died before producing any words says so in words; \
+             projected row: {failed_row:?}"
+        );
+
+        // Pinned as an exact string, not merely as different from the failed
+        // row. This row is `Complete`, so it passes the commit gate and is
+        // written permanently to scrollback; a wording mutation that made a
+        // completed turn read "Assistant turn failed" satisfies `assert_ne!`
+        // on the glyph alone and leaves a durable record of a failure that
+        // never happened. A review mutant did exactly that and survived.
+        let completed = WorkUnit::new("Channeling");
+        completed.set_complete();
+        let completed_row = completed.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            completed_row.label, "\u{23fa} No assistant text",
+            "invariant: a completed turn that produced no words says exactly that, \
+             and never borrows the failure wording — this row reaches durable \
+             scrollback, so wrong wording here is a permanent false record; \
+             completed row: {completed_row:?}"
+        );
+        assert_ne!(
+            failed_row.label, completed_row.label,
+            "invariant: a failed assistant turn is never projected identically to a \
+             completed one — both wordless shapes are production-reachable (stream \
+             error / duplicate tool completion), so an identical row would report a \
+             dead query as an answered one; failed row: {failed_row:?}; completed row: \
+             {completed_row:?}"
+        );
+        assert!(
+            !failed_row.label.contains('\u{23fa}') && !failed_row.label.contains('\u{25cb}'),
+            "invariant: the failure glyph is its own mark, not the completed or the \
+             in-progress one; failed row: {failed_row:?}"
+        );
     }
 
     #[test]

@@ -408,6 +408,141 @@ mod tests {
     }
 
     #[test]
+    fn test_completed_assistant_prose_renders_without_implementation_label() {
+        let work = Arc::new(WorkUnit::new("Channeling"));
+        work.set_response("Hello, Shammah! How can I help you today?");
+        work.set_complete();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Assistant response")),
+            "invariant: a plain assistant turn is projected as the assistant's prose, \
+             never as Finch's internal `Assistant response` placeholder (#350); \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].contains('\u{23fa}'),
+            "invariant: a completed assistant prose row carries the filled activity \
+             glyph; header was {:?}; rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Hello, Shammah! How can I help you today?")),
+            "invariant: the assistant's own words stay visible by default; \
+             rendered transcript:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn test_pending_assistant_prose_uses_hollow_activity_glyph() {
+        let work = Arc::new(WorkUnit::new("Channeling"));
+        work.append_response("Hello, Sha");
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Assistant response")),
+            "invariant: a pending assistant prose row shows a compact activity glyph, \
+             not the internal `Assistant response` placeholder (#350); \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].contains('\u{25cb}') && !rendered[0].contains('\u{23fa}'),
+            "invariant: a pending assistant prose row uses the hollow glyph and the \
+             filled glyph is reserved for the completed row; header was {:?}; \
+             rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+    }
+
+    /// Production reaches this row constantly: `query_processor` creates the
+    /// query WorkUnit empty and it stays empty for the whole provider round
+    /// trip, and a stream error or an unstageable tool round terminalises that
+    /// same empty unit. With no body the accordion is not expandable, so the
+    /// label is the row's entire text — it must be readable, not a bare glyph.
+    #[test]
+    fn test_assistant_row_without_words_renders_readable_text_not_a_bare_glyph() {
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+
+        let pending = Arc::new(WorkUnit::new("Channeling"));
+        let message: MessageRef = pending;
+        let rendered = state
+            .render_message(&message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let transcript = rendered.join("\n");
+
+        assert!(
+            !transcript.contains("Assistant response"),
+            "invariant: the internal `Assistant response` placeholder never reaches the \
+             screen (#350); rendered transcript:\n{transcript}"
+        );
+        assert!(
+            transcript.contains("Channeling"),
+            "invariant: an assistant row with nothing to show yet still carries readable \
+             text — this row is on screen for the entire provider round trip and a bare \
+             glyph would leave it unspeakable (#350, Key Principle 5); \
+             rendered transcript:\n{transcript}"
+        );
+        assert!(
+            rendered[0].chars().any(char::is_alphabetic),
+            "invariant: the rendered header line contains letters, not glyphs alone; \
+             header was {:?}; rendered transcript:\n{transcript}",
+            rendered[0]
+        );
+
+        let failed = Arc::new(WorkUnit::new("Channeling"));
+        failed.set_failed();
+        let failed_message: MessageRef = failed;
+        let failed_rendered = state
+            .render_message(&failed_message, &colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let failed_transcript = failed_rendered.join("\n");
+
+        assert!(
+            failed_transcript.contains("Assistant turn failed"),
+            "invariant: a turn that died before its first token says so in words rather \
+             than presenting as an ordinary finished row (#350); \
+             rendered transcript:\n{failed_transcript}"
+        );
+        assert!(
+            failed_transcript.contains('\u{2298}')
+                && !failed_transcript.contains('\u{23fa}')
+                && !failed_transcript.contains('\u{25cb}'),
+            "invariant: a failed assistant turn carries its own mark and never the \
+             completed or in-progress glyph, so a dead query cannot be read as an \
+             answered or a still-running one; rendered transcript:\n{failed_transcript}"
+        );
+    }
+
+    #[test]
     fn test_semantic_defaults_collapse_long_completed_source_but_not_output() {
         let source = Arc::new(WorkUnit::new("program"));
         source.set_program_source("forth");
