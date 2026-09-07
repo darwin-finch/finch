@@ -1697,6 +1697,30 @@ mod tests {
     /// (`query_processor.rs` streaming and non-streaming entry), and a stream
     /// that errors or a tool round that cannot be staged terminalises the same
     /// empty unit. Dropping the label there would leave nothing to read aloud.
+    /// The wordless in-progress row keeps words even when the verb is useless.
+    ///
+    /// Both arms of the safety net are unreachable today — every
+    /// `start_work_unit` verb is a non-empty literal or `random_spinner_verb()`,
+    /// which is itself pinned non-empty. They exist so that a later caller
+    /// passing an empty or user-derived verb cannot silently reintroduce the
+    /// bare glyph this row was added to remove. Review mutants against both the
+    /// `Working…` fallback and the `trim()` guard survived the suite; these are
+    /// the assertions that kill them.
+    #[test]
+    fn test_a_wordless_row_with_a_useless_verb_still_names_its_state() {
+        for verb in ["", "   ", "\t"] {
+            let pending = WorkUnit::new(verb);
+            let row = pending.transcript_row(&colors()).unwrap();
+            assert_eq!(
+                row.label, "\u{25cb} Working\u{2026}",
+                "invariant: a verb that carries no words falls back to words, never \
+                 to a bare glyph — an unreadable row is the defect this label \
+                 exists to prevent (#350, Key Principle 5); verb={verb:?}; \
+                 projected row: {row:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_wordless_assistant_row_still_names_its_state_in_words() {
         let pending = WorkUnit::new("Channeling");
@@ -1722,9 +1746,22 @@ mod tests {
              projected row: {failed_row:?}"
         );
 
+        // Pinned as an exact string, not merely as different from the failed
+        // row. This row is `Complete`, so it passes the commit gate and is
+        // written permanently to scrollback; a wording mutation that made a
+        // completed turn read "Assistant turn failed" satisfies `assert_ne!`
+        // on the glyph alone and leaves a durable record of a failure that
+        // never happened. A review mutant did exactly that and survived.
         let completed = WorkUnit::new("Channeling");
         completed.set_complete();
         let completed_row = completed.transcript_row(&colors()).unwrap();
+        assert_eq!(
+            completed_row.label, "\u{23fa} No assistant text",
+            "invariant: a completed turn that produced no words says exactly that, \
+             and never borrows the failure wording — this row reaches durable \
+             scrollback, so wrong wording here is a permanent false record; \
+             completed row: {completed_row:?}"
+        );
         assert_ne!(
             failed_row.label, completed_row.label,
             "invariant: a failed assistant turn is never projected identically to a \
