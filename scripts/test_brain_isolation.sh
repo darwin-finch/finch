@@ -944,6 +944,7 @@ integration_inventory="$(
   rg -l -i 'brain|daemon|IpcClient' tests --glob '*.rs' | sort
 )"
 expected_integration_inventory="$(cat <<'EOF'
+tests/brain_warm_log_spam.rs
 tests/daemon_integration_test.rs
 tests/daemon_log_rotation.rs
 tests/daemon_stdio_binding.rs

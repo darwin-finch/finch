@@ -32,6 +32,18 @@ unrelated same-name process survives the TUI smoke.
 
 ## Rust test entrypoints
 
+- `tests/brain_warm_log_spam.rs` constructs a real `BrainStore` over a
+  `tempfile` root and calls `warm_schedule_index` directly. It spawns no
+  daemon, binds no endpoint, performs no discovery, and never reads the user's
+  Finch state; `BrainStore::with_root` is given an explicit root on every
+  construction. It is a separate binary rather than a `src/` unit test because
+  it counts real `tracing` output, and `tracing` caches callsite interest
+  process-globally: sibling unit tests warming the index on other threads with
+  no subscriber installed poison the callsite and silently empty a
+  thread-local capture. Measured failing two runs in three under
+  `--lib -- brain::store::` while passing under `--test-threads=1`;
+  `rebuild_interest_cache` does not help, because the poisoning is concurrent
+  rather than merely earlier. Owning the process removes the race.
 - `tests/daemon_integration_test.rs` fails closed without authenticated
   supervisor proof. Its daemon receives the sealed HOME, password, IPC socket,
   and inherited kernel-assigned listener.
