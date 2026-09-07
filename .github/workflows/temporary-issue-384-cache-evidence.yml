@@ -1,0 +1,160 @@
+# TEMPORARY_FINCH_ISSUE_384_CACHE_EVIDENCE_BEGIN
+# Delete this entire workflow after recording cold run + identical-run rerun
+# evidence. Production workflows never restore either `evidence-only` prefix.
+name: TEMPORARY issue 384 cache evidence
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  controlled-cache-evidence:
+    name: TEMPORARY controlled cache evidence (Ubuntu)
+    if: >-
+      github.repository == 'darwin-finch/finch' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/issue-384-ci-cache-v3' &&
+      github.actor == 'schancel' &&
+      github.triggering_actor == 'schancel'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Record queue boundary and immutable identity
+        shell: bash
+        run: |
+          date -u '+job-start=%Y-%m-%dT%H:%M:%SZ'
+          echo 'repository=${{ github.repository }}'
+          echo 'head-ref=${{ github.event.pull_request.head.ref }}'
+          echo 'head-sha=${{ github.event.pull_request.head.sha }}'
+          echo 'actor=${{ github.actor }}'
+          echo 'triggering-actor=${{ github.triggering_actor }}'
+          echo 'run-id=${{ github.run_id }}'
+          echo 'run-attempt=${{ github.run_attempt }}'
+
+      - name: Checkout exact reviewed evidence tip
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+
+      - name: Install native dependency
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+
+      - name: Configure isolated Cargo download home
+        run: scripts/configure_ci_cargo_home.sh
+
+      - name: Restore evidence-only Cargo downloads
+        id: evidence-cargo
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/finch-cargo-home/registry/cache
+            ${{ runner.temp }}/finch-cargo-home/git/db
+          key: finch-evidence-only-issue384-claim-5f155aeb-2a15-4837-8590-833b4a4daa06-run-${{ github.run_id }}-cargo-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+
+      - name: Report Cargo download restore and timestamp
+        run: |
+          date -u '+cargo-restore-finished=%Y-%m-%dT%H:%M:%SZ'
+          echo 'cargo-cache-hit=${{ steps.evidence-cargo.outputs.cache-hit }}'
+          echo 'cargo-primary-key=${{ steps.evidence-cargo.outputs.cache-primary-key }}'
+          du -sk "${CARGO_HOME}/registry/cache" "${CARGO_HOME}/git/db" 2>/dev/null || true
+
+      - name: Fetch exact dependency graph on cold evidence run
+        if: steps.evidence-cargo.outputs.cache-hit != 'true'
+        run: cargo fetch --locked --verbose
+
+      - name: Save evidence-only Cargo downloads
+        if: steps.evidence-cargo.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: |
+            ${{ runner.temp }}/finch-cargo-home/registry/cache
+            ${{ runner.temp }}/finch-cargo-home/git/db
+          key: ${{ steps.evidence-cargo.outputs.cache-primary-key }}
+
+      - name: Identify native compiler inputs
+        id: native-cache
+        run: python3 scripts/ci_native_cache_key.py
+
+      - name: Restore evidence-only bounded compiler objects
+        id: evidence-sccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/finch-sccache-cache
+          key: finch-evidence-only-issue384-claim-5f155aeb-2a15-4837-8590-833b4a4daa06-run-${{ github.run_id }}-sccache-${{ runner.os }}-profile-debug-cap-256m-sccache-0.17.0-rust-1.98.0-native-${{ steps.native-cache.outputs.digest }}-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('Cargo.lock') }}
+
+      - name: Report compiler restore and timestamp
+        run: |
+          date -u '+compiler-restore-finished=%Y-%m-%dT%H:%M:%SZ'
+          echo 'compiler-cache-hit=${{ steps.evidence-sccache.outputs.cache-hit }}'
+          echo 'compiler-primary-key=${{ steps.evidence-sccache.outputs.cache-primary-key }}'
+          du -sk '${{ runner.temp }}/finch-sccache-cache' 2>/dev/null || true
+
+      - name: Configure fixed-digest local compiler cache for evidence
+        id: sccache-config
+        env:
+          FINCH_ISSUE_384_EVIDENCE: 5f155aeb-2a15-4837-8590-833b4a4daa06
+        run: scripts/configure_temporary_issue_384_sccache.sh
+
+      - name: First compile into a fresh target
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/finch-evidence-target-first-${{ github.run_attempt }}
+        run: |
+          date -u '+first-compile-start=%Y-%m-%dT%H:%M:%SZ'
+          cargo check --locked --lib
+          date -u '+first-compile-finish=%Y-%m-%dT%H:%M:%SZ'
+
+      - name: Report compiler statistics after first compile
+        if: steps.sccache-config.outputs.enabled == 'true'
+        run: '"${SCCACHE_PATH}" --show-stats'
+
+      - name: Second compile into another fresh target
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/finch-evidence-target-second-${{ github.run_attempt }}
+        run: |
+          date -u '+second-compile-start=%Y-%m-%dT%H:%M:%SZ'
+          cargo check --locked --lib
+          date -u '+second-compile-finish=%Y-%m-%dT%H:%M:%SZ'
+
+      - name: Report compiler statistics after second compile
+        if: steps.sccache-config.outputs.enabled == 'true'
+        run: '"${SCCACHE_PATH}" --show-stats'
+
+      - name: Stop and measure evidence-only compiler cache
+        id: sccache-stop
+        if: steps.sccache-config.outputs.enabled == 'true'
+        run: scripts/stop_ci_sccache.sh
+
+      - name: Save evidence-only bounded compiler objects
+        if: success() && steps.evidence-sccache.outputs.cache-hit != 'true' && steps.sccache-config.outputs.enabled == 'true' && steps.sccache-stop.outputs.save-ready == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/finch-sccache-cache
+          key: ${{ steps.evidence-sccache.outputs.cache-primary-key }}
+
+      - name: Record completion boundary and measured size
+        if: always()
+        run: |
+          date -u '+job-finish=%Y-%m-%dT%H:%M:%SZ'
+          echo 'cargo-cache-hit=${{ steps.evidence-cargo.outputs.cache-hit }}'
+          echo 'compiler-cache-hit=${{ steps.evidence-sccache.outputs.cache-hit }}'
+          echo 'compiler-cache-size-kib=${{ steps.sccache-stop.outputs.cache-size-kib }}'
+          echo 'compiler-cache-save-ready=${{ steps.sccache-stop.outputs.save-ready }}'
+# TEMPORARY_FINCH_ISSUE_384_CACHE_EVIDENCE_END

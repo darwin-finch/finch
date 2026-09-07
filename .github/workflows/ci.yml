@@ -36,6 +36,10 @@ jobs:
       run: |
         python3 scripts/test_ci_cache_contract.py
         ruby scripts/check_ci_cache_contract.rb
+        # TEMPORARY_FINCH_ISSUE_384_CACHE_EVIDENCE_CHECK_BEGIN
+        python3 scripts/test_issue_384_evidence_contract.py
+        ruby scripts/check_issue_384_evidence_contract.rb
+        # TEMPORARY_FINCH_ISSUE_384_CACHE_EVIDENCE_CHECK_END
 
   windows-format-contract:
     name: Toolchain and formatting contract (Windows)
