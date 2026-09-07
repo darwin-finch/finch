@@ -11,7 +11,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
-  CARGO_INCREMENTAL: 0
   # Speed up CI builds (override Cargo.toml's lto=true / codegen-units=1)
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
@@ -40,33 +39,31 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Cargo.lock is intentionally untracked in this repository. Materialize
-      # it before hashFiles evaluates the exact dependency fingerprint below.
+      # Tag jobs can restore the same key from the default branch's trusted
+      # producer, while a previous tag's private cache would not be reusable.
+      - name: Restore Cargo registry index from trusted main
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry/index
+          key: cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-
+
       - name: Resolve Cargo dependency graph
         run: cargo generate-lockfile
 
-      - name: Cache Cargo dependency sources
-        uses: actions/cache@v4
+      - name: Restore resolved Cargo downloads from trusted main
+        uses: actions/cache/restore@v4
         continue-on-error: true
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-deps-v1-${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-deps-v1-${{ runner.os }}-rust-1.98.0-
-
-      - name: Cache compatible Cargo target artifacts
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: |
-            target/**/.fingerprint
-            target/**/build
-            target/**/deps
-          key: cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-release-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/release.yml') }}-deps-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: |
-            cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-release-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/release.yml') }}-deps-
+            cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'

@@ -16,8 +16,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_BUILD_JOBS: 1
-  # Incremental state is large and tied to one invocation; cache reusable deps.
-  CARGO_INCREMENTAL: 0
 
 jobs:
   toolchain-contract:
@@ -59,6 +57,131 @@ jobs:
     - name: Verify clean-checkout formatting
       run: cargo fmt --all -- --check
 
+  # Four live target caches measured 10,965,750,437 bytes, already beyond
+  # GitHub's free 10 GiB repository quota; restore/save alone took 66-72s.
+  # Cargo's recommended non-duplicated paths measured about 260 MiB locally.
+  # Keep five bounded keys per dependency generation (2 OS x 2 layers + the
+  # Linux audit tool), not target outputs, extracted sources, or native ORT.
+  # Older generations remain until GitHub's quota-driven LRU eviction; cold
+  # and warm CI evidence must confirm the smaller entries do not still thrash.
+  # One trusted producer per OS populates a complete immutable download set.
+  # PR jobs restore these caches but never save into their own merge-ref scope.
+  cargo-download-cache:
+    name: Populate Cargo downloads (${{ matrix.os }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+
+    - name: Restore Cargo registry index bootstrap
+      id: cargo-resolution
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/index
+        key: cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: |
+          cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-
+
+    # The manifest-keyed bootstrap is deliberately only a hint. Its immutable
+    # entry cannot absorb later registry changes under the same manifests, but
+    # Cargo revalidates it before resolving. The archive layer is then keyed by
+    # that run's newly generated lock, so stale index data cannot select a
+    # wrong exact download cache.
+    - name: Resolve Cargo dependency graph
+      run: cargo generate-lockfile
+
+    - name: Restore resolved Cargo downloads
+      id: cargo-downloads
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
+
+    # Without --target, Cargo fetches the lockfile's dependencies for all
+    # targets. This is the only writer, so a narrower job cannot freeze a
+    # partial immutable cache under the shared key.
+    - name: Fetch the complete dependency graph
+      run: cargo fetch --verbose
+
+    - name: Save Cargo registry index bootstrap
+      if: steps.cargo-resolution.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/index
+        key: ${{ steps.cargo-resolution.outputs.cache-primary-key }}
+
+    - name: Save complete Cargo downloads
+      if: steps.cargo-downloads.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: ${{ steps.cargo-downloads.outputs.cache-primary-key }}
+
+  # Successful CI run 34078078044 spent about 6m24s installing cargo-audit
+  # 0.22.2. Pin that crates.io --locked input; only trusted main builds/saves
+  # it. PRs restore it or perform an ordinary, unsaved fallback installation.
+  cargo-audit-cache:
+    name: Populate pinned cargo-audit
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Install repository Rust toolchain
+      uses: dtolnay/rust-toolchain@1.98.0
+
+    - name: Restore pinned cargo-audit
+      id: cargo-audit
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/bin/cargo-audit
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+        key: cargo-tool-v1-${{ runner.os }}-ubuntu-24.04-rust-1.98.0-cargo-audit-0.22.2
+
+    - name: Install pinned cargo-audit on cache miss
+      if: steps.cargo-audit.outputs.cache-hit != 'true'
+      run: cargo install cargo-audit --version 0.22.2 --locked
+
+    - name: Verify pinned cargo-audit
+      run: |
+        actual=$(cargo-audit --version)
+        if [[ "$actual" != "cargo-audit 0.22.2" ]]; then
+          echo "expected trusted cargo-audit 0.22.2, found: $actual" >&2
+          exit 1
+        fi
+
+    - name: Save pinned cargo-audit
+      if: steps.cargo-audit.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/bin/cargo-audit
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+        key: ${{ steps.cargo-audit.outputs.cache-primary-key }}
+
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
     runs-on: ${{ matrix.os }}
@@ -68,24 +191,16 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
             feature_name: default
-            cache_feature_set: default-and-all-features-clippy
             cargo_args: ""
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
             feature_name: no-default-features
-            cache_feature_set: no-default-features
             cargo_args: --no-default-features
           - os: macos-14
-            target: aarch64-apple-darwin
             feature_name: default
-            cache_feature_set: default
             cargo_args: ""
           - os: macos-14
-            target: aarch64-apple-darwin
             feature_name: no-default-features
-            cache_feature_set: no-default-features
             cargo_args: --no-default-features
 
     steps:
@@ -105,33 +220,29 @@ jobs:
       with:
         components: clippy
 
-    # Cargo.lock is intentionally untracked in this repository. Materialize it
-    # before hashFiles evaluates the exact dependency fingerprint below.
+    - name: Restore Cargo registry index bootstrap
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/index
+        key: cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: |
+          cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-
+
     - name: Resolve Cargo dependency graph
       run: cargo generate-lockfile
 
-    - name: Cache Cargo dependency sources
-      uses: actions/cache@v4
+    - name: Restore resolved Cargo downloads
+      uses: actions/cache/restore@v4
       continue-on-error: true
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: cargo-deps-v1-${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          cargo-deps-v1-${{ runner.os }}-rust-1.98.0-
-
-    - name: Cache compatible Cargo target artifacts
-      uses: actions/cache@v4
-      continue-on-error: true
-      with:
-        path: |
-          target/**/.fingerprint
-          target/**/build
-          target/**/deps
-        key: cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-dev-test-features-${{ matrix.cache_feature_set }}-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/ci.yml') }}-deps-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-        restore-keys: |
-          cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-dev-test-features-${{ matrix.cache_feature_set }}-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/ci.yml') }}-deps-
+          cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
     - name: Run clippy (binary only, warnings allowed for now)
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
@@ -166,31 +277,29 @@ jobs:
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
+    - name: Restore Cargo registry index bootstrap
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/index
+        key: cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: |
+          cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-
+
     - name: Resolve Cargo dependency graph
       run: cargo generate-lockfile
 
-    - name: Cache Cargo dependency sources
-      uses: actions/cache@v4
+    - name: Restore resolved Cargo downloads
+      uses: actions/cache/restore@v4
       continue-on-error: true
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: cargo-deps-v1-${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          cargo-deps-v1-${{ runner.os }}-rust-1.98.0-
-
-    - name: Cache compatible Cargo target artifacts
-      uses: actions/cache@v4
-      continue-on-error: true
-      with:
-        path: |
-          target/**/.fingerprint
-          target/**/build
-          target/**/deps
-        key: cargo-target-v1-${{ runner.os }}-x86_64-unknown-linux-gnu-rust-1.98.0-profile-test-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/ci.yml') }}-deps-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-        restore-keys: |
-          cargo-target-v1-${{ runner.os }}-x86_64-unknown-linux-gnu-rust-1.98.0-profile-test-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/ci.yml') }}-deps-
+          cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
     - name: Run runtime authority regressions
       run: cargo test --lib runtime::tests -- --nocapture
@@ -241,31 +350,29 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
+    - name: Restore Cargo registry index bootstrap
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/index
+        key: cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+        restore-keys: |
+          cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-
+
     - name: Resolve Cargo dependency graph
       run: cargo generate-lockfile
 
-    - name: Cache Cargo dependency sources
-      uses: actions/cache@v4
+    - name: Restore resolved Cargo downloads
+      uses: actions/cache/restore@v4
       continue-on-error: true
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: cargo-deps-v1-${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          cargo-deps-v1-${{ runner.os }}-rust-1.98.0-
-
-    - name: Cache compatible Cargo target artifacts
-      uses: actions/cache@v4
-      continue-on-error: true
-      with:
-        path: |
-          target/**/.fingerprint
-          target/**/build
-          target/**/deps
-        key: cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-release-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/ci.yml') }}-deps-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-        restore-keys: |
-          cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-release-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/ci.yml') }}-deps-
+          cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
 
     - name: Build release binary
       run: cargo build --release --target ${{ matrix.target }}
@@ -286,22 +393,52 @@ jobs:
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
-    - name: Resolve Cargo dependency graph
-      run: cargo generate-lockfile
-
-    - name: Cache Cargo dependency sources
-      uses: actions/cache@v4
+    - name: Restore Cargo registry index bootstrap
+      uses: actions/cache/restore@v4
       continue-on-error: true
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: cargo-deps-v1-${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          ~/.cargo/registry/index
+        key: cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
         restore-keys: |
-          cargo-deps-v1-${{ runner.os }}-rust-1.98.0-
+          cargo-resolution-v1-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-manifests-
 
-    - name: Install cargo-audit
-      run: cargo install cargo-audit --locked
+    - name: Resolve Cargo dependency graph
+      run: cargo generate-lockfile
+
+    - name: Restore resolved Cargo downloads
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-downloads-v3-${{ runner.os }}-rust-1.98.0-config-${{ hashFiles('rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}-lock-
+
+    - name: Restore pinned cargo-audit
+      id: cargo-audit
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.cargo/bin/cargo-audit
+          ~/.cargo/.crates.toml
+          ~/.cargo/.crates2.json
+        key: cargo-tool-v1-${{ runner.os }}-ubuntu-24.04-rust-1.98.0-cargo-audit-0.22.2
+
+    - name: Install pinned cargo-audit on cache miss
+      if: steps.cargo-audit.outputs.cache-hit != 'true'
+      run: cargo install cargo-audit --version 0.22.2 --locked
+
+    - name: Verify pinned cargo-audit
+      run: |
+        actual=$(cargo-audit --version)
+        if [[ "$actual" != "cargo-audit 0.22.2" ]]; then
+          echo "expected trusted cargo-audit 0.22.2, found: $actual" >&2
+          exit 1
+        fi
 
     - name: Verify resolved HTTP dependency contract
       run: |
