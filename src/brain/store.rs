@@ -804,37 +804,57 @@ struct BrainState {
 /// lifted to the store, so the daemon can select by *due time* and hydrate only
 /// the Brains that actually have work (#374).
 ///
-/// `due` is the ordering; `by_brain` exists so one Brain's entries can be
-/// replaced without scanning the whole map. Keying on `(next_due_ms,
-/// ScheduleId)` keeps the order total, so two schedules due in the same
-/// millisecond still have a stable position.
+/// `due` is the ordering; `by_brain` exists so a single schedule can be moved
+/// without scanning the map. The key carries the Brain name as well as the
+/// schedule id: keying on `(next_due_ms, ScheduleId)` alone assumed schedule
+/// ids are unique across Brains, and nothing enforces that at this boundary —
+/// two Brains holding the same id at the same instant would silently overwrite
+/// each other's entry, and the loser could never be repaired because
+/// `by_brain` would still claim it was indexed.
+type DueKey = (u64, String, ScheduleId);
+
 #[derive(Debug, Default)]
 struct ScheduleIndex {
-    due: std::collections::BTreeMap<(u64, ScheduleId), String>,
+    due: std::collections::BTreeMap<DueKey, ()>,
     by_brain: HashMap<String, HashMap<ScheduleId, u64>>,
 }
 
 impl ScheduleIndex {
+    /// Move or insert one schedule. O(log n), not O(the Brain's schedules).
+    ///
+    /// The whole-Brain rescan this replaced was O(every schedule the Brain had
+    /// ever held): `BrainState::schedules` is never pruned — deactivation sets
+    /// a flag in place and one-shot schedules stay in the map forever — and
+    /// the rescan ran inside the process-wide `brains` write guard, once per
+    /// schedule event. A Brain with thousands of retired one-shots made every
+    /// subsequent event pay for all of them, and blocked every other Brain's
+    /// request for the duration.
+    fn upsert(&mut self, name: &str, schedule: &BrainSchedule) {
+        let slots = self.by_brain.entry(name.to_string()).or_default();
+        if let Some(previous) = slots.remove(&schedule.schedule_id) {
+            self.due
+                .remove(&(previous, name.to_string(), schedule.schedule_id));
+        }
+        if schedule.active {
+            self.due.insert(
+                (schedule.next_due_ms, name.to_string(), schedule.schedule_id),
+                (),
+            );
+            slots.insert(schedule.schedule_id, schedule.next_due_ms);
+        }
+        if slots.is_empty() {
+            self.by_brain.remove(name);
+        }
+    }
+
     /// Replace everything known about `name` with its current active schedules.
     ///
-    /// Called with the Brain's state in hand, so it is O(that Brain's
-    /// schedules) rather than O(the index).
+    /// Used where the whole set is the unit of work — a Brain becoming
+    /// resident — rather than on the per-event path.
     fn reindex(&mut self, name: &str, schedules: &HashMap<ScheduleId, BrainSchedule>) {
-        if let Some(previous) = self.by_brain.remove(name) {
-            for (schedule_id, next_due_ms) in previous {
-                self.due.remove(&(next_due_ms, schedule_id));
-            }
-        }
-        let mut current = HashMap::new();
+        self.forget(name);
         for schedule in schedules.values().filter(|schedule| schedule.active) {
-            self.due.insert(
-                (schedule.next_due_ms, schedule.schedule_id),
-                name.to_string(),
-            );
-            current.insert(schedule.schedule_id, schedule.next_due_ms);
-        }
-        if !current.is_empty() {
-            self.by_brain.insert(name.to_string(), current);
+            self.upsert(name, schedule);
         }
     }
 
@@ -842,14 +862,18 @@ impl ScheduleIndex {
     fn forget(&mut self, name: &str) {
         if let Some(previous) = self.by_brain.remove(name) {
             for (schedule_id, next_due_ms) in previous {
-                self.due.remove(&(next_due_ms, schedule_id));
+                self.due
+                    .remove(&(next_due_ms, name.to_string(), schedule_id));
             }
         }
     }
 
     /// When the earliest active schedule in the store comes due.
     fn next_due_ms(&self) -> Option<u64> {
-        self.due.keys().next().map(|(next_due_ms, _)| *next_due_ms)
+        self.due
+            .keys()
+            .next()
+            .map(|(next_due_ms, _, _)| *next_due_ms)
     }
 
     /// Brains holding at least one schedule due at or before `now_ms`, in due
@@ -859,8 +883,17 @@ impl ScheduleIndex {
         let mut brains = Vec::new();
         // The upper bound is the largest id at `now_ms`, so every schedule due at
         // exactly `now_ms` is included rather than dropped by an exclusive range.
-        let ceiling = ScheduleId(uuid::Uuid::from_bytes([0xff; 16]));
-        for (_, name) in self.due.range(..=(now_ms, ceiling)) {
+        // Exclusive upper bound on the *next* millisecond rather than a
+        // synthetic maximum key. `Brain` names are unbounded strings, so there
+        // is no largest one to construct; `..(now_ms + 1, "", nil)` includes
+        // every key whose instant is `now_ms` or earlier and excludes the rest,
+        // whatever the name or id.
+        let ceiling = (
+            now_ms.saturating_add(1),
+            String::new(),
+            ScheduleId(uuid::Uuid::nil()),
+        );
+        for ((_, name, _), ()) in self.due.range(..ceiling) {
             if seen.insert(name.clone()) {
                 brains.push(name.clone());
             }
@@ -2747,6 +2780,28 @@ impl BrainStore {
         }
     }
 
+    /// Move one schedule in the due index, waking the loop if it became the
+    /// head. The per-event path: O(log n), touching only this schedule.
+    fn upsert_schedule_locked(&self, name: &str, schedule: &BrainSchedule) {
+        let moved_earlier = {
+            let mut index = self
+                .schedule_index
+                .write()
+                .expect("schedule index lock poisoned");
+            let earliest_before = index.next_due_ms();
+            index.upsert(name, schedule);
+            let earliest_after = index.next_due_ms();
+            match (earliest_before, earliest_after) {
+                (Some(before), Some(after)) => after < before,
+                (None, Some(_)) => true,
+                _ => false,
+            }
+        };
+        if moved_earlier {
+            self.schedule_wakeup.notify_one();
+        }
+    }
+
     /// Drop everything the index knows about a Brain that no longer exists.
     fn forget_schedules_locked(&self, name: &str) {
         self.schedule_index
@@ -2793,14 +2848,19 @@ impl BrainStore {
     /// bounding its diagnostics, and picking a Brain up again once repaired --
     /// belong to #371, and this should consume that API rather than keep its
     /// own once it lands.
-    pub fn warm_schedule_index(&self) -> Result<()> {
+    pub fn warm_schedule_index(&self) {
+        // Infallible by construction: an absent root and a Brain that cannot be
+        // replayed are both ordinary states, not errors. It previously returned
+        // `Result` and never an `Err`, so the caller's error branch and its
+        // diagnostic were unreachable — a promise of a warning that could not
+        // fire.
         let Some(root) = &self.root else {
-            return Ok(());
+            return;
         };
         let entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
             // No Brain root yet is not a failure; it is a daemon with no Brains.
-            Err(_) => return Ok(()),
+            Ok(entries) => entries,
+            Err(_) => return,
         };
         let mut skipped = 0usize;
         for entry in entries.flatten() {
@@ -2827,10 +2887,10 @@ impl BrainStore {
             tracing::warn!(
                 skipped,
                 indexed = self.indexed_schedule_count(),
-                "some Brains were skipped while warming the schedule index"
+                "some Brains were skipped while warming the schedule index; \
+                 they will be retried on the next warm"
             );
         }
-        Ok(())
     }
 
     /// Woken when a schedule appears that is due sooner than the current head.
@@ -5018,16 +5078,22 @@ impl BrainStore {
             kind,
         };
         self.append_event(name, &event)?;
-        let touches_schedules = matches!(
-            event.kind,
-            BrainEventKind::ScheduleChanged { .. } | BrainEventKind::ScheduleDue { .. }
-        );
+        // Which schedule this event moves, if any. Every creation,
+        // cancellation and advance reaches state through these two kinds, so
+        // the index has one maintenance point rather than one per call site.
+        let touched = match &event.kind {
+            BrainEventKind::ScheduleChanged { schedule } => Some(schedule.schedule_id),
+            BrainEventKind::ScheduleDue { due } => Some(due.schedule_id),
+            _ => None,
+        };
         state.apply(event.clone());
-        // Every schedule creation, cancellation and advance reaches state
-        // through `ScheduleChanged`/`ScheduleDue` here, so the index has one
-        // maintenance point rather than one per call site (#374).
-        if touches_schedules {
-            self.reindex_schedules_locked(name, state);
+        // Targeted, not a whole-Brain rescan: `state.schedules` is never pruned,
+        // so rescanning cost every schedule the Brain had ever held, inside the
+        // process-wide `brains` write guard.
+        if let Some(schedule_id) = touched {
+            if let Some(schedule) = state.schedules.get(&schedule_id).cloned() {
+                self.upsert_schedule_locked(name, &schedule);
+            }
         }
         let _ = state.tx.send(event.clone());
         Ok(event)
@@ -7597,7 +7663,7 @@ mod tests {
              -- this is the state that makes the warm-up necessary"
         );
 
-        restarted.warm_schedule_index().unwrap();
+        restarted.warm_schedule_index();
 
         assert_eq!(
             restarted.next_schedule_due_ms(),
@@ -7625,14 +7691,29 @@ mod tests {
         std::fs::create_dir_all(&corrupt).unwrap();
         std::fs::write(corrupt.join("metadata.json"), "{not json").unwrap();
 
-        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        // The negative control runs on its own store. Sharing one with the
+        // subject was wrong: `list()` -> `load_all` -> `ensure_loaded` populates
+        // the index from its tail for every Brain it manages to load before it
+        // bails, so on a filesystem that yields `corrupt` last the control did
+        // the work under test and the assertion below would hold even with
+        // `warm_schedule_index`'s body replaced by `Ok(())`. `read_dir` order is
+        // unspecified, so that made the test's meaning depend on the filesystem.
+        let control = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert!(
-            store.list().is_err(),
+            control.list().is_err(),
             "negative control: this root genuinely defeats the enumerating \
              path, which is what made one bad Brain fatal to delivery"
         );
+        drop(control);
 
-        store.warm_schedule_index().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(
+            store.indexed_schedule_count(),
+            0,
+            "the subject store must start empty, so what the assertion below \
+             observes is the warm-up's work and nothing else"
+        );
+        store.warm_schedule_index();
 
         assert_eq!(
             store.due_schedule_brains(5_000),
@@ -7688,68 +7769,232 @@ mod tests {
         );
     }
 
+    /// Creating a schedule that becomes the new head must wake the delivery
+    /// loop, and creating one that does not must leave it asleep.
+    ///
+    /// The previous version of this test called `notify_one` itself on a handle
+    /// it already held, so both sides of the assertion came from the test. It
+    /// asserted `tokio::sync::Notify`'s contract and left the production call
+    /// site untouched: reverting it to `notify_waiters` -- the exact defect it
+    /// was written to prevent -- kept it green. This one never notifies; only
+    /// `reindex_schedules_locked` can.
     #[test]
-    fn test_a_wakeup_sent_before_the_waiter_registers_is_not_lost() {
-        // Review round 1, finding 3. `notify_waiters` stores no permit, so a
-        // notification sent while the delivery loop sits between reading the
-        // index head and registering its waiter was dropped, and the loop then
-        // slept to the stale head -- up to the 60 s ceiling. That is the
-        // expected interleaving under contention, not a rare race: a writer
-        // blocked on the index lock resumes exactly when the loop releases it.
-        let store = BrainStore::with_root("box.local", None);
+    fn test_creating_an_earlier_schedule_wakes_the_delivery_loop() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        // Take the handle the delivery loop would take, before anything is
+        // indexed, so a mutation that hands out a fresh `Notify` per call is
+        // also caught.
         let wakeup = store.schedule_wakeup();
-
-        // Notify with nobody waiting, exactly as the lost-wakeup window does.
-        wakeup.notify_one();
+        seed_scheduled_brain(&store, "later", 900_000);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
-        let woke = runtime.block_on(async {
+
+        // The first schedule into an empty index is itself a head move, so it
+        // wakes -- and `notify_one` stores that permit. Assert it and consume
+        // it, or the negative case below reads this permit and fails. (It did,
+        // the first time this test ran, which is the coupling to production the
+        // previous version of this test lacked entirely.)
+        let woke_for_first = runtime.block_on(async {
             tokio::time::timeout(std::time::Duration::from_secs(5), wakeup.notified())
                 .await
                 .is_ok()
         });
-
         assert!(
-            woke,
-            "a notification sent before the waiter registers must survive: with \
-             `notify_waiters` it is discarded, and the delivery loop then waits \
-             out its existing sleep while a schedule that is already due sits \
-             at the head of the index"
+            woke_for_first,
+            "the first schedule into an empty index moves the head from None \
+             and must wake the loop, which would otherwise be sleeping the full \
+             60 s ceiling with nothing indexed"
+        );
+
+        // A schedule further out than the head must not wake anything: an
+        // unnecessary wake is a spin, and `moved_earlier` returning true
+        // unconditionally would show up here.
+        seed_scheduled_brain(&store, "further", 950_000);
+        let woke_for_later = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(200), wakeup.notified())
+                .await
+                .is_ok()
+        });
+        assert!(
+            !woke_for_later,
+            "a schedule due after the current head must not interrupt a sleep \
+             it does not shorten; head was 900000 and the new schedule was \
+             950000"
+        );
+
+        // A schedule earlier than the head must wake, and the notification has
+        // to survive being sent while nothing is waiting -- which is the
+        // window the delivery loop sits in between sampling the head and
+        // registering. `notify_waiters` drops it; `notify_one` stores a permit.
+        seed_scheduled_brain(&store, "sooner", 1_000);
+        let woke_for_sooner = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), wakeup.notified())
+                .await
+                .is_ok()
+        });
+        assert!(
+            woke_for_sooner,
+            "a schedule that becomes the new head must wake the delivery loop, \
+             and must do so even though the wake was sent while no waiter was \
+             registered -- otherwise it waits out the existing sleep, up to the \
+             60 s ceiling, silently. Head is {:?}",
+            store.next_schedule_due_ms()
         );
     }
 
+    /// Selecting due work must not hydrate Brains that have none.
+    ///
+    /// Asserted with `resident_brain_count`, as #374 required -- never a
+    /// duration. The previous version asserted only that selection *named* one
+    /// Brain, which `due_schedule_brains` cannot get wrong: it is a pure read
+    /// of the index and cannot hydrate anything. That left the property
+    /// tautological, and a `due_schedule_brains` that called `list()` first --
+    /// hydrating all 65 Brains on every tick, the exact defect #374 removes --
+    /// would have passed it.
     #[test]
     fn test_selection_does_not_hydrate_brains_without_due_work() {
-        // The cost property, asserted structurally. A wall-clock assertion here
-        // would be exactly the mistake #242 made four times.
+        const IDLE: usize = 64;
         let temp = tempfile::tempdir().unwrap();
         {
             let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
             seed_scheduled_brain(&seeding, "has-work", 1_000);
-            for index in 0..64 {
+            for index in 0..IDLE {
                 seeding.snapshot(&format!("idle-{index:04}")).unwrap();
             }
         }
 
+        // Deliberately not warmed: warming hydrates everything it can, which is
+        // the one enumeration #374 keeps. What is under test is the steady
+        // state, where the index already knows the due Brain and selection must
+        // touch nothing else.
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
-        store.warm_schedule_index().unwrap();
+        store.snapshot("has-work").unwrap();
+        assert_eq!(
+            store.resident_brain_count(),
+            1,
+            "precondition: exactly the Brain with work is resident, out of \
+             {} on disk",
+            IDLE + 1
+        );
 
         let due = store.due_schedule_brains(2_000);
 
         assert_eq!(
             due,
             vec!["has-work".to_string()],
-            "only the Brain with due work may be selected, out of 65 on disk;              selecting more means the delivery loop is about to hydrate Brains              that have nothing to do"
+            "only the Brain with due work may be selected"
         );
         assert_eq!(
-            store.indexed_schedule_count(),
+            store.resident_brain_count(),
             1,
-            "the 64 idle Brains contribute no index entries, so selecting due \
-             work is bounded by the number of schedules rather than by the \
-             number of Brains"
+            "selecting due work must hydrate nothing. {} Brains are on disk and \
+             exactly one has a due schedule; a selection path that enumerated \
+             or replayed the root to answer would leave them resident here, \
+             which is the per-second cost #374 exists to remove",
+            IDLE + 1
+        );
+    }
+
+    #[test]
+    fn test_two_schedules_in_one_brain_name_it_once() {
+        // `due_brains` dedups, because the delivery loop hydrates and locks per
+        // name. Without the dedup a Brain with two due schedules is processed
+        // twice per tick, taking its execution lock twice for one pass.
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (attachment, _) = seed_scheduled_brain(&store, "busy", 1_000);
+        store
+            .create_schedule(
+                "busy",
+                "alice",
+                attachment,
+                ProgramLanguage::Lisp,
+                "(say \"second\")",
+                crate::vm::EffectSet::pure(),
+                1_500,
+                Some(1_000),
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert_eq!(store.indexed_schedule_count(), 2, "two schedules indexed");
+
+        assert_eq!(
+            store.due_schedule_brains(2_000),
+            vec!["busy".to_string()],
+            "a Brain with two due schedules must be named once; naming it twice \
+             makes the delivery loop take its execution lock twice for one pass"
+        );
+    }
+
+    #[test]
+    fn test_due_order_holds_across_more_than_two_brains() {
+        // Two-element orderings pass by chance about half the time against a
+        // hash-ordered mutation. Four, in an order that matches neither name
+        // order nor insertion order, does not.
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        seed_scheduled_brain(&store, "delta", 4_000);
+        seed_scheduled_brain(&store, "alpha", 2_000);
+        seed_scheduled_brain(&store, "charlie", 1_000);
+        seed_scheduled_brain(&store, "bravo", 3_000);
+
+        assert_eq!(
+            store.due_schedule_brains(10_000),
+            vec![
+                "charlie".to_string(),
+                "alpha".to_string(),
+                "bravo".to_string(),
+                "delta".to_string(),
+            ],
+            "due order must follow next_due_ms across every Brain. This order \
+             matches neither name order (alpha, bravo, charlie, delta) nor \
+             insertion order (delta, alpha, charlie, bravo), so a hash-ordered \
+             or enumeration-ordered result cannot produce it by chance"
+        );
+    }
+
+    #[test]
+    fn test_the_warmed_index_agrees_with_the_log_after_a_restart_mid_flight() {
+        // The "one authoritative store" claim rests on this: the index is
+        // derived, so after a restart with a fired-but-outstanding occurrence
+        // the warmed head must equal what the event log replays to, not what it
+        // was before the fire.
+        let temp = tempfile::tempdir().unwrap();
+        let advanced = {
+            let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+            seed_scheduled_brain(&store, "midflight", 1_000);
+            let queued = store.queue_due_schedules("midflight", 1_500).unwrap();
+            assert_eq!(
+                queued.len(),
+                1,
+                "the schedule fired, leaving a due outstanding"
+            );
+            let head = store.next_schedule_due_ms();
+            assert_eq!(head, Some(2_000), "and advanced by its interval");
+            head
+        };
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        restarted.warm_schedule_index();
+
+        assert_eq!(
+            restarted.next_schedule_due_ms(),
+            advanced,
+            "after a restart with an occurrence outstanding, the warmed index \
+             must agree with the replayed log. Disagreeing means the daemon \
+             would either re-fire an occurrence it already queued or skip the \
+             next one"
+        );
+        let snapshot = restarted.snapshot("midflight").unwrap();
+        assert_eq!(
+            snapshot.schedules[0].next_due_ms,
+            advanced.unwrap(),
+            "and the log itself must carry that same next_due_ms, so the index \
+             is derived from it rather than merely consistent with itself"
         );
     }
 
