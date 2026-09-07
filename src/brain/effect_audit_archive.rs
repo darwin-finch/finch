@@ -127,6 +127,12 @@ pub(crate) struct EffectAuditActiveJournal {
     path: PathBuf,
     #[cfg(test)]
     fail_next_batch_before_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only override of [`MAX_ACTIVE_JOURNAL_BYTES`]. The production bound
+    /// is 48 MiB, which a deterministic regression cannot reach cheaply; the
+    /// admission decision under test is the ordering of the bound check against
+    /// the commit, not the numeric value of the bound.
+    #[cfg(test)]
+    max_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl EffectAuditActiveJournal {
@@ -159,12 +165,32 @@ impl EffectAuditActiveJournal {
             fail_next_batch_before_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            #[cfg(test)]
+            max_bytes: std::sync::atomic::AtomicU64::new(MAX_ACTIVE_JOURNAL_BYTES),
         };
         anyhow::ensure!(
-            journal.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
+            journal.file_bytes()? <= journal.max_bytes(),
             "effect-audit active journal exceeds its durable byte bound"
         );
         Ok(journal)
+    }
+
+    /// The durable byte ceiling this journal admits work against.
+    fn max_bytes(&self) -> u64 {
+        #[cfg(test)]
+        {
+            self.max_bytes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            MAX_ACTIVE_JOURNAL_BYTES
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_bytes_for_test(&self, bytes: u64) {
+        self.max_bytes
+            .store(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn load(&self) -> Result<Vec<(u64, EffectAuditTransition)>> {
@@ -233,7 +259,7 @@ impl EffectAuditActiveJournal {
             active
                 .saturating_add(encoded_reserve_bytes as u64)
                 .saturating_add(reserved_terminal_bytes)
-                <= MAX_ACTIVE_JOURNAL_BYTES,
+                <= self.max_bytes(),
             "effect-audit active journal quota exceeded before durable host permit"
         );
         archive.ensure_total_storage_bound(
@@ -242,40 +268,40 @@ impl EffectAuditActiveJournal {
         )
     }
 
+    /// Durably admit one transition. The caller's sequence number is consumed
+    /// only if this returns `Ok`.
     pub(crate) fn append(&self, seq: u64, transition: &EffectAuditTransition) -> Result<()> {
-        let encoded = serde_json::to_vec(transition)?;
-        let encoded_len = encoded.len();
-        let identity = identity_key(&transition.identity())?;
-        let connection = open_active(&self.path)?;
-        let existing: Option<Vec<u8>> = connection
-            .query_row(
-                "SELECT transition_json FROM transitions WHERE seq = ?1",
-                params![seq as i64],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = existing {
-            anyhow::ensure!(
-                existing == encoded,
-                "conflicting active effect-audit transition sequence {seq}"
-            );
-            return Ok(());
-        }
-        connection
-            .execute(
-                "INSERT INTO transitions(seq, identity, transition_json, encoded_bytes)
-             VALUES (?1, ?2, ?3, ?4)",
-                params![seq as i64, identity, encoded, encoded_len as i64],
-            )
-            .with_context(|| format!("append active effect-audit transition #{seq}"))?;
-        anyhow::ensure!(
-            self.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
-            "effect-audit active journal exceeded its durable byte bound"
-        );
-        Ok(())
+        self.append_transitions(std::iter::once((seq, transition)), false)
     }
 
+    /// Durably admit a batch of transitions as one atomic outcome. Either every
+    /// transition is committed and every sequence number is consumed, or none
+    /// is and the durable journal is left exactly as it was.
     pub(crate) fn append_batch(&self, transitions: &[(u64, EffectAuditTransition)]) -> Result<()> {
+        self.append_transitions(
+            transitions
+                .iter()
+                .map(|(seq, transition)| (*seq, transition)),
+            true,
+        )
+    }
+
+    /// Single admission path for both the batch and single-transition writers.
+    ///
+    /// The durable byte bound is enforced **before** the commit, so a caller
+    /// that observes `Err` can rely on nothing having been committed and on its
+    /// sequence numbers still being free. Checking after the commit made a full
+    /// journal deterministically corrupt the Brain's canonical sequence: the
+    /// transitions were durable, the caller saw a failure, `state.revision`
+    /// stayed behind them, and the next canonical append reused a `seq` the
+    /// journal already held — which is what made a Brain permanently unloadable
+    /// (#379, and the artifact in #377).
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn append_transitions<'a>(
+        &self,
+        transitions: impl IntoIterator<Item = (u64, &'a EffectAuditTransition)>,
+        injectable_failure: bool,
+    ) -> Result<()> {
         let mut connection = open_active(&self.path)?;
         let transaction = connection.transaction()?;
         for (seq, transition) in transitions {
@@ -284,7 +310,7 @@ impl EffectAuditActiveJournal {
             let existing: Option<Vec<u8>> = transaction
                 .query_row(
                     "SELECT transition_json FROM transitions WHERE seq = ?1",
-                    params![*seq as i64],
+                    params![seq as i64],
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -295,29 +321,43 @@ impl EffectAuditActiveJournal {
                 );
                 continue;
             }
-            transaction.execute(
-                "INSERT INTO transitions(seq, identity, transition_json, encoded_bytes)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    *seq as i64,
-                    identity_key(&transition.identity())?,
-                    encoded,
-                    encoded_len as i64
-                ],
-            )?;
+            transaction
+                .execute(
+                    "INSERT INTO transitions(seq, identity, transition_json, encoded_bytes)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        seq as i64,
+                        identity_key(&transition.identity())?,
+                        encoded,
+                        encoded_len as i64
+                    ],
+                )
+                .with_context(|| format!("append active effect-audit transition #{seq}"))?;
         }
         #[cfg(test)]
-        if self
-            .fail_next_batch_before_commit
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        if injectable_failure
+            && self
+                .fail_next_batch_before_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             anyhow::bail!("injected active effect-audit transaction failure before commit");
         }
+        let bound = self.max_bytes();
+        let projected = pending_file_bytes(&transaction)?;
+        if projected > bound {
+            transaction
+                .rollback()
+                .context("roll back a refused active effect-audit transaction")?;
+            anyhow::bail!(
+                "effect-audit active journal refused an append that would exceed its durable \
+                 byte bound: {projected} bytes projected against a bound of {bound}. Nothing \
+                 was committed and the Brain's canonical sequence is unchanged. The journal \
+                 drains when in-flight host effects reach a terminal outcome, which fences \
+                 them into the replay archive; new host effects are refused before any permit \
+                 is granted while that headroom is gone."
+            );
+        }
         transaction.commit()?;
-        anyhow::ensure!(
-            self.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
-            "effect-audit active journal exceeded its durable byte bound"
-        );
         Ok(())
     }
 
@@ -846,6 +886,25 @@ fn open_active(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// Size the database file will have once the open transaction commits.
+///
+/// These connections run `journal_mode = DELETE`, so a write transaction's
+/// pages are already in the main database file and the rollback journal holds
+/// the originals; `page_count` therefore reports the pending size, and a
+/// rollback restores both the pages and the file length. A SQLite database
+/// file is exactly `page_count * page_size` bytes, so this is the same quantity
+/// [`EffectAuditActiveJournal::file_bytes`] observes after the commit — read
+/// before it, where refusing still costs nothing.
+fn pending_file_bytes(connection: &Connection) -> Result<u64> {
+    let page_count: i64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .context("read pending effect-audit journal page count")?;
+    let page_size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .context("read effect-audit journal page size")?;
+    Ok((page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64))
+}
+
 fn initialize_index(path: &Path) -> Result<()> {
     let created = !path.exists();
     let connection = open_index(path)?;
@@ -1187,6 +1246,114 @@ mod tests {
                 .to_string()
                 .contains("multiple epochs"),
             "duplicate identity membership across epochs must fail closed"
+        );
+    }
+
+    /// #379 relies on `pending_file_bytes` reading, before the commit, the
+    /// exact size `file_bytes` reports after it. If those two ever disagree the
+    /// bound would be enforced against a different quantity than it is measured
+    /// with at `open` and at reserve admission.
+    #[test]
+    fn test_pending_file_bytes_matches_committed_file_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = EffectAuditActiveJournal::open(temporary.path()).unwrap();
+        let brain_id = uuid::Uuid::new_v4();
+        for round in 0..8u64 {
+            let batch = (0..32u64)
+                .map(|index| {
+                    let seq = round * 32 + index + 1;
+                    (seq, fence(brain_id, seq))
+                })
+                .collect::<Vec<_>>();
+            journal.append_batch(&batch).unwrap();
+            let mut connection = open_active(&journal.path).unwrap();
+            let transaction = connection.transaction().unwrap();
+            let pending = pending_file_bytes(&transaction).unwrap();
+            transaction.rollback().unwrap();
+            let committed = journal.file_bytes().unwrap();
+            assert_eq!(
+                pending, committed,
+                "the pre-commit projection and the post-commit file size must be the same \
+                 quantity after round {round}: projected {pending} bytes, file {committed} bytes"
+            );
+        }
+    }
+
+    /// #379: a refused append must leave the durable journal byte-identical and
+    /// its sequence space untouched, at the journal boundary itself.
+    #[test]
+    fn test_append_batch_past_byte_bound_rolls_back_and_commits_no_sequence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = EffectAuditActiveJournal::open(temporary.path()).unwrap();
+        let brain_id = uuid::Uuid::new_v4();
+        let seeded = (1..=64u64)
+            .map(|seq| (seq, fence(brain_id, seq)))
+            .collect::<Vec<_>>();
+        journal.append_batch(&seeded).unwrap();
+        let settled = journal.file_bytes().unwrap();
+        let bytes_before = std::fs::read(&journal.path).unwrap();
+        let seqs_before = journal
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect::<Vec<_>>();
+
+        journal.set_max_bytes_for_test(settled);
+        let crossing = (65..=256u64)
+            .map(|seq| (seq, fence(brain_id, seq)))
+            .collect::<Vec<_>>();
+        let refusal = journal.append_batch(&crossing).expect_err(
+            "a batch that grows the journal past a bound equal to its settled size must be \
+             refused",
+        );
+
+        let bytes_after = std::fs::read(&journal.path).unwrap();
+        let seqs_after = journal
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect::<Vec<_>>();
+        assert!(
+            format!("{refusal:#}").contains("durable byte bound"),
+            "the refusal must name the durable byte bound (bound={settled} bytes, \
+             refusal={refusal:#})"
+        );
+        assert!(
+            bytes_before == bytes_after,
+            "a refused append must leave the durable journal byte-identical: {} bytes before, \
+             {} bytes after, bound={settled}, refusal={refusal:#}",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+        assert_eq!(
+            seqs_after,
+            seqs_before,
+            "a refused append must commit no sequence: journal held {} rows ending at {:?} \
+             before and {} rows ending at {:?} after, bound={settled} bytes, refusal={refusal:#}",
+            seqs_before.len(),
+            seqs_before.last(),
+            seqs_after.len(),
+            seqs_after.last()
+        );
+        journal.set_max_bytes_for_test(MAX_ACTIVE_JOURNAL_BYTES);
+        journal
+            .append_batch(&crossing)
+            .expect("the refused batch must be admissible once the bound allows it");
+        let seqs_final = journal
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seqs_final.len(),
+            256,
+            "the retried batch must admit every transition exactly once (journal holds {} rows, \
+             last {:?})",
+            seqs_final.len(),
+            seqs_final.last()
         );
     }
 
