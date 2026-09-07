@@ -7939,14 +7939,10 @@ Rules:\n\
     fn update_plan_mode_indicator(&self, mode: &ReplMode) {
         use crate::cli::status_bar::StatusLineType;
 
-        let indicator = match mode {
-            ReplMode::Normal => "⏵⏵ accept edits on (shift+tab to cycle)",
-            ReplMode::Planning { .. } => "⏸ plan mode on (shift+tab to cycle)",
-            ReplMode::Executing { .. } => "▶ executing plan (shift+tab disabled)",
-        };
-
-        self.status_bar
-            .update_line(StatusLineType::Custom("plan_mode".to_string()), indicator);
+        self.status_bar.update_line(
+            StatusLineType::Custom("plan_mode".to_string()),
+            plan_mode_indicator(mode),
+        );
     }
 
     #[allow(dead_code)]
@@ -8887,6 +8883,28 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
         .parse()
         .map_err(|_| anyhow::anyhow!("bad len in hunk: {len_str}"))?;
     Ok((start, len))
+}
+
+/// Status-bar text for a REPL mode.
+///
+/// The string here is the only thing that reports the current mode to the user,
+/// so it must describe what the mode actually does. Finch has no auto-acceptance
+/// mode: `Permissions::check_tool_use` (`src/tools/permissions.rs`) makes every
+/// approval decision and never reads a `ReplMode`, and the one place the mode is
+/// consulted during execution (`src/tools/executor.rs`) only *restricts* tools in
+/// `Planning`. No mode widens or waives an approval. See #438.
+///
+/// Extracted from `update_plan_mode_indicator` so the labels can be pinned by a
+/// test; nothing in the repository constructs a `ReplEventLoop` outside
+/// production.
+pub(crate) fn plan_mode_indicator(mode: &ReplMode) -> &'static str {
+    match mode {
+        ReplMode::Normal => "⏵ normal mode: tools ask before running (shift+tab for plan mode)",
+        ReplMode::Planning { .. } => "⏸ plan mode: read-only tools only (shift+tab to exit)",
+        ReplMode::Executing { .. } => {
+            "▶ executing plan: all tools, still ask before running (shift+tab to exit)"
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11266,6 +11284,186 @@ mod tests {
             "index 2 is No/Deny in 3-option dialog, got {:?}",
             result
         );
+    }
+
+    /// Fixed, clock-free modes to label. `Planning` and `Executing` carry
+    /// timestamps, so they are pinned to the epoch: nothing here reads a clock.
+    #[cfg(test)]
+    fn modes_under_test() -> Vec<(&'static str, crate::cli::repl::ReplMode)> {
+        use crate::cli::repl::ReplMode;
+
+        let at = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid timestamp");
+        let plan_path = std::path::PathBuf::from("/nonexistent/finch-438-plan.md");
+
+        vec![
+            ("Normal", ReplMode::Normal),
+            (
+                "Planning",
+                ReplMode::Planning {
+                    task: "explore".to_string(),
+                    plan_path: plan_path.clone(),
+                    created_at: at,
+                },
+            ),
+            (
+                "Executing",
+                ReplMode::Executing {
+                    task: "explore".to_string(),
+                    plan_path,
+                    approved_at: at,
+                },
+            ),
+        ]
+    }
+
+    /// No mode's status-bar label may advertise that approvals are waived,
+    /// because no mode waives one.
+    ///
+    /// #438: `ReplMode::Normal` — whose own doc comment reads "all tools require
+    /// confirmation" — shipped labelled `⏵⏵ accept edits on`. A maintainer read
+    /// that, believed their approvals had been waived, and then experienced
+    /// `$EDITOR` opening on every write as a malfunction. It was not a
+    /// malfunction; it was the documented behaviour of the mode, mislabelled. The
+    /// status bar is the only surface reporting mode, and it reported a mode that
+    /// does not exist.
+    ///
+    /// This asserts the property rather than the wording, so a later rewrite of
+    /// the labels cannot drift back the way a hardcoded expected string would.
+    /// The property is grounded in the gates themselves: `check_tool_use`
+    /// (`src/tools/permissions.rs`) makes every approval decision and never takes
+    /// a `ReplMode`, and the only place execution consults the mode
+    /// (`src/tools/executor.rs`) *restricts* tools in `Planning` — nothing
+    /// anywhere widens or waives an approval. Should an auto-accept mode ever be
+    /// implemented, this test is the thing that must be changed deliberately, in
+    /// the same commit that makes the claim true.
+    #[test]
+    fn test_mode_indicator_never_claims_edits_are_accepted_automatically() {
+        // Phrasings that would tell a user their approvals are being waived.
+        const CLAIMS_OF_WAIVED_APPROVAL: [&str; 12] = [
+            "accept edits",
+            "accepts edits",
+            "auto-accept",
+            "auto accept",
+            "autoaccept",
+            "accepted automatically",
+            "automatically accept",
+            "no confirmation",
+            "without confirmation",
+            "without approval",
+            "skip confirmation",
+            "skips confirmation",
+        ];
+
+        for (mode_name, mode) in modes_under_test() {
+            let indicator = super::plan_mode_indicator(&mode);
+            let lowered = indicator.to_lowercase();
+
+            for claim in CLAIMS_OF_WAIVED_APPROVAL {
+                assert!(
+                    !lowered.contains(claim),
+                    "invariant: a REPL mode indicator must never advertise waived \
+                     approvals, because no ReplMode waives one — check_tool_use \
+                     (src/tools/permissions.rs) never reads the mode, and the \
+                     executor's only mode branch (src/tools/executor.rs) restricts \
+                     Planning rather than widening anything (#438). \
+                     mode={mode_name} mode_value={mode:?} \
+                     indicator={indicator:?} forbidden_claim={claim:?}"
+                );
+            }
+        }
+    }
+
+    /// Each label must state something true of its own variant, and must reach
+    /// the status bar as written.
+    ///
+    /// The required substrings are behavioural facts, each checkable in the
+    /// source:
+    ///
+    /// - `Normal` and `Executing` prompt for approval. Neither is exempt from
+    ///   `check_tool_use`; `Executing` differs from `Normal` only in that a plan
+    ///   has been approved, not in what a tool call costs the user.
+    /// - `Planning` is restricted to inspection tools — `src/tools/executor.rs`
+    ///   rejects anything outside read/glob/grep/web_fetch plus the plan tools.
+    /// - Shift+tab is live in every mode. `KeyCode::BackTab` maps to
+    ///   `Command::PlanModeToggle` unconditionally
+    ///   (`src/cli/tui/async_input.rs`), and the handler treats `Planning` and
+    ///   `Executing` identically, returning both to `Normal`. The shipped
+    ///   `Executing` label said "shift+tab disabled", which was false for the
+    ///   same reason "accept edits on" was: it described a mode set Finch does
+    ///   not implement.
+    #[test]
+    fn test_mode_indicator_describes_each_modes_actual_behavior() {
+        use crate::cli::status_bar::{StatusBar, StatusLineType};
+
+        // (mode name, substring the label must contain, why that is true)
+        let required: [(&str, &str, &str); 3] = [
+            (
+                "Normal",
+                "ask",
+                "Normal is subject to check_tool_use like every other mode; its own \
+                 doc comment reads \"all tools require confirmation\"",
+            ),
+            (
+                "Planning",
+                "read-only",
+                "src/tools/executor.rs rejects any tool outside \
+                 read/glob/grep/web_fetch plus the plan tools while Planning",
+            ),
+            (
+                "Executing",
+                "ask",
+                "Executing lifts the Planning tool restriction only; it does not \
+                 exempt anything from check_tool_use",
+            ),
+        ];
+
+        for (mode_name, mode) in modes_under_test() {
+            let indicator = super::plan_mode_indicator(&mode);
+            let lowered = indicator.to_lowercase();
+
+            let (_, needle, why) = required
+                .iter()
+                .find(|(name, _, _)| *name == mode_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "invariant: every ReplMode variant needs a stated required \
+                         fact in this test, so a new variant cannot ship an \
+                         unchecked label (#438). unmatched mode={mode_name}"
+                    )
+                });
+
+            assert!(
+                lowered.contains(needle),
+                "invariant: a REPL mode indicator must state what its mode \
+                 actually does (#438). mode={mode_name} mode_value={mode:?} \
+                 indicator={indicator:?} missing={needle:?} \
+                 grounds={why:?}"
+            );
+
+            assert!(
+                !lowered.contains("disabled"),
+                "invariant: no mode may report shift+tab as disabled — \
+                 KeyCode::BackTab maps to Command::PlanModeToggle unconditionally \
+                 (src/cli/tui/async_input.rs) and the handler returns both \
+                 Planning and Executing to Normal (#438). \
+                 mode={mode_name} mode_value={mode:?} indicator={indicator:?}"
+            );
+
+            // The label must survive the trip to the surface the user reads.
+            let status_bar = StatusBar::new();
+            let line = StatusLineType::Custom("plan_mode".to_string());
+            status_bar.update_line(line.clone(), indicator);
+            let shown = status_bar.get_line(&line);
+
+            assert_eq!(
+                shown.as_deref(),
+                Some(indicator),
+                "invariant: the plan_mode status line must carry the mode \
+                 indicator verbatim, since it is the only surface reporting mode \
+                 (#438). mode={mode_name} mode_value={mode:?} \
+                 indicator={indicator:?} status_line={shown:?}"
+            );
+        }
     }
 }
 
