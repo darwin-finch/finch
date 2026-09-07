@@ -1196,6 +1196,16 @@ pub struct BrainStore {
     run_connection_authority: Arc<RwLock<RunConnectionAuthority>>,
     disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
     effect_audit_storage: Arc<std::sync::Mutex<HashMap<String, EffectAuditStorage>>>,
+    /// Brains the warm-up could not load on its last pass.
+    ///
+    /// The warm-up runs on a timer and a Brain that cannot be replayed stays
+    /// that way until a human repairs it, so logging the failure on every pass
+    /// turns a permanent condition into unbounded log growth. That is the shape
+    /// that produced 30 MiB of identical lines from the one-second tick this
+    /// replaced; repeating it once a minute is the same defect, slower. This
+    /// tracks which Brains are already known bad so the warm-up can log edges —
+    /// one line when a Brain starts failing, one when it recovers.
+    unloadable_brains: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Active schedules across every resident Brain, ordered by due time (#374).
     schedule_index: Arc<RwLock<ScheduleIndex>>,
     /// Woken whenever the index gains an entry that may be due sooner than the
@@ -1437,6 +1447,7 @@ impl BrainStore {
             run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
             disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
             effect_audit_storage: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            unloadable_brains: Arc::new(std::sync::Mutex::new(HashSet::new())),
             schedule_index: Arc::new(RwLock::new(ScheduleIndex::default())),
             schedule_wakeup: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -2834,6 +2845,24 @@ impl BrainStore {
             .due_brains(now_ms)
     }
 
+    /// Brains the last warm-up could not load, for tests and diagnostics.
+    ///
+    /// This is the state that turns level-logging into edge-logging, so it is
+    /// what a regression asserts against: a warm that reports the same set as
+    /// the previous warm has nothing new to say.
+    #[cfg(test)]
+    pub(crate) fn unloadable_brains_for_test(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .unloadable_brains
+            .lock()
+            .expect("unloadable Brain registry poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Populate the due index from every Brain on disk, once.
     ///
     /// Schedules only become known when a Brain is loaded, so a freshly started
@@ -2862,7 +2891,8 @@ impl BrainStore {
             Ok(entries) => entries,
             Err(_) => return,
         };
-        let mut skipped = 0usize;
+        let mut failing = HashSet::new();
+        let mut newly_failing = Vec::new();
         for entry in entries.flatten() {
             if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 continue;
@@ -2874,21 +2904,45 @@ impl BrainStore {
                 continue;
             }
             if let Err(error) = self.ensure_loaded(&name) {
-                skipped += 1;
-                tracing::warn!(
-                    brain = %name,
-                    %error,
-                    "Brain could not be loaded while warming the schedule index; its \
-                     schedules will not be delivered until it is repaired"
-                );
+                if failing.insert(name.clone()) {
+                    newly_failing.push((name, error));
+                }
             }
         }
-        if skipped > 0 {
+
+        // Log the edges, not the level. A Brain that cannot be replayed stays
+        // that way until someone repairs it, so a line per pass is unbounded
+        // growth describing an unchanging fact.
+        let recovered: Vec<String> = {
+            let mut known = self
+                .unloadable_brains
+                .lock()
+                .expect("unloadable Brain registry poisoned");
+            let recovered = known
+                .iter()
+                .filter(|name| !failing.contains(*name))
+                .cloned()
+                .collect();
+            *known = failing.iter().cloned().collect();
+            recovered
+        };
+
+        for (name, error) in newly_failing
+            .into_iter()
+            .filter(|(name, _)| !recovered.contains(name))
+        {
             tracing::warn!(
-                skipped,
-                indexed = self.indexed_schedule_count(),
-                "some Brains were skipped while warming the schedule index; \
-                 they will be retried on the next warm"
+                brain = %name,
+                %error,
+                "Brain could not be loaded while warming the schedule index; its \
+                 schedules will not be delivered until it is repaired. This is \
+                 logged once per transition, not once per warm"
+            );
+        }
+        for name in recovered {
+            tracing::info!(
+                brain = %name,
+                "Brain became loadable again; its schedules are scheduled once more"
             );
         }
     }
@@ -7855,6 +7909,96 @@ mod tests {
     /// tautological, and a `due_schedule_brains` that called `list()` first --
     /// hydrating all 65 Brains on every tick, the exact defect #374 removes --
     /// would have passed it.
+    /// The warm-up must report a Brain's failure once, not once per pass.
+    ///
+    /// A Brain that cannot be replayed stays that way until a human repairs it,
+    /// so a line per warm is unbounded growth describing an unchanging fact.
+    /// That shape produced 30.4 MiB of one identical line on the reference
+    /// host, from the one-second tick this replaced; the 60 s re-warm added in
+    /// #374 is the same defect slower (#380).
+    ///
+    /// Asserted through the transition set rather than by capturing logs: the
+    /// set is what decides whether a line is emitted, so it is the observable
+    /// with no subscriber plumbing in the way.
+    #[test]
+    fn test_a_persistently_unloadable_brain_is_reported_once_not_once_per_warm() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+            seed_scheduled_brain(&seeding, "healthy", 1_000);
+        }
+        let broken = temp.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("metadata.json"), "{not json").unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert!(
+            store.unloadable_brains_for_test().is_empty(),
+            "precondition: nothing is known bad before the first warm"
+        );
+
+        store.warm_schedule_index();
+        let after_first = store.unloadable_brains_for_test();
+        assert_eq!(
+            after_first,
+            vec!["broken".to_string()],
+            "the first warm must record the failure, which is what emits the \
+             one line an operator needs"
+        );
+
+        store.warm_schedule_index();
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            after_first,
+            "a second warm over an unchanged condition must find the Brain \
+             already known bad, so it has nothing new to report. A set that \
+             grew or reset here is how a permanent condition becomes a log \
+             line per pass, forever"
+        );
+    }
+
+    #[test]
+    fn test_a_repaired_brain_clears_from_the_unloadable_set() {
+        // The recovery edge matters as much as the failure edge: without it an
+        // operator cannot tell from the log whether a repair worked.
+        let temp = tempfile::tempdir().unwrap();
+        let good = {
+            let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+            seed_scheduled_brain(&seeding, "repairable", 2_000);
+            std::fs::read(temp.path().join("repairable").join("metadata.json")).unwrap()
+        };
+        std::fs::write(
+            temp.path().join("repairable").join("metadata.json"),
+            "{not json",
+        )
+        .unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        store.warm_schedule_index();
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            vec!["repairable".to_string()],
+            "precondition: the Brain is known bad"
+        );
+
+        std::fs::write(temp.path().join("repairable").join("metadata.json"), good).unwrap();
+        store.warm_schedule_index();
+
+        assert!(
+            store.unloadable_brains_for_test().is_empty(),
+            "a repaired Brain must leave the set, so the recovery is reported \
+             once and the failure is not reported again. Latching the state \
+             here would mean a Brain that recovers and fails again is silent \
+             the second time"
+        );
+        assert!(
+            store
+                .due_schedule_brains(5_000)
+                .contains(&"repairable".to_string()),
+            "and it is genuinely scheduled again, not merely forgotten"
+        );
+    }
+
     #[test]
     fn test_a_repaired_brain_is_picked_up_by_a_later_warm() {
         // The regression for round 2's worst finding. Warming once meant a
