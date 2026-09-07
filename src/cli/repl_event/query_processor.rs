@@ -855,7 +855,24 @@ pub(super) async fn dispatch_tool_uses(
         .get_metadata(query_id)
         .await
         .and_then(|metadata| metadata.effect_audit);
-    let current_mode = mode.read().await;
+    // The gate below runs against the mode this batch was *authored* under,
+    // read once by value so no lock is held across the loop.  Two separate
+    // things depend on that:
+    //
+    // * `handle_present_plan` is awaited inside this loop and, once the user
+    //   approves, takes the `mode` **write** lock.  Tokio's `RwLock` is
+    //   write-preferring, so a read guard held across that await made the query
+    //   task wait on itself: approval resolved and then nothing happened, the
+    //   query never terminalized, its lane was never released, and every later
+    //   turn queued behind it forever — the wedged session of #363.  The whole
+    //   mode surface was stuck too, which is why Escape and an empty prompt did
+    //   not recover it either.
+    // * Authority stays fixed for the batch.  Every call in this batch was
+    //   authored by the provider while the session was still `Planning`, so an
+    //   approval landing part-way through must not retroactively unblock a
+    //   sibling `write` the model asked for under the old mode.  The *next*
+    //   batch is authored under `Executing` and is allowed.
+    let batch_mode = mode.read().await.clone();
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
         // the model is stuck; return a terminal error so it breaks out.
@@ -896,7 +913,7 @@ pub(super) async fn dispatch_tool_uses(
         }
 
         // Plan-mode gate: block destructive tools while exploring
-        if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
+        if !is_tool_allowed_in_mode(&tool_use.name, &batch_mode) {
             let label = format_tool_label(&tool_use.name, &tool_use.input);
             let row_idx = work_unit.add_row(label);
             work_unit.fail_row(row_idx, "blocked in plan mode");
@@ -981,7 +998,6 @@ pub(super) async fn dispatch_tool_uses(
             );
         }
     }
-    drop(current_mode);
 
     // Update memory status bar now that tools are queued
     if let Some(ref mem) = memory_system {
@@ -2023,6 +2039,709 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── #363: approving a plan must not wedge the session ─────────────────────
+    //
+    // `dispatch_tool_uses` used to bind a `ReplMode` read guard before its tool
+    // loop and hold it across the awaited `handle_present_plan`.  Approval takes
+    // the `mode` **write** lock, and tokio's `RwLock` is write-preferring, so the
+    // query task ended up waiting on a guard it was holding itself.  What the
+    // maintainer saw: "plan mode still does nothing on approval of plan", and
+    // then "it permanently breaks entry of new turn prompts ... The brain is
+    // dead."  Both halves are the same deadlock — the turn never terminalizes,
+    // so its lane is never released, and the whole `ReplMode` surface stays
+    // locked, which is why Escape and an empty prompt did not recover it.
+    //
+    // These regressions drive the real `dispatch_tool_uses` → `ShowDialog` →
+    // dialog decision → `ToolResult` path with a real `ToolExecutionCoordinator`
+    // and a real headless `TuiRenderer`.  What they deliberately do *not* reach
+    // is `EventLoop::execute_query_inner`, the admission gate that queues a later
+    // turn behind `active_query_id`: nothing in this repository constructs an
+    // `EventLoop` outside production (see the note in `event_loop.rs`'s test
+    // module).  The next-turn half is therefore pinned at the layer the wedge
+    // actually occupied — shared `ReplMode` ownership plus a dispatch that
+    // returns — rather than at the admission gate itself.
+
+    const PLAN_DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    type ObservedToolResult = (Uuid, String, std::result::Result<String, String>);
+
+    struct PlanDispatchFixture {
+        _temp: tempfile::TempDir,
+        plan_path: std::path::PathBuf,
+        mode: Arc<RwLock<ReplMode>>,
+        conversation: Arc<RwLock<ConversationHistory>>,
+        query_states: Arc<QueryStateManager>,
+        tui: Arc<tokio::sync::Mutex<TuiRenderer>>,
+        output: Arc<OutputManager>,
+        status: Arc<StatusBar>,
+        coordinator: Arc<ToolExecutionCoordinator>,
+        event_tx: mpsc::UnboundedSender<ReplEvent>,
+        event_rx: mpsc::UnboundedReceiver<ReplEvent>,
+        active_tool_uses: ActiveToolUsesMap,
+        tool_call_history:
+            Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+        events: Vec<String>,
+        results: Vec<ObservedToolResult>,
+    }
+
+    impl PlanDispatchFixture {
+        async fn planning() -> Self {
+            let temp = tempfile::tempdir().expect("plan dispatch fixture needs a temp directory");
+            let plan_path = temp.path().join("plan.md");
+            let colors = crate::config::ColorScheme::default();
+            let output = Arc::new(OutputManager::new(colors.clone()));
+            output.disable_stdout();
+            let status = Arc::new(StatusBar::new());
+            let tui = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+                Arc::clone(&output),
+                Arc::clone(&status),
+                colors,
+            )));
+            let mode = Arc::new(RwLock::new(ReplMode::Planning {
+                task: "repair plan approval".into(),
+                plan_path: plan_path.clone(),
+                created_at: chrono::Utc::now(),
+            }));
+            let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let executor = Arc::new(tokio::sync::Mutex::new(
+                crate::tools::executor::ToolExecutor::new(
+                    crate::tools::registry::ToolRegistry::new(),
+                    crate::tools::permissions::PermissionManager::new(),
+                    temp.path().join("tool-patterns.json"),
+                )
+                .expect("fixture tool executor must initialize"),
+            ));
+            let coordinator = Arc::new(ToolExecutionCoordinator::new(
+                event_tx.clone(),
+                executor,
+                Arc::clone(&output),
+                Arc::clone(&conversation),
+                Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+                Arc::new(
+                    crate::models::TextTokenizer::stub().expect("fixture needs a stub tokenizer"),
+                ),
+                Arc::clone(&mode),
+                Arc::new(RwLock::new(None)),
+            ));
+            Self {
+                _temp: temp,
+                plan_path,
+                mode,
+                conversation,
+                query_states: Arc::new(QueryStateManager::new()),
+                tui,
+                output,
+                status,
+                coordinator,
+                event_tx,
+                event_rx,
+                active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                tool_call_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                events: Vec::new(),
+                results: Vec::new(),
+            }
+        }
+
+        /// Stage one provider turn exactly as the streaming path does, so the
+        /// dispatch under test sees a real `ExecutingTools` query and a real
+        /// tool-round token.
+        async fn begin_turn(
+            &self,
+            tool_uses: &[ToolUse],
+        ) -> (Uuid, crate::cli::conversation::ToolRoundToken) {
+            let query_id = self.query_states.create_query(Vec::new()).await;
+            let assistant = crate::claude::Message {
+                role: "assistant".into(),
+                content: tool_uses
+                    .iter()
+                    .map(|tool_use| ContentBlock::ToolUse {
+                        id: tool_use.id.clone(),
+                        name: tool_use.name.clone(),
+                        input: tool_use.input.clone(),
+                    })
+                    .collect(),
+            };
+            let round_token = self
+                .conversation
+                .write()
+                .await
+                .stage_assistant(query_id, assistant)
+                .expect("fixture must stage the provider's tool call");
+            assert!(
+                self.query_states
+                    .begin_tool_execution(query_id, tool_uses.len())
+                    .await,
+                "a staged turn must enter ExecutingTools before dispatch; query_state={:?}",
+                self.query_states.get_state(query_id).await
+            );
+            let state = self.query_states.get_state(query_id).await;
+            assert!(
+                matches!(state, Some(QueryState::ExecutingTools { .. })),
+                "these regressions only mean something against a real in-flight tool round; \
+                 query_state={state:?}"
+            );
+            (query_id, round_token)
+        }
+
+        async fn cancel_token(&self, query_id: Uuid) -> tokio_util::sync::CancellationToken {
+            self.query_states
+                .get_metadata(query_id)
+                .await
+                .expect("a live query must expose its cancellation token")
+                .cancellation_token
+        }
+
+        fn spawn_dispatch(
+            &self,
+            tool_uses: Vec<ToolUse>,
+            query_id: Uuid,
+            round_token: crate::cli::conversation::ToolRoundToken,
+        ) -> tokio::task::JoinHandle<()> {
+            let work_unit = self.output.start_work_unit("planning");
+            let mode = Arc::clone(&self.mode);
+            let tool_call_history = Arc::clone(&self.tool_call_history);
+            let event_tx = self.event_tx.clone();
+            let active_tool_uses = Arc::clone(&self.active_tool_uses);
+            let tui = Arc::clone(&self.tui);
+            let output = Arc::clone(&self.output);
+            let query_states = Arc::clone(&self.query_states);
+            let coordinator = Arc::clone(&self.coordinator);
+            let status = Arc::clone(&self.status);
+            tokio::spawn(async move {
+                dispatch_tool_uses(
+                    tool_uses,
+                    query_id,
+                    round_token,
+                    &work_unit,
+                    &mode,
+                    &tool_call_history,
+                    &event_tx,
+                    &active_tool_uses,
+                    &tui,
+                    &output,
+                    &query_states,
+                    coordinator.as_ref(),
+                    &None,
+                    crate::memory_status::Recall::none(),
+                    "plan-approval-regression",
+                    "/workspace",
+                    &status,
+                    0,
+                )
+                .await;
+            })
+        }
+
+        /// Consume events until the plan dialog is published, recording every
+        /// event and tool result on the way for failure diagnostics.
+        async fn await_plan_dialog(
+            &mut self,
+            what: &str,
+        ) -> tokio::sync::oneshot::Sender<crate::cli::tui::DialogResult> {
+            let event_rx = &mut self.event_rx;
+            let events = &mut self.events;
+            let results = &mut self.results;
+            let found = tokio::time::timeout(PLAN_DISPATCH_DEADLINE, async {
+                loop {
+                    let event = event_rx.recv().await?;
+                    events.push(format!("{event:?}"));
+                    match event {
+                        ReplEvent::ShowDialog { response_tx, .. } => return Some(response_tx),
+                        ReplEvent::ToolResult {
+                            query_id,
+                            tool_id,
+                            result,
+                            ..
+                        } => results.push((query_id, tool_id, result.map_err(|e| e.to_string()))),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            match found {
+                Ok(Some(response_tx)) => response_tx,
+                Ok(None) => panic!(
+                    "{what}: the frontend event channel closed before dispatch published the plan \
+                     approval dialog; events={:?}, results={:?}",
+                    self.events, self.results
+                ),
+                Err(_) => panic!(
+                    "{what}: dispatch published no plan approval dialog within \
+                     {PLAN_DISPATCH_DEADLINE:?}; events={:?}, results={:?}",
+                    self.events, self.results
+                ),
+            }
+        }
+
+        /// Wait for one dispatch to return.  A dispatch that does not return is
+        /// exactly the #363 wedge, so the timeout reports the state a maintainer
+        /// needs rather than hanging the suite.
+        async fn join_dispatch(
+            &mut self,
+            mut handle: tokio::task::JoinHandle<()>,
+            query_id: Uuid,
+            what: &str,
+        ) {
+            match tokio::time::timeout(PLAN_DISPATCH_DEADLINE, &mut handle).await {
+                Ok(joined) => {
+                    joined.unwrap_or_else(|error| {
+                        panic!("{what}: the dispatch task panicked: {error}")
+                    });
+                }
+                Err(_) => {
+                    handle.abort();
+                    let _ = tokio::time::timeout(PLAN_DISPATCH_DEADLINE, &mut handle).await;
+                    let observed_mode = match tokio::time::timeout(
+                        PLAN_DISPATCH_DEADLINE,
+                        self.mode.read(),
+                    )
+                    .await
+                    {
+                        Ok(guard) => format!("{:?}", *guard),
+                        Err(_) => "<ReplMode lock still owned after aborting dispatch>".into(),
+                    };
+                    let state = self.query_states.get_state(query_id).await;
+                    panic!(
+                        "{what}: dispatch_tool_uses did not return within \
+                         {PLAN_DISPATCH_DEADLINE:?}. The interactive query task is wedged, so this \
+                         turn never terminalizes, its lane is never released, and every later turn \
+                         is stranded (#363). mode={observed_mode}, query_state={state:?}, \
+                         events={:?}, results={:?}",
+                        self.events, self.results
+                    );
+                }
+            }
+        }
+
+        fn drain_events(&mut self) {
+            while let Ok(event) = self.event_rx.try_recv() {
+                self.events.push(format!("{event:?}"));
+                if let ReplEvent::ToolResult {
+                    query_id,
+                    tool_id,
+                    result,
+                    ..
+                } = event
+                {
+                    self.results
+                        .push((query_id, tool_id, result.map_err(|e| e.to_string())));
+                }
+            }
+        }
+
+        fn results_for(&self, query_id: Uuid) -> Vec<&ObservedToolResult> {
+            self.results
+                .iter()
+                .filter(|(id, _, _)| *id == query_id)
+                .collect()
+        }
+
+        fn rendered_output(&self) -> String {
+            let colors = crate::config::ColorScheme::default();
+            self.output
+                .get_messages()
+                .iter()
+                .map(|message| message.format(&colors))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        async fn observed_mode(&self) -> ReplMode {
+            self.mode.read().await.clone()
+        }
+    }
+
+    fn present_plan_call(id: &str, plan: &str) -> ToolUse {
+        ToolUse {
+            id: id.into(),
+            name: "present_plan".into(),
+            input: serde_json::json!({ "plan": plan }),
+        }
+    }
+
+    /// The maintainer's first symptom: "plan mode still does nothing on approval
+    /// of plan."  Approval must reach `Executing` and the dispatch must return.
+    #[tokio::test]
+    async fn test_plan_approval_reaches_executing_without_wedging_the_query() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let call = present_plan_call("present-plan-1", "Implement the approved change.");
+        let (query_id, round_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
+        let dispatch = fixture.spawn_dispatch(vec![call], query_id, round_token);
+
+        let response_tx = fixture.await_plan_dialog("plan approval").await;
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("the plan dialog receiver disappeared before the user could approve");
+        fixture
+            .join_dispatch(dispatch, query_id, "plan approval")
+            .await;
+        fixture.drain_events();
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Executing { .. }),
+            "approving a plan must transition Planning -> Executing so implementation can start; \
+             mode={mode:?}, query_state={:?}, events={:?}, results={:?}",
+            fixture.query_states.get_state(query_id).await,
+            fixture.events,
+            fixture.results
+        );
+        let results = fixture.results_for(query_id);
+        assert_eq!(
+            results.len(),
+            1,
+            "one present_plan call must terminalize exactly once; mode={mode:?}, events={:?}, \
+             results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        let (_, tool_id, result) = results[0];
+        assert!(
+            tool_id == "present-plan-1" && result.is_ok(),
+            "the sole ToolResult must carry the original tool id and succeed, or the provider \
+             cannot continue; mode={mode:?}, results={:?}, events={:?}",
+            fixture.results,
+            fixture.events
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_ok_and(|text| text.contains("Plan approved by user")
+                    && text.contains("Implement the approved change.")),
+            "the approved result must hand the plan back to the provider to execute; \
+             results={:?}, events={:?}",
+            fixture.results,
+            fixture.events
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.plan_path).ok().as_deref(),
+            Some("Implement the approved change."),
+            "the reviewed plan must be the one persisted; results={:?}",
+            fixture.results
+        );
+    }
+
+    /// The maintainer's second symptom, and the one that makes this a demo
+    /// blocker: "it permanently breaks entry of new turn prompts. escape, empty
+    /// inputs + enter also don't reset it. The brain is dead."
+    ///
+    /// Both halves of that are shared `ReplMode` ownership.  After an approval
+    /// the mode surface must be writable again — that is the `/plan`, Escape and
+    /// mode-reset path — and a following turn's dispatch must run to completion.
+    #[tokio::test]
+    async fn test_a_turn_after_plan_approval_is_still_accepted() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let call = present_plan_call("present-plan-1", "Ship the reviewed change.");
+        let (first_id, round_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
+        let dispatch = fixture.spawn_dispatch(vec![call], first_id, round_token);
+        let response_tx = fixture.await_plan_dialog("plan approval").await;
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("the plan dialog receiver disappeared before the user could approve");
+        fixture
+            .join_dispatch(dispatch, first_id, "plan approval")
+            .await;
+        fixture.drain_events();
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Executing { .. }),
+            "the next-turn regression is only meaningful once approval itself worked; mode={mode:?}, \
+             events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+
+        // Escape, `/plan` and every mode reset need the write lock.  The wedge
+        // held it forever, which is why no keystroke recovered the session.
+        let reset_probe = tokio::spawn({
+            let mode = Arc::clone(&fixture.mode);
+            async move { mode.write().await.clone() }
+        });
+        let observed = tokio::time::timeout(PLAN_DISPATCH_DEADLINE, reset_probe)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no task could take the ReplMode write lock within {PLAN_DISPATCH_DEADLINE:?} \
+                     after plan approval, so Escape and /plan cannot reset the session (#363); \
+                     events={:?}, results={:?}",
+                    fixture.events, fixture.results
+                )
+            })
+            .expect("the mode-reset probe task panicked");
+        assert!(
+            matches!(observed, ReplMode::Executing { .. }),
+            "the mode-reset path must observe the approved mode, not a stale one; observed={observed:?}"
+        );
+
+        // A following turn dispatches through the same shared mode.  On the
+        // wedged build this never got past acquiring it.
+        let next_call = present_plan_call("present-plan-2", "A later turn's tool call.");
+        let (second_id, second_token) = fixture.begin_turn(std::slice::from_ref(&next_call)).await;
+        let second_dispatch = fixture.spawn_dispatch(vec![next_call], second_id, second_token);
+        fixture
+            .join_dispatch(second_dispatch, second_id, "the turn after approval")
+            .await;
+        fixture.drain_events();
+
+        assert_ne!(
+            first_id, second_id,
+            "the two turns must be distinct queries for this assertion to mean anything"
+        );
+        assert_eq!(
+            fixture.results_for(first_id).len(),
+            1,
+            "the approved turn must stay terminal exactly once after a later turn runs; \
+             events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        let second = fixture.results_for(second_id);
+        assert_eq!(
+            second.len(),
+            1,
+            "the turn after plan approval must be accepted and terminalize exactly once — this is \
+             the 'brain is dead' half of #363; events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        assert!(
+            second[0].2.is_ok(),
+            "the later turn must produce a usable result; results={:?}, events={:?}",
+            fixture.results,
+            fixture.events
+        );
+    }
+
+    /// Rejection takes the same write lock as approval and deadlocked the same
+    /// way, so it needs its own regression rather than an argument by analogy.
+    #[tokio::test]
+    async fn test_plan_rejection_returns_to_normal_mode_without_wedging_the_query() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let call = present_plan_call("present-plan-1", "A plan the user does not want.");
+        let (query_id, round_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
+        let dispatch = fixture.spawn_dispatch(vec![call], query_id, round_token);
+
+        let response_tx = fixture.await_plan_dialog("plan rejection").await;
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(2))
+            .expect("the plan dialog receiver disappeared before the user could reject");
+        fixture
+            .join_dispatch(dispatch, query_id, "plan rejection")
+            .await;
+        fixture.drain_events();
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Normal),
+            "rejecting a plan must return the session to Normal; mode={mode:?}, events={:?}, \
+             results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        let results = fixture.results_for(query_id);
+        assert_eq!(
+            results.len(),
+            1,
+            "a rejected present_plan must terminalize exactly once; mode={mode:?}, events={:?}, \
+             results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        assert!(
+            results[0]
+                .2
+                .as_ref()
+                .is_ok_and(|text| text.contains("Plan rejected by user")),
+            "the provider must be told the plan was rejected; results={:?}, events={:?}",
+            fixture.results,
+            fixture.events
+        );
+    }
+
+    /// Hostile schedule: the user answers the dialog and the turn is cancelled
+    /// before the handler is polled again, so both `select!` branches are ready
+    /// at once.  A cancelled turn must not be followed by an `Executing`
+    /// transition or a visible "Plan approved!" — those are post-terminal
+    /// effects on a session the user already abandoned.
+    #[tokio::test]
+    async fn test_cancelling_an_outstanding_plan_approval_publishes_no_approval_effects() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let call = present_plan_call("present-plan-1", "A plan the user cancels out of.");
+        let (query_id, round_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
+        let cancel = fixture.cancel_token(query_id).await;
+        let dispatch = fixture.spawn_dispatch(vec![call], query_id, round_token);
+
+        let response_tx = fixture.await_plan_dialog("cancelled plan approval").await;
+        // Single-threaded test runtime: the dispatch task cannot be polled while
+        // this block runs, so both branches become ready before it observes
+        // either.  That is precisely the schedule an unbiased select decided by
+        // coin flip.
+        let _ = response_tx.send(crate::cli::tui::DialogResult::Selected(0));
+        cancel.cancel();
+
+        fixture
+            .join_dispatch(dispatch, query_id, "cancelled plan approval")
+            .await;
+        fixture.drain_events();
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Planning { .. }),
+            "a cancelled turn must not leave the session in the approved Executing mode; \
+             mode={mode:?}, events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        let rendered = fixture.rendered_output();
+        assert!(
+            !rendered.contains("Plan approved"),
+            "a cancelled turn must not tell the user its plan was approved; rendered={rendered:?}, \
+             mode={mode:?}, results={:?}",
+            fixture.results
+        );
+        let results = fixture.results_for(query_id);
+        assert_eq!(
+            results.len(),
+            1,
+            "a cancelled present_plan must still terminalize exactly once; mode={mode:?}, \
+             events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        assert!(
+            results[0]
+                .2
+                .as_ref()
+                .is_ok_and(|text| text.contains("cancelled")),
+            "the sole result must report the cancellation, not an approval; results={:?}, \
+             rendered={rendered:?}",
+            fixture.results
+        );
+    }
+
+    /// A second turn submitted while the first is still parked on the approval
+    /// dialog.  Neither turn may be lost: the approval terminalizes its own
+    /// query and the later turn terminalizes its own, exactly once each.
+    #[tokio::test]
+    async fn test_a_second_turn_submitted_during_plan_approval_is_not_stranded() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let call = present_plan_call("present-plan-1", "The plan under review.");
+        let (first_id, first_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
+        let first_dispatch = fixture.spawn_dispatch(vec![call], first_id, first_token);
+        let response_tx = fixture
+            .await_plan_dialog("second turn during plan approval")
+            .await;
+
+        // The user types the next turn while the first dialog is still open.
+        // Waiting for the second turn's own dialog pins the interleaving: both
+        // turns are genuinely in flight and neither has been answered yet.
+        let queued_call = present_plan_call("present-plan-2", "The turn typed while waiting.");
+        let (second_id, second_token) =
+            fixture.begin_turn(std::slice::from_ref(&queued_call)).await;
+        let second_dispatch = fixture.spawn_dispatch(vec![queued_call], second_id, second_token);
+        let second_response_tx = fixture
+            .await_plan_dialog("the turn typed during approval")
+            .await;
+
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("the plan dialog receiver disappeared before the user could approve");
+        second_response_tx
+            .send(crate::cli::tui::DialogResult::Selected(1))
+            .expect("the later turn's dialog receiver disappeared before the user could answer");
+        fixture
+            .join_dispatch(first_dispatch, first_id, "the approved turn")
+            .await;
+        fixture
+            .join_dispatch(second_dispatch, second_id, "the turn typed during approval")
+            .await;
+        fixture.drain_events();
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Executing { .. }),
+            "approval must still take effect when a later turn was submitted first; mode={mode:?}, \
+             events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        assert_eq!(
+            fixture.results_for(first_id).len(),
+            1,
+            "the approved turn must terminalize exactly once; events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        assert_eq!(
+            fixture.results_for(second_id).len(),
+            1,
+            "the turn submitted during approval must not be stranded and must terminalize exactly \
+             once; events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+    }
+
+    /// What the loop observes once the mode changes underneath it, made
+    /// explicit.  Every call in one provider batch was authored while the
+    /// session was still `Planning`, so an approval part-way through the batch
+    /// does not retroactively unblock a sibling the model asked for under the
+    /// old authority.  The *next* batch is authored under `Executing`.
+    #[tokio::test]
+    async fn test_mid_batch_plan_approval_does_not_widen_the_same_batch() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let plan_call = present_plan_call("present-plan-1", "Approve, then write.");
+        let write_call = ToolUse {
+            id: "write-1".into(),
+            name: "write".into(),
+            input: serde_json::json!({ "path": "/workspace/should-not-run", "content": "x" }),
+        };
+        let batch = vec![plan_call, write_call];
+        let (query_id, round_token) = fixture.begin_turn(&batch).await;
+        let dispatch = fixture.spawn_dispatch(batch, query_id, round_token);
+
+        let response_tx = fixture.await_plan_dialog("mid-batch approval").await;
+        response_tx
+            .send(crate::cli::tui::DialogResult::Selected(0))
+            .expect("the plan dialog receiver disappeared before the user could approve");
+        fixture
+            .join_dispatch(dispatch, query_id, "mid-batch approval")
+            .await;
+        fixture.drain_events();
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Executing { .. }),
+            "the approval in this batch must still take effect; mode={mode:?}, events={:?}, \
+             results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        let write_result = fixture
+            .results
+            .iter()
+            .find(|(id, tool_id, _)| *id == query_id && tool_id == "write-1")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the sibling write must terminalize rather than vanish; events={:?}, \
+                     results={:?}",
+                    fixture.events, fixture.results
+                )
+            });
+        assert!(
+            write_result
+                .2
+                .as_ref()
+                .err()
+                .is_some_and(|message| message.contains("not allowed in planning mode")),
+            "a write authored under Planning must keep that batch's authority even after a \
+             mid-batch approval; write_result={write_result:?}, mode={mode:?}, events={:?}",
+            fixture.events
+        );
+    }
 
     #[test]
     fn streaming_requires_both_user_opt_in_and_provider_support() {

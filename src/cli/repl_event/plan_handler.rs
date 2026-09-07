@@ -187,16 +187,33 @@ pub(crate) async fn handle_present_plan(
     }
 
     let dialog_result: crate::cli::tui::DialogResult = tokio::select! {
-        result = dialog_rx => match result {
-            Ok(r) => r,
-            Err(_) => crate::cli::tui::DialogResult::Cancelled,
-        },
+        // Cancellation is polled first on purpose.  An unbiased `select!`
+        // chooses at random when both branches are ready, so a Ctrl-C that had
+        // already terminalized the query could lose a coin flip to an approval
+        // sitting in the channel — and the session would then be left in
+        // `Executing` with a visible "Plan approved!" banner for a turn the
+        // user had cancelled (#363).
+        biased;
         _ = cancel.cancelled() => {
             // Clean up active dialog on cancellation
             let mut tui = tui_renderer.lock().await;
             tui.active_dialog = None;
             crate::cli::tui::DialogResult::Cancelled
         }
+        result = dialog_rx => match result {
+            Ok(r) => r,
+            Err(_) => crate::cli::tui::DialogResult::Cancelled,
+        },
+    };
+
+    // Approving or rejecting a plan publishes session-wide effects: the REPL
+    // mode and a banner the user reads as "this happened".  Neither is
+    // actionable once the turn that asked the question is gone, so a decision
+    // that raced a cancellation is discarded rather than applied.
+    let dialog_result = if cancel.is_cancelled() {
+        crate::cli::tui::DialogResult::Cancelled
+    } else {
+        dialog_result
     };
 
     // Handle dialog result
