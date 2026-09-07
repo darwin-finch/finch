@@ -3259,6 +3259,120 @@ mod tests {
         );
     }
 
+    /// Cancellation at a turn boundary *after* a completed tool turn bills only
+    /// the attempts that started.
+    ///
+    /// This pins the exact program point the loop-top cancellation precheck
+    /// used to occupy. That branch was deleted because the biased select's
+    /// first arm covers the same site with a byte-identical message, but the
+    /// argument was one test short: every other regression here reaches the
+    /// boundary on turn one, before any tool has run, which is not the case
+    /// the deleted branch existed for. Round 2 of the review wrote this and
+    /// confirmed it passes; it is kept so the deletion stays justified rather
+    /// than merely asserted.
+    ///
+    /// The load-bearing assertions are the negative ones: no attempt is billed
+    /// at the cancelled boundary, and no extra tool is dispatched. A select
+    /// that polled the provider arm first would satisfy the status and turn
+    /// count and still fail both.
+    #[tokio::test]
+    async fn typed_agent_await_cancelled_at_a_later_turn_boundary_bills_only_started_attempts() {
+        let provider = AttemptGenerator::new(vec![AttemptAction::ToolTurn]);
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(provider.clone()),
+            Arc::clone(&runtime),
+        );
+        let waiting_one = Arc::new(Notify::new());
+        let resume_one = Arc::new(Notify::new());
+        *scheduler.wait_before_provider_poll.lock().await =
+            Some((Arc::clone(&waiting_one), Arc::clone(&resume_one)));
+        let mut events = scheduler.subscribe();
+        let submission = tokio::spawn(submit_typed_agent_await(Arc::clone(&runtime), 4, 60_000));
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), waiting_one.notified())
+            .await
+            .expect("the child never parked at the turn-one boundary");
+        let task_id = {
+            let tasks = scheduler.tasks.read().await;
+            tasks.values().next().unwrap().snapshot.identity.task_id
+        };
+        let waiting_two = Arc::new(Notify::new());
+        let resume_two = Arc::new(Notify::new());
+        *scheduler.wait_before_provider_poll.lock().await =
+            Some((Arc::clone(&waiting_two), Arc::clone(&resume_two)));
+        resume_one.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), waiting_two.notified())
+            .await
+            .expect("the child never parked at the turn-two boundary after its tool turn");
+        assert_eq!(
+            provider.provider_calls(),
+            1,
+            "exactly one provider attempt precedes the turn-two boundary; provider_calls={}",
+            provider.provider_calls()
+        );
+        scheduler
+            .cancel(task_id)
+            .await
+            .expect("a child parked at the turn-two boundary must accept cancellation");
+        resume_two.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), submission)
+            .await
+            .expect("the child never terminalized after boundary cancellation")
+            .expect("the typed agent-await submission panicked");
+        assert_typed_child_accounting(
+            &outcome,
+            "cancelled",
+            1,
+            &["agent cancelled after consuming 1 provider attempts"],
+        );
+        assert_eq!(
+            provider.provider_calls(),
+            1,
+            "no attempt is billed at the cancelled turn-two boundary; provider_calls={} outcome_diagnostics={:?}",
+            provider.provider_calls(),
+            outcome.diagnostics
+        );
+        let mut observed = Vec::new();
+        drain_events(&mut events, &mut observed);
+        let tool_started = observed
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+            .count();
+        let tool_completed = observed
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCompleted { .. }))
+            .count();
+        assert_eq!(
+            (tool_started, tool_completed),
+            (1, 1),
+            "cancellation at the turn-two boundary dispatches no extra tool; task_id={task_id} events={observed:?}"
+        );
+        let finished = terminal_results(&observed);
+        assert_eq!(
+            finished.len(),
+            1,
+            "exactly one terminal event; task_id={task_id} events={observed:?}"
+        );
+        assert_eq!(
+            (finished[0].status, finished[0].turns),
+            (AgentTaskStatus::Cancelled, 1),
+            "the broadcast terminal agrees with the typed record; terminal={:?}",
+            finished[0]
+        );
+        settle_scheduler().await;
+        let mut late = Vec::new();
+        drain_events(&mut events, &mut late);
+        assert!(
+            late.is_empty() && provider.provider_calls() == 1,
+            "quiescent after the boundary terminal; late_events={late:?} provider_calls={}",
+            provider.provider_calls()
+        );
+    }
+
     #[tokio::test]
     async fn typed_agent_await_reports_zero_attempts_when_cancelled_before_the_provider_poll() {
         for iteration in 0..CANCEL_BEFORE_PROVIDER_POLL_CYCLES {
