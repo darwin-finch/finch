@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,13 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     arguments = parser.parse_args()
     root = arguments.root.resolve()
+    lockfile = root / "Cargo.lock"
+    if not lockfile.is_file():
+        print(
+            f"Cargo audit contract: expected lockfile is missing: {lockfile}",
+            file=sys.stderr,
+        )
+        return 1
     executable = cargo_audit_path()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         print(
@@ -54,14 +62,24 @@ def main() -> int:
         )
         return 1
 
-    command = [str(executable), "audit", "--json"]
-    result = subprocess.run(
-        command,
-        cwd=root,
-        check=False,
-        capture_output=True,
-        text=False,
-    )
+    command = [str(executable), "audit", "--json", "--file", str(lockfile)]
+    with tempfile.TemporaryDirectory(prefix="finch-cargo-audit-") as temporary:
+        sandbox = Path(temporary)
+        clean_home = sandbox / "home"
+        clean_cargo_home = sandbox / "cargo-home"
+        clean_home.mkdir()
+        clean_cargo_home.mkdir()
+        child_environment = os.environ.copy()
+        child_environment["HOME"] = str(clean_home)
+        child_environment["CARGO_HOME"] = str(clean_cargo_home)
+        result = subprocess.run(
+            command,
+            cwd=sandbox,
+            env=child_environment,
+            check=False,
+            capture_output=True,
+            text=False,
+        )
     if result.stderr:
         sys.stderr.buffer.write(result.stderr)
     if result.returncode not in (0, 1):
@@ -88,6 +106,7 @@ def main() -> int:
         print(f"Cargo audit contract: malformed cargo-audit JSON: {error}", file=sys.stderr)
         return 1
 
+    found: list[str] = []
     focused: list[str] = []
     for entry in entries:
         advisory = entry.get("advisory")
@@ -95,14 +114,23 @@ def main() -> int:
         advisory_id = advisory.get("id") if isinstance(advisory, dict) else None
         package_name = package.get("name") if isinstance(package, dict) else None
         package_version = package.get("version") if isinstance(package, dict) else None
+        diagnostic = f"{advisory_id}/{package_name}@{package_version}"
+        found.append(diagnostic)
         print(f"{advisory_id}\t{package_name}\t{package_version}")
         if advisory_id in HISTORICAL_ADVISORIES or package_name in FORBIDDEN_PACKAGES:
-            focused.append(f"{advisory_id}/{package_name}@{package_version}")
+            focused.append(diagnostic)
 
     if focused:
         print(
             "Cargo audit contract: a permanently excluded SSH/RSA/quick-xml advisory "
             f"returned: {', '.join(focused)}",
+            file=sys.stderr,
+        )
+        return 1
+    if found:
+        print(
+            "Cargo audit contract: cargo-audit returned a non-empty vulnerability list: "
+            f"{', '.join(found)}",
             file=sys.stderr,
         )
         return 1

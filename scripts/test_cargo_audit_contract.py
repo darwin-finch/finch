@@ -26,12 +26,23 @@ class AuditFixture:
         self.audit_log = self.root / "cargo-audit-argv.json"
         self.cargo_log = self.root / "cargo-was-invoked"
         self.report = self.root / "report.json"
+        self.lockfile = self.root / "Cargo.lock"
+        self.lockfile.write_text("# deterministic audit fixture\nversion = 3\n", encoding="utf-8")
         self.report.write_text(json.dumps(report), encoding="utf-8")
         self._write_executable(
             self.bin / "cargo-audit",
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
-            "pathlib.Path(os.environ['AUDIT_ARGV_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+            "state = {\n"
+            "  'argv': sys.argv[1:],\n"
+            "  'cwd': str(pathlib.Path.cwd()),\n"
+            "  'cargo_home': os.environ.get('CARGO_HOME'),\n"
+            "  'home': os.environ.get('HOME'),\n"
+            "  'cwd_audit_config': (pathlib.Path.cwd() / '.cargo/audit.toml').exists(),\n"
+            "  'cargo_home_audit_config': (pathlib.Path(os.environ['CARGO_HOME']) / 'audit.toml').exists(),\n"
+            "  'home_audit_config': (pathlib.Path(os.environ['HOME']) / '.cargo/audit.toml').exists(),\n"
+            "}\n"
+            "pathlib.Path(os.environ['AUDIT_ARGV_LOG']).write_text(json.dumps(state))\n"
             "sys.stdout.buffer.write(pathlib.Path(os.environ['AUDIT_REPORT']).read_bytes())\n"
             f"raise SystemExit({status})\n",
         )
@@ -46,10 +57,24 @@ class AuditFixture:
         )
         repository_config = self.root / ".cargo"
         repository_config.mkdir()
-        self.hostile_config = repository_config / "config.toml"
-        self.hostile_config.write_text(
+        self.hostile_alias = repository_config / "config.toml"
+        self.hostile_alias.write_text(
             "[alias]\naudit = ['run', '--bin', 'forged-clean-audit']\n", encoding="utf-8"
         )
+        hostile_audit_config = (
+            "[advisories]\nseverity_threshold = 'critical'\n"
+            "[target]\narch = ['suppressed-arch']\nos = ['suppressed-os']\n"
+            "[database]\npath = '/nonexistent/suppressed-db'\n"
+            "url = 'https://invalid.example/suppressed-db'\nfetch = false\nstale = true\n"
+        )
+        self.hostile_project_audit = repository_config / "audit.toml"
+        self.hostile_project_audit.write_text(hostile_audit_config, encoding="utf-8")
+        self.hostile_user_audit = self.cargo_home / "audit.toml"
+        self.hostile_user_audit.write_text(hostile_audit_config, encoding="utf-8")
+        self.user_home = self.root / "user-home"
+        (self.user_home / ".cargo").mkdir(parents=True)
+        self.hostile_home_audit = self.user_home / ".cargo/audit.toml"
+        self.hostile_home_audit.write_text(hostile_audit_config, encoding="utf-8")
         self.environment = os.environ.copy()
         self.environment.update(
             {
@@ -57,6 +82,7 @@ class AuditFixture:
                 "AUDIT_ARGV_LOG": str(self.audit_log),
                 "AUDIT_REPORT": str(self.report),
                 "CARGO_INVOKED_LOG": str(self.cargo_log),
+                "HOME": str(self.user_home),
                 "PATH": f"{hostile_bin}{os.pathsep}{self.environment.get('PATH', '')}",
             }
         )
@@ -95,14 +121,68 @@ class CargoAuditContractTests(unittest.TestCase):
                 f"direct cargo-audit boundary rejected a clean report: stdout={result.stdout!r} stderr={result.stderr!r}",
             )
             self.assertEqual(
-                json.loads(fixture.audit_log.read_text(encoding="utf-8")),
-                ["audit", "--json"],
+                json.loads(fixture.audit_log.read_text(encoding="utf-8"))["argv"],
+                ["audit", "--json", "--file", str(fixture.lockfile.resolve())],
                 f"cargo-audit received incorrect argv; stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            state = json.loads(fixture.audit_log.read_text(encoding="utf-8"))
+            self.assertNotEqual(
+                Path(state["cwd"]),
+                fixture.root,
+                f"cargo-audit ran in the hostile repository config scope: state={state!r}",
+            )
+            self.assertFalse(
+                state["cwd_audit_config"],
+                f"cargo-audit clean cwd unexpectedly contained project audit config: state={state!r}",
+            )
+            self.assertNotEqual(
+                Path(state["cargo_home"]),
+                fixture.cargo_home,
+                f"cargo-audit inherited the hostile user Cargo home: state={state!r}",
+            )
+            self.assertFalse(
+                state["cargo_home_audit_config"],
+                f"cargo-audit clean Cargo home unexpectedly contained user audit config: state={state!r}",
+            )
+            self.assertNotEqual(
+                Path(state["home"]),
+                Path(fixture.environment["HOME"]),
+                f"cargo-audit inherited the hostile user home: state={state!r}",
+            )
+            self.assertFalse(
+                state["home_audit_config"],
+                f"cargo-audit clean home unexpectedly contained user audit config: state={state!r}",
             )
             self.assertFalse(
                 fixture.cargo_log.exists(),
                 f"repository Cargo alias or PATH cargo intercepted the audit; stdout={result.stdout!r} stderr={result.stderr!r}",
             )
+        finally:
+            fixture.close()
+
+    def test_nonempty_vulnerability_list_fails_even_when_child_reports_success(self) -> None:
+        fixture = AuditFixture(
+            {
+                "vulnerabilities": {
+                    "list": [
+                        {
+                            "advisory": {"id": "RUSTSEC-2099-0001"},
+                            "package": {"name": "unexpected-crate", "version": "2.3.4"},
+                        }
+                    ]
+                }
+            },
+            status=0,
+        )
+        try:
+            result = fixture.run()
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"non-empty vulnerability report passed on child status zero: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn("RUSTSEC-2099-0001/unexpected-crate@2.3.4", result.stderr)
+            self.assertIn("non-empty vulnerability list", result.stderr)
         finally:
             fixture.close()
 
@@ -144,7 +224,8 @@ class CargoAuditContractTests(unittest.TestCase):
         try:
             result = fixture.run()
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("outside the five permanent focused guards", result.stderr)
+            self.assertIn("non-empty vulnerability list", result.stderr)
+            self.assertIn("RUSTSEC-2099-9999/future-crate@1.0.0", result.stderr)
         finally:
             fixture.close()
 
