@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`FINCH_STARTUP_TIMINGS` publishes a per-phase interactive-startup report.**
+  Nothing in the binary measured its own startup, so every latency claim about
+  it was unfalsifiable. Set the variable to a path to write the report there,
+  or to `1`/`stderr` to write it to standard error; unset, nothing is rendered
+  and nothing is written. The report names each phase and instant mark in start
+  order with its offset from t0, its duration, its nesting depth, and content-free
+  counts and categories — never a Brain name, path, prompt or credential — and
+  ends with `accounted_ms`, `unaccounted_ms` and `time_to_ready_ms`.
+  `time_to_ready_ms` is t0 (the first statement of `main`'s async body) through
+  the first instant a typed key is acted upon; the first painted frame is later,
+  and process spawn and dynamic loading are earlier. A phase over its budget is
+  reported as `SLOW` and warned by name. `scripts/bench_startup_time_to_ready.sh`
+  runs the measurement repeatedly and reports median, p90, min and max with the
+  machine and commit attached. (#364, "Instrument and reduce Finch interactive
+  TUI time-to-ready")
+
 ### Security
 
 - Upgraded Calamine to 0.36.1, moving quick-xml to the fixed 0.41 line and

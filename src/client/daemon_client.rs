@@ -87,6 +87,12 @@ impl DaemonClient {
         // Clients created from the legacy ClientConfig do not carry the global
         // Finch API key. Fill it from the same local config used by the daemon.
         if config.api_key.is_none() {
+            // The fourth full read and TOML parse of `config.toml` on an
+            // interactive start. Timed under the same `config_load` name as
+            // the other three so the report shows all four rather than
+            // absorbing this one into `daemon_http_connect` (#364).
+            let mut phase = crate::startup::phase(crate::startup::PHASE_CONFIG);
+            phase.detail(crate::startup::PhaseDetail::category("daemon_api_key"));
             config.api_key = crate::config::load_config()
                 .ok()
                 .and_then(|config| config.server.api_keys.first().cloned());

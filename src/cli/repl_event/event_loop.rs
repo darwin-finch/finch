@@ -1957,7 +1957,14 @@ impl EventLoop {
         // Unit-level production-boundary fixtures drive the event channel
         // directly and must not install a competing terminal reader.
         #[cfg(not(test))]
-        let input_rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+        let input_rx = {
+            let rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+            // Keys are buffered from here, but nothing acts on them until the
+            // select loop below. The two instants are recorded separately
+            // because they are routinely confused (#364).
+            crate::startup::mark(crate::startup::MARK_INPUT_CAPTURED);
+            rx
+        };
         #[cfg(test)]
         let input_rx = {
             drop(quit_tx);
@@ -2202,14 +2209,23 @@ impl EventLoop {
         tracing::debug!("Event loop starting");
         // Signal that the TUI owns the terminal so proposal editors perform a
         // complete terminal-protocol handoff before launching $VISUAL/$EDITOR.
-        crate::set_tui_active(true);
+        //
+        // This and the generator resolve below were the rest of the 6.4 ms the
+        // first report could not attribute (#364).
+        {
+            let _phase = crate::startup::phase(crate::startup::PHASE_TUI_HANDOFF);
+            crate::set_tui_active(true);
 
-        // ── Startup header (Claude Code style) ───────────────────────────────
-        // Clear accumulated startup noise from the output manager, then print a
-        // clean header: finch version · primary model · working directory.
-        self.output_manager.clear();
+            // ── Startup header (Claude Code style) ───────────────────────────
+            // Clear accumulated startup noise from the output manager, then
+            // print a clean header: finch version · primary model · cwd.
+            self.output_manager.clear();
+        }
 
-        let model_name = self.model_selection.generator().await.name().to_string();
+        let model_name = {
+            let _phase = crate::startup::phase(crate::startup::PHASE_GENERATOR_RESOLVE);
+            self.model_selection.generator().await.name().to_string()
+        };
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| {
@@ -2223,13 +2239,32 @@ impl EventLoop {
             })
             .unwrap_or_else(|| "~".to_string());
         self.cwd = cwd.clone();
-        let home_runner_state = match self.register_home_brain().await {
-            Ok(state) => state,
-            Err(error) => {
-                tracing::warn!("could not register home Brain: {error}");
-                None
+        let home_runner_state = {
+            // Four serial IPC round-trips, before the first frame (#364).
+            let mut phase = crate::startup::phase(crate::startup::PHASE_BRAIN_REGISTER);
+            match self.register_home_brain().await {
+                Ok(state) => {
+                    // Brains actually registered, so the offline path reports
+                    // zero rather than claiming one (#364).
+                    phase.detail(if state.is_some() {
+                        crate::startup::PhaseDetail::count(1).with_category("registered")
+                    } else {
+                        crate::startup::PhaseDetail::count(0).with_category("offline")
+                    });
+                    state
+                }
+                Err(error) => {
+                    phase.detail(crate::startup::PhaseDetail::count(0).with_category("failed"));
+                    tracing::warn!("could not register home Brain: {error}");
+                    None
+                }
             }
         };
+        // Runner-state projection and the header itself. Small individually
+        // and 1.1 ms together on the reference machine -- which is what the
+        // report's `unaccounted_ms` was for, and why this now has a name
+        // (#364).
+        let header_phase = crate::startup::phase(crate::startup::PHASE_STARTUP_HEADER);
         self.home_runner_lease_id = home_runner_state
             .as_ref()
             .and_then(|state| state.target.lease_id);
@@ -2270,6 +2305,11 @@ impl EventLoop {
             &cwd,
             &self.session_label,
         ));
+        drop(header_phase);
+        // Queued, not painted: in TUI mode stdout is disabled and `write_info`
+        // appends to an in-memory buffer, so the first real paint happens on a
+        // render tick after the loop below starts (#364).
+        crate::startup::mark(crate::startup::MARK_HEADER_QUEUED);
         if let Some(error) = self.daemon_ipc_error.take() {
             self.output_manager
                 .write_info(format!("Brain daemon unavailable: {error}"));
@@ -2287,7 +2327,13 @@ impl EventLoop {
             }
         }
         if self.daemon_base_url.is_some() {
+            // One Brain, whatever the size of the on-disk inventory: the
+            // frontend attaches its own home Brain and never enumerates the
+            // Brain root (#364).
+            let mut phase = crate::startup::phase(crate::startup::PHASE_BRAIN_ATTACH);
+            phase.detail(crate::startup::PhaseDetail::count(1).with_category("attached"));
             if let Err(error) = self.attach_home_brain().await {
+                phase.detail(crate::startup::PhaseDetail::count(0).with_category("failed"));
                 let detail = error.to_string();
                 self.last_home_watch_error = Some(detail.clone());
                 self.output_manager.write_info(format!(
@@ -2301,8 +2347,17 @@ impl EventLoop {
 
         // Show weekly license notice for non-commercial users (honor system)
         {
+            let _phase = crate::startup::phase(crate::startup::PHASE_LICENSE_NOTICE);
             use crate::config::{load_config, LicenseType};
-            if let Ok(cfg) = load_config() {
+            // The third of four full reads and TOML parses of `config.toml` on
+            // an interactive start. It was inside the unattributed gap, so the
+            // report showed a reader half the config cost (#364).
+            let loaded = {
+                let mut phase = crate::startup::phase(crate::startup::PHASE_CONFIG);
+                phase.detail(crate::startup::PhaseDetail::category("license_notice"));
+                load_config()
+            };
+            if let Ok(cfg) = loaded {
                 if cfg.license.license_type == LicenseType::Noncommercial {
                     let today = chrono::Local::now().date_naive();
                     // Recorded in a runtime-state file, not in `config.toml`.
@@ -2340,6 +2395,11 @@ impl EventLoop {
                 }
             }
         }
+
+        // Priming the status bar: compaction state, plan mode, the memory
+        // engine badge and the context strip. All before the first frame, and
+        // all previously unattributed (#364).
+        let status_prime_phase = crate::startup::phase(crate::startup::PHASE_STATUS_PRIME);
 
         // Apply auto-compact setting to the conversation history
         if !self.auto_compact_enabled {
@@ -2388,10 +2448,12 @@ impl EventLoop {
             )
             .await;
         }
+        drop(status_prime_phase);
 
         // ── Spawn LLM worker loop ─────────────────────────────────────────────
         // Hand the receiver half of the channel to LlmLoop so it runs as its own
         // Tokio task, decoupled from TUI select! timing.
+        let llm_worker_phase = crate::startup::phase(crate::startup::PHASE_LLM_WORKER);
         self.start_llm_worker();
 
         // Render interval (33ms ≈ 30fps) — smooth streaming without terminal flicker.
@@ -2404,6 +2466,13 @@ impl EventLoop {
 
         // Flag to control the loop
         let mut should_exit = false;
+        drop(llm_worker_phase);
+
+        // Time-to-ready ends here: the first instant at which a typed key is
+        // acted upon rather than merely buffered. Not the first painted frame
+        // -- that happens on a render tick after this loop starts, which is
+        // why the mark above it is called `header_queued` (#364).
+        crate::startup::ready();
 
         while !should_exit {
             tokio::select! {

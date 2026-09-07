@@ -131,14 +131,25 @@ where
     }
 }
 
-/// Visitor to extract the log message from tracing events
-struct MessageVisitor {
+/// Visitor to extract the log message from tracing events.
+///
+/// This keeps the `message` field and **discards every other field**. That is
+/// the whole reason it is `pub(crate)`: any warning whose actionable content
+/// lives in a structured field reaches the user's terminal with that content
+/// gone, so code that emits one has to be able to assert on what survives
+/// this visitor rather than on what it passed to `tracing` (#364).
+pub(crate) struct MessageVisitor {
     message: Option<String>,
 }
 
 impl MessageVisitor {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { message: None }
+    }
+
+    /// The formatted `message` field, which is all the TUI ever shows.
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.message.as_deref()
     }
 }
 

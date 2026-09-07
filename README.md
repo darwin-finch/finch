@@ -253,6 +253,34 @@ Some full builds and tests are memory-intensive. Narrow commands to the module u
 appropriate, then rely on CI for the supported platform matrix. See [CONTRIBUTING.md](CONTRIBUTING.md)
 before submitting work and [docs/README.md](docs/README.md) for the documentation map.
 
+### Measuring interactive startup
+
+`FINCH_STARTUP_TIMINGS` publishes a per-phase startup report. It is off by
+default and costs nothing when unset.
+
+```bash
+FINCH_STARTUP_TIMINGS=~/startup.txt finch     # write the report to a file
+FINCH_STARTUP_TIMINGS=1 finch                 # write it to stderr (also: stderr)
+RUST_LOG=finch::startup=debug finch           # per-phase tracing events instead
+```
+
+The report lists each phase and instant mark in start order with its offset
+from t0, its duration, and how many phases enclose it (`depth` — phases nest,
+so the `ms` column does not sum). It ends with `accounted_ms`,
+`unaccounted_ms`, and `time_to_ready_ms`.
+
+Two things it is careful about. `time_to_ready_ms` runs from the first
+statement of `main`'s async body to the first instant a typed key is *acted
+upon* — not to the first painted frame, which happens on a render tick after
+it; process spawn and dynamic loading are before t0. And the report carries
+phase names, durations, counts and fixed categories only: no Brain name, path,
+prompt or credential can appear in it, which is what makes it safe to paste
+into a bug report.
+
+`scripts/bench_startup_time_to_ready.sh [runs] [brains]` runs the same
+measurement repeatedly under disposable HOMEs and reports median, p90, min and
+max with the machine and commit attached. It is a benchmark, not a gate.
+
 ## Maintainer and development assistance
 
 Finch was created and is maintained by **Shammah Chancellor**. Substantial portions of the project
