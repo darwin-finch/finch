@@ -8236,6 +8236,150 @@ mod handler_tests {
         }));
     }
 
+    // Both fixtures are the store's own, shared rather than copied: verbatim
+    // duplicates of them drifted apart once already, and a boundary test that
+    // seeds a Brain differently from the store tests is not testing the same
+    // Brain.
+    use crate::brain::store::directory_listing_for_tests as directory_listing;
+    use crate::brain::store::seed_scheduled_brain_for_tests as seed_scheduled_brain;
+
+    #[tokio::test]
+    async fn deleted_brain_is_pruned_at_the_delivery_boundary_and_not_resurrected() {
+        // The store-level regressions for #383 (schedules for a deleted Brain
+        // are delivered, and delivery recreates the Brain) all stop at
+        // `queue_due_schedules`. The resurrection has a *second* route through
+        // this boundary: `deliver_due_named_brain_schedules` reads
+        //
+        //     let queued = store.queue_due_schedules(&name, now_ms)?;
+        //     if queued.is_empty() || !named_brain_runner_is_ready(..)? {
+        //
+        // and `named_brain_runner_is_ready` calls `store.snapshot(name)` ->
+        // `ensure_loaded` -> `load_or_create_metadata`, which mints and fsyncs a
+        // fresh `BrainId` for a Brain whose `metadata.json` is gone. The fix is
+        // correct today only because `||` short-circuits on the empty queue: if
+        // that condition is ever reordered, or the short-circuit lost, the
+        // Brain comes back through `snapshot` and every store test stays green.
+        // So the property is asserted here, at the boundary the daemon actually
+        // calls, over one pass in the delivery loop's own shape.
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        seed_scheduled_brain(&store, "vanished", 1_000);
+        seed_scheduled_brain(&store, "survivor", 1_200);
+        let survivor_id = store.snapshot("survivor").unwrap().brain_id;
+        let vanished_id = store.snapshot("vanished").unwrap().brain_id;
+        let vanished_dir = temp.path().join("vanished");
+
+        std::fs::remove_dir_all(&vanished_dir).unwrap();
+        // Indexed but not resident: the state in which `snapshot` reaches the
+        // filesystem, and therefore the state in which the boundary can mint a
+        // new identity. A resident Brain would answer from memory and the
+        // reordering above would be invisible.
+        assert!(
+            store.evict_resident_brain_for_tests("vanished"),
+            "test setup: 'vanished' must be resident before eviction, so what \
+             follows exercises the unhydrated delivery path"
+        );
+
+        // One pass, exactly as `schedule_delivery` runs it: read the head,
+        // select by due time, deliver each selected Brain, then decide whether
+        // to back off. Every instant here is synthetic -- no wall-clock
+        // threshold assertions (#242, assert hydration state rather than a
+        // wall-clock ratio).
+        const NOW_MS: u64 = 1_500;
+        let head_before = store.next_schedule_due_ms();
+        let selected = store.due_schedule_brains(NOW_MS);
+        assert_eq!(
+            selected,
+            vec!["vanished".to_string(), "survivor".to_string()],
+            "precondition: the deleted Brain is the head this pass starts from, \
+             and the healthy one is behind it"
+        );
+        let mut delivered = Vec::new();
+        for name in &selected {
+            let dispatched = deliver_due_named_brain_schedules(
+                store.clone(),
+                crate::server::BrainRunnerBroker::default(),
+                name.clone(),
+                NOW_MS,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a delivery pass must survive a Brain that is gone: '{name}' \
+                     failed with {error:#}; the Brain root holds [{}]",
+                    directory_listing(temp.path())
+                )
+            });
+            delivered.push((name.clone(), dispatched));
+        }
+        let head_after = store.next_schedule_due_ms();
+
+        assert!(
+            !vanished_dir.exists(),
+            "the delivery boundary must not write the Brain back: {} holds [{}]. \
+             Before deletion its identity was {vanished_id:?}; anything under \
+             this path now is a second, empty Brain minted by the pass -- and \
+             reaching it through `named_brain_runner_is_ready` rather than \
+             through `queue_due_schedules` makes it invisible to every store \
+             test. Brain root holds [{}]",
+            vanished_dir.display(),
+            directory_listing(&vanished_dir),
+            directory_listing(temp.path())
+        );
+        assert!(
+            !vanished_dir.join("metadata.json").exists(),
+            "and specifically no identity may be fsynced into place for it: {} \
+             exists, so the Brain that was {vanished_id:?} now has a different \
+             identity on disk",
+            vanished_dir.join("metadata.json").display()
+        );
+        assert_eq!(
+            delivered,
+            vec![("vanished".to_string(), 0), ("survivor".to_string(), 1)],
+            "the deleted Brain must report nothing queued and must not abort \
+             the pass, while the healthy Brain's due occurrence must still be \
+             queued on that same pass -- with no runner registered the boundary \
+             returns the queued count, so 0 and 1 are exactly 'pruned' and \
+             'delivered'"
+        );
+        assert_eq!(
+            store.snapshot("survivor").unwrap().runs.len(),
+            1,
+            "the healthy Brain's due occurrence must still have been queued on \
+             the same pass -- pruning one Brain must not cost another its \
+             delivery"
+        );
+        assert_eq!(
+            store.snapshot("survivor").unwrap().brain_id,
+            survivor_id,
+            "and the surviving Brain must keep its identity across the pass; a \
+             changed BrainId here means delivery rebuilt it too"
+        );
+        assert_eq!(
+            store.indexed_schedule_count(),
+            1,
+            "exactly the survivor's schedule may remain indexed after the pass"
+        );
+
+        // The loop's own arithmetic over a pruning pass, executed rather than
+        // reasoned about: pruning the head moves it, so the pass is not a
+        // no-op and the loop must neither back off nor spin.
+        assert!(
+            !crate::server::schedule_delivery::should_back_off(head_before, head_after, NOW_MS),
+            "a pass that pruned the head and advanced the survivor is not a pass \
+             that changed nothing: head moved {head_before:?} -> {head_after:?}, \
+             and backing off here would delay every other Brain by the \
+             undelivered-retry interval"
+        );
+        assert!(
+            !crate::server::schedule_delivery::sleep_for(head_after, NOW_MS).is_zero(),
+            "and the next sleep must not be zero, or the loop spins on an entry \
+             it can never deliver: head_after is {head_after:?} against \
+             {NOW_MS} ms"
+        );
+    }
+
     #[tokio::test]
     async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
         let store = crate::brain::store::BrainStore::with_root("box.local", None);
