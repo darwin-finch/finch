@@ -125,12 +125,17 @@ pub(crate) struct EffectAuditReplayArchive {
 /// removed only after their terminal replay fence is durable.
 pub(crate) struct EffectAuditActiveJournal {
     path: PathBuf,
+    max_bytes: u64,
     #[cfg(test)]
     fail_next_batch_before_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EffectAuditActiveJournal {
     pub(crate) fn open(brain_directory: &Path) -> Result<Self> {
+        Self::open_with_bound(brain_directory, MAX_ACTIVE_JOURNAL_BYTES)
+    }
+
+    fn open_with_bound(brain_directory: &Path, max_bytes: u64) -> Result<Self> {
         let directory = brain_directory.join("effect-audit-replay");
         reject_symlink(&directory)?;
         super::store::create_dir_all_durable(&directory)?;
@@ -155,15 +160,21 @@ impl EffectAuditActiveJournal {
         }
         let journal = Self {
             path,
+            max_bytes,
             #[cfg(test)]
             fail_next_batch_before_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
         };
-        anyhow::ensure!(
-            journal.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
-            "effect-audit active journal exceeds its durable byte bound"
-        );
+        // Physical SQLite growth is checked before admitting a new Reserve.
+        // An already-committed journal may nevertheless exceed the estimate
+        // because SQLite allocates by page. Reopen it so terminal transitions
+        // can drain accepted intents; rejecting here would make the entire
+        // Brain permanently unloadable because of a successful commit.
+        if journal.file_bytes()? > journal.max_bytes {
+            tracing::error!(path = %journal.path.display(),
+                "effect-audit active journal reopened above its admission bound; new reserves remain blocked while terminal drain is allowed");
+        }
         Ok(journal)
     }
 
@@ -233,7 +244,7 @@ impl EffectAuditActiveJournal {
             active
                 .saturating_add(encoded_reserve_bytes as u64)
                 .saturating_add(reserved_terminal_bytes)
-                <= MAX_ACTIVE_JOURNAL_BYTES,
+                <= self.max_bytes,
             "effect-audit active journal quota exceeded before durable host permit"
         );
         archive.ensure_total_storage_bound(
@@ -268,10 +279,10 @@ impl EffectAuditActiveJournal {
                 params![seq as i64, identity, encoded, encoded_len as i64],
             )
             .with_context(|| format!("append active effect-audit transition #{seq}"))?;
-        anyhow::ensure!(
-            self.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
-            "effect-audit active journal exceeded its durable byte bound"
-        );
+        if self.file_bytes()? > self.max_bytes {
+            tracing::error!(path = %self.path.display(),
+                "effect-audit active journal exceeded its preflight durable byte bound after commit");
+        }
         Ok(())
     }
 
@@ -314,10 +325,15 @@ impl EffectAuditActiveJournal {
             anyhow::bail!("injected active effect-audit transaction failure before commit");
         }
         transaction.commit()?;
-        anyhow::ensure!(
-            self.file_bytes()? <= MAX_ACTIVE_JOURNAL_BYTES,
-            "effect-audit active journal exceeded its durable byte bound"
-        );
+        // The transaction is already durable. Reporting an error here would
+        // tell the caller not to advance its projection, allowing the next
+        // canonical writer to reuse these committed sequence numbers. Quota
+        // admission is checked before Reserve; a filesystem-size overshoot is
+        // therefore diagnostic after commit, never an ambiguous outcome.
+        if self.file_bytes()? > self.max_bytes {
+            tracing::error!(path = %self.path.display(),
+                "effect-audit active journal exceeded its preflight durable byte bound after batch commit");
+        }
         Ok(())
     }
 
@@ -963,6 +979,36 @@ mod tests {
             outcome_kind: "abandoned_not_applied".into(),
             outcome_sha256: "b".repeat(64),
         }
+    }
+
+    #[test]
+    fn test_active_journal_reopens_overshoot_but_blocks_new_reserve_capacity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let brain_id = uuid::Uuid::new_v4();
+        EffectAuditActiveJournal::open(temporary.path()).unwrap();
+        let reopened = EffectAuditActiveJournal::open_with_bound(temporary.path(), 1)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "already-committed SQLite overshoot must reopen for terminal drain: {error:#}"
+                )
+            });
+        reopened
+            .append(1, &fence(brain_id, 0))
+            .expect("a terminal transition must commit even after physical SQLite overshoot");
+        drop(reopened);
+        let reopened = EffectAuditActiveJournal::open_with_bound(temporary.path(), 1)
+            .expect("post-commit physical overshoot must remain reopenable after restart");
+        assert_eq!(
+            reopened.max_seq().unwrap(),
+            1,
+            "post-commit overshoot must retain its canonical sequence across restart"
+        );
+        let archive = EffectAuditReplayArchive::open(temporary.path(), brain_id).unwrap();
+        let error = reopened.ensure_reserve_capacity(&archive, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "new Reserve admission must remain fail-closed above the bound: {error:#}"
+        );
     }
 
     #[test]

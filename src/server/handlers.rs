@@ -253,6 +253,33 @@ fn authorize_named_brain(
     Ok(claims)
 }
 
+fn authorize_named_brain_archive(
+    server: &AgentServer,
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<crate::brain::credential::BrainCredentialClaims, Response> {
+    let token = bearer_token(headers).ok_or_else(|| {
+        brain_auth_error(StatusCode::UNAUTHORIZED, "scoped Brain credential required")
+    })?;
+    let claims = server
+        .brain_credentials()
+        .verify(token, unix_epoch_millis())
+        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let brain_id = server
+        .brain_store()
+        .identity_without_replay(name)
+        .map_err(|error| AppError(error).into_response())?;
+    claims
+        .require_audience(
+            brain_id,
+            name,
+            server.brain_store().environment().generation,
+            crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
+        )
+        .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+    Ok(claims)
+}
+
 pub(crate) fn authorize_pending_remote_attachment(
     lifecycle: &crate::server::BrainLifecycleService,
     credentials: &crate::brain::credential::BrainCredentialAuthority,
@@ -836,12 +863,7 @@ async fn archive_named_brain(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<ArchiveNamedBrainResponse>, Response> {
-    let claims = authorize_named_brain(
-        &server,
-        &headers,
-        &name,
-        crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
-    )?;
+    let claims = authorize_named_brain_archive(&server, &headers, &name)?;
     require_unbound_administrative_credential(&claims)?;
     let execution_lock = server
         .brain_store()
@@ -850,7 +872,7 @@ async fn archive_named_brain(
     let _turn = execution_lock.lock_owned().await;
     let archived_to = server
         .brain_store()
-        .archive(&name)
+        .archive_authorized(&name, claims.brain_id)
         .map_err(|error| AppError(error).into_response())?;
     Ok(Json(ArchiveNamedBrainResponse {
         name,
@@ -9421,6 +9443,32 @@ mod handler_tests {
         (status, parsed)
     }
 
+    async fn delete_named_brain(
+        server: Arc<crate::server::AgentServer>,
+        name: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let mut request = axum::http::Request::builder()
+            .method(axum::http::Method::DELETE)
+            .uri(format!("/v1/brains/named/{name}"));
+        if let Some(token) = token {
+            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = create_router(server)
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     /// The regression for the fix, at the boundary the defect crossed.
     ///
     /// Reverting `health_check` to `list()?.len()` and leaving
@@ -9551,6 +9599,159 @@ mod handler_tests {
             (0, 0),
             "and neither probe may hydrate, so its cost is bounded by the \
              number of directories rather than by accumulated event history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_brain_can_be_archived_without_successful_replay() {
+        use crate::brain::credential::{BrainCredentialRequest, BrainCredentialScope};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let seeding = BrainStore::with_root("box.local", Some(root.clone()));
+        let first = seeding
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt { text: "one".into() },
+            )
+            .unwrap();
+        let second = seeding
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt { text: "two".into() },
+            )
+            .unwrap();
+        let snapshot = seeding.snapshot("shared").unwrap();
+        let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral([77; 32]);
+        let token = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "test".into(),
+                    subject: "admin".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: [BrainCredentialScope::EnvironmentAdmin]
+                        .into_iter()
+                        .collect(),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        let non_admin = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "test".into(),
+                    subject: "reader".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Observer,
+                    scopes: [BrainCredentialScope::BrainRead].into_iter().collect(),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        let wrong_audience = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "test".into(),
+                    subject: "admin".into(),
+                    brain_id: BrainId(uuid::Uuid::new_v4()),
+                    brain: "other".into(),
+                    environment_generation: snapshot.environment.generation + 1,
+                    role: AttachmentRole::Driver,
+                    scopes: [BrainCredentialScope::EnvironmentAdmin]
+                        .into_iter()
+                        .collect(),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        drop(seeding);
+
+        let path = root.join("shared/events.jsonl");
+        let duplicate = serde_json::to_vec(&BrainEvent {
+            seq: second.seq,
+            created_ms: second.created_ms + 1,
+            kind: BrainEventKind::Prompt {
+                text: "conflicting duplicate".into(),
+            },
+            ..second.clone()
+        })
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        file.write_all(&duplicate).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+        let forensic_bytes = std::fs::read(&path).unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(root));
+        assert!(
+            store.snapshot("shared").is_err(),
+            "fixture must be unloadable before recovery; first_seq={}, duplicate_seq={}",
+            first.seq,
+            second.seq
+        );
+        let server = Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store,
+                authority,
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap(),
+        );
+        for (label, supplied, expected) in [
+            ("missing", None, StatusCode::UNAUTHORIZED),
+            ("non-admin", Some(non_admin.as_str()), StatusCode::FORBIDDEN),
+            (
+                "wrong audience",
+                Some(wrong_audience.as_str()),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let (status, body) = delete_named_brain(Arc::clone(&server), "shared", supplied).await;
+            assert_eq!(
+                status, expected,
+                "{label} credential must not authorize corrupt recovery; body={body}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                forensic_bytes,
+                "{label} recovery rejection must not rename or change forensic bytes"
+            );
+        }
+        let (status, body) = delete_named_brain(Arc::clone(&server), "shared", Some(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "authorized archive must bypass replay only for identity lookup; body={body}"
+        );
+        let archived_to = body["archived_to"]
+            .as_str()
+            .unwrap_or_else(|| panic!("recovery output must name the archive destination: {body}"));
+        assert_eq!(
+            std::fs::read(std::path::Path::new(archived_to).join("events.jsonl")).unwrap(),
+            forensic_bytes,
+            "archive recovery must preserve the corrupt journal byte-for-byte"
+        );
+        assert!(
+            server.brain_store().list().unwrap().is_empty(),
+            "archiving one corrupt Brain must restore listing usability"
         );
     }
 }
