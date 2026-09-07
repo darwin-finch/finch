@@ -11,6 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 1
+  CARGO_INCREMENTAL: 0
   # Speed up CI builds (override Cargo.toml's lto=true / codegen-units=1)
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
@@ -39,16 +40,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
+      # Cargo.lock is intentionally untracked in this repository. Materialize
+      # it before hashFiles evaluates the exact dependency fingerprint below.
+      - name: Resolve Cargo dependency graph
+        run: cargo generate-lockfile
+
+      - name: Cache Cargo dependency sources
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-deps-v1-${{ runner.os }}-rust-1.98.0-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-cargo-
+            cargo-deps-v1-${{ runner.os }}-rust-1.98.0-
+
+      - name: Cache compatible Cargo target artifacts
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            target/**/.fingerprint
+            target/**/build
+            target/**/deps
+          key: cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-release-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/release.yml') }}-deps-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-target-v1-${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-profile-release-features-default-cfg-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'Cargo.toml', '.github/workflows/release.yml') }}-deps-
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
