@@ -207,8 +207,39 @@ class WorkflowManifestTests(unittest.TestCase):
                     "name: surprise\n", encoding="utf-8"
                 )
 
-            with self.assertRaisesRegex(ContractError, "entry set changed"):
+            with self.assertRaisesRegex(
+                ContractError, "directory identity changed|entry set changed"
+            ):
                 workflow_records(repository.root, phase_hook=add_workflow)
+        finally:
+            repository.close()
+
+    def test_leaf_replaced_after_enumeration_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            workflow = repository.workflow("ci.yml")
+            reviewed_bytes = workflow.read_bytes()
+
+            def replace_leaf() -> None:
+                workflow.unlink()
+                workflow.write_bytes(reviewed_bytes)
+
+            with self.assertRaisesRegex(ContractError, "identity changed after enumeration"):
+                workflow_records(repository.root, phase_hook=replace_leaf)
+        finally:
+            repository.close()
+
+    def test_leaf_replaced_after_hashing_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            workflow = repository.workflow("ci.yml")
+            reviewed_bytes = workflow.read_bytes()
+
+            def replace_leaf() -> None:
+                workflow.write_bytes(b"#" + reviewed_bytes[1:])
+
+            with self.assertRaisesRegex(ContractError, "identity changed after hashing"):
+                workflow_records(repository.root, after_hash_hook=replace_leaf)
         finally:
             repository.close()
 
@@ -230,9 +261,18 @@ class WorkflowManifestTests(unittest.TestCase):
     def test_authoritative_opened_sizes_enforce_aggregate_bound(self) -> None:
         repository = WorkflowRepository()
         try:
+            paths = sorted((repository.root / ".github/workflows").glob("*.y*ml"))
+            initial_size = 65_500
+            self.assertEqual(
+                len(paths),
+                16,
+                f"aggregate-race fixture assumes 16 reviewed workflows: paths={paths!r}",
+            )
+            for path in paths:
+                path.write_bytes(b"x" * initial_size)
+
             def grow_workflows() -> None:
-                for path in (repository.root / ".github/workflows").glob("*.y*ml"):
-                    path.write_bytes(b"x" * 70_000)
+                paths[-1].write_bytes(b"x" * (initial_size + 1_000))
 
             with self.assertRaisesRegex(ContractError, "aggregate opened bytes exceeds"):
                 workflow_records(repository.root, phase_hook=grow_workflows)

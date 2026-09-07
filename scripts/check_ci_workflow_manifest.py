@@ -29,6 +29,9 @@ class ContractError(Exception):
     """Actionable failure in the reviewed workflow contract."""
 
 
+FileIdentity = tuple[int, int, int, int, int]
+
+
 CANONICAL_CHECKS = (
     "Build Release (aarch64-apple-darwin)",
     "Build Release (x86_64-unknown-linux-gnu)",
@@ -204,6 +207,16 @@ def regular_file_metadata(path: Path, display: str, maximum: int) -> os.stat_res
     return metadata
 
 
+def file_identity(metadata: os.stat_result) -> FileIdentity:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def open_regular_file(
     path: Path, root: Path, maximum: int
 ) -> tuple[BinaryIO, os.stat_result, str]:
@@ -220,11 +233,7 @@ def open_regular_file(
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise ContractError(f"{display}: opened path is not a regular file")
-        if (opened.st_dev, opened.st_ino, opened.st_size) != (
-            metadata.st_dev,
-            metadata.st_ino,
-            metadata.st_size,
-        ):
+        if file_identity(opened) != file_identity(metadata):
             raise ContractError(f"{display}: file identity changed before reading")
         return os.fdopen(descriptor, "rb"), opened, display
     except Exception:
@@ -258,14 +267,14 @@ def hash_stream(stream: BinaryIO, expected_size: int, display: str) -> str:
     return digest.hexdigest()
 
 
-def exact_digest(path: Path, root: Path, maximum: int) -> tuple[str, int]:
+def exact_digest(path: Path, root: Path, maximum: int) -> tuple[str, int, FileIdentity]:
     stream, opened, display = open_regular_file(path, root, maximum)
     with stream:
         digest = hash_stream(stream, opened.st_size, display)
-    return digest, opened.st_size
+    return digest, opened.st_size, file_identity(opened)
 
 
-def workflow_paths(root: Path) -> tuple[tuple[int, int], list[Path]]:
+def workflow_paths(root: Path) -> tuple[FileIdentity, list[Path]]:
     directory = root / WORKFLOW_DIRECTORY
     try:
         directory_metadata = directory.lstat()
@@ -290,11 +299,13 @@ def workflow_paths(root: Path) -> tuple[tuple[int, int], list[Path]]:
     paths.sort()
     if not paths:
         raise ContractError(f"{WORKFLOW_DIRECTORY}: no workflow documents were found")
-    return (directory_metadata.st_dev, directory_metadata.st_ino), paths
+    return file_identity(directory_metadata), paths
 
 
 def workflow_records(
-    root: Path, phase_hook: Callable[[], None] | None = None
+    root: Path,
+    phase_hook: Callable[[], None] | None = None,
+    after_hash_hook: Callable[[], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     directory_identity, paths = workflow_paths(root)
     metadata_by_path = {
@@ -312,20 +323,29 @@ def workflow_records(
     if phase_hook is not None:
         phase_hook()
     records: dict[str, dict[str, Any]] = {}
+    opened_identities: dict[Path, FileIdentity] = {}
     opened_total_bytes = 0
     for path in paths:
-        digest, size = exact_digest(path, root, MAX_WORKFLOW_BYTES)
+        digest, size, opened_identity = exact_digest(path, root, MAX_WORKFLOW_BYTES)
         opened_total_bytes += size
         if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
             raise ContractError(
                 f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
                 f"the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
             )
+        initial_identity = file_identity(metadata_by_path[path])
+        if opened_identity != initial_identity:
+            raise ContractError(
+                f"{path.relative_to(root)}: file identity changed after enumeration"
+            )
+        opened_identities[path] = opened_identity
         records[path.name] = {
             "sha256": digest,
             "bytes": size,
             "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),
         }
+    if after_hash_hook is not None:
+        after_hash_hook()
     final_directory_identity, final_paths = workflow_paths(root)
     if final_directory_identity != directory_identity:
         raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
@@ -336,6 +356,11 @@ def workflow_records(
             f"{WORKFLOW_DIRECTORY}: workflow entry set changed while checking; "
             f"before={initial_names!r} after={final_names!r}"
         )
+    for path in final_paths:
+        display = path.relative_to(root).as_posix()
+        final_metadata = regular_file_metadata(path, display, MAX_WORKFLOW_BYTES)
+        if file_identity(final_metadata) != opened_identities[path]:
+            raise ContractError(f"{display}: file identity changed after hashing")
     return records
 
 
