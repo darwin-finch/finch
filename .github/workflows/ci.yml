@@ -97,6 +97,40 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-
 
+    - name: Detect removed-SSH API-relevant changes
+      id: removed-ssh-api-paths
+      shell: bash
+      run: |
+        base='${{ github.event.pull_request.base.sha || github.event.before }}'
+        if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+          echo 'cannot identify a trustworthy comparison base; running the downstream probe' >&2
+          echo 'run_probe=true' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if ! git fetch --no-tags --depth=1 origin "$base"; then
+          echo 'cannot fetch the comparison base; running the downstream probe' >&2
+          echo 'run_probe=true' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        set +e
+        git diff --quiet "$base" '${{ github.sha }}' -- \
+          Cargo.toml Cargo.lock build.rs src/lib.rs scripts/check_removed_ssh_api.py \
+          .github/workflows/ci.yml
+        diff_status=$?
+        set -e
+        case "$diff_status" in
+          0) echo 'run_probe=false' >> "$GITHUB_OUTPUT" ;;
+          1) echo 'run_probe=true' >> "$GITHUB_OUTPUT" ;;
+          *)
+            echo "cannot inspect removed-SSH API-relevant changes: git diff exited $diff_status; running the downstream probe" >&2
+            echo 'run_probe=true' >> "$GITHUB_OUTPUT"
+            ;;
+        esac
+
+    - name: Compile downstream positive controls and require removed-API diagnostics
+      if: steps.removed-ssh-api-paths.outputs.run_probe == 'true'
+      run: python3 scripts/check_removed_ssh_api.py ${{ matrix.cargo_args }}
+
     - name: Run clippy (binary only, warnings allowed for now)
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
       run: cargo clippy --bin finch --all-features
@@ -195,6 +229,20 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install workflow parser
+      run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+    - name: Check pull-request workflow fan-out
+      run: python3 scripts/check_workflow_fanout.py
+
+    - name: Run workflow fan-out mutation regressions
+      run: python3 scripts/test_workflow_fanout.py
+
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
@@ -275,34 +323,3 @@ jobs:
           echo "cargo audit found advisories outside the five permanent focused guards" >&2
           exit "$audit_status"
         fi
-
-    - name: Detect manifest and public-API changes
-      id: security-paths
-      shell: bash
-      run: |
-        base='${{ github.event.pull_request.base.sha || github.event.before }}'
-        if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-          base="$(git rev-parse HEAD^)"
-        fi
-        git fetch --no-tags --depth=1 origin "$base"
-        set +e
-        git diff --quiet "$base" '${{ github.sha }}' -- \
-          Cargo.toml Cargo.lock src/lib.rs scripts/check_removed_ssh_api.py \
-          .github/workflows/ci.yml
-        diff_status=$?
-        set -e
-        case "$diff_status" in
-          0) echo 'removed_ssh_api=false' >> "$GITHUB_OUTPUT" ;;
-          1) echo 'removed_ssh_api=true' >> "$GITHUB_OUTPUT" ;;
-          *) echo "cannot inspect security-relevant changes: git diff exited $diff_status" >&2; exit "$diff_status" ;;
-        esac
-
-    - name: Install Cap'n Proto for the downstream removed-API probe
-      if: steps.security-paths.outputs.removed_ssh_api == 'true'
-      run: sudo apt-get update && sudo apt-get install -y capnproto
-
-    - name: Compile downstream positive controls and require removed-API diagnostics
-      if: steps.security-paths.outputs.removed_ssh_api == 'true'
-      run: |
-        python3 scripts/check_removed_ssh_api.py
-        python3 scripts/check_removed_ssh_api.py --no-default-features

@@ -145,6 +145,14 @@ def block(value: str) -> str:
 
 SECURITY_STEPS: tuple[dict[str, Any], ...] = (
     {"name": "Checkout code", "uses": "actions/checkout@v4"},
+    {
+        "name": "Install Python",
+        "uses": "actions/setup-python@v5",
+        "with": {"python-version": "3.12"},
+    },
+    {"name": "Install workflow parser", "run": "python3 -m pip install --disable-pip-version-check PyYAML==6.0.3"},
+    {"name": "Check pull-request workflow fan-out", "run": "python3 scripts/check_workflow_fanout.py"},
+    {"name": "Run workflow fan-out mutation regressions", "run": "python3 scripts/test_workflow_fanout.py"},
     {"name": "Install repository Rust toolchain", "uses": "dtolnay/rust-toolchain@1.98.0"},
     {"name": "Install cargo-audit", "run": "cargo install cargo-audit --locked"},
     {
@@ -230,42 +238,6 @@ SECURITY_STEPS: tuple[dict[str, Any], ...] = (
             fi
         """),
     },
-    {
-        "name": "Detect manifest and public-API changes",
-        "id": "security-paths",
-        "shell": "bash",
-        "run": block(r"""
-            base='${{ github.event.pull_request.base.sha || github.event.before }}'
-            if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-              base="$(git rev-parse HEAD^)"
-            fi
-            git fetch --no-tags --depth=1 origin "$base"
-            set +e
-            git diff --quiet "$base" '${{ github.sha }}' -- \
-              Cargo.toml Cargo.lock src/lib.rs scripts/check_removed_ssh_api.py \
-              .github/workflows/ci.yml
-            diff_status=$?
-            set -e
-            case "$diff_status" in
-              0) echo 'removed_ssh_api=false' >> "$GITHUB_OUTPUT" ;;
-              1) echo 'removed_ssh_api=true' >> "$GITHUB_OUTPUT" ;;
-              *) echo "cannot inspect security-relevant changes: git diff exited $diff_status" >&2; exit "$diff_status" ;;
-            esac
-        """),
-    },
-    {
-        "name": "Install Cap'n Proto for the downstream removed-API probe",
-        "if": "steps.security-paths.outputs.removed_ssh_api == 'true'",
-        "run": "sudo apt-get update && sudo apt-get install -y capnproto",
-    },
-    {
-        "name": "Compile downstream positive controls and require removed-API diagnostics",
-        "if": "steps.security-paths.outputs.removed_ssh_api == 'true'",
-        "run": block("""
-            python3 scripts/check_removed_ssh_api.py
-            python3 scripts/check_removed_ssh_api.py --no-default-features
-        """),
-    },
 )
 
 HYGIENE_STEPS: tuple[dict[str, Any], ...] = (
@@ -278,6 +250,203 @@ HYGIENE_STEPS: tuple[dict[str, Any], ...] = (
     {"name": "Run removed SSH surface regressions", "run": "python3 scripts/test_no_ssh_surface.py"},
     {"name": "Check pull-request workflow fan-out", "run": "python3 scripts/check_workflow_fanout.py"},
     {"name": "Run workflow fan-out mutation regressions", "run": "python3 scripts/test_workflow_fanout.py"},
+)
+
+TOOLCHAIN_STEPS: tuple[dict[str, Any], ...] = (
+    {"name": "Checkout code", "uses": "actions/checkout@v4"},
+    {
+        "name": "Install repository Rust toolchain",
+        "uses": "dtolnay/rust-toolchain@1.98.0",
+        "with": {"components": "rustfmt"},
+    },
+    {"name": "Verify pinned toolchain and clean-checkout formatting", "run": "tests/toolchain_contract.sh"},
+)
+
+TEST_STEPS: tuple[dict[str, Any], ...] = (
+    {"name": "Checkout code", "uses": "actions/checkout@v4"},
+    {
+        "name": "Install capnproto (Ubuntu)",
+        "if": "runner.os == 'Linux'",
+        "run": "sudo apt-get update && sudo apt-get install -y capnproto",
+    },
+    {"name": "Install capnproto (macOS)", "if": "runner.os == 'macOS'", "run": "brew install capnp"},
+    {
+        "name": "Install repository Rust toolchain",
+        "uses": "dtolnay/rust-toolchain@1.98.0",
+        "with": {"components": "clippy"},
+    },
+    {
+        "name": "Cache Cargo registry and build",
+        "uses": "actions/cache@v4",
+        "with": {
+            "path": "~/.cargo/registry\n~/.cargo/git\ntarget\n",
+            "key": "${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}",
+            "restore-keys": "${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-\n",
+        },
+    },
+    {
+        "name": "Detect removed-SSH API-relevant changes",
+        "id": "removed-ssh-api-paths",
+        "shell": "bash",
+        "run": block(r"""
+            base='${{ github.event.pull_request.base.sha || github.event.before }}'
+            if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+              echo 'cannot identify a trustworthy comparison base; running the downstream probe' >&2
+              echo 'run_probe=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! git fetch --no-tags --depth=1 origin "$base"; then
+              echo 'cannot fetch the comparison base; running the downstream probe' >&2
+              echo 'run_probe=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            set +e
+            git diff --quiet "$base" '${{ github.sha }}' -- \
+              Cargo.toml Cargo.lock build.rs src/lib.rs scripts/check_removed_ssh_api.py \
+              .github/workflows/ci.yml
+            diff_status=$?
+            set -e
+            case "$diff_status" in
+              0) echo 'run_probe=false' >> "$GITHUB_OUTPUT" ;;
+              1) echo 'run_probe=true' >> "$GITHUB_OUTPUT" ;;
+              *)
+                echo "cannot inspect removed-SSH API-relevant changes: git diff exited $diff_status; running the downstream probe" >&2
+                echo 'run_probe=true' >> "$GITHUB_OUTPUT"
+                ;;
+            esac
+        """),
+    },
+    {
+        "name": "Compile downstream positive controls and require removed-API diagnostics",
+        "if": "steps.removed-ssh-api-paths.outputs.run_probe == 'true'",
+        "run": "python3 scripts/check_removed_ssh_api.py ${{ matrix.cargo_args }}",
+    },
+    {
+        "name": "Run clippy (binary only, warnings allowed for now)",
+        "if": "runner.os == 'Linux' && matrix.feature_name == 'default'",
+        "run": "cargo clippy --bin finch --all-features",
+        "continue-on-error": "true",
+    },
+    {"name": "Build binary", "run": "cargo build --bin finch ${{ matrix.cargo_args }} --verbose"},
+    {"name": "Compile all targets", "run": "cargo test --all-targets ${{ matrix.cargo_args }} --no-run"},
+    {"name": "Test all targets", "run": "cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture"},
+    {"name": "Verify binary reports its version", "run": "cargo run ${{ matrix.cargo_args }} -- --version"},
+)
+
+BUILD_STEPS: tuple[dict[str, Any], ...] = (
+    {"name": "Checkout code", "uses": "actions/checkout@v4"},
+    {
+        "name": "Install capnproto (Ubuntu)",
+        "if": "runner.os == 'Linux'",
+        "run": "sudo apt-get update && sudo apt-get install -y capnproto",
+    },
+    {"name": "Install capnproto (macOS)", "if": "runner.os == 'macOS'", "run": "brew install capnp"},
+    {
+        "name": "Install repository Rust toolchain",
+        "uses": "dtolnay/rust-toolchain@1.98.0",
+        "with": {"targets": "${{ matrix.target }}"},
+    },
+    {"name": "Build release binary", "run": "cargo build --release --target ${{ matrix.target }}"},
+    {
+        "name": "Upload artifact",
+        "uses": "actions/upload-artifact@v4",
+        "with": {
+            "name": "finch-${{ matrix.target }}",
+            "path": "target/${{ matrix.target }}/release/finch",
+        },
+    },
+)
+
+EFFECT_STEPS: tuple[dict[str, Any], ...] = (
+    {"uses": "actions/checkout@v4"},
+    {"name": "Install Cap'n Proto", "run": "sudo apt-get update && sudo apt-get install -y capnproto"},
+    {"uses": "dtolnay/rust-toolchain@1.98.0"},
+    {"name": "Test durable reducer and log recovery", "run": "cargo test --lib runtime::effect_log::tests -- --nocapture"},
+    {"name": "Test named-Brain and Cap'n Proto audit boundary", "run": "cargo test --lib effect_audit -- --nocapture"},
+)
+
+ISOLATION_STEPS: tuple[dict[str, Any], ...] = (
+    {"name": "Checkout code", "uses": "actions/checkout@v4"},
+    {
+        "name": "Install capnproto (Ubuntu)",
+        "if": "runner.os == 'Linux'",
+        "run": "sudo apt-get update && sudo apt-get install -y capnproto ripgrep",
+    },
+    {"name": "Install capnproto (macOS)", "if": "runner.os == 'macOS'", "run": "brew install capnp ripgrep"},
+    {"name": "Install Rust toolchain", "uses": "dtolnay/rust-toolchain@1.98.0"},
+    {
+        "name": "Cache Cargo state",
+        "uses": "actions/cache@v4",
+        "with": {
+            "path": "~/.cargo/registry\n~/.cargo/git\ntarget\n",
+            "key": "issue-56-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}",
+        },
+    },
+    {"name": "Check bins and tests", "timeout-minutes": "25", "run": "cargo check --lib --bins --tests"},
+    {
+        "name": "Reject external provider binaries",
+        "timeout-minutes": "15",
+        "run": "cargo test --test no_external_provider_binary_test -- --nocapture",
+    },
+    {
+        "name": "Build isolation supervisor",
+        "timeout-minutes": "40",
+        "run": block("""
+            cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
+            cargo build --bin finch-test-supervisor
+            cargo build --release --bin finch-test-supervisor
+            install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
+            install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+        """),
+    },
+    {
+        "name": "Reject self-issued proof authority",
+        "timeout-minutes": "15",
+        "run": "./scripts/test_brains.sh cargo test --lib brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority -- --nocapture",
+    },
+    {
+        "name": "Validate offset-independent concurrent proof reads",
+        "timeout-minutes": "15",
+        "run": "./scripts/test_brains.sh cargo test --lib brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency -- --nocapture",
+    },
+    {
+        "name": "Reject rewritten proof at the production constructor",
+        "timeout-minutes": "15",
+        "run": "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore -- --nocapture",
+    },
+    {
+        "name": "Reject fixture traversal before external mutation",
+        "timeout-minutes": "15",
+        "run": block("""
+            ./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture
+            ./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture
+            ./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture
+        """),
+    },
+    {
+        "name": "Exercise real Brain and server paths behind the guard",
+        "timeout-minutes": "25",
+        "run": block("""
+            ./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture
+            ./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture
+            ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture
+            ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture
+            ./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored --nocapture
+        """),
+    },
+    {
+        "name": "Keep worker node identity inside disposable state",
+        "timeout-minutes": "15",
+        "run": block("""
+            tests/worker_node_isolation_contract.sh
+            ./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture
+        """),
+    },
+    {
+        "name": "Exercise the complete synthetic isolation harness",
+        "timeout-minutes": "15",
+        "run": "./scripts/test_brain_isolation.sh",
+    },
 )
 
 
@@ -323,13 +492,73 @@ def pull_request_trigger(workflow: dict[str, Any], context: str) -> dict[str, An
     return value
 
 
+def has_event(workflow: dict[str, Any], event: str) -> bool:
+    trigger = workflow.get("on")
+    if isinstance(trigger, str):
+        return trigger == event
+    if isinstance(trigger, list):
+        return event in trigger
+    return isinstance(trigger, dict) and event in trigger
+
+
+def target_synchronize_capable(workflow: dict[str, Any], context: str) -> bool:
+    if not has_event(workflow, "pull_request_target"):
+        return False
+    trigger = workflow.get("on")
+    if not isinstance(trigger, dict):
+        return True
+    value = trigger.get("pull_request_target")
+    if value in (None, ""):
+        return True
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{context}: pull_request_target must be a mapping or empty, found {value!r}"
+        )
+    if "types" not in value:
+        return True
+    return "synchronize" in string_list(
+        value["types"], f"{context}: pull_request_target.types"
+    )
+
+
+def synchronize_capable(workflow: dict[str, Any], context: str) -> bool:
+    trigger = pull_request_trigger(workflow, context)
+    if trigger is None:
+        return False
+    if "types" in trigger and "synchronize" not in string_list(
+        trigger["types"], f"{context}: pull_request.types"
+    ):
+        return False
+    if "branches" in trigger and not matches(
+        "main", string_list(trigger["branches"], f"{context}: pull_request.branches")
+    ):
+        return False
+    if "branches-ignore" in trigger and matches(
+        "main",
+        string_list(trigger["branches-ignore"], f"{context}: pull_request.branches-ignore"),
+    ):
+        return False
+    return True
+
+
 def glob_regex(pattern: str) -> re.Pattern[str]:
+    unsupported = sorted(set(pattern) & set("[]{}()\\"))
+    if unsupported:
+        raise ValueError(
+            f"unsupported GitHub path-pattern construct {unsupported!r} in {pattern!r}; "
+            "the fan-out checker refuses to guess"
+        )
     output = ""
     index = 0
     while index < len(pattern):
         char = pattern[index]
         if char == "*":
             if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                if index + 2 < len(pattern) and pattern[index + 2] == "/":
+                    # GitHub's `**/name` includes `name` at the repository root.
+                    output += "(?:.*/)?"
+                    index += 3
+                    continue
                 output += ".*"
                 index += 2
                 continue
@@ -355,15 +584,10 @@ def matches(path: str, patterns: list[str]) -> bool:
 def activates_on_synchronize(
     workflow: dict[str, Any], changed: tuple[str, ...], context: str
 ) -> bool:
+    if not synchronize_capable(workflow, context):
+        return False
     trigger = pull_request_trigger(workflow, context)
-    if trigger is None:
-        return False
-    if "types" in trigger and "synchronize" not in string_list(trigger["types"], f"{context}: pull_request.types"):
-        return False
-    if "branches" in trigger and not matches("main", string_list(trigger["branches"], f"{context}: pull_request.branches")):
-        return False
-    if "branches-ignore" in trigger and matches("main", string_list(trigger["branches-ignore"], f"{context}: pull_request.branches-ignore")):
-        return False
+    assert trigger is not None
     if "paths" in trigger and not any(matches(path, string_list(trigger["paths"], f"{context}: pull_request.paths")) for path in changed):
         return False
     if "paths-ignore" in trigger and all(matches(path, string_list(trigger["paths-ignore"], f"{context}: pull_request.paths-ignore")) for path in changed):
@@ -527,34 +751,70 @@ def run_steps(workflow: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]
     return output
 
 
-def audit_errors(workflows: dict[str, dict[str, Any]], ordinary_active: Counter[str]) -> list[str]:
-    installs: list[str] = []
-    audits: list[str] = []
-    active_jobs = {item.split("[", 1)[0] for item in ordinary_active}
+def audit_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
+    allowed_install = ("ci.yml", "security", "Install cargo-audit")
+    allowed_audit = (
+        "ci.yml",
+        "security",
+        "Run the one full Cargo audit and retain named advisory diagnostics",
+    )
+    installs: list[tuple[str, str, str]] = []
+    audits: list[tuple[str, str, str]] = []
+    errors: list[str] = []
+    prefix = (
+        r"(?:(?:sudo|command|time)\s+|env(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S+)*\s+|"
+        r"(?:bash|sh)\s+-c\s+['\"]\s*)*"
+    )
+    install_command = re.compile(
+        rf"(?m)^\s*{prefix}cargo(?:\s+\+[A-Za-z0-9_.-]+)?\s+install\s+cargo-audit\b",
+        re.IGNORECASE,
+    )
+    audit_command = re.compile(
+        rf"(?m)^\s*{prefix}(?:cargo(?:\s+\+[A-Za-z0-9_.-]+)?\s+audit|cargo-audit)\b",
+        re.IGNORECASE,
+    )
     for workflow_name, workflow in workflows.items():
-        for job_name, label, step in run_steps(workflow):
-            if f"{workflow_name}::{job_name}" not in active_jobs:
+        try:
+            if (
+                pull_request_trigger(workflow, workflow_name) is None
+                and not has_event(workflow, "pull_request_target")
+            ):
                 continue
+        except ValueError as error:
+            errors.append(str(error))
+            continue
+        for job_name, label, step in run_steps(workflow):
             location = f"{workflow_name}::{job_name}::{label}"
             uses = str(step.get("uses", ""))
-            if re.search(r"(?:^|/)audit-check(?:@|$)", uses, re.IGNORECASE):
-                audits.append(f"{location} uses={uses!r}")
             run = str(step.get("run", ""))
-            install_matches = list(re.finditer(r"\bcargo\s+install\s+cargo-audit\b", run))
-            installs.extend(f"{location} run={run!r}" for _ in install_matches)
-            without_installs = re.sub(r"\bcargo\s+install\s+cargo-audit\b[^\n;|&]*", "", run)
-            invocations = re.findall(
-                r"(?:^[ \t]*|[;&|][ \t]*|^[ \t]*(?:bash|sh)[ \t]+-c[ \t]+['\"][ \t]*)"
-                r"(?:sudo[ \t]+)?cargo(?:[ \t]+audit|-audit)\b",
-                without_installs,
-                re.MULTILINE,
-            )
-            audits.extend(f"{location} run={run!r}" for _ in invocations)
-    errors: list[str] = []
-    if len(installs) != 1 or not installs[0].startswith("ci.yml::security::step[2]"):
-        errors.append(f"ordinary source must activate exactly the canonical cargo-audit install; found {len(installs)} occurrences: {installs!r}")
-    if len(audits) != 1 or not audits[0].startswith("ci.yml::security::step[6]"):
-        errors.append(f"ordinary source must activate exactly one full cargo audit in canonical security; found {len(audits)} occurrences: {audits!r}")
+            is_action_audit = re.search(
+                r"(?:^|/)audit-check(?:@|$)", uses, re.IGNORECASE
+            ) is not None
+            is_install = install_command.search(run) is not None
+            is_audit = audit_command.search(run) is not None or is_action_audit
+            if not is_install and not is_audit:
+                continue
+            step_name = str(step.get("name", ""))
+            key = (workflow_name, job_name, step_name)
+            if is_install:
+                installs.append(key)
+            if is_audit:
+                audits.append(key)
+            if (is_install and key != allowed_install) or (is_audit and key != allowed_audit):
+                errors.append(
+                    f"{location}: Cargo audit occurrence is outside the exact canonical install/audit steps; "
+                    f"uses={uses!r}, run={run!r}"
+                )
+    if installs != [allowed_install]:
+        errors.append(
+            "every pull-request path/event must retain exactly one canonical cargo-audit install; "
+            f"expected={[allowed_install]!r}, found {len(installs)}: {installs!r}"
+        )
+    if audits != [allowed_audit]:
+        errors.append(
+            "every pull-request path/event must retain exactly one full Cargo audit; "
+            f"expected={[allowed_audit]!r}, found {len(audits)}: {audits!r}"
+        )
     return errors
 
 
@@ -564,7 +824,7 @@ def duplicate_build_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
         if workflow_name == "ci.yml":
             continue
         try:
-            if pull_request_trigger(workflow, workflow_name) is None:
+            if not synchronize_capable(workflow, workflow_name):
                 continue
         except ValueError as error:
             errors.append(str(error))
@@ -572,7 +832,8 @@ def duplicate_build_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
         jobs = workflow.get("jobs", {})
         for job_name, label, step in run_steps(workflow):
             run = str(step.get("run", "")).replace("\\\n", " ")
-            command_lines = [line for line in run.splitlines() if re.search(r"\bcargo\s+(?:test|build)\b", line)]
+            cargo_command = r"\bcargo(?:\s+\+[A-Za-z0-9_.-]+)?\s+(?:test|build)\b"
+            command_lines = [line for line in run.splitlines() if re.search(cargo_command, line)]
             definition = jobs.get(job_name, {}) if isinstance(jobs, dict) else {}
             try:
                 has_matrix, rows = matrix_rows(definition, f"{workflow_name}::{job_name}")
@@ -583,11 +844,11 @@ def duplicate_build_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
             except ValueError as error:
                 expanded = [f"unexpandable matrix: {error}"]
             for line in command_lines:
-                if re.search(r"\bcargo\s+test\b", line) and "--all-targets" in line:
+                if re.search(r"\bcargo(?:\s+\+[A-Za-z0-9_.-]+)?\s+test\b", line) and "--all-targets" in line:
                     errors.append(f"{workflow_name}::{job_name}::{label}: pull-request workflow outside ci.yml runs forbidden duplicate cargo test --all-targets; expanded job/matrix identities={expanded!r}; run={step.get('run')!r}")
                 if (
                     workflow_name != "issue-56-brain-isolation.yml"
-                    and re.search(r"\bcargo\s+build\b", line)
+                    and re.search(r"\bcargo(?:\s+\+[A-Za-z0-9_.-]+)?\s+build\b", line)
                     and "--release" in line
                     and re.search(r"--target(?:\s|=)", line)
                 ):
@@ -597,6 +858,126 @@ def duplicate_build_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
 
 def format_counter(counter: Counter[str]) -> list[str]:
     return [f"{item} x{count}" if count != 1 else item for item, count in sorted(counter.items())]
+
+
+def root_policy_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    checked = {
+        "ci.yml",
+        "repository-hygiene.yml",
+        "issue-56-brain-isolation.yml",
+        "issue-163-effect-audit.yml",
+    }
+    for name, workflow in workflows.items():
+        try:
+            unsafe_target = target_synchronize_capable(workflow, name)
+        except ValueError as error:
+            errors.append(str(error))
+            unsafe_target = False
+        if unsafe_target:
+            errors.append(
+                f"{name}: synchronize-capable pull_request_target is unsupported because untrusted "
+                f"PR code must not receive target-repository authority; on={workflow.get('on')!r}"
+            )
+        if name in checked and "defaults" in workflow:
+            errors.append(
+                f"{name}: workflow-root defaults are forbidden in a canonical checked workflow; "
+                f"actual defaults={workflow.get('defaults')!r}"
+            )
+    protected_triggers = {
+        "issue-56-brain-isolation.yml": {
+            "pull_request": {"paths": [
+                ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
+                "build.rs", "schema/**", "src/**", "scripts/**", "tests/**",
+            ]},
+            "push": {
+                "branches": ["main"],
+                "paths": [
+                    ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
+                    "build.rs", "schema/**", "src/**", "scripts/**", "tests/**",
+                ],
+            },
+            "workflow_dispatch": "",
+        },
+        "issue-163-effect-audit.yml": {
+            "push": {
+                "branches": ["main"],
+                "paths": [
+                    ".github/workflows/issue-163-effect-audit.yml", "schema/finch_ipc.capnp",
+                    "src/brain/effect_audit_archive.rs", "src/brain/mod.rs", "src/brain/remote.rs",
+                    "src/brain/store.rs", "src/cli/repl_event/**", "src/ipc/**",
+                    "src/runtime/effect_log.rs", "src/runtime/mod.rs", "src/server/brain_runner.rs",
+                    "src/server/brain_service.rs", "src/server/handlers.rs", "src/server/mod.rs",
+                    "src/tools/executor.rs", "src/tools/types.rs",
+                    "src/tools/implementations/program.rs",
+                ],
+            },
+            "pull_request": {"paths": [
+                ".github/workflows/issue-163-effect-audit.yml", "schema/finch_ipc.capnp",
+                "src/brain/effect_audit_archive.rs", "src/brain/mod.rs", "src/brain/remote.rs",
+                "src/brain/store.rs", "src/cli/repl_event/**", "src/ipc/**",
+                "src/runtime/effect_log.rs", "src/runtime/mod.rs", "src/server/brain_runner.rs",
+                "src/server/brain_service.rs", "src/server/handlers.rs", "src/server/mod.rs",
+                "src/tools/executor.rs", "src/tools/types.rs",
+                "src/tools/implementations/program.rs",
+            ]},
+            "workflow_dispatch": "",
+        },
+    }
+    for name, expected in protected_triggers.items():
+        actual = workflows.get(name, {}).get("on")
+        if actual != expected:
+            errors.append(
+                f"{name}: protected workflow trigger changed; expected={expected!r}, actual={actual!r}"
+            )
+    return errors
+
+
+def job_policy_errors(workflows: dict[str, dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    exact_env_allowance = {
+        ("issue-163-effect-audit.yml", "effect-audit"): {
+            "CARGO_BUILD_JOBS": "1",
+            "CARGO_INCREMENTAL": "0",
+        },
+        ("issue-46-atomic-conversation.yml", "atomic-rounds"): {
+            "CARGO_BUILD_JOBS": "1",
+            "CARGO_INCREMENTAL": "0",
+        },
+    }
+    for workflow_name, workflow in workflows.items():
+        try:
+            if not synchronize_capable(workflow, workflow_name):
+                continue
+        except ValueError as error:
+            errors.append(str(error))
+            continue
+        jobs = workflow.get("jobs", {})
+        if not isinstance(jobs, dict):
+            continue
+        for job_name, definition in jobs.items():
+            context = f"{workflow_name}::{job_name}"
+            if not isinstance(definition, dict):
+                continue
+            if "uses" in definition:
+                errors.append(
+                    f"{context}: reusable-workflow job-level uses is unsupported for a "
+                    f"synchronize-active PR workflow; actual uses={definition.get('uses')!r}"
+                )
+            for key in ("continue-on-error", "defaults"):
+                if key in definition:
+                    errors.append(
+                        f"{context}: job-level {key} is forbidden for counted gating jobs; "
+                        f"actual value={definition.get(key)!r}"
+                    )
+            if "env" in definition:
+                allowed = exact_env_allowance.get((workflow_name, str(job_name)))
+                if definition.get("env") != allowed:
+                    errors.append(
+                        f"{context}: job-level env is not an exact allowed existing contract; "
+                        f"expected={allowed!r}, actual={definition.get('env')!r}"
+                    )
+    return errors
 
 
 def validate_contract(root: Path) -> list[str]:
@@ -645,6 +1026,46 @@ def validate_contract(root: Path) -> list[str]:
 
     ci = workflows.get("ci.yml", {})
     hygiene = workflows.get("repository-hygiene.yml", {})
+    errors.extend(root_policy_errors(workflows))
+    errors.extend(job_policy_errors(workflows))
+    errors.extend(exact_job_errors(
+        "ci.yml", ci, "toolchain-contract",
+        {"name": "Toolchain and formatting contract", "runs-on": "ubuntu-24.04"},
+        TOOLCHAIN_STEPS,
+    ))
+    errors.extend(exact_job_errors(
+        "ci.yml", ci, "test",
+        {
+            "name": "Test (${{ matrix.os }}, ${{ matrix.feature_name }})",
+            "runs-on": "${{ matrix.os }}",
+            "timeout-minutes": "45",
+            "strategy": {
+                "fail-fast": "false",
+                "matrix": {"include": [
+                    {"os": "ubuntu-24.04", "feature_name": "default", "cargo_args": ""},
+                    {"os": "ubuntu-24.04", "feature_name": "no-default-features", "cargo_args": "--no-default-features"},
+                    {"os": "macos-14", "feature_name": "default", "cargo_args": ""},
+                    {"os": "macos-14", "feature_name": "no-default-features", "cargo_args": "--no-default-features"},
+                ]},
+            },
+        },
+        TEST_STEPS,
+    ))
+    errors.extend(exact_job_errors(
+        "ci.yml", ci, "build",
+        {
+            "name": "Build Release (${{ matrix.target }})",
+            "runs-on": "${{ matrix.os }}",
+            "strategy": {
+                "fail-fast": "false",
+                "matrix": {"include": [
+                    {"os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},
+                    {"os": "macos-14", "target": "aarch64-apple-darwin"},
+                ]},
+            },
+        },
+        BUILD_STEPS,
+    ))
     errors.extend(exact_job_errors(
         "ci.yml", ci, "security",
         {"name": "Security Audit", "runs-on": "ubuntu-24.04"}, SECURITY_STEPS,
@@ -659,7 +1080,33 @@ def validate_contract(root: Path) -> list[str]:
         },
         HYGIENE_STEPS,
     ))
-    errors.extend(audit_errors(workflows, activations.get("ordinary source", Counter())))
+    errors.extend(exact_job_errors(
+        "issue-56-brain-isolation.yml",
+        workflows.get("issue-56-brain-isolation.yml", {}),
+        "isolation-boundaries",
+        {
+            "name": "Isolation boundaries (${{ matrix.os }})",
+            "runs-on": "${{ matrix.os }}",
+            "timeout-minutes": "90",
+            "strategy": {
+                "fail-fast": "false",
+                "matrix": {"os": ["ubuntu-24.04", "macos-14"]},
+            },
+        },
+        ISOLATION_STEPS,
+    ))
+    errors.extend(exact_job_errors(
+        "issue-163-effect-audit.yml",
+        workflows.get("issue-163-effect-audit.yml", {}),
+        "effect-audit",
+        {
+            "runs-on": "ubuntu-24.04",
+            "timeout-minutes": "30",
+            "env": {"CARGO_BUILD_JOBS": "1", "CARGO_INCREMENTAL": "0"},
+        },
+        EFFECT_STEPS,
+    ))
+    errors.extend(audit_errors(workflows))
     errors.extend(duplicate_build_errors(workflows))
     return errors
 
