@@ -172,8 +172,15 @@ pub(crate) async fn handle_present_plan(
         let mut tui = tui_renderer.lock().await;
         tui.active_dialog = Some(dialog.clone());
         tui.pending_dialog_result = None;
-        let _ = tui.erase_live_area();
-        let _ = tui.draw_live_area();
+        // Repaint only a terminal this renderer actually owns.  `erase_live_area`
+        // and `draw_live_area` open `io::stdout()` unconditionally, so a headless
+        // renderer — which has no live area and never entered raw mode — would
+        // otherwise spray escape sequences over whatever else holds the terminal.
+        // Always true in a live session, so this changes nothing there.
+        if tui.is_active() {
+            let _ = tui.erase_live_area();
+            let _ = tui.draw_live_area();
+        }
     }
     let (dialog_tx, dialog_rx) = tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
     if event_tx

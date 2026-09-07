@@ -867,11 +867,20 @@ pub(super) async fn dispatch_tool_uses(
     //   turn queued behind it forever — the wedged session of #363.  The whole
     //   mode surface was stuck too, which is why Escape and an empty prompt did
     //   not recover it either.
-    // * Authority stays fixed for the batch.  Every call in this batch was
-    //   authored by the provider while the session was still `Planning`, so an
-    //   approval landing part-way through must not retroactively unblock a
-    //   sibling `write` the model asked for under the old mode.  The *next*
-    //   batch is authored under `Executing` and is allowed.
+    // * The *dispatch gate below* stays fixed for the batch.  Every call here
+    //   was authored by the provider while the session was still `Planning`, so
+    //   an approval landing part-way through does not make this loop re-gate the
+    //   siblings queued behind it: a `write` the model asked for under
+    //   `Planning` is still refused here.
+    //
+    //   Be exact about what that does *not* claim.  A tool that passes this gate
+    //   is handed to `spawn_tool_execution`, and the executor re-reads the mode
+    //   at execution time (`src/tools/executor.rs:467`), where the block applies
+    //   only while the mode is still `Planning`.  A same-batch `bash` therefore
+    //   does run after an approval, because by then the mode is `Executing`.
+    //   That is the executor's decision rather than this gate's, and it is not
+    //   an escalation — the user just approved "all tools enabled" — but this
+    //   snapshot fixes the gate, not the batch's effective authority.
     let batch_mode = mode.read().await.clone();
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
@@ -2054,13 +2063,22 @@ mod tests {
     //
     // These regressions drive the real `dispatch_tool_uses` → `ShowDialog` →
     // dialog decision → `ToolResult` path with a real `ToolExecutionCoordinator`
-    // and a real headless `TuiRenderer`.  What they deliberately do *not* reach
-    // is `EventLoop::execute_query_inner`, the admission gate that queues a later
-    // turn behind `active_query_id`: nothing in this repository constructs an
-    // `EventLoop` outside production (see the note in `event_loop.rs`'s test
-    // module).  The next-turn half is therefore pinned at the layer the wedge
-    // actually occupied — shared `ReplMode` ownership plus a dispatch that
-    // returns — rather than at the admission gate itself.
+    // and a real headless `TuiRenderer`.  The next-turn half is pinned at the
+    // layer the wedge actually occupied: shared `ReplMode` ownership plus a
+    // dispatch that returns.
+    //
+    // They stop short of `EventLoop::execute_query_inner`, the admission gate
+    // that parks a later turn in `pending_queries` behind `active_query_id`.
+    // That is a choice, not a limitation — `EventLoop::new_named_brain_test_runner`
+    // (`event_loop.rs:2103`, `#[cfg(test)]`) does construct an `EventLoop`, and
+    // `src/ipc/server.rs:3959` uses it — so the gate is reachable from a test.
+    // It is left alone here because that constructor is the named-Brain runner
+    // path rather than the interactive one, and because `pending_queries` has a
+    // separate pre-existing defect of its own: `CancelQuery` clears
+    // `active_query_id` without draining the queue (`event_loop.rs:4699`, versus
+    // the drains at `:4327` and `:4598`), so a queued turn re-fires out of order
+    // or is lost.  Read `pending_queries` admission and drain as
+    // known-uncovered here, not as covered.
 
     const PLAN_DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -2090,8 +2108,9 @@ mod tests {
             let temp = tempfile::tempdir().expect("plan dispatch fixture needs a temp directory");
             let plan_path = temp.path().join("plan.md");
             let colors = crate::config::ColorScheme::default();
+            // `TuiRenderer::new_headless` already calls `disable_stdout()` on
+            // this manager; do not repeat it here.
             let output = Arc::new(OutputManager::new(colors.clone()));
-            output.disable_stdout();
             let status = Arc::new(StatusBar::new());
             let tui = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
                 Arc::clone(&output),
@@ -2561,13 +2580,85 @@ mod tests {
         );
     }
 
-    /// Hostile schedule: the user answers the dialog and the turn is cancelled
-    /// before the handler is polled again, so both `select!` branches are ready
-    /// at once.  A cancelled turn must not be followed by an `Executing`
-    /// transition or a visible "Plan approved!" — those are post-terminal
-    /// effects on a session the user already abandoned.
-    #[tokio::test]
-    async fn test_cancelling_an_outstanding_plan_approval_publishes_no_approval_effects() {
+    /// Ctrl-C while the approval dialog is still unanswered.  The session must
+    /// stay exactly where it was — `Planning`, no approval banner — and the
+    /// turn must still terminalize exactly once so its lane is released.
+    ///
+    /// Deterministic on every build, including the base revision, which is
+    /// already correct here: with nothing in the dialog channel there is only
+    /// one ready `select!` arm to take.  This is a behaviour lock, not a
+    /// fail-before case.  What fails on base is the deadlock set above.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cancelling_an_unanswered_plan_approval_keeps_the_session_planning() {
+        let mut fixture = PlanDispatchFixture::planning().await;
+        let call = present_plan_call("present-plan-1", "A plan abandoned mid-review.");
+        let (query_id, round_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
+        let cancel = fixture.cancel_token(query_id).await;
+        let dispatch = fixture.spawn_dispatch(vec![call], query_id, round_token);
+
+        let response_tx = fixture.await_plan_dialog("unanswered plan approval").await;
+        cancel.cancel();
+
+        fixture
+            .join_dispatch(dispatch, query_id, "unanswered plan approval")
+            .await;
+        fixture.drain_events();
+        drop(response_tx);
+
+        let mode = fixture.observed_mode().await;
+        assert!(
+            matches!(mode, ReplMode::Planning { .. }),
+            "cancelling an unanswered plan review must leave the session in Planning; \
+             mode={mode:?}, events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        let rendered = fixture.rendered_output();
+        assert!(
+            !rendered.contains("Plan approved"),
+            "an unanswered, cancelled review must not report an approval; rendered={rendered:?}, \
+             mode={mode:?}, results={:?}",
+            fixture.results
+        );
+        let results = fixture.results_for(query_id);
+        assert_eq!(
+            results.len(),
+            1,
+            "a cancelled present_plan must still terminalize exactly once, or its lane is never \
+             released; mode={mode:?}, events={:?}, results={:?}",
+            fixture.events,
+            fixture.results
+        );
+        assert!(
+            results[0]
+                .2
+                .as_ref()
+                .is_ok_and(|text| text.contains("cancelled")),
+            "the sole result must report the cancellation; results={:?}, rendered={rendered:?}",
+            fixture.results
+        );
+    }
+
+    /// The hostile schedule: the user's approval and a Ctrl-C become ready in
+    /// the same poll.  Cancellation must win, so a turn the user abandoned is
+    /// never followed by an `Executing` transition or a visible "Plan
+    /// approved!".
+    ///
+    /// `flavor = "current_thread"` is load-bearing rather than incidental.  The
+    /// case only exists because the dispatch task is not polled between the send
+    /// and the cancel; on a multi-thread runtime it could observe the approval
+    /// first, and this would then fail on a *correct* build.
+    ///
+    /// Fail-before provenance, stated plainly: this case is pinned by mutation,
+    /// not by the base revision.  Biasing the `select!` back toward the dialog
+    /// arm and deleting the post-select discard fails it deterministically, with
+    /// the approved `ToolResult` and the `Executing` mode in the message.  The
+    /// base revision is *not* cited as the negative, because base's `select!` is
+    /// unbiased: it takes the cancellation arm about half the time and is
+    /// accidentally right when it does (measured 18 failures in 40 isolated
+    /// runs).  A coin flip is not regression evidence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_a_simultaneous_cancel_and_plan_approval_resolves_as_cancelled() {
         let mut fixture = PlanDispatchFixture::planning().await;
         let call = present_plan_call("present-plan-1", "A plan the user cancels out of.");
         let (query_id, round_token) = fixture.begin_turn(std::slice::from_ref(&call)).await;
@@ -2575,10 +2666,9 @@ mod tests {
         let dispatch = fixture.spawn_dispatch(vec![call], query_id, round_token);
 
         let response_tx = fixture.await_plan_dialog("cancelled plan approval").await;
-        // Single-threaded test runtime: the dispatch task cannot be polled while
-        // this block runs, so both branches become ready before it observes
-        // either.  That is precisely the schedule an unbiased select decided by
-        // coin flip.
+        // Nothing awaits between these two lines, and the runtime is
+        // single-threaded, so the dispatch task cannot run in between: both arms
+        // are ready before it observes either.
         let _ = response_tx.send(crate::cli::tui::DialogResult::Selected(0));
         cancel.cancel();
 
@@ -2685,13 +2775,20 @@ mod tests {
         );
     }
 
-    /// What the loop observes once the mode changes underneath it, made
-    /// explicit.  Every call in one provider batch was authored while the
-    /// session was still `Planning`, so an approval part-way through the batch
-    /// does not retroactively unblock a sibling the model asked for under the
-    /// old authority.  The *next* batch is authored under `Executing`.
+    /// What the dispatch loop observes once the mode changes underneath it,
+    /// made explicit.  Every call in one provider batch was authored while the
+    /// session was still `Planning`, so an approval part-way through does not
+    /// make this loop re-gate the siblings behind it.
+    ///
+    /// This pins the **dispatch gate** and nothing wider.  It does not claim the
+    /// batch's effective authority is unchanged: a tool that passes the gate is
+    /// spawned, and the executor re-reads the mode at execution time
+    /// (`src/tools/executor.rs:467`), whose block applies only while the mode is
+    /// `Planning`.  A same-batch `bash` does run after an approval for exactly
+    /// that reason.  `write` is refused by the gate here and is what this
+    /// asserts.
     #[tokio::test]
-    async fn test_mid_batch_plan_approval_does_not_widen_the_same_batch() {
+    async fn test_mid_batch_plan_approval_does_not_widen_the_dispatch_gate() {
         let mut fixture = PlanDispatchFixture::planning().await;
         let plan_call = present_plan_call("present-plan-1", "Approve, then write.");
         let write_call = ToolUse {
