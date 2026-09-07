@@ -1,7 +1,8 @@
 use super::*;
 use crate::config::EndpointFamily;
 use crate::providers::chatgpt_oauth::{
-    OpenAiChatGptOAuthDialect, OpenAiTokenVerifier, VerifiedOpenAiClaims,
+    ChatGptDeviceEndpointError, OpenAiChatGptOAuthDialect, OpenAiTokenVerifier,
+    VerifiedOpenAiClaims,
 };
 use anyhow::{bail, Result};
 use axum::body::Body;
@@ -474,24 +475,34 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
     let sentinels = [
         "html-secret-sentinel",
         "json-secret-sentinel",
-        "empty-body-sentinel",
         "scalar-secret-sentinel",
+        "terminal-secret-sentinel",
     ];
-    for index in 0..12 {
-        let (status, body) = match index % 4 {
-            0 => (
-                StatusCode::FORBIDDEN,
-                format!("<html>{}</html>", sentinels[0]),
-            ),
-            1 => (
-                StatusCode::NOT_FOUND,
-                json!({"error": sentinels[1]}).to_string(),
-            ),
-            2 => (StatusCode::FORBIDDEN, String::new()),
-            _ => (StatusCode::NOT_FOUND, format!("\"{}\"", sentinels[3])),
-        };
-        server.push_raw("/api/accounts/deviceauth/token", status, body);
-    }
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::FORBIDDEN,
+        format!("<html>{}</html>", sentinels[0]),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::NOT_FOUND,
+        json!({"error": sentinels[1]}).to_string(),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::FORBIDDEN,
+        String::new(),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::NOT_FOUND,
+        format!("\"{}\"", sentinels[2]),
+    );
+    server.push_raw(
+        "/api/accounts/deviceauth/token",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error": sentinels[3]}).to_string(),
+    );
     let dialect = Arc::new(
         OpenAiChatGptOAuthDialect::for_test(&server.origin, Arc::new(NeverReachedOpenAiVerifier))
             .unwrap(),
@@ -503,7 +514,7 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
         "ABCD-EFGH".into(),
         format!("{}/codex/device", server.origin),
         None,
-        Duration::from_millis(70),
+        Duration::from_secs(30),
         Duration::ZERO,
     )
     .unwrap();
@@ -512,13 +523,28 @@ async fn chatgpt_poll_discards_bounded_403_and_404_bodies_before_json_parsing() 
         .await
         .unwrap_err();
     let diagnostic = format!("{error:#}");
-    assert!(diagnostic.contains("expired"), "{diagnostic}");
+    assert_eq!(
+        error.downcast_ref::<ChatGptDeviceEndpointError>(),
+        Some(&ChatGptDeviceEndpointError::PollRejected(500)),
+        "four status-only pending responses must reach the scripted HTTP 500 terminal cause; diagnostic={diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("ChatGPT device polling ended (HTTP 500)"),
+        "terminal polling failure must identify the rejected stage and HTTP status; diagnostic={diagnostic}"
+    );
     assert!(
         sentinels.iter().all(|secret| !diagnostic.contains(secret)),
-        "{diagnostic}"
+        "OAuth polling diagnostics must not retain hostile provider bodies; diagnostic={diagnostic}"
     );
-    assert!(server.request_count("/api/accounts/deviceauth/token") >= 2);
-    assert!(store.0.lock().unwrap().is_empty());
+    assert_eq!(
+        server.request_count("/api/accounts/deviceauth/token"),
+        5,
+        "OAuth polling must discard all four 403/404 bodies before reaching the scripted HTTP 500 terminal response; diagnostic={diagnostic}"
+    );
+    assert!(
+        store.0.lock().unwrap().is_empty(),
+        "terminal device-poll rejection must not persist a credential; diagnostic={diagnostic}"
+    );
 }
 
 #[tokio::test]
