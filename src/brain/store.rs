@@ -1205,6 +1205,14 @@ pub struct BrainStore {
     /// replaced; repeating it once a minute is the same defect, slower. This
     /// tracks which Brains are already known bad so the warm-up can log edges —
     /// one line when a Brain starts failing, one when it recovers.
+    ///
+    /// The map is keyed by Brain *name*, and a name outlives the Brain that
+    /// held it. It is therefore bounded two ways rather than one: `archive` and
+    /// `remove_if_unused` evict eagerly, and every complete warm-up enumeration
+    /// drops names no longer on disk. Both are silent — a Brain that vanished
+    /// was not repaired — and both exist so that a different Brain later
+    /// created under a retired name is treated as new: its first failure warns,
+    /// and its health is never reported as its predecessor's recovery.
     unloadable_brains: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Active schedules across every resident Brain, ordered by due time (#374).
     schedule_index: Arc<RwLock<ScheduleIndex>>,
@@ -2863,6 +2871,22 @@ impl BrainStore {
         names
     }
 
+    /// Stop tracking `name` as unloadable, without reporting a recovery.
+    ///
+    /// Called from every path that retires a name: a Brain that was archived or
+    /// removed has not become loadable, so it earns no line, but leaving its
+    /// name in the registry would suppress the first failure of a genuinely
+    /// different Brain later created under it — the one line #380 (log spam:
+    /// the daemon reported an unchanging condition on a timer) exists to
+    /// guarantee — or report that different Brain's health as this one's
+    /// recovery, which is false about both the identity and the schedules.
+    fn forget_unloadable(&self, name: &str) {
+        self.unloadable_brains
+            .lock()
+            .expect("unloadable Brain registry poisoned")
+            .remove(name);
+    }
+
     /// Populate the due index from every Brain on disk, once.
     ///
     /// Schedules only become known when a Brain is loaded, so a freshly started
@@ -2893,9 +2917,30 @@ impl BrainStore {
         };
         let mut failing: Vec<(String, anyhow::Error)> = Vec::new();
         let mut loaded: HashSet<String> = HashSet::new();
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+        // Every Brain name this pass proved is still on disk, so the registry
+        // of known-bad names can be reconciled against it below.
+        //
+        // Eviction is only sound against a *complete* enumeration, so an entry
+        // or a file type we could not read forfeits it for this pass: an
+        // unreadable entry is a name we cannot prove absent, and evicting it
+        // would re-arm the first-failure warning for a Brain that never went
+        // anywhere -- the log spam this fixes, in a slower form. A name that is
+        // not UTF-8 or fails `validate_name` does not forfeit it, because such
+        // a name can never have entered the registry in the first place.
+        let mut present: HashSet<String> = HashSet::new();
+        let mut enumeration_is_complete = true;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                enumeration_is_complete = false;
                 continue;
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    enumeration_is_complete = false;
+                    continue;
+                }
             }
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -2903,6 +2948,7 @@ impl BrainStore {
             if Self::validate_name(&name).is_err() {
                 continue;
             }
+            present.insert(name.clone());
             match self.ensure_loaded(&name) {
                 Ok(()) => {
                     loaded.insert(name);
@@ -2943,6 +2989,19 @@ impl BrainStore {
             for name in &recovered {
                 known.remove(name);
             }
+            // A Brain that is gone has not been repaired, so it gets no line;
+            // but its name must not stay behind either. `archive` and
+            // `remove_if_unused` evict eagerly, and a Brain can also leave by
+            // `rm -rf`, which is the remediation an operator reaches for first
+            // and which nothing in-process observes. Reconciling the registry
+            // against the enumeration bounds it by what is on disk rather than
+            // by the daemon's lifetime, and makes a Brain later created under
+            // the same name fresh: its first failure warns instead of being
+            // suppressed by its predecessor's, and if it is healthy it is not
+            // announced as its predecessor's recovery.
+            if enumeration_is_complete {
+                known.retain(|name| present.contains(name));
+            }
             for (name, _) in &newly_failing {
                 known.insert(name.clone());
             }
@@ -2950,9 +3009,14 @@ impl BrainStore {
         };
 
         for (name, error) in newly_failing {
+            // `{:#}` renders the cause chain, not only the outermost context.
+            // #380 requires the line to name the Brain *and the reason* so it
+            // stays actionable, and "parse /.../metadata.json" alone tells an
+            // operator which file to look at but not what is wrong with it.
+            let reason = format!("{error:#}");
             tracing::warn!(
                 brain = %name,
-                %error,
+                error = %reason,
                 "Brain could not be loaded while warming the schedule index; its \
                  schedules will not be delivered until it is repaired"
             );
@@ -4606,6 +4670,7 @@ impl BrainStore {
             .write()
             .expect("shared brain execution-lock map poisoned")
             .remove(name);
+        self.forget_unloadable(name);
         Ok(true)
     }
 
@@ -4738,6 +4803,9 @@ impl BrainStore {
             .write()
             .expect("shared Brain run-gate map poisoned")
             .retain(|(brain, _), _| brain != name);
+        // Archiving is the natural remediation for a Brain the warm-up cannot
+        // load, so this is the common way a known-bad name retires.
+        self.forget_unloadable(name);
         Ok(archived_to)
     }
 
@@ -7918,15 +7986,6 @@ mod tests {
         );
     }
 
-    /// Selecting due work must not hydrate Brains that have none.
-    ///
-    /// Asserted with `resident_brain_count`, as #374 required -- never a
-    /// duration. The previous version asserted only that selection *named* one
-    /// Brain, which `due_schedule_brains` cannot get wrong: it is a pure read
-    /// of the index and cannot hydrate anything. That left the property
-    /// tautological, and a `due_schedule_brains` that called `list()` first --
-    /// hydrating all 65 Brains on every tick, the exact defect #374 removes --
-    /// would have passed it.
     /// The warm-up must report a Brain's failure once, not once per pass.
     ///
     /// A Brain that cannot be replayed stays that way until a human repairs it,
@@ -8017,18 +8076,117 @@ mod tests {
         );
     }
 
+    /// A name is not a Brain: retiring one must retire its recorded failure.
+    ///
+    /// `unloadable_brains` is keyed by name, and a name outlives the Brain that
+    /// held it. Archiving is the natural remediation for a Brain the warm-up
+    /// cannot load, so this is the ordinary way a known-bad name retires. If
+    /// the name stayed behind, a genuinely different Brain later created under
+    /// it would inherit its predecessor's history: broken, and its first
+    /// failure is suppressed -- the one line #380 exists to guarantee; healthy,
+    /// and it is announced as the archived Brain's recovery, which is false
+    /// about the identity and about the schedules, which went with the
+    /// directory.
+    #[test]
+    fn test_an_archived_brain_leaves_the_unloadable_registry_and_its_name_starts_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        // A root below the tempdir, because `archive` writes `brains-archive`
+        // beside the root and the tempdir must contain it.
+        let root = temp.path().join("brains");
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let seeding = BrainStore::with_root("box.local", Some(root.clone()));
+            seed_scheduled_brain(&seeding, "healthy", 1_000);
+        }
+        let reused = root.join("reused");
+        std::fs::create_dir_all(&reused).unwrap();
+        std::fs::write(reused.join("metadata.json"), "{not json").unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
+        store.warm_schedule_index();
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            vec!["reused".to_string()],
+            "precondition: the warm-up recorded the failure it warned about"
+        );
+
+        store
+            .archive("reused")
+            .expect("archive the unloadable Brain");
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            Vec::<String>::new(),
+            "archiving retires the name, so the failure recorded against it \
+             must retire with it. Archive already clears every other per-name \
+             map -- brains, runtimes, initializations, execution locks, run \
+             gates, schedules -- and this one is no different"
+        );
+
+        std::fs::create_dir_all(&reused).unwrap();
+        std::fs::write(reused.join("metadata.json"), "{not json").unwrap();
+        store.warm_schedule_index();
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            vec!["reused".to_string()],
+            "a different Brain created under a retired name must fail freshly. \
+             A retained name would make its first failure silent, which is \
+             exactly the report #380 requires"
+        );
+    }
+
+    /// The registry is bounded by what is on disk, not by daemon uptime.
+    ///
+    /// A Brain can leave without any store API being called -- `rm -rf` on the
+    /// directory is the remediation an operator reaches for first, and nothing
+    /// in-process observes it. A complete warm-up enumeration therefore drops
+    /// names it did not see, silently: a Brain that vanished was not repaired,
+    /// so it earns no recovery line. Without this, repeated fail-then-remove
+    /// lifecycles over unique names grow the set for the daemon's lifetime.
+    #[test]
+    fn test_a_removed_brain_is_evicted_from_the_unloadable_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
+            seed_scheduled_brain(&seeding, "healthy", 1_000);
+        }
+        let gone = temp.path().join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(gone.join("metadata.json"), "{not json").unwrap();
+
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        store.warm_schedule_index();
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            vec!["gone".to_string()],
+            "precondition: the warm-up recorded the failure it warned about"
+        );
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        store.warm_schedule_index();
+        assert_eq!(
+            store.unloadable_brains_for_test(),
+            Vec::<String>::new(),
+            "a name the enumeration did not see is no longer a Brain this \
+             daemon knows anything about, so it must not stay in the registry. \
+             Retaining it both grows the set without bound and silences the \
+             first failure of whatever is created under that name next"
+        );
+    }
+
+    /// Warming again must pick up a Brain that has since become loadable.
+    ///
+    /// Warming only once meant a Brain that happened to be unloadable at daemon
+    /// start -- a volume not yet mounted, a journal mid-repair -- was never
+    /// scheduled again for the life of the daemon, silently, because a
+    /// scheduled Brain is precisely the one nothing else touches by name to
+    /// hydrate it. The fixed one-second tick this replaced recovered within a
+    /// second.
+    ///
+    /// Asserted at the store, with no clock and no loop: the property the
+    /// periodic re-warm depends on is that warming again picks up a Brain that
+    /// has since become loadable.
     #[test]
     fn test_a_repaired_brain_is_picked_up_by_a_later_warm() {
-        // The regression for round 2's worst finding. Warming once meant a
-        // Brain that happened to be unloadable at daemon start -- a volume not
-        // yet mounted, a journal mid-repair -- was never scheduled again for
-        // the life of the daemon, silently, because a scheduled Brain is
-        // precisely the one nothing else touches by name to hydrate it. The
-        // fixed one-second tick this replaced recovered within a second.
-        //
-        // Asserted at the store, with no clock and no loop: the property the
-        // periodic re-warm depends on is that warming again picks up a Brain
-        // that has since become loadable.
         let temp = tempfile::tempdir().unwrap();
         let good_metadata = {
             let seeding = BrainStore::with_root("box.local", Some(temp.path().into()));
@@ -8074,6 +8232,15 @@ mod tests {
         );
     }
 
+    /// Selecting due work must not hydrate Brains that have none.
+    ///
+    /// Asserted with `resident_brain_count`, as #374 required -- never a
+    /// duration. The previous version asserted only that selection *named* one
+    /// Brain, which `due_schedule_brains` cannot get wrong: it is a pure read
+    /// of the index and cannot hydrate anything. That left the property
+    /// tautological, and a `due_schedule_brains` that called `list()` first --
+    /// hydrating all 65 Brains on every tick, the exact defect #374 removes --
+    /// would have passed it.
     #[test]
     fn test_selection_does_not_hydrate_brains_without_due_work() {
         const IDLE: usize = 64;

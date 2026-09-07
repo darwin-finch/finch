@@ -36,14 +36,14 @@ unrelated same-name process survives the TUI smoke.
   `tempfile` root and calls `warm_schedule_index` directly. It spawns no
   daemon, binds no endpoint, performs no discovery, and never reads the user's
   Finch state; `BrainStore::with_root` is given an explicit root on every
-  construction. It is a separate binary rather than a `src/` unit test because
-  it counts real `tracing` output, and `tracing` caches callsite interest
-  process-globally: sibling unit tests warming the index on other threads with
-  no subscriber installed poison the callsite and silently empty a
-  thread-local capture. Measured failing two runs in three under
-  `--lib -- brain::store::` while passing under `--test-threads=1`;
-  `rebuild_interest_cache` does not help, because the poisoning is concurrent
-  rather than merely earlier. Owning the process removes the race.
+  construction. It is a separate binary because it is an executable-level
+  regression over real `tracing` output, which AGENTS.md places under `tests/`,
+  and because owning the process means no sibling test shares the
+  process-global subscriber state it depends on. An earlier draft of these
+  assertions, written as `src/brain/store.rs` unit tests, was observed failing
+  intermittently under `--lib -- brain::store::` and passing under
+  `--test-threads=1`; the cause of that flakiness was never established, and a
+  later reconstruction of that draft did not reproduce it.
 - `tests/daemon_integration_test.rs` fails closed without authenticated
   supervisor proof. Its daemon receives the sealed HOME, password, IPC socket,
   and inherited kernel-assigned listener.
