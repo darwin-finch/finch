@@ -59,28 +59,6 @@ HYGIENE = frozenset(
 )
 EFFECT = frozenset({job("issue-163-effect-audit.yml", "effect-audit")})
 DOCS = frozenset({job("docs.yml", "current-docs")})
-QUICK_XML = frozenset(
-    {job("issue-185-spreadsheet-advisories.yml", "quick-xml-dependency-contract")}
-)
-SSH_DEPENDENCY = frozenset(
-    job(
-        "issue-186-ssh-removal.yml",
-        "dependency-graph",
-        target=target,
-        feature_name=feature,
-    )
-    for target in (
-        "x86_64-unknown-linux-gnu",
-        "aarch64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-    )
-    for feature in ("default", "no-default-features")
-)
-SSH_API = frozenset(
-    job("issue-186-ssh-removal.yml", "public-api-absence", feature_name=feature)
-    for feature in ("default", "no-default-features")
-)
-SSH = SSH_DEPENDENCY | SSH_API
 OAUTH_105 = frozenset(
     job("issue-105-oauth.yml", name) for name in ("oauth", "windows-compile", "macos-oauth")
 )
@@ -99,33 +77,28 @@ FIXTURES = (
         ("src/brain/store.rs", "src/server/handlers.rs"),
         CI | BRAIN | HYGIENE | EFFECT,
     ),
-    Fixture("Cargo.toml", ("Cargo.toml",), CI | BRAIN | HYGIENE | QUICK_XML | SSH | OAUTH_105 | AUTH_201),
-    Fixture("Cargo.lock", ("Cargo.lock",), CI | BRAIN | HYGIENE | QUICK_XML | SSH),
-    Fixture("public API", ("src/lib.rs",), CI | BRAIN | HYGIENE | SSH | OAUTH_105),
+    Fixture("Cargo.toml", ("Cargo.toml",), CI | BRAIN | HYGIENE | OAUTH_105 | AUTH_201),
+    Fixture("Cargo.lock", ("Cargo.lock",), CI | BRAIN | HYGIENE),
+    Fixture("public API", ("src/lib.rs",), CI | BRAIN | HYGIENE | OAUTH_105),
     Fixture(
         "SSH source guard",
         ("scripts/check_no_ssh_surface.py",),
-        CI | BRAIN | HYGIENE | SSH,
+        CI | BRAIN | HYGIENE,
     ),
     Fixture(
         "SSH API guard",
         ("scripts/check_removed_ssh_api.py",),
-        CI | BRAIN | HYGIENE | SSH,
-    ),
-    Fixture(
-        "spreadsheet workflow definition",
-        (".github/workflows/issue-185-spreadsheet-advisories.yml",),
-        CI | HYGIENE | QUICK_XML,
-    ),
-    Fixture(
-        "SSH workflow definition",
-        (".github/workflows/issue-186-ssh-removal.yml",),
-        CI | HYGIENE | SSH,
+        CI | BRAIN | HYGIENE,
     ),
     Fixture(
         "fan-out guard",
         ("scripts/check_workflow_fanout.py", "scripts/test_workflow_fanout.py"),
         CI | BRAIN | HYGIENE,
+    ),
+    Fixture(
+        "canonical CI workflow definition",
+        (".github/workflows/ci.yml",),
+        CI | HYGIENE,
     ),
     Fixture(
         "hygiene workflow definition",
@@ -283,7 +256,8 @@ def active_steps(definition: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def all_run_text(definition: dict[str, Any]) -> str:
-    return "\n".join(str(step.get("run", "")) for step in active_steps(definition))
+    lines = "\n".join(str(step.get("run", "")) for step in active_steps(definition))
+    return "\n".join(line for line in lines.splitlines() if not line.lstrip().startswith("#"))
 
 
 def full_audit_jobs(workflows: dict[str, dict[str, Any]], active: set[str]) -> list[str]:
@@ -308,9 +282,13 @@ def validate_contract(root: Path) -> list[str]:
         return [str(error)]
 
     for name in ("issue-185-spreadsheet-advisories.yml", "issue-186-ssh-removal.yml"):
-        trigger = pull_request_trigger(workflows.get(name, {}))
-        if isinstance(trigger, dict) and not trigger.get("paths") and not trigger.get("paths-ignore"):
-            errors.append(f"{name}: closed-issue pull_request trigger is unfiltered (paths/paths-ignore missing)")
+        if name in workflows:
+            trigger = pull_request_trigger(workflows[name])
+            trigger_detail = "no pull_request trigger" if trigger is None else repr(trigger)
+            errors.append(
+                f"{name}: retired closed-issue workflow returned; permanent guards belong in "
+                f"canonical CI/repository hygiene (pull_request={trigger_detail})"
+            )
 
     activations: dict[str, set[str]] = {}
     for fixture in FIXTURES:
@@ -367,12 +345,16 @@ def validate_contract(root: Path) -> list[str]:
                 if "os" in row and "target" in row
             }
             commands = all_run_text(definition)
-            if canonical_tests <= test_rows and "cargo test --all-targets" in commands:
+            if canonical_tests <= test_rows and re.search(
+                r"(?m)cargo\s+test[^\n]*--all-targets", commands
+            ):
                 errors.append(
                     f"{name}::{job_name}: duplicates the canonical four-job all-target "
                     f"OS x feature matrix: {sorted(canonical_tests)}"
                 )
-            if canonical_builds <= build_rows and "cargo build --release" in commands:
+            if canonical_builds <= build_rows and re.search(
+                r"(?m)cargo\s+build[^\n]*--release", commands
+            ):
                 errors.append(
                     f"{name}::{job_name}: duplicates the canonical two-job release "
                     f"OS x target matrix: {sorted(canonical_builds)}"
@@ -394,26 +376,59 @@ def validate_contract(root: Path) -> list[str]:
         if command not in hygiene_run:
             errors.append(f"repository-hygiene.yml::tracked-tree: active steps must run {command}; comments or if:false steps do not satisfy the guard")
 
-    required_text = {
-        "issue-185-spreadsheet-advisories.yml": ("0.41.0", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195", "quick-xml"),
-        "issue-186-ssh-removal.yml": (
-            "rsa",
-            "russh",
-            "russh-keys",
-            "russh-cryptovec",
-            "RUSTSEC-2026-0154",
-            "RUSTSEC-2026-0153",
-            "RUSTSEC-2023-0071",
-            "scripts/check_removed_ssh_api.py",
-        ),
-    }
-    for name, needles in required_text.items():
-        workflow = workflows.get(name, {})
-        jobs = workflow.get("jobs", {}) if isinstance(workflow, dict) else {}
-        active_text = "\n".join(all_run_text(definition) for definition in jobs.values() if isinstance(definition, dict) and not inert(definition.get("if")))
-        for needle in needles:
-            if needle not in active_text:
-                errors.append(f"{name}: active jobs/steps do not enforce required security marker {needle!r}")
+    ci = workflows.get("ci.yml", {})
+    ci_jobs = ci.get("jobs", {}) if isinstance(ci, dict) else {}
+    security = ci_jobs.get("security", {}) if isinstance(ci_jobs, dict) else {}
+    security_run = all_run_text(security) if isinstance(security, dict) else ""
+    security_steps = active_steps(security) if isinstance(security, dict) else []
+    detector_run = "\n".join(
+        str(step.get("run", ""))
+        for step in security_steps
+        if step.get("id") == "security-paths"
+    )
+    security_markers = (
+        "cargo audit --json",
+        "grep -Eq '^name = \"(rsa|russh|russh-cryptovec|russh-keys)\"$' Cargo.lock",
+        "cargo tree --invert quick-xml",
+        "minimum=0.41.0",
+        "quick-xml",
+        "0.41.0",
+        "RUSTSEC-2026-0194",
+        "RUSTSEC-2026-0195",
+        "rsa",
+        "russh",
+        "russh-keys",
+        "russh-cryptovec",
+        "RUSTSEC-2026-0154",
+        "RUSTSEC-2026-0153",
+        "RUSTSEC-2023-0071",
+        "scripts/check_removed_ssh_api.py",
+        "--no-default-features",
+        "removed_ssh_api=true",
+    )
+    for marker in security_markers:
+        if marker not in security_run:
+            errors.append(
+                "ci.yml::security: active jobs/steps do not enforce required security "
+                f"marker {marker!r}; if:false steps and comments are inert"
+            )
+    if security_run.count("python3 scripts/check_removed_ssh_api.py") != 2:
+        errors.append(
+            "ci.yml::security: active downstream removed-API step must run exactly two "
+            "positive/negative probes (default and no-default-features)"
+        )
+    for path in (
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/lib.rs",
+        "scripts/check_removed_ssh_api.py",
+        ".github/workflows/ci.yml",
+    ):
+        if path not in detector_run:
+            errors.append(
+                "ci.yml::security: downstream removed-API change detector does not include "
+                f"required path {path!r}"
+            )
 
     return errors
 

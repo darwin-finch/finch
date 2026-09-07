@@ -31,6 +31,10 @@ class WorkflowRepository:
             raise AssertionError(f"mutation anchor missing from {name}: {old!r}")
         path.write_text(contents.replace(old, new, 1), encoding="utf-8")
 
+    def write(self, name: str, contents: str) -> None:
+        path = self.root / ".github" / "workflows" / name
+        path.write_text(contents, encoding="utf-8")
+
     def run(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(CHECKER), "--root", str(self.root)],
@@ -53,26 +57,26 @@ class WorkflowFanoutMutationTests(unittest.TestCase):
         self.assertIn(expected, result.stderr, result.stdout + result.stderr)
 
     def test_rejects_unfiltered_closed_issue_pull_request(self) -> None:
-        self.repo.replace(
+        self.repo.write(
             "issue-185-spreadsheet-advisories.yml",
-            "  pull_request:\n    branches: [main]\n    paths:\n",
-            "  pull_request:\n    branches: [main]\n  ignored_paths:\n",
+            "name: retired\non:\n  pull_request:\njobs:\n  audit:\n"
+            "    runs-on: ubuntu-24.04\n    steps:\n      - run: cargo audit\n",
         )
-        self.assert_rejected("closed-issue pull_request trigger is unfiltered")
+        self.assert_rejected("retired closed-issue workflow returned")
 
     def test_rejects_duplicate_canonical_all_target_matrix(self) -> None:
         self.repo.replace(
-            "issue-186-ssh-removal.yml",
-            "  public-api-absence:\n",
-            "  test:\n    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-14]\n        feature_name: [default, no-default-features]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test --all-targets\n\n  public-api-absence:\n",
+            "repository-hygiene.yml",
+            "  tracked-tree:\n",
+            "  duplicate-all-targets:\n    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-14]\n        feature_name: [default, no-default-features]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo test --all-targets\n\n  tracked-tree:\n",
         )
         self.assert_rejected("duplicates the canonical four-job all-target")
 
     def test_rejects_duplicate_canonical_release_matrix(self) -> None:
         self.repo.replace(
-            "issue-186-ssh-removal.yml",
-            "  public-api-absence:\n",
-            "  build:\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n          - os: macos-14\n            target: aarch64-apple-darwin\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo build --release --target ${{ matrix.target }}\n\n  public-api-absence:\n",
+            "repository-hygiene.yml",
+            "  tracked-tree:\n",
+            "  duplicate-release:\n    strategy:\n      matrix:\n        include:\n          - os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n          - os: macos-14\n            target: aarch64-apple-darwin\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: cargo build --release --target ${{ matrix.target }}\n\n  tracked-tree:\n",
         )
         self.assert_rejected("duplicates the canonical two-job release")
 
@@ -100,35 +104,80 @@ class WorkflowFanoutMutationTests(unittest.TestCase):
         )
         self.assert_rejected("active steps must run scripts/check_no_ssh_surface.py")
 
-    def test_rejects_manifest_not_triggering_quick_xml_gate(self) -> None:
+    def test_rejects_manifest_not_triggering_downstream_api_gate(self) -> None:
         self.repo.replace(
-            "issue-185-spreadsheet-advisories.yml", '      - "Cargo.toml"\n', ""
+            "ci.yml",
+            "          Cargo.toml Cargo.lock src/lib.rs scripts/check_removed_ssh_api.py \\\n",
+            "          Cargo.lock src/lib.rs scripts/check_removed_ssh_api.py \\\n",
         )
-        self.assert_rejected("fixture Cargo.toml")
+        self.assert_rejected("required path 'Cargo.toml'")
 
-    def test_rejects_lockfile_not_triggering_ssh_dependency_gate(self) -> None:
-        self.repo.replace("issue-186-ssh-removal.yml", '      - "Cargo.lock"\n', "")
-        self.assert_rejected("fixture Cargo.lock")
+    def test_rejects_lockfile_not_triggering_downstream_api_gate(self) -> None:
+        self.repo.replace(
+            "ci.yml",
+            "          Cargo.toml Cargo.lock src/lib.rs scripts/check_removed_ssh_api.py \\\n",
+            "          Cargo.toml src/lib.rs scripts/check_removed_ssh_api.py \\\n",
+        )
+        self.assert_rejected("required path 'Cargo.lock'")
 
     def test_rejects_public_api_not_triggering_ssh_api_gate(self) -> None:
-        self.repo.replace("issue-186-ssh-removal.yml", '      - "src/lib.rs"\n', "")
-        self.assert_rejected("fixture public API")
+        self.repo.replace(
+            "ci.yml",
+            "          Cargo.toml Cargo.lock src/lib.rs scripts/check_removed_ssh_api.py \\\n",
+            "          Cargo.toml Cargo.lock scripts/check_removed_ssh_api.py \\\n",
+        )
+        self.assert_rejected("required path 'src/lib.rs'")
 
     def test_rejects_disabled_required_matrix(self) -> None:
         self.repo.replace(
-            "issue-186-ssh-removal.yml",
-            "  dependency-graph:\n",
-            "  dependency-graph:\n    if: false\n",
+            "ci.yml",
+            "  test:\n",
+            "  test:\n    if: false\n",
         )
-        self.assert_rejected("fixture Cargo.toml")
+        self.assert_rejected("fixture ordinary source")
+
+    def test_rejects_if_false_canonical_audit_step(self) -> None:
+        self.repo.replace(
+            "ci.yml",
+            "    - name: Run the one full Cargo audit and retain named advisory diagnostics\n",
+            "    - name: Run the one full Cargo audit and retain named advisory diagnostics\n"
+            "      if: false\n",
+        )
+        self.assert_rejected("exactly one full cargo audit; found 0")
+
+    def test_rejects_if_false_removed_package_step(self) -> None:
+        self.repo.replace(
+            "ci.yml",
+            "    - name: Prove removed SSH and RSA packages stay out of the resolved graph\n",
+            "    - name: Prove removed SSH and RSA packages stay out of the resolved graph\n"
+            "      if: false\n",
+        )
+        self.assert_rejected("grep -Eq")
+
+    def test_rejects_if_false_downstream_api_step(self) -> None:
+        self.repo.replace(
+            "ci.yml",
+            "      if: steps.security-paths.outputs.removed_ssh_api == 'true'\n"
+            "      run: |\n"
+            "        python3 scripts/check_removed_ssh_api.py\n",
+            "      if: false\n"
+            "      run: |\n"
+            "        python3 scripts/check_removed_ssh_api.py\n",
+        )
+        self.assert_rejected("active downstream removed-API step")
 
     def test_rejects_advisory_marker_only_in_comment(self) -> None:
         self.repo.replace(
-            "issue-185-spreadsheet-advisories.yml",
-            '          minimum=0.41.0\n',
-            '          # minimum=0.41.0\n          minimum=0.40.0\n',
+            "ci.yml",
+            "          'RUSTSEC-2026-0194 is excluded by quick-xml >= 0.41.0' \\\n",
+            "          # RUSTSEC-2026-0194 is excluded by quick-xml >= 0.41.0 \\\n",
         )
-        self.assert_rejected("security marker '0.41.0'")
+        self.repo.replace(
+            "ci.yml",
+            '              .advisory.id != "RUSTSEC-2026-0194"\n',
+            '              .advisory.id != "RUSTSEC-2099-9999"\n',
+        )
+        self.assert_rejected("security marker 'RUSTSEC-2026-0194'")
 
 
 class CurrentWorkflowFanoutTests(unittest.TestCase):

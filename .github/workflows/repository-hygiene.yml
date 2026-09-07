@@ -22,7 +22,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install workflow parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
       - name: Check the current tracked tree
         run: python3 scripts/check_repository_hygiene.py
       - name: Run repository hygiene regressions
         run: python3 scripts/test_repository_hygiene.py
+      - name: Reject restoration of the removed SSH surface
+        run: python3 scripts/check_no_ssh_surface.py
+      - name: Run removed SSH surface regressions
+        run: python3 scripts/test_no_ssh_surface.py
+      - name: Check pull-request workflow fan-out
+        run: python3 scripts/check_workflow_fanout.py
+      - name: Run workflow fan-out mutation regressions
+        run: python3 scripts/test_workflow_fanout.py
