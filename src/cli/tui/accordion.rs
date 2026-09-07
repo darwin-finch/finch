@@ -478,16 +478,18 @@ mod tests {
         );
     }
 
+    /// Production reaches this row constantly: `query_processor` creates the
+    /// query WorkUnit empty and it stays empty for the whole provider round
+    /// trip, and a stream error or an unstageable tool round terminalises that
+    /// same empty unit. With no body the accordion is not expandable, so the
+    /// label is the row's entire text — it must be readable, not a bare glyph.
     #[test]
-    fn test_successful_one_line_program_source_collapses_but_stays_inspectable() {
-        let work = Arc::new(WorkUnit::new("program"));
-        work.set_program_source("lisp");
-        work.set_response("(say \"Hello, Shammah!\")");
-        work.set_complete();
-        let message: MessageRef = work.clone();
+    fn test_assistant_row_without_words_renders_readable_text_not_a_bare_glyph() {
         let colors = ColorScheme::default();
         let state = AccordionState::default();
 
+        let pending = Arc::new(WorkUnit::new("Channeling"));
+        let message: MessageRef = pending;
         let rendered = state
             .render_message(&message, &colors)
             .into_iter()
@@ -495,59 +497,48 @@ mod tests {
             .collect::<Vec<_>>();
         let transcript = rendered.join("\n");
 
-        assert_eq!(
-            rendered.len(),
-            1,
-            "invariant: a successfully executed one-line generated program collapses to \
-             a single disclosure row instead of stacking its source (#350); \
+        assert!(
+            !transcript.contains("Assistant response"),
+            "invariant: the internal `Assistant response` placeholder never reaches the \
+             screen (#350); rendered transcript:\n{transcript}"
+        );
+        assert!(
+            transcript.contains("Channeling"),
+            "invariant: an assistant row with nothing to show yet still carries readable \
+             text — this row is on screen for the entire provider round trip and a bare \
+             glyph would leave it unspeakable (#350, Key Principle 5); \
              rendered transcript:\n{transcript}"
         );
         assert!(
-            !transcript.contains("(say"),
-            "invariant: successful program source is implementation detail behind the \
-             disclosure control; rendered transcript:\n{transcript}"
+            rendered[0].chars().any(char::is_alphabetic),
+            "invariant: the rendered header line contains letters, not glyphs alone; \
+             header was {:?}; rendered transcript:\n{transcript}",
+            rendered[0]
         );
 
-        let expanded = state
-            .render_message_fully_expanded(&message, &colors)
-            .into_iter()
-            .map(|line| line.text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            expanded.contains("(say \"Hello, Shammah!\")"),
-            "invariant: the exact program source stays inspectable through disclosure; \
-             expanded transcript:\n{expanded}"
-        );
-        let canonical = work.complete_transcript(&colors);
-        assert!(
-            canonical.contains("(say \"Hello, Shammah!\")"),
-            "invariant: presentation-only collapsing never removes source from the \
-             canonical transcript; canonical transcript:\n{canonical}"
-        );
-    }
-
-    #[test]
-    fn test_failed_program_source_stays_expanded_and_actionable() {
-        let work = Arc::new(WorkUnit::new("program"));
-        work.set_program_source("lisp");
-        work.set_response("(say \"boom\")");
-        work.set_failed();
-        let message: MessageRef = work;
-        let colors = ColorScheme::default();
-        let state = AccordionState::default();
-
-        let rendered = state
-            .render_message(&message, &colors)
+        let failed = Arc::new(WorkUnit::new("Channeling"));
+        failed.set_failed();
+        let failed_message: MessageRef = failed;
+        let failed_rendered = state
+            .render_message(&failed_message, &colors)
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
-        let transcript = rendered.join("\n");
+        let failed_transcript = failed_rendered.join("\n");
 
         assert!(
-            transcript.contains("(say \"boom\")"),
-            "invariant: a failed generated program stays source-oriented and expanded so \
-             the failure is actionable (#350); rendered transcript:\n{transcript}"
+            failed_transcript.contains("Assistant turn failed"),
+            "invariant: a turn that died before its first token says so in words rather \
+             than presenting as an ordinary finished row (#350); \
+             rendered transcript:\n{failed_transcript}"
+        );
+        assert!(
+            failed_transcript.contains('\u{2298}')
+                && !failed_transcript.contains('\u{23fa}')
+                && !failed_transcript.contains('\u{25cb}'),
+            "invariant: a failed assistant turn carries its own mark and never the \
+             completed or in-progress glyph, so a dead query cannot be read as an \
+             answered or a still-running one; rendered transcript:\n{failed_transcript}"
         );
     }
 
