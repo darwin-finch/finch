@@ -2891,8 +2891,8 @@ impl BrainStore {
             Ok(entries) => entries,
             Err(_) => return,
         };
-        let mut failing = HashSet::new();
-        let mut newly_failing = Vec::new();
+        let mut failing: Vec<(String, anyhow::Error)> = Vec::new();
+        let mut loaded: HashSet<String> = HashSet::new();
         for entry in entries.flatten() {
             if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 continue;
@@ -2903,40 +2903,58 @@ impl BrainStore {
             if Self::validate_name(&name).is_err() {
                 continue;
             }
-            if let Err(error) = self.ensure_loaded(&name) {
-                if failing.insert(name.clone()) {
-                    newly_failing.push((name, error));
+            match self.ensure_loaded(&name) {
+                Ok(()) => {
+                    loaded.insert(name);
                 }
+                Err(error) => failing.push((name, error)),
             }
         }
 
         // Log the edges, not the level. A Brain that cannot be replayed stays
         // that way until someone repairs it, so a line per pass is unbounded
         // growth describing an unchanging fact.
-        let recovered: Vec<String> = {
+        //
+        // The transition is decided against the *previous* pass's set, captured
+        // before it is replaced. An earlier version of this built a fresh
+        // per-pass set and asked whether a name was new to *that*, which is
+        // true for everything that failed and so suppressed nothing — it
+        // shipped the defect under a message claiming it was fixed.
+        //
+        // Recovery requires the Brain to have been enumerated and loaded this
+        // pass, not merely to be absent from the failing list. A Brain that was
+        // deleted is also absent, and reporting "became loadable again; its
+        // schedules are scheduled once more" for a directory that no longer
+        // exists is two false claims in one line.
+        let (newly_failing, recovered): (Vec<(String, anyhow::Error)>, Vec<String>) = {
             let mut known = self
                 .unloadable_brains
                 .lock()
                 .expect("unloadable Brain registry poisoned");
-            let recovered = known
+            let newly_failing: Vec<(String, anyhow::Error)> = failing
+                .into_iter()
+                .filter(|(name, _)| !known.contains(name))
+                .collect();
+            let recovered: Vec<String> = known
                 .iter()
-                .filter(|name| !failing.contains(*name))
+                .filter(|name| loaded.contains(*name))
                 .cloned()
                 .collect();
-            *known = failing.iter().cloned().collect();
-            recovered
+            for name in &recovered {
+                known.remove(name);
+            }
+            for (name, _) in &newly_failing {
+                known.insert(name.clone());
+            }
+            (newly_failing, recovered)
         };
 
-        for (name, error) in newly_failing
-            .into_iter()
-            .filter(|(name, _)| !recovered.contains(name))
-        {
+        for (name, error) in newly_failing {
             tracing::warn!(
                 brain = %name,
                 %error,
                 "Brain could not be loaded while warming the schedule index; its \
-                 schedules will not be delivered until it is repaired. This is \
-                 logged once per transition, not once per warm"
+                 schedules will not be delivered until it is repaired"
             );
         }
         for name in recovered {
