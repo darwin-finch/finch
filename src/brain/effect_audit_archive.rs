@@ -135,7 +135,7 @@ impl EffectAuditActiveJournal {
         Self::open_with_bound(brain_directory, MAX_ACTIVE_JOURNAL_BYTES)
     }
 
-    fn open_with_bound(brain_directory: &Path, max_bytes: u64) -> Result<Self> {
+    pub(crate) fn open_with_bound(brain_directory: &Path, max_bytes: u64) -> Result<Self> {
         let directory = brain_directory.join("effect-audit-replay");
         reject_symlink(&directory)?;
         super::store::create_dir_all_durable(&directory)?;
@@ -194,6 +194,13 @@ impl EffectAuditActiveJournal {
                     .with_context(|| format!("decode active effect-audit transition #{seq}"))?,
             ));
         }
+        for pair in transitions.windows(2) {
+            anyhow::ensure!(
+                pair[0].0 < pair[1].0,
+                "effect-audit active journal has duplicate or reordered sequence {}",
+                pair[1].0
+            );
+        }
         Ok(transitions)
     }
 
@@ -223,6 +230,23 @@ impl EffectAuditActiveJournal {
         Ok(std::fs::metadata(&self.path)
             .with_context(|| format!("stat {}", self.path.display()))?
             .len())
+    }
+
+    fn diagnose_bound_after_commit(&self) {
+        match self.file_bytes() {
+            Ok(bytes) if bytes > self.max_bytes => {
+                tracing::error!(path = %self.path.display(), bytes, max_bytes = self.max_bytes,
+                    "effect-audit active journal exceeded its preflight durable byte bound after commit");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // The SQLite commit is already authoritative. A diagnostic
+                // metadata failure must not make the caller leave its live
+                // projection behind that durable sequence.
+                tracing::error!(path = %self.path.display(), %error,
+                    "could not measure effect-audit active journal after durable commit");
+            }
+        }
     }
 
     pub(crate) fn ensure_reserve_capacity(
@@ -279,10 +303,7 @@ impl EffectAuditActiveJournal {
                 params![seq as i64, identity, encoded, encoded_len as i64],
             )
             .with_context(|| format!("append active effect-audit transition #{seq}"))?;
-        if self.file_bytes()? > self.max_bytes {
-            tracing::error!(path = %self.path.display(),
-                "effect-audit active journal exceeded its preflight durable byte bound after commit");
-        }
+        self.diagnose_bound_after_commit();
         Ok(())
     }
 
@@ -330,10 +351,7 @@ impl EffectAuditActiveJournal {
         // canonical writer to reuse these committed sequence numbers. Quota
         // admission is checked before Reserve; a filesystem-size overshoot is
         // therefore diagnostic after commit, never an ambiguous outcome.
-        if self.file_bytes()? > self.max_bytes {
-            tracing::error!(path = %self.path.display(),
-                "effect-audit active journal exceeded its preflight durable byte bound after batch commit");
-        }
+        self.diagnose_bound_after_commit();
         Ok(())
     }
 
@@ -481,6 +499,42 @@ impl EffectAuditReplayArchive {
         }
         newest.reverse();
         Ok(newest)
+    }
+
+    /// Load canonical fences newer than a resident projection. This is used
+    /// only while holding the root-level Brain commit guard, after reopening
+    /// the manifest and reconciling its derived index.
+    pub(crate) fn load_after_seq(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, EffectAuditTransition)>> {
+        let mut fences = Vec::new();
+        for epoch in &self.manifest.epochs {
+            let path = self.directory.join(&epoch.file);
+            let connection = open_epoch(&path)?;
+            let mut statement = connection.prepare(
+                "SELECT seq, transition_json FROM fences WHERE seq > ?1 ORDER BY seq ASC",
+            )?;
+            let rows = statement.query_map(params![after_seq as i64], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (seq, encoded) = row?;
+                fences.push((
+                    seq,
+                    serde_json::from_slice(&encoded)
+                        .with_context(|| format!("decode effect-audit replay fence #{seq}"))?,
+                ));
+            }
+        }
+        for pair in fences.windows(2) {
+            anyhow::ensure!(
+                pair[0].0 < pair[1].0,
+                "effect-audit replay archive has duplicate or reordered sequence {}",
+                pair[1].0
+            );
+        }
+        Ok(fences)
     }
 
     pub(crate) fn lookup(
@@ -798,6 +852,18 @@ impl EffectAuditReplayArchive {
             .write(true)
             .open(&path)?
             .set_len(MAX_REPLAY_ARCHIVE_BYTES)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_index_identity_for_test(
+        &self,
+        identity: &EffectAuditIdentity,
+    ) -> Result<()> {
+        open_index(&self.index_path)?.execute(
+            "DELETE FROM fence_locations WHERE identity = ?1",
+            params![identity_key(identity)?],
+        )?;
         Ok(())
     }
 }

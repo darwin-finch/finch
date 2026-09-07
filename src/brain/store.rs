@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -25,6 +26,7 @@ const JOURNAL_TAIL_CHUNK_BYTES: usize = 8 * 1024;
 const MAX_RETAINED_TERMINAL_EFFECT_AUDITS: usize = 128;
 const BRAIN_METADATA_VERSION: u32 = 1;
 const BRAIN_INITIALIZATION_VERSION: u32 = 1;
+const MAX_JOURNAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
 const DEFAULT_INITIALIZATION_SOURCE: &str = "(define (finch-brain-initialized) : int 1)";
 
@@ -1218,7 +1220,7 @@ pub struct BrainStore {
     /// This is deliberately not replayed: restored queued work is transport
     /// independent until a new connection explicitly dispatches it.
     run_connection_authority: Arc<RwLock<RunConnectionAuthority>>,
-    disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
+    disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, Option<BrainId>, RunId)>>>,
     effect_audit_storage: Arc<std::sync::Mutex<HashMap<String, EffectAuditStorage>>>,
     /// Active schedules across every resident Brain, ordered by due time (#374).
     schedule_index: Arc<RwLock<ScheduleIndex>>,
@@ -1251,9 +1253,13 @@ pub struct BrainStore {
         >,
     >,
     #[cfg(test)]
+    retry_incarnation_validation_failures: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     cold_load_entry_barrier: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
     #[cfg(test)]
     append_tail_bytes_read: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    effect_audit_max_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -1273,12 +1279,42 @@ struct EffectAuditStorage {
 }
 
 struct BrainCommitGuard {
-    file: std::fs::File,
+    file: Option<std::fs::File>,
+    key: Option<PathBuf>,
+}
+
+thread_local! {
+    /// Store methods are synchronous once they enter canonical persistence,
+    /// but several high-level operations intentionally nest append/rewrite
+    /// helpers. Keep one OS lock per thread/name while allowing those nested
+    /// helpers to share the already-held authority.
+    static HELD_BRAIN_COMMIT_GUARDS: RefCell<HashMap<PathBuf, usize>> =
+        RefCell::new(HashMap::new());
 }
 
 impl Drop for BrainCommitGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let release_file = HELD_BRAIN_COMMIT_GUARDS.with(|held| {
+            let mut held = held.borrow_mut();
+            let depth = held
+                .get_mut(&key)
+                .expect("canonical Brain guard depth disappeared");
+            *depth -= 1;
+            if *depth == 0 {
+                held.remove(&key);
+                true
+            } else {
+                false
+            }
+        });
+        if release_file {
+            if let Some(file) = self.file.take() {
+                let _ = FileExt::unlock(&file);
+            }
+        }
     }
 }
 
@@ -1319,7 +1355,13 @@ impl BrainStore {
         status: BrainRunStatus,
         detail: String,
     ) {
-        let key = (name.clone(), run_id);
+        let incarnation = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(&name)
+            .map(|state| state.brain_id);
+        let key = (name.clone(), incarnation, run_id);
         if !self
             .disconnect_retry_owners
             .lock()
@@ -1352,6 +1394,25 @@ impl BrainStore {
             }
             let mut delay = std::time::Duration::from_millis(10);
             loop {
+                if let Some(brain_id) = incarnation {
+                    match store.durable_incarnation_is_active(&name, brain_id) {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(error) => {
+                            #[cfg(test)]
+                            store
+                                .retry_incarnation_validation_failures
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                                "disconnect retry could not validate its Brain incarnation");
+                            let jitter = u64::from(run_id.0.as_bytes()[0]) % 7;
+                            tokio::time::sleep(delay + std::time::Duration::from_millis(jitter))
+                                .await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                            continue;
+                        }
+                    }
+                }
                 match store.terminalize_run_with_result_if_active(
                     &name,
                     &sender,
@@ -1411,7 +1472,13 @@ impl BrainStore {
         sender: String,
         run_id: RunId,
     ) {
-        let key = (name.clone(), run_id);
+        let incarnation = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(&name)
+            .map(|state| state.brain_id);
+        let key = (name.clone(), incarnation, run_id);
         if !self
             .disconnect_retry_owners
             .lock()
@@ -1433,6 +1500,23 @@ impl BrainStore {
         runtime.spawn(async move {
             let mut delay = std::time::Duration::from_millis(10);
             loop {
+                if let Some(brain_id) = incarnation {
+                    match store.durable_incarnation_is_active(&name, brain_id) {
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        Err(error) => {
+                            #[cfg(test)]
+                            store
+                                .retry_incarnation_validation_failures
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                                "cancellation retry could not validate its Brain incarnation");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                            continue;
+                        }
+                    }
+                }
                 let publication = match store.acquire_run_publication(&name, run_id).await {
                     Ok(publication) => publication,
                     Err(error) => {
@@ -1534,9 +1618,15 @@ impl BrainStore {
             #[cfg(test)]
             disconnect_retry_entry_pause: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
+            retry_incarnation_validation_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
             cold_load_entry_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             append_tail_bytes_read: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            effect_audit_max_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
+                super::effect_audit_archive::MAX_ACTIVE_JOURNAL_BYTES,
+            )),
         }
     }
 
@@ -1885,6 +1975,9 @@ impl BrainStore {
         })
     }
 
+    pub(crate) fn create_incarnation(&self, name: &str) -> Result<BrainSnapshot> {
+        self.snapshot(name)
+    }
     /// Mint daemon-local authority for the currently active runner lease.
     pub(crate) fn issue_effect_audit_authority(
         &self,
@@ -1968,6 +2061,7 @@ impl BrainStore {
             .iter()
             .map(|lease_id| lease_id.0)
             .collect::<std::collections::BTreeSet<_>>();
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -2026,6 +2120,7 @@ impl BrainStore {
     ) -> Result<usize> {
         let name = Self::validate_name(&grant.brain)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -2120,6 +2215,7 @@ impl BrainStore {
     ) -> Result<crate::runtime::effect_log::EffectAuditIdentity> {
         let name = Self::validate_name(&grant.brain)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -2177,6 +2273,7 @@ impl BrainStore {
     ) -> Result<crate::runtime::effect_log::HostEffectPermit> {
         let name = Self::validate_name(&grant.brain)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -2240,10 +2337,44 @@ impl BrainStore {
                 "a physical host outcome requires its durable permit"
             );
         }
+        let _writer = self.acquire_writer_guard(name)?;
+        let transition = crate::runtime::effect_log::EffectAuditTransition::Finish {
+            identity,
+            authority_id: grant.authority.authority_id,
+            outcome,
+        };
+        let needs_archived_lookup = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .effect_audits
+            .get(&identity)
+            .is_none();
+        let archived_fence = if self.root.is_some() && needs_archived_lookup {
+            self.with_effect_audit_storage_mut(name, BrainId(identity.brain_id), |storage| {
+                storage.replay.lookup(&identity)
+            })?
+            .flatten()
+        } else {
+            None
+        };
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
             .context("Brain was removed concurrently")?;
+        if state.effect_audits.get(&identity).is_none() {
+            if let Some(fence) = archived_fence {
+                let mut archived = crate::runtime::effect_log::EffectAuditReducer::default();
+                archived.apply(fence)?;
+                anyhow::ensure!(
+                    !archived.validate(&transition)?,
+                    "archived terminal effect retry unexpectedly changed state"
+                );
+                return Ok(());
+            }
+        }
         if permit.is_none() {
             anyhow::ensure!(
                 state
@@ -2256,15 +2387,7 @@ impl BrainStore {
                 "begun effect outcome requires its durable host permit"
             );
         }
-        self.append_effect_audit_transition_locked(
-            name,
-            state,
-            crate::runtime::effect_log::EffectAuditTransition::Finish {
-                identity,
-                authority_id: grant.authority.authority_id,
-                outcome,
-            },
-        )?;
+        self.append_effect_audit_transition_locked(name, state, transition)?;
         Ok(())
     }
 
@@ -2302,6 +2425,33 @@ impl BrainStore {
         transition: crate::runtime::effect_log::EffectAuditTransition,
     ) -> Result<bool> {
         if !state.effect_audits.validate(&transition)? {
+            let identity = transition.identity();
+            if self.root.is_some()
+                && state
+                    .effect_audits
+                    .get(&identity)
+                    .is_some_and(|entry| entry.state.is_terminal())
+            {
+                let archived = self
+                    .with_effect_audit_storage_mut(name, state.brain_id, |storage| {
+                        storage.replay.lookup(&identity)
+                    })?
+                    .flatten()
+                    .is_some();
+                if archived {
+                    let observer = state
+                        .effect_audits
+                        .get(&identity)
+                        .expect("terminal effect audit checked above")
+                        .observer_projection();
+                    state.effect_audits.forget_archived(&identity)?;
+                    state.recent_effect_audits.push_back(observer);
+                    while state.recent_effect_audits.len() > MAX_RETAINED_TERMINAL_EFFECT_AUDITS {
+                        state.recent_effect_audits.pop_front();
+                    }
+                    return Ok(false);
+                }
+            }
             self.compact_terminal_effect_audits_locked(
                 name,
                 state,
@@ -2374,7 +2524,7 @@ impl BrainStore {
         state: &mut BrainState,
         transitions: Vec<crate::runtime::effect_log::EffectAuditTransition>,
     ) -> Result<usize> {
-        let mut events = Vec::new();
+        let mut events: Vec<BrainEvent> = Vec::new();
         let mut seen = HashSet::new();
         let mut next_seq = state.revision + 1;
         for transition in transitions {
@@ -2621,6 +2771,7 @@ impl BrainStore {
     ) -> Result<BrainSchedule> {
         let name = Self::validate_name(name)?;
         let initialization = self.initialization(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -2814,6 +2965,7 @@ impl BrainStore {
             }
         }
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3039,6 +3191,7 @@ impl BrainStore {
     pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3224,6 +3377,7 @@ impl BrainStore {
         let name = Self::validate_name(name)?;
         let cancelled_by = validate_participant_subject("schedule canceller", cancelled_by)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3334,6 +3488,7 @@ impl BrainStore {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("run initiator", sender)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3412,6 +3567,7 @@ impl BrainStore {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("run initiator", sender)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3486,6 +3642,7 @@ impl BrainStore {
     ) -> Result<BrainRun> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3552,6 +3709,7 @@ impl BrainStore {
         if publication.cancel_requested() || self.run_cancellation_reserved(name, run_id)? {
             return Ok(None);
         }
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3646,6 +3804,7 @@ impl BrainStore {
     ) -> Result<RunId> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3725,6 +3884,7 @@ impl BrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut publication = self.acquire_run_publication(name, run_id).await?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -3967,6 +4127,7 @@ impl BrainStore {
     ) -> Result<()> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4046,6 +4207,7 @@ impl BrainStore {
         self.ensure_loaded(name)?;
         let now = unix_millis();
         let expires_ms = now.saturating_add(ttl_ms);
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4091,6 +4253,7 @@ impl BrainStore {
     pub fn release_runner_lease(&self, name: &str, lease_id: RunnerLeaseId) -> Result<()> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4151,6 +4314,7 @@ impl BrainStore {
         }
         self.ensure_loaded(name)?;
         let now = unix_millis();
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4246,6 +4410,7 @@ impl BrainStore {
         }
         self.ensure_loaded(name)?;
         let now = unix_millis();
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4310,6 +4475,7 @@ impl BrainStore {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("handoff canceller", sender)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4380,6 +4546,7 @@ impl BrainStore {
     ) -> Result<bool> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4407,6 +4574,7 @@ impl BrainStore {
     ) -> Result<bool> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4441,6 +4609,7 @@ impl BrainStore {
         let attachment_id = attachment_id.unwrap_or_else(AttachmentId::new);
         let connection_id = ConnectionId::new();
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4482,6 +4651,7 @@ impl BrainStore {
     ) -> Result<BrainAttachment> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4527,6 +4697,7 @@ impl BrainStore {
     ) -> Result<bool> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4549,6 +4720,7 @@ impl BrainStore {
     ) -> Result<()> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4589,12 +4761,8 @@ impl BrainStore {
     pub fn remove_if_unused(&self, name: &str) -> Result<bool> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
-        {
-            // Keep the state lock from the eligibility check through removal.
-            // Otherwise a concurrent attach could recreate a live participant
-            // between the check and deletion of the provisional directory.
-            let mut brains = self.brains.write().expect("shared brain lock poisoned");
-            let state = brains.get(name).context("Brain was removed concurrently")?;
+        let _writer = self.acquire_writer_guard(name)?;
+        let is_unused = |state: &BrainState| {
             let has_substantive_history = state.events.iter().any(|event| {
                 matches!(
                     event.kind,
@@ -4624,41 +4792,47 @@ impl BrainStore {
                 .attachments
                 .values()
                 .any(|attachment| attachment.connection_id.is_some());
-            if has_substantive_history || has_live_attachment || state.runner_lease.is_some() {
+            !has_substantive_history && !has_live_attachment && state.runner_lease.is_none()
+        };
+        if self.root.is_none() {
+            // Rootless stores have no filesystem guard, so keep the state lock
+            // from eligibility through removal.
+            let mut brains = self.brains.write().expect("shared brain lock poisoned");
+            let state = brains.get(name).context("Brain was removed concurrently")?;
+            if !is_unused(state) {
                 return Ok(false);
-            }
-
-            if let Some(runtime) = self
-                .runtimes
-                .read()
-                .expect("shared brain runtime lock poisoned")
-                .get(name)
-                .cloned()
-            {
-                runtime.clear_authority_sink()?;
-            }
-            if let Some(root) = &self.root {
-                let directory = root.join(name);
-                if directory.exists() {
-                    std::fs::remove_dir_all(&directory)
-                        .with_context(|| format!("remove unused Brain {}", directory.display()))?;
-                }
             }
             brains.remove(name);
             self.forget_schedules_locked(name);
+        } else {
+            // The per-name commit guard excludes every writer, including other
+            // BrainStore instances, so filesystem work need not stall the
+            // global resident-state lock for unrelated Brains.
+            let unused = {
+                let brains = self.brains.read().expect("shared brain lock poisoned");
+                let state = brains.get(name).context("Brain was removed concurrently")?;
+                is_unused(state)
+            };
+            if !unused {
+                return Ok(false);
+            }
+            let root = self.root.as_ref().expect("persistent branch checked above");
+            let directory = root.join(name);
+            if directory.exists() {
+                std::fs::remove_dir_all(&directory)
+                    .with_context(|| format!("remove unused Brain {}", directory.display()))?;
+                if let Err(error) = sync_directory(root) {
+                    tracing::error!(brain = name, %error,
+                        "unused Brain directory was removed but parent sync reported an error");
+                }
+            }
+            if let Err(error) = self.clear_cached_name(name) {
+                tracing::error!(brain = name, %error,
+                    "unused Brain removal completed but runtime authority cleanup reported an error");
+            }
+            return Ok(true);
         }
-        self.runtimes
-            .write()
-            .expect("shared brain runtime lock poisoned")
-            .remove(name);
-        self.initializations
-            .write()
-            .expect("shared Brain initialization lock poisoned")
-            .remove(name);
-        self.execution_locks
-            .write()
-            .expect("shared brain execution-lock map poisoned")
-            .remove(name);
+        self.clear_cached_name(name)?;
         Ok(true)
     }
 
@@ -4693,6 +4867,7 @@ impl BrainStore {
     ) -> Result<BrainAttachment> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4738,6 +4913,58 @@ impl BrainStore {
         self.archive_with_expected_identity(name, None)
     }
 
+    fn clear_cached_name(&self, name: &str) -> Result<()> {
+        let authority_result = if let Some(runtime) = self
+            .runtimes
+            .read()
+            .expect("shared brain runtime lock poisoned")
+            .get(name)
+            .cloned()
+        {
+            runtime.clear_authority_sink()
+        } else {
+            Ok(())
+        };
+        self.brains
+            .write()
+            .expect("shared brain lock poisoned")
+            .remove(name);
+        self.forget_schedules_locked(name);
+        self.runtimes
+            .write()
+            .expect("shared brain runtime lock poisoned")
+            .remove(name);
+        self.initializations
+            .write()
+            .expect("shared Brain initialization lock poisoned")
+            .remove(name);
+        self.runtime_checkpoints
+            .write()
+            .expect("shared Brain runtime-checkpoint lock poisoned")
+            .remove(name);
+        self.execution_locks
+            .write()
+            .expect("shared brain execution-lock map poisoned")
+            .remove(name);
+        self.run_publication_gates
+            .write()
+            .expect("shared Brain run-gate map poisoned")
+            .retain(|(brain, _), _| brain != name);
+        {
+            let mut authority = self
+                .run_connection_authority
+                .write()
+                .expect("shared Brain run-authority map poisoned");
+            authority.owners.retain(|(brain, _), _| brain != name);
+            authority.retired.retain(|(brain, _, _)| brain != name);
+        }
+        self.effect_audit_storage
+            .lock()
+            .expect("effect-audit storage map poisoned")
+            .remove(name);
+        authority_result
+    }
+
     pub(crate) fn archive_authorized(
         &self,
         name: &str,
@@ -4752,70 +4979,71 @@ impl BrainStore {
         expected_brain_id: Option<BrainId>,
     ) -> Result<Option<PathBuf>> {
         let name = Self::validate_name(name)?;
+        // Serialize with cold installation in this process, then take the
+        // root-level OS guard shared by every store using this root. The
+        // identity check and namespace rename must be one canonical commit:
+        // otherwise a stale writer can validate the old metadata between the
+        // check and rename and append into the incarnation being quarantined.
         let authority = self.load_authority(name);
         let _load = authority.lock().expect("Brain load authority poisoned");
-        let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let _commit = self.acquire_commit_guard(name)?;
-        if let Some(expected) = expected_brain_id {
-            let current = self.identity_without_replay(name)?;
-            anyhow::ensure!(
-                current == expected,
-                "Brain identity changed before authorized archive"
-            );
-        }
         let archived_to = if let Some(root) = &self.root {
             let source = root.join(name);
-            if source.exists() {
+            if !source.exists() {
+                None
+            } else {
+                let current = self.identity_without_replay(name)?;
+                if let Some(expected) = expected_brain_id {
+                    anyhow::ensure!(
+                        current == expected,
+                        "Brain identity changed before authorized archive"
+                    );
+                }
                 let archive_root = root
                     .parent()
                     .map(|parent| parent.join("brains-archive"))
                     .unwrap_or_else(|| root.join("archive"));
-                std::fs::create_dir_all(&archive_root)
-                    .with_context(|| format!("create {}", archive_root.display()))?;
-                let destination = archive_root.join(format!("{name}-{}", unix_millis()));
+                create_dir_all_durable(&archive_root)?;
+                let destination = archive_root.join(format!("{name}-{}", current.0));
+                anyhow::ensure!(
+                    !destination.exists(),
+                    "Brain quarantine destination already exists"
+                );
                 std::fs::rename(&source, &destination).with_context(|| {
                     format!("archive {} as {}", source.display(), destination.display())
                 })?;
+                for directory in [root.as_path(), archive_root.as_path()] {
+                    if let Err(error) = sync_directory(directory) {
+                        // The complete directory is already visible at its
+                        // deterministic quarantine destination. Reporting a
+                        // failure would falsely claim the source was retained.
+                        tracing::error!(path = %directory.display(), %error,
+                            quarantine = %destination.display(),
+                            "Brain quarantine rename completed but directory sync reported an error");
+                    }
+                }
                 Some(destination)
-            } else {
-                None
             }
         } else {
+            if let Some(expected) = expected_brain_id {
+                let current = self
+                    .brains
+                    .read()
+                    .expect("shared brain lock poisoned")
+                    .get(name)
+                    .context("Brain does not exist")?
+                    .brain_id;
+                anyhow::ensure!(
+                    current == expected,
+                    "Brain identity changed before authorized archive"
+                );
+            }
             None
         };
-        if let Some(runtime) = self
-            .runtimes
-            .read()
-            .expect("shared brain runtime lock poisoned")
-            .get(name)
-            .cloned()
-        {
-            runtime.clear_authority_sink()?;
+        if let Err(error) = self.clear_cached_name(name) {
+            tracing::error!(brain = name, %error,
+                "Brain quarantine completed but runtime authority cleanup reported an error");
         }
-        brains.remove(name);
-        drop(brains);
-        // Without this the index keeps pointing at an archived Brain, the
-        // delivery loop selects it, and `queue_due_schedules` -> `ensure_loaded`
-        // -> `load_or_create_metadata` recreates the directory with a *new*
-        // BrainId. Archiving a Brain that had an active schedule would silently
-        // resurrect it as an empty one.
-        self.forget_schedules_locked(name);
-        self.runtimes
-            .write()
-            .expect("shared brain runtime lock poisoned")
-            .remove(name);
-        self.initializations
-            .write()
-            .expect("shared Brain initialization lock poisoned")
-            .remove(name);
-        self.execution_locks
-            .write()
-            .expect("shared brain execution-lock map poisoned")
-            .remove(name);
-        self.run_publication_gates
-            .write()
-            .expect("shared Brain run-gate map poisoned")
-            .retain(|(brain, _), _| brain != name);
         Ok(archived_to)
     }
 
@@ -4844,6 +5072,7 @@ impl BrainStore {
     pub fn push(&self, name: &str, sender: &str, kind: BrainEventKind) -> Result<BrainEvent> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4863,6 +5092,7 @@ impl BrainStore {
     ) -> Result<BrainMutationAppend> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4881,6 +5111,7 @@ impl BrainStore {
     ) -> Result<BrainApprovalDecisionReservation> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -4932,6 +5163,7 @@ impl BrainStore {
     ) -> Result<()> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -5083,6 +5315,7 @@ impl BrainStore {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("run initiator", sender)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -5280,6 +5513,7 @@ impl BrainStore {
     ) -> Result<BrainEvent> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -5624,11 +5858,12 @@ impl BrainStore {
     }
 
     fn ensure_loaded(&self, name: &str) -> Result<()> {
-        if self
-            .brains
-            .read()
-            .expect("shared brain lock poisoned")
-            .contains_key(name)
+        if self.root.is_none()
+            && self
+                .brains
+                .read()
+                .expect("shared brain lock poisoned")
+                .contains_key(name)
         {
             return Ok(());
         }
@@ -5644,13 +5879,61 @@ impl BrainStore {
         }
         let authority = self.load_authority(name);
         let _load = authority.lock().expect("Brain load authority poisoned");
-        if self
-            .brains
-            .read()
-            .expect("shared brain lock poisoned")
-            .contains_key(name)
-        {
-            return Ok(());
+        let _commit = self.acquire_commit_guard(name)?;
+        let resident_id = {
+            self.brains
+                .read()
+                .expect("shared brain lock poisoned")
+                .get(name)
+                .map(|state| state.brain_id)
+        };
+        if let Some(resident_id) = resident_id {
+            if self.root.is_none() {
+                return Ok(());
+            }
+            match self.validate_active_incarnation_under_commit_guard(name, resident_id) {
+                Ok(()) => {
+                    let (revision, terminal_candidates) = {
+                        let brains = self.brains.read().expect("shared brain lock poisoned");
+                        let state = brains.get(name).context("Brain was removed concurrently")?;
+                        (
+                            state.revision,
+                            state
+                                .effect_audits
+                                .entries()
+                                .values()
+                                .filter_map(|entry| {
+                                    entry.state.is_terminal().then_some(entry.intent.identity)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    let (durable_head, durable, archived) = self.read_refresh_under_commit_guard(
+                        name,
+                        resident_id,
+                        revision,
+                        &terminal_candidates,
+                    )?;
+                    let mut brains = self.brains.write().expect("shared brain lock poisoned");
+                    let state = brains
+                        .get_mut(name)
+                        .context("Brain was removed concurrently")?;
+                    anyhow::ensure!(
+                        state.brain_id == resident_id && state.revision == revision,
+                        "Brain projection changed outside canonical writer authority"
+                    );
+                    self.apply_refresh(name, state, durable_head, durable)?;
+                    Self::forget_archived_effects(state, &archived)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Brain '{name}' resident incarnation cannot be validated; it may have been archived or replaced"
+                        )
+                    });
+                }
+            }
         }
         let brain_id = self.load_or_create_metadata(name)?.brain_id;
         let initialization = self.load_or_create_initialization(name, brain_id)?;
@@ -5689,9 +5972,22 @@ impl BrainStore {
                 });
                 self.rewrite_events_under_commit_guard(name, &events)?;
             }
-            let segmented = self
-                .with_effect_audit_storage_mut(name, brain_id, |storage| storage.active.load())?
+            let (segmented, replayed) = self
+                .with_effect_audit_storage_mut(name, brain_id, |storage| {
+                    Ok((storage.active.load()?, storage.replay.load_after_seq(0)?))
+                })?
                 .unwrap_or_default();
+            let mut canonical_sequences = events.iter().map(|event| event.seq).collect::<Vec<_>>();
+            canonical_sequences.extend(segmented.iter().map(|(seq, _)| *seq));
+            canonical_sequences.extend(replayed.iter().map(|(seq, _)| *seq));
+            canonical_sequences.sort_unstable();
+            for pair in canonical_sequences.windows(2) {
+                anyhow::ensure!(
+                    pair[0] < pair[1],
+                    "Brain '{name}' has duplicate canonical event sequence {} across durable sources",
+                    pair[1]
+                );
+            }
             events.extend(segmented.into_iter().map(|(seq, transition)| BrainEvent {
                 schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                 brain_id,
@@ -5704,13 +6000,8 @@ impl BrainStore {
                 kind: BrainEventKind::EffectAuditTransition { transition },
             }));
             events.sort_by_key(|event| event.seq);
-            for pair in events.windows(2) {
-                anyhow::ensure!(
-                    pair[0].seq < pair[1].seq,
-                    "Brain '{name}' has duplicate or reordered canonical event sequence {}",
-                    pair[1].seq
-                );
-            }
+            // JSON and active source order were validated before this merge;
+            // sorting here is only for projection across distinct segments.
         }
         backfill_legacy_speculative_run_correlation(&mut events);
         let canonical_run_requests = events
@@ -6193,6 +6484,35 @@ impl BrainStore {
         Ok(())
     }
 
+    fn validate_active_incarnation_under_commit_guard(
+        &self,
+        name: &str,
+        brain_id: BrainId,
+    ) -> Result<()> {
+        let current = self.identity_without_replay(name)?;
+        anyhow::ensure!(
+            current == brain_id,
+            "Brain identity changed before canonical commit"
+        );
+        Ok(())
+    }
+
+    fn durable_incarnation_is_active(&self, name: &str, brain_id: BrainId) -> Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(true);
+        };
+        let _commit = self.acquire_commit_guard(name)?;
+        let metadata_path = root.join(name).join("metadata.json");
+        match std::fs::metadata(&metadata_path) {
+            Ok(_) => self
+                .identity_without_replay(name)
+                .map(|current| current == brain_id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("inspect Brain identity at {}", metadata_path.display())),
+        }
+    }
+
     fn load_or_create_metadata(&self, name: &str) -> Result<BrainMetadata> {
         let Some(root) = &self.root else {
             return Ok(BrainMetadata {
@@ -6202,9 +6522,9 @@ impl BrainStore {
             });
         };
         let directory = root.join(name);
+        let path = directory.join("metadata.json");
         create_dir_all_durable(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
-        let path = directory.join("metadata.json");
         if path.exists() {
             let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             let metadata: BrainMetadata = serde_json::from_slice(&bytes)
@@ -6240,8 +6560,14 @@ impl BrainStore {
                 let _ = std::fs::remove_file(&temporary);
                 let bytes = std::fs::read(&path)
                     .with_context(|| format!("read {} after metadata race", path.display()))?;
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parse {} after metadata race", path.display()))
+                let existing: BrainMetadata = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {} after metadata race", path.display()))?;
+                anyhow::ensure!(
+                    existing.version == BRAIN_METADATA_VERSION
+                        && existing.brain_id != BrainId::nil(),
+                    "unsupported or invalid Brain metadata after creation race"
+                );
+                Ok(existing)
             }
             Err(error) => {
                 let _ = std::fs::remove_file(&temporary);
@@ -6281,7 +6607,26 @@ impl BrainStore {
         };
         let directory = root.join(".canonical-seq-locks");
         create_dir_all_durable(&directory)?;
-        let path = directory.join(hex::encode(Sha256::digest(name.as_bytes())));
+        let file_name = hex::encode(Sha256::digest(name.as_bytes()));
+        let path = directory.join(&file_name);
+        let key = directory
+            .canonicalize()
+            .unwrap_or(directory)
+            .join(file_name);
+        if HELD_BRAIN_COMMIT_GUARDS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(depth) = held.get_mut(&key) {
+                *depth += 1;
+                true
+            } else {
+                false
+            }
+        }) {
+            return Ok(Some(BrainCommitGuard {
+                file: None,
+                key: Some(key),
+            }));
+        }
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -6290,7 +6635,13 @@ impl BrainStore {
             .with_context(|| format!("open {}", path.display()))?;
         file.lock_exclusive()
             .with_context(|| format!("lock canonical Brain sequence at {}", path.display()))?;
-        Ok(Some(BrainCommitGuard { file }))
+        HELD_BRAIN_COMMIT_GUARDS.with(|held| {
+            held.borrow_mut().insert(key.clone(), 1);
+        });
+        Ok(Some(BrainCommitGuard {
+            file: Some(file),
+            key: Some(key),
+        }))
     }
 
     fn read_tail_exact(&self, file: &mut std::fs::File, bytes: &mut [u8]) -> Result<()> {
@@ -6346,6 +6697,11 @@ impl BrainStore {
         let mut cursor = record_end;
         let record_start = loop {
             let start = cursor.saturating_sub(JOURNAL_TAIL_CHUNK_BYTES as u64);
+            anyhow::ensure!(
+                record_end.saturating_sub(start) <= MAX_JOURNAL_RECORD_BYTES as u64,
+                "canonical Brain journal {} final record exceeds the record bound",
+                path.display()
+            );
             let mut chunk = vec![0; (cursor - start) as usize];
             file.seek(SeekFrom::Start(start))?;
             self.read_tail_exact(&mut file, &mut chunk)?;
@@ -6360,6 +6716,11 @@ impl BrainStore {
         anyhow::ensure!(
             record_start < record_end,
             "canonical Brain journal {} ends with an empty record",
+            path.display()
+        );
+        anyhow::ensure!(
+            record_end - record_start <= MAX_JOURNAL_RECORD_BYTES as u64,
+            "canonical Brain journal {} final record exceeds the record bound",
             path.display()
         );
         let mut record = vec![0; (record_end - record_start) as usize];
@@ -6434,6 +6795,216 @@ impl BrainStore {
         Ok(journal_max.max(audit_max))
     }
 
+    fn read_refresh_under_commit_guard(
+        &self,
+        name: &str,
+        brain_id: BrainId,
+        revision: u64,
+        terminal_candidates: &[crate::runtime::effect_log::EffectAuditIdentity],
+    ) -> Result<(
+        u64,
+        Vec<BrainEvent>,
+        Vec<crate::runtime::effect_log::EffectAuditIdentity>,
+    )> {
+        if self.root.is_none() {
+            return Ok((revision, Vec::new(), Vec::new()));
+        }
+        self.validate_active_incarnation_under_commit_guard(name, brain_id)?;
+        let durable_head = self.durable_max_seq_under_commit_guard(name)?;
+        anyhow::ensure!(
+            durable_head >= revision,
+            "Brain '{name}' durable head {durable_head} regressed behind resident revision {}",
+            revision
+        );
+        let archived = self
+            .with_effect_audit_storage_mut(name, brain_id, |storage| {
+                let mut archived = Vec::new();
+                for identity in terminal_candidates {
+                    if storage.replay.lookup(identity)?.is_some() {
+                        archived.push(*identity);
+                    }
+                }
+                Ok(archived)
+            })?
+            .unwrap_or_default();
+        if durable_head == revision {
+            return Ok((durable_head, Vec::new(), archived));
+        }
+        let mut durable = self
+            .read_events(name)?
+            .into_iter()
+            .filter(|event| event.seq > revision)
+            .collect::<Vec<_>>();
+        let (active, replay) = self
+            .with_effect_audit_storage_mut(name, brain_id, |storage| {
+                Ok((
+                    storage
+                        .active
+                        .load()?
+                        .into_iter()
+                        .filter(|(seq, _)| *seq > revision)
+                        .collect::<Vec<_>>(),
+                    storage.replay.load_after_seq(revision)?,
+                ))
+            })?
+            .context("persistent effect-audit storage was unavailable")?;
+        for (seq, transition) in active.into_iter().chain(replay) {
+            durable.push(BrainEvent {
+                schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                brain_id,
+                seq,
+                environment_generation: self.environment.generation,
+                sender: "daemon/effect-audit-refresh".into(),
+                created_ms: 0,
+                run_id: Some(RunId(transition.identity().run_id)),
+                mutation: None,
+                kind: BrainEventKind::EffectAuditTransition { transition },
+            });
+        }
+        durable.sort_by_key(|event| event.seq);
+        for pair in durable.windows(2) {
+            anyhow::ensure!(
+                pair[0].seq < pair[1].seq,
+                "Brain '{name}' has duplicate canonical sequence {} across durable sources",
+                pair[1].seq
+            );
+        }
+        Ok((durable_head, durable, archived))
+    }
+
+    fn forget_archived_effects(
+        state: &mut BrainState,
+        archived: &[crate::runtime::effect_log::EffectAuditIdentity],
+    ) -> Result<()> {
+        for identity in archived {
+            let Some(entry) = state.effect_audits.get(identity) else {
+                continue;
+            };
+            anyhow::ensure!(
+                entry.state.is_terminal(),
+                "archived effect-audit fence conflicts with unresolved live state"
+            );
+            let observer = entry.observer_projection();
+            state.effect_audits.forget_archived(identity)?;
+            state.recent_effect_audits.push_back(observer);
+        }
+        while state.recent_effect_audits.len() > MAX_RETAINED_TERMINAL_EFFECT_AUDITS {
+            state.recent_effect_audits.pop_front();
+        }
+        Ok(())
+    }
+
+    fn apply_refresh(
+        &self,
+        name: &str,
+        state: &mut BrainState,
+        durable_head: u64,
+        durable: Vec<BrainEvent>,
+    ) -> Result<()> {
+        for event in durable {
+            anyhow::ensure!(
+                event.brain_id == BrainId::nil() || event.brain_id == state.brain_id,
+                "Brain '{name}' durable event #{} belongs to a different incarnation",
+                event.seq
+            );
+            let audit_identity = match &event.kind {
+                BrainEventKind::EffectAuditTransition { transition } => Some((
+                    transition.identity(),
+                    matches!(
+                        transition,
+                        crate::runtime::effect_log::EffectAuditTransition::Fence { .. }
+                    ),
+                )),
+                _ => None,
+            };
+            if let Some((identity, true)) = audit_identity {
+                if let Some(existing) = state.effect_audits.get(&identity) {
+                    anyhow::ensure!(
+                        existing.state.is_terminal(),
+                        "archived effect-audit fence conflicts with live unresolved state"
+                    );
+                    let observer = existing.observer_projection();
+                    state.effect_audits.forget_archived(&identity)?;
+                    state.recent_effect_audits.push_back(observer);
+                    state.revision = event.seq;
+                    continue;
+                }
+            }
+            state.apply_replayed(event.clone())?;
+            if let Some((identity, _)) = audit_identity {
+                state.events.pop();
+                if state
+                    .effect_audits
+                    .get(&identity)
+                    .is_some_and(|entry| entry.state.is_terminal())
+                    && matches!(
+                        event.kind,
+                        BrainEventKind::EffectAuditTransition {
+                            transition: crate::runtime::effect_log::EffectAuditTransition::Fence { .. }
+                        }
+                    )
+                {
+                    let observer = state
+                        .effect_audits
+                        .get(&identity)
+                        .expect("terminal effect audit checked above")
+                        .observer_projection();
+                    state.effect_audits.forget_archived(&identity)?;
+                    state.recent_effect_audits.push_back(observer);
+                }
+            }
+            let _ = state.tx.send(observer_effect_audit_event(&event));
+        }
+        while state.recent_effect_audits.len() > MAX_RETAINED_TERMINAL_EFFECT_AUDITS {
+            state.recent_effect_audits.pop_front();
+        }
+        anyhow::ensure!(
+            state.revision == durable_head,
+            "Brain '{name}' refresh reached revision {} but durable head is {durable_head}",
+            state.revision
+        );
+        Ok(())
+    }
+
+    fn acquire_writer_guard(&self, name: &str) -> Result<Option<BrainCommitGuard>> {
+        let commit = self.acquire_commit_guard(name)?;
+        if self.root.is_some() {
+            let (brain_id, revision, terminal_candidates) = {
+                let brains = self.brains.read().expect("shared brain lock poisoned");
+                let state = brains.get(name).context("Brain was removed concurrently")?;
+                (
+                    state.brain_id,
+                    state.revision,
+                    state
+                        .effect_audits
+                        .entries()
+                        .values()
+                        .filter_map(|entry| {
+                            entry.state.is_terminal().then_some(entry.intent.identity)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let (durable_head, durable, archived) = self.read_refresh_under_commit_guard(
+                name,
+                brain_id,
+                revision,
+                &terminal_candidates,
+            )?;
+            let mut brains = self.brains.write().expect("shared brain lock poisoned");
+            let state = brains
+                .get_mut(name)
+                .context("Brain was removed concurrently")?;
+            anyhow::ensure!(
+                state.brain_id == brain_id && state.revision == revision,
+                "Brain projection changed outside canonical writer authority"
+            );
+            self.apply_refresh(name, state, durable_head, durable)?;
+            Self::forget_archived_effects(state, &archived)?;
+        }
+        Ok(commit)
+    }
+
     fn with_effect_audit_storage_mut<T>(
         &self,
         name: &str,
@@ -6443,32 +7014,48 @@ impl BrainStore {
         let Some(root) = &self.root else {
             return Ok(None);
         };
+        let _commit = self.acquire_commit_guard(name)?;
+        self.validate_active_incarnation_under_commit_guard(name, brain_id)?;
         let brain_directory = root.join(name);
-        create_dir_all_durable(&brain_directory)?;
+        anyhow::ensure!(
+            brain_directory.is_dir(),
+            "Brain lifecycle ended before audit commit"
+        );
         let mut stores = self
             .effect_audit_storage
             .lock()
             .expect("effect-audit storage map poisoned");
-        if !stores.contains_key(name) {
-            stores.insert(
-                name.to_string(),
-                EffectAuditStorage {
-                    active: super::effect_audit_archive::EffectAuditActiveJournal::open(
-                        &brain_directory,
-                    )?,
-                    replay: super::effect_audit_archive::EffectAuditReplayArchive::open(
-                        &brain_directory,
-                        brain_id.0,
-                    )?,
-                },
-            );
+        // Reopen both physical sources for every guarded operation. Another
+        // valid store may have rolled an epoch or completed either half of a
+        // fence/archive move since this process last touched the Brain.
+        #[cfg(test)]
+        let active = super::effect_audit_archive::EffectAuditActiveJournal::open_with_bound(
+            &brain_directory,
+            self.effect_audit_max_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )?;
+        #[cfg(not(test))]
+        let active = super::effect_audit_archive::EffectAuditActiveJournal::open(&brain_directory)?;
+        let mut storage = EffectAuditStorage {
+            active,
+            replay: super::effect_audit_archive::EffectAuditReplayArchive::open(
+                &brain_directory,
+                brain_id.0,
+            )?,
+        };
+        let mut archived_identities = HashSet::new();
+        for (_, transition) in storage.active.load()? {
+            if storage.replay.lookup(&transition.identity())?.is_some() {
+                archived_identities.insert(transition.identity());
+            }
         }
-        operation(
-            stores
-                .get_mut(name)
-                .context("effect-audit storage disappeared during operation")?,
-        )
-        .map(Some)
+        let archived_identities = archived_identities.into_iter().collect::<Vec<_>>();
+        if !archived_identities.is_empty() {
+            storage.active.remove_identities(&archived_identities)?;
+        }
+        let result = operation(&mut storage)?;
+        stores.insert(name.to_string(), storage);
+        Ok(Some(result))
     }
 
     #[cfg(test)]
@@ -6495,6 +7082,7 @@ impl BrainStore {
                 Ok(storage.replay.max_seq())
             })?
             .unwrap_or(0);
+        let _writer = self.acquire_writer_guard(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains
             .get_mut(name)
@@ -6586,7 +7174,7 @@ impl BrainStore {
         let Some(path) = self.event_path(name) else {
             return Ok(Vec::new());
         };
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(mut bytes) = std::fs::read(&path) else {
             return Ok(Vec::new());
         };
         if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
@@ -6603,12 +7191,12 @@ impl BrainStore {
                 .with_context(|| format!("truncate torn tail in {}", path.display()))?;
             file.sync_all()
                 .with_context(|| format!("sync recovered {}", path.display()))?;
+            bytes.truncate(committed_len);
         }
-        let mut events = Vec::new();
+        let mut events: Vec<BrainEvent> = Vec::new();
         let records = bytes
             .split_inclusive(|byte| *byte == b'\n')
             .collect::<Vec<_>>();
-        let mut committed_offset = 0usize;
         for (line_no, terminated) in records.iter().enumerate() {
             // Committed records are newline-terminated. A torn final append
             // projects none of its logical events after restart.
@@ -6619,6 +7207,12 @@ impl BrainStore {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
+            anyhow::ensure!(
+                line.len() <= MAX_JOURNAL_RECORD_BYTES,
+                "canonical Brain journal {} line {} exceeds the record bound",
+                path.display(),
+                line_no + 1
+            );
             let parsed = match serde_json::from_slice::<BrainJournalRecord>(line) {
                 Ok(BrainJournalRecord::EventBatch {
                     event_count,
@@ -6635,29 +7229,38 @@ impl BrainStore {
                         }
                         _ => false,
                     };
-                    valid_framing.then_some(batch)
+                    if !valid_framing {
+                        None
+                    } else {
+                        for pair in batch.windows(2) {
+                            anyhow::ensure!(
+                                pair[1].seq == pair[0].seq + 1,
+                                "canonical Brain journal {} line {} has a non-contiguous batch at sequence {}",
+                                path.display(),
+                                line_no + 1,
+                                pair[1].seq
+                            );
+                        }
+                        Some(batch)
+                    }
                 }
                 Err(_) => serde_json::from_slice::<BrainEvent>(line)
                     .ok()
                     .map(|event| vec![event]),
             };
             if let Some(batch) = parsed {
-                events.extend(batch);
-                committed_offset += terminated.len();
+                for event in batch {
+                    if let Some(previous) = events.last() {
+                        anyhow::ensure!(
+                            previous.seq < event.seq,
+                            "Brain '{name}' has duplicate or reordered physical journal sequence {} on line {}",
+                            event.seq,
+                            line_no + 1
+                        );
+                    }
+                    events.push(event);
+                }
                 continue;
-            }
-            if line_no + 1 == records.len() {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .with_context(|| {
-                        format!("open {} for corrupt-tail recovery", path.display())
-                    })?;
-                file.set_len(committed_offset as u64)
-                    .with_context(|| format!("truncate corrupt tail in {}", path.display()))?;
-                file.sync_all()
-                    .with_context(|| format!("sync recovered {}", path.display()))?;
-                break;
             }
             anyhow::bail!("parse {} line {}", path.display(), line_no + 1);
         }
@@ -6731,6 +7334,11 @@ impl BrainStore {
             return self.append_journal_value(name, value);
         };
         let _commit = self.acquire_commit_guard(name)?;
+        let brain_id = events
+            .first()
+            .context("Brain journal append requires at least one event")?
+            .brain_id;
+        self.validate_active_incarnation_under_commit_guard(name, brain_id)?;
         for pair in events.windows(2) {
             anyhow::ensure!(
                 pair[1].seq == pair[0].seq + 1,
@@ -6740,13 +7348,6 @@ impl BrainStore {
         }
         let mut encoded = serde_json::to_vec(value)?;
         encoded.push(b'\n');
-        if self.journal_ends_with(&path, &encoded)? {
-            if let Err(sync_error) = std::fs::File::open(&path).and_then(|file| file.sync_all()) {
-                tracing::error!(path = %path.display(), %sync_error,
-                    "exact Brain append retry is present but reconciliation sync failed");
-            }
-            return Ok(());
-        }
         let durable_max = self.durable_max_seq_under_commit_guard(name)?;
         anyhow::ensure!(
             events.first().is_some_and(|event| event.seq == durable_max + 1),
@@ -6884,6 +7485,16 @@ impl BrainStore {
     pub(crate) fn fail_cancellation_terminal_appends_for_test(&self, count: usize) {
         self.fail_cancellation_terminal_appends
             .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn set_effect_audit_max_bytes_for_test(&self, bytes: u64) {
+        self.effect_audit_max_bytes
+            .store(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.effect_audit_storage
+            .lock()
+            .expect("effect-audit storage map poisoned")
+            .clear();
     }
 
     fn append_journal_value<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
@@ -7688,21 +8299,38 @@ mod tests {
         let expected_id = seeding.snapshot("shared").unwrap().brain_id;
         drop(seeding);
 
-        let store = Arc::new(BrainStore::with_root("box.local", Some(temp.path().into())));
-        store.set_cold_load_entry_barrier_for_test(Arc::new(std::sync::Barrier::new(2)));
-        let callers = (0..2)
-            .map(|_| {
-                let store = Arc::clone(&store);
-                std::thread::spawn(move || store.snapshot("shared"))
-            })
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let stores = ["first", "second"].map(|machine| {
+            let store = Arc::new(BrainStore::with_root(machine, Some(temp.path().into())));
+            store.set_cold_load_entry_barrier_for_test(Arc::clone(&barrier));
+            store
+        });
+        let callers = stores
+            .into_iter()
+            .map(|store| std::thread::spawn(move || store.snapshot("shared")))
             .collect::<Vec<_>>();
         let results = callers
             .into_iter()
             .map(|caller| caller.join().expect("cold-load caller panicked"))
             .collect::<Vec<_>>();
+        let path = temp.path().join("shared/events.jsonl");
+        let events = raw_journal_events(&path);
+        let raw = events
+            .iter()
+            .map(|event| {
+                (
+                    event.seq,
+                    format!("{:?}", event.kind),
+                    event.run_id,
+                    event.created_ms,
+                )
+            })
+            .collect::<Vec<_>>();
+        let content = std::fs::read_to_string(&path).unwrap();
         assert!(
             results.iter().all(Result::is_ok),
-            "both real first-use callers must share one completed load; results={results:?}"
+            "both real first-use callers must share one completed load; results={results:?}; raw={raw:?}; path={}; content={content}",
+            path.display()
         );
         let snapshots = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
         assert!(
@@ -7712,9 +8340,6 @@ mod tests {
                     && snapshot.revision == snapshots[0].revision),
             "cold callers must observe one identity and revision; snapshots={snapshots:?}"
         );
-
-        let path = temp.path().join("shared/events.jsonl");
-        let events = raw_journal_events(&path);
         let interrupted = events
             .iter()
             .filter(|event| {
@@ -7728,29 +8353,17 @@ mod tests {
                     )
             })
             .count();
-        let raw = events
-            .iter()
-            .map(|event| {
-                (
-                    event.seq,
-                    format!("{:?}", event.kind),
-                    event.run_id,
-                    event.created_ms,
-                )
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
             interrupted,
             1,
             "restart recovery must append exactly once; raw={raw:?}; path={}; content={}",
             path.display(),
-            std::fs::read_to_string(&path).unwrap()
+            content
         );
         assert!(
             events.windows(2).all(|pair| pair[1].seq == pair[0].seq + 1),
             "raw canonical sequences must be unique and strict; raw={raw:?}"
         );
-        drop(store);
         BrainStore::with_root("box.local", Some(temp.path().into()))
             .snapshot("shared")
             .unwrap_or_else(|error| panic!("strict journal must reopen: {error}; raw={raw:?}"));
@@ -7821,7 +8434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_store_rejects_occupied_sequence_without_changing_bytes() {
+    fn test_independent_stores_refresh_before_allocating_canonical_sequence() {
         let temp = tempfile::tempdir().unwrap();
         let first = BrainStore::with_root("one", Some(temp.path().into()));
         let second = BrainStore::with_root("two", Some(temp.path().into()));
@@ -7836,9 +8449,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let path = temp.path().join("shared/events.jsonl");
-        let before = std::fs::read(&path).unwrap();
-        let error = second
+        let appended = second
             .push(
                 "shared",
                 "two",
@@ -7846,15 +8457,493 @@ mod tests {
                     text: "loser".into(),
                 },
             )
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(
+            appended.seq, 2,
+            "an independently constructed store must refresh the durable head before allocation"
+        );
+        let path = temp.path().join("shared/events.jsonl");
+        let raw = raw_journal_events(&path);
+        assert_eq!(
+            raw.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2],
+            "independent writers must preserve a unique contiguous physical sequence; raw={raw:?}"
+        );
+    }
+
+    #[test]
+    fn test_independent_store_writers_serialize_without_duplicate_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = BrainStore::with_root("one", Some(temp.path().into()));
+        let second = BrainStore::with_root("two", Some(temp.path().into()));
+        let identity = first.snapshot("shared").unwrap().brain_id;
+        assert_eq!(second.snapshot("shared").unwrap().brain_id, identity);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = Arc::clone(&barrier);
+        let first_writer = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.push(
+                "shared",
+                "one",
+                BrainEventKind::Prompt {
+                    text: "same".into(),
+                },
+            )
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_writer = std::thread::spawn(move || {
+            second_barrier.wait();
+            second.push(
+                "shared",
+                "two",
+                BrainEventKind::Prompt {
+                    text: "same".into(),
+                },
+            )
+        });
+        barrier.wait();
+        let first_result = first_writer.join().expect("first writer panicked");
+        let second_result = second_writer.join().expect("second writer panicked");
+        assert!(
+            first_result.is_ok() && second_result.is_ok(),
+            "both independent writers must commit after guarded refresh; first={first_result:?}, second={second_result:?}"
+        );
+        let raw = raw_journal_events(&temp.path().join("shared/events.jsonl"));
+        assert_eq!(
+            raw.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2],
+            "racing independent stores must allocate each sequence exactly once; raw={raw:?}"
+        );
+    }
+
+    #[test]
+    fn test_independent_identical_append_is_not_mistaken_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = BrainStore::with_root("one", Some(temp.path().into()));
+        let second = BrainStore::with_root("two", Some(temp.path().into()));
+        let brain_id = first.snapshot("shared").unwrap().brain_id;
+        second.snapshot("shared").unwrap();
+        let event = journal_event(brain_id, 1, "byte-identical");
+        first.append_event("shared", &event).unwrap();
+        let before = std::fs::read(temp.path().join("shared/events.jsonl")).unwrap();
+        let error = second.append_event("shared", &event).unwrap_err();
         assert!(
             error.to_string().contains("occupied or stale"),
-            "occupied sequence rejection must be actionable; error={error:#}"
+            "a distinct invocation must not deduplicate merely because its bytes equal EOF; error={error:#}"
         );
         assert_eq!(
-            std::fs::read(&path).unwrap(),
+            std::fs::read(temp.path().join("shared/events.jsonl")).unwrap(),
             before,
-            "occupied-sequence rejection must leave forensic bytes unchanged"
+            "rejected byte-identical admission must not mutate canonical bytes"
+        );
+    }
+
+    #[test]
+    fn test_process_boundary_writers_serialize_canonical_sequence() {
+        const ROOT_ENV: &str = "FINCH_SEQ377_CHILD_ROOT";
+        const BARRIER_ENV: &str = "FINCH_SEQ377_CHILD_BARRIER";
+        if let (Ok(root), Ok(barrier)) = (std::env::var(ROOT_ENV), std::env::var(BARRIER_ENV)) {
+            let store = BrainStore::with_root("child", Some(PathBuf::from(root)));
+            store.snapshot("shared").unwrap();
+            let mut stream = std::net::TcpStream::connect(barrier).unwrap();
+            let mut release = [0_u8; 1];
+            stream.read_exact(&mut release).unwrap();
+            assert_eq!(release, [1]);
+            store
+                .push(
+                    "shared",
+                    "child",
+                    BrainEventKind::Prompt {
+                        text: "same".into(),
+                    },
+                )
+                .unwrap();
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        BrainStore::with_root("parent", Some(temp.path().into()))
+            .snapshot("shared")
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let barrier = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let spawn = || {
+            std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("brain::store::tests::test_process_boundary_writers_serialize_canonical_sequence")
+                .arg("--nocapture")
+                .env(ROOT_ENV, temp.path())
+                .env(BARRIER_ENV, &barrier)
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let mut second = spawn();
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ready = Vec::new();
+        while ready.len() < 2 && std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => ready.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept child writer barrier: {error}"),
+            }
+        }
+        assert_eq!(
+            ready.len(),
+            2,
+            "both supervised child writers must reach the pre-append barrier"
+        );
+        let mut first_ready = ready.remove(0);
+        let mut second_ready = ready.remove(0);
+        first_ready.write_all(&[1]).unwrap();
+        second_ready.write_all(&[1]).unwrap();
+        let wait_child = |child: &mut std::process::Child| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "supervised child writer did not finish within 10 seconds"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let first_status = wait_child(&mut first);
+        let second_status = wait_child(&mut second);
+        assert!(
+            first_status.success() && second_status.success(),
+            "supervised child writers must both finish; first={first_status}, second={second_status}"
+        );
+        let raw = raw_journal_events(&temp.path().join("shared/events.jsonl"));
+        assert_eq!(
+            raw.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2],
+            "separate processes must share one filesystem commit authority; raw={raw:?}"
+        );
+    }
+
+    #[test]
+    fn test_archive_identity_rejects_old_store_and_allows_fresh_incarnation() {
+        let temp = tempfile::tempdir().unwrap();
+        let archiver = BrainStore::with_root("one", Some(temp.path().into()));
+        let stale = BrainStore::with_root("two", Some(temp.path().into()));
+        let old = archiver
+            .push(
+                "shared",
+                "one",
+                BrainEventKind::Prompt { text: "old".into() },
+            )
+            .unwrap();
+        let old_id = archiver.snapshot("shared").unwrap().brain_id;
+        assert_eq!(stale.snapshot("shared").unwrap().brain_id, old_id);
+        let archived = archiver
+            .archive("shared")
+            .unwrap()
+            .expect("persistent archive must name its quarantine directory");
+        let archived_bytes = std::fs::read(archived.join("events.jsonl")).unwrap();
+        let error = stale
+            .push(
+                "shared",
+                "two",
+                BrainEventKind::Prompt {
+                    text: "stale".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resident incarnation cannot be validated"),
+            "an old store must not resurrect an archived incarnation: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(archived.join("events.jsonl")).unwrap(),
+            archived_bytes,
+            "stale writer rejection must preserve archived forensic bytes"
+        );
+        let replacement = archiver.create_incarnation("shared").unwrap();
+        assert_ne!(replacement.brain_id, old_id);
+        assert_eq!(replacement.revision, 0);
+        let stale_error = stale.snapshot("shared").unwrap_err();
+        assert!(
+            stale_error
+                .to_string()
+                .contains("resident incarnation cannot be validated"),
+            "a stale projection must not silently join the successor: {stale_error:#}"
+        );
+        let refreshed = BrainStore::with_root("fresh", Some(temp.path().into()))
+            .snapshot("shared")
+            .unwrap();
+        assert_eq!(
+            refreshed.brain_id, replacement.brain_id,
+            "a fresh store must observe the explicitly created successor incarnation"
+        );
+        assert_eq!(old.seq, 1);
+    }
+
+    #[test]
+    fn test_resident_incarnation_validation_preserves_malformed_metadata_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "preserve me".into(),
+                },
+            )
+            .unwrap();
+        let journal = temp.path().join("shared/events.jsonl");
+        let before = std::fs::read(&journal).unwrap();
+        std::fs::write(temp.path().join("shared/metadata.json"), b"{invalid\n").unwrap();
+
+        let error = store.snapshot("shared").unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("resident incarnation cannot be validated")
+                && chain.contains("parse existing Brain identity"),
+            "resident validation must distinguish corrupt metadata from an ordinary identity replacement; chain={chain}"
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            before,
+            "failed incarnation validation must not rewrite canonical journal bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_identity_terminates_old_retry_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "archive retry owner".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        let detail = "connection lost".to_string();
+        store.fail_event_batches_for_test(1);
+        let initial_error = store
+            .terminalize_run_with_result_if_active(
+                "shared",
+                "daemon",
+                run.run_id,
+                prompt.seq,
+                BrainRunStatus::Failed,
+                detail.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            store
+                .disconnect_intent_path("shared", run.run_id)
+                .is_some_and(|path| path.exists()),
+            "failed terminalization must durably fence the retry before archive; error={initial_error:#}"
+        );
+        let (reached, release) = store.pause_disconnect_retry_at_entry_for_test();
+        store.schedule_disconnect_terminalization_retry(
+            "shared".into(),
+            "daemon".into(),
+            run.run_id,
+            prompt.seq,
+            BrainRunStatus::Failed,
+            detail,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+            .await
+            .expect("retry owner did not reach the production retry-entry fence")
+            .expect("retry owner dropped its entry acknowledgement");
+        let archived = store
+            .archive("shared")
+            .unwrap()
+            .expect("persistent archive must preserve the old incarnation");
+        let archived_bytes = std::fs::read(archived.join("events.jsonl")).unwrap();
+        let successor = store.create_incarnation("shared").unwrap();
+        release
+            .send(())
+            .expect("retry owner disappeared before the archive released it");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if store.pending_disconnect_terminalization_retries() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old-incarnation retry owner survived archive identity replacement");
+        assert_eq!(
+            store.snapshot("shared").unwrap().revision,
+            successor.revision,
+            "old retry owner must not append terminal events into the successor incarnation"
+        );
+        assert_eq!(
+            std::fs::read(archived.join("events.jsonl")).unwrap(),
+            archived_bytes,
+            "old retry owner must not mutate archived forensic bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_owner_survives_malformed_incarnation_metadata_until_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "retry through metadata fault".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        let detail = "connection lost".to_string();
+        store.fail_event_batches_for_test(1);
+        let initial_error = store
+            .terminalize_run_with_result_if_active(
+                "shared",
+                "daemon",
+                run.run_id,
+                prompt.seq,
+                BrainRunStatus::Failed,
+                detail.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            store
+                .disconnect_intent_path("shared", run.run_id)
+                .is_some_and(|path| path.exists()),
+            "failed terminalization must durably fence the retry before metadata corruption; error={initial_error:#}"
+        );
+        let (reached, release) = store.pause_disconnect_retry_at_entry_for_test();
+        store.schedule_disconnect_terminalization_retry(
+            "shared".into(),
+            "daemon".into(),
+            run.run_id,
+            prompt.seq,
+            BrainRunStatus::Failed,
+            detail,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+            .await
+            .expect("retry owner did not reach the production retry-entry fence")
+            .expect("retry owner dropped its entry acknowledgement");
+        let metadata_path = temp.path().join("shared/metadata.json");
+        let metadata = std::fs::read(&metadata_path).unwrap();
+        std::fs::write(&metadata_path, b"{invalid\n").unwrap();
+        release
+            .send(())
+            .expect("retry owner disappeared before metadata corruption was installed");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store
+                .retry_incarnation_validation_failures
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retry owner never observed the malformed identity metadata");
+        assert_eq!(
+            store.pending_disconnect_terminalization_retries(),
+            1,
+            "an indeterminate identity read must keep the retry owner pending instead of treating corruption as archive proof"
+        );
+
+        std::fs::write(&metadata_path, metadata).unwrap();
+        std::fs::File::open(&metadata_path)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        sync_directory(temp.path().join("shared").as_path()).unwrap();
+        assert_eq!(
+            store
+                .durable_incarnation_is_active("shared", store.snapshot("shared").unwrap().brain_id)
+                .unwrap(),
+            true,
+            "restored metadata must validate before waiting for retry completion"
+        );
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.pending_disconnect_terminalization_retries() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            completion.is_ok(),
+            "retry owner did not finish after valid identity metadata was restored; pending={}, run={:?}, intent_exists={}, validation_failures={}",
+            store.pending_disconnect_terminalization_retries(),
+            store.inspect_run("shared", run.run_id),
+            store
+                .disconnect_intent_path("shared", run.run_id)
+                .is_some_and(|path| path.exists()),
+            store
+                .retry_incarnation_validation_failures
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind,
+                    BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status: BrainRunStatus::Failed,
+                        ..
+                    } if run_id == run.run_id))
+                .count(),
+            1,
+            "the surviving retry owner must publish exactly one terminal event after repair; events={:?}",
+            snapshot.events
+        );
+    }
+
+    #[test]
+    fn test_rootless_archive_remains_supported() {
+        let store = BrainStore::with_root("box.local", None);
+        store.snapshot("shared").unwrap();
+        assert_eq!(store.archive("shared").unwrap(), None);
+        assert!(
+            store.list().unwrap().is_empty(),
+            "rootless archive must clear the resident Brain without requiring filesystem identity"
         );
     }
 
@@ -8058,8 +9147,8 @@ mod tests {
             history.len()
         );
         assert!(
-            bytes_read <= JOURNAL_TAIL_CHUNK_BYTES * 2,
-            "real append admission must read only a bounded suffix, independent of {}-byte history; tail_bytes_read={bytes_read}",
+            bytes_read <= JOURNAL_TAIL_CHUNK_BYTES * 4,
+            "load refresh, writer admission, and commit validation must each read only a bounded suffix, independent of {}-byte history; tail_bytes_read={bytes_read}",
             history.len()
         );
     }
@@ -9788,7 +10877,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_ignores_newline_terminated_batch_with_invalid_checksum() {
+    fn test_restart_rejects_newline_terminated_batch_with_invalid_checksum() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         store
@@ -9841,15 +10930,50 @@ mod tests {
             .unwrap()
             .write_all(&[encoded.as_slice(), b"\n"].concat())
             .unwrap();
+        let forensic = std::fs::read(temp.path().join("shared/events.jsonl")).unwrap();
         drop(store);
 
         let recovered = BrainStore::with_root("box.local", Some(temp.path().into()));
-        let recovered_snapshot = recovered.snapshot("shared").unwrap();
-        assert_eq!(recovered_snapshot.revision, snapshot.revision);
-        assert!(recovered_snapshot
-            .events
-            .iter()
-            .all(|event| event.run_id != Some(run_id)));
+        let error = recovered.snapshot("shared").unwrap_err();
+        assert!(
+            error.to_string().contains("parse"),
+            "newline-terminated corruption must fail closed instead of being normalized: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("shared/events.jsonl")).unwrap(),
+            forensic,
+            "committed corrupt bytes must remain available for quarantine/forensics"
+        );
+    }
+
+    #[test]
+    fn test_restart_rejects_reordered_physical_journal_without_rewriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let brain_id = store.snapshot("shared").unwrap().brain_id;
+        let path = temp.path().join("shared/events.jsonl");
+        let mut bytes = Vec::new();
+        for seq in [1, 3, 2] {
+            serde_json::to_writer(&mut bytes, &journal_event(brain_id, seq, "physical-order"))
+                .unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        drop(store);
+        let error = BrainStore::with_root("box.local", Some(temp.path().into()))
+            .snapshot("shared")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reordered physical journal sequence 2"),
+            "physical order must be validated before cross-source sorting: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "newline-terminated reordered records are forensic evidence and must not be rewritten"
+        );
     }
 
     #[tokio::test]
@@ -13145,6 +14269,70 @@ mod tests {
     }
 
     #[test]
+    fn test_independent_effect_and_ordinary_writers_share_sequence_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let effect_store = BrainStore::with_root("effect", Some(temp.path().into()));
+        let ordinary_store = BrainStore::with_root("ordinary", Some(temp.path().into()));
+        // Hydrate both projections before the run becomes Running. Loading a
+        // Running Brain in a new process is restart recovery and correctly
+        // interrupts it; that is not the live-writer race exercised here.
+        effect_store.snapshot("shared").unwrap();
+        ordinary_store.snapshot("shared").unwrap();
+        let (_run, _lease, grant) = audit_run_fixture(&effect_store);
+        let before = effect_store.snapshot("shared").unwrap().revision;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let effect_barrier = Arc::clone(&barrier);
+        let effect_writer = effect_store.clone();
+        let effect = std::thread::spawn(move || {
+            effect_barrier.wait();
+            effect_writer.reserve_effect_audit(
+                &grant,
+                uuid::Uuid::new_v4(),
+                audit_effect(0, "cross-store"),
+            )
+        });
+        let ordinary_barrier = Arc::clone(&barrier);
+        let ordinary_writer = ordinary_store.clone();
+        let ordinary = std::thread::spawn(move || {
+            ordinary_barrier.wait();
+            ordinary_writer.push(
+                "shared",
+                "ordinary",
+                BrainEventKind::Prompt {
+                    text: "beside effect".into(),
+                },
+            )
+        });
+        barrier.wait();
+        let effect_result = effect.join().expect("effect writer panicked");
+        let ordinary_result = ordinary.join().expect("ordinary writer panicked");
+        assert!(
+            effect_result.is_ok() && ordinary_result.is_ok(),
+            "effect and ordinary independent stores must both commit; effect={effect_result:?}, ordinary={ordinary_result:?}"
+        );
+        let snapshot = effect_store.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot.revision,
+            before + 2,
+            "one effect reserve and one ordinary append must consume exactly two sequences; snapshot={snapshot:?}"
+        );
+        let raw = raw_journal_events(&temp.path().join("shared/events.jsonl"));
+        let active = effect_store
+            .with_effect_audit_storage_mut("shared", snapshot.brain_id, |storage| {
+                storage.active.load()
+            })
+            .unwrap()
+            .unwrap();
+        let mut sequences = raw.iter().map(|event| event.seq).collect::<Vec<_>>();
+        sequences.extend(active.iter().map(|(seq, _)| *seq));
+        sequences.sort_unstable();
+        assert!(
+            sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "ordinary JSON and effect SQLite sources must have one unique canonical sequence; sequences={sequences:?}, raw={raw:?}, active={active:?}"
+        );
+    }
+
+    #[test]
     fn effect_audit_permit_precedes_host_outcome_and_survives_turn_terminalization() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
@@ -13602,7 +14790,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            error.to_string().contains("after replay fence commit"),
+            format!("{error:#}").contains("after replay fence commit"),
             "fixture must stop between the two durable archive halves: {error:#}"
         );
         drop(store);
@@ -13628,6 +14816,165 @@ mod tests {
         assert_eq!(
             active, None,
             "restart must remove active detail after recognizing the durable replay fence"
+        );
+    }
+
+    #[test]
+    fn test_live_retry_completes_effect_archive_after_replay_fence_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let identity = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(0, "terminal"))
+            .unwrap();
+        let permit = store.begin_effect_audit(&grant, identity).unwrap();
+        let outcome = crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+            response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+        };
+        store.fail_terminal_archive_after_replay_for_test();
+        let error = store
+            .finish_effect_audit(&grant, Some(&permit), identity, outcome.clone())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("after replay fence commit"),
+            "fixture must fail after committing its replay fence: {error:#}"
+        );
+        let ordinary = BrainStore::with_root("ordinary", Some(temp.path().into()));
+        ordinary
+            .push(
+                "shared",
+                "ordinary",
+                BrainEventKind::Prompt {
+                    text: "after split commit".into(),
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "an independent ordinary writer must reconcile the split move live: {error:#}"
+                )
+            });
+        store
+            .finish_effect_audit(&grant, Some(&permit), identity, outcome)
+            .unwrap_or_else(|error| {
+                panic!("live retry must reconcile the split durable move: {error:#}")
+            });
+        let snapshot = store.snapshot("shared").unwrap();
+        let active = store
+            .with_effect_audit_storage_mut("shared", snapshot.brain_id, |storage| {
+                storage.active.last_seq_for(&identity)
+            })
+            .unwrap()
+            .flatten();
+        assert_eq!(
+            active, None,
+            "live retry must remove active detail already represented by its replay fence"
+        );
+        assert_eq!(
+            snapshot
+                .effect_audits
+                .iter()
+                .filter(|entry| entry.intent.identity == identity)
+                .count(),
+            1,
+            "live split-commit reconciliation must expose one terminal audit: {:?}",
+            snapshot.effect_audits
+        );
+    }
+
+    #[test]
+    fn test_brain_store_reopens_committed_effect_audit_overshoot() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (run, _lease, grant) = audit_run_fixture(&store);
+        let identity = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(0, "terminal"))
+            .unwrap();
+        let permit = store.begin_effect_audit(&grant, identity).unwrap();
+        store.set_effect_audit_max_bytes_for_test(1);
+        store
+            .finish_effect_audit(
+                &grant,
+                Some(&permit),
+                identity,
+                crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("production BrainStore terminal drain must accept physical overshoot: {error:#}")
+            });
+        let revision = store.snapshot("shared").unwrap().revision;
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        restarted.set_effect_audit_max_bytes_for_test(1);
+        let snapshot = restarted.snapshot("shared").unwrap_or_else(|error| {
+            panic!("committed effect-audit overshoot must not strand Brain reload: {error:#}")
+        });
+        assert_eq!(
+            snapshot.revision,
+            revision + 1,
+            "reopening the one Running fixture must add exactly one restart interruption after accepting the oversized canonical audit; before={revision}, events={:?}",
+            snapshot.events
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind,
+                    BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status: BrainRunStatus::Interrupted,
+                        ..
+                    } if run_id == run.run_id))
+                .count(),
+            1,
+            "oversized audit reopen must perform exactly one restart reconciliation for the fixture run; events={:?}",
+            snapshot.events
+        );
+        assert!(
+            snapshot
+                .effect_audits
+                .iter()
+                .any(|entry| entry.intent.identity == identity && entry.state.is_terminal()),
+            "reopened overshoot must preserve the terminal audit projection: {:?}",
+            snapshot.effect_audits
+        );
+    }
+
+    #[test]
+    fn test_live_effect_replay_refresh_repairs_epoch_index_split_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let identity = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(0, "terminal"))
+            .unwrap();
+        store
+            .finish_effect_audit(
+                &grant,
+                None,
+                identity,
+                crate::runtime::effect_log::EffectAuditTerminalOutcome::NotApplied {
+                    reason: "fixture".into(),
+                },
+            )
+            .unwrap();
+        let brain_id = store.snapshot("shared").unwrap().brain_id;
+        store
+            .with_effect_audit_storage_mut("shared", brain_id, |storage| {
+                storage.replay.remove_index_identity_for_test(&identity)
+            })
+            .unwrap();
+        let recovered = store
+            .with_effect_audit_storage_mut("shared", brain_id, |storage| {
+                storage.replay.lookup(&identity)
+            })
+            .unwrap()
+            .flatten();
+        assert!(
+            recovered.is_some(),
+            "the next live guarded operation must reopen and reconcile an epoch commit missing its derived index row"
         );
     }
 

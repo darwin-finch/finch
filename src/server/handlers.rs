@@ -268,7 +268,12 @@ fn authorize_named_brain_archive(
     let brain_id = server
         .brain_store()
         .identity_without_replay(name)
-        .map_err(|error| AppError(error).into_response())?;
+        .map_err(|_| {
+            brain_auth_error(
+                StatusCode::CONFLICT,
+                "Brain identity is unavailable; use host-local quarantine recovery",
+            )
+        })?;
     claims
         .require_audience(
             brain_id,
@@ -860,23 +865,49 @@ struct ArchiveNamedBrainResponse {
 
 async fn archive_named_brain(
     State(server): State<Arc<AgentServer>>,
+    restricted: Option<axum::Extension<RestrictedBrainListener>>,
+    addr: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<ArchiveNamedBrainResponse>, Response> {
-    let claims = authorize_named_brain_archive(&server, &headers, &name)?;
-    require_unbound_administrative_credential(&claims)?;
+    let expected_brain_id = if restricted.is_some() {
+        let claims = authorize_named_brain_archive(&server, &headers, &name)?;
+        require_unbound_administrative_credential(&claims)?;
+        Some(claims.brain_id)
+    } else {
+        let local = addr
+            .map(|ConnectInfo(addr)| is_local_brain_bootstrap(addr))
+            .unwrap_or(false);
+        if !local {
+            return Err(brain_auth_error(
+                StatusCode::UNAUTHORIZED,
+                "host-local Brain recovery access required",
+            ));
+        }
+        None
+    };
     let execution_lock = server
         .brain_store()
         .execution_lock(&name)
         .map_err(|error| AppError(error).into_response())?;
     let _turn = execution_lock.lock_owned().await;
-    let archived_to = server
-        .brain_store()
-        .archive_authorized(&name, claims.brain_id)
-        .map_err(|error| AppError(error).into_response())?;
+    let archived_to = match expected_brain_id {
+        Some(brain_id) => server.brain_store().archive_authorized(&name, brain_id),
+        None => server.brain_store().archive(&name),
+    }
+    .map_err(|_| {
+        brain_auth_error(
+            StatusCode::CONFLICT,
+            "Brain quarantine is incomplete; forensic bytes remain preserved and the operation may be retried",
+        )
+    })?;
     Ok(Json(ArchiveNamedBrainResponse {
         name,
-        archived_to: archived_to.map(|path| path.display().to_string()),
+        archived_to: archived_to.and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        }),
     }))
 }
 
@@ -9447,6 +9478,8 @@ mod handler_tests {
         server: Arc<crate::server::AgentServer>,
         name: &str,
         token: Option<&str>,
+        restricted: bool,
+        peer: Option<std::net::SocketAddr>,
     ) -> (StatusCode, serde_json::Value) {
         use tower::ServiceExt as _;
         let mut request = axum::http::Request::builder()
@@ -9455,10 +9488,16 @@ mod handler_tests {
         if let Some(token) = token {
             request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
         }
-        let response = create_router(server)
-            .oneshot(request.body(axum::body::Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let router = if restricted {
+            create_remote_brain_router(server)
+        } else {
+            create_router(server)
+        };
+        let mut request = request.body(axum::body::Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
+        let response = router.oneshot(request).await.unwrap();
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
             .await
@@ -9699,7 +9738,7 @@ mod handler_tests {
         file.sync_all().unwrap();
         let forensic_bytes = std::fs::read(&path).unwrap();
 
-        let store = BrainStore::with_root("box.local", Some(root));
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
         assert!(
             store.snapshot("shared").is_err(),
             "fixture must be unloadable before recovery; first_seq={}, duplicate_seq={}",
@@ -9724,7 +9763,14 @@ mod handler_tests {
                 StatusCode::FORBIDDEN,
             ),
         ] {
-            let (status, body) = delete_named_brain(Arc::clone(&server), "shared", supplied).await;
+            let (status, body) = delete_named_brain(
+                Arc::clone(&server),
+                "shared",
+                supplied,
+                true,
+                Some("198.51.100.10:443".parse().unwrap()),
+            )
+            .await;
             assert_eq!(
                 status, expected,
                 "{label} credential must not authorize corrupt recovery; body={body}"
@@ -9735,7 +9781,14 @@ mod handler_tests {
                 "{label} recovery rejection must not rename or change forensic bytes"
             );
         }
-        let (status, body) = delete_named_brain(Arc::clone(&server), "shared", Some(&token)).await;
+        let (status, body) = delete_named_brain(
+            Arc::clone(&server),
+            "shared",
+            Some(&token),
+            true,
+            Some("198.51.100.10:443".parse().unwrap()),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -9744,14 +9797,97 @@ mod handler_tests {
         let archived_to = body["archived_to"]
             .as_str()
             .unwrap_or_else(|| panic!("recovery output must name the archive destination: {body}"));
+        assert!(
+            !archived_to.contains('/'),
+            "restricted recovery must return an opaque archive identifier, not a host path: {body}"
+        );
         assert_eq!(
-            std::fs::read(std::path::Path::new(archived_to).join("events.jsonl")).unwrap(),
+            std::fs::read(
+                temp.path()
+                    .join("brains-archive")
+                    .join(archived_to)
+                    .join("events.jsonl")
+            )
+            .unwrap(),
             forensic_bytes,
             "archive recovery must preserve the corrupt journal byte-for-byte"
         );
         assert!(
             server.brain_store().list().unwrap().is_empty(),
             "archiving one corrupt Brain must restore listing usability"
+        );
+
+        server
+            .brain_store()
+            .create_incarnation("shared")
+            .expect("host-local recovery must permit an explicit successor incarnation");
+        let event = server
+            .brain_store()
+            .push(
+                "shared",
+                "fixture",
+                BrainEventKind::Prompt { text: "new".into() },
+            )
+            .unwrap();
+        let mut duplicate = event.clone();
+        duplicate.created_ms += 1;
+        let path = root.join("shared/events.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&duplicate).unwrap())
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+        let replacement_forensic = std::fs::read(&path).unwrap();
+        for (label, peer) in [
+            ("missing peer provenance", None),
+            (
+                "non-loopback peer",
+                Some("198.51.100.11:8443".parse().unwrap()),
+            ),
+        ] {
+            let (status, body) =
+                delete_named_brain(Arc::clone(&server), "shared", None, false, peer).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{label} must not gain host-local quarantine authority; body={body}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                replacement_forensic,
+                "{label} rejection must preserve the corrupt successor bytes"
+            );
+        }
+        let (status, local_body) = delete_named_brain(
+            Arc::clone(&server),
+            "shared",
+            None,
+            false,
+            Some("127.0.0.1:49152".parse().unwrap()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "host-local quarantine must work after corruption without a pre-issued credential; body={local_body}"
+        );
+        let local_archive = local_body["archived_to"]
+            .as_str()
+            .expect("host-local recovery must return a path-free quarantine identifier");
+        assert!(!local_archive.contains('/'));
+        assert_eq!(
+            std::fs::read(
+                temp.path()
+                    .join("brains-archive")
+                    .join(local_archive)
+                    .join("events.jsonl")
+            )
+            .unwrap(),
+            replacement_forensic,
+            "host-local quarantine must preserve the corrupt successor bytes"
         );
     }
 }

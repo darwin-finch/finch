@@ -155,7 +155,7 @@ impl BrainLifecycleService {
             !self.store.list()?.iter().any(|name| name == brain),
             "Brain '{brain}' already exists"
         );
-        self.store.snapshot(brain)
+        self.store.create_incarnation(brain)
     }
 
     pub fn start_run_with_parent(
