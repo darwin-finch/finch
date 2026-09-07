@@ -79,13 +79,22 @@ Stop as soon as a round fails that comparison, even if it is only the second. Wa
 
 Each round's fixes are new code and can introduce new defects — in practice they often do, at the exact lines the previous round's fix touched. That is normal once or twice and is why rounds continue at all; it is also why "keep going until it is clean" is not a safe rule on its own.
 
-Escalate instead. Post the round records per section 5 with the verdict DO NOT MERGE, and hand the coordinator, named one by one, every CONFIRMED finding still unresolved with its failure scenario, the round that raised it, and what was attempted for it. Include the per-round counts and worst severity, so the coordinator can see the trend that triggered the stop rather than only the final state. The coordinator decides what happens next — split the change, narrow its scope, or accept a named risk explicitly. Continuing to loop, dropping the findings, or declaring success anyway are each a failure of this protocol.
+**Then ask where the new findings are, not just how many.** The count alone points the wrong way often enough to matter, because it is confounded by how hard the round looked: a round that runs fourteen mutants finds more than one that ran three, and more findings at lower severity from a deeper probe is a better review, not a worse change. Locality is the signal the count is standing in for.
+
+- New findings **on the lines the previous round's fix touched** are ordinary iteration — the paragraph above. Continue if the trend test also passes.
+- New findings in a **different subsystem or concern than the original defect** mean the change is carrying a second issue. Logging to lifetime, pruning to locking, rendering to persistence. Another round cannot fix that, because each round will keep discovering the second change hiding inside the first. Split it.
+
+Two shapes make this concrete. A logging-cadence fix escalated when its second round raised more findings than its first, and the blocker was not about logging at all: the registry that made the fix possible latched on a name across identity changes, so the same name reused by a different Brain announced a false recovery and swallowed a real first failure. Closing that needed an eviction-and-reconciliation design — a second issue, sitting inside the first. Separately, a fix that pruned stale schedules at delivery drew second-round findings about a lock held across a filesystem call and an unbounded per-minute rescan; neither existed in the reported defect, and both were created by the fix, because "prune at delivery" silently required "restore at warm" to be correct.
+
+In both, the count said stop and the locality said why.
+
+Escalate instead. Post the round records per section 5 with the verdict DO NOT MERGE, and hand the coordinator, named one by one, every CONFIRMED finding still unresolved with its failure scenario, the round that raised it, and what was attempted for it. Include the per-round counts and worst severity, and say which pattern the last round showed — findings on the previous fix's own lines, or findings in a different concern — so the coordinator can see the trend and its shape rather than only the final state. That is what makes the three options below distinguishable from the report instead of re-derived by hand. The coordinator decides what happens next — split the change, narrow its scope, or accept a named risk explicitly. Continuing to loop, dropping the findings, or declaring success anyway are each a failure of this protocol.
 
 ## 5. Record the outcome where it can be checked
 
 Post one pull request comment per round, carrying that round's record:
 
-- the exact commit reviewed, and the round number as `round N of at most 3`;
+- the exact commit reviewed, and the round number as `round N`, with the six-round backstop named only if the round reaches it;
 - the perspectives selected, and each skipped one with its reason;
 - every CONFIRMED finding with its failure scenario, and its resolution once a later round confirms the fix;
 - every PLAUSIBLE finding, explicitly left open;
