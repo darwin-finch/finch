@@ -23,6 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install workflow manifest parser
+        if: runner.os == 'Linux'
         run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
       - name: Check the current tracked tree
         run: python3 scripts/check_repository_hygiene.py
@@ -33,6 +34,8 @@ jobs:
       - name: Run removed SSH surface regressions
         run: python3 scripts/test_no_ssh_surface.py
       - name: Check reviewed workflow documents and fixture inventories
+        if: runner.os == 'Linux'
         run: python3 scripts/check_ci_workflow_manifest.py
       - name: Run workflow manifest mutation regressions
+        if: runner.os == 'Linux'
         run: python3 scripts/test_ci_workflow_manifest.py

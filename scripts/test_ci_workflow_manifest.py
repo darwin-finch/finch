@@ -145,6 +145,22 @@ class WorkflowManifestMutationTests(unittest.TestCase):
         finally:
             repository.close()
 
+    def test_symlinked_workflow_is_rejected_before_digesting_its_target(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            workflow = repository.workflow("repository-hygiene.yml")
+            target = repository.root / "scripts/repository-hygiene.yml"
+            workflow.rename(target)
+            workflow.symlink_to("../../scripts/repository-hygiene.yml")
+            self.assert_rejected(
+                repository,
+                ".github/workflows/repository-hygiene.yml",
+                "must be a regular file",
+                "not a symbolic link",
+            )
+        finally:
+            repository.close()
+
     def test_duplicate_yaml_keys_are_rejected_with_location(self) -> None:
         repository = WorkflowRepository()
         try:

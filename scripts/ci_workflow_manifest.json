@@ -78,7 +78,7 @@
       "activated_fixtures": []
     },
     "repository-hygiene.yml": {
-      "digest": "5086e2dc15882d9cc28f4407b9d511e2818e72abf89ab02ce32c569b78d72472",
+      "digest": "44b81824a39675ae617389c934ddf4a4a4b233a73d40afb37a5935fb8ec3579a",
       "activated_fixtures": [
         "brain_effect",
         "manifest_dependency",

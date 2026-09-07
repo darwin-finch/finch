@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -213,6 +214,21 @@ def workflow_records(root: Path) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     for path in paths:
         relative = path.relative_to(root).as_posix()
+        try:
+            mode = path.lstat().st_mode
+        except OSError as error:
+            raise ContractError(
+                f"{relative}: workflow file metadata could not be read: {error}"
+            ) from error
+        if stat.S_ISLNK(mode):
+            raise ContractError(
+                f"{relative}: workflow document must be a regular file, not a symbolic link"
+            )
+        if not stat.S_ISREG(mode):
+            raise ContractError(
+                f"{relative}: workflow document must be a regular file; "
+                f"found mode {stat.filemode(mode)!r}"
+            )
         records[path.name] = {
             "digest": semantic_digest(load_yaml_document(path, relative)),
             "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),

@@ -24,6 +24,7 @@ class AuditFixture:
         self.bin = self.cargo_home / "bin"
         self.bin.mkdir(parents=True)
         self.audit_log = self.root / "cargo-audit-argv.json"
+        self.audit_continued_log = self.root / "cargo-audit-continued"
         self.cargo_log = self.root / "cargo-was-invoked"
         self.report = self.root / "report.json"
         self.lockfile = self.root / "Cargo.lock"
@@ -80,6 +81,7 @@ class AuditFixture:
             {
                 "CARGO_HOME": str(self.cargo_home),
                 "AUDIT_ARGV_LOG": str(self.audit_log),
+                "AUDIT_CONTINUED_LOG": str(self.audit_continued_log),
                 "AUDIT_REPORT": str(self.report),
                 "CARGO_INVOKED_LOG": str(self.cargo_log),
                 "HOME": str(self.user_home),
@@ -92,14 +94,25 @@ class AuditFixture:
         path.write_text(contents, encoding="utf-8")
         path.chmod(0o755)
 
-    def run(self) -> subprocess.CompletedProcess[str]:
+    def replace_audit_executable(self, contents: str) -> None:
+        self._write_executable(self.bin / "cargo-audit", contents)
+
+    def run(self, timeout_seconds: float = 5.0) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CHECKER), "--root", str(self.root)],
+            [
+                sys.executable,
+                str(CHECKER),
+                "--root",
+                str(self.root),
+                "--timeout-seconds",
+                str(timeout_seconds),
+            ],
             cwd=self.root,
             env=self.environment,
             check=False,
             capture_output=True,
             text=True,
+            timeout=10,
         )
 
     def close(self) -> None:
@@ -226,6 +239,85 @@ class CargoAuditContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("non-empty vulnerability list", result.stderr)
             self.assertIn("RUSTSEC-2099-9999/future-crate@1.0.0", result.stderr)
+        finally:
+            fixture.close()
+
+    def test_oversized_stdout_is_terminated_before_the_child_continues(self) -> None:
+        fixture = AuditFixture(clean_report())
+        fixture.replace_audit_executable(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys, time\n"
+            "chunk = b'x' * 65536\n"
+            "for _ in range(200):\n"
+            "    sys.stdout.buffer.write(chunk)\n"
+            "    sys.stdout.buffer.flush()\n"
+            "    time.sleep(0.001)\n"
+            "pathlib.Path(os.environ['AUDIT_CONTINUED_LOG']).write_text('continued')\n"
+            "time.sleep(30)\n"
+        )
+        try:
+            result = fixture.run()
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"oversized cargo-audit stdout did not fail: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn("stdout exceeded the 10 MiB bound", result.stderr)
+            self.assertFalse(
+                fixture.audit_continued_log.exists(),
+                f"cargo-audit continued after crossing the stdout bound: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+        finally:
+            fixture.close()
+
+    def test_oversized_stderr_is_terminated_before_the_child_continues(self) -> None:
+        fixture = AuditFixture(clean_report())
+        fixture.replace_audit_executable(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys, time\n"
+            "chunk = b'x' * 65536\n"
+            "for _ in range(32):\n"
+            "    sys.stderr.buffer.write(chunk)\n"
+            "    sys.stderr.buffer.flush()\n"
+            "    time.sleep(0.001)\n"
+            "pathlib.Path(os.environ['AUDIT_CONTINUED_LOG']).write_text('continued')\n"
+            "time.sleep(30)\n"
+        )
+        try:
+            result = fixture.run()
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"oversized cargo-audit stderr did not fail: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn("stderr exceeded the 1 MiB bound", result.stderr)
+            self.assertFalse(
+                fixture.audit_continued_log.exists(),
+                f"cargo-audit continued after crossing the stderr bound: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+        finally:
+            fixture.close()
+
+    def test_nonterminating_audit_is_stopped_by_the_explicit_deadline(self) -> None:
+        fixture = AuditFixture(clean_report())
+        fixture.replace_audit_executable(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, time\n"
+            "time.sleep(30)\n"
+            "pathlib.Path(os.environ['AUDIT_CONTINUED_LOG']).write_text('continued')\n"
+        )
+        try:
+            result = fixture.run(timeout_seconds=0.1)
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"nonterminating cargo-audit did not fail: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn("exceeded the 0.1-second timeout", result.stderr)
+            self.assertFalse(
+                fixture.audit_continued_log.exists(),
+                f"cargo-audit continued after its deadline: stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
         finally:
             fixture.close()
 
