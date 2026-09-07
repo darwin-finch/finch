@@ -477,6 +477,15 @@ impl AgentServer {
             // safe from this only because it slept a second unconditionally.
             const UNDELIVERED_RETRY: tokio::time::Duration = tokio::time::Duration::from_secs(1);
             loop {
+                // Register the waiter *before* sampling the head. A writer that
+                // blocks on the index lock resumes the instant this loop
+                // releases it, so a notification sent between reading the head
+                // and registering would land in that window. Enabling the
+                // future first makes the window empty rather than merely narrow.
+                let notified = wakeup.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
                 let now = crate::brain::store::unix_millis();
                 let sleep_for = match schedule_store.next_schedule_due_ms() {
                     Some(due) if due <= now => tokio::time::Duration::ZERO,
@@ -488,7 +497,7 @@ impl AgentServer {
                     // than the head this sleep was computed against.
                     tokio::select! {
                         _ = tokio::time::sleep(sleep_for) => {}
-                        _ = wakeup.notified() => {}
+                        _ = notified.as_mut() => {}
                     }
                 }
 

@@ -2705,40 +2705,45 @@ impl BrainStore {
         }
     }
 
-    /// Atomically advance due schedules and append the exact queued ProgramRun
-    /// for each delivery. The returned runs are durable before this method
-    /// returns and are safe for the runner broker to dispatch immediately.
     /// Bring the due index into line with one Brain's current schedules.
     ///
     /// Called wherever a schedule is created, cancelled, or advanced, and when
     /// a Brain becomes resident. Takes the state the caller already holds, so
     /// it never hydrates anything itself.
     fn reindex_schedules_locked(&self, name: &str, state: &BrainState) {
-        let earliest_before = {
-            let index = self
-                .schedule_index
-                .read()
-                .expect("schedule index lock poisoned");
-            index.next_due_ms()
-        };
-        let earliest_after = {
+        // Both reads happen inside the single write critical section. An
+        // earlier version sampled the head under a read guard, released it, and
+        // then took the write guard -- so a writer that blocked on the write
+        // lock compared a stale `before` against a fresh `after` and could
+        // conclude the head had not moved earlier when it had. The schedule it
+        // inserted then waited out the loop's existing sleep, up to the 60 s
+        // ceiling, silently.
+        let moved_earlier = {
             let mut index = self
                 .schedule_index
                 .write()
                 .expect("schedule index lock poisoned");
+            let earliest_before = index.next_due_ms();
             index.reindex(name, &state.schedules);
-            index.next_due_ms()
-        };
-        // Only wake the delivery loop when the head actually moved earlier.
-        // A schedule created far in the future must not interrupt a sleep it
-        // does not shorten.
-        let moved_earlier = match (earliest_before, earliest_after) {
-            (Some(before), Some(after)) => after < before,
-            (None, Some(_)) => true,
-            _ => false,
+            let earliest_after = index.next_due_ms();
+            // Only wake the delivery loop when the head actually moved earlier.
+            // A schedule created far in the future must not interrupt a sleep
+            // it does not shorten.
+            match (earliest_before, earliest_after) {
+                (Some(before), Some(after)) => after < before,
+                (None, Some(_)) => true,
+                _ => false,
+            }
         };
         if moved_earlier {
-            self.schedule_wakeup.notify_waiters();
+            // `notify_one`, not `notify_waiters`: the latter stores no permit,
+            // so a notification sent while the loop is between reading the head
+            // and registering its waiter is simply lost -- which is the
+            // expected interleaving under contention, not a rare race, because
+            // a writer blocked on this lock resumes exactly when the loop
+            // releases it. `notify_one` stores a permit, so the wake survives
+            // the window. A spurious extra wake costs one re-read of the head.
+            self.schedule_wakeup.notify_one();
         }
     }
 
@@ -2843,6 +2848,9 @@ impl BrainStore {
             .len()
     }
 
+    /// Atomically advance due schedules and append the exact queued ProgramRun
+    /// for each delivery. The returned runs are durable before this method
+    /// returns and are safe for the runner broker to dispatch immediately.
     pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
@@ -4576,6 +4584,12 @@ impl BrainStore {
             .write()
             .expect("shared brain lock poisoned")
             .remove(name);
+        // Without this the index keeps pointing at an archived Brain, the
+        // delivery loop selects it, and `queue_due_schedules` -> `ensure_loaded`
+        // -> `load_or_create_metadata` recreates the directory with a *new*
+        // BrainId. Archiving a Brain that had an active schedule would silently
+        // resurrect it as an empty one.
+        self.forget_schedules_locked(name);
         self.runtimes
             .write()
             .expect("shared brain runtime lock poisoned")
@@ -7625,6 +7639,85 @@ mod tests {
             vec!["healthy-one".to_string(), "healthy-two".to_string()],
             "both healthy Brains must still be scheduled, in due order, with \
              the unreplayable one simply absent"
+        );
+    }
+
+    #[test]
+    fn test_archiving_a_scheduled_brain_does_not_resurrect_it() {
+        // Review round 1, finding 1. The index kept pointing at an archived
+        // Brain, so the delivery loop selected it and `queue_due_schedules` ->
+        // `ensure_loaded` -> `load_or_create_metadata` recreated the directory
+        // with a *new* BrainId. Archiving a Brain that had an active schedule
+        // silently resurrected it as an empty one, on disk.
+        //
+        // The `forget_schedules_locked` call originally added went on
+        // `remove_if_unused`, which refuses to remove any Brain whose history
+        // contains a schedule event -- so the cleanup was installed where it
+        // could never have entries and missing where it always does.
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        seed_scheduled_brain(&store, "doomed", 1_000);
+        assert_eq!(
+            store.indexed_schedule_count(),
+            1,
+            "precondition: the Brain has an indexed active schedule"
+        );
+
+        store.archive("doomed").unwrap();
+
+        assert_eq!(
+            store.indexed_schedule_count(),
+            0,
+            "archiving must drop the Brain's index entries; a stale entry makes \
+             the delivery loop select a Brain that no longer exists"
+        );
+        assert_eq!(
+            store.next_schedule_due_ms(),
+            None,
+            "and the archived schedule must not remain the index head"
+        );
+        assert!(
+            store.due_schedule_brains(u64::MAX).is_empty(),
+            "selection must not name an archived Brain at any instant; naming \
+             it is what drives the recreation"
+        );
+        assert!(
+            !temp.path().join("doomed").exists(),
+            "the archived Brain directory must stay gone -- if the index still \
+             named it, selecting it would recreate it here with a fresh BrainId"
+        );
+    }
+
+    #[test]
+    fn test_a_wakeup_sent_before_the_waiter_registers_is_not_lost() {
+        // Review round 1, finding 3. `notify_waiters` stores no permit, so a
+        // notification sent while the delivery loop sits between reading the
+        // index head and registering its waiter was dropped, and the loop then
+        // slept to the stale head -- up to the 60 s ceiling. That is the
+        // expected interleaving under contention, not a rare race: a writer
+        // blocked on the index lock resumes exactly when the loop releases it.
+        let store = BrainStore::with_root("box.local", None);
+        let wakeup = store.schedule_wakeup();
+
+        // Notify with nobody waiting, exactly as the lost-wakeup window does.
+        wakeup.notify_one();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let woke = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), wakeup.notified())
+                .await
+                .is_ok()
+        });
+
+        assert!(
+            woke,
+            "a notification sent before the waiter registers must survive: with \
+             `notify_waiters` it is discarded, and the delivery loop then waits \
+             out its existing sleep while a schedule that is already due sits \
+             at the head of the index"
         );
     }
 
