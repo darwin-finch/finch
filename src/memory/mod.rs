@@ -4735,8 +4735,27 @@ mod tests {
     }
 
     /// The text of one semantic leaf, read durably.
+    /// The text of the node a mapping points at, asserting that node is a leaf.
+    ///
+    /// The leaf check is load-bearing, not decoration. An internal node carries
+    /// a provisional label duplicated from one of its children, so a mapping
+    /// repointed to a parent that inherited the label would satisfy a bare text
+    /// comparison while the turn was no longer placed as its own memory. The
+    /// assertions that call this say "resolves to a leaf holding its own text";
+    /// without this check they would only be asserting the second half.
     fn node_text(db_path: &std::path::Path, node_id: i64) -> Result<String> {
         let conn = Connection::open(db_path)?;
+        let children: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tree_nodes WHERE parent_id = ?1",
+            [node_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            children, 0,
+            "a projected conversation must map to a leaf, not an internal node \
+             that merely inherited a child's provisional label; node_id={node_id} \
+             children={children}"
+        );
         Ok(conn.query_row(
             "SELECT text FROM tree_nodes WHERE node_id = ?1",
             [node_id],
