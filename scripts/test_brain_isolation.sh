@@ -34,6 +34,69 @@ assert_inventory() {
   fail "$label drift ('<' expected, '>' found):
 $(diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true)"
 }
+
+# Report a leading compound or negated assertion unless its compound closing
+# delimiter is followed by an explicit shell-list guard. Looking only for
+# `||`/`&&` anywhere on the line is unsound: those operators can be part of
+# the `[[ ... ]]` or `(( ... ))` expression whose false status is invisible to
+# macOS bash 3.2. Leading `!` is always rejected; spell the assertion as `if`
+# so its success and failure arms are explicit.
+scan_errexit_blind_constructs() {
+  local source_label="$1"
+  awk -v source_label="$source_label" '
+    function has_external_guard(statement, closing,    character, escaped, index_, in_double, in_single, suffix) {
+      escaped = 0
+      in_double = 0
+      in_single = 0
+      for (index_ = 1; index_ <= length(statement); index_++) {
+        character = substr(statement, index_, 1)
+        if (escaped) {
+          escaped = 0
+          continue
+        }
+        if (in_double && character == "\\") {
+          escaped = 1
+          continue
+        }
+        if (!in_double && character == "\047") {
+          in_single = !in_single
+          continue
+        }
+        if (!in_single && character == "\"") {
+          in_double = !in_double
+          continue
+        }
+        if (!in_single && !in_double &&
+            substr(statement, index_, length(closing)) == closing) {
+          suffix = substr(statement, index_ + length(closing))
+          sub(/^[[:space:]]*/, "", suffix)
+          return suffix ~ /^([|][|]|&&)([[:space:]]|$)/
+        }
+      }
+      return 0
+    }
+
+    {
+      statement = $0
+      sub(/^[[:space:]]*/, "", statement)
+
+      blind = 0
+      if (statement ~ /^!([[:space:]]|$)/) {
+        blind = 1
+      } else if (statement ~ /^\[\[/ &&
+                 !has_external_guard(statement, "]]")) {
+        blind = 1
+      } else if (statement ~ /^\(\(/ &&
+                 !has_external_guard(statement, "))")) {
+        blind = 1
+      }
+
+      if (blind) {
+        print source_label ":" NR ":" $0
+      }
+    }
+  '
+}
 # --- end errexit-blind assertion helpers ---
 
 # Prove the gate can fail before trusting anything it reports. Until #401 this
@@ -63,18 +126,38 @@ if [[ "$selftest_status" -eq 0 ]]; then
   exit 1
 fi
 
+# Exercise the scanner against the cleanup assertion shape that originally
+# escaped it, its arithmetic-AND sibling, a quoted fake guard, and guarded
+# controls. The old grep-v-for-any-operator implementation returns no findings
+# for the first three lines, so this regression fails under that mutant.
+scanner_selftest_hits="$(
+  printf '%s\n' \
+    '[[ "$value" == /private/tmp/ft.* || "$value" == /tmp/ft.* ]]' \
+    '(( left && right ))' \
+    '[[ "$value" == "]] || hidden" ]]' \
+    '[[ "$value" == /private/tmp/ft.* || "$value" == /tmp/ft.* ]] || fail "guarded"' \
+    '(( left && right )) && :' \
+    | scan_errexit_blind_constructs synthetic-errexit-blind.sh
+)" || fail 'errexit-blind scanner self-test could not run'
+expected_scanner_selftest_hits='synthetic-errexit-blind.sh:1:[[ "$value" == /private/tmp/ft.* || "$value" == /tmp/ft.* ]]
+synthetic-errexit-blind.sh:2:(( left && right ))
+synthetic-errexit-blind.sh:3:[[ "$value" == "]] || hidden" ]]'
+assert_inventory 'errexit-blind scanner self-test' \
+  "$scanner_selftest_hits" "$expected_scanner_selftest_hits"
+
 # Statically forbid reintroducing the class. A statement that begins with
-# `[[`, `((`, or `!` and is not itself guarded by `||`/`&&` is invisible to
-# `set -e` on macOS bash 3.2 (the first two) or on every bash (the third).
+# `[[` or `((` and whose closing delimiter is not followed by `||`/`&&` is
+# invisible to `set -e` on macOS bash 3.2. A leading `!` is invisible on every
+# bash version and must be written as an explicit `if` assertion.
 # The scan is line-based, so the guard must sit on the same physical line as
 # the condition it guards; break the line after `|| fail`, not before it.
 phase=errexit-blind-construct-scan
 blind_constructs="$(
-  grep -nE '^[[:space:]]*(![[:space:]]|\[\[|\(\()' \
-    "$repo_root/scripts/test_brain_isolation.sh" \
-    "$repo_root/scripts/lib/brain_test_isolation.sh" \
-    | grep -vE '(\|\||&&)' || true
-)"
+  scan_errexit_blind_constructs "$repo_root/scripts/test_brain_isolation.sh" \
+    <"$repo_root/scripts/test_brain_isolation.sh" || exit $?
+  scan_errexit_blind_constructs "$repo_root/scripts/lib/brain_test_isolation.sh" \
+    <"$repo_root/scripts/lib/brain_test_isolation.sh"
+)" || fail 'errexit-blind construct scan could not run'
 if [[ -n "$blind_constructs" ]]; then
   fail "assertions whose failure \`set -e\` cannot see; give each an explicit
 \`|| fail ...\` or \`if ...; then fail ...; fi\`:
@@ -678,7 +761,9 @@ preserved_home="$(find "$temp_parent" -type d -name 'finch-brain-test-home.*' -p
 test -n "$preserved_home" && test -d "$preserved_home"
 rg -q 'process group was not quiescent' "$scratch/inspection.err"
 preserved_socket_root="$(sed -n 's/.*socket root at \([^ ]*\) because.*/\1/p' "$scratch/inspection.err")"
-[[ "$preserved_socket_root" == /private/tmp/ft.* || "$preserved_socket_root" == /tmp/ft.* ]]
+if [[ "$preserved_socket_root" != /private/tmp/ft.* && "$preserved_socket_root" != /tmp/ft.* ]]; then
+  fail "refusing to clean unexpected preserved socket root '$preserved_socket_root'"
+fi
 test -d "$preserved_socket_root"
 rm -rf -- "$preserved_home"
 rm -rf -- "$preserved_socket_root"
