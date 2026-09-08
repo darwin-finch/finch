@@ -86,7 +86,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -304,6 +304,49 @@ prefer_local = true
     }
 }
 
+/// A command for the real binary with every mutable path redirected into the
+/// fixture and every provider credential removed.
+fn isolated_finch_command(fixture: &Fixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+    command
+        .env("HOME", &fixture.home)
+        .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+        .env("XDG_CACHE_HOME", fixture.home.join(".cache"))
+        .env("XDG_DATA_HOME", fixture.home.join(".local/share"))
+        .env("HF_HOME", fixture.home.join(".cache/huggingface"))
+        .env("TERM", "xterm-256color")
+        .env("FINCH_STARTUP_TIMINGS", &fixture.timings)
+        // Blocks daemon discovery, reuse and auto-spawn without needing a
+        // supervisor proof (`src/daemon/spawn.rs`).
+        .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
+        // No provider credential can be picked up from the developer's
+        // environment, so no request can be made even in principle.
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("XAI_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("SHAMMAH_DEBUG")
+        .env_remove("SHAMMAH_LOG")
+        .env_remove("RUST_LOG")
+        // Constructed isolation, not incidental. The child must not inherit
+        // the supervisor proof or another process's paths and endpoints.
+        .env_remove("FINCH_BRAIN_TEST_ISOLATED")
+        .env_remove("FINCH_BRAIN_TEST_TOKEN")
+        .env_remove("FINCH_BRAIN_TEST_PROOF_FD")
+        .env_remove("FINCH_BRAIN_TEST_PROOF_BACKUP_FD")
+        .env_remove("FINCH_BRAIN_TEST_AUTH_FD")
+        .env_remove("FINCH_BRAIN_TEST_HOME")
+        .env_remove("FINCH_BRAIN_TEST_ROOT")
+        .env_remove("FINCH_TEST_SUPERVISOR_PID")
+        .env_remove("FINCH_TEST_SUPERVISOR_BIN")
+        .env_remove("FINCH_TEST_IPC_SOCKET")
+        .env_remove("FINCH_TEST_SOCKET_ROOT")
+        .env_remove("FINCH_TEST_DAEMON_ADDR")
+        .env_remove("FINCH_TEST_BRAIN_ADDR");
+    command
+}
+
 /// A `finch` running on the far side of a pty.
 struct Session {
     child: Child,
@@ -338,51 +381,12 @@ impl Session {
         let slave_out = pty.slave.try_clone().expect("clone slave for stdout");
         let slave_err = pty.slave.try_clone().expect("clone slave for stderr");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+        let mut command = isolated_finch_command(fixture);
         command
             .args(args)
             .stdin(Stdio::from(slave_in))
             .stdout(Stdio::from(slave_out))
-            .stderr(Stdio::from(slave_err))
-            .env("HOME", &fixture.home)
-            .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
-            .env("XDG_CACHE_HOME", fixture.home.join(".cache"))
-            .env("XDG_DATA_HOME", fixture.home.join(".local/share"))
-            .env("HF_HOME", fixture.home.join(".cache/huggingface"))
-            .env("TERM", "xterm-256color")
-            .env("FINCH_STARTUP_TIMINGS", &fixture.timings)
-            // Blocks daemon discovery, reuse and auto-spawn without needing a
-            // supervisor proof (`src/daemon/spawn.rs`).
-            .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
-            // No provider credential can be picked up from the developer's
-            // environment, so no request can be made even in principle.
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("XAI_API_KEY")
-            .env_remove("GEMINI_API_KEY")
-            .env_remove("GOOGLE_API_KEY")
-            .env_remove("SHAMMAH_DEBUG")
-            .env_remove("RUST_LOG")
-            // Constructed isolation, not incidental. Under the mandated
-            // launcher the parent carries the supervisor's whole environment,
-            // and the child would inherit a proof descriptor it was not given,
-            // a Brain root that no longer matches its HOME, and a socket path
-            // belonging to another process. None of it is read on the
-            // interactive path today, so the fixture's determinism rested on
-            // that reachability argument rather than on a clean environment.
-            .env_remove("FINCH_BRAIN_TEST_ISOLATED")
-            .env_remove("FINCH_BRAIN_TEST_TOKEN")
-            .env_remove("FINCH_BRAIN_TEST_PROOF_FD")
-            .env_remove("FINCH_BRAIN_TEST_PROOF_BACKUP_FD")
-            .env_remove("FINCH_BRAIN_TEST_AUTH_FD")
-            .env_remove("FINCH_BRAIN_TEST_HOME")
-            .env_remove("FINCH_BRAIN_TEST_ROOT")
-            .env_remove("FINCH_TEST_SUPERVISOR_PID")
-            .env_remove("FINCH_TEST_SUPERVISOR_BIN")
-            .env_remove("FINCH_TEST_IPC_SOCKET")
-            .env_remove("FINCH_TEST_SOCKET_ROOT")
-            .env_remove("FINCH_TEST_DAEMON_ADDR")
-            .env_remove("FINCH_TEST_BRAIN_ADDR");
+            .stderr(Stdio::from(slave_err));
         for (name, value) in extra_env {
             command.env(name, value);
         }
@@ -601,6 +605,137 @@ impl Drop for Session {
             }
         }
     }
+}
+
+/// Run the real REPL with terminal stdin but redirected output. This is the
+/// production path for `finch >log`: main does not take the piped-query early
+/// return because stdin is a terminal, while `Repl` correctly observes that
+/// stdout is not one and selects its non-interactive banner.
+fn run_with_redirected_output(fixture: &Fixture) -> (std::process::ExitStatus, String, String) {
+    let pty = nix::pty::openpty(None, None).expect("open pty for terminal stdin");
+    let mut stdout = tempfile::tempfile().expect("temporary stdout capture");
+    let mut stderr = tempfile::tempfile().expect("temporary stderr capture");
+    let mut command = isolated_finch_command(fixture);
+    command
+        .arg("--raw")
+        .stdin(Stdio::from(pty.slave))
+        .stdout(Stdio::from(
+            stdout.try_clone().expect("clone stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().expect("clone stderr capture"),
+        ));
+
+    let mut child = command.spawn().expect("spawn finch with redirected output");
+    let mut input = std::fs::File::from(pty.master);
+    write!(input, "/exit\r").expect("send /exit to redirected repl");
+    input.flush().expect("flush redirected repl input");
+
+    let deadline = Instant::now() + READY_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => panic!("could not wait for redirected finch: {error}"),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "redirected finch did not consume `/exit` within {READY_DEADLINE:?}; \
+                 this deadline detects a stuck real REPL, not startup latency"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let mut stdout_text = String::new();
+    stdout.seek(SeekFrom::Start(0)).expect("rewind stdout");
+    stdout
+        .read_to_string(&mut stdout_text)
+        .expect("read stdout capture");
+    let mut stderr_text = String::new();
+    stderr.seek(SeekFrom::Start(0)).expect("rewind stderr");
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read stderr capture");
+    (status, stdout_text, stderr_text)
+}
+
+fn command_payload(output: &std::process::Output) -> String {
+    format!(
+        "status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn test_cli_help_and_version_report_the_real_finch_identity() {
+    let fixture = Fixture::new(0);
+    let help = isolated_finch_command(&fixture)
+        .arg("--help")
+        .output()
+        .expect("run the built finch --help");
+    let help_payload = command_payload(&help);
+    assert!(
+        help.status.success(),
+        "the built `finch --help` must exit successfully; {help_payload}"
+    );
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert_eq!(
+        help_stdout.lines().next(),
+        Some(finch::ABOUT),
+        "the first line emitted by the real clap parser must be Finch's \
+         evidence-backed description; {help_payload}"
+    );
+
+    let version = isolated_finch_command(&fixture)
+        .arg("--version")
+        .output()
+        .expect("run the built finch --version");
+    let version_payload = command_payload(&version);
+    assert!(
+        version.status.success(),
+        "the built `finch --version` must exit successfully; {version_payload}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("finch {}", env!("CARGO_PKG_VERSION")),
+        "the real clap version must use the Cargo package name and version; \
+         {version_payload}"
+    );
+}
+
+#[test]
+fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
+    let expected = format!("finch {} - {}", env!("CARGO_PKG_VERSION"), finch::ABOUT);
+
+    let interactive_fixture = Fixture::new(0);
+    let mut interactive = Session::spawn_with_args(&interactive_fixture, &["--raw"]);
+    let _report = interactive.wait_for_report(&interactive_fixture);
+    interactive.send_line("/exit");
+    let interactive_status = interactive.wait_for_exit();
+    let interactive_transcript = interactive.readable_transcript();
+    assert!(
+        interactive_status.success() && interactive_transcript.contains(&expected),
+        "the real raw interactive REPL must visibly report the Cargo version \
+         and evidence-backed product description before accepting input. \
+         expected={expected:?} status={interactive_status:?} terminal:\n\
+         {interactive_transcript}"
+    );
+
+    let redirected_fixture = Fixture::new(0);
+    let (redirected_status, stdout, stderr) = run_with_redirected_output(&redirected_fixture);
+    let expected_redirected = format!("# {expected} - non-interactive mode");
+    assert!(
+        redirected_status.success() && stderr.lines().any(|line| line == expected_redirected),
+        "the real redirected-output REPL must visibly report the same identity \
+         on stderr without requiring a logging environment variable. \
+         expected={expected_redirected:?} status={redirected_status:?}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 /// Every phase and mark an interactive start records, in the order it records

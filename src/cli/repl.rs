@@ -2386,7 +2386,7 @@ impl Repl {
             self.print_status_line().await;
         } else {
             // Minimal output for non-interactive mode (pipes, scripts)
-            output_status!("# {} - non-interactive mode", startup_identity_line());
+            eprintln!("# {} - non-interactive mode", startup_identity_line());
         }
 
         // Register Ctrl+C handler for graceful shutdown
