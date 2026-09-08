@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from check_ci_workflow_manifest import (
     ContractError,
@@ -25,6 +26,7 @@ from check_ci_workflow_manifest import (
     compare_contract,
     hash_canonical_workflow_stream,
     read_exact_bytes,
+    repository_snapshot,
     workflow_records,
 )
 
@@ -34,12 +36,20 @@ CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
 
 
 class WorkflowRepository:
-    def __init__(self) -> None:
+    def __init__(self, source_root: Path = ROOT) -> None:
+        snapshot = repository_snapshot(source_root)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        shutil.copytree(ROOT / ".github/workflows", self.root / ".github/workflows")
-        (self.root / "scripts").mkdir()
-        shutil.copy2(ROOT / "scripts/ci_workflow_manifest.json", self.root / "scripts")
+        try:
+            workflows = self.root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            for name, contents in snapshot.workflow_bytes.items():
+                (workflows / name).write_bytes(contents)
+            (self.root / "scripts").mkdir()
+            self.manifest_path().write_bytes(snapshot.manifest_bytes)
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         self.temporary.cleanup()
@@ -78,7 +88,70 @@ class WorkflowRepository:
         )
 
 
+class OpenAuditRecorder:
+    """Record lexical open paths only while one source snapshot is active."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.paths: list[str] = []
+
+        def record(event: str, arguments: tuple[object, ...]) -> None:
+            if not self.active or event != "open" or not arguments:
+                return
+            try:
+                path = os.fspath(arguments[0])
+            except TypeError:
+                return
+            if isinstance(path, bytes):
+                path = os.fsdecode(path)
+            self.paths.append(path)
+
+        sys.addaudithook(record)
+
+    def start(self) -> None:
+        self.paths.clear()
+        self.active = True
+
+    def stop(self) -> None:
+        self.active = False
+
+
 class WorkflowManifestTests(unittest.TestCase):
+    def write_snapshot_source(
+        self,
+        root: Path,
+        workflows: dict[str, bytes] | None = None,
+        manifest_bytes: bytes = b"{}\n",
+    ) -> None:
+        workflow_directory = root / ".github/workflows"
+        workflow_directory.mkdir(parents=True)
+        for name, contents in (workflows or {"synthetic.yml": b"name: fixture\n"}).items():
+            (workflow_directory / name).write_bytes(contents)
+        scripts = root / "scripts"
+        scripts.mkdir()
+        (scripts / "ci_workflow_manifest.json").write_bytes(manifest_bytes)
+
+    def assert_snapshot_source_rejected(
+        self,
+        diagnostic: str,
+        invariant: str,
+        workflows: dict[str, bytes] | None = None,
+        manifest_bytes: bytes = b"{}\n",
+        ignored_entries: int = 0,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root, workflows, manifest_bytes)
+            directory = root / ".github/workflows"
+            for index in range(ignored_entries):
+                (directory / f"ignored-{index}.txt").touch()
+            with self.assertRaisesRegex(
+                ContractError,
+                diagnostic,
+                msg=f"{invariant}: root={root}",
+            ):
+                repository_snapshot(root)
+
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
         self.assertEqual(
@@ -150,6 +223,202 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_source_snapshot_bounds_total_directory_entries(self) -> None:
+        self.assert_snapshot_source_rejected(
+            "directory entry count exceeds",
+            "the source snapshot must reject the first entry beyond its reviewed "
+            f"directory bound; entries={MAX_WORKFLOW_DIRECTORY_ENTRIES + 1}",
+            ignored_entries=MAX_WORKFLOW_DIRECTORY_ENTRIES,
+        )
+
+    def test_source_snapshot_bounds_workflow_count_independently(self) -> None:
+        workflows = {
+            f"workflow-{index}.yml": b"name: fixture\n"
+            for index in range(MAX_WORKFLOW_FILES + 1)
+        }
+        self.assert_snapshot_source_rejected(
+            "workflow count exceeds",
+            "the source snapshot must reject the first workflow beyond its reviewed "
+            f"count independently of entry and byte bounds; workflows={len(workflows)}",
+            workflows,
+        )
+
+    def test_source_snapshot_bounds_each_workflow_before_reading(self) -> None:
+        size = MAX_WORKFLOW_BYTES + 1
+        self.assert_snapshot_source_rejected(
+            rf"oversized.yml: {size} bytes exceeds the reviewed {MAX_WORKFLOW_BYTES}-byte bound",
+            "the source snapshot must enforce the per-workflow bound before reading; "
+            f"size={size} limit={MAX_WORKFLOW_BYTES}",
+            {"oversized.yml": b"x" * size},
+        )
+
+    def test_source_snapshot_bounds_aggregate_workflow_bytes_independently(self) -> None:
+        workflows = {
+            f"workflow-{index}.yml": b"x" * MAX_WORKFLOW_BYTES for index in range(9)
+        }
+        total = sum(len(contents) for contents in workflows.values())
+        self.assert_snapshot_source_rejected(
+            rf"{total} aggregate bytes exceeds the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound",
+            "the source snapshot must enforce aggregate bytes while every leaf and count "
+            f"remains in bounds; total={total} limit={MAX_TOTAL_WORKFLOW_BYTES}",
+            workflows,
+        )
+
+    def test_source_snapshot_bounds_valid_manifest_before_reading(self) -> None:
+        manifest_bytes = b'{"padding":"' + b"x" * MAX_MANIFEST_BYTES + b'"}\n'
+        self.assert_snapshot_source_rejected(
+            rf"{len(manifest_bytes)} bytes exceeds the reviewed {MAX_MANIFEST_BYTES}-byte bound",
+            "the source snapshot must reject an otherwise valid oversized manifest before "
+            f"reading or parsing it; size={len(manifest_bytes)} limit={MAX_MANIFEST_BYTES}",
+            manifest_bytes=manifest_bytes,
+        )
+
+    def test_source_snapshot_never_opens_ignored_nonworkflow_link_or_target(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        recorder = OpenAuditRecorder()
+        try:
+            root = Path(temporary.name)
+            self.write_snapshot_source(root)
+            target = root / "tiny-nonworkflow-target.txt"
+            target.write_bytes(b"sentinel\n")
+            link = root / ".github/workflows/ignored.txt"
+            link.symlink_to(target)
+
+            recorder.start()
+            try:
+                snapshot = repository_snapshot(root)
+            finally:
+                recorder.stop()
+
+            self.assertEqual(
+                sorted(snapshot.workflow_bytes),
+                ["synthetic.yml"],
+                "the source snapshot must contain only workflow YAML after ignoring a link: "
+                f"root={root} captured={sorted(snapshot.workflow_bytes)!r}",
+            )
+            self.assertNotIn(
+                str(link),
+                recorder.paths,
+                "the source snapshot must filter an ignored non-workflow link lexically "
+                f"before open: link={link} target={target} opens={recorder.paths!r}",
+            )
+            self.assertNotIn(
+                str(target),
+                recorder.paths,
+                "the source snapshot must never open an ignored non-workflow link target: "
+                f"link={link} target={target} opens={recorder.paths!r}",
+            )
+        finally:
+            recorder.stop()
+            temporary.cleanup()
+
+    def test_source_snapshot_rejects_manifest_link_without_opening_target(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        recorder = OpenAuditRecorder()
+        try:
+            root = Path(temporary.name)
+            self.write_snapshot_source(root)
+            manifest = root / "scripts/ci_workflow_manifest.json"
+            manifest.unlink()
+            target = root / "tiny-valid-manifest.json"
+            target.write_bytes(b"{}\n")
+            manifest.symlink_to(target)
+
+            recorder.start()
+            try:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "must be a regular file, not a symbolic link",
+                    msg=(
+                        "the source snapshot must reject a manifest link before opening its "
+                        f"tiny valid target: manifest={manifest} target={target}"
+                    ),
+                ):
+                    repository_snapshot(root)
+            finally:
+                recorder.stop()
+
+            self.assertNotIn(
+                str(manifest),
+                recorder.paths,
+                "manifest lstat rejection must occur before any open attempt: "
+                f"manifest={manifest} target={target} opens={recorder.paths!r}",
+            )
+            self.assertNotIn(
+                str(target),
+                recorder.paths,
+                "the source snapshot must never open a symlinked manifest target: "
+                f"manifest={manifest} target={target} opens={recorder.paths!r}",
+            )
+        finally:
+            recorder.stop()
+            temporary.cleanup()
+
+    def test_source_snapshot_rejects_directory_replacement_before_materializing(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            root = Path(temporary.name)
+            workflow_bytes = b"name: fixture\n"
+            self.write_snapshot_source(root, {"synthetic.yml": workflow_bytes})
+            directory = root / ".github/workflows"
+            replacement = root / ".github/workflows-replacement"
+            replacement.mkdir()
+            (replacement / "synthetic.yml").write_bytes(workflow_bytes)
+            original_inode = directory.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+            self.assertNotEqual(
+                replacement_inode,
+                original_inode,
+                "directory replacement fixture must allocate both same-byte directories "
+                "while the original remains live: "
+                f"directory={directory} inode={original_inode} replacement={replacement} "
+                f"replacement_inode={replacement_inode}",
+            )
+
+            def replace_directory() -> None:
+                original = root / ".github/workflows-original"
+                directory.rename(original)
+                os.replace(replacement, directory)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                "directory identity changed during enumeration",
+                msg=(
+                    "the source snapshot must discard captured names when the workflow "
+                    "directory pathname changes before leaf opens: "
+                    f"directory={directory} original_inode={original_inode} "
+                    f"replacement_inode={replacement_inode}"
+                ),
+            ):
+                repository_snapshot(root, workflow_post_scan_hook=replace_directory)
+        finally:
+            temporary.cleanup()
+
+    def test_rejected_source_snapshot_allocates_no_fixture_tree(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            root = Path(temporary.name)
+            self.write_snapshot_source(
+                root, {"oversized.yml": b"x" * (MAX_WORKFLOW_BYTES + 1)}
+            )
+            with mock.patch.object(
+                tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("fixture tree allocated before source validation"),
+            ) as temporary_factory:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "exceeds the reviewed",
+                    msg=(
+                        "WorkflowRepository must reject an invalid source snapshot before "
+                        f"allocating any destination tree: source={root}"
+                    ),
+                ):
+                    WorkflowRepository(root)
+            temporary_factory.assert_not_called()
+        finally:
+            temporary.cleanup()
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):

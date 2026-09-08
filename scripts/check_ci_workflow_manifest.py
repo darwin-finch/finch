@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, BinaryIO
@@ -32,6 +33,16 @@ class ContractError(Exception):
 
 
 FileIdentity = tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class RepositorySnapshot:
+    """Bounded, identity-validated source bytes used by checks and test fixtures."""
+
+    manifest_bytes: bytes
+    manifest: dict[str, Any]
+    workflow_bytes: dict[str, bytes]
+    workflow_records: dict[str, dict[str, Any]]
 
 
 CANONICAL_CHECKS = (
@@ -262,7 +273,18 @@ def hash_canonical_workflow_stream(
     stream: BinaryIO, expected_size: int, display: str
 ) -> tuple[str, int]:
     """Hash reviewed workflow bytes with Git's declared CRLF-to-LF checkout semantics."""
+    _, digest, canonical_size = capture_canonical_workflow_stream(
+        stream, expected_size, display
+    )
+    return digest, canonical_size
+
+
+def capture_canonical_workflow_stream(
+    stream: BinaryIO, expected_size: int, display: str
+) -> tuple[bytes, str, int]:
+    """Capture and hash reviewed workflow bytes through one bounded stream."""
     digest = hashlib.sha256()
+    contents = bytearray()
     consumed = 0
     canonical_size = 0
     pending_carriage_return = False
@@ -272,6 +294,7 @@ def hash_canonical_workflow_stream(
         if not chunk:
             break
         consumed += len(chunk)
+        contents.extend(chunk)
         if pending_carriage_return:
             chunk = b"\r" + chunk
             pending_carriage_return = False
@@ -291,7 +314,7 @@ def hash_canonical_workflow_stream(
         digest.update(b"\r")
     if stream.read(1):
         raise ContractError(f"{display}: file grew while its reviewed bytes were hashed")
-    return digest.hexdigest(), canonical_size
+    return bytes(contents), digest.hexdigest(), canonical_size
 
 
 def exact_digest(
@@ -301,16 +324,111 @@ def exact_digest(
     before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
 ) -> tuple[str, int, int, FileIdentity]:
+    _, digest, canonical_size, physical_size, identity = exact_workflow(
+        path, root, maximum, before_open_hook, after_open_hook
+    )
+    return digest, canonical_size, physical_size, identity
+
+
+def exact_workflow(
+    path: Path,
+    root: Path,
+    maximum: int,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
+) -> tuple[bytes, str, int, int, FileIdentity]:
+    """Read and hash one bounded regular workflow from the same opened inode."""
     stream, opened, display = open_regular_file(
         path, root, maximum, before_open_hook
     )
     with stream:
         if after_open_hook is not None:
             after_open_hook(path)
-        digest, canonical_size = hash_canonical_workflow_stream(
+        contents, digest, canonical_size = capture_canonical_workflow_stream(
             stream, opened.st_size, display
         )
-    return digest, canonical_size, opened.st_size, file_identity(opened)
+    return (
+        contents,
+        digest,
+        canonical_size,
+        opened.st_size,
+        file_identity(opened),
+    )
+
+
+def workflow_snapshot(
+    root: Path,
+    phase_hook: Callable[[], None] | None = None,
+    after_hash_hook: Callable[[], None] | None = None,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
+    final_scan_hook: Callable[[], None] | None = None,
+    post_scan_hook: Callable[[], None] | None = None,
+) -> tuple[dict[str, bytes], dict[str, dict[str, Any]]]:
+    """Capture bounded workflow bytes after complete directory and leaf validation."""
+    directory_identity, paths = workflow_paths(root, post_scan_hook)
+    metadata_by_path = {
+        path: regular_file_metadata(
+            path, path.relative_to(root).as_posix(), MAX_WORKFLOW_BYTES
+        )
+        for path in paths
+    }
+    total_bytes = sum(metadata.st_size for metadata in metadata_by_path.values())
+    if total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: {total_bytes} aggregate bytes exceeds the reviewed "
+            f"{MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
+        )
+    if phase_hook is not None:
+        phase_hook()
+    records: dict[str, dict[str, Any]] = {}
+    contents_by_path: dict[Path, bytes] = {}
+    opened_identities: dict[Path, FileIdentity] = {}
+    opened_total_bytes = 0
+    for path in paths:
+        contents, digest, canonical_size, physical_size, opened_identity = exact_workflow(
+            path,
+            root,
+            MAX_WORKFLOW_BYTES,
+            before_open_hook,
+            after_open_hook,
+        )
+        opened_total_bytes += physical_size
+        if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
+            raise ContractError(
+                f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
+                f"the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
+            )
+        initial_identity = file_identity(metadata_by_path[path])
+        if opened_identity != initial_identity:
+            raise ContractError(
+                f"{path.relative_to(root)}: file identity changed after enumeration"
+            )
+        contents_by_path[path] = contents
+        opened_identities[path] = opened_identity
+        records[path.name] = {
+            "sha256": digest,
+            "bytes": canonical_size,
+            "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),
+        }
+    if after_hash_hook is not None:
+        after_hash_hook()
+    final_directory_identity, final_paths = workflow_paths(root, final_scan_hook)
+    initial_names = [path.name for path in paths]
+    final_names = [path.name for path in final_paths]
+    if final_names != initial_names:
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: workflow entry set changed while checking; "
+            f"before={initial_names!r} after={final_names!r}"
+        )
+    for path in final_paths:
+        display = path.relative_to(root).as_posix()
+        final_metadata = regular_file_metadata(path, display, MAX_WORKFLOW_BYTES)
+        if file_identity(final_metadata) != opened_identities[path]:
+            raise ContractError(f"{display}: file identity changed after hashing")
+    if final_directory_identity != directory_identity:
+        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
+    return ({path.name: contents_by_path[path] for path in paths}, records)
 
 
 def workflow_paths(
@@ -375,66 +493,14 @@ def workflow_records(
     after_open_hook: Callable[[Path], None] | None = None,
     final_scan_hook: Callable[[], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    directory_identity, paths = workflow_paths(root)
-    metadata_by_path = {
-        path: regular_file_metadata(
-            path, path.relative_to(root).as_posix(), MAX_WORKFLOW_BYTES
-        )
-        for path in paths
-    }
-    total_bytes = sum(metadata.st_size for metadata in metadata_by_path.values())
-    if total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
-        raise ContractError(
-            f"{WORKFLOW_DIRECTORY}: {total_bytes} aggregate bytes exceeds the reviewed "
-            f"{MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
-        )
-    if phase_hook is not None:
-        phase_hook()
-    records: dict[str, dict[str, Any]] = {}
-    opened_identities: dict[Path, FileIdentity] = {}
-    opened_total_bytes = 0
-    for path in paths:
-        digest, canonical_size, physical_size, opened_identity = exact_digest(
-            path,
-            root,
-            MAX_WORKFLOW_BYTES,
-            before_open_hook,
-            after_open_hook,
-        )
-        opened_total_bytes += physical_size
-        if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
-            raise ContractError(
-                f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
-                f"the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
-            )
-        initial_identity = file_identity(metadata_by_path[path])
-        if opened_identity != initial_identity:
-            raise ContractError(
-                f"{path.relative_to(root)}: file identity changed after enumeration"
-            )
-        opened_identities[path] = opened_identity
-        records[path.name] = {
-            "sha256": digest,
-            "bytes": canonical_size,
-            "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),
-        }
-    if after_hash_hook is not None:
-        after_hash_hook()
-    final_directory_identity, final_paths = workflow_paths(root, final_scan_hook)
-    initial_names = [path.name for path in paths]
-    final_names = [path.name for path in final_paths]
-    if final_names != initial_names:
-        raise ContractError(
-            f"{WORKFLOW_DIRECTORY}: workflow entry set changed while checking; "
-            f"before={initial_names!r} after={final_names!r}"
-        )
-    for path in final_paths:
-        display = path.relative_to(root).as_posix()
-        final_metadata = regular_file_metadata(path, display, MAX_WORKFLOW_BYTES)
-        if file_identity(final_metadata) != opened_identities[path]:
-            raise ContractError(f"{display}: file identity changed after hashing")
-    if final_directory_identity != directory_identity:
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
+    _, records = workflow_snapshot(
+        root,
+        phase_hook,
+        after_hash_hook,
+        before_open_hook,
+        after_open_hook,
+        final_scan_hook,
+    )
     return records
 
 
@@ -443,6 +509,18 @@ def load_manifest(
     before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
 ) -> tuple[dict[str, Any], FileIdentity]:
+    _, manifest, identity = manifest_snapshot(
+        root, before_open_hook, after_open_hook
+    )
+    return manifest, identity
+
+
+def manifest_snapshot(
+    root: Path,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
+) -> tuple[bytes, dict[str, Any], FileIdentity]:
+    """Capture bounded raw and parsed manifest bytes from one validated inode."""
     path = root / MANIFEST_PATH
     display = MANIFEST_PATH.as_posix()
     try:
@@ -452,8 +530,8 @@ def load_manifest(
         with stream:
             if after_open_hook is not None:
                 after_open_hook(path)
-            contents = read_exact_bytes(stream, metadata.st_size, display).decode("utf-8")
-        manifest = json.loads(contents, object_pairs_hook=json_object)
+            contents = read_exact_bytes(stream, metadata.st_size, display)
+        manifest = json.loads(contents.decode("utf-8"), object_pairs_hook=json_object)
     except (
         OSError,
         UnicodeError,
@@ -465,7 +543,7 @@ def load_manifest(
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
-    return manifest, file_identity(metadata)
+    return contents, manifest, file_identity(metadata)
 
 
 def revalidate_manifest(root: Path, initial_identity: FileIdentity) -> None:
@@ -476,6 +554,33 @@ def revalidate_manifest(root: Path, initial_identity: FileIdentity) -> None:
         raise ContractError(
             f"{display}: file identity changed while workflows were being checked"
         )
+
+
+def repository_snapshot(
+    root: Path,
+    workflow_phase_hook: Callable[[], None] | None = None,
+    after_workflow_hook: Callable[[], None] | None = None,
+    workflow_before_open_hook: Callable[[Path], None] | None = None,
+    workflow_after_open_hook: Callable[[Path], None] | None = None,
+    manifest_before_open_hook: Callable[[Path], None] | None = None,
+    manifest_after_open_hook: Callable[[Path], None] | None = None,
+    workflow_post_scan_hook: Callable[[], None] | None = None,
+) -> RepositorySnapshot:
+    """Capture one bounded source snapshot after all identities revalidate."""
+    manifest_bytes, manifest, manifest_identity = manifest_snapshot(
+        root, manifest_before_open_hook, manifest_after_open_hook
+    )
+    workflow_bytes, records = workflow_snapshot(
+        root,
+        phase_hook=workflow_phase_hook,
+        before_open_hook=workflow_before_open_hook,
+        after_open_hook=workflow_after_open_hook,
+        post_scan_hook=workflow_post_scan_hook,
+    )
+    if after_workflow_hook is not None:
+        after_workflow_hook()
+    revalidate_manifest(root, manifest_identity)
+    return RepositorySnapshot(manifest_bytes, manifest, workflow_bytes, records)
 
 
 def evidence_errors(actual_names: set[str]) -> list[str]:
@@ -528,21 +633,20 @@ def compare_contract(
     manifest_after_open_hook: Callable[[Path], None] | None = None,
 ) -> list[str]:
     try:
-        manifest, manifest_identity = load_manifest(
-            root, manifest_before_open_hook, manifest_after_open_hook
-        )
-        actual = workflow_records(
+        snapshot = repository_snapshot(
             root,
-            phase_hook=workflow_phase_hook,
-            before_open_hook=workflow_before_open_hook,
-            after_open_hook=workflow_after_open_hook,
+            workflow_phase_hook,
+            after_workflow_hook,
+            workflow_before_open_hook,
+            workflow_after_open_hook,
+            manifest_before_open_hook,
+            manifest_after_open_hook,
         )
-        if after_workflow_hook is not None:
-            after_workflow_hook()
-        revalidate_manifest(root, manifest_identity)
     except ContractError as error:
         return [str(error)]
 
+    manifest = snapshot.manifest
+    actual = snapshot.workflow_records
     errors: list[str] = []
     errors.extend(evidence_errors(set(actual)))
     expected_root_keys = {
