@@ -130,63 +130,45 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"rejection omitted diagnostic {diagnostic!r}: output={output!r}",
             )
 
-    def assert_lstat_open_symlink_swap_rejected(
-        self,
-        repository: WorkflowRepository,
-        path: Path,
-        target: Path,
-        link_target: str,
-        kind: str,
+    def assert_canonical_workflow_inventory_wiring(
+        self, ci_path: Path, hygiene_path: Path
     ) -> None:
-        swapped = False
-
-        def swap_to_same_inode_symlink(opened_path: Path) -> None:
-            nonlocal swapped
-            if swapped or opened_path != path:
-                return
-            opened_path.rename(target)
-            opened_path.symlink_to(link_target)
-            swapped = True
-
-        def restore_path(opened_path: Path) -> None:
-            if opened_path != path or not opened_path.is_symlink():
-                return
-            opened_path.unlink()
-            target.rename(opened_path)
-
-        hooks = {
-            f"{kind}_before_open_hook": swap_to_same_inode_symlink,
-            f"{kind}_after_open_hook": restore_path,
-        }
-        errors = compare_contract(repository.root, **hooks)
-        self.assertTrue(
-            swapped,
-            f"{kind} race hook must replace the lstat-validated path before open: "
-            f"path={path} target={target}",
-        )
-        self.assertTrue(
-            any("regular file could not be opened safely" in error for error in errors),
-            "O_NOFOLLOW must reject an lstat-to-open symlink swap even when the link "
-            "resolves to the same reviewed inode; removing O_NOFOLLOW would let the "
-            f"restore hook conceal the race: kind={kind} path={path} errors={errors!r}",
-        )
-
-    def test_current_reviewed_inventory_passes(self) -> None:
-        repository = WorkflowRepository()
-        try:
-            self.assert_accepted(repository)
-        finally:
-            repository.close()
-
-    def test_canonical_jobs_run_workflow_inventory_checks_without_new_fanout(self) -> None:
         checker_command = "python3 scripts/check_ci_workflow_manifest.py"
         mutation_command = "python3 scripts/test_ci_workflow_manifest.py"
-        ci_path = ROOT / ".github/workflows/ci.yml"
-        hygiene_path = ROOT / ".github/workflows/repository-hygiene.yml"
         ci_contents = ci_path.read_text(encoding="utf-8")
         hygiene_contents = hygiene_path.read_text(encoding="utf-8")
         ci_security = workflow_job_block(ci_path, "security")
         hygiene_tracked_tree = workflow_job_block(hygiene_path, "tracked-tree")
+        matrix_lines = [
+            line.strip()
+            for line in hygiene_tracked_tree.splitlines()
+            if line.strip().startswith("os:")
+        ]
+        expected_matrix = ["ubuntu-24.04", "macos-14"]
+        self.assertEqual(
+            matrix_lines,
+            ["os: [ubuntu-24.04, macos-14]"],
+            "repository hygiene matrix must use the exact reviewed OS declaration; "
+            f"workflow={hygiene_path} expected={expected_matrix!r} "
+            f"matrix_lines={matrix_lines!r}",
+        )
+        matrix_values = [
+            value.strip()
+            for value in matrix_lines[0].removeprefix("os: [").removesuffix("]").split(",")
+        ]
+        self.assertEqual(
+            len(matrix_values),
+            2,
+            "repository hygiene must retain exactly two matrix cells; "
+            f"workflow={hygiene_path} matrix={matrix_values!r}",
+        )
+        linux_values = [value for value in matrix_values if value.startswith("ubuntu-")]
+        self.assertEqual(
+            linux_values,
+            ["ubuntu-24.04"],
+            "repository hygiene must retain exactly one Linux matrix cell, ubuntu-24.04; "
+            f"workflow={hygiene_path} matrix={matrix_values!r} linux={linux_values!r}",
+        )
         ci_step = (
             "    - name: Verify reviewed CI workflow inventory\n"
             "      run: |\n"
@@ -258,6 +240,97 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"invocation; workflow={hygiene_path} command={command!r} "
                 f"count={hygiene_contents.count(command)}",
             )
+
+    def assert_lstat_open_symlink_swap_rejected(
+        self,
+        repository: WorkflowRepository,
+        path: Path,
+        target: Path,
+        link_target: str,
+        kind: str,
+    ) -> None:
+        swapped = False
+
+        def swap_to_same_inode_symlink(opened_path: Path) -> None:
+            nonlocal swapped
+            if swapped or opened_path != path:
+                return
+            opened_path.rename(target)
+            opened_path.symlink_to(link_target)
+            swapped = True
+
+        def restore_path(opened_path: Path) -> None:
+            if opened_path != path or not opened_path.is_symlink():
+                return
+            opened_path.unlink()
+            target.rename(opened_path)
+
+        hooks = {
+            f"{kind}_before_open_hook": swap_to_same_inode_symlink,
+            f"{kind}_after_open_hook": restore_path,
+        }
+        errors = compare_contract(repository.root, **hooks)
+        self.assertTrue(
+            swapped,
+            f"{kind} race hook must replace the lstat-validated path before open: "
+            f"path={path} target={target}",
+        )
+        self.assertTrue(
+            any("regular file could not be opened safely" in error for error in errors),
+            "O_NOFOLLOW must reject an lstat-to-open symlink swap even when the link "
+            "resolves to the same reviewed inode; removing O_NOFOLLOW would let the "
+            f"restore hook conceal the race: kind={kind} path={path} errors={errors!r}",
+        )
+
+    def test_current_reviewed_inventory_passes(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            self.assert_accepted(repository)
+        finally:
+            repository.close()
+
+    def test_canonical_jobs_run_workflow_inventory_checks_without_new_fanout(self) -> None:
+        ci_path = ROOT / ".github/workflows/ci.yml"
+        hygiene_path = ROOT / ".github/workflows/repository-hygiene.yml"
+        self.assert_canonical_workflow_inventory_wiring(ci_path, hygiene_path)
+
+        repository = WorkflowRepository()
+        try:
+            mutant_path = repository.workflow("repository-hygiene.yml")
+            original = mutant_path.read_text(encoding="utf-8")
+            mutant = original.replace(
+                "os: [ubuntu-24.04, macos-14]",
+                "os: [ubuntu-24.04, ubuntu-22.04, macos-14]",
+                1,
+            )
+            self.assertNotEqual(
+                mutant,
+                original,
+                "ubuntu-22.04 matrix mutant must alter repository hygiene: "
+                f"workflow={mutant_path}",
+            )
+            mutant_path.write_text(mutant, encoding="utf-8")
+            mutant_bytes = mutant_path.read_bytes()
+            manifest = repository.manifest()
+            record = manifest["workflows"]["repository-hygiene.yml"]
+            record["bytes"] = len(mutant_bytes)
+            record["sha256"] = hashlib.sha256(mutant_bytes).hexdigest()
+            repository.write_manifest(manifest)
+            self.assert_accepted(repository)
+            with self.assertRaisesRegex(
+                AssertionError,
+                "exact reviewed OS declaration",
+                msg=(
+                    "structural wiring regression must reject a second Linux matrix cell "
+                    "even after the exact-byte manifest is refreshed: "
+                    f"workflow={mutant_path} matrix=ubuntu-24.04,ubuntu-22.04,macos-14"
+                ),
+            ):
+                self.assert_canonical_workflow_inventory_wiring(
+                    repository.workflow("ci.yml"), mutant_path
+                )
+        finally:
+            repository.close()
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):
@@ -647,15 +720,20 @@ class WorkflowManifestTests(unittest.TestCase):
                 manifest["workflows"]["ci.yml"]["sha256"] = hashlib.sha256(
                     changed_bytes
                 ).hexdigest()
-                manifest_path.unlink()
-                repository.write_manifest(manifest)
-                self.assertNotEqual(
-                    manifest_path.stat().st_ino,
-                    initial_manifest_inode,
-                    "snapshot race fixture must replace the manifest pathname: "
-                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
-                    f"replacement_inode={manifest_path.stat().st_ino}",
+                replacement = manifest_path.with_name("manifest-replacement.json")
+                replacement.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
                 )
+                self.assertNotEqual(
+                    replacement.stat().st_ino,
+                    initial_manifest_inode,
+                    "snapshot race fixture must allocate a distinct replacement while "
+                    "the reviewed manifest inode still exists: "
+                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
+                    f"replacement={replacement} replacement_inode={replacement.stat().st_ino}",
+                )
+                os.replace(replacement, manifest_path)
 
             errors = compare_contract(
                 repository.root,
@@ -738,15 +816,17 @@ class WorkflowManifestTests(unittest.TestCase):
             initial_inode = workflow.stat().st_ino
 
             def replace_leaf() -> None:
-                workflow.unlink()
-                workflow.write_bytes(reviewed_bytes)
+                replacement = workflow.with_name("ci-replacement.yml")
+                replacement.write_bytes(reviewed_bytes)
                 self.assertNotEqual(
-                    workflow.stat().st_ino,
+                    replacement.stat().st_ino,
                     initial_inode,
-                    "post-hash replacement regression must create a different leaf inode: "
+                    "post-hash replacement regression must allocate a distinct leaf while "
+                    "the hashed inode still exists: "
                     f"workflow={workflow} initial_inode={initial_inode} "
-                    f"replacement_inode={workflow.stat().st_ino}",
+                    f"replacement={replacement} replacement_inode={replacement.stat().st_ino}",
                 )
+                os.replace(replacement, workflow)
 
             with self.assertRaisesRegex(
                 ContractError,
