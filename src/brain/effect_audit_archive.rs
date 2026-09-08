@@ -125,10 +125,16 @@ pub(crate) struct EffectAuditReplayArchive {
 /// removed only after their terminal replay fence is durable.
 pub(crate) struct EffectAuditActiveJournal {
     path: PathBuf,
+    /// A reported COMMIT failure whose durable outcome could not be proven.
+    /// No writer may allocate another canonical sequence until restart reopens
+    /// and replays the journal from disk.
+    commit_outcome_uncertain: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_batch_before_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     report_next_commit_error_after_durable_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    make_next_commit_reconciliation_unknowable: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Test-only override of [`MAX_ACTIVE_JOURNAL_BYTES`]. The production bound
     /// is 48 MiB, which a deterministic regression cannot reach cheaply; the
     /// admission decision under test is the ordering of the bound check against
@@ -163,12 +169,17 @@ impl EffectAuditActiveJournal {
         }
         let journal = Self {
             path,
+            commit_outcome_uncertain: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_batch_before_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
             #[cfg(test)]
             report_next_commit_error_after_durable_commit: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(test)]
+            make_next_commit_reconciliation_unknowable: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
             #[cfg(test)]
@@ -251,6 +262,7 @@ impl EffectAuditActiveJournal {
         archive: &EffectAuditReplayArchive,
         encoded_reserve_bytes: usize,
     ) -> Result<()> {
+        self.ensure_commit_outcome_known()?;
         let active = self.file_bytes()?;
         let connection = open_active(&self.path)?;
         let active_identities: u64 = connection.query_row(
@@ -308,6 +320,7 @@ impl EffectAuditActiveJournal {
         transitions: impl IntoIterator<Item = (u64, &'a EffectAuditTransition)>,
         injectable_failure: bool,
     ) -> Result<()> {
+        self.ensure_commit_outcome_known()?;
         let mut connection = open_active(&self.path)?;
         let transaction = connection.transaction()?;
         let mut intended = Vec::new();
@@ -395,12 +408,26 @@ impl EffectAuditActiveJournal {
         commit_error: anyhow::Error,
     ) -> Result<()> {
         if intended.is_empty() {
+            self.mark_commit_outcome_uncertain();
             return Err(commit_error).context(
                 "effect-audit COMMIT was reported unsuccessful and an empty transaction cannot \
                  prove whether it became durable",
             );
         }
+        #[cfg(test)]
+        if self
+            .make_next_commit_reconciliation_unknowable
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.mark_commit_outcome_uncertain();
+            anyhow::bail!(
+                "effect-audit COMMIT was reported unsuccessful and its durable outcome could \
+                 not be determined: injected reconciliation read failure; commit error: \
+                 {commit_error:#}"
+            );
+        }
         let connection = open_active(&self.path).map_err(|reconcile_error| {
+            self.mark_commit_outcome_uncertain();
             anyhow::anyhow!(
                 "effect-audit COMMIT was reported unsuccessful and its durable outcome could \
                  not be determined by reopening {}: commit error: {commit_error:#}; \
@@ -417,6 +444,7 @@ impl EffectAuditActiveJournal {
                 )
                 .optional()
                 .map_err(|reconcile_error| {
+                    self.mark_commit_outcome_uncertain();
                     anyhow::anyhow!(
                         "effect-audit COMMIT was reported unsuccessful and transition #{seq} \
                          could not be checked in {}: commit error: {commit_error:#}; \
@@ -433,17 +461,35 @@ impl EffectAuditActiveJournal {
                     )
                 });
             };
-            anyhow::ensure!(
-                actual == *expected,
-                "effect-audit COMMIT was reported unsuccessful and durable transition #{seq} \
-                 conflicts with the intended batch in {} (expected {} bytes, found {} bytes); \
-                 refusing to guess whether canonical sequence numbers were consumed; commit \
-                 error: {commit_error:#}",
-                self.path.display(),
-                expected.len(),
-                actual.len()
-            );
+            if actual != *expected {
+                self.mark_commit_outcome_uncertain();
+                anyhow::bail!(
+                    "effect-audit COMMIT was reported unsuccessful and durable transition #{seq} \
+                     conflicts with the intended batch in {} (expected {} bytes, found {} bytes); \
+                     refusing to guess whether canonical sequence numbers were consumed; commit \
+                     error: {commit_error:#}",
+                    self.path.display(),
+                    expected.len(),
+                    actual.len()
+                );
+            }
         }
+        Ok(())
+    }
+
+    fn mark_commit_outcome_uncertain(&self) {
+        self.commit_outcome_uncertain
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn ensure_commit_outcome_known(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .commit_outcome_uncertain
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "effect-audit journal has an unresolved SQLite COMMIT outcome; canonical writes for \
+             this Brain are fenced until restart reopens and replays the durable journal"
+        );
         Ok(())
     }
 
@@ -456,6 +502,12 @@ impl EffectAuditActiveJournal {
     #[cfg(test)]
     pub(crate) fn report_next_commit_error_after_durable_commit_for_test(&self) {
         self.report_next_commit_error_after_durable_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_next_commit_reconciliation_unknowable_for_test(&self) {
+        self.make_next_commit_reconciliation_unknowable
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1281,6 +1333,17 @@ mod tests {
                 .map(|(seq, _)| seq)
                 .collect::<Vec<_>>()
         );
+        journal
+            .ensure_commit_outcome_known()
+            .unwrap_or_else(|error| {
+                panic!(
+                "confirmed absence must leave the journal writable because the sequence was not \
+                 consumed (expected_bytes={}, journal_bytes={}, error={error:#}, original \
+                 diagnostic={absent_diagnostic})",
+                intended_bytes.len(),
+                journal.file_bytes().unwrap()
+            )
+            });
 
         let conflicting = fence(uuid::Uuid::new_v4(), 2);
         journal.append(7, &conflicting).unwrap();
@@ -1307,6 +1370,18 @@ mod tests {
                 .into_iter()
                 .map(|(seq, _)| seq)
                 .collect::<Vec<_>>()
+        );
+        let poison = journal
+            .ensure_commit_outcome_known()
+            .expect_err("a conflicting durable row must fence later canonical writers");
+        assert!(
+            format!("{poison:#}").contains("fenced until restart"),
+            "a conflicting durable row must produce an actionable persistent-process fence \
+             (expected_bytes={}, actual_bytes={}, journal_bytes={}, conflict={conflict_diagnostic}, \
+             fence={poison:#})",
+            intended_bytes.len(),
+            serde_json::to_vec(&conflicting).unwrap().len(),
+            journal.file_bytes().unwrap()
         );
     }
 

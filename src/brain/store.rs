@@ -6746,6 +6746,32 @@ impl BrainStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn make_next_effect_audit_commit_reconciliation_unknowable_for_test(
+        &self,
+        name: &str,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .brain_id;
+        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage
+                .active
+                .report_next_commit_error_after_durable_commit_for_test();
+            storage
+                .active
+                .make_next_commit_reconciliation_unknowable_for_test();
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Override the durable byte ceiling of this Brain's active effect-audit
     /// journal so a regression can reach the bound without writing 48 MiB.
     #[cfg(test)]
@@ -6828,6 +6854,7 @@ impl BrainStore {
         let Some(path) = self.event_path(name) else {
             return Ok(());
         };
+        self.ensure_effect_audit_commit_outcome_known(name)?;
         if let Some(parent) = path.parent() {
             create_dir_all_durable(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
@@ -6850,6 +6877,19 @@ impl BrainStore {
                     .sync_all()
                     .with_context(|| format!("sync directory {}", parent.display()))?;
             }
+        }
+        Ok(())
+    }
+
+    /// A canonical JSONL append must not reuse a sequence while the active
+    /// SQLite journal may already hold it behind an ambiguous COMMIT result.
+    fn ensure_effect_audit_commit_outcome_known(&self, name: &str) -> Result<()> {
+        let stores = self
+            .effect_audit_storage
+            .lock()
+            .expect("effect-audit storage map poisoned");
+        if let Some(storage) = stores.get(name) {
+            storage.active.ensure_commit_outcome_known()?;
         }
         Ok(())
     }
@@ -13778,6 +13818,141 @@ mod tests {
             after_restart.seq,
             restarted_snapshot.revision,
             bytes_after.len()
+        );
+    }
+
+    /// #379: if a fresh read cannot determine whether a reported COMMIT error
+    /// happened before or after durability, the resident Brain must refuse all
+    /// canonical writers. Restart is the recovery boundary: it reopens and
+    /// replays the durable journal before allocating another sequence.
+    #[test]
+    fn test_effect_audit_unknowable_commit_fences_writes_until_restart_replay() {
+        const REPORTED_ERROR: &str =
+            "injected active effect-audit COMMIT error after the transaction became durable";
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let journal_path = active_journal_path(temp.path());
+        let revision_before = store.snapshot("shared").unwrap().revision;
+        let bytes_before = std::fs::read(&journal_path).unwrap();
+        let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        let execution_id = uuid::Uuid::new_v4();
+        let effect = audit_effect(9002, "unknowable");
+        store
+            .make_next_effect_audit_commit_reconciliation_unknowable_for_test("shared")
+            .unwrap();
+
+        let uncertain = store
+            .reserve_effect_audit(&grant, execution_id, effect.clone())
+            .expect_err("an unknowable durable COMMIT outcome must fail closed");
+        let uncertain_diagnostic = format!("{uncertain:#}");
+        let bytes_after = std::fs::read(&journal_path).unwrap();
+        let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        let revision_after = store.snapshot("shared").unwrap().revision;
+        assert!(
+            uncertain_diagnostic.contains("could not be determined")
+                && uncertain_diagnostic.contains(REPORTED_ERROR),
+            "the ambiguous result must retain both the unknown-outcome explanation and original \
+             COMMIT error (error={uncertain_diagnostic}, revision {revision_before}->{revision_after}, \
+             journal bytes {}->{}, seqs {seqs_before:?}->{seqs_after:?})",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+        assert_eq!(
+            revision_after,
+            revision_before,
+            "state must not guess that an unknowable COMMIT consumed its sequence (revision \
+             {revision_before}->{revision_after}, error={uncertain_diagnostic}, journal bytes \
+             {}->{}, seqs {seqs_before:?}->{seqs_after:?})",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+        assert!(
+            seqs_after.contains(&(revision_before + 1)),
+            "the fixture must really simulate the dangerous durable-then-error case: SQLite must \
+             hold seq {} while state remains at revision {revision_after} (error={uncertain_diagnostic}, \
+             journal bytes {}->{}, seqs {seqs_before:?}->{seqs_after:?})",
+            revision_before + 1,
+            bytes_before.len(),
+            bytes_after.len()
+        );
+
+        let ordinary_error = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "must be fenced".into(),
+                },
+            )
+            .expect_err("ordinary canonical writes must be fenced after an unknowable COMMIT");
+        let retry_error = store
+            .reserve_effect_audit(&grant, execution_id, effect)
+            .expect_err("audit writers must also be fenced after an unknowable COMMIT");
+        let revision_fenced = store.snapshot("shared").unwrap().revision;
+        let bytes_fenced = std::fs::read(&journal_path).unwrap();
+        let seqs_fenced = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        assert!(
+            format!("{ordinary_error:#}").contains("fenced until restart")
+                && format!("{retry_error:#}").contains("fenced until restart"),
+            "both ordinary and audit writers must receive the actionable restart fence \
+             (ordinary_error={ordinary_error:#}, retry_error={retry_error:#}, original_error=\
+             {uncertain_diagnostic}, revision {revision_before}->{revision_fenced}, journal bytes \
+             {}->{}, seqs {seqs_before:?}->{seqs_fenced:?})",
+            bytes_before.len(),
+            bytes_fenced.len()
+        );
+        assert!(
+            revision_fenced == revision_before
+                && bytes_fenced == bytes_after
+                && seqs_fenced == seqs_after,
+            "fenced writers must change neither canonical state nor either durable journal \
+             (revision {revision_before}->{revision_fenced}, journal bytes {}->{} after ambiguity \
+             and {} after refusals, seqs before={seqs_before:?}, after ambiguity={seqs_after:?}, \
+             after refusals={seqs_fenced:?}, ordinary_error={ordinary_error:#}, \
+             retry_error={retry_error:#})",
+            bytes_before.len(),
+            bytes_after.len(),
+            bytes_fenced.len()
+        );
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = restarted.snapshot("shared").unwrap_or_else(|error| {
+            panic!(
+                "restart must reopen and replay the possibly durable transition before clearing \
+                 the in-process fence (restart_error={error:#}, original_error={uncertain_diagnostic}, \
+                 revision_before={revision_before}, journal_bytes={}, journal_seqs={seqs_fenced:?})",
+                bytes_fenced.len()
+            )
+        });
+        assert!(
+            snapshot.revision >= revision_before + 1,
+            "restart must consume the durable ambiguous sequence before accepting another writer \
+             (revision_before={revision_before}, restarted_revision={}, original_error=\
+             {uncertain_diagnostic}, journal_bytes={}, journal_seqs={seqs_fenced:?})",
+            snapshot.revision,
+            bytes_fenced.len()
+        );
+        let recovered = restarted
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "after safe restart replay".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.seq,
+            snapshot.revision + 1,
+            "the first post-restart writer must allocate above the replayed ambiguous sequence \
+             (new seq {}, restarted revision {}, revision_before={revision_before}, \
+             original_error={uncertain_diagnostic}, journal_bytes={}, \
+             journal_seqs={seqs_fenced:?})",
+            recovered.seq,
+            snapshot.revision,
+            bytes_fenced.len()
         );
     }
 
