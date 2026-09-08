@@ -154,7 +154,82 @@ class PullBoundIterator:
         return type("Entry", (), {"name": name})()
 
 
+class MetadataRecordingEntry:
+    """Proxy one real directory entry and record target-following metadata calls."""
+
+    def __init__(self, entry, forbidden_name: str, attempts: list[str]) -> None:
+        self.entry = entry
+        self.forbidden_name = forbidden_name
+        self.attempts = attempts
+
+    @property
+    def name(self) -> str:
+        return self.entry.name
+
+    def stat(self, *args, **kwargs):
+        if self.name == self.forbidden_name and kwargs.get("follow_symlinks", True):
+            self.attempts.append(f"DirEntry.stat({self.name!r})")
+        return self.entry.stat(*args, **kwargs)
+
+    def is_file(self, *args, **kwargs):
+        if self.name == self.forbidden_name and kwargs.get("follow_symlinks", True):
+            self.attempts.append(f"DirEntry.is_file({self.name!r})")
+        return self.entry.is_file(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self.entry, name)
+
+
+class MetadataRecordingScandir:
+    """Preserve a real scandir context while proxying its yielded entries."""
+
+    def __init__(self, entries, forbidden_name: str, attempts: list[str]) -> None:
+        self.entries = entries
+        self.forbidden_name = forbidden_name
+        self.attempts = attempts
+
+    def __enter__(self):
+        self.entries.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.entries.__exit__(*args)
+
+    def __iter__(self):
+        return (
+            MetadataRecordingEntry(entry, self.forbidden_name, self.attempts)
+            for entry in self.entries
+        )
+
+
 class WorkflowManifestTests(unittest.TestCase):
+    def path_stat_follow_patch(
+        self, forbidden_paths: tuple[Path, ...], attempts: list[str]
+    ):
+        original_stat = Path.stat
+        forbidden = set(forbidden_paths)
+
+        def record_stat(path: Path, *args, **kwargs):
+            if path in forbidden and kwargs.get("follow_symlinks", True):
+                attempts.append(f"Path.stat({path!s})")
+            return original_stat(path, *args, **kwargs)
+
+        return mock.patch.object(Path, "stat", autospec=True, side_effect=record_stat)
+
+    def scandir_metadata_follow_patch(
+        self, forbidden_name: str, attempts: list[str]
+    ):
+        original_scandir = os.scandir
+
+        def record_scandir(path):
+            return MetadataRecordingScandir(
+                original_scandir(path), forbidden_name, attempts
+            )
+
+        return mock.patch(
+            "check_ci_workflow_manifest.os.scandir", side_effect=record_scandir
+        )
+
     def write_snapshot_source(
         self,
         root: Path,
@@ -354,10 +429,14 @@ class WorkflowManifestTests(unittest.TestCase):
             self.write_snapshot_source(root)
             link = root / ".github/workflows/ignored.txt"
             link.symlink_to(link.name)
+            metadata_attempts: list[str] = []
 
             recorder.start()
             try:
-                snapshot = repository_snapshot(root)
+                with self.scandir_metadata_follow_patch(
+                    link.name, metadata_attempts
+                ):
+                    snapshot = repository_snapshot(root)
             finally:
                 recorder.stop()
 
@@ -375,6 +454,13 @@ class WorkflowManifestTests(unittest.TestCase):
                 "before content or target-metadata access; the self-referential target "
                 f"makes any metadata dereference fail actionably: link={link}",
             )
+            self.assertEqual(
+                metadata_attempts,
+                [],
+                "ignored non-workflow entries must be filtered by name before any "
+                "target-following DirEntry metadata query, even if its failure is swallowed: "
+                f"link={link} attempts={metadata_attempts!r}",
+            )
         finally:
             recorder.stop()
             temporary.cleanup()
@@ -388,19 +474,21 @@ class WorkflowManifestTests(unittest.TestCase):
             manifest = root / "scripts/ci_workflow_manifest.json"
             manifest.unlink()
             manifest.symlink_to(manifest.name)
+            metadata_attempts: list[str] = []
 
             recorder.start()
             try:
-                with self.assertRaisesRegex(
-                    ContractError,
-                    "must be a regular file, not a symbolic link",
-                    msg=(
-                        "the source snapshot must reject a manifest link before opening its "
-                        "target or following target metadata; the self-referential target "
-                        f"makes metadata dereference observable: manifest={manifest}"
-                    ),
-                ):
-                    repository_snapshot(root)
+                with self.path_stat_follow_patch((manifest,), metadata_attempts):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "must be a regular file, not a symbolic link",
+                        msg=(
+                            "the source snapshot must reject a manifest link before opening "
+                            "its target or following target metadata: "
+                            f"manifest={manifest} attempts={metadata_attempts!r}"
+                        ),
+                    ):
+                        repository_snapshot(root)
             finally:
                 recorder.stop()
 
@@ -410,6 +498,13 @@ class WorkflowManifestTests(unittest.TestCase):
                 ("scripts/ci_workflow_manifest.json",),
                 "manifest lstat rejection must occur before any absolute or "
                 f"directory-relative open or target metadata access; manifest={manifest}",
+            )
+            self.assertEqual(
+                metadata_attempts,
+                [],
+                "manifest validation must not issue target-following Path.stat calls, even "
+                "if their errors would be swallowed before lstat rejection: "
+                f"manifest={manifest} attempts={metadata_attempts!r}",
             )
         finally:
             recorder.stop()
@@ -423,18 +518,20 @@ class WorkflowManifestTests(unittest.TestCase):
             workflow.unlink()
             workflow.symlink_to(workflow.name)
             recorder = OpenAuditRecorder()
+            metadata_attempts: list[str] = []
             recorder.start()
             try:
-                with self.assertRaisesRegex(
-                    ContractError,
-                    "must be a regular file, not a symbolic link",
-                    msg=(
-                        "the source snapshot must reject a workflow link before opening its "
-                        "target or following target metadata; the self-referential target "
-                        f"makes metadata dereference observable: workflow={workflow}"
-                    ),
-                ):
-                    repository_snapshot(root)
+                with self.path_stat_follow_patch((workflow,), metadata_attempts):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "must be a regular file, not a symbolic link",
+                        msg=(
+                            "the source snapshot must reject a workflow link before opening "
+                            "its target or following target metadata: "
+                            f"workflow={workflow} attempts={metadata_attempts!r}"
+                        ),
+                    ):
+                        repository_snapshot(root)
             finally:
                 recorder.stop()
             self.assert_open_names_absent(
@@ -443,6 +540,13 @@ class WorkflowManifestTests(unittest.TestCase):
                 (".github/workflows/synthetic.yml",),
                 "workflow metadata rejection must precede any link open or target "
                 f"metadata access: workflow={workflow}",
+            )
+            self.assertEqual(
+                metadata_attempts,
+                [],
+                "workflow validation must not issue target-following Path.stat calls, even "
+                "if their errors would be swallowed before lstat rejection: "
+                f"workflow={workflow} attempts={metadata_attempts!r}",
             )
 
     def test_source_snapshot_rejects_workflow_directory_link_without_target_open(self) -> None:
@@ -453,18 +557,20 @@ class WorkflowManifestTests(unittest.TestCase):
             shutil.rmtree(directory)
             directory.symlink_to(directory.name)
             recorder = OpenAuditRecorder()
+            metadata_attempts: list[str] = []
             recorder.start()
             try:
-                with self.assertRaisesRegex(
-                    ContractError,
-                    "must be a real directory, not a link",
-                    msg=(
-                        "the source snapshot must reject a workflow-directory link before "
-                        "opening it or following target metadata; the self-referential target "
-                        f"makes metadata dereference observable: directory={directory}"
-                    ),
-                ):
-                    repository_snapshot(root)
+                with self.path_stat_follow_patch((directory,), metadata_attempts):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "must be a real directory, not a link",
+                        msg=(
+                            "the source snapshot must reject a workflow-directory link "
+                            "before opening it or following target metadata: "
+                            f"directory={directory} attempts={metadata_attempts!r}"
+                        ),
+                    ):
+                        repository_snapshot(root)
             finally:
                 recorder.stop()
             self.assert_open_names_absent(
@@ -473,6 +579,13 @@ class WorkflowManifestTests(unittest.TestCase):
                 (".github/workflows",),
                 "workflow-directory lstat rejection must precede any target open or "
                 f"metadata access: directory={directory}",
+            )
+            self.assertEqual(
+                metadata_attempts,
+                [],
+                "workflow-directory validation must not issue target-following Path.stat "
+                "calls, even if their errors would be swallowed before lstat rejection: "
+                f"directory={directory} attempts={metadata_attempts!r}",
             )
 
     @unittest.skipUnless(
