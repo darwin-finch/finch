@@ -33,6 +33,33 @@ ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
 
 
+def workflow_job_block(path: Path, job_name: str) -> str:
+    """Return one top-level job block from the deliberately small workflow YAML."""
+    contents = path.read_text(encoding="utf-8")
+    jobs_marker = "jobs:\n"
+    jobs_start = contents.find(jobs_marker)
+    if jobs_start == -1:
+        raise AssertionError(f"workflow jobs mapping is missing: workflow={path}")
+    marker = f"  {job_name}:\n"
+    start = contents.find(marker, jobs_start + len(jobs_marker))
+    if start == -1:
+        raise AssertionError(
+            f"required workflow job is missing: workflow={path} job={job_name!r}"
+        )
+    next_job = len(contents)
+    for line_start in range(start + len(marker), len(contents)):
+        if line_start != 0 and contents[line_start - 1] != "\n":
+            continue
+        line_end = contents.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(contents)
+        line = contents[line_start:line_end]
+        if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+            next_job = line_start
+            break
+    return contents[start:next_job]
+
+
 class WorkflowRepository:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -150,6 +177,87 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_canonical_jobs_run_workflow_inventory_checks_without_new_fanout(self) -> None:
+        checker_command = "python3 scripts/check_ci_workflow_manifest.py"
+        mutation_command = "python3 scripts/test_ci_workflow_manifest.py"
+        ci_path = ROOT / ".github/workflows/ci.yml"
+        hygiene_path = ROOT / ".github/workflows/repository-hygiene.yml"
+        ci_contents = ci_path.read_text(encoding="utf-8")
+        hygiene_contents = hygiene_path.read_text(encoding="utf-8")
+        ci_security = workflow_job_block(ci_path, "security")
+        hygiene_tracked_tree = workflow_job_block(hygiene_path, "tracked-tree")
+        ci_step = (
+            "    - name: Verify reviewed CI workflow inventory\n"
+            "      run: |\n"
+            f"        {checker_command}\n"
+            f"        {mutation_command}\n"
+        )
+        hygiene_step = (
+            "      - name: Verify reviewed CI workflow inventory\n"
+            "        if: runner.os == 'Linux'\n"
+            "        run: |\n"
+            f"          {checker_command}\n"
+            f"          {mutation_command}\n"
+        )
+
+        self.assertIn(
+            ci_step,
+            ci_security,
+            "Security Audit must run the production workflow checker followed by its "
+            "mutation suite in one exact step; an invocation disappeared, changed, or "
+            f"moved outside jobs.security: workflow={ci_path} job={ci_security!r}",
+        )
+        self.assertIn(
+            hygiene_step,
+            hygiene_tracked_tree,
+            "repository hygiene must run both workflow inventory commands only in the "
+            "Linux matrix cell with exact condition runner.os == 'Linux'; an invocation "
+            "or condition disappeared, changed, or moved outside jobs.tracked-tree: "
+            f"workflow={hygiene_path} job={hygiene_tracked_tree!r}",
+        )
+        expected_jobs = {
+            ci_path: {
+                "toolchain-contract",
+                "windows-format-contract",
+                "test",
+                "runtime-authority",
+                "build",
+                "security",
+            },
+            hygiene_path: {"tracked-tree"},
+        }
+        for path, expected in expected_jobs.items():
+            jobs = {
+                line[2:-1]
+                for line in path.read_text(encoding="utf-8")
+                .split("jobs:\n", maxsplit=1)[1]
+                .splitlines()
+                if line.startswith("  ")
+                and not line.startswith("    ")
+                and line.endswith(":")
+            }
+            self.assertEqual(
+                jobs,
+                expected,
+                "workflow inventory wiring must reuse existing jobs without adding CI "
+                f"fan-out: workflow={path} expected_jobs={sorted(expected)!r} "
+                f"actual_jobs={sorted(jobs)!r}",
+            )
+        for command in (checker_command, mutation_command):
+            self.assertEqual(
+                ci_contents.count(command),
+                1,
+                "Security Audit must contain exactly one workflow-inventory invocation; "
+                f"workflow={ci_path} command={command!r} count={ci_contents.count(command)}",
+            )
+            self.assertEqual(
+                hygiene_contents.count(command),
+                1,
+                "tracked-tree must contain exactly one Linux-only workflow-inventory "
+                f"invocation; workflow={hygiene_path} command={command!r} "
+                f"count={hygiene_contents.count(command)}",
+            )
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):

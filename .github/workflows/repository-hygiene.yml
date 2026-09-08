@@ -26,3 +26,8 @@ jobs:
         run: python3 scripts/check_repository_hygiene.py
       - name: Run repository hygiene regressions
         run: python3 scripts/test_repository_hygiene.py
+      - name: Verify reviewed CI workflow inventory
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/check_ci_workflow_manifest.py
+          python3 scripts/test_ci_workflow_manifest.py

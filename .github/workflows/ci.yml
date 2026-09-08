@@ -195,6 +195,11 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Verify reviewed CI workflow inventory
+      run: |
+        python3 scripts/check_ci_workflow_manifest.py
+        python3 scripts/test_ci_workflow_manifest.py
+
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
