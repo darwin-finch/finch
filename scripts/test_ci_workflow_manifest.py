@@ -539,15 +539,21 @@ class WorkflowManifestTests(unittest.TestCase):
                 manifest["workflows"]["ci.yml"]["sha256"] = hashlib.sha256(
                     changed_bytes
                 ).hexdigest()
-                manifest_path.unlink()
-                repository.write_manifest(manifest)
-                self.assertNotEqual(
-                    manifest_path.stat().st_ino,
-                    initial_manifest_inode,
-                    "snapshot race fixture must replace the manifest pathname: "
-                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
-                    f"replacement_inode={manifest_path.stat().st_ino}",
+                replacement = manifest_path.with_name("manifest-replacement.json")
+                replacement.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
                 )
+                self.assertNotEqual(
+                    replacement.stat().st_ino,
+                    initial_manifest_inode,
+                    "snapshot race fixture must allocate a distinct replacement while "
+                    "the reviewed manifest inode still exists: "
+                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
+                    f"replacement={replacement} "
+                    f"replacement_inode={replacement.stat().st_ino}",
+                )
+                os.replace(replacement, manifest_path)
 
             errors = compare_contract(
                 repository.root,
@@ -606,16 +612,27 @@ class WorkflowManifestTests(unittest.TestCase):
             reviewed_bytes = workflow.read_bytes()
 
             def replace_leaf() -> None:
-                workflow.unlink()
-                workflow.write_bytes(reviewed_bytes)
+                replacement = workflow.with_name("ci-enumeration-replacement.yml")
+                replacement.write_bytes(reviewed_bytes)
+                self.assertNotEqual(
+                    replacement.stat().st_ino,
+                    initial_inode,
+                    "post-enumeration replacement regression must allocate a distinct leaf "
+                    "while the enumerated inode still exists: "
+                    f"workflow={workflow} initial_inode={initial_inode} "
+                    f"replacement={replacement} "
+                    f"replacement_inode={replacement.stat().st_ino}",
+                )
+                os.replace(replacement, workflow)
 
             initial_inode = workflow.stat().st_ino
             with self.assertRaisesRegex(
                 ContractError,
                 "identity changed after enumeration",
                 msg=(
-                    "unlink/recreate before workflow hashing must invalidate the enumerated "
-                    f"leaf identity: workflow={workflow} initial_inode={initial_inode}"
+                    "atomic pathname replacement before workflow hashing must invalidate the "
+                    f"enumerated leaf identity: workflow={workflow} "
+                    f"initial_inode={initial_inode}"
                 ),
             ):
                 workflow_records(repository.root, phase_hook=replace_leaf)
@@ -630,21 +647,25 @@ class WorkflowManifestTests(unittest.TestCase):
             initial_inode = workflow.stat().st_ino
 
             def replace_leaf() -> None:
-                workflow.unlink()
-                workflow.write_bytes(reviewed_bytes)
+                replacement = workflow.with_name("ci-replacement.yml")
+                replacement.write_bytes(reviewed_bytes)
                 self.assertNotEqual(
-                    workflow.stat().st_ino,
+                    replacement.stat().st_ino,
                     initial_inode,
-                    "post-hash replacement regression must create a different leaf inode: "
+                    "post-hash replacement regression must allocate a distinct leaf while "
+                    "the hashed inode still exists: "
                     f"workflow={workflow} initial_inode={initial_inode} "
-                    f"replacement_inode={workflow.stat().st_ino}",
+                    f"replacement={replacement} "
+                    f"replacement_inode={replacement.stat().st_ino}",
                 )
+                os.replace(replacement, workflow)
 
             with self.assertRaisesRegex(
                 ContractError,
                 "identity changed after hashing",
                 msg=(
-                    "unlink/recreate after hashing must invalidate the hashed leaf identity: "
+                    "atomic pathname replacement after hashing must invalidate the hashed "
+                    "leaf identity: "
                     f"workflow={workflow} initial_inode={initial_inode}"
                 ),
             ):
