@@ -310,7 +310,10 @@ impl Session {
         let deadline = Instant::now() + EXIT_DEADLINE;
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return status,
+                Ok(Some(status)) => {
+                    self.drain_reader_after_exit(context);
+                    return status;
+                }
                 Ok(None) => {}
                 Err(error) => panic!("{context}: could not wait for finch setup: {error}"),
             }
@@ -326,6 +329,26 @@ impl Session {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn drain_reader_after_exit(&mut self, context: &str) {
+        if self.reader.is_none() {
+            return;
+        }
+        self.reader_done
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{context}: PTY output did not drain after finch setup exited: {error}. \
+                     Terminal so far:\n{}",
+                    self.transcript()
+                )
+            });
+        self.reader
+            .take()
+            .expect("setup PTY reader exists before drain")
+            .join()
+            .expect("setup PTY reader must not panic");
     }
 }
 
