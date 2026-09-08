@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import shutil
@@ -18,8 +19,11 @@ from check_ci_workflow_manifest import (
     MAX_MANIFEST_BYTES,
     MAX_TOTAL_WORKFLOW_BYTES,
     MAX_WORKFLOW_BYTES,
+    MAX_WORKFLOW_DIRECTORY_ENTRIES,
     MAX_WORKFLOW_FILES,
+    compare_contract,
     hash_stream,
+    read_exact_bytes,
     workflow_records,
 )
 
@@ -94,6 +98,43 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
+        for name in ("ci.yml", "synthetic.yaml"):
+            with self.subTest(workflow=name):
+                result = subprocess.run(
+                    [
+                        "git",
+                        "check-attr",
+                        "text",
+                        "eol",
+                        "--",
+                        f".github/workflows/{name}",
+                    ],
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    "workflow EOL attribute lookup failed: "
+                    f"workflow={name} stdout={result.stdout!r} stderr={result.stderr!r}",
+                )
+                self.assertIn(
+                    f".github/workflows/{name}: text: set",
+                    result.stdout,
+                    "workflow YAML must be declared text for Git checkout normalization: "
+                    f"workflow={name} attributes={result.stdout!r}",
+                )
+                self.assertIn(
+                    f".github/workflows/{name}: eol: lf",
+                    result.stdout,
+                    "workflow YAML exact-byte hashes require LF in every Git checkout: "
+                    f"workflow={name} attributes={result.stdout!r}",
+                )
 
     def test_every_workflow_byte_change_requires_allocation_review(self) -> None:
         names = sorted(path.name for path in (ROOT / ".github/workflows").glob("*.y*ml"))
@@ -202,6 +243,23 @@ class WorkflowManifestTests(unittest.TestCase):
         finally:
             repository.close()
 
+    def test_total_directory_entries_are_bounded_during_scandir(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            directory = repository.root / ".github/workflows"
+            workflow_count = len(list(directory.glob("*.y*ml")))
+            nonworkflow_count = MAX_WORKFLOW_DIRECTORY_ENTRIES - workflow_count + 1
+            for index in range(nonworkflow_count):
+                (directory / f"ignored-{index}.txt").touch()
+            self.assert_rejected(
+                repository,
+                ".github/workflows",
+                "directory entry count exceeds",
+                str(MAX_WORKFLOW_DIRECTORY_ENTRIES),
+            )
+        finally:
+            repository.close()
+
     def test_entry_added_after_enumeration_is_rejected(self) -> None:
         repository = WorkflowRepository()
         try:
@@ -211,7 +269,12 @@ class WorkflowManifestTests(unittest.TestCase):
                 )
 
             with self.assertRaisesRegex(
-                ContractError, "directory identity changed|entry set changed"
+                ContractError,
+                "directory identity changed|entry set changed",
+                msg=(
+                    "a workflow inserted after initial enumeration must invalidate the "
+                    f"snapshot: root={repository.root} added=surprise.yml"
+                ),
             ):
                 workflow_records(repository.root, phase_hook=add_workflow)
         finally:
@@ -275,6 +338,82 @@ class WorkflowManifestTests(unittest.TestCase):
             f"requests={stream.requests!r}",
         )
 
+    def test_exact_read_rejects_early_eof(self) -> None:
+        expected_size = 10
+        contents = b"abc"
+        with self.assertRaisesRegex(
+            ContractError,
+            "file size changed while reading; expected=10 actual=3",
+            msg=(
+                "an early EOF must not be accepted as the reviewed manifest bytes: "
+                f"expected_size={expected_size} actual_size={len(contents)}"
+            ),
+        ):
+            read_exact_bytes(io.BytesIO(contents), expected_size, "manifest.json")
+
+    def test_manifest_truncated_after_open_is_rejected_at_checker_boundary(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            manifest = repository.manifest_path()
+            initial_size = manifest.stat().st_size
+
+            def truncate_open_manifest(opened_path: Path) -> None:
+                self.assertEqual(
+                    opened_path,
+                    manifest,
+                    "manifest mutation hook must target the safely opened manifest: "
+                    f"opened={opened_path} expected={manifest}",
+                )
+                opened_path.write_bytes(b"{}\n")
+
+            errors = compare_contract(
+                repository.root, manifest_after_open_hook=truncate_open_manifest
+            )
+            self.assertTrue(
+                any("file size changed while reading" in error for error in errors),
+                "the checker boundary must reject an early EOF after manifest open: "
+                f"manifest={manifest} initial_size={initial_size} errors={errors!r}",
+            )
+        finally:
+            repository.close()
+
+    def test_manifest_identity_overlaps_the_workflow_snapshot(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            workflow = repository.workflow("ci.yml")
+            manifest_path = repository.manifest_path()
+            initial_manifest_inode = manifest_path.stat().st_ino
+
+            def replace_workflow_and_manifest_after_scan() -> None:
+                changed_bytes = workflow.read_bytes() + b"\n# coherent late snapshot\n"
+                workflow.write_bytes(changed_bytes)
+                manifest = repository.manifest()
+                manifest["workflows"]["ci.yml"]["bytes"] = len(changed_bytes)
+                manifest["workflows"]["ci.yml"]["sha256"] = hashlib.sha256(
+                    changed_bytes
+                ).hexdigest()
+                manifest_path.unlink()
+                repository.write_manifest(manifest)
+                self.assertNotEqual(
+                    manifest_path.stat().st_ino,
+                    initial_manifest_inode,
+                    "snapshot race fixture must replace the manifest pathname: "
+                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
+                    f"replacement_inode={manifest_path.stat().st_ino}",
+                )
+
+            errors = compare_contract(
+                repository.root,
+                after_workflow_hook=replace_workflow_and_manifest_after_scan,
+            )
+            self.assertTrue(
+                any("manifest.json: file identity changed" in error for error in errors),
+                "manifest identity must remain stable across the complete workflow scan: "
+                f"manifest={manifest_path} workflow={workflow} errors={errors!r}",
+            )
+        finally:
+            repository.close()
+
     def test_same_inode_growth_after_open_is_rejected(self) -> None:
         repository = WorkflowRepository()
         try:
@@ -323,7 +462,15 @@ class WorkflowManifestTests(unittest.TestCase):
                 workflow.unlink()
                 workflow.write_bytes(reviewed_bytes)
 
-            with self.assertRaisesRegex(ContractError, "identity changed after enumeration"):
+            initial_inode = workflow.stat().st_ino
+            with self.assertRaisesRegex(
+                ContractError,
+                "identity changed after enumeration",
+                msg=(
+                    "unlink/recreate before workflow hashing must invalidate the enumerated "
+                    f"leaf identity: workflow={workflow} initial_inode={initial_inode}"
+                ),
+            ):
                 workflow_records(repository.root, phase_hook=replace_leaf)
         finally:
             repository.close()
@@ -333,11 +480,27 @@ class WorkflowManifestTests(unittest.TestCase):
         try:
             workflow = repository.workflow("ci.yml")
             reviewed_bytes = workflow.read_bytes()
+            initial_inode = workflow.stat().st_ino
 
             def replace_leaf() -> None:
-                workflow.write_bytes(b"#" + reviewed_bytes[1:])
+                workflow.unlink()
+                workflow.write_bytes(reviewed_bytes)
+                self.assertNotEqual(
+                    workflow.stat().st_ino,
+                    initial_inode,
+                    "post-hash replacement regression must create a different leaf inode: "
+                    f"workflow={workflow} initial_inode={initial_inode} "
+                    f"replacement_inode={workflow.stat().st_ino}",
+                )
 
-            with self.assertRaisesRegex(ContractError, "identity changed after hashing"):
+            with self.assertRaisesRegex(
+                ContractError,
+                "identity changed after hashing",
+                msg=(
+                    "unlink/recreate after hashing must invalidate the hashed leaf identity: "
+                    f"workflow={workflow} initial_inode={initial_inode}"
+                ),
+            ):
                 workflow_records(repository.root, after_hash_hook=replace_leaf)
         finally:
             repository.close()
@@ -352,7 +515,14 @@ class WorkflowManifestTests(unittest.TestCase):
                 directory.rename(target)
                 directory.symlink_to("../workflow-target")
 
-            with self.assertRaisesRegex(ContractError, "real directory"):
+            with self.assertRaisesRegex(
+                ContractError,
+                "real directory",
+                msg=(
+                    "replacing the enumerated workflow directory with a symlink must fail: "
+                    f"directory={directory} symlink_target={target}"
+                ),
+            ):
                 workflow_records(repository.root, phase_hook=replace_directory)
         finally:
             repository.close()
@@ -373,7 +543,15 @@ class WorkflowManifestTests(unittest.TestCase):
             def grow_workflows() -> None:
                 paths[-1].write_bytes(b"x" * (initial_size + 1_000))
 
-            with self.assertRaisesRegex(ContractError, "aggregate opened bytes exceeds"):
+            with self.assertRaisesRegex(
+                ContractError,
+                "aggregate opened bytes exceeds",
+                msg=(
+                    "authoritative opened sizes must enforce the aggregate byte bound: "
+                    f"paths={paths!r} initial_size={initial_size} "
+                    f"limit={MAX_TOTAL_WORKFLOW_BYTES}"
+                ),
+            ):
                 workflow_records(repository.root, phase_hook=grow_workflows)
         finally:
             repository.close()

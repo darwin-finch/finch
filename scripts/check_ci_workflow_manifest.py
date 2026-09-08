@@ -21,6 +21,7 @@ SCHEMA = "finch-ci-workflow-manifest:v2"
 MAX_WORKFLOW_BYTES = 128 * 1024
 MAX_TOTAL_WORKFLOW_BYTES = 1024 * 1024
 MAX_WORKFLOW_FILES = 64
+MAX_WORKFLOW_DIRECTORY_ENTRIES = 128
 MAX_MANIFEST_BYTES = 512 * 1024
 HASH_CHUNK_BYTES = 64 * 1024
 
@@ -296,9 +297,16 @@ def workflow_paths(
     if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode):
         raise ContractError(f"{WORKFLOW_DIRECTORY}: must be a real directory, not a link")
     paths: list[Path] = []
+    entry_count = 0
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
+                entry_count += 1
+                if entry_count > MAX_WORKFLOW_DIRECTORY_ENTRIES:
+                    raise ContractError(
+                        f"{WORKFLOW_DIRECTORY}: directory entry count exceeds the reviewed "
+                        f"{MAX_WORKFLOW_DIRECTORY_ENTRIES}-entry bound"
+                    )
                 if not entry.name.endswith((".yml", ".yaml")):
                     continue
                 paths.append(directory / entry.name)
@@ -381,8 +389,6 @@ def workflow_records(
     if after_hash_hook is not None:
         after_hash_hook()
     final_directory_identity, final_paths = workflow_paths(root, final_scan_hook)
-    if final_directory_identity != directory_identity:
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
     initial_names = [path.name for path in paths]
     final_names = [path.name for path in final_paths]
     if final_names != initial_names:
@@ -395,15 +401,21 @@ def workflow_records(
         final_metadata = regular_file_metadata(path, display, MAX_WORKFLOW_BYTES)
         if file_identity(final_metadata) != opened_identities[path]:
             raise ContractError(f"{display}: file identity changed after hashing")
+    if final_directory_identity != directory_identity:
+        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
     return records
 
 
-def load_manifest(root: Path) -> dict[str, Any]:
+def load_manifest(
+    root: Path, after_open_hook: Callable[[Path], None] | None = None
+) -> tuple[dict[str, Any], FileIdentity]:
     path = root / MANIFEST_PATH
     display = MANIFEST_PATH.as_posix()
     try:
         stream, metadata, display = open_regular_file(path, root, MAX_MANIFEST_BYTES)
         with stream:
+            if after_open_hook is not None:
+                after_open_hook(path)
             contents = read_exact_bytes(stream, metadata.st_size, display).decode("utf-8")
         manifest = json.loads(contents, object_pairs_hook=json_object)
     except (
@@ -417,7 +429,17 @@ def load_manifest(root: Path) -> dict[str, Any]:
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
-    return manifest
+    return manifest, file_identity(metadata)
+
+
+def revalidate_manifest(root: Path, initial_identity: FileIdentity) -> None:
+    path = root / MANIFEST_PATH
+    display = MANIFEST_PATH.as_posix()
+    metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    if file_identity(metadata) != initial_identity:
+        raise ContractError(
+            f"{display}: file identity changed while workflows were being checked"
+        )
 
 
 def evidence_errors(actual_names: set[str]) -> list[str]:
@@ -460,10 +482,18 @@ def evidence_errors(actual_names: set[str]) -> list[str]:
     return errors
 
 
-def compare_contract(root: Path) -> list[str]:
+def compare_contract(
+    root: Path,
+    workflow_phase_hook: Callable[[], None] | None = None,
+    after_workflow_hook: Callable[[], None] | None = None,
+    manifest_after_open_hook: Callable[[Path], None] | None = None,
+) -> list[str]:
     try:
-        actual = workflow_records(root)
-        manifest = load_manifest(root)
+        manifest, manifest_identity = load_manifest(root, manifest_after_open_hook)
+        actual = workflow_records(root, phase_hook=workflow_phase_hook)
+        if after_workflow_hook is not None:
+            after_workflow_hook()
+        revalidate_manifest(root, manifest_identity)
     except ContractError as error:
         return [str(error)]
 
@@ -484,6 +514,7 @@ def compare_contract(root: Path) -> list[str]:
         "max_workflow_bytes": MAX_WORKFLOW_BYTES,
         "max_total_workflow_bytes": MAX_TOTAL_WORKFLOW_BYTES,
         "max_workflow_files": MAX_WORKFLOW_FILES,
+        "max_workflow_directory_entries": MAX_WORKFLOW_DIRECTORY_ENTRIES,
         "max_manifest_bytes": MAX_MANIFEST_BYTES,
     }
     if manifest.get("limits") != expected_limits:
