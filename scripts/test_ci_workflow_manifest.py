@@ -26,6 +26,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_FILES,
     acquire_regular_file_descriptor,
     compare_contract,
+    file_identity,
     hash_canonical_workflow_stream,
     open_path_descriptor,
     read_exact_bytes,
@@ -189,6 +190,87 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"identity rejection must close its descriptor path={path}",
             )
 
+    def test_regular_descriptor_rejects_same_inode_full_identity_changes(self) -> None:
+        for mutation in ("size", "metadata"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                path = self.write_regular_source(root)
+                initial = path.stat()
+                initial_identity = file_identity(initial)
+                real_open = os.open
+                descriptors: list[int] = []
+                opened_identity: list[tuple[int, int, int, int, int]] = []
+
+                def record_open(opened_path, flags, *args, **kwargs):
+                    descriptor = real_open(opened_path, flags, *args, **kwargs)
+                    descriptors.append(descriptor)
+                    opened_identity.append(file_identity(os.fstat(descriptor)))
+                    return descriptor
+
+                def mutate_same_inode(_path: Path) -> None:
+                    if mutation == "size":
+                        with path.open("ab") as stream:
+                            stream.write(b"!")
+                    else:
+                        os.utime(
+                            path,
+                            ns=(initial.st_atime_ns, initial.st_mtime_ns + 1_000_000_000),
+                        )
+
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.open", side_effect=record_open
+                ):
+                    with self.assertRaises(
+                        ContractError,
+                        msg=(
+                            "full identity validation must reject a same-inode change: "
+                            f"path={path} mutation={mutation} "
+                            f"initial_identity={initial_identity!r}"
+                        ),
+                    ) as raised:
+                        acquire_regular_file_descriptor(
+                            path, root, 1024, mutate_same_inode
+                        )
+                self.assertEqual(
+                    len(opened_identity),
+                    1,
+                    "same-inode mutation fixture must capture one opened identity: "
+                    f"path={path} mutation={mutation} opened={opened_identity!r}",
+                )
+                self.assertEqual(
+                    initial_identity[:2],
+                    opened_identity[0][:2],
+                    "identity regression must retain device and inode while changing "
+                    "size or metadata: "
+                    f"path={path} mutation={mutation} initial={initial_identity!r} "
+                    f"opened={opened_identity[0]!r}",
+                )
+                self.assertNotEqual(
+                    initial_identity,
+                    opened_identity[0],
+                    "same-inode mutation must alter the full identity deterministically: "
+                    f"path={path} mutation={mutation} initial={initial_identity!r} "
+                    f"opened={opened_identity[0]!r}",
+                )
+                diagnostic = str(raised.exception)
+                for detail in (
+                    str(path),
+                    f"initial_identity={initial_identity!r}",
+                    f"opened_identity={opened_identity[0]!r}",
+                ):
+                    with self.subTest(mutation=mutation, detail=detail):
+                        self.assertIn(
+                            detail,
+                            diagnostic,
+                            "same-inode rejection must report path and both full identities: "
+                            f"path={path} mutation={mutation} detail={detail!r} "
+                            f"diagnostic={diagnostic!r}",
+                        )
+                self.assert_descriptor_closed(
+                    descriptors[0],
+                    f"same-inode {mutation} rejection must close fd path={path}",
+                )
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO replacement requires os.mkfifo")
     def test_regular_descriptor_rejects_fifo_promptly_and_closes_fd(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -239,10 +321,7 @@ class WorkflowManifestTests(unittest.TestCase):
             )
 
     def test_regular_descriptor_interruptions_propagate_and_close_fd(self) -> None:
-        for stage, target in (
-            ("fstat", "check_ci_workflow_manifest.os.fstat"),
-            ("identity", "check_ci_workflow_manifest.file_identity"),
-        ):
+        for stage, target in (("fstat", "check_ci_workflow_manifest.os.fstat"),):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as name:
                 root = Path(name)
                 path = self.write_regular_source(root)
@@ -277,6 +356,57 @@ class WorkflowManifestTests(unittest.TestCase):
                     descriptors[0],
                     f"BaseException cleanup must close fd path={path} stage={stage}",
                 )
+
+    def test_regular_descriptor_second_identity_interruption_closes_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            path = self.write_regular_source(root)
+            real_open = os.open
+            real_file_identity = file_identity
+            descriptors: list[int] = []
+            identity_calls: list[os.stat_result] = []
+
+            def record_open(opened_path, flags, *args, **kwargs):
+                descriptor = real_open(opened_path, flags, *args, **kwargs)
+                descriptors.append(descriptor)
+                return descriptor
+
+            def interrupt_second_identity(metadata: os.stat_result):
+                identity_calls.append(metadata)
+                if len(identity_calls) == 2:
+                    raise KeyboardInterrupt("injected second identity interruption")
+                return real_file_identity(metadata)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ), mock.patch(
+                "check_ci_workflow_manifest.file_identity",
+                side_effect=interrupt_second_identity,
+            ):
+                with self.assertRaises(
+                    KeyboardInterrupt,
+                    msg=(
+                        "second identity conversion interruption must propagate after cleanup: "
+                        f"path={path} calls={len(identity_calls)} descriptors={descriptors!r}"
+                    ),
+                ):
+                    acquire_regular_file_descriptor(path, root, 1024)
+            self.assertEqual(
+                len(identity_calls),
+                2,
+                "interruption must occur while converting saved initial metadata on the "
+                f"second identity call: path={path} calls={identity_calls!r}",
+            )
+            self.assertEqual(
+                len(descriptors),
+                1,
+                "second identity interruption must follow exactly one descriptor open: "
+                f"path={path} descriptors={descriptors!r}",
+            )
+            self.assert_descriptor_closed(
+                descriptors[0],
+                f"second identity interruption must close fd path={path} calls=2",
+            )
 
     def test_path_descriptor_open_uses_exact_read_only_safety_mask(self) -> None:
         with tempfile.TemporaryDirectory() as name:
