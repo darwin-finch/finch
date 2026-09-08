@@ -219,6 +219,28 @@ def file_identity(metadata: os.stat_result) -> FileIdentity:
     )
 
 
+def open_path_descriptor(path: Path, display: str) -> int:
+    """Open ``path`` without following links or blocking; the caller owns the fd."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ContractError(
+            f"{display}: O_NOFOLLOW is unavailable; refusing to open path={path}"
+        )
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nonblock is None:
+        raise ContractError(
+            f"{display}: O_NONBLOCK is unavailable; refusing to open path={path}"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
+    try:
+        return os.open(path, flags)
+    except OSError as error:
+        raise ContractError(
+            f"{display}: path={path} could not be opened with no-follow nonblocking "
+            f"read-only flags: {error}"
+        ) from error
+
+
 def open_regular_file(
     path: Path,
     root: Path,
