@@ -270,6 +270,60 @@ class WorkflowManifestTests(unittest.TestCase):
                     manifest_bytes_snapshot(root)
             opened.assert_not_called()
 
+    def test_manifest_bytes_snapshot_fails_closed_without_nonblock(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"raw")
+            with mock.patch.object(os, "O_NONBLOCK", None), mock.patch(
+                "check_ci_workflow_manifest.os.open",
+                side_effect=AssertionError("manifest opened without O_NONBLOCK"),
+            ) as opened:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "O_NONBLOCK is unavailable; refusing unsafe capture",
+                    msg=(
+                        "raw manifest capture must fail closed before open without "
+                        f"nonblocking support: manifest={manifest}"
+                    ),
+                ):
+                    manifest_bytes_snapshot(root)
+            opened.assert_not_called()
+
+    def test_manifest_bytes_snapshot_open_uses_nofollow_and_nonblock(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"raw")
+            real_open = os.open
+            observed_flags: list[int] = []
+
+            def record_open(path, flags, *args, **kwargs):
+                observed_flags.append(flags)
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                manifest_bytes_snapshot(root)
+            self.assertEqual(
+                len(observed_flags),
+                1,
+                "raw manifest capture must issue exactly one descriptor open: "
+                f"manifest={manifest} flags={observed_flags!r}",
+            )
+            flags = observed_flags[0]
+            self.assertEqual(
+                flags & os.O_NOFOLLOW,
+                os.O_NOFOLLOW,
+                "raw manifest open must pass O_NOFOLLOW directly: "
+                f"manifest={manifest} flags={flags:#x} nofollow={os.O_NOFOLLOW:#x}",
+            )
+            self.assertEqual(
+                flags & os.O_NONBLOCK,
+                os.O_NONBLOCK,
+                "raw manifest open must pass O_NONBLOCK directly: "
+                f"manifest={manifest} flags={flags:#x} nonblock={os.O_NONBLOCK:#x}",
+            )
+
     def test_manifest_bytes_snapshot_rejects_post_open_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -293,6 +347,162 @@ class WorkflowManifestTests(unittest.TestCase):
                 ),
             ):
                 manifest_bytes_snapshot(root, after_open_hook=replace_manifest)
+
+    def test_manifest_bytes_snapshot_rejects_distinct_before_open_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"original")
+            replacement = manifest.with_name("distinct-replacement.json")
+            replacement.write_bytes(b"replacement")
+            original_inode = manifest.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+            real_open = os.open
+            descriptors: list[int] = []
+
+            def record_open(path, flags, *args, **kwargs):
+                descriptor = real_open(path, flags, *args, **kwargs)
+                descriptors.append(descriptor)
+                return descriptor
+
+            def replace_before_open(_path: Path) -> None:
+                os.replace(replacement, manifest)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "file identity changed before reading",
+                    msg=(
+                        "opened descriptor identity must reject a distinct regular file "
+                        "installed after pathname metadata: "
+                        f"manifest={manifest} original_inode={original_inode} "
+                        f"replacement_inode={replacement_inode}"
+                    ),
+                ):
+                    manifest_bytes_snapshot(root, before_open_hook=replace_before_open)
+            self.assertEqual(
+                len(descriptors),
+                1,
+                "distinct replacement regression must reach exactly one descriptor open: "
+                f"manifest={manifest} descriptors={descriptors!r}",
+            )
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptors[0])
+            self.assertEqual(
+                raised.exception.errno,
+                errno.EBADF,
+                "identity rejection must close the replacement descriptor: "
+                f"manifest={manifest} descriptor={descriptors[0]}",
+            )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO replacement requires os.mkfifo")
+    def test_manifest_bytes_snapshot_rejects_fifo_before_open_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"original")
+            program = (
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "import check_ci_workflow_manifest as checker\n"
+                "root = Path(sys.argv[1])\n"
+                "manifest = root / 'scripts/ci_workflow_manifest.json'\n"
+                "real_open = os.open\n"
+                "descriptors = []\n"
+                "def record_open(path, flags, *args, **kwargs):\n"
+                "    descriptor = real_open(path, flags, *args, **kwargs)\n"
+                "    descriptors.append(descriptor)\n"
+                "    return descriptor\n"
+                "def install_fifo(_path):\n"
+                "    manifest.unlink()\n"
+                "    os.mkfifo(manifest)\n"
+                "checker.os.open = record_open\n"
+                "try:\n"
+                "    checker.manifest_bytes_snapshot(root, before_open_hook=install_fifo)\n"
+                "except checker.ContractError as error:\n"
+                "    closed = False\n"
+                "    try:\n"
+                "        os.fstat(descriptors[0])\n"
+                "    except OSError:\n"
+                "        closed = True\n"
+                "    print(f'error={error} closed={closed} descriptors={descriptors!r}')\n"
+                "    raise SystemExit(0 if 'opened path is not a regular file' in str(error) "
+                "and closed else 2)\n"
+                "raise SystemExit(3)\n"
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", program, str(root)],
+                    cwd=ROOT / "scripts",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    "FIFO replacement blocked instead of reaching non-regular descriptor "
+                    f"validation within two seconds: manifest={manifest} error={error!r}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                "FIFO replacement must reject actionably and close its nonblocking "
+                "descriptor: "
+                f"manifest={manifest} stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn(
+                "opened path is not a regular file",
+                result.stdout,
+                "FIFO replacement diagnostic must name the opened non-regular file: "
+                f"stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+
+    def test_manifest_bytes_snapshot_closes_fd_on_setup_interruptions(self) -> None:
+        for stage, target in (
+            ("fstat", "check_ci_workflow_manifest.os.fstat"),
+            ("identity validation", "check_ci_workflow_manifest.file_identity"),
+            ("fdopen transfer", "check_ci_workflow_manifest.os.fdopen"),
+        ):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                manifest = self.write_manifest_source(root, b"raw")
+                real_open = os.open
+                descriptors: list[int] = []
+
+                def record_open(path, flags, *args, **kwargs):
+                    descriptor = real_open(path, flags, *args, **kwargs)
+                    descriptors.append(descriptor)
+                    return descriptor
+
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.open", side_effect=record_open
+                ), mock.patch(
+                    target,
+                    side_effect=KeyboardInterrupt(f"injected {stage} interruption"),
+                ):
+                    with self.assertRaises(
+                        KeyboardInterrupt,
+                        msg=(
+                            "setup interruption must propagate after descriptor cleanup: "
+                            f"stage={stage} manifest={manifest}"
+                        ),
+                    ):
+                        manifest_bytes_snapshot(root)
+                self.assertEqual(
+                    len(descriptors),
+                    1,
+                    "setup interruption must occur after exactly one descriptor open: "
+                    f"stage={stage} descriptors={descriptors!r}",
+                )
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptors[0])
+                self.assertEqual(
+                    raised.exception.errno,
+                    errno.EBADF,
+                    "raw descriptor ownership must close on BaseException before stream "
+                    f"transfer: stage={stage} descriptor={descriptors[0]}",
+                )
 
     def test_manifest_bytes_snapshot_closes_stream_on_success_and_failure(self) -> None:
         for outcome in ("success", "growth failure"):

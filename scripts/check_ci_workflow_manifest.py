@@ -452,10 +452,16 @@ def manifest_bytes_snapshot(
             f"{display}: this platform cannot open files without following symbolic "
             "links because O_NOFOLLOW is unavailable; refusing unsafe capture"
         )
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nonblock is None:
+        raise ContractError(
+            f"{display}: this platform cannot safely reject raced non-regular files "
+            "because O_NONBLOCK is unavailable; refusing unsafe capture"
+        )
     metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
     if before_open_hook is not None:
         before_open_hook(path)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -469,7 +475,7 @@ def manifest_bytes_snapshot(
         if file_identity(opened) != file_identity(metadata):
             raise ContractError(f"{display}: file identity changed before reading")
         stream = os.fdopen(descriptor, "rb", buffering=0)
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
     with stream:
