@@ -4844,11 +4844,26 @@ fn render_add_provider_overlay(
     let overlay_y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
     let overlay = Rect::new(overlay_x, overlay_y, overlay_width, overlay_height);
 
+    // The wizard already knows which operation it is performing; say so rather
+    // than telling someone editing a working provider that they are adding one
+    // (#418). Only the remote form is ever reopened for an existing provider.
+    let editing_existing_provider = matches!(
+        step,
+        AddProviderStep::ConfigureRemote {
+            editing_idx: Some(_),
+            ..
+        }
+    );
+
     // Clear the overlay area with a filled block
     let background = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Add AI Provider ")
+        .title(if editing_existing_provider {
+            " Edit AI Provider "
+        } else {
+            " Add AI Provider "
+        })
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -4934,7 +4949,7 @@ fn render_add_provider_overlay(
                 ]));
             }
             let list = List::new(items).block(
-                Block::default().title("Add AI provider  ↑/↓: Move | Enter: Select | Esc: Cancel"),
+                Block::default().title("Add AI Provider  ↑/↓: Move | Enter: Select | Esc: Cancel"),
             );
             f.render_widget(list, inner);
         }
@@ -10430,6 +10445,47 @@ mod tests {
                 &reloaded.providers,
                 reloaded.credentials()
             )
+        );
+    }
+
+    // ── #418: the dialog must say which operation it is performing ───────────
+
+    #[test]
+    fn test_provider_dialog_is_titled_add_when_adding_and_edit_when_editing() {
+        let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
+        state.current_section = WizardSection::Models;
+        let adding = render_wizard_text(&state);
+        assert!(
+            adding.contains("Add AI Provider"),
+            "invariant: the add path must title the dialog for adding.\n{adding}"
+        );
+        assert!(
+            !adding.contains("Edit AI Provider"),
+            "invariant: the add path must not claim to be editing.\n{adding}"
+        );
+        assert!(
+            !adding.contains("Add AI provider"),
+            "invariant: the dialog's title and footer must agree on capitalisation.\n{adding}"
+        );
+
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: cloud_provider_index("grok"),
+            name: "Grok Build".to_string(),
+            model: "grok-code-fast-1".to_string(),
+            api_key: Some("xai-test-preserved".to_string()),
+            focused_field: 1,
+            editing_idx: Some(0),
+        });
+        state.current_section = WizardSection::Models;
+        let editing = render_wizard_text(&state);
+        assert!(
+            editing.contains("Edit AI Provider"),
+            "invariant: editing an existing provider must say so, so the user is not led to \
+             believe they are creating a duplicate.\n{editing}"
+        );
+        assert!(
+            !editing.contains("Add AI Provider"),
+            "invariant: the edit path must not be titled as an add.\n{editing}"
         );
     }
 
