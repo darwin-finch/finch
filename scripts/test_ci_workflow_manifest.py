@@ -325,6 +325,37 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"raw={captured_manifest!r} manifest={manifest!r}",
             )
 
+    def test_manifest_snapshot_rejects_path_replacement_after_open(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root, manifest_bytes=b'{"source":"opened"}\n')
+            manifest = root / "scripts/ci_workflow_manifest.json"
+            replacement = root / "scripts/manifest-replacement.json"
+            replacement.write_bytes(b'{"source":"replacement"}\n')
+            opened_inode = manifest.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+
+            def replace_manifest(opened_path: Path) -> None:
+                self.assertEqual(
+                    opened_path,
+                    manifest,
+                    "manifest replacement hook must target the opened manifest path: "
+                    f"opened={opened_path} expected={manifest}",
+                )
+                os.replace(replacement, manifest)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                "file identity changed while capturing manifest",
+                msg=(
+                    "manifest_snapshot must reject a distinct live pathname replacement "
+                    "after reading the originally opened descriptor: "
+                    f"manifest={manifest} opened_inode={opened_inode} "
+                    f"replacement_inode={replacement_inode}"
+                ),
+            ):
+                manifest_snapshot(root, after_open_hook=replace_manifest)
+
     def test_workflow_snapshot_never_opens_ignored_nonworkflow_link(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -415,6 +446,80 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"forbidden={forbidden!r} captured={captured!r}",
             )
 
+    @unittest.skipUnless(
+        WORKFLOW_DIRECTORY_FD_SUPPORTED and hasattr(os, "link"),
+        "directory-relative workflow pinning and hard links are required",
+    )
+    def test_final_workflow_validation_rejects_same_leaf_new_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root)
+            directory = root / ".github/workflows"
+            original_leaf = directory / "synthetic.yml"
+            replacement = root / ".github/workflows-replacement"
+            replacement.mkdir()
+            os.link(original_leaf, replacement / original_leaf.name)
+            original_directory_inode = directory.stat().st_ino
+            replacement_directory_inode = replacement.stat().st_ino
+
+            def replace_after_final_scan() -> None:
+                original = root / ".github/workflows-original"
+                directory.rename(original)
+                os.replace(replacement, directory)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                "directory identity changed while checking",
+                msg=(
+                    "final validation must scan and stat through the retained directory fd, "
+                    "then reject a new live directory pathname even when every leaf is the "
+                    "same hard-linked inode: "
+                    f"original_inode={original_directory_inode} "
+                    f"replacement_inode={replacement_directory_inode}"
+                ),
+            ):
+                workflow_snapshot(root, final_scan_hook=replace_after_final_scan)
+
+    def test_aggregate_exact_first_excess_rejects_before_leaf_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            workflows = {
+                f"base-{index}.yml": b"x" * MAX_WORKFLOW_BYTES for index in range(8)
+            }
+            workflows["zz-crossing.yml"] = b""
+            self.write_snapshot_source(root, workflows)
+            crossing = root / ".github/workflows/zz-crossing.yml"
+            captured: list[str] = []
+
+            def grow_to_first_excess() -> None:
+                crossing.write_bytes(b"x")
+
+            def record_capture(stream, expected_size: int, display: str):
+                captured.append(display)
+                return capture_canonical_workflow_stream(stream, expected_size, display)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.capture_canonical_workflow_stream",
+                side_effect=record_capture,
+            ):
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "1048577 aggregate opened bytes exceeds.*before capturing.*zz-crossing",
+                    msg=(
+                        "workflow_snapshot must reject exactly the first aggregate excess "
+                        "byte before capturing its leaf: "
+                        f"limit={MAX_TOTAL_WORKFLOW_BYTES} crossing={crossing} "
+                        f"captured={captured!r}"
+                    ),
+                ):
+                    workflow_snapshot(root, phase_hook=grow_to_first_excess)
+            self.assertNotIn(
+                ".github/workflows/zz-crossing.yml",
+                captured,
+                "the leaf crossing the aggregate bound by one byte must not be captured: "
+                f"crossing={crossing} captured={captured!r}",
+            )
+
     def test_workflow_snapshot_fails_closed_without_directory_fd_support(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -471,6 +576,53 @@ class WorkflowManifestTests(unittest.TestCase):
                 errno.EBADF,
                 "workflow_snapshot must close its owned directory descriptor on success: "
                 f"directory={directory} descriptor={directory_fds[0]}",
+            )
+
+    @unittest.skipUnless(
+        WORKFLOW_DIRECTORY_FD_SUPPORTED,
+        "directory-relative workflow pinning is unavailable on this platform",
+    )
+    def test_workflow_snapshot_closes_owned_directory_fd_after_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(
+                root, {"oversized.yml": b"x" * (MAX_WORKFLOW_BYTES + 1)}
+            )
+            directory = root / ".github/workflows"
+            real_open = os.open
+            directory_fds: list[int] = []
+
+            def record_open(path, flags, *args, **kwargs):
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if os.fspath(path) == os.fspath(directory):
+                    directory_fds.append(descriptor)
+                return descriptor
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "exceeds the reviewed",
+                    msg=(
+                        "failure-path fd cleanup fixture must reject after acquiring the "
+                        f"workflow directory descriptor: directory={directory}"
+                    ),
+                ):
+                    workflow_snapshot(root)
+            self.assertGreaterEqual(
+                len(directory_fds),
+                1,
+                "rejection must occur after workflow_snapshot acquires its owned directory "
+                f"descriptor: directory={directory} descriptors={directory_fds!r}",
+            )
+            with self.assertRaises(OSError) as raised:
+                os.fstat(directory_fds[0])
+            self.assertEqual(
+                raised.exception.errno,
+                errno.EBADF,
+                "workflow_snapshot must close its owned directory descriptor after a "
+                f"ContractError: directory={directory} descriptor={directory_fds[0]}",
             )
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
@@ -732,7 +884,8 @@ class WorkflowManifestTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 ContractError,
-                "directory identity changed during enumeration",
+                "directory identity changed during enumeration|"
+                "directory identity changed while checking",
                 msg=(
                     "an entry inserted after the final scandir exhausted must invalidate "
                     f"that enumeration: root={repository.root}"

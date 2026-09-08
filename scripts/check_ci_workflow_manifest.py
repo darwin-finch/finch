@@ -533,20 +533,43 @@ def _capture_workflow_snapshot(
         }
     if after_hash_hook is not None:
         after_hash_hook()
-    final_directory_identity, final_paths = workflow_paths(root, final_scan_hook)
     initial_names = [path.name for path in paths]
-    final_names = [path.name for path in final_paths]
+    try:
+        with os.scandir(directory_fd) as entries:
+            final_names = sorted(bounded_workflow_names(entries))
+            if final_scan_hook is not None:
+                final_scan_hook()
+    except ContractError:
+        raise
+    except OSError as error:
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: final pinned enumeration failed: {error}"
+        ) from error
     if final_names != initial_names:
         raise ContractError(
             f"{WORKFLOW_DIRECTORY}: workflow entry set changed while checking; "
             f"before={initial_names!r} after={final_names!r}"
         )
-    for path in final_paths:
+    for path in paths:
         display = path.relative_to(root).as_posix()
-        final_metadata = regular_file_metadata(path, display, MAX_WORKFLOW_BYTES)
+        final_metadata = regular_file_metadata(
+            path, display, MAX_WORKFLOW_BYTES, directory_fd
+        )
         if file_identity(final_metadata) != opened_identities[path]:
             raise ContractError(f"{display}: file identity changed after hashing")
-    if final_directory_identity != directory_identity:
+    directory = root / WORKFLOW_DIRECTORY
+    try:
+        final_directory_metadata = directory.lstat()
+    except OSError as error:
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: final directory metadata failed: {error}"
+        ) from error
+    if (
+        stat.S_ISLNK(final_directory_metadata.st_mode)
+        or not stat.S_ISDIR(final_directory_metadata.st_mode)
+    ):
+        raise ContractError(f"{WORKFLOW_DIRECTORY}: must remain a real directory, not a link")
+    if file_identity(final_directory_metadata) != directory_identity:
         raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
     return ({path.name: contents_by_path[path] for path in paths}, records)
 
@@ -625,6 +648,9 @@ def manifest_snapshot(
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
+    final_metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    if file_identity(final_metadata) != file_identity(metadata):
+        raise ContractError(f"{display}: file identity changed while capturing manifest")
     return contents, manifest, file_identity(metadata)
 
 
