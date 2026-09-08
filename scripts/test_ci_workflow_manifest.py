@@ -24,6 +24,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_FILES,
     compare_contract,
     hash_canonical_workflow_stream,
+    open_regular_file,
     read_exact_bytes,
     workflow_records,
 )
@@ -37,7 +38,51 @@ class WorkflowRepository:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        shutil.copytree(ROOT / ".github/workflows", self.root / ".github/workflows")
+        source_directory = ROOT / ".github/workflows"
+        destination_directory = self.root / ".github/workflows"
+        destination_directory.mkdir(parents=True)
+        entries: list[os.DirEntry[str]] = []
+        with os.scandir(source_directory) as iterator:
+            for entry in iterator:
+                entries.append(entry)
+                if len(entries) > MAX_WORKFLOW_DIRECTORY_ENTRIES:
+                    raise AssertionError(
+                        "workflow fixture source exceeds the reviewed directory-entry "
+                        f"bound: source={source_directory} entries={len(entries)} "
+                        f"limit={MAX_WORKFLOW_DIRECTORY_ENTRIES}"
+                    )
+
+        workflow_entries = sorted(
+            (
+                entry
+                for entry in entries
+                if Path(entry.name).suffix in {".yml", ".yaml"}
+            ),
+            key=lambda entry: entry.name,
+        )
+        if len(workflow_entries) > MAX_WORKFLOW_FILES:
+            raise AssertionError(
+                "workflow fixture source exceeds the reviewed workflow-count bound: "
+                f"source={source_directory} workflows={len(workflow_entries)} "
+                f"limit={MAX_WORKFLOW_FILES}"
+            )
+
+        total_bytes = 0
+        for entry in workflow_entries:
+            source = Path(entry.path)
+            stream, metadata, display = open_regular_file(
+                source, ROOT, MAX_WORKFLOW_BYTES
+            )
+            with stream:
+                contents = read_exact_bytes(stream, metadata.st_size, display)
+            total_bytes += len(contents)
+            if total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
+                raise AssertionError(
+                    "workflow fixture source exceeds the reviewed aggregate byte bound: "
+                    f"source={source_directory} bytes={total_bytes} "
+                    f"limit={MAX_TOTAL_WORKFLOW_BYTES}"
+                )
+            (destination_directory / entry.name).write_bytes(contents)
         (self.root / "scripts").mkdir()
         shutil.copy2(ROOT / "scripts/ci_workflow_manifest.json", self.root / "scripts")
 
@@ -150,6 +195,46 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_fixture_copy_ignores_unrelated_nonworkflow_symlink(self) -> None:
+        source = tempfile.TemporaryDirectory()
+        original_root = ROOT
+        repository: WorkflowRepository | None = None
+        try:
+            source_root = Path(source.name)
+            workflows = source_root / ".github/workflows"
+            scripts = source_root / "scripts"
+            workflows.mkdir(parents=True)
+            scripts.mkdir()
+            (workflows / "synthetic.yml").write_text(
+                "name: bounded fixture\n", encoding="utf-8"
+            )
+            target = source_root / "tiny-unrelated-target.bin"
+            target.write_bytes(b"must not be copied through a symlink\n")
+            link = workflows / "padding.bin"
+            link.symlink_to(target)
+            shutil.copy2(original_root / "scripts/ci_workflow_manifest.json", scripts)
+
+            globals()["ROOT"] = source_root
+            repository = WorkflowRepository()
+
+            copied_workflows = repository.root / ".github/workflows"
+            self.assertTrue(
+                (copied_workflows / "synthetic.yml").is_file(),
+                "fixture copying must retain bounded regular workflow YAML: "
+                f"source={workflows} destination={copied_workflows}",
+            )
+            self.assertFalse(
+                (copied_workflows / "padding.bin").exists(),
+                "fixture copying must ignore unrelated non-workflow symlinks instead of "
+                "dereferencing their targets: "
+                f"source_link={link} target={target} destination={copied_workflows}",
+            )
+        finally:
+            globals()["ROOT"] = original_root
+            if repository is not None:
+                repository.close()
+            source.cleanup()
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):
@@ -539,15 +624,21 @@ class WorkflowManifestTests(unittest.TestCase):
                 manifest["workflows"]["ci.yml"]["sha256"] = hashlib.sha256(
                     changed_bytes
                 ).hexdigest()
-                manifest_path.unlink()
-                repository.write_manifest(manifest)
-                self.assertNotEqual(
-                    manifest_path.stat().st_ino,
-                    initial_manifest_inode,
-                    "snapshot race fixture must replace the manifest pathname: "
-                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
-                    f"replacement_inode={manifest_path.stat().st_ino}",
+                replacement = manifest_path.with_name("manifest-replacement.json")
+                replacement.write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
                 )
+                self.assertNotEqual(
+                    replacement.stat().st_ino,
+                    initial_manifest_inode,
+                    "snapshot race fixture must allocate a distinct replacement while "
+                    "the reviewed manifest inode still exists: "
+                    f"path={manifest_path} initial_inode={initial_manifest_inode} "
+                    f"replacement={replacement} "
+                    f"replacement_inode={replacement.stat().st_ino}",
+                )
+                os.replace(replacement, manifest_path)
 
             errors = compare_contract(
                 repository.root,
@@ -630,21 +721,25 @@ class WorkflowManifestTests(unittest.TestCase):
             initial_inode = workflow.stat().st_ino
 
             def replace_leaf() -> None:
-                workflow.unlink()
-                workflow.write_bytes(reviewed_bytes)
+                replacement = workflow.with_name("ci-replacement.yml")
+                replacement.write_bytes(reviewed_bytes)
                 self.assertNotEqual(
-                    workflow.stat().st_ino,
+                    replacement.stat().st_ino,
                     initial_inode,
-                    "post-hash replacement regression must create a different leaf inode: "
+                    "post-hash replacement regression must allocate a distinct leaf while "
+                    "the hashed inode still exists: "
                     f"workflow={workflow} initial_inode={initial_inode} "
-                    f"replacement_inode={workflow.stat().st_ino}",
+                    f"replacement={replacement} "
+                    f"replacement_inode={replacement.stat().st_ino}",
                 )
+                os.replace(replacement, workflow)
 
             with self.assertRaisesRegex(
                 ContractError,
                 "identity changed after hashing",
                 msg=(
-                    "unlink/recreate after hashing must invalidate the hashed leaf identity: "
+                    "atomic pathname replacement after hashing must invalidate the hashed "
+                    "leaf identity: "
                     f"workflow={workflow} initial_inode={initial_inode}"
                 ),
             ):
