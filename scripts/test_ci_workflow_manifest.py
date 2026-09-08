@@ -315,12 +315,6 @@ class WorkflowManifestTests(unittest.TestCase):
                         ),
                     ):
                         manifest_snapshot(root, after_open_hook=grow_after_open)
-                self.assertEqual(
-                    buffering_values,
-                    [0],
-                    "manifest capture must request an unbuffered descriptor stream: "
-                    f"manifest={manifest} buffering={buffering_values!r}",
-                )
                 offset = os.lseek(duplicate_fds[0], 0, os.SEEK_CUR)
                 self.assertEqual(
                     offset,
@@ -328,6 +322,12 @@ class WorkflowManifestTests(unittest.TestCase):
                     "the shared raw file description must advance by exactly expected_size "
                     "plus one, with no buffered physical prefetch: "
                     f"manifest={manifest} offset={offset} expected={len(initial) + 1}",
+                )
+                self.assertEqual(
+                    buffering_values,
+                    [0],
+                    "manifest capture must request an unbuffered descriptor stream: "
+                    f"manifest={manifest} buffering={buffering_values!r}",
                 )
             finally:
                 for descriptor in duplicate_fds:
