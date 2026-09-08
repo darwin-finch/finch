@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_DIRECTORY_ENTRIES,
     MAX_WORKFLOW_FILES,
     compare_contract,
-    hash_stream,
+    hash_canonical_workflow_stream,
     read_exact_bytes,
     workflow_records,
 )
@@ -66,6 +67,16 @@ class WorkflowRepository:
             timeout=10,
         )
 
+    def git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
 
 class WorkflowManifestTests(unittest.TestCase):
     def assert_accepted(self, repository: WorkflowRepository) -> None:
@@ -91,6 +102,47 @@ class WorkflowManifestTests(unittest.TestCase):
                 output,
                 f"rejection omitted diagnostic {diagnostic!r}: output={output!r}",
             )
+
+    def assert_lstat_open_symlink_swap_rejected(
+        self,
+        repository: WorkflowRepository,
+        path: Path,
+        target: Path,
+        link_target: str,
+        kind: str,
+    ) -> None:
+        swapped = False
+
+        def swap_to_same_inode_symlink(opened_path: Path) -> None:
+            nonlocal swapped
+            if swapped or opened_path != path:
+                return
+            opened_path.rename(target)
+            opened_path.symlink_to(link_target)
+            swapped = True
+
+        def restore_path(opened_path: Path) -> None:
+            if opened_path != path or not opened_path.is_symlink():
+                return
+            opened_path.unlink()
+            target.rename(opened_path)
+
+        hooks = {
+            f"{kind}_before_open_hook": swap_to_same_inode_symlink,
+            f"{kind}_after_open_hook": restore_path,
+        }
+        errors = compare_contract(repository.root, **hooks)
+        self.assertTrue(
+            swapped,
+            f"{kind} race hook must replace the lstat-validated path before open: "
+            f"path={path} target={target}",
+        )
+        self.assertTrue(
+            any("regular file could not be opened safely" in error for error in errors),
+            "O_NOFOLLOW must reject an lstat-to-open symlink swap even when the link "
+            "resolves to the same reviewed inode; removing O_NOFOLLOW would let the "
+            f"restore hook conceal the race: kind={kind} path={path} errors={errors!r}",
+        )
 
     def test_current_reviewed_inventory_passes(self) -> None:
         repository = WorkflowRepository()
@@ -136,6 +188,60 @@ class WorkflowManifestTests(unittest.TestCase):
                     f"workflow={name} attributes={result.stdout!r}",
                 )
 
+    def test_git_clean_autocrlf_checkout_from_pre_attributes_base_is_accepted(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            attributes = repository.root / ".gitattributes"
+            repository.git("init", "--quiet")
+            for key, value in (
+                ("user.name", "Workflow Manifest Test"),
+                ("user.email", "workflow-manifest@example.invalid"),
+                ("core.autocrlf", "true"),
+            ):
+                repository.git("config", key, value)
+            repository.git(
+                "add", ".github/workflows", "scripts/ci_workflow_manifest.json"
+            )
+            repository.git(
+                "commit", "--quiet", "-m", "base before workflow attributes"
+            )
+            shutil.rmtree(repository.root / ".github/workflows")
+            repository.git("checkout", "--", ".github/workflows")
+            attributes.write_text(
+                ".github/workflows/*.yml text eol=lf\n"
+                ".github/workflows/*.yaml text eol=lf\n",
+                encoding="utf-8",
+            )
+            repository.git("add", ".gitattributes")
+            repository.git("commit", "--quiet", "-m", "declare workflow LF checkout")
+
+            status = repository.git("status", "--porcelain")
+            workflow = repository.workflow("ci.yml")
+            checkout_bytes = workflow.read_bytes()
+            self.assertEqual(
+                status.stdout,
+                "",
+                "the upgraded core.autocrlf=true checkout must be Git-clean before checking: "
+                f"root={repository.root} status={status.stdout!r}",
+            )
+            self.assertIn(
+                b"\r\n",
+                checkout_bytes,
+                "the reused-checkout regression must retain pre-attribute CRLF workflow bytes: "
+                f"workflow={workflow} sample={checkout_bytes[:80]!r}",
+            )
+            self.assert_accepted(repository)
+
+            workflow.write_bytes(checkout_bytes + b"# substantive mutation\r\n")
+            self.assert_rejected(
+                repository,
+                "ci.yml",
+                "reviewed sha256 changed",
+                "review actual GitHub allocation",
+            )
+        finally:
+            repository.close()
+
     def test_every_workflow_byte_change_requires_allocation_review(self) -> None:
         names = sorted(path.name for path in (ROOT / ".github/workflows").glob("*.y*ml"))
         self.assertGreater(names, [], "workflow inventory must contain reviewed files")
@@ -180,6 +286,20 @@ class WorkflowManifestTests(unittest.TestCase):
             workflow.rename(target)
             workflow.symlink_to("../../scripts/ci.yml")
             self.assert_rejected(repository, ".github/workflows/ci.yml", "not a symbolic link")
+        finally:
+            repository.close()
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is POSIX-only")
+    def test_workflow_symlink_swap_between_lstat_and_open_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            self.assert_lstat_open_symlink_swap_rejected(
+                repository,
+                repository.workflow("ci.yml"),
+                repository.root / "scripts/ci-race-target.yml",
+                "../../scripts/ci-race-target.yml",
+                "workflow",
+            )
         finally:
             repository.close()
 
@@ -302,7 +422,7 @@ class WorkflowManifestTests(unittest.TestCase):
         finally:
             repository.close()
 
-    def test_hash_stream_never_requests_unbounded_or_oversized_reads(self) -> None:
+    def test_canonical_workflow_hash_never_requests_unbounded_reads(self) -> None:
         class BoundedReadStream(io.BytesIO):
             def __init__(self, contents: bytes) -> None:
                 super().__init__(contents)
@@ -319,11 +439,19 @@ class WorkflowManifestTests(unittest.TestCase):
 
         contents = b"x" * (HASH_CHUNK_BYTES * 2 + 17)
         stream = BoundedReadStream(contents)
-        digest = hash_stream(stream, len(contents), "bounded-read.yml")
+        digest, canonical_size = hash_canonical_workflow_stream(
+            stream, len(contents), "bounded-read.yml"
+        )
         self.assertEqual(
             len(digest),
             64,
             f"workflow hash must remain a SHA-256 digest: digest={digest!r}",
+        )
+        self.assertEqual(
+            canonical_size,
+            len(contents),
+            "workflow canonical byte count must preserve bytes without CRLF pairs: "
+            f"physical_size={len(contents)} canonical_size={canonical_size}",
         )
         self.assertGreater(
             len(stream.requests),
@@ -336,6 +464,25 @@ class WorkflowManifestTests(unittest.TestCase):
             1,
             "workflow hashing must probe for same-inode growth with one bounded byte: "
             f"requests={stream.requests!r}",
+        )
+
+    def test_canonical_workflow_hash_handles_crlf_split_across_chunks(self) -> None:
+        lf_contents = b"x" * (HASH_CHUNK_BYTES - 1) + b"\nnext\n"
+        crlf_contents = lf_contents.replace(b"\n", b"\r\n")
+        digest, canonical_size = hash_canonical_workflow_stream(
+            io.BytesIO(crlf_contents), len(crlf_contents), "split-crlf.yml"
+        )
+        self.assertEqual(
+            digest,
+            hashlib.sha256(lf_contents).hexdigest(),
+            "CRLF split at the bounded-read edge must hash as the exact reviewed LF bytes: "
+            f"physical_size={len(crlf_contents)} canonical_size={canonical_size}",
+        )
+        self.assertEqual(
+            canonical_size,
+            len(lf_contents),
+            "canonical workflow byte count must remove exactly one byte per CRLF pair: "
+            f"physical_size={len(crlf_contents)} canonical_size={canonical_size}",
         )
 
     def test_exact_read_rejects_early_eof(self) -> None:
@@ -567,6 +714,20 @@ class WorkflowManifestTests(unittest.TestCase):
         finally:
             repository.close()
 
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is POSIX-only")
+    def test_manifest_symlink_swap_between_lstat_and_open_is_rejected(self) -> None:
+        repository = WorkflowRepository()
+        try:
+            self.assert_lstat_open_symlink_swap_rejected(
+                repository,
+                repository.manifest_path(),
+                repository.root / "manifest-race-target.json",
+                "../manifest-race-target.json",
+                "manifest",
+            )
+        finally:
+            repository.close()
+
     def test_nonregular_manifest_is_rejected(self) -> None:
         repository = WorkflowRepository()
         try:
@@ -627,6 +788,7 @@ class WorkflowManifestTests(unittest.TestCase):
     def test_manifest_root_and_schema_are_exact(self) -> None:
         mutations = (
             ("schema", "finch-ci-workflow-manifest:v999", "schema must be"),
+            ("workflow_canonical_eol", "crlf", "workflow canonical EOL must be"),
             ("unexpected", True, "root keys changed"),
         )
         for key, value, diagnostic in mutations:

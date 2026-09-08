@@ -17,7 +17,8 @@ from typing import Any, BinaryIO
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_DIRECTORY = Path(".github/workflows")
 MANIFEST_PATH = Path("scripts/ci_workflow_manifest.json")
-SCHEMA = "finch-ci-workflow-manifest:v2"
+SCHEMA = "finch-ci-workflow-manifest:v3"
+WORKFLOW_CANONICAL_EOL = "lf"
 MAX_WORKFLOW_BYTES = 128 * 1024
 MAX_TOTAL_WORKFLOW_BYTES = 1024 * 1024
 MAX_WORKFLOW_FILES = 64
@@ -219,10 +220,15 @@ def file_identity(metadata: os.stat_result) -> FileIdentity:
 
 
 def open_regular_file(
-    path: Path, root: Path, maximum: int
+    path: Path,
+    root: Path,
+    maximum: int,
+    before_open_hook: Callable[[Path], None] | None = None,
 ) -> tuple[BinaryIO, os.stat_result, str]:
     display = path.relative_to(root).as_posix()
     metadata = regular_file_metadata(path, display, maximum)
+    if before_open_hook is not None:
+        before_open_hook(path)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -252,38 +258,59 @@ def read_exact_bytes(stream: BinaryIO, expected_size: int, display: str) -> byte
     return contents
 
 
-def hash_stream(stream: BinaryIO, expected_size: int, display: str) -> str:
+def hash_canonical_workflow_stream(
+    stream: BinaryIO, expected_size: int, display: str
+) -> tuple[str, int]:
+    """Hash reviewed workflow bytes with Git's declared CRLF-to-LF checkout semantics."""
     digest = hashlib.sha256()
     consumed = 0
+    canonical_size = 0
+    pending_carriage_return = False
     while consumed < expected_size:
         request_bytes = min(HASH_CHUNK_BYTES, expected_size - consumed)
         chunk = stream.read(request_bytes)
         if not chunk:
             break
         consumed += len(chunk)
-        digest.update(chunk)
+        if pending_carriage_return:
+            chunk = b"\r" + chunk
+            pending_carriage_return = False
+        if chunk.endswith(b"\r"):
+            chunk = chunk[:-1]
+            pending_carriage_return = True
+        canonical = chunk.replace(b"\r\n", b"\n")
+        canonical_size += len(canonical)
+        digest.update(canonical)
     if consumed != expected_size:
         raise ContractError(
             f"{display}: file size changed while hashing; expected={expected_size} "
             f"actual={consumed}"
         )
+    if pending_carriage_return:
+        canonical_size += 1
+        digest.update(b"\r")
     if stream.read(1):
         raise ContractError(f"{display}: file grew while its reviewed bytes were hashed")
-    return digest.hexdigest()
+    return digest.hexdigest(), canonical_size
 
 
 def exact_digest(
     path: Path,
     root: Path,
     maximum: int,
+    before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
-) -> tuple[str, int, FileIdentity]:
-    stream, opened, display = open_regular_file(path, root, maximum)
+) -> tuple[str, int, int, FileIdentity]:
+    stream, opened, display = open_regular_file(
+        path, root, maximum, before_open_hook
+    )
     with stream:
         if after_open_hook is not None:
             after_open_hook(path)
-        digest = hash_stream(stream, opened.st_size, display)
-    return digest, opened.st_size, file_identity(opened)
+        digest, canonical_size = hash_canonical_workflow_stream(
+            stream, opened.st_size, display
+        )
+    return digest, canonical_size, opened.st_size, file_identity(opened)
 
 
 def workflow_paths(
@@ -344,6 +371,7 @@ def workflow_records(
     root: Path,
     phase_hook: Callable[[], None] | None = None,
     after_hash_hook: Callable[[], None] | None = None,
+    before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
     final_scan_hook: Callable[[], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
@@ -366,10 +394,14 @@ def workflow_records(
     opened_identities: dict[Path, FileIdentity] = {}
     opened_total_bytes = 0
     for path in paths:
-        digest, size, opened_identity = exact_digest(
-            path, root, MAX_WORKFLOW_BYTES, after_open_hook
+        digest, canonical_size, physical_size, opened_identity = exact_digest(
+            path,
+            root,
+            MAX_WORKFLOW_BYTES,
+            before_open_hook,
+            after_open_hook,
         )
-        opened_total_bytes += size
+        opened_total_bytes += physical_size
         if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
             raise ContractError(
                 f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
@@ -383,7 +415,7 @@ def workflow_records(
         opened_identities[path] = opened_identity
         records[path.name] = {
             "sha256": digest,
-            "bytes": size,
+            "bytes": canonical_size,
             "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),
         }
     if after_hash_hook is not None:
@@ -407,12 +439,16 @@ def workflow_records(
 
 
 def load_manifest(
-    root: Path, after_open_hook: Callable[[Path], None] | None = None
+    root: Path,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
 ) -> tuple[dict[str, Any], FileIdentity]:
     path = root / MANIFEST_PATH
     display = MANIFEST_PATH.as_posix()
     try:
-        stream, metadata, display = open_regular_file(path, root, MAX_MANIFEST_BYTES)
+        stream, metadata, display = open_regular_file(
+            path, root, MAX_MANIFEST_BYTES, before_open_hook
+        )
         with stream:
             if after_open_hook is not None:
                 after_open_hook(path)
@@ -486,11 +522,21 @@ def compare_contract(
     root: Path,
     workflow_phase_hook: Callable[[], None] | None = None,
     after_workflow_hook: Callable[[], None] | None = None,
+    workflow_before_open_hook: Callable[[Path], None] | None = None,
+    workflow_after_open_hook: Callable[[Path], None] | None = None,
+    manifest_before_open_hook: Callable[[Path], None] | None = None,
     manifest_after_open_hook: Callable[[Path], None] | None = None,
 ) -> list[str]:
     try:
-        manifest, manifest_identity = load_manifest(root, manifest_after_open_hook)
-        actual = workflow_records(root, phase_hook=workflow_phase_hook)
+        manifest, manifest_identity = load_manifest(
+            root, manifest_before_open_hook, manifest_after_open_hook
+        )
+        actual = workflow_records(
+            root,
+            phase_hook=workflow_phase_hook,
+            before_open_hook=workflow_before_open_hook,
+            after_open_hook=workflow_after_open_hook,
+        )
         if after_workflow_hook is not None:
             after_workflow_hook()
         revalidate_manifest(root, manifest_identity)
@@ -499,7 +545,14 @@ def compare_contract(
 
     errors: list[str] = []
     errors.extend(evidence_errors(set(actual)))
-    expected_root_keys = {"schema", "limits", "pr_active_workflows", "workflows", "fixtures"}
+    expected_root_keys = {
+        "schema",
+        "workflow_canonical_eol",
+        "limits",
+        "pr_active_workflows",
+        "workflows",
+        "fixtures",
+    }
     if set(manifest) != expected_root_keys:
         errors.append(
             f"{MANIFEST_PATH}: root keys changed; expected={sorted(expected_root_keys)!r} "
@@ -509,6 +562,12 @@ def compare_contract(
         errors.append(
             f"{MANIFEST_PATH}: schema must be {SCHEMA!r}, "
             f"found {manifest.get('schema')!r}"
+        )
+    if manifest.get("workflow_canonical_eol") != WORKFLOW_CANONICAL_EOL:
+        errors.append(
+            f"{MANIFEST_PATH}: workflow canonical EOL must be "
+            f"{WORKFLOW_CANONICAL_EOL!r}, "
+            f"found {manifest.get('workflow_canonical_eol')!r}"
         )
     expected_limits = {
         "max_workflow_bytes": MAX_WORKFLOW_BYTES,

@@ -1,5 +1,6 @@
 {
-  "schema": "finch-ci-workflow-manifest:v2",
+  "schema": "finch-ci-workflow-manifest:v3",
+  "workflow_canonical_eol": "lf",
   "limits": {
     "max_workflow_bytes": 131072,
     "max_total_workflow_bytes": 1048576,
