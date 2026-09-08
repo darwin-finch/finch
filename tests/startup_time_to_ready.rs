@@ -88,6 +88,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -99,6 +100,23 @@ const READY_DEADLINE: Duration = Duration::from_secs(90);
 
 /// Failure deadline for a clean exit after `/exit`.
 const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Independent executable oracle. This deliberately does not read
+/// `finch::ABOUT`: the regression must still compile and reject the old binary
+/// if the production constant is removed or never wired to a CLI surface.
+const EXPECTED_ABOUT: &str =
+    "Terminal coding assistant with typed programs, named Brains, and tool use";
+
+const FORBIDDEN_IDENTITY_PHRASES: &[&str] = &[
+    "proxy",
+    "constitutional",
+    "local-first",
+    "local first",
+    "shammah v",
+];
+
+const SUPERVISOR_AUTHORITY_FDS: &[i32] = &[9, 10, 11, 12, 108, 109, 110, 111, 112];
+const CAPTURE_DIAGNOSTIC_LIMIT: u64 = 64 * 1024;
 
 /// One parsed line of the startup report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,7 +325,10 @@ prefer_local = true
 /// A command for the real binary with every mutable path redirected into the
 /// fixture and every provider credential removed.
 fn isolated_finch_command(fixture: &Fixture) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+    isolated_child_command(Command::new(env!("CARGO_BIN_EXE_finch")), fixture)
+}
+
+fn isolated_child_command(mut command: Command, fixture: &Fixture) -> Command {
     command
         .env("HOME", &fixture.home)
         .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
@@ -316,9 +337,6 @@ fn isolated_finch_command(fixture: &Fixture) -> Command {
         .env("HF_HOME", fixture.home.join(".cache/huggingface"))
         .env("TERM", "xterm-256color")
         .env("FINCH_STARTUP_TIMINGS", &fixture.timings)
-        // Blocks daemon discovery, reuse and auto-spawn without needing a
-        // supervisor proof (`src/daemon/spawn.rs`).
-        .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
         // No provider credential can be picked up from the developer's
         // environment, so no request can be made even in principle.
         .env_remove("ANTHROPIC_API_KEY")
@@ -328,22 +346,32 @@ fn isolated_finch_command(fixture: &Fixture) -> Command {
         .env_remove("GOOGLE_API_KEY")
         .env_remove("SHAMMAH_DEBUG")
         .env_remove("SHAMMAH_LOG")
-        .env_remove("RUST_LOG")
-        // Constructed isolation, not incidental. The child must not inherit
-        // the supervisor proof or another process's paths and endpoints.
-        .env_remove("FINCH_BRAIN_TEST_ISOLATED")
-        .env_remove("FINCH_BRAIN_TEST_TOKEN")
-        .env_remove("FINCH_BRAIN_TEST_PROOF_FD")
-        .env_remove("FINCH_BRAIN_TEST_PROOF_BACKUP_FD")
-        .env_remove("FINCH_BRAIN_TEST_AUTH_FD")
-        .env_remove("FINCH_BRAIN_TEST_HOME")
-        .env_remove("FINCH_BRAIN_TEST_ROOT")
-        .env_remove("FINCH_TEST_SUPERVISOR_PID")
-        .env_remove("FINCH_TEST_SUPERVISOR_BIN")
-        .env_remove("FINCH_TEST_IPC_SOCKET")
-        .env_remove("FINCH_TEST_SOCKET_ROOT")
-        .env_remove("FINCH_TEST_DAEMON_ADDR")
-        .env_remove("FINCH_TEST_BRAIN_ADDR");
+        .env_remove("RUST_LOG");
+
+    // The supervisor intentionally exports more authority variables over
+    // time. Prefix removal fails closed for additions instead of relying on a
+    // hand-maintained list that silently omitted passwords and listener FDs.
+    for (name, _) in std::env::vars_os() {
+        let name_text = name.to_string_lossy();
+        if name_text.starts_with("FINCH_BRAIN_TEST_") || name_text.starts_with("FINCH_TEST_") {
+            command.env_remove(name);
+        }
+    }
+    // This is a restriction, not authority: a regression that tries to find
+    // or launch a daemon must fail rather than escape the fixture.
+    command.env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1");
+
+    // Environment labels are not capabilities. Close every descriptor the
+    // authenticated supervisor deliberately makes inheritable, in the child
+    // after stdio has been installed and immediately before exec.
+    unsafe {
+        command.pre_exec(|| {
+            for fd in SUPERVISOR_AUTHORITY_FDS {
+                nix::libc::close(*fd);
+            }
+            Ok(())
+        });
+    }
     command
 }
 
@@ -611,7 +639,40 @@ impl Drop for Session {
 /// production path for `finch >log`: main does not take the piped-query early
 /// return because stdin is a terminal, while `Repl` correctly observes that
 /// stdout is not one and selects its non-interactive banner.
-fn run_with_redirected_output(fixture: &Fixture) -> (std::process::ExitStatus, String, String) {
+#[derive(Debug)]
+struct CapturedOutcome {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn bounded_capture(file: &mut std::fs::File, label: &str) -> String {
+    let total = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return format!("<{label} metadata unavailable: {error}>"),
+    };
+    if let Err(error) = file.seek(SeekFrom::Start(0)) {
+        return format!("<{label} rewind failed: {error}; captured_bytes={total}>");
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(CAPTURE_DIAGNOSTIC_LIMIT).read_to_end(&mut bytes) {
+        return format!("<{label} read failed: {error}; captured_bytes={total}>");
+    }
+    let mut rendered = String::from_utf8_lossy(&bytes).into_owned();
+    if total > CAPTURE_DIAGNOSTIC_LIMIT {
+        rendered.push_str(&format!(
+            "\n<{label} truncated: showing {} of {total} bytes>",
+            CAPTURE_DIAGNOSTIC_LIMIT
+        ));
+    }
+    rendered
+}
+
+fn run_with_redirected_output(
+    fixture: &Fixture,
+    logging: bool,
+    writable_stderr: bool,
+) -> CapturedOutcome {
     let pty = nix::pty::openpty(None, None).expect("open pty for terminal stdin");
     let mut stdout = tempfile::tempfile().expect("temporary stdout capture");
     let mut stderr = tempfile::tempfile().expect("temporary stderr capture");
@@ -621,10 +682,19 @@ fn run_with_redirected_output(fixture: &Fixture) -> (std::process::ExitStatus, S
         .stdin(Stdio::from(pty.slave))
         .stdout(Stdio::from(
             stdout.try_clone().expect("clone stdout capture"),
-        ))
-        .stderr(Stdio::from(
+        ));
+    if logging {
+        command.env("SHAMMAH_LOG", "1");
+    }
+    if writable_stderr {
+        command.stderr(Stdio::from(
             stderr.try_clone().expect("clone stderr capture"),
         ));
+    } else {
+        command.stderr(Stdio::from(
+            std::fs::File::open("/dev/null").expect("open read-only stderr target"),
+        ));
+    }
 
     let mut child = command.spawn().expect("spawn finch with redirected output");
     let mut input = std::fs::File::from(pty.master);
@@ -640,26 +710,32 @@ fn run_with_redirected_output(fixture: &Fixture) -> (std::process::ExitStatus, S
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            let wait_after_kill = child.wait();
+            let stdout_text = bounded_capture(&mut stdout, "stdout");
+            let stderr_text = if writable_stderr {
+                bounded_capture(&mut stderr, "stderr")
+            } else {
+                "<stderr was intentionally unwritable>".to_string()
+            };
             panic!(
                 "redirected finch did not consume `/exit` within {READY_DEADLINE:?}; \
-                 this deadline detects a stuck real REPL, not startup latency"
+                 this deadline detects a stuck real REPL, not startup latency. \
+                 wait_after_kill={wait_after_kill:?}\nstdout:\n{stdout_text}\n\
+                 stderr:\n{stderr_text}"
             );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    let mut stdout_text = String::new();
-    stdout.seek(SeekFrom::Start(0)).expect("rewind stdout");
-    stdout
-        .read_to_string(&mut stdout_text)
-        .expect("read stdout capture");
-    let mut stderr_text = String::new();
-    stderr.seek(SeekFrom::Start(0)).expect("rewind stderr");
-    stderr
-        .read_to_string(&mut stderr_text)
-        .expect("read stderr capture");
-    (status, stdout_text, stderr_text)
+    CapturedOutcome {
+        status,
+        stdout: bounded_capture(&mut stdout, "stdout"),
+        stderr: if writable_stderr {
+            bounded_capture(&mut stderr, "stderr")
+        } else {
+            "<stderr was intentionally unwritable>".to_string()
+        },
+    }
 }
 
 fn command_payload(output: &std::process::Output) -> String {
@@ -669,6 +745,25 @@ fn command_payload(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn assert_no_forbidden_identity_phrases(
+    context: &str,
+    status: std::process::ExitStatus,
+    channels: &[(&str, &str)],
+) {
+    for (channel, text) in channels {
+        let lowered = text.to_ascii_lowercase();
+        for forbidden in FORBIDDEN_IDENTITY_PHRASES {
+            assert!(
+                !lowered.contains(forbidden),
+                "{context}: no user-visible channel may restore a stale or \
+                 unevidenced product identity, case-insensitively. \
+                 forbidden={forbidden:?} channel={channel} status={status:?}\n\
+                 channel contents:\n{text}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -684,11 +779,17 @@ fn test_cli_help_and_version_report_the_real_finch_identity() {
         "the built `finch --help` must exit successfully; {help_payload}"
     );
     let help_stdout = String::from_utf8_lossy(&help.stdout);
+    let help_stderr = String::from_utf8_lossy(&help.stderr);
     assert_eq!(
         help_stdout.lines().next(),
-        Some(finch::ABOUT),
+        Some(EXPECTED_ABOUT),
         "the first line emitted by the real clap parser must be Finch's \
          evidence-backed description; {help_payload}"
+    );
+    assert_no_forbidden_identity_phrases(
+        "the real `finch --help` process",
+        help.status,
+        &[("stdout", &help_stdout), ("stderr", &help_stderr)],
     );
 
     let version = isolated_finch_command(&fixture)
@@ -706,11 +807,18 @@ fn test_cli_help_and_version_report_the_real_finch_identity() {
         "the real clap version must use the Cargo package name and version; \
          {version_payload}"
     );
+    let version_stdout = String::from_utf8_lossy(&version.stdout);
+    let version_stderr = String::from_utf8_lossy(&version.stderr);
+    assert_no_forbidden_identity_phrases(
+        "the real `finch --version` process",
+        version.status,
+        &[("stdout", &version_stdout), ("stderr", &version_stderr)],
+    );
 }
 
 #[test]
 fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
-    let expected = format!("finch {} - {}", env!("CARGO_PKG_VERSION"), finch::ABOUT);
+    let expected = format!("finch {} - {}", env!("CARGO_PKG_VERSION"), EXPECTED_ABOUT);
 
     let interactive_fixture = Fixture::new(0);
     let mut interactive = Session::spawn_with_args(&interactive_fixture, &["--raw"]);
@@ -725,16 +833,110 @@ fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
          expected={expected:?} status={interactive_status:?} terminal:\n\
          {interactive_transcript}"
     );
+    assert_no_forbidden_identity_phrases(
+        "the real raw interactive REPL",
+        interactive_status,
+        &[("pty transcript", &interactive_transcript)],
+    );
 
     let redirected_fixture = Fixture::new(0);
-    let (redirected_status, stdout, stderr) = run_with_redirected_output(&redirected_fixture);
+    let redirected = run_with_redirected_output(&redirected_fixture, false, true);
+    assert!(
+        redirected.status.success() && redirected.stderr.is_empty(),
+        "redirected startup must preserve the established quiet-by-default \
+         status contract when SHAMMAH_LOG is absent. outcome={redirected:?}"
+    );
+    assert_no_forbidden_identity_phrases(
+        "the quiet redirected REPL",
+        redirected.status,
+        &[
+            ("stdout", &redirected.stdout),
+            ("stderr", &redirected.stderr),
+        ],
+    );
+
+    let logged_fixture = Fixture::new(0);
+    let logged = run_with_redirected_output(&logged_fixture, true, true);
     let expected_redirected = format!("# {expected} - non-interactive mode");
     assert!(
-        redirected_status.success() && stderr.lines().any(|line| line == expected_redirected),
-        "the real redirected-output REPL must visibly report the same identity \
-         on stderr without requiring a logging environment variable. \
-         expected={expected_redirected:?} status={redirected_status:?}\n\
-         stdout:\n{stdout}\nstderr:\n{stderr}"
+        logged.status.success()
+            && logged
+                .stderr
+                .lines()
+                .any(|line| line == format!("[STATUS] {expected_redirected}")),
+        "redirected startup with SHAMMAH_LOG must preserve the status gate and \
+         prefix while reporting the shared identity. \
+         expected={expected_redirected:?} outcome={logged:?}"
+    );
+    assert_no_forbidden_identity_phrases(
+        "the logged redirected REPL",
+        logged.status,
+        &[("stdout", &logged.stdout), ("stderr", &logged.stderr)],
+    );
+
+    let unwritable_fixture = Fixture::new(0);
+    let unwritable = run_with_redirected_output(&unwritable_fixture, false, false);
+    assert!(
+        unwritable.status.success(),
+        "quiet redirected startup must not write to or fail on an unwritable \
+         stderr when SHAMMAH_LOG is absent. outcome={unwritable:?}"
+    );
+}
+
+#[test]
+fn test_isolated_subprocess_cannot_inherit_supervisor_authority() {
+    const PROBE: &str = "FINCH_IDENTITY_ISOLATION_CHILD_PROBE";
+    if std::env::var_os(PROBE).is_some() {
+        let mut authority_variables: Vec<(String, String)> = std::env::vars()
+            .filter(|(name, _)| {
+                name.starts_with("FINCH_BRAIN_TEST_") || name.starts_with("FINCH_TEST_")
+            })
+            .collect();
+        authority_variables.sort();
+        assert_eq!(
+            authority_variables,
+            vec![(
+                "FINCH_BRAIN_TEST_NO_AUTO_SPAWN".to_string(),
+                "1".to_string()
+            )],
+            "an isolated test child may inherit only the fail-closed \
+             no-auto-spawn restriction, never supervisor proof, passwords, \
+             listener identities, or paths; inherited={authority_variables:?}"
+        );
+
+        for fd in SUPERVISOR_AUTHORITY_FDS {
+            let result = unsafe { nix::libc::fcntl(*fd, nix::libc::F_GETFD) };
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                (result, error.raw_os_error()),
+                (-1, Some(nix::libc::EBADF)),
+                "supervisor authority descriptor {fd} must be closed in the \
+                 child immediately before exec; fcntl_result={result} \
+                 os_error={error}"
+            );
+        }
+        return;
+    }
+
+    let fixture = Fixture::new(0);
+    let mut command = isolated_child_command(
+        Command::new(std::env::current_exe().expect("current integration-test executable")),
+        &fixture,
+    );
+    let output = command
+        .args([
+            "--exact",
+            "test_isolated_subprocess_cannot_inherit_supervisor_authority",
+            "--nocapture",
+        ])
+        .env(PROBE, "1")
+        .output()
+        .expect("run child-side supervisor-authority probe");
+    let payload = command_payload(&output);
+    assert!(
+        output.status.success(),
+        "the subprocess-boundary authority probe must observe EBADF for every \
+         supervisor descriptor and no authority environment. {payload}"
     );
 }
 
@@ -1101,6 +1303,24 @@ fn test_interactive_startup_reports_every_phase_and_reaches_input_ready() {
          synced; its count is a count of successes and means nothing without \
          it. Entry was {sync:?} and the report was:\n{}",
         report.raw
+    );
+
+    // This is the ordinary no-argument TUI path. It does not call
+    // `Repl::run`, so the raw-mode banner cannot stand in for this assertion.
+    session.send_line("/exit");
+    let status = session.wait_for_exit();
+    let terminal = session.readable_transcript();
+    let expected_identity = format!("finch v{} · {}", env!("CARGO_PKG_VERSION"), EXPECTED_ABOUT);
+    assert!(
+        status.success() && terminal.contains(&expected_identity),
+        "the default no-argument TUI header must visibly identify Finch with \
+         the Cargo package version and evidence-backed description. \
+         expected={expected_identity:?} status={status:?} terminal:\n{terminal}"
+    );
+    assert_no_forbidden_identity_phrases(
+        "the default no-argument TUI",
+        status,
+        &[("pty transcript", &terminal)],
     );
 }
 
