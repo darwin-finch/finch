@@ -219,12 +219,12 @@ def file_identity(metadata: os.stat_result) -> FileIdentity:
     )
 
 
-def open_regular_file(
+def acquire_regular_file_descriptor(
     path: Path,
     root: Path,
     maximum: int,
     before_open_hook: Callable[[Path], None] | None = None,
-) -> tuple[BinaryIO, os.stat_result, str]:
+) -> tuple[int, os.stat_result, str]:
     display = path.relative_to(root).as_posix()
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -262,8 +262,37 @@ def open_regular_file(
                 f"{display}: file identity changed during descriptor acquisition; "
                 f"initial_identity={initial_identity!r} opened_identity={opened_identity!r}"
             )
-        return os.fdopen(descriptor, "rb"), opened, display
+        return descriptor, opened, display
     except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_regular_file(
+    path: Path,
+    root: Path,
+    maximum: int,
+    before_open_hook: Callable[[Path], None] | None = None,
+) -> tuple[BinaryIO, os.stat_result, str]:
+    display = path.relative_to(root).as_posix()
+    metadata = regular_file_metadata(path, display, maximum)
+    if before_open_hook is not None:
+        before_open_hook(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ContractError(
+            f"{display}: regular file could not be opened safely: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ContractError(f"{display}: opened path is not a regular file")
+        if file_identity(opened) != file_identity(metadata):
+            raise ContractError(f"{display}: file identity changed before reading")
+        return os.fdopen(descriptor, "rb"), opened, display
+    except Exception:
         os.close(descriptor)
         raise
 

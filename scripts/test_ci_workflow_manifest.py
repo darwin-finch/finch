@@ -24,9 +24,9 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_DIRECTORY_ENTRIES,
     MAX_WORKFLOW_FILES,
+    acquire_regular_file_descriptor,
     compare_contract,
     hash_canonical_workflow_stream,
-    open_regular_file,
     read_exact_bytes,
     workflow_records,
 )
@@ -162,7 +162,7 @@ class WorkflowManifestTests(unittest.TestCase):
         finally:
             repository.close()
 
-    def test_safe_regular_file_open_uses_exact_safety_flags(self) -> None:
+    def test_safe_regular_file_descriptor_uses_exact_safety_flags(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             path = self.write_regular_source(root)
@@ -176,8 +176,10 @@ class WorkflowManifestTests(unittest.TestCase):
             with mock.patch(
                 "check_ci_workflow_manifest.os.open", side_effect=record_open
             ):
-                stream, _, _ = open_regular_file(path, root, len(b"reviewed"))
-            stream.close()
+                descriptor, _, _ = acquire_regular_file_descriptor(
+                    path, root, len(b"reviewed")
+                )
+            os.close(descriptor)
             self.assertEqual(
                 len(observed_flags),
                 1,
@@ -198,7 +200,7 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"path={path} flags={flags:#x} required={os.O_NONBLOCK:#x}",
             )
 
-    def test_safe_regular_file_open_rejects_same_inode_symlink_swap(self) -> None:
+    def test_safe_regular_file_descriptor_rejects_same_inode_symlink_swap(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             path = self.write_regular_source(root)
@@ -217,11 +219,11 @@ class WorkflowManifestTests(unittest.TestCase):
                     f"resolves to the reviewed inode: path={path} target={target} inode={inode}"
                 ),
             ):
-                open_regular_file(
+                acquire_regular_file_descriptor(
                     path, root, len(b"reviewed"), before_open_hook=install_same_inode_link
                 )
 
-    def test_safe_regular_file_open_rejects_distinct_regular_replacement(self) -> None:
+    def test_safe_regular_file_descriptor_rejects_distinct_regular_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             path = self.write_regular_source(root)
@@ -254,7 +256,7 @@ class WorkflowManifestTests(unittest.TestCase):
                         f"replacement_inode={replacement_inode}"
                     ),
                 ):
-                    open_regular_file(
+                    acquire_regular_file_descriptor(
                         path, root, 1024, before_open_hook=replace_before_open
                     )
             self.assertEqual(
@@ -280,7 +282,7 @@ class WorkflowManifestTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO replacement requires os.mkfifo")
-    def test_safe_regular_file_open_rejects_fifo_without_blocking(self) -> None:
+    def test_safe_regular_file_descriptor_rejects_fifo_without_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             path = self.write_regular_source(root)
@@ -301,7 +303,7 @@ class WorkflowManifestTests(unittest.TestCase):
                 "    os.mkfifo(path)\n"
                 "checker.os.open = record_open\n"
                 "try:\n"
-                "    checker.open_regular_file(path, root, 1024, install_fifo)\n"
+                "    checker.acquire_regular_file_descriptor(path, root, 1024, install_fifo)\n"
                 "except checker.ContractError as error:\n"
                 "    try:\n"
                 "        os.fstat(descriptors[0])\n"
@@ -336,7 +338,7 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"path={path} stdout={result.stdout!r} stderr={result.stderr!r}",
             )
 
-    def test_safe_regular_file_open_fails_before_open_without_required_flags(self) -> None:
+    def test_safe_regular_file_descriptor_fails_before_open_without_required_flags(self) -> None:
         for flag_name in ("O_NOFOLLOW", "O_NONBLOCK"):
             with self.subTest(flag=flag_name), tempfile.TemporaryDirectory() as name:
                 root = Path(name)
@@ -353,14 +355,13 @@ class WorkflowManifestTests(unittest.TestCase):
                             f"path={path} stage=capability-check flag={flag_name}"
                         ),
                     ):
-                        open_regular_file(path, root, 1024)
+                        acquire_regular_file_descriptor(path, root, 1024)
                 opened.assert_not_called()
 
-    def test_safe_regular_file_open_closes_fd_on_setup_interruptions(self) -> None:
+    def test_safe_regular_file_descriptor_closes_fd_on_setup_interruptions(self) -> None:
         for stage, target in (
             ("fstat", "check_ci_workflow_manifest.os.fstat"),
             ("identity", "check_ci_workflow_manifest.file_identity"),
-            ("fdopen", "check_ci_workflow_manifest.os.fdopen"),
         ):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as name:
                 root = Path(name)
@@ -385,7 +386,7 @@ class WorkflowManifestTests(unittest.TestCase):
                             f"path={path} stage={stage} descriptors={descriptors!r}"
                         ),
                     ):
-                        open_regular_file(path, root, 1024)
+                        acquire_regular_file_descriptor(path, root, 1024)
                 self.assertEqual(
                     len(descriptors),
                     1,
