@@ -226,10 +226,21 @@ def open_regular_file(
     before_open_hook: Callable[[Path], None] | None = None,
 ) -> tuple[BinaryIO, os.stat_result, str]:
     display = path.relative_to(root).as_posix()
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ContractError(
+            f"{display}: O_NOFOLLOW is unavailable; refusing unsafe descriptor acquisition"
+        )
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nonblock is None:
+        raise ContractError(
+            f"{display}: O_NONBLOCK is unavailable; refusing potentially blocking "
+            "descriptor acquisition"
+        )
     metadata = regular_file_metadata(path, display, maximum)
     if before_open_hook is not None:
         before_open_hook(path)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -239,11 +250,20 @@ def open_regular_file(
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
-            raise ContractError(f"{display}: opened path is not a regular file")
-        if file_identity(opened) != file_identity(metadata):
-            raise ContractError(f"{display}: file identity changed before reading")
+            raise ContractError(
+                f"{display}: opened path is not a regular file; "
+                f"opened_mode={stat.filemode(opened.st_mode)!r} "
+                f"opened_identity={file_identity(opened)!r}"
+            )
+        initial_identity = file_identity(metadata)
+        opened_identity = file_identity(opened)
+        if opened_identity != initial_identity:
+            raise ContractError(
+                f"{display}: file identity changed during descriptor acquisition; "
+                f"initial_identity={initial_identity!r} opened_identity={opened_identity!r}"
+            )
         return os.fdopen(descriptor, "rb"), opened, display
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
 

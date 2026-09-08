@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from check_ci_workflow_manifest import (
     ContractError,
@@ -24,6 +26,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_FILES,
     compare_contract,
     hash_canonical_workflow_stream,
+    open_regular_file,
     read_exact_bytes,
     workflow_records,
 )
@@ -79,6 +82,14 @@ class WorkflowRepository:
 
 
 class WorkflowManifestTests(unittest.TestCase):
+    def write_regular_source(
+        self, root: Path, relative: str = "reviewed.bin", contents: bytes = b"reviewed"
+    ) -> Path:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+        return path
+
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
         self.assertEqual(
@@ -150,6 +161,253 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_safe_regular_file_open_uses_exact_safety_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            path = self.write_regular_source(root)
+            real_open = os.open
+            observed_flags: list[int] = []
+
+            def record_open(opened_path, flags, *args, **kwargs):
+                observed_flags.append(flags)
+                return real_open(opened_path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                stream, _, _ = open_regular_file(path, root, len(b"reviewed"))
+            stream.close()
+            self.assertEqual(
+                len(observed_flags),
+                1,
+                "safe regular-file acquisition must issue exactly one open: "
+                f"path={path} flags={observed_flags!r}",
+            )
+            flags = observed_flags[0]
+            self.assertEqual(
+                flags & os.O_NOFOLLOW,
+                os.O_NOFOLLOW,
+                "safe regular-file acquisition must pass O_NOFOLLOW: "
+                f"path={path} flags={flags:#x} required={os.O_NOFOLLOW:#x}",
+            )
+            self.assertEqual(
+                flags & os.O_NONBLOCK,
+                os.O_NONBLOCK,
+                "safe regular-file acquisition must pass O_NONBLOCK: "
+                f"path={path} flags={flags:#x} required={os.O_NONBLOCK:#x}",
+            )
+
+    def test_safe_regular_file_open_rejects_same_inode_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            path = self.write_regular_source(root)
+            target = root / "reviewed-target.bin"
+            inode = path.stat().st_ino
+
+            def install_same_inode_link(opened_path: Path) -> None:
+                opened_path.rename(target)
+                opened_path.symlink_to(target.name)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                "regular file could not be opened safely",
+                msg=(
+                    "O_NOFOLLOW must reject a lstat-to-open symlink swap even when the link "
+                    f"resolves to the reviewed inode: path={path} target={target} inode={inode}"
+                ),
+            ):
+                open_regular_file(
+                    path, root, len(b"reviewed"), before_open_hook=install_same_inode_link
+                )
+
+    def test_safe_regular_file_open_rejects_distinct_regular_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            path = self.write_regular_source(root)
+            replacement = self.write_regular_source(
+                root, "replacement.bin", b"replacement"
+            )
+            initial_inode = path.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+            real_open = os.open
+            descriptors: list[int] = []
+
+            def record_open(opened_path, flags, *args, **kwargs):
+                descriptor = real_open(opened_path, flags, *args, **kwargs)
+                descriptors.append(descriptor)
+                return descriptor
+
+            def replace_before_open(_path: Path) -> None:
+                os.replace(replacement, path)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                with self.assertRaisesRegex(
+                    ContractError,
+                    rf"initial_identity=.*{initial_inode}.*opened_identity=.*{replacement_inode}",
+                    msg=(
+                        "opened descriptor identity must reject a distinct regular "
+                        "replacement and report both identities: "
+                        f"path={path} initial_inode={initial_inode} "
+                        f"replacement_inode={replacement_inode}"
+                    ),
+                ):
+                    open_regular_file(
+                        path, root, 1024, before_open_hook=replace_before_open
+                    )
+            self.assertEqual(
+                len(descriptors),
+                1,
+                "replacement invariant must fail after exactly one descriptor open: "
+                f"path={path} descriptors={descriptors!r}",
+            )
+            descriptor = descriptors[0]
+            with self.assertRaises(
+                OSError,
+                msg=(
+                    "identity-rejected descriptor must already be closed: "
+                    f"path={path} fd={descriptor}"
+                ),
+            ) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(
+                raised.exception.errno,
+                errno.EBADF,
+                "identity rejection must close the opened fd: "
+                f"path={path} fd={descriptor} error={raised.exception!r}",
+            )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO replacement requires os.mkfifo")
+    def test_safe_regular_file_open_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            path = self.write_regular_source(root)
+            program = (
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "import check_ci_workflow_manifest as checker\n"
+                "root = Path(sys.argv[1])\n"
+                "path = root / 'reviewed.bin'\n"
+                "real_open = os.open\n"
+                "descriptors = []\n"
+                "def record_open(opened_path, flags, *args, **kwargs):\n"
+                "    fd = real_open(opened_path, flags, *args, **kwargs)\n"
+                "    descriptors.append(fd)\n"
+                "    return fd\n"
+                "def install_fifo(_path):\n"
+                "    path.unlink()\n"
+                "    os.mkfifo(path)\n"
+                "checker.os.open = record_open\n"
+                "try:\n"
+                "    checker.open_regular_file(path, root, 1024, install_fifo)\n"
+                "except checker.ContractError as error:\n"
+                "    try:\n"
+                "        os.fstat(descriptors[0])\n"
+                "    except OSError:\n"
+                "        closed = True\n"
+                "    else:\n"
+                "        closed = False\n"
+                "    print(f'error={error} closed={closed} fd={descriptors!r}')\n"
+                "    raise SystemExit(0 if 'opened path is not a regular file' in str(error) "
+                "and closed else 2)\n"
+                "raise SystemExit(3)\n"
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", program, str(root)],
+                    cwd=ROOT / "scripts",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    "O_NONBLOCK invariant failed: FIFO replacement blocked descriptor "
+                    f"acquisition; path={path} stage=os.open timeout=2 error={error!r}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                "FIFO replacement must reject with an actionable non-regular diagnostic "
+                "and closed fd: "
+                f"path={path} stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+
+    def test_safe_regular_file_open_fails_before_open_without_required_flags(self) -> None:
+        for flag_name in ("O_NOFOLLOW", "O_NONBLOCK"):
+            with self.subTest(flag=flag_name), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                path = self.write_regular_source(root)
+                with mock.patch.object(os, flag_name, None), mock.patch(
+                    "check_ci_workflow_manifest.os.open",
+                    side_effect=AssertionError(f"opened without {flag_name}"),
+                ) as opened:
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        rf"{flag_name} is unavailable; refusing",
+                        msg=(
+                            "missing safety flag must fail closed before descriptor open: "
+                            f"path={path} stage=capability-check flag={flag_name}"
+                        ),
+                    ):
+                        open_regular_file(path, root, 1024)
+                opened.assert_not_called()
+
+    def test_safe_regular_file_open_closes_fd_on_setup_interruptions(self) -> None:
+        for stage, target in (
+            ("fstat", "check_ci_workflow_manifest.os.fstat"),
+            ("identity", "check_ci_workflow_manifest.file_identity"),
+            ("fdopen", "check_ci_workflow_manifest.os.fdopen"),
+        ):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                path = self.write_regular_source(root)
+                real_open = os.open
+                descriptors: list[int] = []
+
+                def record_open(opened_path, flags, *args, **kwargs):
+                    descriptor = real_open(opened_path, flags, *args, **kwargs)
+                    descriptors.append(descriptor)
+                    return descriptor
+
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.open", side_effect=record_open
+                ), mock.patch(
+                    target, side_effect=KeyboardInterrupt(f"injected {stage} interruption")
+                ):
+                    with self.assertRaises(
+                        KeyboardInterrupt,
+                        msg=(
+                            "setup interruption must propagate after owned fd cleanup: "
+                            f"path={path} stage={stage} descriptors={descriptors!r}"
+                        ),
+                    ):
+                        open_regular_file(path, root, 1024)
+                self.assertEqual(
+                    len(descriptors),
+                    1,
+                    "interruption fixture must acquire exactly one raw fd: "
+                    f"path={path} stage={stage} descriptors={descriptors!r}",
+                )
+                descriptor = descriptors[0]
+                with self.assertRaises(
+                    OSError,
+                    msg=(
+                        "BaseException cleanup must close raw fd before propagation: "
+                        f"path={path} stage={stage} fd={descriptor}"
+                    ),
+                ) as raised:
+                    os.fstat(descriptor)
+                self.assertEqual(
+                    raised.exception.errno,
+                    errno.EBADF,
+                    "interrupted descriptor setup must yield EBADF after cleanup: "
+                    f"path={path} stage={stage} fd={descriptor} "
+                    f"error={raised.exception!r}",
+                )
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):
