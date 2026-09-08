@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from check_ci_workflow_manifest import (
     ContractError,
@@ -22,15 +24,39 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_BYTES,
     MAX_WORKFLOW_DIRECTORY_ENTRIES,
     MAX_WORKFLOW_FILES,
+    WORKFLOW_DIRECTORY_FD_SUPPORTED,
+    bounded_workflow_names,
+    capture_canonical_workflow_stream,
     compare_contract,
     hash_canonical_workflow_stream,
     read_exact_bytes,
+    manifest_snapshot,
+    workflow_snapshot,
     workflow_records,
 )
 
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
+
+
+class PullBoundIterator:
+    def __init__(self, names: list[str]) -> None:
+        self.names = names
+        self.pulls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.pulls == len(self.names):
+            raise AssertionError(
+                "bounded workflow enumeration pulled after its first excess element: "
+                f"pulls={self.pulls} names={len(self.names)}"
+            )
+        name = self.names[self.pulls]
+        self.pulls += 1
+        return type("Entry", (), {"name": name})()
 
 
 class WorkflowRepository:
@@ -79,6 +105,20 @@ class WorkflowRepository:
 
 
 class WorkflowManifestTests(unittest.TestCase):
+    def write_snapshot_source(
+        self,
+        root: Path,
+        workflows: dict[str, bytes] | None = None,
+        manifest_bytes: bytes = b"{}\n",
+    ) -> None:
+        workflow_directory = root / ".github/workflows"
+        workflow_directory.mkdir(parents=True)
+        for name, contents in (workflows or {"synthetic.yml": b"name: fixture\n"}).items():
+            (workflow_directory / name).write_bytes(contents)
+        scripts = root / "scripts"
+        scripts.mkdir()
+        (scripts / "ci_workflow_manifest.json").write_bytes(manifest_bytes)
+
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
         self.assertEqual(
@@ -150,6 +190,288 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_per_resource_snapshots_enforce_all_five_bounds(self) -> None:
+        cases = (
+            (
+                "directory entries",
+                {"synthetic.yml": b"name: fixture\n"},
+                MAX_WORKFLOW_DIRECTORY_ENTRIES,
+                "directory entry count exceeds",
+            ),
+            (
+                "workflow count",
+                {
+                    f"workflow-{index}.yml": b"name: fixture\n"
+                    for index in range(MAX_WORKFLOW_FILES + 1)
+                },
+                0,
+                "workflow count exceeds",
+            ),
+            (
+                "per-workflow bytes",
+                {"oversized.yml": b"x" * (MAX_WORKFLOW_BYTES + 1)},
+                0,
+                "exceeds the reviewed",
+            ),
+            (
+                "aggregate workflow bytes",
+                {
+                    f"workflow-{index}.yml": b"x" * MAX_WORKFLOW_BYTES
+                    for index in range(9)
+                },
+                0,
+                "aggregate bytes exceeds",
+            ),
+        )
+        for label, workflows, ignored_entries, diagnostic in cases:
+            with self.subTest(bound=label), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                self.write_snapshot_source(root, workflows)
+                directory = root / ".github/workflows"
+                for index in range(ignored_entries):
+                    (directory / f"ignored-{index}.txt").touch()
+                with self.assertRaisesRegex(
+                    ContractError,
+                    diagnostic,
+                    msg=(
+                        "workflow_snapshot must enforce each source bound independently: "
+                        f"bound={label} root={root} workflows={len(workflows)} "
+                        f"ignored_entries={ignored_entries}"
+                    ),
+                ):
+                    workflow_snapshot(root)
+
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest_bytes = b'{"padding":"' + b"x" * MAX_MANIFEST_BYTES + b'"}\n'
+            self.write_snapshot_source(root, manifest_bytes=manifest_bytes)
+            with self.assertRaisesRegex(
+                ContractError,
+                "exceeds the reviewed",
+                msg=(
+                    "manifest_snapshot must enforce its byte bound before reading: "
+                    f"root={root} size={len(manifest_bytes)} limit={MAX_MANIFEST_BYTES}"
+                ),
+            ):
+                manifest_snapshot(root)
+
+    def test_bounded_enumeration_stops_at_each_first_excess_element(self) -> None:
+        for label, names, limit, diagnostic in (
+            (
+                "directory entries",
+                [
+                    f"ignored-{index}.txt"
+                    for index in range(MAX_WORKFLOW_DIRECTORY_ENTRIES + 1)
+                ],
+                MAX_WORKFLOW_DIRECTORY_ENTRIES,
+                "directory entry count exceeds",
+            ),
+            (
+                "workflow count",
+                [f"workflow-{index}.yml" for index in range(MAX_WORKFLOW_FILES + 1)],
+                MAX_WORKFLOW_FILES,
+                "workflow count exceeds",
+            ),
+        ):
+            with self.subTest(bound=label):
+                entries = PullBoundIterator(names)
+                with self.assertRaisesRegex(
+                    ContractError,
+                    diagnostic,
+                    msg=f"enumeration must reject the first excess {label}: limit={limit}",
+                ):
+                    bounded_workflow_names(entries)
+                self.assertEqual(
+                    entries.pulls,
+                    limit + 1,
+                    "bounded enumeration must not pull after its first rejected element: "
+                    f"bound={label} pulls={entries.pulls} limit={limit}",
+                )
+
+    def test_per_resource_snapshots_preserve_exact_raw_and_canonical_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            workflow_raw = b"name: fixture\r\non:\r\n  push:\r\n"
+            manifest_raw = b'{"schema":"fixture"}\n'
+            self.write_snapshot_source(
+                root, {"synthetic.yml": workflow_raw}, manifest_raw
+            )
+            workflow_bytes, records = workflow_snapshot(root)
+            captured_manifest, manifest, _ = manifest_snapshot(root)
+            canonical = workflow_raw.replace(b"\r\n", b"\n")
+            self.assertEqual(
+                workflow_bytes,
+                {"synthetic.yml": workflow_raw},
+                "workflow_snapshot must preserve exact physical source bytes: "
+                f"root={root} captured={workflow_bytes!r}",
+            )
+            self.assertEqual(
+                records["synthetic.yml"]["sha256"],
+                hashlib.sha256(canonical).hexdigest(),
+                "workflow record digest must use canonical LF bytes while retaining raw "
+                f"capture: raw={workflow_raw!r} canonical={canonical!r} records={records!r}",
+            )
+            self.assertEqual(
+                records["synthetic.yml"]["bytes"],
+                len(canonical),
+                "workflow record byte count must describe canonical LF bytes: "
+                f"canonical={canonical!r} records={records!r}",
+            )
+            self.assertEqual(
+                (captured_manifest, manifest),
+                (manifest_raw, {"schema": "fixture"}),
+                "manifest_snapshot must return exact raw bytes and their parsed object: "
+                f"raw={captured_manifest!r} manifest={manifest!r}",
+            )
+
+    def test_workflow_snapshot_never_opens_ignored_nonworkflow_link(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root)
+            target = root / "tiny-ignored-target.txt"
+            target.write_bytes(b"forbidden target content\n")
+            link = root / ".github/workflows/ignored.txt"
+            link.symlink_to(target)
+            real_open = os.open
+            opened: list[str] = []
+
+            def record_open(path, flags, *args, **kwargs):
+                opened.append(os.fspath(path))
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                workflow_bytes, _ = workflow_snapshot(root)
+            forbidden = {str(link), link.name, str(target), target.name}
+            forbidden_opens = [path for path in opened if path in forbidden]
+            self.assertEqual(
+                workflow_bytes,
+                {"synthetic.yml": b"name: fixture\n"},
+                "ignored non-workflow links must not enter the captured workflow set: "
+                f"link={link} captured={workflow_bytes!r}",
+            )
+            self.assertEqual(
+                forbidden_opens,
+                [],
+                "workflow_snapshot must filter an ignored non-workflow link before opening "
+                "either its lexical path or target content: "
+                f"link={link} target={target} opens={opened!r}",
+            )
+
+    @unittest.skipUnless(
+        WORKFLOW_DIRECTORY_FD_SUPPORTED,
+        "directory-relative workflow pinning is unavailable on this platform",
+    )
+    def test_workflow_snapshot_parent_replacement_never_captures_target_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            reviewed = b"name: reviewed source\n"
+            forbidden = b"name: replacement source\n"
+            self.write_snapshot_source(root, {"synthetic.yml": reviewed})
+            directory = root / ".github/workflows"
+            replacement = root / ".github/workflows-replacement"
+            replacement.mkdir()
+            (replacement / "synthetic.yml").write_bytes(forbidden)
+            captured: list[bytes] = []
+
+            def replace_parent() -> None:
+                original = root / ".github/workflows-original"
+                directory.rename(original)
+                os.replace(replacement, directory)
+
+            def record_capture(stream, expected_size: int, display: str):
+                contents, digest, canonical_size = capture_canonical_workflow_stream(
+                    stream, expected_size, display
+                )
+                captured.append(contents)
+                return contents, digest, canonical_size
+
+            with mock.patch(
+                "check_ci_workflow_manifest.capture_canonical_workflow_stream",
+                side_effect=record_capture,
+            ):
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "directory identity changed|file identity changed",
+                    msg=(
+                        "replacing the workflow parent after pinned enumeration must reject "
+                        "without capturing replacement bytes: "
+                        f"directory={directory} replacement={replacement}"
+                    ),
+                ):
+                    workflow_snapshot(root, phase_hook=replace_parent)
+            self.assertIn(
+                reviewed,
+                captured,
+                "the pinned directory descriptor must capture the reviewed directory inode: "
+                f"reviewed={reviewed!r} captured={captured!r}",
+            )
+            self.assertNotIn(
+                forbidden,
+                captured,
+                "a replaced parent pathname must never redirect workflow capture: "
+                f"forbidden={forbidden!r} captured={captured!r}",
+            )
+
+    def test_workflow_snapshot_fails_closed_without_directory_fd_support(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root)
+            with mock.patch(
+                "check_ci_workflow_manifest.WORKFLOW_DIRECTORY_FD_SUPPORTED", False
+            ), mock.patch(
+                "check_ci_workflow_manifest.os.scandir",
+                side_effect=AssertionError("unsupported platform enumerated source children"),
+            ) as scandir:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "cannot identity-pin the workflow directory.*refusing an unsafe",
+                    msg=(
+                        "workflow_snapshot must fail closed before enumeration when "
+                        f"directory-relative descriptor pinning is unavailable: root={root}"
+                    ),
+                ):
+                    workflow_snapshot(root)
+            scandir.assert_not_called()
+
+    @unittest.skipUnless(
+        WORKFLOW_DIRECTORY_FD_SUPPORTED,
+        "directory-relative workflow pinning is unavailable on this platform",
+    )
+    def test_workflow_snapshot_closes_its_owned_directory_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root)
+            directory = root / ".github/workflows"
+            real_open = os.open
+            directory_fds: list[int] = []
+
+            def record_open(path, flags, *args, **kwargs):
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if os.fspath(path) == os.fspath(directory):
+                    directory_fds.append(descriptor)
+                return descriptor
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                workflow_snapshot(root)
+            self.assertGreaterEqual(
+                len(directory_fds),
+                1,
+                "workflow_snapshot must acquire an owned directory descriptor: "
+                f"directory={directory} descriptors={directory_fds!r}",
+            )
+            with self.assertRaises(OSError) as raised:
+                os.fstat(directory_fds[0])
+            self.assertEqual(
+                raised.exception.errno,
+                errno.EBADF,
+                "workflow_snapshot must close its owned directory descriptor on success: "
+                f"directory={directory} descriptor={directory_fds[0]}",
+            )
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):
