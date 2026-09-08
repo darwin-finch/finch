@@ -26,6 +26,12 @@ MAX_WORKFLOW_FILES = 64
 MAX_WORKFLOW_DIRECTORY_ENTRIES = 128
 MAX_MANIFEST_BYTES = 512 * 1024
 HASH_CHUNK_BYTES = 64 * 1024
+WORKFLOW_DIRECTORY_FD_SUPPORTED = (
+    os.name != "nt"
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+)
 
 
 class ContractError(Exception):
@@ -202,9 +208,17 @@ def json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def regular_file_metadata(path: Path, display: str, maximum: int) -> os.stat_result:
+def regular_file_metadata(
+    path: Path,
+    display: str,
+    maximum: int,
+    directory_fd: int | None = None,
+) -> os.stat_result:
     try:
-        metadata = path.lstat()
+        if directory_fd is None:
+            metadata = path.lstat()
+        else:
+            metadata = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
     except OSError as error:
         raise ContractError(f"{display}: file metadata could not be read: {error}") from error
     if stat.S_ISLNK(metadata.st_mode):
@@ -235,14 +249,18 @@ def open_regular_file(
     root: Path,
     maximum: int,
     before_open_hook: Callable[[Path], None] | None = None,
+    directory_fd: int | None = None,
 ) -> tuple[BinaryIO, os.stat_result, str]:
     display = path.relative_to(root).as_posix()
-    metadata = regular_file_metadata(path, display, maximum)
+    metadata = regular_file_metadata(path, display, maximum, directory_fd)
     if before_open_hook is not None:
         before_open_hook(path)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        if directory_fd is None:
+            descriptor = os.open(path, flags)
+        else:
+            descriptor = os.open(path.name, flags, dir_fd=directory_fd)
     except OSError as error:
         raise ContractError(
             f"{display}: regular file could not be opened safely: {error}"
@@ -323,9 +341,10 @@ def exact_digest(
     maximum: int,
     before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
+    directory_fd: int | None = None,
 ) -> tuple[str, int, int, FileIdentity]:
     _, digest, canonical_size, physical_size, identity = exact_workflow(
-        path, root, maximum, before_open_hook, after_open_hook
+        path, root, maximum, before_open_hook, after_open_hook, directory_fd
     )
     return digest, canonical_size, physical_size, identity
 
@@ -336,10 +355,11 @@ def exact_workflow(
     maximum: int,
     before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
+    directory_fd: int | None = None,
 ) -> tuple[bytes, str, int, int, FileIdentity]:
     """Read and hash one bounded regular workflow from the same opened inode."""
     stream, opened, display = open_regular_file(
-        path, root, maximum, before_open_hook
+        path, root, maximum, before_open_hook, directory_fd
     )
     with stream:
         if after_open_hook is not None:
@@ -366,10 +386,41 @@ def workflow_snapshot(
     post_scan_hook: Callable[[], None] | None = None,
 ) -> tuple[dict[str, bytes], dict[str, dict[str, Any]]]:
     """Capture bounded workflow bytes after complete directory and leaf validation."""
-    directory_identity, paths = workflow_paths(root, post_scan_hook)
+    directory_identity, paths, directory_fd = _workflow_paths(root, post_scan_hook)
+    try:
+        return _capture_workflow_snapshot(
+            root,
+            directory_identity,
+            paths,
+            directory_fd,
+            phase_hook,
+            after_hash_hook,
+            before_open_hook,
+            after_open_hook,
+            final_scan_hook,
+        )
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _capture_workflow_snapshot(
+    root: Path,
+    directory_identity: FileIdentity,
+    paths: list[Path],
+    directory_fd: int | None,
+    phase_hook: Callable[[], None] | None,
+    after_hash_hook: Callable[[], None] | None,
+    before_open_hook: Callable[[Path], None] | None,
+    after_open_hook: Callable[[Path], None] | None,
+    final_scan_hook: Callable[[], None] | None,
+) -> tuple[dict[str, bytes], dict[str, dict[str, Any]]]:
     metadata_by_path = {
         path: regular_file_metadata(
-            path, path.relative_to(root).as_posix(), MAX_WORKFLOW_BYTES
+            path,
+            path.relative_to(root).as_posix(),
+            MAX_WORKFLOW_BYTES,
+            directory_fd,
         )
         for path in paths
     }
@@ -386,19 +437,23 @@ def workflow_snapshot(
     opened_identities: dict[Path, FileIdentity] = {}
     opened_total_bytes = 0
     for path in paths:
-        contents, digest, canonical_size, physical_size, opened_identity = exact_workflow(
-            path,
-            root,
-            MAX_WORKFLOW_BYTES,
-            before_open_hook,
-            after_open_hook,
+        stream, opened, display = open_regular_file(
+            path, root, MAX_WORKFLOW_BYTES, before_open_hook, directory_fd
         )
-        opened_total_bytes += physical_size
-        if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
-            raise ContractError(
-                f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
-                f"the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
+        with stream:
+            if after_open_hook is not None:
+                after_open_hook(path)
+            opened_total_bytes += opened.st_size
+            if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
+                raise ContractError(
+                    f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes "
+                    f"exceeds the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound before "
+                    f"capturing {display}"
+                )
+            contents, digest, canonical_size = capture_canonical_workflow_stream(
+                stream, opened.st_size, display
             )
+        opened_identity = file_identity(opened)
         initial_identity = file_identity(metadata_by_path[path])
         if opened_identity != initial_identity:
             raise ContractError(
@@ -431,9 +486,30 @@ def workflow_snapshot(
     return ({path.name: contents_by_path[path] for path in paths}, records)
 
 
-def workflow_paths(
-    root: Path, post_scan_hook: Callable[[], None] | None = None
-) -> tuple[FileIdentity, list[Path]]:
+def bounded_workflow_names(entries: Any) -> list[str]:
+    """Pull workflow entry names only through the first rejected element."""
+    names: list[str] = []
+    entry_count = 0
+    for entry in entries:
+        entry_count += 1
+        if entry_count > MAX_WORKFLOW_DIRECTORY_ENTRIES:
+            raise ContractError(
+                f"{WORKFLOW_DIRECTORY}: directory entry count exceeds the reviewed "
+                f"{MAX_WORKFLOW_DIRECTORY_ENTRIES}-entry bound"
+            )
+        if not entry.name.endswith((".yml", ".yaml")):
+            continue
+        names.append(entry.name)
+        if len(names) > MAX_WORKFLOW_FILES:
+            raise ContractError(
+                f"{WORKFLOW_DIRECTORY}: workflow count exceeds the reviewed "
+                f"{MAX_WORKFLOW_FILES}-file bound"
+            )
+    return names
+
+
+def open_workflow_directory(root: Path) -> tuple[os.stat_result, int | None]:
+    """Open and identity-pin the workflow directory where CPython supports it."""
     directory = root / WORKFLOW_DIRECTORY
     try:
         directory_metadata = directory.lstat()
@@ -441,32 +517,58 @@ def workflow_paths(
         raise ContractError(f"{WORKFLOW_DIRECTORY}: directory metadata failed: {error}") from error
     if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode):
         raise ContractError(f"{WORKFLOW_DIRECTORY}: must be a real directory, not a link")
-    paths: list[Path] = []
-    entry_count = 0
+    if not WORKFLOW_DIRECTORY_FD_SUPPORTED:
+        return directory_metadata, None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                entry_count += 1
-                if entry_count > MAX_WORKFLOW_DIRECTORY_ENTRIES:
-                    raise ContractError(
-                        f"{WORKFLOW_DIRECTORY}: directory entry count exceeds the reviewed "
-                        f"{MAX_WORKFLOW_DIRECTORY_ENTRIES}-entry bound"
-                    )
-                if not entry.name.endswith((".yml", ".yaml")):
-                    continue
-                paths.append(directory / entry.name)
-                if len(paths) > MAX_WORKFLOW_FILES:
-                    raise ContractError(
-                        f"{WORKFLOW_DIRECTORY}: workflow count exceeds the reviewed "
-                        f"{MAX_WORKFLOW_FILES}-file bound"
-                    )
+        directory_fd = os.open(directory, flags)
+    except OSError as error:
+        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory open failed: {error}") from error
+    try:
+        opened_metadata = os.fstat(directory_fd)
+        if file_identity(opened_metadata) == file_identity(directory_metadata):
+            return opened_metadata, directory_fd
+    except OSError as error:
+        os.close(directory_fd)
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: opened directory metadata failed: {error}"
+        ) from error
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    os.close(directory_fd)
+    raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed before opening")
+
+
+def _workflow_paths(
+    root: Path, post_scan_hook: Callable[[], None] | None = None
+) -> tuple[FileIdentity, list[Path], int | None]:
+    directory = root / WORKFLOW_DIRECTORY
+    directory_metadata, directory_fd = open_workflow_directory(root)
+    try:
+        scan_target: Path | int = directory if directory_fd is None else directory_fd
+        with os.scandir(scan_target) as entries:
+            names = bounded_workflow_names(entries)
             if post_scan_hook is not None:
                 post_scan_hook()
+    except ContractError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise
     except OSError as error:
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise ContractError(f"{WORKFLOW_DIRECTORY}: enumeration failed: {error}") from error
+    except BaseException:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise
     try:
         post_scan_metadata = directory.lstat()
     except OSError as error:
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise ContractError(
             f"{WORKFLOW_DIRECTORY}: post-enumeration directory metadata failed: {error}"
         ) from error
@@ -474,15 +576,30 @@ def workflow_paths(
         stat.S_ISLNK(post_scan_metadata.st_mode)
         or not stat.S_ISDIR(post_scan_metadata.st_mode)
     ):
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise ContractError(f"{WORKFLOW_DIRECTORY}: must remain a real directory, not a link")
     if file_identity(post_scan_metadata) != file_identity(directory_metadata):
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise ContractError(
             f"{WORKFLOW_DIRECTORY}: directory identity changed during enumeration"
         )
-    paths.sort()
+    paths = sorted(directory / name for name in names)
     if not paths:
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise ContractError(f"{WORKFLOW_DIRECTORY}: no workflow documents were found")
-    return file_identity(post_scan_metadata), paths
+    return file_identity(post_scan_metadata), paths, directory_fd
+
+
+def workflow_paths(
+    root: Path, post_scan_hook: Callable[[], None] | None = None
+) -> tuple[FileIdentity, list[Path]]:
+    directory_identity, paths, directory_fd = _workflow_paths(root, post_scan_hook)
+    if directory_fd is not None:
+        os.close(directory_fd)
+    return directory_identity, paths
 
 
 def workflow_records(
