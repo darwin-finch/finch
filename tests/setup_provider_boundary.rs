@@ -12,12 +12,14 @@ use finch::config::{CredentialLifecycle, CredentialProvider, ProviderCredential,
 use finch::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 const FRAME_DEADLINE: Duration = Duration::from_secs(30);
 const EXIT_DEADLINE: Duration = Duration::from_secs(30);
+const SUPERVISOR_AUTHORITY_FDS: &[i32] = &[9, 10, 11, 12, 108, 109, 110, 111, 112];
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -183,7 +185,8 @@ impl Session {
         let slave_out = pty.slave.try_clone().expect("clone setup PTY stdout");
         let slave_err = pty.slave.try_clone().expect("clone setup PTY stderr");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+        command
             .arg("setup")
             .stdin(Stdio::from(slave_in))
             .stdout(Stdio::from(slave_out))
@@ -194,7 +197,6 @@ impl Session {
             .env("XDG_DATA_HOME", fixture.home.join(".local/share"))
             .env("HF_HOME", fixture.home.join(".cache/huggingface"))
             .env("TERM", "xterm-256color")
-            .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("GROK_API_KEY")
@@ -204,22 +206,23 @@ impl Session {
             .env_remove("MISTRAL_API_KEY")
             .env_remove("GROQ_API_KEY")
             .env_remove("SHAMMAH_DEBUG")
-            .env_remove("RUST_LOG")
-            .env_remove("FINCH_BRAIN_TEST_ISOLATED")
-            .env_remove("FINCH_BRAIN_TEST_TOKEN")
-            .env_remove("FINCH_BRAIN_TEST_PROOF_FD")
-            .env_remove("FINCH_BRAIN_TEST_PROOF_BACKUP_FD")
-            .env_remove("FINCH_BRAIN_TEST_AUTH_FD")
-            .env_remove("FINCH_BRAIN_TEST_HOME")
-            .env_remove("FINCH_BRAIN_TEST_ROOT")
-            .env_remove("FINCH_TEST_SUPERVISOR_PID")
-            .env_remove("FINCH_TEST_SUPERVISOR_BIN")
-            .env_remove("FINCH_TEST_IPC_SOCKET")
-            .env_remove("FINCH_TEST_SOCKET_ROOT")
-            .env_remove("FINCH_TEST_DAEMON_ADDR")
-            .env_remove("FINCH_TEST_BRAIN_ADDR")
-            .spawn()
-            .expect("spawn finch setup under a PTY");
+            .env_remove("RUST_LOG");
+        for (name, _) in std::env::vars_os() {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("FINCH_BRAIN_TEST_") || name_text.starts_with("FINCH_TEST_") {
+                command.env_remove(name);
+            }
+        }
+        command.env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1");
+        unsafe {
+            command.pre_exec(|| {
+                for fd in SUPERVISOR_AUTHORITY_FDS {
+                    nix::libc::close(*fd);
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn finch setup under a PTY");
         drop(pty.slave);
 
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -627,6 +630,12 @@ fn assert_exact_append(
 
 #[test]
 fn test_setup_provider_add_and_cancel_cross_render_apply_save_reload_boundary() {
+    if std::env::var_os("FINCH_BRAIN_TEST_ISOLATED").is_none() {
+        eprintln!("skipped: this real-TUI regression requires scripts/test_brains.sh");
+        return;
+    }
+    finch::brain::isolated_test_proof()
+        .expect("scripts/test_brains.sh must provide authenticated supervisor authority");
     // A sole configured subscription is the exact hostile shape that the old
     // provider-count heuristic mistook for an unconfigured placeholder.
     let fixture = Fixture::sole_subscription();
