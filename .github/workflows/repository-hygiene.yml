@@ -19,6 +19,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -26,3 +29,12 @@ jobs:
         run: python3 scripts/check_repository_hygiene.py
       - name: Run repository hygiene regressions
         run: python3 scripts/test_repository_hygiene.py
+      - name: Verify PR 513 exact-tip safe-open regressions
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONWARNINGS: "error::ResourceWarning"
+        run: |
+          test "$(git rev-parse HEAD^)" = "f92a2590b732b5fb4364600e4e5f45623cee4ab3"
+          python3 scripts/test_ci_workflow_manifest.py
+          python3 scripts/check_ci_workflow_manifest.py
