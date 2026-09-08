@@ -511,7 +511,8 @@ class WorkflowManifestTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(
                         ContractError,
-                        "must be a real directory, not a link|directory identity changed",
+                        "must be a real directory, not a link|directory identity changed|"
+                        "file identity changed after enumeration",
                         msg=(
                             "replacing the workflow parent after enumeration must reject "
                             "without capturing target bytes: "
