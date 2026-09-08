@@ -241,6 +241,40 @@ def open_path_descriptor(path: Path, display: str) -> int:
         ) from error
 
 
+def acquire_regular_file_descriptor(
+    path: Path,
+    root: Path,
+    maximum: int,
+    before_open_hook: Callable[[Path], None] | None = None,
+) -> tuple[int, os.stat_result, str]:
+    """Validate and transfer one caller-owned descriptor for a reviewed regular file."""
+    display = path.relative_to(root).as_posix()
+    initial = regular_file_metadata(path, display, maximum)
+    if before_open_hook is not None:
+        before_open_hook(path)
+    descriptor = open_path_descriptor(path, display)
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = file_identity(opened)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ContractError(
+                f"{display}: path={path} opened descriptor is not a regular file; "
+                f"opened_mode={stat.filemode(opened.st_mode)!r} "
+                f"opened_identity={opened_identity!r}"
+            )
+        initial_identity = file_identity(initial)
+        if opened_identity != initial_identity:
+            raise ContractError(
+                f"{display}: path={path} file identity changed during descriptor "
+                f"acquisition; initial_identity={initial_identity!r} "
+                f"opened_identity={opened_identity!r}"
+            )
+        return descriptor, opened, display
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def open_regular_file(
     path: Path,
     root: Path,
