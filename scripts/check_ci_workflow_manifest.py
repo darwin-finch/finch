@@ -518,7 +518,10 @@ def open_workflow_directory(root: Path) -> tuple[os.stat_result, int | None]:
     if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode):
         raise ContractError(f"{WORKFLOW_DIRECTORY}: must be a real directory, not a link")
     if not WORKFLOW_DIRECTORY_FD_SUPPORTED:
-        return directory_metadata, None
+        raise ContractError(
+            f"{WORKFLOW_DIRECTORY}: this platform cannot identity-pin the workflow "
+            "directory; refusing an unsafe pathname-based snapshot"
+        )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:

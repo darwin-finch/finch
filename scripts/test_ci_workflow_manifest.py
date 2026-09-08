@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -30,6 +31,7 @@ from check_ci_workflow_manifest import (
     hash_canonical_workflow_stream,
     read_exact_bytes,
     repository_snapshot,
+    workflow_snapshot,
     workflow_records,
 )
 
@@ -50,7 +52,7 @@ class WorkflowRepository:
                 (workflows / name).write_bytes(contents)
             (self.root / "scripts").mkdir()
             self.manifest_path().write_bytes(snapshot.manifest_bytes)
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -350,10 +352,8 @@ class WorkflowManifestTests(unittest.TestCase):
         try:
             root = Path(temporary.name)
             self.write_snapshot_source(root)
-            target = root / "tiny-nonworkflow-target.txt"
-            target.write_bytes(b"sentinel\n")
             link = root / ".github/workflows/ignored.txt"
-            link.symlink_to(target)
+            link.symlink_to(link.name)
 
             recorder.start()
             try:
@@ -370,9 +370,10 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_open_names_absent(
                 recorder,
                 root,
-                (".github/workflows/ignored.txt", "tiny-nonworkflow-target.txt"),
+                (".github/workflows/ignored.txt",),
                 "the source snapshot must filter an ignored non-workflow link lexically "
-                f"before open and never read its target; link={link} target={target}",
+                "before content or target-metadata access; the self-referential target "
+                f"makes any metadata dereference fail actionably: link={link}",
             )
         finally:
             recorder.stop()
@@ -386,9 +387,7 @@ class WorkflowManifestTests(unittest.TestCase):
             self.write_snapshot_source(root)
             manifest = root / "scripts/ci_workflow_manifest.json"
             manifest.unlink()
-            target = root / "tiny-valid-manifest.json"
-            target.write_bytes(b"{}\n")
-            manifest.symlink_to(target)
+            manifest.symlink_to(manifest.name)
 
             recorder.start()
             try:
@@ -397,7 +396,8 @@ class WorkflowManifestTests(unittest.TestCase):
                     "must be a regular file, not a symbolic link",
                     msg=(
                         "the source snapshot must reject a manifest link before opening its "
-                        f"tiny valid target: manifest={manifest} target={target}"
+                        "target or following target metadata; the self-referential target "
+                        f"makes metadata dereference observable: manifest={manifest}"
                     ),
                 ):
                     repository_snapshot(root)
@@ -407,9 +407,9 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_open_names_absent(
                 recorder,
                 root,
-                ("scripts/ci_workflow_manifest.json", "tiny-valid-manifest.json"),
+                ("scripts/ci_workflow_manifest.json",),
                 "manifest lstat rejection must occur before any absolute or "
-                f"directory-relative open; manifest={manifest} target={target}",
+                f"directory-relative open or target metadata access; manifest={manifest}",
             )
         finally:
             recorder.stop()
@@ -421,9 +421,7 @@ class WorkflowManifestTests(unittest.TestCase):
             self.write_snapshot_source(root)
             workflow = root / ".github/workflows/synthetic.yml"
             workflow.unlink()
-            target = root / "tiny-workflow-target.yml"
-            target.write_bytes(b"name: forbidden target\n")
-            workflow.symlink_to(target)
+            workflow.symlink_to(workflow.name)
             recorder = OpenAuditRecorder()
             recorder.start()
             try:
@@ -432,7 +430,8 @@ class WorkflowManifestTests(unittest.TestCase):
                     "must be a regular file, not a symbolic link",
                     msg=(
                         "the source snapshot must reject a workflow link before opening its "
-                        f"target: workflow={workflow} target={target}"
+                        "target or following target metadata; the self-referential target "
+                        f"makes metadata dereference observable: workflow={workflow}"
                     ),
                 ):
                     repository_snapshot(root)
@@ -441,8 +440,9 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_open_names_absent(
                 recorder,
                 root,
-                (".github/workflows/synthetic.yml", "tiny-workflow-target.yml"),
-                "workflow metadata rejection must precede any link or target open",
+                (".github/workflows/synthetic.yml",),
+                "workflow metadata rejection must precede any link open or target "
+                f"metadata access: workflow={workflow}",
             )
 
     def test_source_snapshot_rejects_workflow_directory_link_without_target_open(self) -> None:
@@ -450,9 +450,8 @@ class WorkflowManifestTests(unittest.TestCase):
             root = Path(name)
             self.write_snapshot_source(root)
             directory = root / ".github/workflows"
-            target = root / "tiny-workflow-directory-target"
-            directory.rename(target)
-            directory.symlink_to(target)
+            shutil.rmtree(directory)
+            directory.symlink_to(directory.name)
             recorder = OpenAuditRecorder()
             recorder.start()
             try:
@@ -461,7 +460,8 @@ class WorkflowManifestTests(unittest.TestCase):
                     "must be a real directory, not a link",
                     msg=(
                         "the source snapshot must reject a workflow-directory link before "
-                        f"opening its target: directory={directory} target={target}"
+                        "opening it or following target metadata; the self-referential target "
+                        f"makes metadata dereference observable: directory={directory}"
                     ),
                 ):
                     repository_snapshot(root)
@@ -470,8 +470,9 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_open_names_absent(
                 recorder,
                 root,
-                (".github/workflows", "tiny-workflow-directory-target"),
-                "workflow-directory lstat rejection must precede any target open",
+                (".github/workflows",),
+                "workflow-directory lstat rejection must precede any target open or "
+                f"metadata access: directory={directory}",
             )
 
     @unittest.skipUnless(
@@ -542,20 +543,81 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"opens={recorder.paths!r} directory={directory}",
             )
 
-    def test_snapshot_path_fallback_preserves_workflow_bytes(self) -> None:
+    @unittest.skipUnless(
+        WORKFLOW_DIRECTORY_FD_SUPPORTED,
+        "directory-relative workflow pinning is unavailable on this platform",
+    )
+    def test_successful_workflow_snapshot_closes_owned_directory_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_snapshot_source(root)
+            directory = root / ".github/workflows"
+            real_open = os.open
+            directory_fds: list[int] = []
+
+            def record_directory_open(path, flags, *args, **kwargs):
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if os.fspath(path) == os.fspath(directory):
+                    directory_fds.append(descriptor)
+                return descriptor
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_directory_open
+            ):
+                workflow_snapshot(root)
+
+            self.assertGreaterEqual(
+                len(directory_fds),
+                1,
+                "a successful workflow snapshot must acquire an owned directory descriptor: "
+                f"directory={directory} descriptors={directory_fds!r}",
+            )
+            descriptor = directory_fds[0]
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(
+                raised.exception.errno,
+                errno.EBADF,
+                "workflow_snapshot must close its owned directory descriptor on success: "
+                f"directory={directory} descriptor={descriptor} error={raised.exception!r}",
+            )
+
+    def test_snapshot_without_directory_fd_fails_before_source_enumeration(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             contents = b"name: fallback workflow\n"
             self.write_snapshot_source(root, {"synthetic.yml": contents})
-            with mock.patch(
-                "check_ci_workflow_manifest.WORKFLOW_DIRECTORY_FD_SUPPORTED", False
-            ):
-                snapshot = repository_snapshot(root)
-            self.assertEqual(
-                snapshot.workflow_bytes,
-                {"synthetic.yml": contents},
-                "platforms without directory-relative opens must retain the supported "
-                f"path-based snapshot behavior: root={root} snapshot={snapshot!r}",
+            recorder = OpenAuditRecorder()
+            recorder.start()
+            try:
+                with mock.patch(
+                    "check_ci_workflow_manifest.WORKFLOW_DIRECTORY_FD_SUPPORTED", False
+                ), mock.patch(
+                    "check_ci_workflow_manifest.os.scandir",
+                    side_effect=AssertionError(
+                        "unsupported snapshot enumerated workflow source children"
+                    ),
+                ) as scandir:
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "cannot identity-pin the workflow directory.*refusing an unsafe "
+                        "pathname-based snapshot",
+                        msg=(
+                            "platforms without directory-relative descriptor pinning must "
+                            "fail closed before enumerating or opening workflow children: "
+                            f"root={root}"
+                        ),
+                    ):
+                        repository_snapshot(root)
+                scandir.assert_not_called()
+            finally:
+                recorder.stop()
+            self.assert_open_names_absent(
+                recorder,
+                root,
+                (".github/workflows/synthetic.yml",),
+                "unsupported platforms must not open or read a source workflow leaf before "
+                f"the fail-closed diagnostic: root={root}",
             )
 
     def test_opened_aggregate_bound_precedes_over_budget_leaf_capture(self) -> None:
@@ -800,6 +862,49 @@ class WorkflowManifestTests(unittest.TestCase):
                 "WorkflowRepository must remove its partially materialized tree before "
                 "propagating the write failure, even while traceback retains constructor "
                 f"locals: allocated_root={allocated_root} error={retained_error!r}",
+            )
+
+    def test_materialization_interrupt_removes_allocated_tree_with_traceback_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            source_root = Path(name)
+            self.write_snapshot_source(source_root)
+            attempted_paths: list[Path] = []
+
+            def interrupt_write(path: Path, contents: bytes) -> int:
+                attempted_paths.append(path)
+                raise KeyboardInterrupt("injected fixture materialization interruption")
+
+            retained_interrupt: KeyboardInterrupt | None = None
+            with mock.patch.object(
+                Path, "write_bytes", autospec=True, side_effect=interrupt_write
+            ):
+                try:
+                    WorkflowRepository(source_root)
+                except KeyboardInterrupt as error:
+                    retained_interrupt = error
+            self.assertIsNotNone(
+                retained_interrupt,
+                "materialization interruption injection must retain KeyboardInterrupt",
+            )
+            self.assertIsNotNone(
+                retained_interrupt.__traceback__
+                if retained_interrupt is not None
+                else None,
+                "materialization interruption must retain its traceback while cleanup is "
+                f"checked: error={retained_interrupt!r}",
+            )
+            self.assertEqual(
+                len(attempted_paths),
+                1,
+                "KeyboardInterrupt injection must stop at the first fixture write: "
+                f"attempted_paths={attempted_paths!r}",
+            )
+            allocated_root = attempted_paths[0].parents[2]
+            self.assertFalse(
+                allocated_root.exists(),
+                "WorkflowRepository must remove its partially materialized tree before "
+                "re-raising KeyboardInterrupt, even while its traceback retains constructor "
+                f"locals: allocated_root={allocated_root} error={retained_interrupt!r}",
             )
 
     def test_audit_recorder_fails_when_existing_hook_vetoes_installation(self) -> None:
