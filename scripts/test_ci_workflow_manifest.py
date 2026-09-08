@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from check_ci_workflow_manifest import (
     ContractError,
@@ -24,6 +25,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_FILES,
     compare_contract,
     hash_canonical_workflow_stream,
+    open_path_descriptor,
     read_exact_bytes,
     workflow_records,
 )
@@ -79,6 +81,157 @@ class WorkflowRepository:
 
 
 class WorkflowManifestTests(unittest.TestCase):
+    def test_path_descriptor_open_uses_exact_read_only_safety_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "reviewed.bin"
+            path.write_bytes(b"reviewed")
+            observed: list[tuple[Path, int]] = []
+            real_open = os.open
+
+            def record_open(opened_path, flags, *args, **kwargs):
+                observed.append((Path(opened_path), flags))
+                return real_open(opened_path, flags, *args, **kwargs)
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                descriptor = open_path_descriptor(path, "reviewed.bin")
+            os.close(descriptor)
+            expected = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+            )
+            self.assertEqual(
+                observed,
+                [(path, expected)],
+                "pathname acquisition must make one os.open call with the exact "
+                "read-only, no-follow, nonblocking mask: "
+                f"path={path} observed={observed!r} expected_flags={expected:#x}",
+            )
+            self.assertEqual(
+                expected & os.O_ACCMODE,
+                os.O_RDONLY,
+                "reviewed pathname acquisition must not expand access to writing: "
+                f"path={path} flags={expected:#x} access={expected & os.O_ACCMODE:#x}",
+            )
+
+    def test_path_descriptor_open_rejects_same_inode_symlink_with_os_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            path = root / "reviewed.bin"
+            path.write_bytes(b"reviewed")
+            target = root / "reviewed-target.bin"
+            path.rename(target)
+            path.symlink_to(target.name)
+            display = "manifest-contract"
+            with self.assertRaises(
+                ContractError,
+                msg=(
+                    "O_NOFOLLOW must reject a pathname changed to a same-inode symlink: "
+                    f"display={display} path={path} target={target} "
+                    f"target_inode={target.stat().st_ino}"
+                ),
+            ) as raised:
+                open_path_descriptor(path, display)
+            diagnostic = str(raised.exception)
+            self.assertIn(
+                display,
+                diagnostic,
+                "symlink rejection must identify the reviewed display name: "
+                f"display={display} path={path} diagnostic={diagnostic!r}",
+            )
+            self.assertIn(
+                str(path),
+                diagnostic,
+                "symlink rejection must include the exact source path: "
+                f"display={display} path={path} diagnostic={diagnostic!r}",
+            )
+            for invariant in ("read-only", "no-follow", "nonblocking"):
+                with self.subTest(invariant=invariant):
+                    self.assertIn(
+                        invariant,
+                        diagnostic,
+                        "symlink rejection must name every enforced open invariant: "
+                        f"display={display} path={path} invariant={invariant!r} "
+                        f"diagnostic={diagnostic!r}",
+                    )
+            self.assertIsInstance(
+                raised.exception.__cause__,
+                OSError,
+                "symlink rejection must retain the underlying OSError as its cause: "
+                f"display={display} path={path} cause={raised.exception.__cause__!r}",
+            )
+            self.assertIn(
+                os.strerror(raised.exception.__cause__.errno),
+                diagnostic,
+                "symlink rejection must preserve the underlying OS error detail: "
+                f"display={display} path={path} cause={raised.exception.__cause__!r} "
+                f"diagnostic={diagnostic!r}",
+            )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO open requires os.mkfifo")
+    def test_path_descriptor_open_fifo_returns_promptly_and_is_caller_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "reviewed.fifo"
+            os.mkfifo(path)
+            program = (
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "from check_ci_workflow_manifest import open_path_descriptor\n"
+                "path = Path(sys.argv[1])\n"
+                "fd = open_path_descriptor(path, 'reviewed.fifo')\n"
+                "os.fstat(fd)\n"
+                "os.close(fd)\n"
+                "raise SystemExit(0)\n"
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", program, str(path)],
+                    cwd=ROOT / "scripts",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    "O_NONBLOCK must make FIFO pathname acquisition return promptly: "
+                    f"path={path} timeout=2 error={error!r}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                "FIFO descriptor must return promptly and remain caller-closeable: "
+                f"path={path} stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+
+    def test_path_descriptor_open_fails_before_open_without_required_flags(self) -> None:
+        path = Path("/bounded/fixture/reviewed.bin")
+        for flag_name in ("O_NOFOLLOW", "O_NONBLOCK"):
+            with self.subTest(flag=flag_name):
+                original = getattr(os, flag_name)
+                delattr(os, flag_name)
+                try:
+                    with mock.patch(
+                        "check_ci_workflow_manifest.os.open",
+                        side_effect=AssertionError(f"os.open called without {flag_name}"),
+                    ) as opened:
+                        with self.assertRaisesRegex(
+                            ContractError,
+                            rf"reviewed\.bin: {flag_name} is unavailable; refusing to open "
+                            rf"path={path}",
+                            msg=(
+                                "missing safety capability must fail closed before os.open: "
+                                f"display=reviewed.bin path={path} flag={flag_name}"
+                            ),
+                        ):
+                            open_path_descriptor(path, "reviewed.bin")
+                        opened.assert_not_called()
+                finally:
+                    setattr(os, flag_name, original)
+
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
         self.assertEqual(
