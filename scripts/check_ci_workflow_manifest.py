@@ -224,12 +224,19 @@ def open_regular_file(
     root: Path,
     maximum: int,
     before_open_hook: Callable[[Path], None] | None = None,
+    buffering: int = -1,
 ) -> tuple[BinaryIO, os.stat_result, str]:
     display = path.relative_to(root).as_posix()
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ContractError(
+            f"{display}: this platform cannot open files without following symbolic "
+            "links because O_NOFOLLOW is unavailable; refusing unsafe capture"
+        )
     metadata = regular_file_metadata(path, display, maximum)
     if before_open_hook is not None:
         before_open_hook(path)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -242,7 +249,7 @@ def open_regular_file(
             raise ContractError(f"{display}: opened path is not a regular file")
         if file_identity(opened) != file_identity(metadata):
             raise ContractError(f"{display}: file identity changed before reading")
-        return os.fdopen(descriptor, "rb"), opened, display
+        return os.fdopen(descriptor, "rb", buffering=buffering), opened, display
     except Exception:
         os.close(descriptor)
         raise
@@ -448,15 +455,28 @@ def manifest_snapshot(
     display = MANIFEST_PATH.as_posix()
     try:
         stream, metadata, display = open_regular_file(
-            path, root, MAX_MANIFEST_BYTES, before_open_hook
+            path, root, MAX_MANIFEST_BYTES, before_open_hook, buffering=0
         )
         with stream:
             if after_open_hook is not None:
                 after_open_hook(path)
             contents = read_exact_bytes(stream, metadata.st_size, display)
-        manifest = json.loads(contents.decode("utf-8"), object_pairs_hook=json_object)
     except (
         OSError,
+        ContractError,
+    ) as error:
+        raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
+    final_metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    opened_identity = file_identity(metadata)
+    live_identity = file_identity(final_metadata)
+    if live_identity != opened_identity:
+        raise ContractError(
+            f"{display}: file identity changed while capturing manifest; "
+            f"opened_identity={opened_identity!r} live_identity={live_identity!r}"
+        )
+    try:
+        manifest = json.loads(contents.decode("utf-8"), object_pairs_hook=json_object)
+    except (
         UnicodeError,
         ValueError,
         json.JSONDecodeError,
@@ -466,14 +486,6 @@ def manifest_snapshot(
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
-    final_metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
-    opened_identity = file_identity(metadata)
-    live_identity = file_identity(final_metadata)
-    if live_identity != opened_identity:
-        raise ContractError(
-            f"{display}: file identity changed while capturing manifest; "
-            f"opened_identity={opened_identity!r} live_identity={live_identity!r}"
-        )
     return contents, manifest, opened_identity
 
 

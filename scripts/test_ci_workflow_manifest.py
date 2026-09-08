@@ -259,6 +259,99 @@ class WorkflowManifestTests(unittest.TestCase):
             ):
                 manifest_snapshot(root, after_open_hook=replace_manifest)
 
+    def test_manifest_snapshot_reports_replacement_before_malformed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"{malformed captured content")
+            replacement = manifest.with_name("manifest-valid-replacement.json")
+            replacement.write_bytes(b'{"source":"replacement"}\n')
+            opened_inode = manifest.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+
+            def replace_manifest(_opened_path: Path) -> None:
+                os.replace(replacement, manifest)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                rf"opened_identity=.*{opened_inode}.*live_identity=.*{replacement_inode}",
+                msg=(
+                    "live-path replacement must take diagnostic precedence over malformed "
+                    "captured JSON and report both identities: "
+                    f"manifest={manifest} opened_inode={opened_inode} "
+                    f"replacement_inode={replacement_inode}"
+                ),
+            ):
+                manifest_snapshot(root, after_open_hook=replace_manifest)
+
+    def test_manifest_snapshot_physically_pulls_only_first_excess_byte(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            initial = b"{}\n"
+            manifest = self.write_manifest_source(root, initial)
+            real_fdopen = os.fdopen
+            duplicate_fds: list[int] = []
+            buffering_values: list[int] = []
+
+            def retain_shared_offset(descriptor: int, *args, **kwargs):
+                duplicate_fds.append(os.dup(descriptor))
+                buffering_values.append(kwargs.get("buffering", -1))
+                return real_fdopen(descriptor, *args, **kwargs)
+
+            def grow_after_open(opened_path: Path) -> None:
+                with opened_path.open("ab") as stream:
+                    stream.write(b"x" * 8192)
+
+            try:
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.fdopen",
+                    side_effect=retain_shared_offset,
+                ):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "file size changed while reading; expected=3 actual=4",
+                        msg=(
+                            "a grown manifest must inspect only the exact expected bytes plus "
+                            f"one first-excess byte: manifest={manifest} initial={len(initial)}"
+                        ),
+                    ):
+                        manifest_snapshot(root, after_open_hook=grow_after_open)
+                self.assertEqual(
+                    buffering_values,
+                    [0],
+                    "manifest capture must request an unbuffered descriptor stream: "
+                    f"manifest={manifest} buffering={buffering_values!r}",
+                )
+                offset = os.lseek(duplicate_fds[0], 0, os.SEEK_CUR)
+                self.assertEqual(
+                    offset,
+                    len(initial) + 1,
+                    "the shared raw file description must advance by exactly expected_size "
+                    "plus one, with no buffered physical prefetch: "
+                    f"manifest={manifest} offset={offset} expected={len(initial) + 1}",
+                )
+            finally:
+                for descriptor in duplicate_fds:
+                    os.close(descriptor)
+
+    def test_manifest_snapshot_fails_closed_without_nofollow(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"{}\n")
+            with mock.patch.object(os, "O_NOFOLLOW", None), mock.patch(
+                "check_ci_workflow_manifest.os.open",
+                side_effect=AssertionError("manifest opened without O_NOFOLLOW"),
+            ) as opened:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "O_NOFOLLOW is unavailable; refusing unsafe capture",
+                    msg=(
+                        "manifest capture must fail closed before open when no-follow support "
+                        f"is unavailable: manifest={manifest}"
+                    ),
+                ):
+                    manifest_snapshot(root)
+            opened.assert_not_called()
+
     def test_manifest_snapshot_closes_owned_stream_on_success_and_failure(self) -> None:
         for outcome in ("success", "short-read failure"):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as name:
