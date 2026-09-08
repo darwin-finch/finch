@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from check_ci_workflow_manifest import (
     ContractError,
@@ -24,6 +26,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_FILES,
     compare_contract,
     hash_canonical_workflow_stream,
+    manifest_snapshot,
     read_exact_bytes,
     workflow_records,
 )
@@ -79,6 +82,13 @@ class WorkflowRepository:
 
 
 class WorkflowManifestTests(unittest.TestCase):
+    def write_manifest_source(self, root: Path, contents: bytes) -> Path:
+        scripts = root / "scripts"
+        scripts.mkdir()
+        manifest = scripts / "ci_workflow_manifest.json"
+        manifest.write_bytes(contents)
+        return manifest
+
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
         self.assertEqual(
@@ -150,6 +160,159 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_manifest_snapshot_accepts_exact_limit_and_rejects_first_excess(self) -> None:
+        prefix = b'{"padding":"'
+        suffix = b'"}'
+        exact = prefix + b"x" * (MAX_MANIFEST_BYTES - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(
+            len(exact),
+            MAX_MANIFEST_BYTES,
+            "exact-limit manifest fixture must be exactly the reviewed byte bound: "
+            f"actual={len(exact)} expected={MAX_MANIFEST_BYTES}",
+        )
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_manifest_source(root, exact)
+            raw, parsed, _ = manifest_snapshot(root)
+            self.assertEqual(
+                raw,
+                exact,
+                "manifest_snapshot must accept and preserve a valid manifest exactly at "
+                f"the reviewed bound: size={len(exact)}",
+            )
+            self.assertEqual(
+                len(parsed["padding"]),
+                MAX_MANIFEST_BYTES - len(prefix) - len(suffix),
+                "the exact-limit manifest must parse without truncation: "
+                f"size={len(exact)} parsed_padding={len(parsed['padding'])}",
+            )
+
+        first_excess = prefix + b"x" * (
+            MAX_MANIFEST_BYTES + 1 - len(prefix) - len(suffix)
+        ) + suffix
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, first_excess)
+            with mock.patch(
+                "check_ci_workflow_manifest.json.loads",
+                side_effect=AssertionError("oversized manifest reached JSON loading"),
+            ) as loads:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    rf"{MAX_MANIFEST_BYTES + 1} bytes exceeds the reviewed "
+                    rf"{MAX_MANIFEST_BYTES}-byte bound",
+                    msg=(
+                        "manifest_snapshot must reject the first excess byte before JSON "
+                        f"loading: manifest={manifest} size={len(first_excess)}"
+                    ),
+                ):
+                    manifest_snapshot(root)
+            loads.assert_not_called()
+
+    def test_manifest_snapshot_preserves_exact_raw_and_parsed_content(self) -> None:
+        contents = b'{"name":"fixture","enabled":true}\n'
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            self.write_manifest_source(root, contents)
+            raw, parsed, identity = manifest_snapshot(root)
+            self.assertEqual(
+                raw,
+                contents,
+                "manifest_snapshot must preserve exact raw manifest bytes: "
+                f"expected={contents!r} actual={raw!r}",
+            )
+            self.assertEqual(
+                parsed,
+                {"name": "fixture", "enabled": True},
+                "manifest_snapshot must parse the same captured bytes: "
+                f"raw={raw!r} parsed={parsed!r} identity={identity!r}",
+            )
+
+    def test_manifest_snapshot_rejects_distinct_replacement_after_open(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b'{"source":"opened"}\n')
+            replacement = manifest.with_name("manifest-replacement.json")
+            replacement.write_bytes(b'{"source":"replacement"}\n')
+            opened_inode = manifest.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+
+            def replace_manifest(opened_path: Path) -> None:
+                self.assertEqual(
+                    opened_path,
+                    manifest,
+                    "replacement hook must target the opened manifest pathname: "
+                    f"opened={opened_path} expected={manifest}",
+                )
+                os.replace(replacement, manifest)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                rf"opened_identity=.*{opened_inode}.*live_identity=.*{replacement_inode}",
+                msg=(
+                    "manifest_snapshot must reject a distinct live pathname after reading "
+                    "the originally opened descriptor and report both identities: "
+                    f"manifest={manifest} opened_inode={opened_inode} "
+                    f"replacement_inode={replacement_inode}"
+                ),
+            ):
+                manifest_snapshot(root, after_open_hook=replace_manifest)
+
+    def test_manifest_snapshot_closes_owned_stream_on_success_and_failure(self) -> None:
+        for outcome in ("success", "short-read failure"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                contents = b'{"source":"fixture"}\n'
+                manifest = self.write_manifest_source(root, contents)
+                real_fdopen = os.fdopen
+                streams = []
+                descriptors: list[int] = []
+
+                def record_fdopen(descriptor: int, *args, **kwargs):
+                    descriptors.append(descriptor)
+                    stream = real_fdopen(descriptor, *args, **kwargs)
+                    streams.append(stream)
+                    return stream
+
+                def truncate_after_open(opened_path: Path) -> None:
+                    opened_path.write_bytes(b"{}\n")
+
+                hook = truncate_after_open if outcome == "short-read failure" else None
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.fdopen", side_effect=record_fdopen
+                ):
+                    if hook is None:
+                        manifest_snapshot(root)
+                    else:
+                        with self.assertRaisesRegex(
+                            ContractError,
+                            "file size changed while reading",
+                            msg=(
+                                "supported post-open short read must exercise stream cleanup: "
+                                f"manifest={manifest} initial_size={len(contents)}"
+                            ),
+                        ):
+                            manifest_snapshot(root, after_open_hook=hook)
+                self.assertEqual(
+                    len(streams),
+                    1,
+                    "manifest_snapshot must own exactly one opened stream per capture: "
+                    f"outcome={outcome} streams={streams!r} descriptors={descriptors!r}",
+                )
+                self.assertTrue(
+                    streams[0].closed,
+                    "manifest_snapshot must close its owned stream deterministically: "
+                    f"outcome={outcome} descriptor={descriptors[0]}",
+                )
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptors[0])
+                self.assertEqual(
+                    raised.exception.errno,
+                    errno.EBADF,
+                    "manifest_snapshot must close the underlying descriptor on every "
+                    f"supported outcome: outcome={outcome} descriptor={descriptors[0]}",
+                )
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):

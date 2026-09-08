@@ -438,11 +438,12 @@ def workflow_records(
     return records
 
 
-def load_manifest(
+def manifest_snapshot(
     root: Path,
     before_open_hook: Callable[[Path], None] | None = None,
     after_open_hook: Callable[[Path], None] | None = None,
-) -> tuple[dict[str, Any], FileIdentity]:
+) -> tuple[bytes, dict[str, Any], FileIdentity]:
+    """Capture one bounded manifest's raw and parsed bytes from one validated inode."""
     path = root / MANIFEST_PATH
     display = MANIFEST_PATH.as_posix()
     try:
@@ -452,8 +453,8 @@ def load_manifest(
         with stream:
             if after_open_hook is not None:
                 after_open_hook(path)
-            contents = read_exact_bytes(stream, metadata.st_size, display).decode("utf-8")
-        manifest = json.loads(contents, object_pairs_hook=json_object)
+            contents = read_exact_bytes(stream, metadata.st_size, display)
+        manifest = json.loads(contents.decode("utf-8"), object_pairs_hook=json_object)
     except (
         OSError,
         UnicodeError,
@@ -465,7 +466,24 @@ def load_manifest(
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
-    return manifest, file_identity(metadata)
+    final_metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    opened_identity = file_identity(metadata)
+    live_identity = file_identity(final_metadata)
+    if live_identity != opened_identity:
+        raise ContractError(
+            f"{display}: file identity changed while capturing manifest; "
+            f"opened_identity={opened_identity!r} live_identity={live_identity!r}"
+        )
+    return contents, manifest, opened_identity
+
+
+def load_manifest(
+    root: Path,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
+) -> tuple[dict[str, Any], FileIdentity]:
+    _, manifest, identity = manifest_snapshot(root, before_open_hook, after_open_hook)
+    return manifest, identity
 
 
 def revalidate_manifest(root: Path, initial_identity: FileIdentity) -> None:
