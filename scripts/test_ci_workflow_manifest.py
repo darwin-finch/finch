@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from check_ci_workflow_manifest import (
     ContractError,
@@ -24,6 +26,7 @@ from check_ci_workflow_manifest import (
     MAX_WORKFLOW_FILES,
     compare_contract,
     hash_canonical_workflow_stream,
+    manifest_bytes_snapshot,
     read_exact_bytes,
     workflow_records,
 )
@@ -79,6 +82,13 @@ class WorkflowRepository:
 
 
 class WorkflowManifestTests(unittest.TestCase):
+    def write_manifest_source(self, root: Path, contents: bytes) -> Path:
+        scripts = root / "scripts"
+        scripts.mkdir()
+        manifest = scripts / "ci_workflow_manifest.json"
+        manifest.write_bytes(contents)
+        return manifest
+
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
         self.assertEqual(
@@ -150,6 +160,194 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_accepted(repository)
         finally:
             repository.close()
+
+    def test_manifest_bytes_snapshot_accepts_exact_limit(self) -> None:
+        contents = b"x" * MAX_MANIFEST_BYTES
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, contents)
+            captured, identity = manifest_bytes_snapshot(root)
+            self.assertEqual(
+                captured,
+                contents,
+                "raw manifest capture must accept exactly MAX_MANIFEST_BYTES without "
+                f"truncation: manifest={manifest} size={len(contents)} identity={identity!r}",
+            )
+
+    def test_manifest_bytes_snapshot_rejects_first_excess_before_open(self) -> None:
+        contents = b"x" * (MAX_MANIFEST_BYTES + 1)
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, contents)
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open",
+                side_effect=AssertionError("oversized manifest reached descriptor open"),
+            ) as opened:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    rf"{MAX_MANIFEST_BYTES + 1} bytes exceeds the reviewed "
+                    rf"{MAX_MANIFEST_BYTES}-byte bound",
+                    msg=(
+                        "raw manifest capture must reject exactly the first excess byte "
+                        f"before opening or pulling content: manifest={manifest}"
+                    ),
+                ):
+                    manifest_bytes_snapshot(root)
+            opened.assert_not_called()
+
+    def test_manifest_bytes_snapshot_preserves_raw_bytes_exactly(self) -> None:
+        contents = b"\x00raw\r\nmanifest\xffbytes\n"
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, contents)
+            captured, identity = manifest_bytes_snapshot(root)
+            self.assertEqual(
+                captured,
+                contents,
+                "raw manifest capture must not decode, normalize, or parse bytes: "
+                f"manifest={manifest} expected={contents!r} actual={captured!r} "
+                f"identity={identity!r}",
+            )
+
+    def test_manifest_bytes_snapshot_physically_pulls_only_first_excess(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            initial = b"abc"
+            manifest = self.write_manifest_source(root, initial)
+            real_fdopen = os.fdopen
+            duplicate_fds: list[int] = []
+
+            def retain_shared_offset(descriptor: int, *args, **kwargs):
+                duplicate_fds.append(os.dup(descriptor))
+                return real_fdopen(descriptor, *args, **kwargs)
+
+            def grow_after_open(opened_path: Path) -> None:
+                with opened_path.open("ab") as stream:
+                    stream.write(b"x" * 8192)
+
+            try:
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.fdopen",
+                    side_effect=retain_shared_offset,
+                ):
+                    with self.assertRaisesRegex(
+                        ContractError,
+                        "file size changed while reading; expected=3 actual=4",
+                        msg=(
+                            "grown manifest capture must pull only expected_size plus one: "
+                            f"manifest={manifest} initial_size={len(initial)}"
+                        ),
+                    ):
+                        manifest_bytes_snapshot(root, after_open_hook=grow_after_open)
+                offset = os.lseek(duplicate_fds[0], 0, os.SEEK_CUR)
+                self.assertEqual(
+                    offset,
+                    len(initial) + 1,
+                    "unbuffered raw capture must not physically prefetch past the first "
+                    f"excess byte: manifest={manifest} offset={offset} "
+                    f"expected={len(initial) + 1}",
+                )
+            finally:
+                for descriptor in duplicate_fds:
+                    os.close(descriptor)
+
+    def test_manifest_bytes_snapshot_fails_closed_without_nofollow(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"raw")
+            with mock.patch.object(os, "O_NOFOLLOW", None), mock.patch(
+                "check_ci_workflow_manifest.os.open",
+                side_effect=AssertionError("manifest opened without O_NOFOLLOW"),
+            ) as opened:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "O_NOFOLLOW is unavailable; refusing unsafe capture",
+                    msg=(
+                        "raw manifest capture must fail closed before open without no-follow "
+                        f"support: manifest={manifest}"
+                    ),
+                ):
+                    manifest_bytes_snapshot(root)
+            opened.assert_not_called()
+
+    def test_manifest_bytes_snapshot_rejects_post_open_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"opened bytes")
+            replacement = manifest.with_name("manifest-replacement.json")
+            replacement.write_bytes(b"replacement")
+            opened_inode = manifest.stat().st_ino
+            replacement_inode = replacement.stat().st_ino
+
+            def replace_manifest(_opened_path: Path) -> None:
+                os.replace(replacement, manifest)
+
+            with self.assertRaisesRegex(
+                ContractError,
+                rf"opened_identity=.*{opened_inode}.*live_identity=.*{replacement_inode}",
+                msg=(
+                    "raw manifest capture must reject post-open pathname replacement and "
+                    "report both identities: "
+                    f"manifest={manifest} opened_inode={opened_inode} "
+                    f"replacement_inode={replacement_inode}"
+                ),
+            ):
+                manifest_bytes_snapshot(root, after_open_hook=replace_manifest)
+
+    def test_manifest_bytes_snapshot_closes_stream_on_success_and_failure(self) -> None:
+        for outcome in ("success", "growth failure"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                manifest = self.write_manifest_source(root, b"abc")
+                real_fdopen = os.fdopen
+                streams = []
+                descriptors: list[int] = []
+
+                def record_fdopen(descriptor: int, *args, **kwargs):
+                    descriptors.append(descriptor)
+                    stream = real_fdopen(descriptor, *args, **kwargs)
+                    streams.append(stream)
+                    return stream
+
+                def grow_after_open(opened_path: Path) -> None:
+                    with opened_path.open("ab") as stream:
+                        stream.write(b"x")
+
+                hook = grow_after_open if outcome == "growth failure" else None
+                with mock.patch(
+                    "check_ci_workflow_manifest.os.fdopen", side_effect=record_fdopen
+                ):
+                    if hook is None:
+                        manifest_bytes_snapshot(root)
+                    else:
+                        with self.assertRaisesRegex(
+                            ContractError,
+                            "file size changed while reading",
+                            msg=(
+                                "supported growth failure must exercise owned-stream cleanup: "
+                                f"manifest={manifest}"
+                            ),
+                        ):
+                            manifest_bytes_snapshot(root, after_open_hook=hook)
+                self.assertEqual(
+                    len(streams),
+                    1,
+                    "raw capture must own exactly one stream: "
+                    f"outcome={outcome} streams={streams!r} descriptors={descriptors!r}",
+                )
+                self.assertTrue(
+                    streams[0].closed,
+                    "raw capture must close its owned stream deterministically: "
+                    f"outcome={outcome} descriptor={descriptors[0]}",
+                )
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptors[0])
+                self.assertEqual(
+                    raised.exception.errno,
+                    errno.EBADF,
+                    "raw capture must close its underlying descriptor deterministically: "
+                    f"outcome={outcome} descriptor={descriptors[0]}",
+                )
 
     def test_workflow_yaml_checkouts_are_normalized_to_lf(self) -> None:
         for name in ("ci.yml", "synthetic.yaml"):

@@ -438,6 +438,55 @@ def workflow_records(
     return records
 
 
+def manifest_bytes_snapshot(
+    root: Path,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
+) -> tuple[bytes, FileIdentity]:
+    """Capture bounded raw manifest bytes and identity from one no-follow descriptor."""
+    path = root / MANIFEST_PATH
+    display = MANIFEST_PATH.as_posix()
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ContractError(
+            f"{display}: this platform cannot open files without following symbolic "
+            "links because O_NOFOLLOW is unavailable; refusing unsafe capture"
+        )
+    metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    if before_open_hook is not None:
+        before_open_hook(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ContractError(
+            f"{display}: regular file could not be opened safely: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ContractError(f"{display}: opened path is not a regular file")
+        if file_identity(opened) != file_identity(metadata):
+            raise ContractError(f"{display}: file identity changed before reading")
+        stream = os.fdopen(descriptor, "rb", buffering=0)
+    except Exception:
+        os.close(descriptor)
+        raise
+    with stream:
+        if after_open_hook is not None:
+            after_open_hook(path)
+        contents = read_exact_bytes(stream, opened.st_size, display)
+    final_metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    opened_identity = file_identity(opened)
+    live_identity = file_identity(final_metadata)
+    if live_identity != opened_identity:
+        raise ContractError(
+            f"{display}: file identity changed while capturing manifest bytes; "
+            f"opened_identity={opened_identity!r} live_identity={live_identity!r}"
+        )
+    return contents, opened_identity
+
+
 def load_manifest(
     root: Path,
     before_open_hook: Callable[[Path], None] | None = None,
