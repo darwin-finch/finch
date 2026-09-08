@@ -125,33 +125,49 @@ class WorkflowManifestTests(unittest.TestCase):
             target = root / "reviewed-target.bin"
             path.rename(target)
             path.symlink_to(target.name)
+            display = "manifest-contract"
             with self.assertRaises(
                 ContractError,
                 msg=(
                     "O_NOFOLLOW must reject a pathname changed to a same-inode symlink: "
-                    f"display=reviewed.bin path={path} target={target} "
+                    f"display={display} path={path} target={target} "
                     f"target_inode={target.stat().st_ino}"
                 ),
             ) as raised:
-                open_path_descriptor(path, "reviewed.bin")
+                open_path_descriptor(path, display)
             diagnostic = str(raised.exception)
             self.assertIn(
-                "reviewed.bin",
+                display,
                 diagnostic,
                 "symlink rejection must identify the reviewed display name: "
-                f"path={path} diagnostic={diagnostic!r}",
+                f"display={display} path={path} diagnostic={diagnostic!r}",
             )
             self.assertIn(
                 str(path),
                 diagnostic,
                 "symlink rejection must include the exact source path: "
-                f"path={path} diagnostic={diagnostic!r}",
+                f"display={display} path={path} diagnostic={diagnostic!r}",
+            )
+            for invariant in ("read-only", "no-follow", "nonblocking"):
+                with self.subTest(invariant=invariant):
+                    self.assertIn(
+                        invariant,
+                        diagnostic,
+                        "symlink rejection must name every enforced open invariant: "
+                        f"display={display} path={path} invariant={invariant!r} "
+                        f"diagnostic={diagnostic!r}",
+                    )
+            self.assertIsInstance(
+                raised.exception.__cause__,
+                OSError,
+                "symlink rejection must retain the underlying OSError as its cause: "
+                f"display={display} path={path} cause={raised.exception.__cause__!r}",
             )
             self.assertIn(
                 os.strerror(raised.exception.__cause__.errno),
                 diagnostic,
                 "symlink rejection must preserve the underlying OS error detail: "
-                f"path={path} cause={raised.exception.__cause__!r} "
+                f"display={display} path={path} cause={raised.exception.__cause__!r} "
                 f"diagnostic={diagnostic!r}",
             )
 
@@ -194,23 +210,27 @@ class WorkflowManifestTests(unittest.TestCase):
     def test_path_descriptor_open_fails_before_open_without_required_flags(self) -> None:
         path = Path("/bounded/fixture/reviewed.bin")
         for flag_name in ("O_NOFOLLOW", "O_NONBLOCK"):
-            with self.subTest(flag=flag_name), mock.patch.object(
-                os, flag_name, None
-            ), mock.patch(
-                "check_ci_workflow_manifest.os.open",
-                side_effect=AssertionError(f"os.open called without {flag_name}"),
-            ) as opened:
-                with self.assertRaisesRegex(
-                    ContractError,
-                    rf"reviewed\.bin: {flag_name} is unavailable; refusing to open "
-                    rf"path={path}",
-                    msg=(
-                        "missing safety capability must fail closed before os.open: "
-                        f"display=reviewed.bin path={path} flag={flag_name}"
-                    ),
-                ):
-                    open_path_descriptor(path, "reviewed.bin")
-                opened.assert_not_called()
+            with self.subTest(flag=flag_name):
+                original = getattr(os, flag_name)
+                delattr(os, flag_name)
+                try:
+                    with mock.patch(
+                        "check_ci_workflow_manifest.os.open",
+                        side_effect=AssertionError(f"os.open called without {flag_name}"),
+                    ) as opened:
+                        with self.assertRaisesRegex(
+                            ContractError,
+                            rf"reviewed\.bin: {flag_name} is unavailable; refusing to open "
+                            rf"path={path}",
+                            msg=(
+                                "missing safety capability must fail closed before os.open: "
+                                f"display=reviewed.bin path={path} flag={flag_name}"
+                            ),
+                        ):
+                            open_path_descriptor(path, "reviewed.bin")
+                        opened.assert_not_called()
+                finally:
+                    setattr(os, flag_name, original)
 
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
