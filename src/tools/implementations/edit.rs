@@ -181,22 +181,19 @@ fn build_review_artifact(description: &str, diff: &str) -> String {
     out
 }
 
-/// Compare artifact bodies without failing over an editor's whitespace
-/// conventions.
+/// Compare artifact bodies without failing over structural diff whitespace.
 ///
-/// Trailing whitespace is trimmed per line because stripping it on save is a
-/// common editor default, and `to_unified` writes a blank context line as a
-/// single space — so without this, every edit whose hunk contains a blank
-/// line would be reported to those users as "you edited the diff". Trailing
-/// whitespace inside the *view* cannot change what is applied, since the edit
-/// comes from the tool's parameters, so tolerating it is safe.
+/// `to_unified` writes a blank context line as a single space. Editors commonly
+/// strip that structural marker, so canonicalize exactly that one case. Never
+/// trim a changed or non-blank context line: its trailing bytes are content,
+/// and treating an editor-stripped line as equal would apply bytes the human
+/// no longer saw. `str::lines` already makes the final artifact newline
+/// immaterial.
 fn normalize_body(body: &str) -> String {
     body.lines()
-        .map(str::trim_end)
+        .map(|line| if line == " " { "" } else { line })
         .collect::<Vec<_>>()
         .join("\n")
-        .trim_end()
-        .to_string()
 }
 
 /// Read the user's decision out of the artifact they saved.
@@ -356,6 +353,42 @@ fn read_text(file_path: &str) -> Result<String> {
         )),
         Err(error) => Err(error).with_context(|| format!("Failed to read file: {}", file_path)),
     }
+}
+
+/// Refuse text that the shared terminal-oriented diff model rewrites.
+///
+/// `FileDiff` is intentionally safe to print directly in a terminal: it
+/// expands tabs, strips ANSI escape sequences, and substitutes other control
+/// characters. Those transformations are appropriate for a transcript, but
+/// not for an approval artifact whose bytes authorize a file write. Until the
+/// shared diff model has a lossless editor representation, fail closed and
+/// name the first byte the reviewer could not see faithfully.
+fn ensure_review_representation_is_exact(label: &str, text: &str) -> Result<()> {
+    // NUL selects FileDiff's existing binary path. That path does not pretend
+    // to show bytes: its review artifact explicitly says the content is binary
+    // and reports both sizes, which is the agreed review contract for binary
+    // edits. This guard applies only to text diffs that otherwise look exact.
+    if text.contains('\0') {
+        return Ok(());
+    }
+    for (byte_offset, character) in text.char_indices() {
+        let allowed_line_ending = character == '\n'
+            || (character == '\r' && text.as_bytes().get(byte_offset + 1) == Some(&b'\n'));
+        if allowed_line_ending || !character.is_control() {
+            continue;
+        }
+        let name = match character {
+            '\t' => "TAB".to_string(),
+            '\u{1b}' => "ESCAPE".to_string(),
+            other => format!("control character U+{:04X}", other as u32),
+        };
+        anyhow::bail!(
+            "Cannot open a byte-faithful edit review: the {label} contains {name} at byte \
+             {byte_offset}. The review diff would rewrite or hide that byte, so Finch refused \
+             the edit before opening $VISUAL/$EDITOR."
+        );
+    }
+    Ok(())
 }
 
 /// Header lines stating everything the diff below does not faithfully show.
@@ -593,6 +626,9 @@ where
     // Refuse an impossible or ambiguous edit before spending the user's
     // attention on a review.
     let planned = plan_edit(&original, file_path, old_string, new_string, replace_all)?;
+
+    ensure_review_representation_is_exact("current file", &original)?;
+    ensure_review_representation_is_exact("proposed file", &planned)?;
 
     let file_diff = FileDiff::from_texts(file_path, &original, &planned);
     let diff = file_diff.to_unified();
