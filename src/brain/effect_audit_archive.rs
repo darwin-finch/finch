@@ -127,6 +127,8 @@ pub(crate) struct EffectAuditActiveJournal {
     path: PathBuf,
     #[cfg(test)]
     fail_next_batch_before_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    report_next_commit_error_after_durable_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Test-only override of [`MAX_ACTIVE_JOURNAL_BYTES`]. The production bound
     /// is 48 MiB, which a deterministic regression cannot reach cheaply; the
     /// admission decision under test is the ordering of the bound check against
@@ -165,6 +167,10 @@ impl EffectAuditActiveJournal {
             fail_next_batch_before_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
+            #[cfg(test)]
+            report_next_commit_error_after_durable_commit: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             #[cfg(test)]
             max_bytes: std::sync::atomic::AtomicU64::new(MAX_ACTIVE_JOURNAL_BYTES),
         };
@@ -304,8 +310,10 @@ impl EffectAuditActiveJournal {
     ) -> Result<()> {
         let mut connection = open_active(&self.path)?;
         let transaction = connection.transaction()?;
+        let mut intended = Vec::new();
         for (seq, transition) in transitions {
             let encoded = serde_json::to_vec(transition)?;
+            intended.push((seq, encoded.clone()));
             let encoded_len = encoded.len();
             let existing: Option<Vec<u8>> = transaction
                 .query_row(
@@ -357,13 +365,97 @@ impl EffectAuditActiveJournal {
                  is granted while that headroom is gone."
             );
         }
-        transaction.commit()?;
+        let commit = transaction.commit().map_err(anyhow::Error::from);
+        #[cfg(test)]
+        let commit = if commit.is_ok()
+            && self
+                .report_next_commit_error_after_durable_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            Err(anyhow::anyhow!(
+                "injected active effect-audit COMMIT error after the transaction became durable"
+            ))
+        } else {
+            commit
+        };
+        match commit {
+            Ok(()) => Ok(()),
+            Err(error) => self.reconcile_reported_commit_error(&intended, error),
+        }
+    }
+
+    /// SQLite's DELETE-mode commit can make the transaction durable and then
+    /// report a failure while deleting the rollback journal or releasing the
+    /// file lock. In that case the caller must not reuse the batch's canonical
+    /// sequence numbers. Treat the append as successful only when a fresh
+    /// connection proves that every intended row is present byte-for-byte.
+    fn reconcile_reported_commit_error(
+        &self,
+        intended: &[(u64, Vec<u8>)],
+        commit_error: anyhow::Error,
+    ) -> Result<()> {
+        if intended.is_empty() {
+            return Err(commit_error).context(
+                "effect-audit COMMIT was reported unsuccessful and an empty transaction cannot \
+                 prove whether it became durable",
+            );
+        }
+        let connection = open_active(&self.path).map_err(|reconcile_error| {
+            anyhow::anyhow!(
+                "effect-audit COMMIT was reported unsuccessful and its durable outcome could \
+                 not be determined by reopening {}: commit error: {commit_error:#}; \
+                 reconciliation error: {reconcile_error:#}",
+                self.path.display()
+            )
+        })?;
+        for (seq, expected) in intended {
+            let actual: Option<Vec<u8>> = connection
+                .query_row(
+                    "SELECT transition_json FROM transitions WHERE seq = ?1",
+                    params![*seq as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|reconcile_error| {
+                    anyhow::anyhow!(
+                        "effect-audit COMMIT was reported unsuccessful and transition #{seq} \
+                         could not be checked in {}: commit error: {commit_error:#}; \
+                         reconciliation error: {reconcile_error:#}",
+                        self.path.display()
+                    )
+                })?;
+            let Some(actual) = actual else {
+                return Err(commit_error).with_context(|| {
+                    format!(
+                        "effect-audit COMMIT was reported unsuccessful and transition #{seq} \
+                         is absent from {}; the atomic batch is treated as uncommitted",
+                        self.path.display()
+                    )
+                });
+            };
+            anyhow::ensure!(
+                actual == *expected,
+                "effect-audit COMMIT was reported unsuccessful and durable transition #{seq} \
+                 conflicts with the intended batch in {} (expected {} bytes, found {} bytes); \
+                 refusing to guess whether canonical sequence numbers were consumed; commit \
+                 error: {commit_error:#}",
+                self.path.display(),
+                expected.len(),
+                actual.len()
+            );
+        }
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn fail_next_batch_before_commit_for_test(&self) {
         self.fail_next_batch_before_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_next_commit_error_after_durable_commit_for_test(&self) {
+        self.report_next_commit_error_after_durable_commit
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1159,6 +1251,63 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("conflicting"));
+    }
+
+    #[test]
+    fn reported_commit_error_preserves_absent_error_and_rejects_conflicting_row() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = EffectAuditActiveJournal::open(temporary.path()).unwrap();
+        let intended = fence(uuid::Uuid::new_v4(), 1);
+        let intended_bytes = serde_json::to_vec(&intended).unwrap();
+        let absent = journal
+            .reconcile_reported_commit_error(
+                &[(7, intended_bytes.clone())],
+                anyhow::anyhow!("original SQLite COMMIT error for absent row"),
+            )
+            .expect_err("an absent intended row must preserve the reported COMMIT failure");
+        let absent_diagnostic = format!("{absent:#}");
+        assert!(
+            absent_diagnostic.contains("transition #7 is absent")
+                && absent_diagnostic.contains("original SQLite COMMIT error for absent row"),
+            "an absent-row reconciliation must identify the unconsumed sequence and retain the \
+             original COMMIT error (expected_bytes={}, journal_bytes={}, journal_seqs={:?}, \
+             diagnostic={absent_diagnostic})",
+            intended_bytes.len(),
+            journal.file_bytes().unwrap(),
+            journal
+                .load()
+                .unwrap()
+                .into_iter()
+                .map(|(seq, _)| seq)
+                .collect::<Vec<_>>()
+        );
+
+        let conflicting = fence(uuid::Uuid::new_v4(), 2);
+        journal.append(7, &conflicting).unwrap();
+        let conflict = journal
+            .reconcile_reported_commit_error(
+                &[(7, intended_bytes.clone())],
+                anyhow::anyhow!("original SQLite COMMIT error for conflicting row"),
+            )
+            .expect_err("a conflicting durable row must fail closed rather than consume its seq");
+        let conflict_diagnostic = format!("{conflict:#}");
+        assert!(
+            conflict_diagnostic.contains("transition #7")
+                && conflict_diagnostic.contains("conflicts with the intended batch")
+                && conflict_diagnostic.contains("original SQLite COMMIT error for conflicting row"),
+            "a conflicting-row reconciliation must identify the ambiguous sequence and retain \
+             the original COMMIT error (expected_bytes={}, actual_bytes={}, journal_bytes={}, \
+             journal_seqs={:?}, diagnostic={conflict_diagnostic})",
+            intended_bytes.len(),
+            serde_json::to_vec(&conflicting).unwrap().len(),
+            journal.file_bytes().unwrap(),
+            journal
+                .load()
+                .unwrap()
+                .into_iter()
+                .map(|(seq, _)| seq)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

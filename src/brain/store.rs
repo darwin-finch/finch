@@ -6720,6 +6720,32 @@ impl BrainStore {
         Ok(())
     }
 
+    /// Simulate SQLite reporting a COMMIT error after the active audit
+    /// transaction is already durable. This exercises the production
+    /// reconciliation path without depending on filesystem timing.
+    #[cfg(test)]
+    pub(crate) fn report_next_effect_audit_commit_error_after_durable_commit_for_test(
+        &self,
+        name: &str,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .brain_id;
+        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage
+                .active
+                .report_next_commit_error_after_durable_commit_for_test();
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Override the durable byte ceiling of this Brain's active effect-audit
     /// journal so a regression can reach the bound without writing 48 MiB.
     #[cfg(test)]
@@ -13502,6 +13528,256 @@ mod tests {
             "an admitted batch must advance the canonical revision once per transition \
              (revision {revision_before} -> {revision_after}, reconciled={reconciled}, \
               bound={bound} bytes, journal {before} -> {after} bytes)"
+        );
+    }
+
+    /// #379: SQLite may durably commit a DELETE-mode transaction and then
+    /// report an error while releasing the journal or lock. The store must
+    /// reconcile the exact durable batch before deciding whether its canonical
+    /// sequence numbers were consumed.
+    #[test]
+    fn test_effect_audit_durable_batch_with_reported_commit_error_advances_revision() {
+        const REPORTED_ERROR: &str =
+            "injected active effect-audit COMMIT error after the transaction became durable";
+        let temp = tempfile::tempdir().unwrap();
+        let (store, lease, _grant, _identities) = audit_bound_fixture(temp.path());
+        let journal_path = active_journal_path(temp.path());
+        let bytes_before = std::fs::read(&journal_path).unwrap();
+        let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        let revision_before = store.snapshot("shared").unwrap().revision;
+        store
+            .report_next_effect_audit_commit_error_after_durable_commit_for_test("shared")
+            .unwrap();
+
+        let reconciled = store
+            .reconcile_effect_audits_for_disconnected_leases("shared", &[lease.lease_id])
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a byte-for-byte durable reconciliation batch must turn the reported COMMIT \
+                     error into success: error={error:#}, simulated_error={REPORTED_ERROR}, \
+                     revision_before={revision_before}, journal_bytes_before={}, \
+                     journal_seqs_before={seqs_before:?}",
+                    bytes_before.len()
+                )
+            });
+        let revision_after = store.snapshot("shared").unwrap().revision;
+        let bytes_after = std::fs::read(&journal_path).unwrap();
+        let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        assert_eq!(
+            reconciled,
+            AUDIT_BOUND_FIXTURE_AUDITS,
+            "the entire durably committed batch must be accepted after reconciling the reported \
+             COMMIT error (reconciled={reconciled}, expected={AUDIT_BOUND_FIXTURE_AUDITS}, \
+             simulated_error={REPORTED_ERROR}, revision {revision_before}->{revision_after}, \
+             journal bytes {}->{}, seqs {seqs_before:?}->{seqs_after:?})",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+        assert_eq!(
+            revision_after,
+            revision_before + AUDIT_BOUND_FIXTURE_AUDITS as u64,
+            "the canonical revision must consume every sequence in the reconciled durable batch \
+             (simulated_error={REPORTED_ERROR}, revision {revision_before}->{revision_after}, \
+             journal bytes {}->{}, seqs {seqs_before:?}->{seqs_after:?})",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+
+        let ordinary = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "after reconciled commit error".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ordinary.seq,
+            revision_after + 1,
+            "the append following a reconciled durable batch must not reuse one of its sequences \
+             (ordinary seq {}, revision_after={revision_after}, simulated_error={REPORTED_ERROR}, \
+             journal seqs {seqs_after:?}, bytes_after={})",
+            ordinary.seq,
+            bytes_after.len()
+        );
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted_snapshot = restarted.snapshot("shared").unwrap_or_else(|error| {
+            panic!(
+                "the Brain must restart after reconciling a durable batch whose COMMIT reported \
+                 an error: error={error:#}, simulated_error={REPORTED_ERROR}, ordinary_seq={}, \
+                 revision_after={revision_after}, journal_seqs_after={seqs_after:?}, \
+                 journal_bytes_after={}",
+                ordinary.seq,
+                bytes_after.len()
+            )
+        });
+        let duplicate_seqs = restarted_snapshot
+            .events
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut counts, event| {
+                *counts.entry(event.seq).or_insert(0usize) += 1;
+                counts
+            })
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .collect::<Vec<_>>();
+        assert!(
+            duplicate_seqs.is_empty() && restarted_snapshot.revision >= ordinary.seq,
+            "restart must retain the consumed batch sequences and following event exactly once; \
+             startup may append a disconnected-lease terminal transition \
+             (duplicate seqs {duplicate_seqs:?}, restarted revision {}, ordinary seq {}, \
+             simulated_error={REPORTED_ERROR}, journal seqs {seqs_after:?}, \
+             journal_bytes_after={})",
+            restarted_snapshot.revision,
+            ordinary.seq,
+            bytes_after.len()
+        );
+        let after_restart = restarted
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "after restart of reconciled batch".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            after_restart.seq,
+            restarted_snapshot.revision + 1,
+            "the first append after restart must allocate above every reconciled durable \
+             sequence (new seq {}, restarted revision {}, simulated_error={REPORTED_ERROR}, \
+             duplicate seqs {duplicate_seqs:?}, journal_bytes_after={})",
+            after_restart.seq,
+            restarted_snapshot.revision,
+            bytes_after.len()
+        );
+    }
+
+    /// #379: the same ambiguous COMMIT result exists for the single-transition
+    /// writer. Confirming the exact durable row must advance state before any
+    /// subsequent append or restart can reuse its sequence.
+    #[test]
+    fn test_effect_audit_durable_single_with_reported_commit_error_does_not_reuse_sequence() {
+        const REPORTED_ERROR: &str =
+            "injected active effect-audit COMMIT error after the transaction became durable";
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let journal_path = active_journal_path(temp.path());
+        let bytes_before = std::fs::read(&journal_path).unwrap();
+        let seqs_before = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        let revision_before = store.snapshot("shared").unwrap().revision;
+        store
+            .report_next_effect_audit_commit_error_after_durable_commit_for_test("shared")
+            .unwrap();
+
+        let identity = store
+            .reserve_effect_audit(&grant, uuid::Uuid::new_v4(), audit_effect(9001, "durable"))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "an exact durable single transition must turn the reported COMMIT error into \
+                     success: error={error:#}, simulated_error={REPORTED_ERROR}, \
+                     revision_before={revision_before}, journal_bytes_before={}, \
+                     journal_seqs_before={seqs_before:?}",
+                    bytes_before.len()
+                )
+            });
+        let revision_after = store.snapshot("shared").unwrap().revision;
+        let bytes_after = std::fs::read(&journal_path).unwrap();
+        let seqs_after = store.effect_audit_journal_seqs_for_test("shared").unwrap();
+        assert_eq!(
+            revision_after,
+            revision_before + 1,
+            "the canonical revision must consume the reconciled durable transition sequence \
+             (identity={identity:?}, simulated_error={REPORTED_ERROR}, revision \
+             {revision_before}->{revision_after}, journal bytes {}->{}, seqs \
+             {seqs_before:?}->{seqs_after:?})",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+        assert!(
+            seqs_after.contains(&revision_after),
+            "the byte-for-byte reconciled row must remain at canonical seq {revision_after} \
+             (identity={identity:?}, simulated_error={REPORTED_ERROR}, journal bytes \
+             {}->{}, seqs {seqs_before:?}->{seqs_after:?})",
+            bytes_before.len(),
+            bytes_after.len()
+        );
+
+        let ordinary = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "after reconciled single commit error".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ordinary.seq,
+            revision_after + 1,
+            "the append following a reconciled durable transition must not reuse seq \
+             {revision_after} (ordinary seq {}, simulated_error={REPORTED_ERROR}, journal \
+             seqs {seqs_after:?}, journal_bytes_after={})",
+            ordinary.seq,
+            bytes_after.len()
+        );
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted_snapshot = restarted.snapshot("shared").unwrap_or_else(|error| {
+            panic!(
+                "the Brain must restart after reconciling a durable single transition whose \
+                 COMMIT reported an error: error={error:#}, simulated_error={REPORTED_ERROR}, \
+                 identity={identity:?}, ordinary_seq={}, journal_seqs={seqs_after:?}, \
+                 journal_bytes_after={}",
+                ordinary.seq,
+                bytes_after.len()
+            )
+        });
+        let duplicate_seqs = restarted_snapshot
+            .events
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut counts, event| {
+                *counts.entry(event.seq).or_insert(0usize) += 1;
+                counts
+            })
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .collect::<Vec<_>>();
+        assert!(
+            duplicate_seqs.is_empty() && restarted_snapshot.revision >= ordinary.seq,
+            "restart must retain the reconciled transition and following event without sequence \
+             reuse; startup may append disconnected-lease terminal transitions (duplicate seqs \
+             {duplicate_seqs:?}, restarted revision {}, ordinary seq {}, identity={identity:?}, \
+             simulated_error={REPORTED_ERROR}, journal seqs {seqs_after:?}, \
+             journal_bytes_after={})",
+            restarted_snapshot.revision,
+            ordinary.seq,
+            bytes_after.len()
+        );
+        let after_restart = restarted
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "after restart of reconciled single".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            after_restart.seq,
+            restarted_snapshot.revision + 1,
+            "the first append after restart must allocate above the reconciled single \
+             transition (new seq {}, restarted revision {}, identity={identity:?}, \
+             simulated_error={REPORTED_ERROR}, duplicate seqs {duplicate_seqs:?}, \
+             journal_bytes_after={})",
+            after_restart.seq,
+            restarted_snapshot.revision,
+            bytes_after.len()
         );
     }
 
