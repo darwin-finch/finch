@@ -138,6 +138,7 @@ class WorkflowManifestTests(unittest.TestCase):
         workflows: dict[str, bytes] | None = None,
         manifest_bytes: bytes = b"{}\n",
         ignored_entries: int = 0,
+        unopened_names: tuple[str, ...] = (),
     ) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -145,12 +146,43 @@ class WorkflowManifestTests(unittest.TestCase):
             directory = root / ".github/workflows"
             for index in range(ignored_entries):
                 (directory / f"ignored-{index}.txt").touch()
-            with self.assertRaisesRegex(
-                ContractError,
-                diagnostic,
-                msg=f"{invariant}: root={root}",
-            ):
-                repository_snapshot(root)
+            recorder = OpenAuditRecorder() if unopened_names else None
+            if recorder is not None:
+                recorder.start()
+            try:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    diagnostic,
+                    msg=f"{invariant}: root={root}",
+                ):
+                    repository_snapshot(root)
+            finally:
+                if recorder is not None:
+                    recorder.stop()
+            if recorder is not None:
+                self.assert_open_names_absent(recorder, root, unopened_names, invariant)
+
+    def assert_open_names_absent(
+        self,
+        recorder: OpenAuditRecorder,
+        root: Path,
+        forbidden_names: tuple[str, ...],
+        invariant: str,
+    ) -> None:
+        absolute = {str(root / name) for name in forbidden_names}
+        basenames = {Path(name).name for name in forbidden_names}
+        forbidden_opens = [
+            opened
+            for opened in recorder.paths
+            if opened in absolute or Path(opened).name in basenames
+        ]
+        self.assertEqual(
+            forbidden_opens,
+            [],
+            f"{invariant}; forbidden paths were opened by absolute or directory-relative "
+            f"spelling: root={root} names={forbidden_names!r} "
+            f"forbidden_opens={forbidden_opens!r} all_opens={recorder.paths!r}",
+        )
 
     def assert_accepted(self, repository: WorkflowRepository) -> None:
         result = repository.run()
@@ -251,6 +283,7 @@ class WorkflowManifestTests(unittest.TestCase):
             "the source snapshot must enforce the per-workflow bound before reading; "
             f"size={size} limit={MAX_WORKFLOW_BYTES}",
             {"oversized.yml": b"x" * size},
+            unopened_names=(".github/workflows/oversized.yml",),
         )
 
     def test_source_snapshot_bounds_aggregate_workflow_bytes_independently(self) -> None:
@@ -272,6 +305,7 @@ class WorkflowManifestTests(unittest.TestCase):
             "the source snapshot must reject an otherwise valid oversized manifest before "
             f"reading or parsing it; size={len(manifest_bytes)} limit={MAX_MANIFEST_BYTES}",
             manifest_bytes=manifest_bytes,
+            unopened_names=("scripts/ci_workflow_manifest.json",),
         )
 
     def test_source_snapshot_never_opens_ignored_nonworkflow_link_or_target(self) -> None:
@@ -297,17 +331,12 @@ class WorkflowManifestTests(unittest.TestCase):
                 "the source snapshot must contain only workflow YAML after ignoring a link: "
                 f"root={root} captured={sorted(snapshot.workflow_bytes)!r}",
             )
-            self.assertNotIn(
-                str(link),
-                recorder.paths,
+            self.assert_open_names_absent(
+                recorder,
+                root,
+                (".github/workflows/ignored.txt", "tiny-nonworkflow-target.txt"),
                 "the source snapshot must filter an ignored non-workflow link lexically "
-                f"before open: link={link} target={target} opens={recorder.paths!r}",
-            )
-            self.assertNotIn(
-                str(target),
-                recorder.paths,
-                "the source snapshot must never open an ignored non-workflow link target: "
-                f"link={link} target={target} opens={recorder.paths!r}",
+                f"before open and never read its target; link={link} target={target}",
             )
         finally:
             recorder.stop()
@@ -339,17 +368,12 @@ class WorkflowManifestTests(unittest.TestCase):
             finally:
                 recorder.stop()
 
-            self.assertNotIn(
-                str(manifest),
-                recorder.paths,
-                "manifest lstat rejection must occur before any open attempt: "
-                f"manifest={manifest} target={target} opens={recorder.paths!r}",
-            )
-            self.assertNotIn(
-                str(target),
-                recorder.paths,
-                "the source snapshot must never open a symlinked manifest target: "
-                f"manifest={manifest} target={target} opens={recorder.paths!r}",
+            self.assert_open_names_absent(
+                recorder,
+                root,
+                ("scripts/ci_workflow_manifest.json", "tiny-valid-manifest.json"),
+                "manifest lstat rejection must occur before any absolute or "
+                f"directory-relative open; manifest={manifest} target={target}",
             )
         finally:
             recorder.stop()
@@ -406,17 +430,23 @@ class WorkflowManifestTests(unittest.TestCase):
                 tempfile,
                 "TemporaryDirectory",
                 side_effect=AssertionError("fixture tree allocated before source validation"),
-            ) as temporary_factory:
+            ) as temporary_factory, mock.patch.object(
+                tempfile,
+                "mkdtemp",
+                side_effect=AssertionError("raw fixture directory allocated before validation"),
+            ) as mkdtemp_factory:
                 with self.assertRaisesRegex(
                     ContractError,
                     "exceeds the reviewed",
                     msg=(
                         "WorkflowRepository must reject an invalid source snapshot before "
-                        f"allocating any destination tree: source={root}"
+                        "TemporaryDirectory or mkdtemp can allocate a destination: "
+                        f"source={root}"
                     ),
                 ):
                     WorkflowRepository(root)
             temporary_factory.assert_not_called()
+            mkdtemp_factory.assert_not_called()
         finally:
             temporary.cleanup()
 
