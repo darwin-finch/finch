@@ -39,7 +39,7 @@
     "issue-56-brain-isolation.yml": {"sha256": "018c3e3360739bfa79cab39f4cfc02375a18754aa1d8e88b1bec03d2419d2b02", "bytes": 4818, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api"]},
     "issue-72-capability-contract.yml": {"sha256": "b6502f078270811f9508bffb1378523b7d64cf55f26cac0ef1a37bcd3fbe3b42", "bytes": 1640, "activated_fixtures": []},
     "release.yml": {"sha256": "b443a81265056f549e9d0a7032d4c1bb29bcdd581ab998674faa79325ceeb229", "bytes": 4215, "activated_fixtures": []},
-    "repository-hygiene.yml": {"sha256": "33b301cc31e337e00e2c8c2940977f4930f3dc3bff91112f6be3cb878f64381d", "bytes": 649, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
+    "repository-hygiene.yml": {"sha256": "35c09fada6bac72c58266d5b4f0f8761b216d3a48d16ba0bd9fa377546a5ba0a", "bytes": 800, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
   },
   "fixtures": {
     "readme_only": {
