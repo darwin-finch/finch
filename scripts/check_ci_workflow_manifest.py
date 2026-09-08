@@ -460,6 +460,88 @@ def workflow_records(
     return records
 
 
+def read_bounded_descriptor(
+    descriptor: int, expected_size: int, maximum: int, display: str
+) -> bytes:
+    """Read through EOF or the first byte beyond the reviewed bound."""
+    capture_limit = min(expected_size + 1, maximum + 1)
+    chunks: list[bytes] = []
+    consumed = 0
+    while consumed < capture_limit:
+        chunk = os.read(descriptor, capture_limit - consumed)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        consumed += len(chunk)
+    contents = b"".join(chunks)
+    if expected_size > maximum or len(contents) > maximum:
+        raise ContractError(
+            f"{display}: captured {len(contents)} bytes exceeds the reviewed "
+            f"{maximum}-byte bound"
+        )
+    if len(contents) != expected_size:
+        raise ContractError(
+            f"{display}: file size changed while reading; expected={expected_size} "
+            f"actual={len(contents)}"
+        )
+    return contents
+
+
+def manifest_bytes_snapshot(
+    root: Path,
+    before_open_hook: Callable[[Path], None] | None = None,
+    after_open_hook: Callable[[Path], None] | None = None,
+    after_read_hook: Callable[[Path], None] | None = None,
+) -> tuple[bytes, FileIdentity]:
+    """Capture bounded manifest bytes during one validated descriptor lifetime."""
+    path = root / MANIFEST_PATH
+    display = MANIFEST_PATH.as_posix()
+    initial = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+    if before_open_hook is not None:
+        before_open_hook(path)
+    descriptor = open_path_descriptor(path, display)
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = file_identity(opened)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ContractError(
+                f"{display}: path={path} opened descriptor is not a regular file; "
+                f"opened_mode={stat.filemode(opened.st_mode)!r} "
+                f"opened_identity={opened_identity!r}"
+            )
+        initial_identity = file_identity(initial)
+        if opened_identity != initial_identity:
+            raise ContractError(
+                f"{display}: path={path} file identity changed before capture; "
+                f"initial_identity={initial_identity!r} "
+                f"opened_identity={opened_identity!r}"
+            )
+        if after_open_hook is not None:
+            after_open_hook(path)
+        contents = read_bounded_descriptor(
+            descriptor, opened.st_size, MAX_MANIFEST_BYTES, display
+        )
+        if after_read_hook is not None:
+            after_read_hook(path)
+        final_opened_identity = file_identity(os.fstat(descriptor))
+        if final_opened_identity != opened_identity:
+            raise ContractError(
+                f"{display}: path={path} opened descriptor identity changed during "
+                f"capture; opened_identity={opened_identity!r} "
+                f"final_opened_identity={final_opened_identity!r}"
+            )
+        live = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+        live_identity = file_identity(live)
+        if live_identity != opened_identity:
+            raise ContractError(
+                f"{display}: path={path} live identity changed during capture; "
+                f"opened_identity={opened_identity!r} live_identity={live_identity!r}"
+            )
+        return contents, opened_identity
+    finally:
+        os.close(descriptor)
+
+
 def load_manifest(
     root: Path,
     before_open_hook: Callable[[Path], None] | None = None,
@@ -468,13 +550,10 @@ def load_manifest(
     path = root / MANIFEST_PATH
     display = MANIFEST_PATH.as_posix()
     try:
-        stream, metadata, display = open_regular_file(
-            path, root, MAX_MANIFEST_BYTES, before_open_hook
+        raw_contents, manifest_identity = manifest_bytes_snapshot(
+            root, before_open_hook, after_open_hook
         )
-        with stream:
-            if after_open_hook is not None:
-                after_open_hook(path)
-            contents = read_exact_bytes(stream, metadata.st_size, display).decode("utf-8")
+        contents = raw_contents.decode("utf-8")
         manifest = json.loads(contents, object_pairs_hook=json_object)
     except (
         OSError,
@@ -487,7 +566,7 @@ def load_manifest(
         raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
     if not isinstance(manifest, dict):
         raise ContractError(f"{display}: manifest root must be an object")
-    return manifest, file_identity(metadata)
+    return manifest, manifest_identity
 
 
 def revalidate_manifest(root: Path, initial_identity: FileIdentity) -> None:
