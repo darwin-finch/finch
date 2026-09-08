@@ -12,8 +12,8 @@ These documents are intended to describe the current `main` branch:
 - [Contributing and attribution](../CONTRIBUTING.md)
 - [MCP client guide](MCP_USER_GUIDE.md)
 - [macOS GUI automation permissions](MACOS_GUI_AUTOMATION.md)
-- [Automatic-training status](AUTOMATIC_TRAINING.md) — disabled; issue
-  [#139](https://github.com/darwin-finch/finch/issues/139)
+- [Automatic-training and LoRA status](AUTOMATIC_TRAINING.md) — deferred because training and
+  adapter loading depend on unsupported runtime and ML-toolchain requirements
 - [Legacy ChatGPT subscription configuration](chatgpt-subscription-provider.md) — migration note,
   not a supported subscription-auth flow
 
@@ -54,8 +54,8 @@ promises and must not be cited as proof that a behavior is implemented.
 - [Semiotic transition research note](SEMIOTIC_TRANSITION_SYSTEM.md)
 - [Two programmers, one VM](TWO_PROGRAMMERS.md)
 - [Template parsing design](DESIGN_TEMPLATE_PARSING.md)
-- [Training framework design](TRAINING_FRAMEWORK.md) — historical design; automatic training is
-  disabled
+- [Training framework design](TRAINING_FRAMEWORK.md) — historical design; automatic training and
+  LoRA are deferred
 
 ## Historical and archived narrative
 

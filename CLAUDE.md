@@ -30,7 +30,7 @@ typed runtime + capability broker for program effects
 | Component | Module Doc |
 |-----------|-----------|
 | Local model loader | `src/models/unified_loader.rs` · `src/models/ONNX.md` |
-| Disabled LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
+| Deferred LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
 | Router | `src/router/ROUTING.md` |
 | TUI Renderer | `src/cli/tui/ARCHITECTURE.md` |
 | Tool Execution & Permissions | `src/tools/EXECUTION.md` |
@@ -80,8 +80,9 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 ### Provider and local-model claims
 
 Use current provider profiles and pre-trained local artifacts only. Local routing and provider parity
-remain experimental under Issues #74 and #98. LoRA training and adapter loading are disabled under
-Issue #139; preserved legacy queues and adapters are not processed automatically.
+remain experimental under Issues #74 and #98. LoRA training and adapter loading are deferred because
+their runtime and ML-toolchain requirements are unsupported; the automatic Python path was disabled
+until a supported path exists. Preserved legacy queues and adapters are not processed automatically.
 
 ### Weighted feedback
 
@@ -276,7 +277,7 @@ artifacts exist; release and installer reliability are tracked in Issues #119 an
 `Cargo.toml` is authoritative for the source version. Finch is experimental. The interactive CLI,
 typed runtime, bounded HTTP routes, local persistence, MCP client, and explicit feedback store have
 implementation and tests. Provider/local routing parity, remote collaboration, subagents, and
-release integration remain active work. Automatic LoRA training is disabled.
+release integration remain active work. Automatic training and LoRA adapter loading are deferred.
 
 ### Open Issues
 
