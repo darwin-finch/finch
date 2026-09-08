@@ -426,6 +426,14 @@ async fn propose_in_editor_with_suffix(
 /// layer. The `.diff` suffix is what makes an editor highlight the body as a
 /// diff, and `executable: false` keeps the temp file off the exec path.
 pub async fn open_review_artifact(artifact: &str) -> Result<Option<String>> {
+    // Same guard as `propose_in_editor_with_suffix` and `propose_forth_in_editor`:
+    // unit tests can own a PTY, so gating on `is_terminal()` alone would launch
+    // the developer's real `$EDITOR` and wedge the test runner. Regressions
+    // drive `open_review_artifact_with` instead, which keeps running the editor
+    // it is given.
+    if cfg!(test) || !std::io::stdin().is_terminal() {
+        return Ok(Some(artifact.to_string()));
+    }
     open_review_artifact_with(artifact, run_editor).await
 }
 

@@ -31,16 +31,64 @@ use crate::cli::diff::{FileDiff, MAX_DIFF_LINE_CHARS};
 const REVIEW_DIFF_MARKER: &str =
     "# ---- proposed diff below (review only; edits to it are not applied) ----";
 
-/// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
-fn run_post_save_hook(file_path: &str) {
-    if let Some(hook) = dirs::home_dir().map(|mut p| {
-        p.push(".finch/hooks/post-save");
-        p
-    }) {
-        if hook.exists() {
-            let _ = std::process::Command::new(&hook).arg(file_path).spawn();
+/// Where a user's post-save hook lives, if they have one.
+fn post_save_hook_path() -> Option<std::path::PathBuf> {
+    let mut path = dirs::home_dir()?;
+    path.push(".finch/hooks/post-save");
+    path.exists().then_some(path)
+}
+
+/// Bound on a post-save hook. A hook is the user's own program, but it must
+/// not be able to hold the tool open indefinitely.
+const POST_SAVE_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run one post-save hook to completion and report anything worth telling the
+/// caller about.
+///
+/// Every stream is redirected. The hook runs after the terminal has been put
+/// back into raw mode, so inherited stdout/stderr would be painted straight
+/// into the live frame, and an inherited stdin would race the key reader for
+/// the user's keystrokes. The child is awaited rather than dropped, so an
+/// accepted edit cannot leave a zombie behind.
+async fn run_hook(hook: &std::path::Path, file_path: &str) -> Option<String> {
+    let mut command = tokio::process::Command::new(hook);
+    command
+        .arg(file_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(POST_SAVE_HOOK_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => None,
+        Ok(Ok(output)) => {
+            let mut detail = String::from_utf8_lossy(&output.stderr).into_owned();
+            if detail.trim().is_empty() {
+                detail = String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+            Some(format!(
+                "post-save hook {} exited {}: {}",
+                hook.display(),
+                output.status,
+                crate::cli::diff::sanitize_multiline(detail.trim())
+            ))
         }
+        Ok(Err(error)) => Some(format!(
+            "post-save hook {} could not be started: {}",
+            hook.display(),
+            error
+        )),
+        Err(_) => Some(format!(
+            "post-save hook {} did not finish within {} seconds and was terminated",
+            hook.display(),
+            POST_SAVE_HOOK_TIMEOUT.as_secs()
+        )),
     }
+}
+
+/// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
+async fn run_post_save_hook(file_path: &str) -> Option<String> {
+    let hook = post_save_hook_path()?;
+    run_hook(&hook, file_path).await
 }
 
 /// What the user's saved review artifact says to do.
@@ -58,18 +106,47 @@ enum ReviewOutcome {
     Modified,
 }
 
+/// What a single header line says about the user's decision.
+///
+/// `Some(Err(()))` is a *near miss*: a line that is plainly trying to be a
+/// directive but is not one. A near miss must never be read as consent, so it
+/// is reported rather than ignored. Recognises the same comment markers the
+/// rest of the proposal protocol uses (`#`, `\`, `;;`), because a user who
+/// has seen the Forth and Lisp artifacts will reasonably type those here.
+fn directive_on_line(line: &str) -> Option<Result<&str, ()>> {
+    let trimmed = line.trim();
+    let body = trimmed
+        .strip_prefix(";;")
+        .or_else(|| trimmed.strip_prefix('#'))
+        .or_else(|| trimmed.strip_prefix('\\'))?
+        .trim_start();
+    let Some(rest) = body.strip_prefix("finch:") else {
+        // Only a line that *starts* with the reserved word is a near miss;
+        // quoted description text (`> finch: ...`) is ordinary prose.
+        return (body.starts_with("finch") && body.contains("action=")).then_some(Err(()));
+    };
+    match rest.trim_start().strip_prefix("action=") {
+        Some(action) => Some(Ok(action.trim())),
+        None => Some(Err(())),
+    }
+}
+
 /// Render one header line, keeping model-supplied text out of the decision
 /// protocol.
 ///
 /// `file_path` reaches the description straight from the model, so an
 /// unescaped description line could otherwise write `finch: action=cancel`
-/// into the header and decide the human's review for them.
+/// into the header and decide the human's review for them. The escape is
+/// decided by asking `directive_on_line` itself, so the two can never drift
+/// apart: anything the parser would read as a directive is quoted, and a
+/// quoted line is never read as a directive.
 fn header_comment(line: &str) -> String {
     let clean = crate::cli::diff::sanitize_terminal(line);
-    if clean.trim_start().starts_with("finch:") {
-        format!("#  {}\n", clean)
+    let candidate = format!("# {}", clean);
+    if directive_on_line(&candidate).is_some() {
+        format!("# > {}\n", clean)
     } else {
-        format!("# {}\n", clean)
+        format!("{}\n", candidate)
     }
 }
 
@@ -80,11 +157,17 @@ fn header_comment(line: &str) -> String {
 /// never passed through a shell, so hostile file content cannot escape it.
 fn build_review_artifact(description: &str, diff: &str) -> String {
     let mut out = String::new();
-    out.push_str("# Finch proposal: save and quit to apply this change.\n");
-    out.push_str(
-        "# Reject it with action=cancel, or ask for a different change with action=chat.\n",
-    );
+    out.push_str("# Finch proposal. Read the diff below, then save and quit to apply it.\n");
+    out.push_str("# To reject it or ask for something different, change the value on the\n");
+    out.push_str("# next line to cancel or chat, then save and quit.\n");
     out.push_str("# finch: action=execute\n");
+    out.push_str("#   execute = apply it   cancel = reject it   chat = ask for a change\n");
+    if let Some(hook) = post_save_hook_path() {
+        out.push_str(&header_comment(&format!(
+            "Applying also runs your post-save hook {}.",
+            hook.display()
+        )));
+    }
     out.push_str("#\n");
     for line in description.lines() {
         out.push_str(&header_comment(line));
@@ -98,11 +181,21 @@ fn build_review_artifact(description: &str, diff: &str) -> String {
     out
 }
 
-/// Compare artifact bodies without failing over an editor's line-ending or
-/// trailing-newline conventions.
+/// Compare artifact bodies without failing over an editor's whitespace
+/// conventions.
+///
+/// Trailing whitespace is trimmed per line because stripping it on save is a
+/// common editor default, and `to_unified` writes a blank context line as a
+/// single space — so without this, every edit whose hunk contains a blank
+/// line would be reported to those users as "you edited the diff". Trailing
+/// whitespace inside the *view* cannot change what is applied, since the edit
+/// comes from the tool's parameters, so tolerating it is safe.
 fn normalize_body(body: &str) -> String {
-    body.replace("\r\n", "\n")
-        .trim_end_matches('\n')
+    body.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
         .to_string()
 }
 
@@ -112,7 +205,7 @@ fn normalize_body(body: &str) -> String {
 /// `REVIEW_DIFF_MARKER`. File content below it is data: a reviewed file that
 /// happens to contain the literal text `# finch: action=cancel` must not be
 /// able to cancel or redirect the user's own decision.
-fn parse_review_artifact(artifact: &str, expected_diff: &str) -> ReviewOutcome {
+fn split_review_artifact(artifact: &str) -> (String, Option<String>) {
     let mut header = String::new();
     let mut body = String::new();
     let mut in_body = false;
@@ -129,29 +222,28 @@ fn parse_review_artifact(artifact: &str, expected_diff: &str) -> ReviewOutcome {
             body.push('\n');
         }
     }
-    if !in_body {
+    (header, in_body.then_some(body))
+}
+
+fn parse_review_artifact(returned: &str, expected: &str) -> ReviewOutcome {
+    let (header, returned_body) = split_review_artifact(returned);
+    let Some(body) = returned_body else {
         return ReviewOutcome::Cancel {
             reason: "the review marker was removed, so the decision could not be \
                      separated from the diff"
                 .to_string(),
         };
-    }
+    };
+    let (_expected_header, expected_body) = split_review_artifact(expected);
+    let expected_diff = expected_body.unwrap_or_default();
+    let expected_diff = expected_diff.as_str();
 
-    let action = last_action(&header);
-    match action.as_deref() {
-        Some("cancel") => ReviewOutcome::Cancel {
-            reason: "the user set action=cancel".to_string(),
+    match header_decision(&header) {
+        HeaderDecision::Cancel(reason) => ReviewOutcome::Cancel { reason },
+        HeaderDecision::Chat => ReviewOutcome::Chat {
+            context: user_prose(returned, expected),
         },
-        Some("chat") => ReviewOutcome::Chat {
-            context: crate::cli::diff::sanitize_multiline(artifact),
-        },
-        Some(other) if other != "execute" => ReviewOutcome::Cancel {
-            reason: format!(
-                "the artifact requested the unrecognised action {:?}",
-                crate::cli::diff::sanitize_terminal(other)
-            ),
-        },
-        _ => {
+        HeaderDecision::Execute => {
             if normalize_body(&body) == normalize_body(expected_diff) {
                 ReviewOutcome::Apply
             } else {
@@ -161,17 +253,93 @@ fn parse_review_artifact(artifact: &str, expected_diff: &str) -> ReviewOutcome {
     }
 }
 
-/// The last `# finch: action=...` directive in the header, if any.
-fn last_action(header: &str) -> Option<String> {
-    header
+/// The decision the header as a whole expresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeaderDecision {
+    Execute,
+    Cancel(String),
+    Chat,
+}
+
+/// Reduce every directive in the header to one decision, failing closed.
+///
+/// A rejection typed anywhere wins over an approval left elsewhere, an
+/// unrecognised action is a rejection, a near-miss line is a rejection, and a
+/// header with no directive at all is a rejection. Only an unambiguous
+/// `action=execute` applies anything: a user's typo must cost them a second
+/// look, never an unintended write.
+fn header_decision(header: &str) -> HeaderDecision {
+    let mut execute = false;
+    let mut chat = false;
+    for line in header.lines() {
+        match directive_on_line(line) {
+            None => {}
+            Some(Err(())) => {
+                return HeaderDecision::Cancel(format!(
+                    "the line {:?} looks like an action directive but is not one, so Finch \
+                     did not assume it meant approval",
+                    crate::cli::diff::sanitize_terminal(line.trim())
+                ))
+            }
+            Some(Ok("cancel")) => {
+                return HeaderDecision::Cancel("the artifact said action=cancel".to_string())
+            }
+            Some(Ok("chat")) => chat = true,
+            Some(Ok("execute")) => execute = true,
+            Some(Ok(other)) => {
+                return HeaderDecision::Cancel(format!(
+                    "the artifact asked for the unrecognised action {:?}",
+                    crate::cli::diff::sanitize_terminal(other)
+                ))
+            }
+        }
+    }
+    if chat {
+        return HeaderDecision::Chat;
+    }
+    if execute {
+        return HeaderDecision::Execute;
+    }
+    HeaderDecision::Cancel(
+        "the action directive was removed, so no approval was recorded".to_string(),
+    )
+}
+
+/// The lines the user added to the header, without Finch's own boilerplate or
+/// the diff.
+///
+/// A chat request is quoted back to the model, and returning the whole
+/// artifact would send the diff too — which the transcript renderer treats as
+/// a successful edit, making a refusal look like an application.
+fn user_prose(returned: &str, expected: &str) -> String {
+    let generated: Vec<&str> = expected.lines().collect();
+    let prose: Vec<String> = returned
         .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("# finch:")
-                .and_then(|directive| directive.trim().strip_prefix("action="))
-                .map(|action| action.trim().to_string())
+        // Anything Finch itself wrote is not the user speaking. Notes are
+        // taken from anywhere in the artifact, not only the header: the
+        // bottom of the file is just as natural a place to type them.
+        .filter(|line| !generated.contains(line))
+        .filter(|line| directive_on_line(line).is_none())
+        .filter(|line| *line != REVIEW_DIFF_MARKER)
+        // Never carry diff structure into the result: `tool_display` reads a
+        // `--- ` line as a rendered file change, which would make a refusal
+        // look like a successful edit.
+        .filter(|line| {
+            !line.starts_with("--- ") && !line.starts_with("+++ ") && !line.starts_with("@@ ")
         })
-        .next_back()
+        .map(|line| {
+            line.trim_start()
+                .trim_start_matches('#')
+                .trim_start_matches(['\\', ';'])
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    if prose.is_empty() {
+        return "(no explanation given)".to_string();
+    }
+    crate::cli::diff::sanitize_multiline(&prose.join("\n"))
 }
 
 /// Read the target as text, refusing rather than mangling non-UTF-8 content.
@@ -243,6 +411,125 @@ fn fidelity_notes(diff: &FileDiff, original: &str, planned: &str) -> Vec<String>
     notes
 }
 
+/// Reject a diff whose rendering does not actually show the change.
+///
+/// INTERIM GUARD for #482 (`src/cli/diff.rs` can render a diff that omits
+/// part of the change without saying so). Two known ways it happens:
+///
+/// * `to_unified` ends with `bound_rendered`, which cuts the rendered string
+///   at `MAX_RENDER_CHARS` and updates neither `elided` nor the exactness
+///   flags — so asking the struct whether it is complete returns "yes" while
+///   whole hunks are missing;
+/// * `FileDiff::from_texts` renders with `similar` and re-parses its own
+///   output, so a removed line beginning `-- ` (SQL, Lua, Haskell, Ada) is
+///   re-read as a `--- ` file header and disappears from the diff.
+///
+/// Both let a human approve, in good faith, a change the artifact did not
+/// show. Until #482 fixes the module, the tool refuses rather than presents
+/// an unfaithful view. This checks the rendering against itself — each hunk
+/// header states how many old and new lines its body holds — so it needs no
+/// second diff engine and has no timing dependence.
+fn verify_render_is_faithful(
+    file_diff: &FileDiff,
+    rendered: &str,
+    original: &str,
+    planned: &str,
+) -> Result<()> {
+    let interim = "This is an interim refusal for issue #482 (the shared diff renderer can \
+                   silently drop part of a change); it is not a problem with the file.";
+    if file_diff.binary {
+        // Binary content is presented as prose with byte sizes, which is a
+        // complete description rather than a partial diff.
+        return Ok(());
+    }
+    if rendered
+        .lines()
+        .any(|line| line == "# finch: diff rendering truncated")
+    {
+        anyhow::bail!(
+            "Refusing to edit {}: the diff is too large to display in full, so the review \
+             would have shown only part of the change.\nMake a smaller edit.\n{}",
+            file_diff.display_path(),
+            interim
+        );
+    }
+
+    let mut hunks = 0usize;
+    let mut changed_lines = 0usize;
+    let mut pending: Option<(usize, usize, usize, usize)> = None; // old_want, new_want, old_seen, new_seen
+    let finish = |pending: Option<(usize, usize, usize, usize)>| -> Result<()> {
+        if let Some((old_want, new_want, old_seen, new_seen)) = pending {
+            if old_want != old_seen || new_want != new_seen {
+                anyhow::bail!(
+                    "Refusing to edit {}: the rendered diff does not match its own hunk header \
+                     (it claims {} old and {} new lines but shows {} and {}), so the review \
+                     would have hidden part of the change.\n{}",
+                    file_diff.display_path(),
+                    old_want,
+                    new_want,
+                    old_seen,
+                    new_seen,
+                    interim
+                );
+            }
+        }
+        Ok(())
+    };
+    for line in rendered.lines() {
+        if let Some(counts) = hunk_counts(line) {
+            finish(pending.take())?;
+            hunks += 1;
+            pending = Some((counts.0, counts.1, 0, 0));
+            continue;
+        }
+        let Some((_, _, old_seen, new_seen)) = pending.as_mut() else {
+            continue;
+        };
+        match line.chars().next() {
+            Some(' ') | None => {
+                *old_seen += 1;
+                *new_seen += 1;
+            }
+            Some('-') => {
+                *old_seen += 1;
+                changed_lines += 1;
+            }
+            Some('+') => {
+                *new_seen += 1;
+                changed_lines += 1;
+            }
+            // "\ No newline at end of file" belongs to neither side, and a
+            // "# finch:" footer note ends the hunk body.
+            _ => {}
+        }
+    }
+    finish(pending.take())?;
+
+    if original != planned && (hunks == 0 || changed_lines == 0) {
+        anyhow::bail!(
+            "Refusing to edit {}: the change could not be rendered as a reviewable diff, so \
+             the review would have shown nothing to approve.\nMake a smaller edit.\n{}",
+            file_diff.display_path(),
+            interim
+        );
+    }
+    Ok(())
+}
+
+/// Old-side and new-side line counts declared by a `@@ -a,b +c,d @@` header.
+fn hunk_counts(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (ranges, _) = rest.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let count = |range: &str| -> Option<usize> {
+        match range.split_once(',') {
+            Some((_, n)) => n.parse().ok(),
+            None => Some(1),
+        }
+    };
+    Some((count(old)?, count(new)?))
+}
+
 /// Validate the replacement and produce the file's new content.
 ///
 /// Shared by the interactive and non-interactive paths so an ambiguous or
@@ -280,11 +567,10 @@ fn plan_edit(
 }
 
 /// Write the planned content and run the post-save hook.
-fn commit_edit(file_path: &str, new_content: &str) -> Result<()> {
+async fn commit_edit(file_path: &str, new_content: &str) -> Result<Option<String>> {
     fs::write(file_path, new_content)
         .with_context(|| format!("Failed to write file: {}", file_path))?;
-    run_post_save_hook(file_path);
-    Ok(())
+    Ok(run_post_save_hook(file_path).await)
 }
 
 /// Interactive flow: show the human the diff, then apply it here.
@@ -310,6 +596,7 @@ where
 
     let file_diff = FileDiff::from_texts(file_path, &original, &planned);
     let diff = file_diff.to_unified();
+    verify_render_is_faithful(&file_diff, &diff, &original, &planned)?;
     let mut description = format!("Edit {}", file_path);
     for note in fidelity_notes(&file_diff, &original, &planned) {
         description.push('\n');
@@ -317,11 +604,11 @@ where
     }
     let artifact = build_review_artifact(&description, &diff);
 
-    let Some(returned) = open_editor(artifact).await? else {
+    let Some(returned) = open_editor(artifact.clone()).await? else {
         return Ok("Edit aborted by user.".to_string());
     };
 
-    match parse_review_artifact(&returned, &diff) {
+    match parse_review_artifact(&returned, &artifact) {
         ReviewOutcome::Cancel { reason } => Ok(format!("Edit aborted by user: {}.", reason)),
         ReviewOutcome::Chat { context } => Ok(format!(
             "Edit not applied. The user asked for a different change instead of approving:\n{}",
@@ -348,8 +635,10 @@ where
                     file_path
                 ));
             }
-            commit_edit(file_path, &planned)?;
-            Ok(diff)
+            match commit_edit(file_path, &planned).await? {
+                None => Ok(diff),
+                Some(hook_note) => Ok(format!("{}\n{}", diff, hook_note)),
+            }
         }
     }
 }
@@ -426,8 +715,12 @@ impl Tool for EditTool {
         // Non-interactive (tests, daemon): apply directly.
         let original = read_text(file_path)?;
         let new_content = plan_edit(&original, file_path, old_string, new_string, replace_all)?;
-        commit_edit(file_path, &new_content)?;
-        Ok(FileDiff::from_texts(file_path, &original, &new_content).to_unified())
+        let hook_note = commit_edit(file_path, &new_content).await?;
+        let diff = FileDiff::from_texts(file_path, &original, &new_content).to_unified();
+        Ok(match hook_note {
+            None => diff,
+            Some(note) => format!("{}\n{}", diff, note),
+        })
     }
 }
 
@@ -514,25 +807,47 @@ mod tests {
                  is missing {expected:?}.\nThe human would have opened this:\n{artifact}"
             );
         }
-        // A base64 payload shows up as one long unbroken run of the base64
-        // alphabet; readable source and diffs are broken up by spaces and
-        // punctuation.
-        for line in artifact.lines() {
-            let mut run = 0usize;
-            let mut longest = 0usize;
-            for c in line.chars() {
-                if c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' {
-                    run += 1;
-                    longest = longest.max(run);
-                } else {
-                    run = 0;
-                }
-            }
+        assert_body_is_only_diff_lines(artifact, context);
+    }
+
+    /// Reply with `edit(artifact)` and record whether the editor was opened.
+    fn replying_editor(
+        edit: impl Fn(String) -> Option<String> + Send + 'static,
+    ) -> impl FnOnce(
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
+    > {
+        move |artifact: String| {
+            let answer = edit(artifact);
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    /// The body below the marker must consist of diff lines and nothing else.
+    ///
+    /// This is the implementation-independent form of "it is a diff, not a
+    /// program": a program's lines (`import base64, sys`, `python3 << 'PYEOF'`,
+    /// `path = "..."`) cannot satisfy it, and no future encoding scheme can
+    /// sneak past it the way a fixed forbidden-substring list could.
+    fn assert_body_is_only_diff_lines(artifact: &str, context: &str) {
+        let (_, body) = split_review_artifact(artifact);
+        let body = body.unwrap_or_else(|| {
+            panic!("artifact has no review marker ({context}).\nArtifact:\n{artifact}")
+        });
+        for line in body.lines() {
+            let is_diff_line = line.is_empty()
+                || line.starts_with(' ')
+                || line.starts_with('+')
+                || line.starts_with('-')
+                || line.starts_with("@@ ")
+                || line.starts_with('\\')
+                || line.starts_with("Binary files ")
+                || line.starts_with("# finch: ");
             assert!(
-                longest < 120,
-                "$EDITOR review artifact line looks like an encoded blob ({context}): \
-                 {longest} unbroken base64-alphabet characters in {line:?}.\n\
-                 The human would have opened this:\n{artifact}"
+                is_diff_line,
+                "every line below the review marker must be part of the diff ({context}), but \
+                 {line:?} is not.\nThe human would have opened this:\n{artifact}"
             );
         }
     }
@@ -773,7 +1088,7 @@ mod tests {
             "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
         );
         assert_eq!(
-            parse_review_artifact(&artifact, "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"),
+            parse_review_artifact(&artifact, &artifact),
             ReviewOutcome::Apply,
             "a description line must not be readable as the reserved action directive.\n\
              Artifact:\n{artifact}"
@@ -975,40 +1290,134 @@ mod tests {
         );
     }
 
-    /// A diff that `FileDiff` could not compute in full must announce that
-    /// above the diff. Approving an incomplete view is the failure mode this
-    /// whole change exists to prevent.
+    /// A change too large for `FileDiff` to render is refused outright. The
+    /// reviewer is never handed a view that shows nothing to approve.
     #[tokio::test]
-    async fn test_incomplete_diff_is_flagged_before_the_reviewer_approves() {
+    async fn test_change_too_large_to_render_is_refused() {
         let bulk = "x\n".repeat(300_000);
         let (_dir, path) = temp_file("huge.txt", &format!("{bulk}MARKER\n"));
-        let seen = Arc::new(Mutex::new(None));
-        let result = review_and_apply_edit(
-            &path,
-            "MARKER",
-            "REPLACED",
-            false,
-            capturing_editor(seen.clone(), Some),
-        )
+        let opened = Arc::new(Mutex::new(false));
+        let flag = opened.clone();
+        let error = review_and_apply_edit(&path, "MARKER", "REPLACED", false, move |a: String| {
+            *flag.lock().unwrap() = true;
+            Box::pin(async move { Ok(Some(a)) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
+                >
+        })
         .await
-        .expect("interactive edit");
+        .expect_err("an unrenderable change must be refused");
 
-        let artifact = seen.lock().unwrap().clone().expect("editor was opened");
-        let head: String = artifact.lines().take(12).collect::<Vec<_>>().join("\n");
         assert!(
-            artifact.contains("WARNING: this diff is incomplete"),
-            "a diff whose counts are not exact must warn the reviewer in the header.\n\
-             Artifact header:\n{head}"
+            !*opened.lock().unwrap(),
+            "a reviewer must not be shown a diff that omits the change; error: {error}"
         );
         assert!(
-            !artifact.contains("+REPLACED"),
-            "this fixture is only meaningful while the change is genuinely not shown; if the \
-             diff now renders, the warning is no longer load-bearing.\nArtifact header:\n{head}"
+            error.to_string().contains("#482"),
+            "the interim refusal must name the module defect it is standing in for, got: {error}"
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            format!("{bulk}REPLACED\n"),
-            "an incomplete *view* must still apply the complete change; tool said: {result}"
+            format!("{bulk}MARKER\n"),
+            "a refused edit must leave the file untouched"
+        );
+    }
+
+    /// The bounded-rendering warning still fires if the gate above is ever
+    /// relaxed: `fidelity_notes` reports inexact counts from the struct.
+    #[test]
+    fn test_fidelity_notes_report_inexact_counts() {
+        let bulk = "x\n".repeat(300_000);
+        let old = format!("{bulk}MARKER\n");
+        let new = format!("{bulk}REPLACED\n");
+        let diff = FileDiff::from_texts("huge.txt", &old, &new);
+        assert!(
+            !diff.counts_are_exact(),
+            "fixture must actually produce an inexact diff or the note below is untested"
+        );
+        let notes = fidelity_notes(&diff, &old, &new).join("\n");
+        assert!(
+            notes.contains("WARNING: this diff is incomplete"),
+            "an inexact diff must be described as incomplete, got: {notes}"
+        );
+    }
+
+    /// F1 (#482): `to_unified` cuts the rendered string at `MAX_RENDER_CHARS`
+    /// without marking the struct inexact, so the reassuring branch would be
+    /// emitted over a diff missing every changed line.
+    #[tokio::test]
+    async fn test_truncated_rendering_is_refused_not_presented_as_complete() {
+        let filler = "A".repeat(340);
+        let original: String = (0..500).map(|i| format!("{filler}{i}\n")).collect();
+        let replacement: String = (0..500).map(|i| format!("B{filler}{i}\n")).collect();
+        let (_dir, path) = temp_file("wide.txt", &original);
+        let opened = Arc::new(Mutex::new(false));
+        let flag = opened.clone();
+        let error =
+            review_and_apply_edit(&path, &original, &replacement, false, move |a: String| {
+                *flag.lock().unwrap() = true;
+                Box::pin(async move { Ok(Some(a)) })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
+                    >
+            })
+            .await
+            .expect_err("a diff cut by the render bound must be refused");
+
+        assert!(
+            !*opened.lock().unwrap(),
+            "the reviewer must not be shown a diff whose changed lines were cut away; \
+             error: {error}"
+        );
+        assert!(
+            error.to_string().contains("#482"),
+            "the interim refusal must name the module defect, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "a refused edit must leave the file untouched"
+        );
+    }
+
+    /// F2 (#482): `FileDiff::from_texts` re-parses its own rendering, so a
+    /// removed line beginning `-- ` is re-read as a `--- ` file header and
+    /// disappears. Common in SQL, Lua, Haskell and Ada.
+    #[tokio::test]
+    async fn test_removed_line_starting_with_double_dash_is_refused() {
+        let source = "SELECT 1;\n-- keep totals\n-- and averages\nSELECT 2;\n";
+        let (_dir, path) = temp_file("q.sql", source);
+        let opened = Arc::new(Mutex::new(false));
+        let flag = opened.clone();
+        let error = review_and_apply_edit(
+            &path,
+            "-- keep totals\n-- and averages\n",
+            "",
+            false,
+            move |a: String| {
+                *flag.lock().unwrap() = true;
+                Box::pin(async move { Ok(Some(a)) })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<Option<String>>> + Send>,
+                    >
+            },
+        )
+        .await
+        .expect_err("a diff that swallowed a removed line must be refused");
+
+        assert!(
+            !*opened.lock().unwrap(),
+            "the reviewer must not be shown a diff missing the lines being deleted; \
+             error: {error}"
+        );
+        assert!(
+            error.to_string().contains("#482"),
+            "the interim refusal must name the module defect, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            source,
+            "a refused edit must leave the file untouched"
         );
     }
 
@@ -1047,6 +1456,372 @@ mod tests {
             fs::read(&path).unwrap(),
             bytes.to_vec(),
             "a refused edit must leave the bytes untouched"
+        );
+    }
+
+    /// `replace_all` had no coverage anywhere in the repository: swapping
+    /// `replace` for `replacen` survived as a mutant.
+    #[tokio::test]
+    async fn test_replace_all_changes_every_occurrence() {
+        let (_dir, path) = temp_file("dup.txt", "a\nx\nb\nx\nc\n");
+        let seen = Arc::new(Mutex::new(None));
+        let result =
+            review_and_apply_edit(&path, "x", "y", true, capturing_editor(seen.clone(), Some))
+                .await
+                .expect("interactive edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "a\ny\nb\ny\nc\n",
+            "replace_all must change every occurrence, not only the first; tool said: {result}"
+        );
+        let artifact = seen.lock().unwrap().clone().expect("editor was opened");
+        assert_eq!(
+            artifact.matches("+y").count(),
+            2,
+            "the reviewed diff must show both replacements.\nArtifact:\n{artifact}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_all_through_the_tool_boundary() {
+        let (_dir, path) = temp_file("dup.txt", "x\nkeep\nx\n");
+        let tool = EditTool;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: None,
+            poset: None,
+        };
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "file_path": path.clone(), "old_string": "x",
+                    "new_string": "z", "replace_all": true
+                }),
+                &context,
+            )
+            .await
+            .expect("replace_all edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "z\nkeep\nz\n",
+            "replace_all must apply to every occurrence through the tool; tool said: {out}"
+        );
+    }
+
+    /// A rejection typed anywhere must beat an approval left elsewhere. Taking
+    /// only the last directive let a `cancel` typed at the top lose.
+    #[tokio::test]
+    async fn test_cancel_anywhere_in_the_header_wins() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| Some(format!("# finch: action=cancel\n{artifact}"))),
+        )
+        .await
+        .expect("interactive edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "a cancel written above the generated directive must still reject; \
+             tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_removed_directive_fails_closed() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| {
+                Some(
+                    artifact
+                        .lines()
+                        .filter(|line| !line.contains("action=execute"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }),
+        )
+        .await
+        .expect("interactive edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "deleting the directive must not be read as approval; tool said: {result}"
+        );
+    }
+
+    /// A typo in the directive *prefix* used to fail open while a typo in its
+    /// *value* failed closed. Both must fail closed.
+    #[tokio::test]
+    async fn test_near_miss_directive_prefix_fails_closed() {
+        for typo in ["# finch action=cancel", "# finchx: action=cancel"] {
+            let (_dir, path) = temp_file("keep.txt", "before\n");
+            let replacement = typo.to_string();
+            let result = review_and_apply_edit(
+                &path,
+                "before",
+                "after",
+                false,
+                replying_editor(move |artifact| {
+                    Some(artifact.replace("# finch: action=execute", &replacement))
+                }),
+            )
+            .await
+            .expect("interactive edit");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "before\n",
+                "the near-miss directive {typo:?} must not be read as approval; \
+                 tool said: {result}"
+            );
+        }
+    }
+
+    /// The Forth and Lisp proposal artifacts of the same product use `\\` and
+    /// `;;`, so a user will reasonably type those here.
+    #[tokio::test]
+    async fn test_sibling_comment_prefixes_are_honoured() {
+        for prefix in [";; finch: action=cancel", "\\ finch: action=cancel"] {
+            let (_dir, path) = temp_file("keep.txt", "before\n");
+            let replacement = prefix.to_string();
+            let result = review_and_apply_edit(
+                &path,
+                "before",
+                "after",
+                false,
+                replying_editor(move |artifact| {
+                    Some(artifact.replace("# finch: action=execute", &replacement))
+                }),
+            )
+            .await
+            .expect("interactive edit");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "before\n",
+                "{prefix:?} must be honoured as a rejection; tool said: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unrecognised_action_fails_closed() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| Some(artifact.replace("action=execute", "action=aplpy"))),
+        )
+        .await
+        .expect("interactive edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "an unrecognised action must not apply anything; tool said: {result}"
+        );
+        assert!(
+            result.contains("aplpy"),
+            "the refusal must quote what was actually written, got {result:?}"
+        );
+    }
+
+    /// Editors that strip trailing whitespace on save are common, and
+    /// `to_unified` writes a blank context line as a single space. Without
+    /// tolerance every such user would be told they edited the diff.
+    #[tokio::test]
+    async fn test_trailing_whitespace_trimming_editor_still_approves() {
+        let (_dir, path) = temp_file("blank.txt", "alpha\n\nbravo\n\ncharlie\n");
+        let result = review_and_apply_edit(
+            &path,
+            "bravo",
+            "BRAVO",
+            false,
+            replying_editor(|artifact| {
+                Some(
+                    artifact
+                        .lines()
+                        .map(str::trim_end)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }),
+        )
+        .await
+        .expect("interactive edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alpha\n\nBRAVO\n\ncharlie\n",
+            "an untouched approval saved by a whitespace-trimming editor must still apply; \
+             tool said: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_trailing_newline_still_approves() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| Some(artifact.trim_end().to_string())),
+        )
+        .await
+        .expect("interactive edit");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "after\n",
+            "an editor that drops the final newline must not be read as an edited diff; \
+             tool said: {result}"
+        );
+    }
+
+    /// End-to-end version of the forgery guard: the path really is
+    /// model-controlled, and a filename may legally contain a newline.
+    #[tokio::test]
+    async fn test_model_supplied_path_cannot_forge_the_directive_end_to_end() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("evil\nfinch: action=cancel\nx.txt");
+        fs::write(&path, "before\n").expect("seed file");
+        let display = path.to_string_lossy().into_owned();
+
+        let seen = Arc::new(Mutex::new(None));
+        let result = review_and_apply_edit(
+            &display,
+            "before",
+            "after",
+            false,
+            capturing_editor(seen.clone(), Some),
+        )
+        .await
+        .expect("interactive edit");
+
+        let artifact = seen.lock().unwrap().clone().expect("editor was opened");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "after\n",
+            "a directive smuggled through the model-supplied file_path must not decide the \
+             user's review; tool said: {result}\nArtifact:\n{artifact}"
+        );
+    }
+
+    /// A refused edit must not be reported to the model, or rendered in the
+    /// transcript, as though it had been applied.
+    #[tokio::test]
+    async fn test_chat_returns_only_the_users_words() {
+        let (_dir, path) = temp_file("keep.txt", "before\n");
+        let result = review_and_apply_edit(
+            &path,
+            "before",
+            "after",
+            false,
+            replying_editor(|artifact| {
+                Some(format!(
+                    "{}\n# please rename the function instead\n",
+                    artifact.replace("action=execute", "action=chat")
+                ))
+            }),
+        )
+        .await
+        .expect("interactive edit");
+
+        assert!(
+            result.contains("please rename the function instead"),
+            "the user's request must reach the model, got {result:?}"
+        );
+        assert!(
+            !result.lines().any(|line| line.starts_with("--- ")),
+            "a refusal must not carry the diff, which the transcript renderer reads as a \
+             successful edit, got:\n{result}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "before\n",
+            "action=chat must not write"
+        );
+    }
+
+    fn write_hook(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let hook = dir.path().join(name);
+        fs::write(&hook, format!("#!/bin/sh\n{body}\n")).expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        }
+        hook
+    }
+
+    /// The hook runs after the terminal is back in raw mode, so inherited
+    /// stdout would be painted straight into the live frame.
+    #[tokio::test]
+    async fn test_post_save_hook_output_is_captured_not_inherited() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hook = write_hook(&dir, "noisy", "echo out; echo problem >&2; exit 3");
+        let note = run_hook(&hook, "/tmp/target").await;
+        let note = note.expect("a failing hook must be reported rather than swallowed");
+        assert!(
+            note.contains("problem"),
+            "the hook's own diagnostics must reach the caller instead of the terminal, \
+             got: {note}"
+        );
+        assert!(
+            note.contains("exit"),
+            "the report must name the failure, got: {note}"
+        );
+    }
+
+    /// An inherited stdin would race the key reader for the user's keystrokes,
+    /// and a hook that waits for input would hang the tool.
+    #[tokio::test]
+    async fn test_post_save_hook_reading_stdin_does_not_hang() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hook = write_hook(&dir, "reader", "read line; echo \"read:$line\"");
+        // Returning at all is the assertion: with inherited stdin this waits
+        // forever. stdin is /dev/null, so the read sees EOF immediately.
+        let note = run_hook(&hook, "/tmp/target").await;
+        assert!(
+            note.as_deref().map(|n| n.contains("exit")).unwrap_or(true),
+            "a hook reading stdin must finish on EOF, got: {note:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_save_hook_that_cannot_start_is_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hook = dir.path().join("not-executable");
+        fs::write(&hook, "#!/bin/sh\ntrue\n").expect("write hook");
+        let note = run_hook(&hook, "/tmp/target").await;
+        let note = note.expect("a hook that cannot start must be reported, not swallowed");
+        assert!(
+            note.contains("could not be started"),
+            "the report must say the hook never ran, got: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_hook_is_silent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hook = write_hook(&dir, "quiet", "exit 0");
+        assert_eq!(
+            run_hook(&hook, "/tmp/target").await,
+            None,
+            "a hook that succeeds must add nothing to the tool result"
         );
     }
 
