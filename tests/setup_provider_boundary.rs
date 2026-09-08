@@ -623,6 +623,14 @@ fn test_setup_provider_add_and_cancel_cross_render_apply_save_reload_boundary() 
     );
     cancelled.send(b"y");
     let cancel_status = cancelled.wait_for_exit("cancelling production setup");
+    let cancel_transcript = cancelled.transcript();
+    assert!(
+        !cancel_status.success() && cancel_transcript.contains("Setup cancelled"),
+        "cancelling production setup must take the explicit cancellation outcome, not merely \
+         terminate before writing. Config path: {}. Exit status: {cancel_status:?}. \
+         Terminal was:\n{cancel_transcript}",
+        fixture.config_path.display()
+    );
     let after_cancel = Snapshot::read(&fixture.config_path);
     assert_eq!(
         after_cancel.bytes,
