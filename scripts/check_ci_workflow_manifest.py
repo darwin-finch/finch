@@ -219,24 +219,33 @@ def file_identity(metadata: os.stat_result) -> FileIdentity:
     )
 
 
-def open_path_descriptor(path: Path, display: str) -> int:
+def open_path_descriptor(
+    path: Path | str,
+    display: str,
+    *,
+    dir_fd: int | None = None,
+    diagnostic_path: Path | None = None,
+) -> int:
     """Open ``path`` without following links or blocking; the caller owns the fd."""
+    shown_path = diagnostic_path if diagnostic_path is not None else path
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise ContractError(
-            f"{display}: O_NOFOLLOW is unavailable; refusing to open path={path}"
+            f"{display}: O_NOFOLLOW is unavailable; refusing to open path={shown_path}"
         )
     nonblock = getattr(os, "O_NONBLOCK", None)
     if nonblock is None:
         raise ContractError(
-            f"{display}: O_NONBLOCK is unavailable; refusing to open path={path}"
+            f"{display}: O_NONBLOCK is unavailable; refusing to open path={shown_path}"
         )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
-        return os.open(path, flags)
+        if dir_fd is None:
+            return os.open(path, flags)
+        return os.open(path, flags, dir_fd=dir_fd)
     except OSError as error:
         raise ContractError(
-            f"{display}: path={path} could not be opened with no-follow nonblocking "
+            f"{display}: path={shown_path} could not be opened with no-follow nonblocking "
             f"read-only flags: {error}"
         ) from error
 
@@ -465,15 +474,14 @@ def read_bounded_descriptor(
 ) -> bytes:
     """Read through EOF or the first byte beyond the reviewed bound."""
     capture_limit = min(expected_size + 1, maximum + 1)
-    chunks: list[bytes] = []
+    contents = bytearray()
     consumed = 0
     while consumed < capture_limit:
         chunk = os.read(descriptor, capture_limit - consumed)
         if not chunk:
             break
-        chunks.append(chunk)
+        contents.extend(chunk)
         consumed += len(chunk)
-    contents = b"".join(chunks)
     if expected_size > maximum or len(contents) > maximum:
         raise ContractError(
             f"{display}: captured {len(contents)} bytes exceeds the reviewed "
@@ -484,7 +492,60 @@ def read_bounded_descriptor(
             f"{display}: file size changed while reading; expected={expected_size} "
             f"actual={len(contents)}"
         )
-    return contents
+    return bytes(contents)
+
+
+def manifest_parent_identity(root: Path) -> FileIdentity:
+    """Validate and identify the manifest's fixed containing directory."""
+    parent = root / MANIFEST_PATH.parent
+    display = MANIFEST_PATH.parent.as_posix()
+    try:
+        metadata = parent.lstat()
+    except OSError as error:
+        raise ContractError(
+            f"{display}: manifest parent metadata could not be read: path={parent} "
+            f"error={error}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ContractError(
+            f"{display}: manifest parent must be a real directory, not a symbolic link; "
+            f"path={parent}"
+        )
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ContractError(
+            f"{display}: manifest parent must be a directory; path={parent} "
+            f"mode={stat.filemode(metadata.st_mode)!r}"
+        )
+    return file_identity(metadata)
+
+
+def manifest_file_metadata(
+    parent_descriptor: int, path: Path, display: str, maximum: int
+) -> os.stat_result:
+    """Read final-component manifest metadata relative to its pinned parent."""
+    try:
+        metadata = os.stat(
+            MANIFEST_PATH.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+    except OSError as error:
+        raise ContractError(
+            f"{display}: file metadata could not be read: path={path} error={error}"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ContractError(
+            f"{display}: must be a regular file, not a symbolic link; path={path}"
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ContractError(
+            f"{display}: must be a regular file; path={path} found mode "
+            f"{stat.filemode(metadata.st_mode)!r}"
+        )
+    if metadata.st_size > maximum:
+        raise ContractError(
+            f"{display}: path={path} {metadata.st_size} bytes exceeds the reviewed "
+            f"{maximum}-byte bound"
+        )
+    return metadata
 
 
 def manifest_bytes_snapshot(
@@ -496,11 +557,59 @@ def manifest_bytes_snapshot(
     """Capture bounded manifest bytes during one validated descriptor lifetime."""
     path = root / MANIFEST_PATH
     display = MANIFEST_PATH.as_posix()
-    initial = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
-    if before_open_hook is not None:
-        before_open_hook(path)
-    descriptor = open_path_descriptor(path, display)
+    initial_parent_identity = manifest_parent_identity(root)
+    parent = path.parent
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    for flag_name, flag in (
+        ("O_NOFOLLOW", nofollow),
+        ("O_DIRECTORY", directory),
+        ("O_NONBLOCK", nonblock),
+    ):
+        if flag is None:
+            raise ContractError(
+                f"{display}: {flag_name} is unavailable; refusing to open "
+                f"manifest parent path={parent}"
+            )
+    parent_descriptor: int | None = None
+    descriptor: int | None = None
     try:
+        parent_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | directory | nonblock
+        )
+        try:
+            parent_descriptor = os.open(parent, parent_flags)
+        except OSError as error:
+            raise ContractError(
+                f"{display}: manifest parent path={parent} could not be opened with "
+                f"no-follow nonblocking read-only directory flags: {error}"
+            ) from error
+        opened_parent = os.fstat(parent_descriptor)
+        opened_parent_identity = file_identity(opened_parent)
+        if not stat.S_ISDIR(opened_parent.st_mode):
+            raise ContractError(
+                f"{display}: manifest parent opened as a non-directory; path={parent} "
+                f"opened_mode={stat.filemode(opened_parent.st_mode)!r} "
+                f"opened_parent_identity={opened_parent_identity!r}"
+            )
+        if opened_parent_identity != initial_parent_identity:
+            raise ContractError(
+                f"{display}: manifest parent identity changed before capture; path={parent} "
+                f"initial_parent_identity={initial_parent_identity!r} "
+                f"opened_parent_identity={opened_parent_identity!r}"
+            )
+        initial = manifest_file_metadata(
+            parent_descriptor, path, display, MAX_MANIFEST_BYTES
+        )
+        if before_open_hook is not None:
+            before_open_hook(path)
+        descriptor = open_path_descriptor(
+            MANIFEST_PATH.name,
+            display,
+            dir_fd=parent_descriptor,
+            diagnostic_path=path,
+        )
         opened = os.fstat(descriptor)
         opened_identity = file_identity(opened)
         if not stat.S_ISREG(opened.st_mode):
@@ -530,16 +639,39 @@ def manifest_bytes_snapshot(
                 f"capture; opened_identity={opened_identity!r} "
                 f"final_opened_identity={final_opened_identity!r}"
             )
-        live = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
+        try:
+            live = manifest_file_metadata(
+                parent_descriptor, path, display, MAX_MANIFEST_BYTES
+            )
+        except ContractError as error:
+            raise ContractError(
+                f"{display}: path={path} live identity could not be validated during "
+                f"capture; opened_identity={opened_identity!r}; error={error}"
+            ) from error
         live_identity = file_identity(live)
         if live_identity != opened_identity:
             raise ContractError(
                 f"{display}: path={path} live identity changed during capture; "
                 f"opened_identity={opened_identity!r} live_identity={live_identity!r}"
             )
+        final_opened_parent_identity = file_identity(os.fstat(parent_descriptor))
+        live_parent_identity = manifest_parent_identity(root)
+        if (
+            final_opened_parent_identity != opened_parent_identity
+            or live_parent_identity != opened_parent_identity
+        ):
+            raise ContractError(
+                f"{display}: path={path} manifest parent identity changed during capture; "
+                f"opened_parent_identity={opened_parent_identity!r} "
+                f"final_opened_parent_identity={final_opened_parent_identity!r} "
+                f"live_parent_identity={live_parent_identity!r}"
+            )
         return contents, opened_identity
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def load_manifest(

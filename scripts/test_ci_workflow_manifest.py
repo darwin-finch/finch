@@ -9,9 +9,11 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,9 +29,11 @@ from check_ci_workflow_manifest import (
     compare_contract,
     file_identity,
     hash_canonical_workflow_stream,
+    load_manifest,
     manifest_bytes_snapshot,
+    manifest_file_metadata,
     open_path_descriptor,
-    open_path_descriptor,
+    read_bounded_descriptor,
     read_exact_bytes,
     regular_file_metadata,
     workflow_records,
@@ -128,6 +132,7 @@ class WorkflowManifestTests(unittest.TestCase):
                 | os.O_NOFOLLOW
                 | os.O_NONBLOCK
             )
+            expected_parent_flags = expected_flags | os.O_DIRECTORY
             self.assertEqual(
                 captured,
                 contents,
@@ -137,13 +142,21 @@ class WorkflowManifestTests(unittest.TestCase):
             )
             self.assertEqual(
                 opens,
-                [(manifest, expected_flags, opens[0][2])],
-                "manifest capture must open exactly once with the exact safe mask: "
-                f"path={manifest} opens={opens!r} expected_flags={expected_flags:#x}",
+                [
+                    (manifest.parent, expected_parent_flags, opens[0][2]),
+                    (Path(manifest.name), expected_flags, opens[1][2]),
+                ],
+                "manifest capture must pin its parent then open the leaf with exact safe "
+                f"masks: path={manifest} opens={opens!r} "
+                f"expected_parent_flags={expected_parent_flags:#x} "
+                f"expected_leaf_flags={expected_flags:#x}",
             )
-            self.assert_fd_closed(
-                opens[0][2], f"successful manifest capture must close fd path={manifest}"
-            )
+            for opened_path, _, descriptor in opens:
+                self.assert_fd_closed(
+                    descriptor,
+                    f"successful manifest capture must close fd path={manifest} "
+                    f"opened_path={opened_path}",
+                )
 
     def test_manifest_snapshot_static_first_excess_rejects_before_open(self) -> None:
         contents = b"x" * (MAX_MANIFEST_BYTES + 1)
@@ -176,7 +189,10 @@ class WorkflowManifestTests(unittest.TestCase):
             ) as safe_open:
                 manifest_bytes_snapshot(root)
             safe_open.assert_called_once_with(
-                manifest, "scripts/ci_workflow_manifest.json"
+                manifest.name,
+                "scripts/ci_workflow_manifest.json",
+                dir_fd=mock.ANY,
+                diagnostic_path=manifest,
             )
 
     def test_manifest_snapshot_first_excess_is_only_excess_byte_pulled(self) -> None:
@@ -189,7 +205,8 @@ class WorkflowManifestTests(unittest.TestCase):
 
             def retain_offset(path, flags, *args, **kwargs):
                 descriptor = real_open(path, flags, *args, **kwargs)
-                duplicate_fds.append(os.dup(descriptor))
+                if Path(path).name == manifest.name:
+                    duplicate_fds.append(os.dup(descriptor))
                 return descriptor
 
             def grow_after_open(path: Path) -> None:
@@ -258,6 +275,121 @@ class WorkflowManifestTests(unittest.TestCase):
                 f"path={manifest} requests={requests!r} expected_size={len(contents)}",
             )
 
+    def test_manifest_short_reads_retain_bounded_accumulator_overhead(self) -> None:
+        remaining = MAX_MANIFEST_BYTES
+        reads = 0
+
+        def one_fresh_byte(_descriptor: int, _requested: int) -> bytes:
+            nonlocal remaining, reads
+            reads += 1
+            if remaining == 0:
+                return b""
+            remaining -= 1
+            return bytes(bytearray((remaining & 0xFF,)))
+
+        tracemalloc.start()
+        try:
+            with mock.patch(
+                "check_ci_workflow_manifest.os.read", new=one_fresh_byte
+            ):
+                captured = read_bounded_descriptor(
+                    -1,
+                    MAX_MANIFEST_BYTES,
+                    MAX_MANIFEST_BYTES,
+                    "scripts/ci_workflow_manifest.json",
+                )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(
+            len(captured),
+            MAX_MANIFEST_BYTES,
+            "one-byte legal reads must preserve the exact reviewed payload: "
+            f"captured={len(captured)} expected={MAX_MANIFEST_BYTES} reads={reads} "
+            f"peak={peak}",
+        )
+        self.assertEqual(
+            reads,
+            MAX_MANIFEST_BYTES + 1,
+            "exact-limit one-byte reads must finish with one EOF probe: "
+            f"reads={reads} expected={MAX_MANIFEST_BYTES + 1} peak={peak}",
+        )
+        self.assertLess(
+            peak,
+            MAX_MANIFEST_BYTES * 8,
+            "legal short reads must not retain one allocation per byte: "
+            f"payload={MAX_MANIFEST_BYTES} reads={reads} traced_peak={peak} "
+            f"bound={MAX_MANIFEST_BYTES * 8}",
+        )
+
+    def test_file_identity_pins_all_five_fields_and_rejects_ctime_only_change(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"raw")
+            initial = manifest.stat()
+            expected = (
+                initial.st_dev,
+                initial.st_ino,
+                initial.st_size,
+                initial.st_mtime_ns,
+                initial.st_ctime_ns,
+            )
+            self.assertEqual(
+                file_identity(initial),
+                expected,
+                "file identity must independently pin dev, inode, size, mtime_ns, and "
+                f"ctime_ns in that order: path={manifest} expected={expected!r} "
+                f"actual={file_identity(initial)!r}",
+            )
+
+            changed: os.stat_result | None = None
+
+            def change_ctime_only(path: Path) -> None:
+                nonlocal changed
+                os.chmod(path, initial.st_mode ^ stat.S_IXUSR)
+                changed = path.stat()
+                stable_four = (
+                    changed.st_dev,
+                    changed.st_ino,
+                    changed.st_size,
+                    changed.st_mtime_ns,
+                )
+                initial_four = expected[:4]
+                self.assertEqual(
+                    stable_four,
+                    initial_four,
+                    "ctime-only fixture must preserve the other identity fields: "
+                    f"path={path} initial={expected!r} changed="
+                    f"{(stable_four + (changed.st_ctime_ns,))!r}",
+                )
+                self.assertNotEqual(
+                    changed.st_ctime_ns,
+                    initial.st_ctime_ns,
+                    "ctime-only fixture must actually advance ctime_ns: "
+                    f"path={path} initial_ctime={initial.st_ctime_ns} "
+                    f"changed_ctime={changed.st_ctime_ns}",
+                )
+
+            with self.assertRaises(
+                ContractError,
+                msg=(
+                    "manifest capture must reject a ctime-only pre-open change: "
+                    f"path={manifest} initial_identity={expected!r}"
+                ),
+            ) as raised:
+                manifest_bytes_snapshot(root, before_open_hook=change_ctime_only)
+            self.assertIsNotNone(
+                changed,
+                f"ctime-only mutation hook must run before manifest open: path={manifest}",
+            )
+            self.assertIn(
+                f"initial_identity={expected!r}",
+                str(raised.exception),
+                "ctime-only rejection must report the independently pinned initial "
+                f"identity: path={manifest} changed={changed!r} "
+                f"diagnostic={str(raised.exception)!r}",
+            )
+
     def test_manifest_snapshot_rejects_preopen_identity_mutations_and_closes(self) -> None:
         for mutation in ("distinct", "same-inode-size", "same-inode-metadata"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as name:
@@ -315,14 +447,17 @@ class WorkflowManifestTests(unittest.TestCase):
                     )
                 self.assertEqual(
                     len(descriptors),
-                    1,
-                    "pre-open mutation must use exactly one descriptor: "
+                    2,
+                    "pre-open mutation must use one pinned parent and one manifest "
+                    "descriptor: "
                     f"path={manifest} mutation={mutation} descriptors={descriptors!r}",
                 )
-                self.assert_fd_closed(
-                    descriptors[0],
-                    f"pre-open {mutation} rejection must close fd path={manifest}",
-                )
+                for descriptor in descriptors:
+                    self.assert_fd_closed(
+                        descriptor,
+                        f"pre-open {mutation} rejection must close every fd "
+                        f"path={manifest}",
+                    )
 
     def test_manifest_snapshot_rejects_growth_and_truncation_and_closes(self) -> None:
         for mutation in ("growth", "truncation"):
@@ -394,14 +529,15 @@ class WorkflowManifestTests(unittest.TestCase):
                     manifest_bytes_snapshot(root, before_open_hook=replace_with_directory)
             self.assertEqual(
                 len(descriptors),
-                1,
-                "directory replacement must reach exactly one bounded descriptor open: "
+                2,
+                "directory replacement must reach one parent and one bounded manifest open: "
                 f"path={manifest} descriptors={descriptors!r}",
             )
-            self.assert_fd_closed(
-                descriptors[0],
-                f"nonregular directory rejection must close fd path={manifest}",
-            )
+            for descriptor in descriptors:
+                self.assert_fd_closed(
+                    descriptor,
+                    f"nonregular directory rejection must close every fd path={manifest}",
+                )
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO replacement requires os.mkfifo")
     def test_manifest_snapshot_rejects_fifo_promptly_and_closes(self) -> None:
@@ -458,16 +594,27 @@ class WorkflowManifestTests(unittest.TestCase):
             "pathname-replacement",
             "pathname-removal",
             "pathname-symlink",
+            "live-identity",
         ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as name:
                 root = Path(name)
                 manifest = self.write_manifest_source(root, b"original")
+                initial_metadata = manifest.stat()
+                expected_opened_identity = (
+                    initial_metadata.st_dev,
+                    initial_metadata.st_ino,
+                    initial_metadata.st_size,
+                    initial_metadata.st_mtime_ns,
+                    initial_metadata.st_ctime_ns,
+                )
                 replacement = root / "replacement.json"
                 replacement.write_bytes(b"replacement")
                 symlink_target = root / "symlink-target.json"
                 symlink_target.write_bytes(b"original")
                 real_open = os.open
+                real_manifest_metadata = manifest_file_metadata
                 descriptors: list[int] = []
+                manifest_metadata_calls = 0
 
                 def record_open(path, flags, *args, **kwargs):
                     descriptor = real_open(path, flags, *args, **kwargs)
@@ -491,27 +638,108 @@ class WorkflowManifestTests(unittest.TestCase):
                         os.replace(replacement, manifest)
                     elif mutation == "pathname-removal":
                         manifest.unlink()
-                    else:
+                    elif mutation == "pathname-symlink":
                         manifest.unlink()
                         manifest.symlink_to(symlink_target.name)
 
+                def staged_manifest_metadata(
+                    parent_descriptor: int, path: Path, display: str, maximum: int
+                ):
+                    nonlocal manifest_metadata_calls
+                    manifest_metadata_calls += 1
+                    if mutation == "live-identity" and manifest_metadata_calls == 2:
+                        return replacement.stat()
+                    return real_manifest_metadata(
+                        parent_descriptor, path, display, maximum
+                    )
+
                 with mock.patch(
                     "check_ci_workflow_manifest.os.open", side_effect=record_open
+                ), mock.patch(
+                    "check_ci_workflow_manifest.manifest_file_metadata",
+                    side_effect=staged_manifest_metadata,
                 ):
-                    with self.assertRaisesRegex(
+                    with self.assertRaises(
                         ContractError,
-                        "(opened descriptor identity|live identity) changed during capture|"
-                        "file metadata could not be read|must be a regular file, not a symbolic link",
                         msg=(
                             "post-read descriptor/path mutation must fail final validation: "
                             f"path={manifest} mutation={mutation} descriptors={descriptors!r}"
                         ),
-                    ):
+                    ) as raised:
                         manifest_bytes_snapshot(root, after_read_hook=mutate)
-                self.assert_fd_closed(
-                    descriptors[0],
-                    f"final {mutation} rejection must close fd path={manifest}",
+                diagnostic = str(raised.exception)
+                self.assertIn(
+                    str(manifest),
+                    diagnostic,
+                    "final manifest validation diagnostic must name the absolute path: "
+                    f"path={manifest} mutation={mutation} diagnostic={diagnostic!r}",
                 )
+                if mutation == "descriptor-metadata":
+                    final_metadata = manifest.stat()
+                    expected_final_identity = (
+                        final_metadata.st_dev,
+                        final_metadata.st_ino,
+                        final_metadata.st_size,
+                        final_metadata.st_mtime_ns,
+                        final_metadata.st_ctime_ns,
+                    )
+                    for detail in (
+                        f"opened_identity={expected_opened_identity!r}",
+                        f"final_opened_identity={expected_final_identity!r}",
+                    ):
+                        self.assertIn(
+                            detail,
+                            diagnostic,
+                            "final descriptor mismatch must report both actionable "
+                            f"identities: path={manifest} mutation={mutation} "
+                            f"detail={detail!r} diagnostic={diagnostic!r}",
+                        )
+                elif mutation == "live-identity":
+                    live_metadata = replacement.stat()
+                    expected_live_identity = (
+                        live_metadata.st_dev,
+                        live_metadata.st_ino,
+                        live_metadata.st_size,
+                        live_metadata.st_mtime_ns,
+                        live_metadata.st_ctime_ns,
+                    )
+                    for detail in (
+                        f"opened_identity={expected_opened_identity!r}",
+                        f"live_identity={expected_live_identity!r}",
+                    ):
+                        self.assertIn(
+                            detail,
+                            diagnostic,
+                            "final live-path mismatch must report both actionable identities: "
+                            f"path={manifest} mutation={mutation} detail={detail!r} "
+                            f"diagnostic={diagnostic!r}",
+                        )
+                elif mutation == "pathname-replacement":
+                    self.assertIn(
+                        f"opened_identity={expected_opened_identity!r}",
+                        diagnostic,
+                        "pathname replacement must retain the actionable opened identity: "
+                        f"path={manifest} mutation={mutation} diagnostic={diagnostic!r}",
+                    )
+                    self.assertRegex(
+                        diagnostic,
+                        r"final_opened_identity=\([^)]*[0-9][^)]*\)",
+                        "pathname replacement must report a populated final descriptor "
+                        f"identity: path={manifest} mutation={mutation} "
+                        f"diagnostic={diagnostic!r}",
+                    )
+                elif mutation in ("pathname-removal", "pathname-symlink"):
+                    self.assertIn(
+                        f"opened_identity={expected_opened_identity!r}",
+                        diagnostic,
+                        "unreadable final live path must retain the opened identity: "
+                        f"path={manifest} mutation={mutation} diagnostic={diagnostic!r}",
+                    )
+                for descriptor in descriptors:
+                    self.assert_fd_closed(
+                        descriptor,
+                        f"final {mutation} rejection must close every fd path={manifest}",
+                    )
 
     def test_manifest_snapshot_fails_closed_without_required_open_capability(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -528,7 +756,8 @@ class WorkflowManifestTests(unittest.TestCase):
                         ) as opened:
                             with self.assertRaisesRegex(
                                 ContractError,
-                                rf"{flag_name} is unavailable; refusing to open path={manifest}",
+                                rf"{flag_name} is unavailable; refusing to open "
+                                rf"manifest parent path={manifest.parent}",
                                 msg=(
                                     "manifest capture must fail before open without capability: "
                                     f"path={manifest} flag={flag_name}"
@@ -538,6 +767,33 @@ class WorkflowManifestTests(unittest.TestCase):
                             opened.assert_not_called()
                     finally:
                         setattr(os, flag_name, original)
+
+    def test_load_manifest_uses_fail_closed_descriptor_capture(self) -> None:
+        repository = WorkflowRepository()
+        original = os.O_NONBLOCK
+        try:
+            delattr(os, "O_NONBLOCK")
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open",
+                side_effect=AssertionError(
+                    "load_manifest reached os.open without required O_NONBLOCK"
+                ),
+            ) as opened:
+                with self.assertRaisesRegex(
+                    ContractError,
+                    rf"O_NONBLOCK is unavailable; refusing to open manifest parent "
+                    rf"path={repository.manifest_path().parent}",
+                    msg=(
+                        "the production load_manifest boundary must compose fail-closed "
+                        "descriptor capture when O_NONBLOCK is absent: "
+                        f"root={repository.root} manifest={repository.manifest_path()}"
+                    ),
+                ):
+                    load_manifest(repository.root)
+                opened.assert_not_called()
+        finally:
+            setattr(os, "O_NONBLOCK", original)
+            repository.close()
 
     def test_manifest_snapshot_interruptions_after_binding_close_fd(self) -> None:
         for stage in (
@@ -549,6 +805,9 @@ class WorkflowManifestTests(unittest.TestCase):
             "identity-3",
             "final-metadata",
             "identity-4",
+            "parent-final-fstat",
+            "identity-5",
+            "identity-6",
         ):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as name:
                 root = Path(name)
@@ -556,9 +815,10 @@ class WorkflowManifestTests(unittest.TestCase):
                 real_open = os.open
                 real_fstat = os.fstat
                 real_identity = file_identity
-                real_metadata = regular_file_metadata
+                real_metadata = manifest_file_metadata
                 real_read = os.read
                 descriptors: list[int] = []
+                manifest_descriptors: list[int] = []
                 fstat_calls = 0
                 identity_calls = 0
                 metadata_calls = 0
@@ -566,20 +826,26 @@ class WorkflowManifestTests(unittest.TestCase):
                 def record_open(path, flags, *args, **kwargs):
                     descriptor = real_open(path, flags, *args, **kwargs)
                     descriptors.append(descriptor)
+                    if Path(path).name == manifest.name:
+                        manifest_descriptors.append(descriptor)
                     return descriptor
 
                 def staged_fstat(descriptor: int):
                     nonlocal fstat_calls
-                    fstat_calls += 1
+                    if manifest_descriptors:
+                        fstat_calls += 1
                     if stage == "first-fstat" and fstat_calls == 1:
                         raise KeyboardInterrupt("injected first fstat interruption")
                     if stage == "final-fstat" and fstat_calls == 2:
                         raise KeyboardInterrupt("injected final fstat interruption")
+                    if stage == "parent-final-fstat" and fstat_calls == 3:
+                        raise KeyboardInterrupt("injected parent final fstat interruption")
                     return real_fstat(descriptor)
 
                 def staged_identity(metadata: os.stat_result):
                     nonlocal identity_calls
-                    identity_calls += 1
+                    if manifest_descriptors:
+                        identity_calls += 1
                     if stage.startswith("identity-") and identity_calls == int(
                         stage.removeprefix("identity-")
                     ):
@@ -588,12 +854,14 @@ class WorkflowManifestTests(unittest.TestCase):
                         )
                     return real_identity(metadata)
 
-                def staged_metadata(path: Path, display: str, maximum: int):
+                def staged_metadata(
+                    parent_descriptor: int, path: Path, display: str, maximum: int
+                ):
                     nonlocal metadata_calls
                     metadata_calls += 1
                     if stage == "final-metadata" and metadata_calls == 2:
                         raise KeyboardInterrupt("injected final metadata interruption")
-                    return real_metadata(path, display, maximum)
+                    return real_metadata(parent_descriptor, path, display, maximum)
 
                 read_effect = (
                     KeyboardInterrupt("injected read interruption")
@@ -609,7 +877,7 @@ class WorkflowManifestTests(unittest.TestCase):
                 ), mock.patch(
                     "check_ci_workflow_manifest.os.read", side_effect=read_effect
                 ), mock.patch(
-                    "check_ci_workflow_manifest.regular_file_metadata",
+                    "check_ci_workflow_manifest.manifest_file_metadata",
                     side_effect=staged_metadata,
                 ):
                     with self.assertRaises(
@@ -624,15 +892,79 @@ class WorkflowManifestTests(unittest.TestCase):
                         manifest_bytes_snapshot(root)
                 self.assertEqual(
                     len(descriptors),
-                    1,
-                    "interruption must occur after exactly one descriptor binding: "
+                    2,
+                    "interruption must occur after parent and manifest descriptor binding: "
                     f"path={manifest} stage={stage} descriptors={descriptors!r} "
                     f"fstat_calls={fstat_calls} identity_calls={identity_calls} "
                     f"metadata_calls={metadata_calls}",
                 )
+                for descriptor in descriptors:
+                    self.assert_fd_closed(
+                        descriptor,
+                        f"post-binding interruption must close every fd "
+                        f"path={manifest} stage={stage}",
+                    )
+
+    def test_manifest_interrupt_immediately_after_descriptor_store_closes_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"raw")
+            real_open = os.open
+            opened: list[tuple[Path, int]] = []
+            interrupted_descriptor: int | None = None
+
+            def record_open(path, flags, *args, **kwargs):
+                descriptor = real_open(path, flags, *args, **kwargs)
+                opened.append((Path(path), descriptor))
+                return descriptor
+
+            def trace(frame, event, _argument):
+                nonlocal interrupted_descriptor
+                if frame.f_code is not manifest_bytes_snapshot.__code__:
+                    return trace
+                if event != "line":
+                    return trace
+                descriptor = frame.f_locals.get("descriptor")
+                if descriptor is not None:
+                    interrupted_descriptor = descriptor
+                    raise KeyboardInterrupt(
+                        "injected at the first traced line after manifest descriptor binding"
+                    )
+                return trace
+
+            with mock.patch(
+                "check_ci_workflow_manifest.os.open", side_effect=record_open
+            ):
+                sys.settrace(trace)
+                try:
+                    with self.assertRaises(
+                        KeyboardInterrupt,
+                        msg=(
+                            "opcode regression must interrupt immediately after the returned "
+                            f"manifest fd is bound: path={manifest} opened={opened!r}"
+                        ),
+                    ):
+                        manifest_bytes_snapshot(root)
+                finally:
+                    sys.settrace(None)
+            manifest_descriptors = [
+                descriptor
+                for path, descriptor in opened
+                if path.name == manifest.name
+            ]
+            self.assertEqual(
+                manifest_descriptors,
+                [interrupted_descriptor],
+                "opcode fixture must interrupt after the exact manifest descriptor binding: "
+                f"path={manifest} opened={opened!r} "
+                f"interrupted_descriptor={interrupted_descriptor!r}",
+            )
+            for opened_path, descriptor in opened:
                 self.assert_fd_closed(
-                    descriptors[0],
-                    f"post-binding interruption must close fd path={manifest} stage={stage}",
+                    descriptor,
+                    "sentinel-protected try/finally must close every bound descriptor after "
+                    f"the post-STORE_FAST interruption: manifest={manifest} "
+                    f"opened_path={opened_path} opened={opened!r}",
                 )
 
     def test_path_descriptor_open_uses_exact_read_only_safety_mask(self) -> None:
@@ -1445,6 +1777,86 @@ class WorkflowManifestTests(unittest.TestCase):
             self.assert_rejected(repository, "ci_workflow_manifest.json", "not a symbolic link")
         finally:
             repository.close()
+
+    def test_symlinked_manifest_parent_is_rejected_at_checker_boundary(self) -> None:
+        repository = WorkflowRepository()
+        with tempfile.TemporaryDirectory() as external_name:
+            external = Path(external_name) / "scripts"
+            try:
+                scripts = repository.root / "scripts"
+                shutil.copytree(scripts, external)
+                shutil.rmtree(scripts)
+                scripts.symlink_to(external, target_is_directory=True)
+                result = repository.run()
+                output = result.stdout + result.stderr
+                self.assertEqual(
+                    result.returncode,
+                    1,
+                    "the executable checker must reject a manifest reached through a "
+                    "symlinked scripts parent instead of accepting external bytes: "
+                    f"root={repository.root} parent={scripts} target={external} "
+                    f"stdout={result.stdout!r} stderr={result.stderr!r}",
+                )
+                for detail in (str(scripts), "real directory", "symbolic link"):
+                    self.assertIn(
+                        detail,
+                        output,
+                        "symlinked manifest-parent rejection must identify the unsafe "
+                        f"component: root={repository.root} parent={scripts} "
+                        f"target={external} detail={detail!r} output={output!r}",
+                    )
+            finally:
+                repository.close()
+
+    def test_manifest_parent_descriptor_defeats_transient_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as name, tempfile.TemporaryDirectory() as external_name:
+            root = Path(name)
+            manifest = self.write_manifest_source(root, b"reviewed-parent-bytes")
+            scripts = manifest.parent
+            retained = root / "retained-scripts"
+            external = Path(external_name) / "scripts"
+            external.mkdir()
+            external_manifest = external / manifest.name
+            external_manifest.write_bytes(b"external-parent-bytes")
+            swapped = False
+
+            def swap_parent(_path: Path) -> None:
+                nonlocal swapped
+                scripts.rename(retained)
+                scripts.symlink_to(external, target_is_directory=True)
+                swapped = True
+
+            def restore_parent(_path: Path) -> None:
+                scripts.unlink()
+                retained.rename(scripts)
+
+            with self.assertRaises(
+                ContractError,
+                msg=(
+                    "a transient manifest-parent symlink swap must fail closed after "
+                    f"reading only the pinned directory: root={root} parent={scripts} "
+                    f"external={external}"
+                ),
+            ) as raised:
+                manifest_bytes_snapshot(
+                    root,
+                    before_open_hook=swap_parent,
+                    after_open_hook=restore_parent,
+                )
+            self.assertTrue(
+                swapped,
+                "transient parent-symlink fixture must run between pinned metadata and "
+                f"manifest open: root={root} parent={scripts} external={external}",
+            )
+            diagnostic = str(raised.exception)
+            self.assertIn(
+                "manifest parent identity changed during capture",
+                diagnostic,
+                "transient parent swap must be detected after pinned-directory capture: "
+                f"root={root} parent={scripts} external={external} "
+                f"external_bytes={external_manifest.read_bytes()!r} "
+                f"diagnostic={diagnostic!r}",
+            )
 
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is POSIX-only")
     def test_manifest_symlink_swap_between_lstat_and_open_is_rejected(self) -> None:
