@@ -24,6 +24,11 @@ jobs:
       with:
         components: rustfmt
 
+    - name: Verify canonical test cache authority independently
+      run: |
+        ruby tests/test_ci_cache_authority.rb
+        ruby scripts/check_ci_cache_authority.rb
+
     - name: Verify pinned toolchain and clean-checkout formatting
       run: tests/toolchain_contract.sh
 
@@ -119,7 +124,7 @@ jobs:
       run: cargo run ${{ matrix.cargo_args }} -- --version
 
     - name: Save Cargo registry and build cache
-      if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache-restore.outputs.cache-hit != 'true' }}
+      if: ${{ success() && steps.cargo-cache-restore.outcome == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache-restore.outputs.cache-hit != 'true' }}
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
       continue-on-error: true
       with:

@@ -12,7 +12,19 @@ CACHE_PATHS = ["~/.cargo/registry", "~/.cargo/git", "target"].freeze
 CACHE_KEY = "${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}"
 RESTORE_PREFIX = "${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-"
 SAVE_KEY = "${{ steps.#{RESTORE_ID}.outputs.cache-primary-key }}"
-SAVE_CONDITION = "${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.#{RESTORE_ID}.outputs.cache-hit != 'true' }}"
+SAVE_CONDITION = "${{ success() && steps.#{RESTORE_ID}.outcome == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.#{RESTORE_ID}.outputs.cache-hit != 'true' }}"
+DIRECT_CI_ANCHOR = [
+  "ruby tests/test_ci_cache_authority.rb",
+  "ruby scripts/check_ci_cache_authority.rb"
+].freeze
+DIRECT_CI_STEP = {
+  "name" => "Verify canonical test cache authority independently",
+  "run" => "#{DIRECT_CI_ANCHOR.join("\n")}\n"
+}.freeze
+TOOLCHAIN_CONTRACT_STEP = {
+  "name" => "Verify pinned toolchain and clean-checkout formatting",
+  "run" => "tests/toolchain_contract.sh"
+}.freeze
 
 EXPECTED_MATRIX = [
   { "os" => "ubuntu-24.04", "feature_name" => "default", "cargo_args" => "" },
@@ -72,6 +84,13 @@ def add_mismatch(errors, label, actual, expected)
   errors << "#{label} drifted\n  expected: #{expected.inspect}\n  actual:   #{actual.inspect}"
 end
 
+def mapping_or_error(errors, label, value)
+  return value if value.is_a?(Hash)
+
+  errors << "#{label} must be a mapping; found #{value.inspect}"
+  {}
+end
+
 def cache_contract_errors(job)
   errors = []
   unless job.is_a?(Hash)
@@ -81,6 +100,7 @@ def cache_contract_errors(job)
   add_mismatch(errors, "jobs.test runs-on", job["runs-on"], "${{ matrix.os }}")
   errors << "jobs.test must not have a job-level if condition that can disable cache/workload execution" if job.key?("if")
   errors << "jobs.test must not define defaults that can reinterpret the bounded workload commands" if job.key?("defaults")
+  errors << "jobs.test must not define job-level env that can relocate Cargo outside the reviewed cache paths" if job.key?("env")
   errors << "jobs.test must not define job-level continue-on-error" if job.key?("continue-on-error")
 
   strategy = job["strategy"]
@@ -139,17 +159,19 @@ def cache_contract_errors(job)
   errors << "cache restore must be unconditional; found if: #{restore['if'].inspect}" if restore.key?("if")
   add_mismatch(errors, "cache restore enabled/nonfatal fields", restore.keys, ["name", "id", "uses", "continue-on-error", "with"])
   add_mismatch(errors, "cache restore continue-on-error", restore["continue-on-error"], true)
-  add_mismatch(errors, "cache restore inputs", restore.fetch("with", {}).keys, ["path", "key", "restore-keys"])
-  add_mismatch(errors, "cache restore paths", multiline_lines(restore.dig("with", "path")), CACHE_PATHS)
-  add_mismatch(errors, "cache restore primary key", restore.dig("with", "key"), CACHE_KEY)
-  add_mismatch(errors, "cache restore prefix", multiline_lines(restore.dig("with", "restore-keys")), [RESTORE_PREFIX])
+  restore_inputs = mapping_or_error(errors, "cache restore with", restore["with"])
+  add_mismatch(errors, "cache restore inputs", restore_inputs.keys, ["path", "key", "restore-keys"])
+  add_mismatch(errors, "cache restore paths", multiline_lines(restore_inputs["path"]), CACHE_PATHS)
+  add_mismatch(errors, "cache restore primary key", restore_inputs["key"], CACHE_KEY)
+  add_mismatch(errors, "cache restore prefix", multiline_lines(restore_inputs["restore-keys"]), [RESTORE_PREFIX])
 
   add_mismatch(errors, "cache save enabled/nonfatal fields", save.keys, ["name", "if", "uses", "continue-on-error", "with"])
   add_mismatch(errors, "cache save continue-on-error", save["continue-on-error"], true)
   add_mismatch(errors, "cache save trusted successful-main miss-only condition", save["if"], SAVE_CONDITION)
-  add_mismatch(errors, "cache save inputs", save.fetch("with", {}).keys, ["path", "key"])
-  add_mismatch(errors, "cache save paths", multiline_lines(save.dig("with", "path")), CACHE_PATHS)
-  add_mismatch(errors, "cache save primary-key handoff", save.dig("with", "key"), SAVE_KEY)
+  save_inputs = mapping_or_error(errors, "cache save with", save["with"])
+  add_mismatch(errors, "cache save inputs", save_inputs.keys, ["path", "key"])
+  add_mismatch(errors, "cache save paths", multiline_lines(save_inputs["path"]), CACHE_PATHS)
+  add_mismatch(errors, "cache save primary-key handoff", save_inputs["key"], SAVE_KEY)
 
   unless workload_indices.empty? || restore_index < workload_indices.min
     errors << "cache restore step index #{restore_index} must precede every workload at indices #{workload_indices.inspect}"
@@ -159,6 +181,28 @@ def cache_contract_errors(job)
   end
   errors << "cache save must be the final jobs.test step; save index #{save_index}, final index #{steps.length - 1}" unless save_index == steps.length - 1
 
+  errors
+end
+
+def ci_anchor_errors(document)
+  steps = document.is_a?(Hash) ? document.dig("jobs", "toolchain-contract", "steps") : nil
+  unless steps.is_a?(Array) && steps.all? { |step| step.is_a?(Hash) }
+    return ["jobs.toolchain-contract.steps must be an array of mappings; found #{steps.inspect}"]
+  end
+
+  direct_runs = steps.select { |step| step == DIRECT_CI_STEP }
+  contract_runs = steps.select { |step| step == TOOLCHAIN_CONTRACT_STEP }
+  run_lines = steps.flat_map { |step| multiline_lines(step["run"]) }
+  errors = []
+  errors << "jobs.toolchain-contract must directly invoke the cache suite and checker in one enabled exact step; found #{direct_runs.length}" unless direct_runs.length == 1
+  DIRECT_CI_ANCHOR.each do |invocation|
+    count = run_lines.count(invocation)
+    errors << "jobs.toolchain-contract must contain direct invocation #{invocation.inspect} exactly once; found #{count}" unless count == 1
+  end
+  errors << "jobs.toolchain-contract must invoke tests/toolchain_contract.sh in one enabled exact step; found #{contract_runs.length}" unless contract_runs.length == 1
+  if direct_runs.length == 1 && contract_runs.length == 1 && steps.index(direct_runs.first) >= steps.index(contract_runs.first)
+    errors << "jobs.toolchain-contract direct cache suite/checker anchor must precede tests/toolchain_contract.sh"
+  end
   errors
 end
 
@@ -191,6 +235,7 @@ end
 
 job = document.is_a?(Hash) ? document.dig("jobs", "test") : nil
 errors = cache_contract_errors(job)
+errors.concat(ci_anchor_errors(document))
 errors.concat(wiring_errors) if File.expand_path(workflow_path) == File.expand_path(WORKFLOW_PATH)
 
 if errors.any?
