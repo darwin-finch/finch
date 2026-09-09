@@ -12,6 +12,8 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+python3 scripts/test_generated_ci_workflows.py
+python3 scripts/check_generated_ci_workflows.py
 python3 tests/test_toolchain_locked_metadata.py
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 

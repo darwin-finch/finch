@@ -1,2 +1,4 @@
 .github/workflows/*.yml text eol=lf
 .github/workflows/*.yaml text eol=lf
+tests/fixtures/ci-generated-workflows/*.json text eol=lf
+tests/fixtures/ci-generated-workflows/*.yml text eol=lf

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "workflow": {
+    "condition_policy": "workflow-run-or-bounded-continuation-v1",
+    "dispatch_inputs": {
+      "continuation_cursor": {
+        "default": "",
+        "description": "Opaque bounded cursor for the next trusted reconciliation pass",
+        "required": false,
+        "type": "string"
+      }
+    },
+    "environment": {
+      "CONTINUATION_CURSOR": "inputs.continuation_cursor",
+      "TOKEN": "github.token"
+    },
+    "job_id": "cancel-superseded",
+    "job_name": "Cancel superseded canonical CI runs",
+    "name": "Cancel superseded CI runs",
+    "permissions": {
+      "actions": "write",
+      "pull-requests": "read"
+    },
+    "runner": "ubuntu-24.04",
+    "script": {
+      "body": "import sys\nprint(\"inert authority-envelope fixture; no API calls\", file=sys.stderr)\nraise SystemExit(1)\n",
+      "name": "Run trusted bounded reconciliation controller"
+    },
+    "timeout_minutes": 5,
+    "workflow_run": {
+      "types": [
+        "requested",
+        "in_progress"
+      ],
+      "workflows": [
+        "CI"
+      ]
+    }
+  }
+}

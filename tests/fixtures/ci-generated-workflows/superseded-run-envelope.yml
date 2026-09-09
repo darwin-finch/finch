@@ -1,0 +1,38 @@
+name: "Cancel superseded CI runs"
+
+on:
+  workflow_run:
+    workflows:
+      - "CI"
+    types:
+      - "requested"
+      - "in_progress"
+  workflow_dispatch:
+    inputs:
+      "continuation_cursor":
+        description: "Opaque bounded cursor for the next trusted reconciliation pass"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: write
+  pull-requests: read
+
+jobs:
+  "cancel-superseded":
+    name: "Cancel superseded canonical CI runs"
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'requested' || github.event.workflow_run.run_attempt > 1 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: "Run trusted bounded reconciliation controller"
+        env:
+          "CONTINUATION_CURSOR": ${{ inputs.continuation_cursor }}
+          "TOKEN": ${{ github.token }}
+        run: |
+          python3 - <<'PYTHON'
+          import sys
+          print("inert authority-envelope fixture; no API calls", file=sys.stderr)
+          raise SystemExit(1)
+          PYTHON
