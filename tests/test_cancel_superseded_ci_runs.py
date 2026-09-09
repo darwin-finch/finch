@@ -19,6 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci-superseded-run-cancellation.yml"
 REPO = "darwin-finch/finch"
+REPO_ID = 1_161_397_642
 A = "a" * 40
 B = "b" * 40
 C = "c" * 40
@@ -49,8 +50,11 @@ def validate_workflow_contract(text: str) -> None:
         "runs-on: ubuntu-24.04",
         "timeout-minutes: 5",
         "if: github.event.action == 'requested' || github.event.workflow_run.run_attempt > 1",
-        "MAX_PAGES = 4",
+        "PAGE_SIZE = 100",
+        "MAX_CANDIDATES = 50",
         '"branch": branch,',
+        '"per_page": PAGE_SIZE,',
+        '"Authorization": f"Bearer {token}",',
     }
     forbidden = (
         "concurrency:",
@@ -62,10 +66,12 @@ def validate_workflow_contract(text: str) -> None:
     )
     missing = sorted(required_lines - lines)
     present = [item for item in forbidden if item in text]
-    if missing or present or text.count("runs-on:") != 1:
+    job_if_count = len(re.findall(r"^    if:", text, re.MULTILINE))
+    if missing or present or text.count("runs-on:") != 1 or job_if_count != 1:
         raise AssertionError(
             "trusted cancellation workflow contract drifted: "
-            f"missing={missing!r} forbidden={present!r} jobs={text.count('runs-on:')}"
+            f"missing={missing!r} forbidden={present!r} "
+            f"jobs={text.count('runs-on:')} job_if_count={job_if_count}"
         )
     compile(extract_controller(text), str(WORKFLOW), "exec")
 
@@ -75,7 +81,7 @@ def pr(number: int, sha: str, branch: str = "feature", *, state: str = "open") -
         "number": number,
         "state": state,
         "head": {"sha": sha, "ref": branch, "repo": {"full_name": "fork/repo"}},
-        "base": {"ref": "main", "repo": {"full_name": REPO}},
+        "base": {"ref": "main", "repo": {"id": REPO_ID, "full_name": REPO}},
     }
 
 
@@ -95,7 +101,7 @@ def run(
         "name": "CI",
         "path": ".github/workflows/ci.yml",
         "event": event,
-        "repository": {"full_name": REPO},
+        "repository": {"id": REPO_ID, "full_name": REPO},
         "head_sha": sha,
         "head_branch": branch,
         "run_number": run_number,
@@ -104,8 +110,8 @@ def run(
         "pull_requests": [
             {
                 "number": number,
-                "head": {"sha": sha, "ref": branch, "repo": {"full_name": "fork/repo"}},
-                "base": {"ref": "main", "repo": {"full_name": REPO}},
+                "head": {"sha": sha, "ref": branch, "repo": {"id": 99, "name": "repo", "url": "https://api.test/repos/fork/repo"}},
+                "base": {"ref": "main", "repo": {"id": REPO_ID, "name": "finch", "url": "https://api.test/repos/darwin-finch/finch"}},
             }
         ],
     }
@@ -118,10 +124,15 @@ class FakeGitHub:
         self.runs.update({item["id"]: copy.deepcopy(item) for item in listed or []})
         self.prs = copy.deepcopy(prs)
         self.listed = [copy.deepcopy(item) for item in listed or []]
+        for item in [*self.runs.values(), *self.listed]:
+            associations = item.get("pull_requests", [])
+            if len(associations) == 1 and associations[0].get("number") in self.prs:
+                live_head = self.prs[associations[0]["number"]]["head"]
+                associations[0]["head"]["sha"] = live_head["sha"]
+                associations[0]["head"]["ref"] = live_head["ref"]
         self.requests: list[tuple[str, str]] = []
         self.cancel_attempts: list[int] = []
         self.errors: dict[str, tuple[int, bytes, dict[str, str]]] = {}
-        self.full_pages = False
         self.advance_on_pr_get: tuple[int, str] | None = None
         self.pr_gets = 0
         self.cancel_codes: dict[int, int] = {}
@@ -148,8 +159,21 @@ class FakeGitHub:
                         return True
                 return False
 
+            def authorized(self) -> bool:
+                required = {
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": "Bearer test-token",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }
+                if all(self.headers.get(key) == value for key, value in required.items()):
+                    return True
+                self.reply(401, {"message": "missing required test authorization headers"})
+                return False
+
             def do_GET(self):
                 state.requests.append(("GET", self.path))
+                if not self.authorized():
+                    return
                 if self.route_error():
                     return
                 parsed = urllib.parse.urlparse(self.path)
@@ -169,27 +193,25 @@ class FakeGitHub:
                 if parsed.path == f"/repos/{REPO}/actions/workflows/ci.yml/runs":
                     query = urllib.parse.parse_qs(parsed.query)
                     page = int(query.get("page", ["1"])[0])
+                    per_page = int(query.get("per_page", ["30"])[0])
                     branch = query.get("branch", [""])[0]
-                    if state.full_pages:
-                        start = (page - 1) * 100
-                        values = [
-                            run(10_000 + index, A, index + 1, branch=branch, status="completed")
-                            for index in range(start, start + 100)
-                        ]
-                    else:
-                        values = [
-                            item
-                            for item in state.listed
-                            if item["head_branch"] == branch
-                            and item["event"] == query.get("event", [""])[0]
-                        ]
-                        values = values[(page - 1) * 100 : page * 100]
-                    self.reply(200, {"workflow_runs": values})
+                    status = query.get("status", [""])[0]
+                    matching = [
+                        item
+                        for item in state.listed
+                        if item["head_branch"] == branch
+                        and item["event"] == query.get("event", [""])[0]
+                        and item["status"] == status
+                    ]
+                    values = matching[(page - 1) * per_page : page * per_page]
+                    self.reply(200, {"total_count": len(matching), "workflow_runs": values})
                     return
                 self.reply(404, {"message": "not found"})
 
             def do_POST(self):
                 state.requests.append(("POST", self.path))
+                if not self.authorized():
+                    return
                 if self.route_error():
                     return
                 match = re.fullmatch(rf"/repos/{REPO}/actions/runs/(\d+)/cancel", self.path)
@@ -218,7 +240,11 @@ class FakeGitHub:
 
 
 def event(trigger: dict, action: str = "requested") -> dict:
-    return {"action": action, "repository": {"full_name": REPO}, "workflow_run": trigger}
+    return {
+        "action": action,
+        "repository": {"id": REPO_ID, "full_name": REPO},
+        "workflow_run": trigger,
+    }
 
 
 def execute(fake: FakeGitHub, payload: dict) -> subprocess.CompletedProcess[str]:
@@ -269,6 +295,17 @@ class ControllerTests(unittest.TestCase):
             {7: pr(7, B), 8: pr(8, A)},
             [old_queued, old_rerun, future, same_sha, other_pr, push],
         ) as fake:
+            historical = fake.listed[0]["pull_requests"][0]
+            self.assertEqual(
+                historical["head"]["sha"],
+                B,
+                "GitHub historical run associations expose the PR's current head, not the run SHA",
+            )
+            self.assertNotIn(
+                "full_name",
+                historical["base"]["repo"],
+                "workflow-run association repos must use GitHub's compact id/name/url shape",
+            )
             result = execute(fake, event(trigger))
             self.assert_result(result, fake, [100, 101], "new B after queued/running A")
             self.assertNotIn(push["id"], fake.cancel_attempts, "push work must remain isolated")
@@ -324,29 +361,58 @@ class ControllerTests(unittest.TestCase):
                 "candidate that became the live PR head immediately before cancellation",
             )
 
-    def test_bounded_pagination_finishes_before_first_cancellation(self):
+    def test_explicit_page_size_reaches_stale_run_after_github_default(self):
         trigger = run(500, B, 500)
-        completed = [
-            run(10_000 + index, A, 400 - index, status="completed")
-            for index in range(100)
+        current_sha_runs = [
+            run(10_000 + index, B, 400 - index, status="queued")
+            for index in range(30)
         ]
         old = run(100, A, 10)
-        with FakeGitHub(trigger, {7: pr(7, B)}, completed + [old]) as fake:
+        with FakeGitHub(trigger, {7: pr(7, B)}, current_sha_runs + [old]) as fake:
             result = execute(fake, event(trigger))
-            self.assert_result(result, fake, [100], "two-page branch inventory")
+            self.assert_result(result, fake, [100], "explicit 100-run status page")
             first_post = next(
                 index for index, request in enumerate(fake.requests) if request[0] == "POST"
             )
-            listed_pages = [
+            listings = [
                 request
                 for request in fake.requests[:first_post]
                 if "/actions/workflows/ci.yml/runs?" in request[1]
             ]
             self.assertEqual(
-                len(listed_pages),
-                2,
-                "controller must finish both bounded listing pages before any cancellation: "
+                len(listings),
+                5,
+                "controller must finish every bounded active-status listing before cancellation: "
                 f"requests={fake.requests!r}",
+            )
+            self.assertTrue(
+                all("per_page=100" in path and "page=1" in path for _, path in listings),
+                f"every bounded listing must explicitly request one 100-run page: {listings!r}",
+            )
+
+    def test_completed_history_does_not_consume_active_inventory(self):
+        trigger = run(500, B, 500)
+        completed = [run(20_000 + index, A, index + 1, status="completed") for index in range(400)]
+        old = run(100, A, 10)
+        with FakeGitHub(trigger, {7: pr(7, B)}, completed + [old]) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(result, fake, [100], "large completed branch history")
+
+    def test_more_than_plan_cap_makes_bounded_progress(self):
+        trigger = run(500, B, 500)
+        stale = [run(1_000 + index, A, index + 1) for index in range(51)]
+        with FakeGitHub(trigger, {7: pr(7, B)}, stale) as fake:
+            result = execute(fake, event(trigger))
+            self.assert_result(
+                result,
+                fake,
+                [1_000 + index for index in range(50)],
+                "51 stale runs",
+            )
+            self.assertIn(
+                "bounded_plan_omitted=1",
+                result.stdout,
+                f"bounded progress must report uncancelled remainder: {result.stdout!r}",
             )
 
     def test_ambiguous_closed_and_malformed_identity_fail_closed(self):
@@ -368,7 +434,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, f"{label} must fail closed: {result.stdout!r}")
                 self.assertEqual(fake.cancel_attempts, [], f"{label} cancelled runs: {fake.cancel_attempts!r}")
 
-    def test_api_errors_malformed_json_and_pagination_cap_fail_closed(self):
+    def test_api_errors_and_malformed_json_fail_closed(self):
         trigger = run(200, B, 20)
         for label, error in (
             ("forbidden", (403, b"{}", {})),
@@ -383,11 +449,6 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(fake.cancel_attempts, [], f"{label} caused cancellation: {fake.cancel_attempts!r}")
                 if error[0] in (403, 429, 500):
                     self.assertIn("rate_limit_remaining", result.stderr, result.stderr)
-        with FakeGitHub(trigger, {7: pr(7, B)}) as fake:
-            fake.full_pages = True
-            result = execute(fake, event(trigger))
-            self.assertNotEqual(result.returncode, 0, f"pagination cap was accepted: {result.stdout!r}")
-            self.assertEqual(fake.cancel_attempts, [], f"pagination cap cancelled: {fake.cancel_attempts!r}")
 
     def test_malicious_event_text_is_data_not_shell(self):
         trigger = run(100, A, 10)
@@ -412,9 +473,13 @@ class StaticContractTests(unittest.TestCase):
             "requested only": text.replace("types: [requested, in_progress]", "types: [requested]"),
             "PR-only concurrency": text + "\nconcurrency: pr-${{ github.event.workflow_run.pull_requests[0].number }}\n",
             "unique rerun concurrency": text + "\nconcurrency: run-${{ github.event.workflow_run.id }}\n",
+            "disabled duplicate job condition": text.replace(
+                "    runs-on: ubuntu-24.04",
+                "    if: false\n    runs-on: ubuntu-24.04",
+            ),
             "checkout": text.replace("steps:\n", "steps:\n      - uses: actions/checkout@v4\n", 1),
             "broader permission": text.replace("pull-requests: read", "pull-requests: write"),
-            "unbounded listing": text.replace("MAX_PAGES = 4", "MAX_PAGES = 4000"),
+            "default page size": text.replace('"per_page": PAGE_SIZE,\n', ""),
         }
         for label, mutation in mutations.items():
             with self.subTest(label=label):

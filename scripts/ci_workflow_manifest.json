@@ -24,7 +24,7 @@
     "repository-hygiene.yml"
   ],
   "workflows": {
-    "ci-superseded-run-cancellation.yml": {"sha256": "1a4f62707e643336bae5b4c0bb9af4a7b614eef7af42170214a39032d9d7d29b", "bytes": 15740, "activated_fixtures": []},
+    "ci-superseded-run-cancellation.yml": {"sha256": "8c8e51e1ea0b05845f89a141c9bcec76e0109a468089b70b31aeae66f5ce9228", "bytes": 16555, "activated_fixtures": []},
     "ci.yml": {"sha256": "9faf7c66ec2ecfcd2338b0b48dc701be37c0eaaa56d398221bd990b8167f9207", "bytes": 6848, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
     "docs.yml": {"sha256": "2342416bbfe4626882f06b5085fd6d30693a67d2eba8c0af358c465876e1bb1f", "bytes": 570, "activated_fixtures": ["readme_only"]},
     "issue-104-chooser-catalog.yml": {"sha256": "bf003cf3f7258a9430ee38fdf22d68d42b5cbf106259a79f0979b75ee17f98ad", "bytes": 1619, "activated_fixtures": []},
