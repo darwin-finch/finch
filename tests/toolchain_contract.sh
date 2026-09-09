@@ -12,6 +12,9 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+python3 tests/test_toolchain_locked_metadata.py
+cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
 expected_toolchain="1.98.0"
 toolchain_file="rust-toolchain.toml"
 authoritative_workflows=()
