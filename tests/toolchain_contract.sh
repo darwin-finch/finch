@@ -13,6 +13,7 @@ elif [[ $# -ne 0 ]]; then
 fi
 
 python3 tests/test_toolchain_locked_metadata.py
+python3 tests/test_blacksmith_runner_contract.py
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
 expected_toolchain="1.98.0"

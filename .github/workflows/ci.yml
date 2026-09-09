@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -49,25 +53,49 @@ jobs:
       run: cargo fmt --all -- --check
 
   test:
-    name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.check_name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - runner: ubuntu-24.04
+            platform: ubuntu-24.04
+            provider: github
             feature_name: default
             cargo_args: ""
-          - os: ubuntu-24.04
+            check_name: Test A/B GitHub (ubuntu-24.04, default)
+          - runner: ubuntu-24.04
+            platform: ubuntu-24.04
+            provider: github
             feature_name: no-default-features
             cargo_args: --no-default-features
-          - os: macos-14
+            check_name: Test A/B GitHub (ubuntu-24.04, no-default-features)
+          - runner: blacksmith-2vcpu-ubuntu-2404
+            platform: ubuntu-24.04
+            provider: blacksmith
             feature_name: default
             cargo_args: ""
-          - os: macos-14
+            check_name: Test A/B Blacksmith (ubuntu-24.04, default)
+          - runner: blacksmith-2vcpu-ubuntu-2404
+            platform: ubuntu-24.04
+            provider: blacksmith
             feature_name: no-default-features
             cargo_args: --no-default-features
+            check_name: Test A/B Blacksmith (ubuntu-24.04, no-default-features)
+          - runner: macos-14
+            platform: macos-14
+            provider: github
+            feature_name: default
+            cargo_args: ""
+            check_name: Test (macos-14, default)
+          - runner: macos-14
+            platform: macos-14
+            provider: github
+            feature_name: no-default-features
+            cargo_args: --no-default-features
+            check_name: Test (macos-14, no-default-features)
 
     steps:
     - name: Checkout code
