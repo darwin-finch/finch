@@ -9,6 +9,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,11 @@ FIXTURE_DIRECTORY = "tests/fixtures/ci-generated-workflows"
 MAX_SOURCE_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 128 * 1024
 MAX_TOOLCHAIN_BYTES = 64 * 1024
+MAX_ATTRIBUTES_BYTES = 16 * 1024
+REQUIRED_ATTRIBUTES = (
+    "tests/fixtures/ci-generated-workflows/*.json text eol=lf",
+    "tests/fixtures/ci-generated-workflows/*.yml text eol=lf",
+)
 CONDITION = (
     "${{ github.event_name == 'workflow_dispatch' || github.event.action == 'requested' "
     "|| github.event.workflow_run.run_attempt > 1 }}"
@@ -57,6 +63,8 @@ def bounded_string(value: Any, label: str, *, maximum: int = 256) -> str:
         raise ContractError(f"{label} must contain 1..{maximum} UTF-8 bytes")
     if "\r" in value or "\0" in value or any(ord(character) < 0x20 for character in value):
         raise ContractError(f"{label} contains a forbidden control character")
+    if "${{" in value or "}}" in value:
+        raise ContractError(f"{label} contains a forbidden GitHub expression delimiter")
     return value
 
 
@@ -189,6 +197,10 @@ def validate_model(value: Any, source: str) -> dict[str, Any]:
         raise ContractError(f"{source}.workflow.script.body must be a string")
     if not body.endswith("\n") or "\r" in body or "\0" in body:
         raise ContractError(f"{source}.workflow.script.body must be NUL-free LF text ending in LF")
+    if "${{" in body or "}}" in body:
+        raise ContractError(
+            f"{source}.workflow.script.body contains a forbidden GitHub expression delimiter"
+        )
     if len(body.encode("utf-8")) > 48 * 1024:
         raise ContractError(f"{source}.workflow.script.body exceeds the 48 KiB bound")
     if any(line == "PYTHON" for line in body.splitlines()):
@@ -246,13 +258,20 @@ def render(model: dict[str, Any]) -> bytes:
     for key, source in workflow["environment"].items():
         lines.append(f"          {quote(key)}: ${{{{ {source} }}}}")
     lines.extend(["        run: |", "          python3 - <<'PYTHON'"])
-    for body_line in workflow["script"]["body"].splitlines():
+    for body_line in workflow["script"]["body"].split("\n")[:-1]:
         lines.append(f"          {body_line}" if body_line else "")
     lines.append("          PYTHON")
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def safe_read(root: Path, relative: str, maximum: int, label: str) -> bytes:
+def safe_read(
+    root: Path,
+    relative: str,
+    maximum: int,
+    label: str,
+    *,
+    require_lf_utf8: bool = True,
+) -> bytes:
     path = root / relative
     current = root
     for component in Path(relative).parts[:-1]:
@@ -269,7 +288,10 @@ def safe_read(root: Path, relative: str, maximum: int, label: str) -> bytes:
         raise ContractError(f"{label} cannot be inspected: path={path}: {error}") from error
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise ContractError(f"{label} must be a regular non-symlink file: path={path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nofollow, int) or nofollow == 0:
+        raise ContractError(f"{label} cannot be opened safely because O_NOFOLLOW is unavailable")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -285,6 +307,13 @@ def safe_read(root: Path, relative: str, maximum: int, label: str) -> bytes:
             raise ContractError(
                 f"{label} exceeds its {maximum}-byte bound: path={path} size={opened.st_size}"
             )
+        opened_identity = (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
         chunks: list[bytes] = []
         remaining = maximum + 1
         while remaining:
@@ -294,18 +323,32 @@ def safe_read(root: Path, relative: str, maximum: int, label: str) -> bytes:
             chunks.append(chunk)
             remaining -= len(chunk)
         data = b"".join(chunks)
+        after = os.fstat(descriptor)
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if after_identity != opened_identity or len(data) != opened.st_size:
+            raise ContractError(
+                f"{label} changed while it was being read: path={path} "
+                f"before={opened_identity!r} after={after_identity!r} bytes_read={len(data)}"
+            )
     finally:
         os.close(descriptor)
     if len(data) > maximum:
         raise ContractError(f"{label} exceeds its {maximum}-byte bound: path={path} size>{maximum}")
-    if b"\0" in data:
-        raise ContractError(f"{label} contains a forbidden NUL byte: path={path}")
-    if b"\r" in data:
-        raise ContractError(f"{label} must use LF line endings and contains CR: path={path}")
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ContractError(f"{label} is not UTF-8: path={path}: {error}") from error
+    if require_lf_utf8:
+        if b"\0" in data:
+            raise ContractError(f"{label} contains a forbidden NUL byte: path={path}")
+        if b"\r" in data:
+            raise ContractError(f"{label} must use LF line endings and contains CR: path={path}")
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ContractError(f"{label} is not UTF-8: path={path}: {error}") from error
     return data
 
 
@@ -343,16 +386,60 @@ def verify_catalog(root: Path) -> None:
         raise ContractError(f"generated workflow fixture catalog cannot be inspected: {directory}: {error}") from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ContractError(f"generated workflow fixture catalog must be a real directory: {directory}")
-    actual_paths = {
-        str(Path(FIXTURE_DIRECTORY) / entry.name)
-        for entry in os.scandir(directory)
-    }
+    actual_paths: set[str] = set()
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            actual_paths.add(str(Path(FIXTURE_DIRECTORY) / entry.name))
+            if len(actual_paths) > len(expected_paths):
+                raise ContractError(
+                    "generated workflow fixture catalog path/count drifted: "
+                    f"expected_count={len(expected_paths)} actual_count_at_least={len(actual_paths)} "
+                    f"unknown_sample={sorted(actual_paths - expected_paths)!r}"
+                )
     if actual_paths != expected_paths:
         raise ContractError(
             "generated workflow fixture catalog path/count drifted: "
             f"expected_count=2 actual_count={len(actual_paths)} "
             f"missing={sorted(expected_paths - actual_paths)!r} "
             f"unknown={sorted(actual_paths - expected_paths)!r}"
+        )
+
+
+def verify_attributes(root: Path) -> None:
+    raw = safe_read(root, ".gitattributes", MAX_ATTRIBUTES_BYTES, "Git attributes contract")
+    lines = raw.decode("utf-8").splitlines()
+    counts = {line: lines.count(line) for line in REQUIRED_ATTRIBUTES}
+    if any(count != 1 for count in counts.values()):
+        raise ContractError(
+            "Git attributes must contain exactly one LF rule for each generated fixture extension: "
+            f"required={REQUIRED_ATTRIBUTES!r} counts={counts!r}"
+        )
+    fixture_paths = [path for pair in CATALOG for path in pair]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-attr", "-z", "text", "eol", "--", *fixture_paths],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ContractError(f"Git attributes effective-rule check could not run: {error}") from error
+    if result.returncode != 0:
+        raise ContractError(
+            "Git attributes effective-rule check failed: "
+            f"status={result.returncode} stderr={result.stderr[:4096]!r}"
+        )
+    fields = result.stdout.split(b"\0")
+    if fields[-1:] == [b""]:
+        fields.pop()
+    expected_fields: list[bytes] = []
+    for path in fixture_paths:
+        encoded = path.encode("utf-8")
+        expected_fields.extend((encoded, b"text", b"set", encoded, b"eol", b"lf"))
+    if fields != expected_fields:
+        raise ContractError(
+            "Git attributes effective rules must keep generated fixture bytes as text=set eol=lf: "
+            f"expected={expected_fields!r} actual={fields!r}"
         )
 
 
@@ -387,7 +474,13 @@ def difference(expected: bytes, actual: bytes) -> tuple[int, int, int]:
 
 def verify_pair(root: Path, source: str, output: str) -> None:
     expected = render(load_model(root, source))
-    actual = safe_read(root, output, MAX_OUTPUT_BYTES, "generated workflow output")
+    actual = safe_read(
+        root,
+        output,
+        MAX_OUTPUT_BYTES,
+        "generated workflow output",
+        require_lf_utf8=False,
+    )
     if actual == expected:
         return
     offset, line, column = difference(expected, actual)
@@ -422,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = repository_root(arguments.root)
         verify_catalog(root)
+        verify_attributes(root)
         verify_toolchain_wiring(root)
         if arguments.render is not None:
             matches = [pair for pair in CATALOG if pair[0] == arguments.render]

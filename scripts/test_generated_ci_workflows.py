@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import importlib.util
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +23,11 @@ FIXTURE_DIRECTORY = Path("tests/fixtures/ci-generated-workflows")
 SOURCE_NAME = "superseded-run-envelope.json"
 OUTPUT_NAME = "superseded-run-envelope.yml"
 SOURCE_BYTES = (ROOT / FIXTURE_DIRECTORY / SOURCE_NAME).read_bytes()
+CHECKER_SPEC = importlib.util.spec_from_file_location("generated_workflow_checker", CHECKER)
+if CHECKER_SPEC is None or CHECKER_SPEC.loader is None:
+    raise RuntimeError(f"could not load generated workflow checker from {CHECKER}")
+CHECKER_MODULE = importlib.util.module_from_spec(CHECKER_SPEC)
+CHECKER_SPEC.loader.exec_module(CHECKER_MODULE)
 GOLDEN_YAML = b'''name: "Cancel superseded CI runs"
 
 on:
@@ -65,6 +72,11 @@ python3 scripts/test_generated_ci_workflows.py
 python3 scripts/check_generated_ci_workflows.py
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 '''
+ATTRIBUTES = b'''.github/workflows/*.yml text eol=lf
+.github/workflows/*.yaml text eol=lf
+tests/fixtures/ci-generated-workflows/*.json text eol=lf
+tests/fixtures/ci-generated-workflows/*.yml text eol=lf
+'''
 
 
 def canonical_json(value: object) -> bytes:
@@ -76,8 +88,15 @@ class GeneratedWorkflowBoundaryTests(unittest.TestCase):
     def repository(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            subprocess.run(
+                ["git", "init", "-q", str(root)],
+                capture_output=True,
+                timeout=10,
+                check=True,
+            )
             fixtures = root / FIXTURE_DIRECTORY
             fixtures.mkdir(parents=True)
+            (root / ".gitattributes").write_bytes(ATTRIBUTES)
             (root / "tests/toolchain_contract.sh").write_bytes(TOOLCHAIN)
             (fixtures / SOURCE_NAME).write_bytes(SOURCE_BYTES)
             (fixtures / OUTPUT_NAME).write_bytes(GOLDEN_YAML)
@@ -201,18 +220,17 @@ class GeneratedWorkflowBoundaryTests(unittest.TestCase):
                 self.output_path(root).write_bytes(mutation)
                 result = self.run_checker(root)
                 self.assert_failure(result, label, OUTPUT_NAME.encode())
-                if label != "CRLF":
+                self.assertIn(
+                    b"source=tests/fixtures/ci-generated-workflows/superseded-run-envelope.json",
+                    result.stderr,
+                    f"{label}: byte mismatch did not name source; stderr={result.stderr!r}",
+                )
+                for diagnostic in (b"first_difference_byte=", b"line=", b"expected_size=", b"actual_size=", b"reproduce:"):
                     self.assertIn(
-                        b"source=tests/fixtures/ci-generated-workflows/superseded-run-envelope.json",
+                        diagnostic,
                         result.stderr,
-                        f"{label}: byte mismatch did not name source; stderr={result.stderr!r}",
+                        f"{label}: byte mismatch omitted {diagnostic!r}; stderr={result.stderr!r}",
                     )
-                    for diagnostic in (b"first_difference_byte=", b"line=", b"expected_size=", b"actual_size=", b"reproduce:"):
-                        self.assertIn(
-                            diagnostic,
-                            result.stderr,
-                            f"{label}: byte mismatch omitted {diagnostic!r}; stderr={result.stderr!r}",
-                        )
 
     def test_stopped_line_validator_accepts_whitespace_duplicate_but_checker_rejects_it(self):
         condition = (
@@ -269,6 +287,11 @@ class GeneratedWorkflowBoundaryTests(unittest.TestCase):
         expression = self.model()
         expression["workflow"]["condition_policy"] = "${{ always() }}"
         cases["arbitrary expression"] = expression
+        script_expression = self.model()
+        script_expression["workflow"]["script"]["body"] = (
+            'print("${{ secrets.ADMIN }}")\n'
+        )
+        cases["script-body expression"] = script_expression
         secret = self.model()
         secret["workflow"]["environment"]["TOKEN"] = "secrets.ADMIN"
         cases["arbitrary environment"] = secret
@@ -290,7 +313,9 @@ class GeneratedWorkflowBoundaryTests(unittest.TestCase):
         with self.repository() as root:
             (root / FIXTURE_DIRECTORY / "unreviewed.yml").write_bytes(b"name: hidden\n")
             result = self.run_checker(root)
-            self.assert_failure(result, "extra catalog entry", b"path/count drifted", b"actual_count=3")
+            self.assert_failure(
+                result, "extra catalog entry", b"path/count drifted", b"actual_count_at_least=3"
+            )
         with self.repository() as root:
             self.output_path(root).rename(root / FIXTURE_DIRECTORY / "renamed.yml")
             result = self.run_checker(root)
@@ -342,6 +367,80 @@ class GeneratedWorkflowBoundaryTests(unittest.TestCase):
             (root / FIXTURE_DIRECTORY).symlink_to(real_directory, target_is_directory=True)
             result = self.run_checker(root)
             self.assert_failure(result, "symlinked fixture directory", b"must be a real directory")
+
+    def test_catalog_enumeration_stops_at_first_overpopulation_evidence(self):
+        with self.repository() as root:
+            for index in range(100):
+                (root / FIXTURE_DIRECTORY / f"unreviewed-{index:03}.yml").write_bytes(b"name: hidden\n")
+            result = self.run_checker(root)
+            self.assert_failure(
+                result,
+                "overpopulated catalog",
+                b"expected_count=2",
+                b"actual_count_at_least=3",
+                b"unknown_sample=",
+            )
+
+    def test_lf_attributes_are_exactly_once_and_effective(self):
+        mutations = {
+            "missing JSON LF rule": ATTRIBUTES.replace(
+                b"tests/fixtures/ci-generated-workflows/*.json text eol=lf\n", b""
+            ),
+            "changed YAML LF rule": ATTRIBUTES.replace(
+                b"tests/fixtures/ci-generated-workflows/*.yml text eol=lf",
+                b"tests/fixtures/ci-generated-workflows/*.yml -text",
+            ),
+            "duplicate JSON LF rule": ATTRIBUTES
+            + b"tests/fixtures/ci-generated-workflows/*.json text eol=lf\n",
+            "later override": ATTRIBUTES + b"tests/fixtures/ci-generated-workflows/*.yml -text\n",
+        }
+        for label, value in mutations.items():
+            with self.subTest(label=label), self.repository() as root:
+                (root / ".gitattributes").write_bytes(value)
+                result = self.run_checker(root)
+                self.assert_failure(result, label, b"Git attributes", b"eol=lf")
+        with self.repository() as root:
+            with (root / ".gitattributes").open("ab") as stream:
+                stream.write(b"unrelated/*.txt text eol=lf\n")
+            result = self.run_checker(root)
+            self.assert_success(result, "unrelated later Git attribute")
+
+    def test_safe_read_fails_closed_without_nofollow_and_on_same_inode_resize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "race.bin"
+            path.write_bytes(b"a" * 100_000)
+            with mock.patch.object(CHECKER_MODULE.os, "O_NOFOLLOW", 0):
+                with self.assertRaisesRegex(
+                    CHECKER_MODULE.ContractError,
+                    "O_NOFOLLOW is unavailable",
+                    msg="safe_read silently substituted zero for missing O_NOFOLLOW",
+                ):
+                    CHECKER_MODULE.safe_read(root, "race.bin", 128 * 1024, "race fixture")
+
+            original_read = os.read
+            read_count = 0
+
+            def resize_after_first_read(descriptor: int, size: int) -> bytes:
+                nonlocal read_count
+                data = original_read(descriptor, size)
+                read_count += 1
+                if read_count == 1:
+                    path.write_bytes(b"b" * 8)
+                return data
+
+            with mock.patch.object(CHECKER_MODULE.os, "read", side_effect=resize_after_first_read):
+                with self.assertRaisesRegex(
+                    CHECKER_MODULE.ContractError,
+                    "changed while it was being read",
+                    msg="safe_read accepted mixed bytes after a same-inode resize during its bounded read",
+                ):
+                    CHECKER_MODULE.safe_read(root, "race.bin", 128 * 1024, "race fixture")
+            self.assertGreaterEqual(
+                read_count,
+                1,
+                f"same-inode resize hook did not intercept a bounded read; read_count={read_count}",
+            )
 
     def test_toolchain_wiring_is_exactly_once_and_precedes_cargo_metadata(self):
         mutations = {
