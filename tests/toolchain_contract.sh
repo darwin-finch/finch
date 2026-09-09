@@ -22,6 +22,8 @@ if [[ ! -f Cargo.lock ]]; then
   exit 1
 fi
 
+tests/toolchain_contract_regression.sh
+
 expected_toolchain="1.98.0"
 toolchain_file="rust-toolchain.toml"
 authoritative_workflows=()
