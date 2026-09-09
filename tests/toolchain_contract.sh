@@ -13,6 +13,8 @@ elif [[ $# -ne 0 ]]; then
 fi
 
 python3 tests/test_toolchain_locked_metadata.py
+ruby tests/test_ci_cache_authority.rb
+ruby scripts/check_ci_cache_authority.rb
 cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
 expected_toolchain="1.98.0"
