@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}-{1}', github.ref, github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name == 'pull_request' && github.run_attempt == 1 && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'pull_request' && format('pr-rerun-{0}-{1}', github.event.pull_request.number, github.run_id) || format('push-{0}-{1}', github.ref, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,8 +105,8 @@ jobs:
       with:
         components: clippy
 
-    - name: Cache Cargo registry and build
-      uses: actions/cache@v4
+    - name: Restore Cargo registry and build cache
+      uses: actions/cache/restore@v4
       with:
         path: |
           ~/.cargo/registry
@@ -131,6 +134,16 @@ jobs:
       # Exercise Cargo's default binary selection so adding a test-only binary
       # cannot silently break the documented `cargo run -- <args>` workflow.
       run: cargo run ${{ matrix.cargo_args }} -- --version
+
+    - name: Save Cargo registry and build cache
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}
 
   runtime-authority:
     name: Runtime Authority (Ubuntu)

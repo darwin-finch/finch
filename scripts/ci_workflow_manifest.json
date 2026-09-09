@@ -24,7 +24,7 @@
     "repository-hygiene.yml"
   ],
   "workflows": {
-    "ci.yml": {"sha256": "6ccf2c9e9239ca035e068949ed383af3189b80d70123eb1b1c997f2e3a17b697", "bytes": 7598, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
+    "ci.yml": {"sha256": "163eccd39999debaef0970aad418ad70c8b445f0725beaf8e5359240c69c8d48", "bytes": 8185, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
     "docs.yml": {"sha256": "2342416bbfe4626882f06b5085fd6d30693a67d2eba8c0af358c465876e1bb1f", "bytes": 570, "activated_fixtures": ["readme_only"]},
     "issue-104-chooser-catalog.yml": {"sha256": "bf003cf3f7258a9430ee38fdf22d68d42b5cbf106259a79f0979b75ee17f98ad", "bytes": 1619, "activated_fixtures": []},
     "issue-105-oauth.yml": {"sha256": "b8ebc77ab828544d150322232084aff5dbeecd1a815483e29e7b59a674c19ebb", "bytes": 2216, "activated_fixtures": ["manifest_dependency", "public_api"]},

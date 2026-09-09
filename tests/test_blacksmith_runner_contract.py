@@ -30,10 +30,27 @@ AB_LINUX_NAMES = {
     for feature in FEATURES
 }
 EXPECTED_CONCURRENCY_GROUP = (
-    "ci-${{ github.event_name == 'pull_request' && format('pr-{0}', "
-    "github.event.pull_request.number) || format('push-{0}-{1}', github.ref, "
-    "github.run_id) }}"
+    "ci-${{ github.event_name == 'pull_request' && github.run_attempt == 1 && "
+    "format('pr-{0}', github.event.pull_request.number) || "
+    "github.event_name == 'pull_request' && format('pr-rerun-{0}-{1}', "
+    "github.event.pull_request.number, github.run_id) || "
+    "format('push-{0}-{1}', github.ref, github.run_id) }}"
 )
+EXPECTED_CANCEL = (
+    "${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}"
+)
+EXPECTED_HEADER = """name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+"""
 
 
 class ContractError(Exception):
@@ -97,6 +114,26 @@ def matrix_entries(job: str) -> list[dict[str, str]]:
     return entries
 
 
+def named_steps(job: str) -> tuple[list[str], dict[str, str]]:
+    lines = job.splitlines(keepends=True)
+    starts: list[tuple[str, int]] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^    - name:\s*(.*?)\s*$", line)
+        if match is not None:
+            starts.append((match.group(1), index))
+    order: list[str] = []
+    blocks: dict[str, str] = {}
+    for position, (name, start) in enumerate(starts):
+        end = starts[position + 1][1] if position + 1 < len(starts) else len(lines)
+        if name in blocks:
+            raise ContractError(
+                f"job repeats named step {name!r}: step_names={[item[0] for item in starts]!r}"
+            )
+        order.append(name)
+        blocks[name] = "".join(lines[start:end]).rstrip()
+    return order, blocks
+
+
 def unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         return value[1:-1]
@@ -130,22 +167,183 @@ def validate_concurrency(text: str) -> None:
     cancel = match.group("cancel")
     if group != EXPECTED_CONCURRENCY_GROUP:
         raise ContractError(
-            "concurrency group must use only the PR number on pull requests, but the "
-            "ref plus run ID on pushes; this collapses same-PR runs without making PRs "
-            "unique or collapsing independent pushes: "
+            "concurrency group must use the PR number for initial revisions, isolate "
+            "reruns by PR and run ID, and isolate pushes by ref and run ID; this lets "
+            "new tips supersede old tips without stale reruns replacing a pending tip: "
             f"expected={EXPECTED_CONCURRENCY_GROUP!r} parsed={group!r}"
         )
-    expected_cancel = "${{ github.event_name == 'pull_request' }}"
-    if cancel != expected_cancel:
+    if cancel != EXPECTED_CANCEL:
         raise ContractError(
-            "cancel-in-progress must be enabled only for pull_request events so push "
-            f"runs are never cancelled: expected={expected_cancel!r} parsed={cancel!r}"
+            "cancel-in-progress must apply only to initial pull-request attempts: this "
+            "lets a new revision supersede the prior revision without allowing a stale "
+            "rerun to cancel the current tip or any push: "
+            f"expected={EXPECTED_CANCEL!r} parsed={cancel!r}"
+        )
+
+
+def validate_authority(text: str, test_job: str) -> None:
+    if not text.startswith(EXPECTED_HEADER):
+        raise ContractError(
+            "canonical CI must trigger only on main pushes and main pull requests with "
+            "top-level least-privilege contents: read: "
+            f"expected_header={EXPECTED_HEADER!r} actual_prefix={text[:len(EXPECTED_HEADER) + 120]!r}"
+        )
+    forbidden_writes = re.findall(
+        r"(?mi)^\s*(?:permissions:\s*write-all|[a-z0-9_-]+:\s*write)\s*$", text
+    )
+    if forbidden_writes:
+        raise ContractError(
+            "canonical CI must not grant write permissions: "
+            f"forbidden_lines={forbidden_writes!r}"
+        )
+    if re.search(r"(?m)^    permissions:\s*", test_job):
+        raise ContractError(
+            "third-party test job must inherit top-level contents: read and must not "
+            f"override token permissions: job_text={test_job!r}"
+        )
+    secret_references = re.findall(r"(?i)\bsecrets\b", test_job)
+    if secret_references:
+        raise ContractError(
+            "third-party test job must not receive GitHub secret expressions: "
+            f"references={secret_references!r} job_text={test_job!r}"
+        )
+
+
+def validate_job_enabled(job: str, job_name: str) -> None:
+    job_conditions = re.findall(r"(?m)^    if:\s*(.*?)\s*$", job)
+    continued = re.findall(r"(?m)^    continue-on-error:\s*(.*?)\s*$", job)
+    if job_conditions or continued:
+        raise ContractError(
+            f"{job_name} job must be unconditional and cannot be disabled or bypassed: "
+            f"conditions={job_conditions!r} continue_on_error={continued!r} "
+            f"job_text={job!r}"
+        )
+
+
+def validate_toolchain_job(blocks: dict[str, str]) -> None:
+    job = blocks.get("toolchain-contract")
+    if job is None:
+        raise ContractError(
+            "canonical CI must retain the toolchain-contract job: "
+            f"job_ids={sorted(blocks)!r}"
+        )
+    validate_job_enabled(job, "toolchain-contract")
+    state = (scalar(job, "name"), scalar(job, "runs-on"))
+    expected = ("Toolchain and formatting contract", "ubuntu-24.04")
+    if state != expected:
+        raise ContractError(
+            "toolchain-contract must retain its stable name and native runner: "
+            f"expected={expected!r} actual={state!r}"
+        )
+    invocation = "      run: tests/toolchain_contract.sh"
+    exact = [line for line in job.splitlines() if line == invocation]
+    if len(exact) != 1:
+        raise ContractError(
+            "toolchain-contract job must directly run tests/toolchain_contract.sh "
+            "exactly once without a wrapper: "
+            f"expected_line={invocation!r} count={len(exact)} job_text={job!r}"
+        )
+    _, steps = named_steps(job)
+    invocation_name = "Verify pinned toolchain and clean-checkout formatting"
+    invocation_step = steps.get(invocation_name, "")
+    bypasses = re.findall(
+        r"(?m)^      (?:if|continue-on-error):\s*(.*?)\s*$", invocation_step
+    )
+    if bypasses:
+        raise ContractError(
+            "toolchain-contract invocation must be unconditional and failure-enforcing: "
+            f"step={invocation_name!r} bypasses={bypasses!r} "
+            f"step_text={invocation_step!r}"
+        )
+
+
+def validate_test_workload(job: str) -> None:
+    validate_job_enabled(job, "canonical Blacksmith test")
+    order, steps = named_steps(job)
+    expected_commands = (
+        ("Build binary", "cargo build --bin finch ${{ matrix.cargo_args }} --verbose"),
+        ("Compile all targets", "cargo test --all-targets ${{ matrix.cargo_args }} --no-run"),
+        ("Test all targets", "cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture"),
+        ("Verify binary reports its version", "cargo run ${{ matrix.cargo_args }} -- --version"),
+    )
+    missing = [name for name, _ in expected_commands if name not in steps]
+    if missing:
+        raise ContractError(
+            "canonical Blacksmith workload is missing required steps: "
+            f"missing={missing!r} step_order={order!r}"
+        )
+    positions = [order.index(name) for name, _ in expected_commands]
+    if positions != sorted(positions):
+        raise ContractError(
+            "canonical Blacksmith workload steps must retain build, compile, test, and "
+            f"executable-check order: positions={positions!r} step_order={order!r}"
+        )
+    for name, expected_command in expected_commands:
+        step = steps[name]
+        commands = re.findall(r"(?m)^      run:\s*(.*?)\s*$", step)
+        bypasses = re.findall(
+            r"(?m)^      (?:if|continue-on-error):\s*(.*?)\s*$", step
+        )
+        if commands != [expected_command] or bypasses:
+            raise ContractError(
+                "canonical Blacksmith workload step must be unconditional with its exact "
+                "reviewed command: "
+                f"step={name!r} expected_command={expected_command!r} "
+                f"commands={commands!r} bypasses={bypasses!r} step_text={step!r}"
+            )
+
+
+def validate_cache_authority(job: str) -> None:
+    order, steps = named_steps(job)
+    restore_name = "Restore Cargo registry and build cache"
+    save_name = "Save Cargo registry and build cache"
+    if restore_name not in steps or save_name not in steps:
+        raise ContractError(
+            "canonical test job must have distinct upstream cache restore and trusted-main "
+            f"save steps: step_order={order!r}"
+        )
+    expected_restore = """    - name: Restore Cargo registry and build cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-"""
+    expected_save = """    - name: Save Cargo registry and build cache
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}"""
+    if steps[restore_name] != expected_restore:
+        raise ContractError(
+            "cache restore must retain the exact upstream action, paths, key, and restore "
+            f"prefixes: expected={expected_restore!r} actual={steps[restore_name]!r}"
+        )
+    if steps[save_name] != expected_save:
+        raise ContractError(
+            "cache save must retain the same paths/key and run only after success on a "
+            "trusted main push; pull requests and tags must remain restore-only: "
+            f"expected={expected_save!r} actual={steps[save_name]!r}"
+        )
+    final_workload = order.index("Verify binary reports its version")
+    save = order.index(save_name)
+    if save <= final_workload:
+        raise ContractError(
+            "trusted-main cache save must follow the complete canonical workload: "
+            f"verify_position={final_workload} save_position={save} order={order!r}"
         )
 
 
 def validate_toolchain_wiring(text: str) -> None:
     invocation = "python3 tests/test_blacksmith_runner_contract.py"
-    matches = [line for line in text.splitlines() if line.strip() == invocation]
+    matches = [line for line in text.splitlines() if line == invocation]
     if len(matches) != 1:
         raise ContractError(
             "tests/toolchain_contract.sh must invoke the Blacksmith production-boundary "
@@ -324,14 +522,18 @@ def validate_native_jobs(blocks: dict[str, str]) -> None:
 
 
 def validate_workflow(text: str) -> str:
-    validate_concurrency(text)
     blocks = job_blocks(text)
     test = blocks.get("test")
     if test is None:
         raise ContractError(
             f"canonical CI workflow is missing test job; job_ids={sorted(blocks)!r}"
         )
+    validate_authority(text, test)
+    validate_concurrency(text)
+    validate_toolchain_job(blocks)
     mode = validate_test_job(test)
+    validate_test_workload(test)
+    validate_cache_authority(test)
     validate_native_jobs(blocks)
     blacksmith_jobs = [
         name for name, block in blocks.items() if BLACKSMITH_RUNNER in block
@@ -351,6 +553,31 @@ def replace_once(text: str, old: str, new: str) -> str:
             f"mutation fixture expected one occurrence: old={old!r} count={count}"
         )
     return text.replace(old, new, 1)
+
+
+def reviewed_concurrency(
+    event_name: str,
+    run_attempt: int,
+    pull_request_number: int,
+    ref: str,
+    run_id: int,
+) -> tuple[str, bool]:
+    if event_name == "pull_request" and run_attempt == 1:
+        group = f"ci-pr-{pull_request_number}"
+    elif event_name == "pull_request":
+        group = f"ci-pr-rerun-{pull_request_number}-{run_id}"
+    else:
+        group = f"ci-push-{ref}-{run_id}"
+    cancel = event_name == "pull_request" and run_attempt == 1
+    return group, cancel
+
+
+def mutate_job(text: str, job_name: str, old: str, new: str) -> str:
+    job = job_blocks(text).get(job_name)
+    if job is None:
+        raise AssertionError(f"mutation fixture has no job {job_name!r}")
+    mutated_job = replace_once(job, old, new)
+    return replace_once(text, job, mutated_job)
 
 
 def linux_cell(runner: str, provider: str, feature: str, check_name: str) -> str:
@@ -443,44 +670,231 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
             f"validator returned an unknown migration mode: mode={mode!r}",
         )
 
+    def test_workflow_authority_rejects_triggers_writes_and_secrets(self) -> None:
+        mutations = (
+            (
+                replace_once(
+                    self.workflow, "  pull_request:\n", "  pull_request_target:\n"
+                ),
+                "trigger only on main pushes and main pull requests",
+            ),
+            (
+                replace_once(
+                    self.workflow,
+                    "permissions:\n  contents: read\n",
+                    "permissions: write-all\n",
+                ),
+                "least-privilege contents: read",
+            ),
+            (
+                mutate_job(
+                    self.workflow,
+                    "test",
+                    "    runs-on: ${{ matrix.runner }}\n",
+                    "    runs-on: ${{ matrix.runner }}\n"
+                    "    permissions:\n"
+                    "      contents: write\n",
+                ),
+                "must not grant write permissions",
+            ),
+            (
+                mutate_job(
+                    self.workflow,
+                    "test",
+                    "    runs-on: ${{ matrix.runner }}\n",
+                    "    runs-on: ${{ matrix.runner }}\n"
+                    "    env:\n"
+                    "      PROVIDER_TOKEN: ${{ secrets.PROVIDER_TOKEN }}\n",
+                ),
+                "must not receive GitHub secret expressions",
+            ),
+        )
+        for mutated, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                self.assert_rejected(mutated, diagnostic)
+
+    def test_ci_preserves_direct_unconditional_toolchain_job(self) -> None:
+        toolchain = job_blocks(self.workflow)["toolchain-contract"]
+        mutations = (
+            (replace_once(self.workflow, toolchain, ""), "retain the toolchain-contract"),
+            (
+                mutate_job(
+                    self.workflow,
+                    "toolchain-contract",
+                    "    runs-on: ubuntu-24.04\n",
+                    "    runs-on: ubuntu-24.04\n    if: false\n",
+                ),
+                "must be unconditional",
+            ),
+            (
+                mutate_job(
+                    self.workflow,
+                    "toolchain-contract",
+                    "    - name: Verify pinned toolchain and clean-checkout formatting\n",
+                    "    - name: Verify pinned toolchain and clean-checkout formatting\n"
+                    "      if: false\n",
+                ),
+                "invocation must be unconditional",
+            ),
+            (
+                mutate_job(
+                    self.workflow,
+                    "toolchain-contract",
+                    "      run: tests/toolchain_contract.sh",
+                    "      run: bash -c 'tests/toolchain_contract.sh'",
+                ),
+                "must directly run tests/toolchain_contract.sh",
+            ),
+        )
+        for mutated, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                self.assert_rejected(mutated, diagnostic)
+
+    def test_blacksmith_workload_rejects_disabling_removal_and_command_drift(self) -> None:
+        test_job = job_blocks(self.workflow)["test"]
+        _, steps = named_steps(test_job)
+        mutations = [
+            (
+                mutate_job(
+                    self.workflow,
+                    "test",
+                    "    runs-on: ${{ matrix.runner }}\n",
+                    "    runs-on: ${{ matrix.runner }}\n    if: false\n",
+                ),
+                "must be unconditional",
+            )
+        ]
+        for name in (
+            "Build binary",
+            "Compile all targets",
+            "Test all targets",
+            "Verify binary reports its version",
+        ):
+            mutations.append(
+                (replace_once(self.workflow, steps[name], ""), "missing required steps")
+            )
+        mutations.extend(
+            (
+                (
+                    replace_once(
+                        self.workflow,
+                        "      run: cargo build --bin finch ${{ matrix.cargo_args }} --verbose",
+                        "      run: true",
+                    ),
+                    "exact reviewed command",
+                ),
+                (
+                    mutate_job(
+                        self.workflow,
+                        "test",
+                        "    - name: Test all targets\n",
+                        "    - name: Test all targets\n      if: false\n",
+                    ),
+                    "exact reviewed command",
+                ),
+            )
+        )
+        for mutated, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                self.assert_rejected(mutated, diagnostic)
+
+    def test_cache_is_restore_only_except_successful_main_pushes(self) -> None:
+        mutations = (
+            (
+                replace_once(
+                    self.workflow,
+                    "uses: actions/cache/restore@v4",
+                    "uses: actions/cache@v4",
+                ),
+                "cache restore must retain",
+            ),
+            (
+                replace_once(
+                    self.workflow,
+                    "      if: success() && github.event_name == 'push' && "
+                    "github.ref == 'refs/heads/main'\n",
+                    "",
+                ),
+                "pull requests and tags must remain restore-only",
+            ),
+            (
+                replace_once(
+                    self.workflow,
+                    "github.event_name == 'push'",
+                    "github.event_name == 'pull_request'",
+                ),
+                "pull requests and tags must remain restore-only",
+            ),
+            (
+                replace_once(
+                    self.workflow,
+                    "github.ref == 'refs/heads/main'",
+                    "startsWith(github.ref, 'refs/tags/')",
+                ),
+                "pull requests and tags must remain restore-only",
+            ),
+            (
+                replace_once(
+                    self.workflow,
+                    "        key: ${{ runner.os }}-rust-1.98.0-"
+                    "${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}\n"
+                    "        restore-keys: |",
+                    "        key: changed-cache-key\n        restore-keys: |",
+                ),
+                "cache restore must retain",
+            ),
+        )
+        for mutated, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                self.assert_rejected(mutated, diagnostic)
+
     def test_toolchain_contract_invokes_runner_contract_exactly_once(self) -> None:
         validate_toolchain_wiring(self.toolchain_contract)
         invocation = "python3 tests/test_blacksmith_runner_contract.py\n"
-        without_invocation = replace_once(self.toolchain_contract, invocation, "")
-        with self.assertRaisesRegex(
-            ContractError,
-            "production-boundary contract exactly once",
-            msg=(
-                "removing the Blacksmith contract invocation from the CI-wired shell "
-                "boundary must be rejected"
+        mutations = {
+            "removed": replace_once(self.toolchain_contract, invocation, ""),
+            "indented": replace_once(
+                self.toolchain_contract, invocation, f"  {invocation}"
             ),
-        ):
-            validate_toolchain_wiring(without_invocation)
-        with tempfile.NamedTemporaryFile("w", suffix=".sh") as mutated_script:
-            mutated_script.write(without_invocation)
-            mutated_script.flush()
-            result = subprocess.run(
-                ["bash", mutated_script.name],
-                cwd=ROOT,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        self.assertEqual(
-            result.returncode,
-            1,
-            "shell guard must reject a removed Python contract invocation before any "
-            "later toolchain work: "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}",
-        )
-        self.assertIn(
-            "must invoke 'python3 tests/test_blacksmith_runner_contract.py' exactly once; "
-            "found 0",
-            result.stderr,
-            "shell guard rejection must name the missing production-boundary command: "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}",
-        )
+        }
+        for mutation, script in mutations.items():
+            with self.subTest(mutation=mutation):
+                with self.assertRaisesRegex(
+                    ContractError,
+                    "production-boundary contract exactly once",
+                    msg=(
+                        "Python wiring validation must use the same byte-exact line "
+                        f"semantics as the shell guard: mutation={mutation!r}"
+                    ),
+                ):
+                    validate_toolchain_wiring(script)
+                with tempfile.NamedTemporaryFile("w", suffix=".sh") as mutated_script:
+                    mutated_script.write(script)
+                    mutated_script.flush()
+                    result = subprocess.run(
+                        ["bash", mutated_script.name],
+                        cwd=ROOT,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                self.assertEqual(
+                    result.returncode,
+                    1,
+                    "shell guard must reject removed or indented Python wiring before "
+                    "later toolchain work: "
+                    f"mutation={mutation!r} stdout={result.stdout!r} "
+                    f"stderr={result.stderr!r}",
+                )
+                self.assertIn(
+                    "must invoke 'python3 tests/test_blacksmith_runner_contract.py' "
+                    "exactly once; found 0",
+                    result.stderr,
+                    "shell and Python wiring diagnostics must agree on an invalid line: "
+                    f"mutation={mutation!r} stdout={result.stdout!r} "
+                    f"stderr={result.stderr!r}",
+                )
 
     def test_manifest_fixtures_keep_final_stable_linux_names_and_counts(self) -> None:
         fixtures = self.manifest.get("fixtures")
@@ -583,14 +997,65 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
                 self.assert_rejected(mutated, diagnostic)
 
     def test_pr_cancellation_removal_or_push_cancellation_is_rejected(self) -> None:
-        cancellation = "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}"
+        cancellation = f"  cancel-in-progress: {EXPECTED_CANCEL}"
         self.assert_rejected(
             replace_once(self.workflow, cancellation + "\n", ""),
             "top-level concurrency",
         )
         self.assert_rejected(
             replace_once(self.workflow, cancellation, "  cancel-in-progress: true"),
-            "enabled only for pull_request",
+            "only to initial pull-request attempts",
+        )
+        self.assert_rejected(
+            replace_once(
+                self.workflow,
+                cancellation,
+                "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            ),
+            "stale rerun",
+        )
+
+    def test_concurrency_policy_cancels_new_revisions_but_not_reruns_or_pushes(self) -> None:
+        old_initial = reviewed_concurrency(
+            "pull_request", 1, 532, "refs/pull/532/merge", 100
+        )
+        new_initial = reviewed_concurrency(
+            "pull_request", 1, 532, "refs/pull/532/merge", 101
+        )
+        stale_rerun = reviewed_concurrency(
+            "pull_request", 2, 532, "refs/pull/532/merge", 100
+        )
+        push_one = reviewed_concurrency("push", 1, 0, "refs/heads/main", 200)
+        push_two = reviewed_concurrency("push", 1, 0, "refs/heads/main", 201)
+        self.assertEqual(
+            old_initial[0],
+            new_initial[0],
+            "initial revisions of one PR must share a concurrency group so the newer "
+            f"tip supersedes the older: old={old_initial!r} new={new_initial!r}",
+        )
+        self.assertTrue(
+            new_initial[1],
+            f"a new initial PR revision must cancel its predecessor: state={new_initial!r}",
+        )
+        self.assertFalse(
+            stale_rerun[1],
+            "a stale rerun attempt must not cancel the current PR tip: "
+            f"state={stale_rerun!r}",
+        )
+        self.assertNotEqual(
+            stale_rerun[0],
+            new_initial[0],
+            "a stale rerun must not replace a pending current-tip run in the PR group: "
+            f"rerun={stale_rerun!r} current={new_initial!r}",
+        )
+        self.assertNotEqual(
+            push_one[0],
+            push_two[0],
+            f"main pushes must have independent groups: first={push_one!r} second={push_two!r}",
+        )
+        self.assertFalse(
+            push_one[1] or push_two[1],
+            f"push runs must never cancel one another: first={push_one!r} second={push_two!r}",
         )
 
     def test_concurrency_group_keeps_pr_key_and_independent_push_identity(self) -> None:
@@ -609,7 +1074,7 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
             with self.subTest(group=broken_group):
                 self.assert_rejected(
                     replace_once(self.workflow, EXPECTED_CONCURRENCY_GROUP, broken_group),
-                    "only the PR number",
+                    "isolate reruns",
                 )
 
     def test_temporary_ab_mode_preserves_provider_qualified_names(self) -> None:
