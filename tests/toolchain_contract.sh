@@ -14,6 +14,7 @@ fi
 
 expected_toolchain="1.98.0"
 toolchain_file="rust-toolchain.toml"
+lockfile="Cargo.lock"
 authoritative_workflows=()
 while IFS= read -r workflow; do
   if grep -Eq 'dtolnay/rust-toolchain@|(^|[[:space:]])cargo([[:space:]]|$)' "$workflow"; then
@@ -25,6 +26,37 @@ if [[ ${#authoritative_workflows[@]} -eq 0 ]]; then
   echo "no tracked Cargo workflows found to audit" >&2
   exit 1
 fi
+
+if ! git ls-files --error-unmatch "$lockfile" >/dev/null 2>&1; then
+  echo "$lockfile must be tracked so clean checkouts resolve the reviewed dependency graph and CI cache keys are nonempty" >&2
+  exit 1
+fi
+
+if git check-ignore -q "$lockfile"; then
+  echo "$lockfile is tracked but still ignored; remove the ignore rule so dependency updates remain reviewable" >&2
+  exit 1
+fi
+
+if [[ ! -s "$lockfile" ]]; then
+  echo "$lockfile must contain the reviewed dependency graph; found a missing or empty file" >&2
+  exit 1
+fi
+
+cache_identity="hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml')"
+for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
+  cache_key_lines=$(grep -nE '^[[:space:]]+key:' "$workflow" || true)
+  if [[ -z "$cache_key_lines" ]]; then
+    echo "$workflow must declare at least one canonical Cargo build cache key" >&2
+    exit 1
+  fi
+
+  incompatible_cache_keys=$(grep -Fv "$cache_identity" <<<"$cache_key_lines" || true)
+  if [[ -n "$incompatible_cache_keys" ]]; then
+    echo "$workflow has a canonical Cargo build cache key that does not hash Cargo.lock, Cargo.toml, rust-toolchain.toml, and .cargo/config.toml; expected $cache_identity:" >&2
+    echo "$incompatible_cache_keys" >&2
+    exit 1
+  fi
+done
 
 declared_toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$toolchain_file")
 if [[ "$declared_toolchain" != "$expected_toolchain" ]]; then
