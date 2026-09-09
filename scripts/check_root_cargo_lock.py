@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import stat
 import subprocess
 import sys
@@ -12,10 +13,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-NESTED_LOCKS = (
-    Path(".github/issue-105-windows-probe/Cargo.lock"),
-    Path(".github/issue-201-windows-probe/Cargo.lock"),
-)
+GIT_TIMEOUT_SECONDS = 5
+MAX_NESTED_MANIFESTS = 16
 
 
 class ContractError(Exception):
@@ -32,6 +31,10 @@ class IgnoreMatch:
 
 
 def git(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
     return subprocess.run(
         [
             "git",
@@ -39,13 +42,16 @@ def git(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
             "core.hooksPath=/dev/null",
             "-c",
             "core.excludesFile=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
             *arguments,
         ],
         cwd=root,
+        env=environment,
         check=False,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=GIT_TIMEOUT_SECONDS,
     )
 
 
@@ -98,8 +104,26 @@ def check_root_lock(root: Path) -> None:
                 f"status={root_status} diagnostic={root_diagnostic!r}"
             )
 
+    manifests = git(root, "ls-files", "-z", "--", ":(glob)**/Cargo.toml")
+    if manifests.returncode != 0:
+        raise ContractError(
+            "tracked nested Cargo manifests could not be enumerated: "
+            f"status={manifests.returncode} diagnostic={manifests.stderr.strip()!r}"
+        )
+    nested_manifests = [
+        Path(path)
+        for path in manifests.stdout.split("\0")
+        if path and Path(path) != Path("Cargo.toml")
+    ]
+    if len(nested_manifests) > MAX_NESTED_MANIFESTS:
+        raise ContractError(
+            "tracked nested Cargo manifest count exceeds the reviewed checker bound: "
+            f"count={len(nested_manifests)} maximum={MAX_NESTED_MANIFESTS}"
+        )
+
     ignore_file = (root / ".gitignore").resolve()
-    for nested_lock in NESTED_LOCKS:
+    for nested_manifest in nested_manifests:
+        nested_lock = nested_manifest.parent / "Cargo.lock"
         nested_status, nested_match, nested_diagnostic = ignore_match(root, nested_lock)
         if (
             nested_status != 0

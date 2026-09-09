@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_root_cargo_lock.py"
+NESTED_MANIFESTS = (
+    Path(".github/issue-105-windows-probe/Cargo.toml"),
+    Path(".github/issue-201-windows-probe/Cargo.toml"),
+)
 
 
 class LockRepository:
@@ -30,7 +35,16 @@ class LockRepository:
         (self.root / "Cargo.lock").write_text(
             "# generated fixture\nversion = 4\n", encoding="utf-8"
         )
-        self.git("add", ".gitignore", "Cargo.lock")
+        for manifest in NESTED_MANIFESTS:
+            manifest_path = self.root / manifest
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text("[workspace]\n", encoding="utf-8")
+        self.git(
+            "add",
+            ".gitignore",
+            "Cargo.lock",
+            *(str(manifest) for manifest in NESTED_MANIFESTS),
+        )
 
     def close(self) -> None:
         self.temporary.cleanup()
@@ -50,7 +64,7 @@ class LockRepository:
             check=True,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=120,
         )
 
     def run(self) -> subprocess.CompletedProcess[str]:
@@ -108,11 +122,61 @@ class RootCargoLockTests(unittest.TestCase):
         self.assert_contract_failure("root /Cargo.lock must be admitted")
 
     def test_exposed_nested_probe_lock_fails_actionably(self) -> None:
+        for manifest in NESTED_MANIFESTS:
+            with self.subTest(manifest=manifest):
+                nested_lock = manifest.parent / "Cargo.lock"
+                (self.repository.root / ".gitignore").write_text(
+                    f"Cargo.lock\n!/Cargo.lock\n!/{nested_lock}\n", encoding="utf-8"
+                )
+                self.assert_contract_failure(str(nested_lock))
+
+    def test_new_tracked_nested_manifest_is_discovered(self) -> None:
+        manifest = Path(".github/new-probe/Cargo.toml")
+        manifest_path = self.repository.root / manifest
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text("[workspace]\n", encoding="utf-8")
+        self.repository.git("add", str(manifest))
+        nested_lock = manifest.parent / "Cargo.lock"
         (self.repository.root / ".gitignore").write_text(
-            "Cargo.lock\n!/Cargo.lock\n!**/Cargo.lock\n", encoding="utf-8"
+            f"Cargo.lock\n!/Cargo.lock\n!/{nested_lock}\n", encoding="utf-8"
+        )
+        self.assert_contract_failure(str(nested_lock))
+
+    def test_private_exclude_cannot_replace_reviewed_nested_ignore(self) -> None:
+        (self.repository.root / ".gitignore").write_text(
+            "!/Cargo.lock\n", encoding="utf-8"
+        )
+        (self.repository.root / ".git/info/exclude").write_text(
+            "Cargo.lock\n", encoding="utf-8"
         )
         self.assert_contract_failure(
-            "nested standalone-workspace lockfile must remain ignored"
+            "nested lockfile ignore must come from the reviewed .gitignore"
+        )
+
+    def test_inherited_alternate_index_cannot_certify_tracking(self) -> None:
+        alternate_index = self.repository.root / "alternate.index"
+        shutil.copy2(self.repository.root / ".git/index", alternate_index)
+        self.repository.git("rm", "--cached", "--quiet", "Cargo.lock")
+        self.repository.environment["GIT_INDEX_FILE"] = str(alternate_index)
+        self.assert_contract_failure("Cargo.lock must be tracked")
+
+    def test_configured_fsmonitor_is_not_executed(self) -> None:
+        marker = self.repository.root / "fsmonitor-ran"
+        hook = self.repository.root / "fsmonitor-hook"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+        hook.chmod(0o700)
+        self.repository.git("config", "core.fsmonitor", str(hook))
+        result = self.repository.run()
+        self.assertEqual(
+            result.returncode,
+            0,
+            "configured fsmonitor must be disabled without breaking the checker: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertFalse(
+            marker.exists(),
+            "root lock checker must not execute repository-configured fsmonitor code: "
+            f"hook={hook} marker={marker}",
         )
 
     def test_symlink_root_lock_is_rejected(self) -> None:
