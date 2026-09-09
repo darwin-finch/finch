@@ -8,9 +8,11 @@ import ast
 import json
 import os
 import re
+import selectors
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,25 @@ REQUIRED_ATTRIBUTES = (
     "tests/fixtures/ci-generated-workflows/*.json text eol=lf",
     "tests/fixtures/ci-generated-workflows/*.yml text eol=lf",
 )
+TOOLCHAIN_PREFIX = b'''#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root"
+
+check_format=true
+if [[ "${1:-}" == "--metadata-only" ]]; then
+  check_format=false
+elif [[ $# -ne 0 ]]; then
+  echo "usage: $0 [--metadata-only]" >&2
+  exit 2
+fi
+
+python3 scripts/test_generated_ci_workflows.py
+python3 scripts/check_generated_ci_workflows.py
+python3 tests/test_toolchain_locked_metadata.py
+cargo metadata --locked --no-deps --format-version 1 >/dev/null
+'''
 CONDITION = (
     "${{ github.event_name == 'workflow_dispatch' || github.event.action == 'requested' "
     "|| github.event.workflow_run.run_attempt > 1 }}"
@@ -42,6 +63,25 @@ SAFE_WORKFLOW_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()/-]{0,127}\Z")
 
 class ContractError(RuntimeError):
     """A generated-workflow source or output violated the closed contract."""
+
+
+def utf8_size(value: str, label: str) -> int:
+    for character in value:
+        codepoint = ord(character)
+        if (
+            codepoint < 0x20
+            or 0x7F <= codepoint <= 0x9F
+            or codepoint in (0x2028, 0x2029)
+            or 0xD800 <= codepoint <= 0xDFFF
+            or codepoint & 0xFFFF in (0xFFFE, 0xFFFF)
+        ):
+            raise ContractError(
+                f"{label} contains forbidden YAML/control code point U+{codepoint:04X}"
+            )
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ContractError(f"{label} is not valid Unicode: {error}") from error
 
 
 def exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
@@ -59,10 +99,9 @@ def exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
 def bounded_string(value: Any, label: str, *, maximum: int = 256) -> str:
     if not isinstance(value, str):
         raise ContractError(f"{label} must be a string; found {type(value).__name__}")
-    if not value or len(value.encode("utf-8")) > maximum:
+    size = utf8_size(value, label)
+    if not value or size > maximum:
         raise ContractError(f"{label} must contain 1..{maximum} UTF-8 bytes")
-    if "\r" in value or "\0" in value or any(ord(character) < 0x20 for character in value):
-        raise ContractError(f"{label} contains a forbidden control character")
     if "${{" in value or "}}" in value:
         raise ContractError(f"{label} contains a forbidden GitHub expression delimiter")
     return value
@@ -173,21 +212,14 @@ def validate_model(value: Any, source: str) -> dict[str, Any]:
         )
 
     environment = workflow["environment"]
-    if not isinstance(environment, dict) or not 1 <= len(environment) <= 8:
-        raise ContractError(f"{source}.workflow.environment must contain 1..8 entries")
-    allowed_sources = {"github.token", f"inputs.{input_name}"}
-    used_sources: set[str] = set()
-    for key, item in environment.items():
-        safe_string(key, f"{source}.workflow.environment key", SAFE_ENV_IDENTIFIER)
-        if item not in allowed_sources:
-            raise ContractError(
-                f"{source}.workflow.environment.{key} must be github.token or a declared input; "
-                f"found {item!r}"
-            )
-        used_sources.add(item)
-    if used_sources != allowed_sources:
+    expected_environment = {
+        "CONTINUATION_CURSOR": f"inputs.{input_name}",
+        "TOKEN": "github.token",
+    }
+    if environment != expected_environment:
         raise ContractError(
-            f"{source}.workflow.environment must expose exactly github.token and inputs.{input_name}"
+            f"{source}.workflow.environment must be exactly {expected_environment!r}; "
+            f"found {environment!r}"
         )
 
     script = exact_keys(workflow["script"], {"body", "name"}, f"{source}.workflow.script")
@@ -195,13 +227,14 @@ def validate_model(value: Any, source: str) -> dict[str, Any]:
     body = script["body"]
     if not isinstance(body, str):
         raise ContractError(f"{source}.workflow.script.body must be a string")
-    if not body.endswith("\n") or "\r" in body or "\0" in body:
-        raise ContractError(f"{source}.workflow.script.body must be NUL-free LF text ending in LF")
+    if not body.endswith("\n"):
+        raise ContractError(f"{source}.workflow.script.body must end in LF")
+    body_size = utf8_size(body.replace("\n", ""), f"{source}.workflow.script.body")
     if "${{" in body or "}}" in body:
         raise ContractError(
             f"{source}.workflow.script.body contains a forbidden GitHub expression delimiter"
         )
-    if len(body.encode("utf-8")) > 48 * 1024:
+    if body_size + body.count("\n") > 48 * 1024:
         raise ContractError(f"{source}.workflow.script.body exceeds the 48 KiB bound")
     if any(line == "PYTHON" for line in body.splitlines()):
         raise ContractError(f"{source}.workflow.script.body may not contain the fixed heredoc terminator")
@@ -264,96 +297,206 @@ def render(model: dict[str, Any]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def safe_read(
-    root: Path,
-    relative: str,
-    maximum: int,
-    label: str,
-    *,
-    require_lf_utf8: bool = True,
-) -> bytes:
-    path = root / relative
-    current = root
-    for component in Path(relative).parts[:-1]:
-        current = current / component
+TREE_PATHS = {
+    ".gitattributes": ("100644", MAX_ATTRIBUTES_BYTES),
+    "tests/toolchain_contract.sh": ("100755", MAX_TOOLCHAIN_BYTES),
+    CATALOG[0][0]: ("100644", MAX_SOURCE_BYTES),
+    CATALOG[0][1]: ("100644", MAX_OUTPUT_BYTES),
+}
+
+
+class GitSnapshot:
+    """Read one immutable, tracked HEAD tree from an anchored repository root."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.root_descriptor = -1
+        self.root_identity: tuple[int, int] | None = None
+        self.tree: str | None = None
+
+    def __enter__(self) -> "GitSnapshot":
+        required = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+        values = {name: getattr(os, name, None) for name in required}
+        missing = [name for name, value in values.items() if not isinstance(value, int) or value == 0]
+        if missing:
+            raise ContractError(f"safe repository anchor requires unavailable flags: {missing!r}")
+        flags = os.O_RDONLY | values["O_DIRECTORY"] | values["O_NOFOLLOW"] | values["O_NONBLOCK"]
+        flags |= getattr(os, "O_CLOEXEC", 0)
         try:
-            metadata = current.lstat()
+            before = self.root.lstat()
+            descriptor = os.open(self.root, flags)
+            opened = os.fstat(descriptor)
         except OSError as error:
-            raise ContractError(f"{label} parent cannot be inspected: path={current}: {error}") from error
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise ContractError(f"{label} parent must be a real directory, not a symlink: path={current}")
-    try:
-        before = path.lstat()
-    except OSError as error:
-        raise ContractError(f"{label} cannot be inspected: path={path}: {error}") from error
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise ContractError(f"{label} must be a regular non-symlink file: path={path}")
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if not isinstance(nofollow, int) or nofollow == 0:
-        raise ContractError(f"{label} cannot be opened safely because O_NOFOLLOW is unavailable")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ContractError(f"{label} cannot be opened without following symlinks: path={path}: {error}") from error
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-            before.st_dev,
-            before.st_ino,
-        ):
-            raise ContractError(f"{label} changed identity while opening: path={path}")
-        if opened.st_size > maximum:
-            raise ContractError(
-                f"{label} exceeds its {maximum}-byte bound: path={path} size={opened.st_size}"
-            )
-        opened_identity = (
+            raise ContractError(f"repository root cannot be anchored safely: path={self.root}: {error}") from error
+        if not stat.S_ISDIR(opened.st_mode) or (before.st_dev, before.st_ino) != (
             opened.st_dev,
             opened.st_ino,
-            opened.st_size,
-            opened.st_mtime_ns,
-            opened.st_ctime_ns,
-        )
-        chunks: list[bytes] = []
-        remaining = maximum + 1
-        while remaining:
-            chunk = os.read(descriptor, min(65536, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        after = os.fstat(descriptor)
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        )
-        if after_identity != opened_identity or len(data) != opened.st_size:
-            raise ContractError(
-                f"{label} changed while it was being read: path={path} "
-                f"before={opened_identity!r} after={after_identity!r} bytes_read={len(data)}"
-            )
-    finally:
-        os.close(descriptor)
-    if len(data) > maximum:
-        raise ContractError(f"{label} exceeds its {maximum}-byte bound: path={path} size>{maximum}")
-    if require_lf_utf8:
-        if b"\0" in data:
-            raise ContractError(f"{label} contains a forbidden NUL byte: path={path}")
-        if b"\r" in data:
-            raise ContractError(f"{label} must use LF line endings and contains CR: path={path}")
+        ):
+            os.close(descriptor)
+            raise ContractError(f"repository root changed identity while anchoring: path={self.root}")
+        self.root_descriptor = descriptor
+        self.root_identity = (opened.st_dev, opened.st_ino)
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        if self.root_descriptor >= 0:
+            os.close(self.root_descriptor)
+            self.root_descriptor = -1
+
+    def assert_root(self) -> None:
         try:
-            data.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ContractError(f"{label} is not UTF-8: path={path}: {error}") from error
-    return data
+            resident = self.root.lstat()
+            opened = os.fstat(self.root_descriptor)
+        except OSError as error:
+            raise ContractError(f"repository root cannot be revalidated: path={self.root}: {error}") from error
+        identities = {(resident.st_dev, resident.st_ino), (opened.st_dev, opened.st_ino)}
+        if identities != {self.root_identity} or not stat.S_ISDIR(resident.st_mode):
+            raise ContractError(
+                f"repository root changed after anchoring: expected={self.root_identity!r} "
+                f"resident={(resident.st_dev, resident.st_ino)!r}"
+            )
+
+    def git(self, arguments: list[str], maximum: int, label: str) -> bytes:
+        self.assert_root()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+            }
+        )
+        try:
+            process = subprocess.Popen(
+                ["git", "-C", str(self.root), *arguments],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            raise ContractError(f"{label} could not execute Git: {error}") from error
+        assert process.stdout is not None and process.stderr is not None
+        streams = selectors.DefaultSelector()
+        streams.register(process.stdout, selectors.EVENT_READ, ("stdout", maximum))
+        streams.register(process.stderr, selectors.EVENT_READ, ("stderr", 4096))
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        deadline = time.monotonic() + 10
+        try:
+            while streams.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait(timeout=5)
+                    raise ContractError(f"{label} timed out after 10 seconds")
+                events = streams.select(remaining)
+                if not events:
+                    continue
+                for key, _mask in events:
+                    channel, limit = key.data
+                    chunk = os.read(key.fileobj.fileno(), min(4096, limit + 1))
+                    if not chunk:
+                        streams.unregister(key.fileobj)
+                        continue
+                    buffers[channel].extend(chunk)
+                    if len(buffers[channel]) > limit:
+                        process.kill()
+                        process.wait(timeout=5)
+                        raise ContractError(
+                            f"{label} exceeded its {limit}-byte {channel} bound"
+                        )
+            status = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        finally:
+            streams.close()
+            process.stdout.close()
+            process.stderr.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        output = bytes(buffers["stdout"])
+        stderr_prefix = bytes(buffers["stderr"])
+        if status != 0:
+            raise ContractError(
+                f"{label} failed: status={status} stderr_prefix={stderr_prefix!r} "
+                f"stderr_size={len(stderr_prefix)}"
+            )
+        self.assert_root()
+        return output
+
+    def load(self) -> dict[str, bytes]:
+        tree_raw = self.git(["rev-parse", "--verify", "HEAD^{tree}"], 128, "HEAD tree resolution")
+        tree = tree_raw.decode("ascii", "strict").strip()
+        if re.fullmatch(r"[0-9a-f]{40,64}", tree) is None:
+            raise ContractError(f"HEAD tree resolution returned an invalid object ID: {tree!r}")
+        self.tree = tree
+        selection_paths = [".gitattributes", "tests/toolchain_contract.sh", FIXTURE_DIRECTORY]
+        listing = self.git(
+            ["ls-tree", "-rz", "--full-tree", tree, "--", *selection_paths],
+            16 * 1024,
+            "authority tree catalog",
+        )
+        entries: dict[str, tuple[str, str]] = {}
+        for raw_entry in listing.split(b"\0"):
+            if not raw_entry:
+                continue
+            try:
+                metadata, raw_path = raw_entry.split(b"\t", 1)
+                mode, kind, raw_oid = metadata.split(b" ", 2)
+                path = raw_path.decode("utf-8", "strict")
+                oid = raw_oid.decode("ascii", "strict")
+            except (UnicodeDecodeError, ValueError) as error:
+                raise ContractError(f"authority tree catalog contains malformed entry: {raw_entry[:256]!r}") from error
+            if path in entries or kind != b"blob" or re.fullmatch(r"[0-9a-f]{40,64}", oid) is None:
+                raise ContractError(
+                    f"authority tree catalog contains invalid or duplicate entry: path={path!r} "
+                    f"kind={kind!r} oid={oid!r}"
+                )
+            entries[path] = (mode.decode("ascii", "strict"), oid)
+            if len(entries) > len(TREE_PATHS):
+                fixture_entries = {
+                    item for item in entries if item.startswith(f"{FIXTURE_DIRECTORY}/")
+                }
+                raise ContractError(
+                    "authority tree fixture path/count drifted: "
+                    f"expected_count=2 actual_count_at_least={len(fixture_entries)} "
+                    f"unknown_sample={sorted(fixture_entries - set(expected_catalog_paths()))[:2]!r}"
+                )
+        if set(entries) != set(TREE_PATHS):
+            raise ContractError(
+                "authority tree path/count drifted: "
+                f"expected_count={len(TREE_PATHS)} actual_count={len(entries)} "
+                f"missing={sorted(set(TREE_PATHS) - set(entries))!r} "
+                f"unknown={sorted(set(entries) - set(TREE_PATHS))!r}"
+            )
+        blobs: dict[str, bytes] = {}
+        for path, (mode, oid) in entries.items():
+            expected_mode, maximum = TREE_PATHS[path]
+            if mode != expected_mode:
+                raise ContractError(
+                    f"authority tree mode drifted: path={path} expected={expected_mode} actual={mode}"
+                )
+            size_raw = self.git(["cat-file", "-s", oid], 64, f"blob size for {path}")
+            try:
+                size = int(size_raw.strip())
+            except ValueError as error:
+                raise ContractError(f"blob size for {path} is invalid: {size_raw[:64]!r}") from error
+            if not 0 <= size <= maximum:
+                raise ContractError(
+                    f"authority blob exceeds its bound: path={path} size={size} maximum={maximum}"
+                )
+            blob = self.git(["cat-file", "blob", oid], maximum, f"authority blob {path}")
+            if len(blob) != size:
+                raise ContractError(
+                    f"authority blob size changed: path={path} declared={size} actual={len(blob)}"
+                )
+            blobs[path] = blob
+        return blobs
 
 
-def load_model(root: Path, relative: str) -> dict[str, Any]:
-    raw = safe_read(root, relative, MAX_SOURCE_BYTES, "generated workflow source")
+def load_model(raw: bytes, relative: str) -> dict[str, Any]:
+    if b"\0" in raw or b"\r" in raw:
+        raise ContractError(f"generated workflow source must be NUL-free LF text: path={relative}")
     try:
         value = json.loads(
             raw,
@@ -361,8 +504,8 @@ def load_model(root: Path, relative: str) -> dict[str, Any]:
             parse_float=reject_noninteger_number,
             parse_constant=reject_noninteger_number,
         )
-    except UnicodeDecodeError:
-        raise
+    except UnicodeDecodeError as error:
+        raise ContractError(f"generated workflow source is not UTF-8: path={relative}: {error}") from error
     except (json.JSONDecodeError, ContractError) as error:
         raise ContractError(f"generated workflow source is not strict JSON: path={relative}: {error}") from error
     model = validate_model(value, relative)
@@ -375,27 +518,15 @@ def load_model(root: Path, relative: str) -> dict[str, Any]:
     return model
 
 
-def verify_catalog(root: Path) -> None:
-    expected_paths = {path for pair in CATALOG for path in pair}
+def expected_catalog_paths() -> tuple[str, ...]:
+    return tuple(path for pair in CATALOG for path in pair)
+
+
+def verify_catalog(blobs: dict[str, bytes]) -> None:
+    expected_paths = set(expected_catalog_paths())
     if len(CATALOG) != 1 or len(expected_paths) != 2:
         raise ContractError("internal generated workflow catalog must contain exactly one source/output pair")
-    directory = root / FIXTURE_DIRECTORY
-    try:
-        metadata = directory.lstat()
-    except OSError as error:
-        raise ContractError(f"generated workflow fixture catalog cannot be inspected: {directory}: {error}") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ContractError(f"generated workflow fixture catalog must be a real directory: {directory}")
-    actual_paths: set[str] = set()
-    with os.scandir(directory) as entries:
-        for entry in entries:
-            actual_paths.add(str(Path(FIXTURE_DIRECTORY) / entry.name))
-            if len(actual_paths) > len(expected_paths):
-                raise ContractError(
-                    "generated workflow fixture catalog path/count drifted: "
-                    f"expected_count={len(expected_paths)} actual_count_at_least={len(actual_paths)} "
-                    f"unknown_sample={sorted(actual_paths - expected_paths)!r}"
-                )
+    actual_paths = {path for path in blobs if path.startswith(f"{FIXTURE_DIRECTORY}/")}
     if actual_paths != expected_paths:
         raise ContractError(
             "generated workflow fixture catalog path/count drifted: "
@@ -405,9 +536,13 @@ def verify_catalog(root: Path) -> None:
         )
 
 
-def verify_attributes(root: Path) -> None:
-    raw = safe_read(root, ".gitattributes", MAX_ATTRIBUTES_BYTES, "Git attributes contract")
-    lines = raw.decode("utf-8").splitlines()
+def verify_attributes(snapshot: GitSnapshot, raw: bytes) -> None:
+    if b"\0" in raw or b"\r" in raw:
+        raise ContractError("Git attributes contract must be NUL-free LF text")
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ContractError(f"Git attributes contract is not UTF-8: {error}") from error
     counts = {line: lines.count(line) for line in REQUIRED_ATTRIBUTES}
     if any(count != 1 for count in counts.values()):
         raise ContractError(
@@ -415,21 +550,12 @@ def verify_attributes(root: Path) -> None:
             f"required={REQUIRED_ATTRIBUTES!r} counts={counts!r}"
         )
     fixture_paths = [path for pair in CATALOG for path in pair]
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "check-attr", "-z", "text", "eol", "--", *fixture_paths],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ContractError(f"Git attributes effective-rule check could not run: {error}") from error
-    if result.returncode != 0:
-        raise ContractError(
-            "Git attributes effective-rule check failed: "
-            f"status={result.returncode} stderr={result.stderr[:4096]!r}"
-        )
-    fields = result.stdout.split(b"\0")
+    result = snapshot.git(
+        ["check-attr", f"--source={snapshot.tree}", "-z", "text", "eol", "--", *fixture_paths],
+        4096,
+        "Git attributes effective-rule check",
+    )
+    fields = result.split(b"\0")
     if fields[-1:] == [b""]:
         fields.pop()
     expected_fields: list[bytes] = []
@@ -443,10 +569,18 @@ def verify_attributes(root: Path) -> None:
         )
 
 
-def verify_toolchain_wiring(root: Path) -> None:
-    relative = "tests/toolchain_contract.sh"
-    raw = safe_read(root, relative, MAX_TOOLCHAIN_BYTES, "canonical toolchain gate")
-    lines = raw.decode("utf-8").splitlines()
+def verify_toolchain_wiring(raw: bytes) -> None:
+    # This pins the executable top-level prefix instead of interpreting shell. If an
+    # attacker disables every invocation, no in-repository checker can execute itself.
+    if not raw.startswith(TOOLCHAIN_PREFIX):
+        raise ContractError(
+            "canonical toolchain gate executable prefix drifted; generated-workflow tests and checker "
+            "must be unconditional top-level commands before Cargo metadata"
+        )
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ContractError(f"canonical toolchain gate is not UTF-8: {error}") from error
     test_line = "python3 scripts/test_generated_ci_workflows.py"
     check_line = "python3 scripts/check_generated_ci_workflows.py"
     metadata_line = "cargo metadata --locked --no-deps --format-version 1 >/dev/null"
@@ -472,15 +606,9 @@ def difference(expected: bytes, actual: bytes) -> tuple[int, int, int]:
     return offset, line, column
 
 
-def verify_pair(root: Path, source: str, output: str) -> None:
-    expected = render(load_model(root, source))
-    actual = safe_read(
-        root,
-        output,
-        MAX_OUTPUT_BYTES,
-        "generated workflow output",
-        require_lf_utf8=False,
-    )
+def verify_pair(blobs: dict[str, bytes], source: str, output: str) -> None:
+    expected = render(load_model(blobs[source], source))
+    actual = blobs[output]
     if actual == expected:
         return
     offset, line, column = difference(expected, actual)
@@ -514,19 +642,22 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parse_arguments(sys.argv[1:] if argv is None else argv)
     try:
         root = repository_root(arguments.root)
-        verify_catalog(root)
-        verify_attributes(root)
-        verify_toolchain_wiring(root)
-        if arguments.render is not None:
-            matches = [pair for pair in CATALOG if pair[0] == arguments.render]
-            if len(matches) != 1:
-                raise ContractError(
-                    f"--render source must name exactly one catalog source; found {arguments.render!r}"
-                )
-            sys.stdout.buffer.write(render(load_model(root, matches[0][0])))
-            return 0
-        for source, output in CATALOG:
-            verify_pair(root, source, output)
+        with GitSnapshot(root) as snapshot:
+            blobs = snapshot.load()
+            verify_catalog(blobs)
+            verify_attributes(snapshot, blobs[".gitattributes"])
+            verify_toolchain_wiring(blobs["tests/toolchain_contract.sh"])
+            if arguments.render is not None:
+                matches = [pair for pair in CATALOG if pair[0] == arguments.render]
+                if len(matches) != 1:
+                    raise ContractError(
+                        f"--render source must name exactly one catalog source; found {arguments.render!r}"
+                    )
+                rendered = render(load_model(blobs[matches[0][0]], matches[0][0]))
+                sys.stdout.buffer.write(rendered)
+                return 0
+            for source, output in CATALOG:
+                verify_pair(blobs, source, output)
     except (ContractError, OSError) as error:
         print(f"generated CI workflow verification failed: {error}", file=sys.stderr)
         return 1
