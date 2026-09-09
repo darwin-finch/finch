@@ -12,6 +12,16 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+if ! git ls-files --error-unmatch -- Cargo.lock >/dev/null 2>&1; then
+  echo "Cargo.lock must be tracked so clean checkouts use the reviewed dependency graph" >&2
+  exit 1
+fi
+
+if [[ ! -f Cargo.lock ]]; then
+  echo "Cargo.lock is tracked but missing from the worktree; restore the reviewed dependency graph before running repository checks" >&2
+  exit 1
+fi
+
 expected_toolchain="1.98.0"
 toolchain_file="rust-toolchain.toml"
 authoritative_workflows=()
