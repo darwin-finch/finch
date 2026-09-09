@@ -4,6 +4,22 @@ set -euo pipefail
 repository_root=$(git rev-parse --show-toplevel)
 cd "$repository_root"
 
+if ! git ls-files --error-unmatch -- Cargo.lock >/dev/null 2>&1; then
+  echo "Cargo.lock must be tracked so clean checkouts use the reviewed dependency graph" >&2
+  exit 1
+fi
+
+lock_hash_before=$(git hash-object Cargo.lock)
+if ! cargo metadata --locked --no-deps --format-version 1 >/dev/null; then
+  echo "Cargo.lock must describe Cargo.toml exactly; 'cargo metadata --locked --no-deps' rejected the reviewed dependency graph" >&2
+  exit 1
+fi
+lock_hash_after=$(git hash-object Cargo.lock)
+if [[ "$lock_hash_after" != "$lock_hash_before" ]]; then
+  echo "locked metadata validation must not rewrite Cargo.lock: before=$lock_hash_before after=$lock_hash_after" >&2
+  exit 1
+fi
+
 check_format=true
 if [[ "${1:-}" == "--metadata-only" ]]; then
   check_format=false
