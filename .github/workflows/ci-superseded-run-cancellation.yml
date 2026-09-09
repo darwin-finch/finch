@@ -1,0 +1,311 @@
+name: Cancel superseded CI runs
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [requested, in_progress]
+
+permissions:
+  actions: write
+  pull-requests: read
+
+jobs:
+  cancel-superseded:
+    if: github.event.action == 'requested' || github.event.workflow_run.run_attempt > 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Cancel superseded canonical CI runs
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          CANONICAL_NAME = "CI"
+          CANONICAL_PATH = ".github/workflows/ci.yml"
+          ACTIVE_STATUSES = ("requested", "queued", "in_progress", "waiting", "pending")
+          PAGE_SIZE = 100
+          MAX_PAGES = 4
+          MAX_LISTED_RUNS = PAGE_SIZE * MAX_PAGES
+          MAX_CANDIDATES = 50
+          MAX_API_REQUESTS = 3 * MAX_CANDIDATES + MAX_PAGES + 12
+          request_count = 0
+
+          def fail(message):
+              raise RuntimeError(message)
+
+          def integer(value, label):
+              if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                  fail(f"{label} must be a positive integer; found {value!r}")
+              return value
+
+          def api(method, path, expected=(200,)):
+              global request_count
+              request_count += 1
+              if request_count > MAX_API_REQUESTS:
+                  fail(f"Actions API request cap exceeded ({MAX_API_REQUESTS})")
+              url = api_url + path
+              request = urllib.request.Request(
+                  url,
+                  method=method,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      status = response.status
+                      raw = response.read(2 * 1024 * 1024 + 1)
+              except urllib.error.HTTPError as error:
+                  if method == "POST" and error.code == 409:
+                      return False
+                  remaining = error.headers.get("X-RateLimit-Remaining", "missing")
+                  reset = error.headers.get("X-RateLimit-Reset", "missing")
+                  retry_after = error.headers.get("Retry-After", "missing")
+                  fail(
+                      f"Actions API request {request_count}/{MAX_API_REQUESTS} "
+                      f"{method} {path} returned HTTP {error.code}; "
+                      f"rate_limit_remaining={remaining} rate_limit_reset={reset} "
+                      f"retry_after={retry_after}"
+                  )
+              except urllib.error.URLError as error:
+                  fail(f"Actions API {method} {path} failed: {error.reason}")
+              if status not in expected:
+                  fail(f"Actions API {method} {path} returned unexpected HTTP {status}")
+              if method == "POST":
+                  return True
+              if len(raw) > 2 * 1024 * 1024:
+                  fail(f"Actions API {method} {path} exceeded the response-size bound")
+              try:
+                  return json.loads(raw)
+              except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                  fail(f"Actions API {method} {path} returned malformed JSON: {error}")
+
+          def canonical_run(value, label, expected_id=None):
+              if not isinstance(value, dict):
+                  fail(f"{label} must be an object")
+              run_id = integer(value.get("id"), f"{label}.id")
+              if expected_id is not None and run_id != expected_id:
+                  fail(f"{label}.id changed: expected {expected_id}, found {run_id}")
+              if value.get("name") != CANONICAL_NAME or value.get("path") != CANONICAL_PATH:
+                  fail(f"{label} is not the canonical {CANONICAL_PATH} workflow")
+              if value.get("event") != "pull_request":
+                  fail(f"{label}.event must be pull_request; found {value.get('event')!r}")
+              run_repo = value.get("repository")
+              if not isinstance(run_repo, dict) or run_repo.get("full_name") != repo:
+                  fail(f"{label}.repository does not match {repo}")
+              sha = value.get("head_sha")
+              if not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+                  fail(f"{label}.head_sha is not a 40-digit hexadecimal SHA")
+              run_number = integer(value.get("run_number"), f"{label}.run_number")
+              run_attempt = integer(value.get("run_attempt"), f"{label}.run_attempt")
+              branch = value.get("head_branch")
+              if not isinstance(branch, str) or not branch or len(branch) > 255:
+                  fail(f"{label}.head_branch is invalid")
+              pull_requests = value.get("pull_requests")
+              if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+                  fail(f"{label}.pull_requests must identify exactly one PR")
+              association = pull_requests[0]
+              if not isinstance(association, dict):
+                  fail(f"{label}.pull_requests contains a non-object")
+              pr_number = integer(association.get("number"), f"{label} PR number")
+              pr_head = association.get("head")
+              pr_base = association.get("base")
+              pr_head_repo = pr_head.get("repo") if isinstance(pr_head, dict) else None
+              pr_base_repo = pr_base.get("repo") if isinstance(pr_base, dict) else None
+              pr_head_sha = pr_head.get("sha") if isinstance(pr_head, dict) else None
+              if (
+                  not isinstance(pr_head, dict)
+                  or not isinstance(pr_head_sha, str)
+                  or pr_head_sha.lower() != sha.lower()
+                  or pr_head.get("ref") != branch
+                  or not isinstance(pr_head_repo, dict)
+                  or not isinstance(pr_base, dict)
+                  or pr_base.get("ref") != "main"
+                  or not isinstance(pr_base_repo, dict)
+                  or pr_base_repo.get("full_name") != repo
+              ):
+                  fail(f"{label} PR association does not match its SHA, branch, and {repo}/main")
+              status = value.get("status")
+              if status not in ACTIVE_STATUSES and status != "completed":
+                  fail(f"{label}.status is unknown: {status!r}")
+              return {
+                  "id": run_id,
+                  "head_sha": sha.lower(),
+                  "run_number": run_number,
+                  "run_attempt": run_attempt,
+                  "head_branch": branch,
+                  "pr_number": pr_number,
+                  "status": status,
+              }
+
+          def validated_pr(value, expected_number=None):
+              if not isinstance(value, dict):
+                  fail("pull request response must be an object")
+              number = integer(value.get("number"), "pull request number")
+              if expected_number is not None and number != expected_number:
+                  fail(f"pull request number changed: expected {expected_number}, found {number}")
+              base = value.get("base")
+              base_repo = base.get("repo") if isinstance(base, dict) else None
+              head = value.get("head")
+              if (
+                  value.get("state") != "open"
+                  or not isinstance(base, dict)
+                  or base.get("ref") != "main"
+                  or not isinstance(base_repo, dict)
+                  or base_repo.get("full_name") != repo
+                  or not isinstance(head, dict)
+              ):
+                  fail(f"pull request {number} is not open against {repo}/main")
+              sha = head.get("sha")
+              if not isinstance(sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}", sha) is None:
+                  fail(f"pull request {number} has an invalid live head SHA")
+              ref = head.get("ref")
+              if not isinstance(ref, str) or not ref or len(ref) > 255:
+                  fail(f"pull request {number} has an invalid live head branch")
+              return number, sha.lower(), ref
+
+          def branch_runs(branch):
+              found = {}
+              for page in range(1, MAX_PAGES + 1):
+                  query = urllib.parse.urlencode({
+                      "branch": branch,
+                      "event": "pull_request",
+                      "per_page": PAGE_SIZE,
+                      "page": page,
+                  })
+                  data = api("GET", f"/repos/{repo}/actions/workflows/ci.yml/runs?{query}")
+                  if not isinstance(data, dict):
+                      fail("branch run listing must be an object")
+                  runs = data.get("workflow_runs")
+                  if not isinstance(runs, list) or len(runs) > PAGE_SIZE:
+                      fail(f"branch run listing page {page} is invalid")
+                  for raw_run in runs:
+                      run = canonical_run(raw_run, f"listed branch run on page {page}")
+                      if run["head_branch"] != branch:
+                          fail(f"listed run {run['id']} escaped requested branch {branch!r}")
+                      found[run["id"]] = run
+                  if len(found) > MAX_LISTED_RUNS:
+                      fail(f"branch run inventory exceeds the {MAX_LISTED_RUNS}-run cap")
+                  if len(runs) < PAGE_SIZE:
+                      return list(found.values())
+              fail(f"branch run inventory did not complete within {MAX_PAGES} pages")
+              return list(found.values())
+
+          def cancel(run_id):
+              return api("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel", expected=(202,))
+
+          try:
+              event_path = os.environ["GITHUB_EVENT_PATH"]
+              api_url = os.environ["GITHUB_API_URL"].rstrip("/")
+              token = os.environ["TOKEN"]
+              if not api_url or not token:
+                  fail("GITHUB_API_URL and TOKEN must be nonempty")
+              with open(event_path, "rb") as stream:
+                  raw_event = stream.read(1024 * 1024 + 1)
+              if len(raw_event) > 1024 * 1024:
+                  fail("workflow_run event exceeds the 1 MiB bound")
+              event = json.loads(raw_event)
+              if not isinstance(event, dict) or event.get("action") not in ("requested", "in_progress"):
+                  fail("event action must be requested or in_progress")
+              repository = event.get("repository")
+              repo = repository.get("full_name") if isinstance(repository, dict) else None
+              if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
+                  fail("event repository.full_name is invalid")
+              payload_run = canonical_run(event.get("workflow_run"), "event workflow_run")
+              if event["action"] == "in_progress" and payload_run["run_attempt"] == 1:
+                  print("initial in_progress event is already covered by requested")
+                  sys.exit(0)
+              trigger = canonical_run(
+                  api("GET", f"/repos/{repo}/actions/runs/{payload_run['id']}"),
+                  "live triggering run",
+                  payload_run["id"],
+              )
+              if (
+                  trigger["head_sha"] != payload_run["head_sha"]
+                  or trigger["run_number"] != payload_run["run_number"]
+                  or trigger["run_attempt"] != payload_run["run_attempt"]
+              ):
+                  fail("live triggering run identity differs from the event")
+              pr_number, current_sha, current_branch = validated_pr(
+                  api("GET", f"/repos/{repo}/pulls/{trigger['pr_number']}"),
+                  trigger["pr_number"],
+              )
+              if current_branch != trigger["head_branch"]:
+                  fail("live pull request branch differs from the triggering run")
+              if trigger["status"] not in ACTIVE_STATUSES:
+                  print("triggering run is already terminal; no cancellation needed")
+                  sys.exit(0)
+              if trigger["head_sha"] != current_sha:
+                  if cancel(trigger["id"]):
+                      print(f"cancelled stale triggering run {trigger['id']}")
+                  else:
+                      print(f"stale triggering run {trigger['id']} was already terminal")
+                  sys.exit(0)
+
+              plan = []
+              for candidate in branch_runs(trigger["head_branch"]):
+                  if (
+                      candidate["id"] == trigger["id"]
+                      or candidate["run_number"] >= trigger["run_number"]
+                      or candidate["head_sha"] == current_sha
+                      or candidate["status"] not in ACTIVE_STATUSES
+                  ):
+                      continue
+                  if candidate["pr_number"] == pr_number:
+                      plan.append(candidate["id"])
+              if len(plan) > MAX_CANDIDATES:
+                  fail(f"cancellation plan exceeds the {MAX_CANDIDATES}-run cap")
+
+              live_pr_number, live_current_sha, live_branch = validated_pr(
+                  api("GET", f"/repos/{repo}/pulls/{pr_number}"), pr_number
+              )
+              refreshed = canonical_run(
+                  api("GET", f"/repos/{repo}/actions/runs/{trigger['id']}"),
+                  "refreshed triggering run",
+                  trigger["id"],
+              )
+              if live_pr_number != pr_number or live_branch != trigger["head_branch"]:
+                  fail("pull request identity changed before cancellation")
+              if refreshed["head_sha"] != trigger["head_sha"] or refreshed["run_number"] != trigger["run_number"]:
+                  fail("triggering run identity changed before cancellation")
+              if refreshed["status"] not in ACTIVE_STATUSES:
+                  print("triggering run is already terminal; no cancellation needed")
+                  sys.exit(0)
+              if refreshed["head_sha"] != live_current_sha:
+                  cancel(refreshed["id"])
+                  print(f"cancelled triggering run {refreshed['id']} after PR head advanced")
+                  sys.exit(0)
+              cancelled = 0
+              for run_id in plan:
+                  candidate = canonical_run(
+                      api("GET", f"/repos/{repo}/actions/runs/{run_id}"),
+                      "refreshed candidate run",
+                      run_id,
+                  )
+                  _, candidate_current_sha, candidate_branch = validated_pr(
+                      api("GET", f"/repos/{repo}/pulls/{pr_number}"), pr_number
+                  )
+                  if (
+                      candidate["status"] not in ACTIVE_STATUSES
+                      or candidate["pr_number"] != pr_number
+                      or candidate["head_branch"] != candidate_branch
+                      or candidate["head_sha"] == candidate_current_sha
+                  ):
+                      continue
+                  if cancel(run_id):
+                      cancelled += 1
+              print(f"cancelled {cancelled} superseded run(s) for PR {pr_number}")
+          except (KeyError, OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+              print(f"superseded CI cancellation failed closed: {error}", file=sys.stderr)
+              sys.exit(1)
+          PYTHON

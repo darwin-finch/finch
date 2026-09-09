@@ -158,6 +158,7 @@ EXPECTED_PR_ACTIVE_WORKFLOWS = [
 ]
 
 EXPECTED_FIXTURE_MEMBERSHIP = {
+    "ci-superseded-run-cancellation.yml": [],
     "ci.yml": sorted(EXPECTED_FIXTURES),
     "docs.yml": ["readme_only"],
     "issue-104-chooser-catalog.yml": [],

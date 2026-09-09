@@ -852,11 +852,11 @@ class WorkflowManifestTests(unittest.TestCase):
         repository = WorkflowRepository()
         try:
             paths = sorted((repository.root / ".github/workflows").glob("*.y*ml"))
-            initial_size = 65_500
+            initial_size = 61_680
             self.assertEqual(
                 len(paths),
-                16,
-                f"aggregate-race fixture assumes 16 reviewed workflows: paths={paths!r}",
+                17,
+                f"aggregate-race fixture assumes 17 reviewed workflows: paths={paths!r}",
             )
             for path in paths:
                 path.write_bytes(b"x" * initial_size)
