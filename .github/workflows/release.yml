@@ -39,16 +39,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Restore trusted Cargo dependency downloads
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-rust-1.98.0-cargo-
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-rust-1.98.0-dependencies-${{ hashFiles('Cargo.lock') }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -61,7 +59,7 @@ jobs:
         run: brew install capnp
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Strip binary (non-Windows)
         run: strip target/${{ matrix.target }}/release/finch || true

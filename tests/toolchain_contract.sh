@@ -32,7 +32,7 @@ if ! git ls-files --error-unmatch "$lockfile" >/dev/null 2>&1; then
   exit 1
 fi
 
-if git check-ignore -q "$lockfile"; then
+if git check-ignore --no-index -q "$lockfile"; then
   echo "$lockfile is tracked but still ignored; remove the ignore rule so dependency updates remain reviewable" >&2
   exit 1
 fi
@@ -42,9 +42,10 @@ if [[ ! -s "$lockfile" ]]; then
   exit 1
 fi
 
-cache_identity="hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml')"
+cache_identity="hashFiles('Cargo.lock')"
 for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
-  cache_key_lines=$(grep -nE '^[[:space:]]+key:' "$workflow" || true)
+  uncommented_workflow=$(sed 's/[[:space:]]#.*$//' "$workflow")
+  cache_key_lines=$(grep -nE '^[[:space:]]+key:' <<<"$uncommented_workflow" || true)
   if [[ -z "$cache_key_lines" ]]; then
     echo "$workflow must declare at least one canonical Cargo build cache key" >&2
     exit 1
@@ -52,11 +53,46 @@ for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
 
   incompatible_cache_keys=$(grep -Fv "$cache_identity" <<<"$cache_key_lines" || true)
   if [[ -n "$incompatible_cache_keys" ]]; then
-    echo "$workflow has a canonical Cargo build cache key that does not hash Cargo.lock, Cargo.toml, rust-toolchain.toml, and .cargo/config.toml; expected $cache_identity:" >&2
+    echo "$workflow has a canonical Cargo dependency cache key that does not hash the reviewed Cargo.lock; expected $cache_identity:" >&2
     echo "$incompatible_cache_keys" >&2
     exit 1
   fi
+
+  unsafe_cache_paths=$(grep -E '^[[:space:]]+(~/.cargo/(registry|git)|target)[[:space:]]*$' <<<"$uncommented_workflow" || true)
+  if [[ -n "$unsafe_cache_paths" ]]; then
+    echo "$workflow caches an unbounded or executable Cargo path instead of bounded dependency downloads:" >&2
+    echo "$unsafe_cache_paths" >&2
+    exit 1
+  fi
+
+  if grep -Eq '^[[:space:]]+restore-keys:' <<<"$uncommented_workflow"; then
+    echo "$workflow must not merge stale Cargo dependency generations through restore-keys" >&2
+    exit 1
+  fi
 done
+
+unlocked_cargo=$(grep -nE '(^|[[:space:]])cargo[[:space:]]+(build|check|clippy|fetch|metadata|run|test)([[:space:]]|$)' \
+  .github/workflows/ci.yml .github/workflows/release.yml \
+  | grep -Ev 'cargo[[:space:]]+(build|check|clippy|fetch|metadata|run|test)[[:space:]].*--locked([[:space:]]|$)' || true)
+if [[ -n "$unlocked_cargo" ]]; then
+  echo "canonical CI and release Cargo graph consumers must use the reviewed Cargo.lock via --locked:" >&2
+  echo "$unlocked_cargo" >&2
+  exit 1
+fi
+
+trusted_save_condition="github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.feature_name == 'default' && steps.cargo-dependency-cache.outputs.cache-hit != 'true'"
+ci_without_comments=$(sed 's/[[:space:]]#.*$//' .github/workflows/ci.yml)
+release_without_comments=$(sed 's/[[:space:]]#.*$//' .github/workflows/release.yml)
+if [[ $(grep -Fc "uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830" <<<"$ci_without_comments") -ne 1 ]] \
+  || [[ $(grep -Fc "if: $trusted_save_condition" <<<"$ci_without_comments") -ne 2 ]]; then
+  echo ".github/workflows/ci.yml must have one SHA-pinned cache save and bind both complete-fetch and save steps to trusted main/default cache-miss execution" >&2
+  exit 1
+fi
+
+if grep -Fq 'uses: actions/cache/save@' <<<"$release_without_comments"; then
+  echo ".github/workflows/release.yml must restore dependency downloads without publishing tag-scoped cache state" >&2
+  exit 1
+fi
 
 declared_toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$toolchain_file")
 if [[ "$declared_toolchain" != "$expected_toolchain" ]]; then

@@ -86,35 +86,48 @@ jobs:
       with:
         components: clippy
 
-    - name: Cache Cargo registry and build
-      uses: actions/cache@v4
+    - name: Restore trusted Cargo dependency downloads
+      id: cargo-dependency-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
-        restore-keys: |
-          ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-
+          ~/.cargo/registry/cache
+          ~/.cargo/registry/index
+          ~/.cargo/git/db
+        key: ${{ runner.os }}-rust-1.98.0-dependencies-${{ hashFiles('Cargo.lock') }}
+
+    - name: Fetch the complete trusted dependency graph
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.feature_name == 'default' && steps.cargo-dependency-cache.outputs.cache-hit != 'true'
+      run: cargo fetch --locked
 
     - name: Run clippy (binary only, warnings allowed for now)
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
-      run: cargo clippy --bin finch --all-features
+      run: cargo clippy --locked --bin finch --all-features
       continue-on-error: true
 
     - name: Build binary
-      run: cargo build --bin finch ${{ matrix.cargo_args }} --verbose
+      run: cargo build --locked --bin finch ${{ matrix.cargo_args }} --verbose
 
     - name: Compile all targets
-      run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
+      run: cargo test --locked --all-targets ${{ matrix.cargo_args }} --no-run
 
     - name: Test all targets
-      run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+      run: cargo test --locked --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
     - name: Verify binary reports its version
       # Exercise Cargo's default binary selection so adding a test-only binary
       # cannot silently break the documented `cargo run -- <args>` workflow.
-      run: cargo run ${{ matrix.cargo_args }} -- --version
+      run: cargo run --locked ${{ matrix.cargo_args }} -- --version
+
+    - name: Save complete trusted Cargo dependency downloads
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.feature_name == 'default' && steps.cargo-dependency-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ~/.cargo/registry/cache
+          ~/.cargo/registry/index
+          ~/.cargo/git/db
+        key: ${{ runner.os }}-rust-1.98.0-dependencies-${{ hashFiles('Cargo.lock') }}
 
   runtime-authority:
     name: Runtime Authority (Ubuntu)
@@ -131,22 +144,22 @@ jobs:
       uses: dtolnay/rust-toolchain@1.98.0
 
     - name: Run runtime authority regressions
-      run: cargo test --lib runtime::tests -- --nocapture
+      run: cargo test --locked --lib runtime::tests -- --nocapture
 
     - name: Compile all targets
-      run: cargo test --all-targets --no-run
+      run: cargo test --locked --all-targets --no-run
 
     - name: Regress scheduler and authority-use concurrency
       run: |
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::wait_rechecks_completion_after_registering_notification -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::tests::deferred_effect_sink_can_reenter_authority_without_deadlock -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::tests::public_revocation_winning_before_host_use_prevents_file_mutation -- --exact --nocapture
-        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::tests::in_flight_deferred_use_blocks_public_revoke_and_root_mutation -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::scheduler::tests::wait_rechecks_completion_after_registering_notification -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::tests::deferred_effect_sink_can_reenter_authority_without_deadlock -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::tests::public_revocation_winning_before_host_use_prevents_file_mutation -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --locked --lib runtime::tests::in_flight_deferred_use_blocks_public_revoke_and_root_mutation -- --exact --nocapture
 
     - name: Test all targets
-      run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
+      run: timeout --signal=TERM --kill-after=30s 15m cargo test --locked --all-targets -- --nocapture
 
   build:
     name: Build Release (${{ matrix.target }})
@@ -180,7 +193,7 @@ jobs:
         targets: ${{ matrix.target }}
 
     - name: Build release binary
-      run: cargo build --release --target ${{ matrix.target }}
+      run: cargo build --locked --release --target ${{ matrix.target }}
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -203,7 +216,7 @@ jobs:
 
     - name: Verify resolved HTTP dependency contract
       run: |
-        cargo generate-lockfile
+        cargo metadata --locked --no-deps --format-version 1 >/dev/null
         python3 scripts/test_http_dependency_contract.py
         python3 scripts/check_http_dependency_contract.py
 
