@@ -12,6 +12,13 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+blacksmith_contract_invocation='python3 tests/test_blacksmith_runner_contract.py'
+blacksmith_contract_count=$(grep -Fxc "$blacksmith_contract_invocation" "$0" || true)
+if [[ "$blacksmith_contract_count" -ne 1 ]]; then
+  echo "$0 must invoke '$blacksmith_contract_invocation' exactly once; found $blacksmith_contract_count" >&2
+  exit 1
+fi
+
 python3 tests/test_toolchain_locked_metadata.py
 python3 tests/test_blacksmith_runner_contract.py
 cargo metadata --locked --no-deps --format-version 1 >/dev/null

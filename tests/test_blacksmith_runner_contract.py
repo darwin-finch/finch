@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
+TOOLCHAIN_CONTRACT = ROOT / "tests/toolchain_contract.sh"
+WORKFLOW_MANIFEST = ROOT / "scripts/ci_workflow_manifest.json"
 BLACKSMITH_RUNNER = "blacksmith-2vcpu-ubuntu-2404"
 FEATURES = ("default", "no-default-features")
 FINAL_LINUX_NAMES = {
@@ -25,6 +29,11 @@ AB_LINUX_NAMES = {
     ("blacksmith", feature): f"Test A/B Blacksmith (ubuntu-24.04, {feature})"
     for feature in FEATURES
 }
+EXPECTED_CONCURRENCY_GROUP = (
+    "ci-${{ github.event_name == 'pull_request' && format('pr-{0}', "
+    "github.event.pull_request.number) || format('push-{0}-{1}', github.ref, "
+    "github.run_id) }}"
+)
 
 
 class ContractError(Exception):
@@ -119,23 +128,41 @@ def validate_concurrency(text: str) -> None:
         )
     group = match.group("group")
     cancel = match.group("cancel")
-    required_group_tokens = (
-        "github.event.pull_request.number",
-        "github.ref",
-        "github.run_id",
-    )
-    missing = [token for token in required_group_tokens if token not in group]
-    if missing:
+    if group != EXPECTED_CONCURRENCY_GROUP:
         raise ContractError(
-            "concurrency group must collapse superseded runs per PR while giving each "
-            "push run an independent ref-qualified group: "
-            f"missing={missing!r} parsed_group={group!r}"
+            "concurrency group must use only the PR number on pull requests, but the "
+            "ref plus run ID on pushes; this collapses same-PR runs without making PRs "
+            "unique or collapsing independent pushes: "
+            f"expected={EXPECTED_CONCURRENCY_GROUP!r} parsed={group!r}"
         )
     expected_cancel = "${{ github.event_name == 'pull_request' }}"
     if cancel != expected_cancel:
         raise ContractError(
             "cancel-in-progress must be enabled only for pull_request events so push "
             f"runs are never cancelled: expected={expected_cancel!r} parsed={cancel!r}"
+        )
+
+
+def validate_toolchain_wiring(text: str) -> None:
+    invocation = "python3 tests/test_blacksmith_runner_contract.py"
+    matches = [line for line in text.splitlines() if line.strip() == invocation]
+    if len(matches) != 1:
+        raise ContractError(
+            "tests/toolchain_contract.sh must invoke the Blacksmith production-boundary "
+            "contract exactly once: "
+            f"expected_invocation={invocation!r} count={len(matches)} script={text!r}"
+        )
+    guard_fragments = (
+        "blacksmith_contract_count=$(grep -Fxc",
+        'if [[ "$blacksmith_contract_count" -ne 1 ]]; then',
+        "must invoke '$blacksmith_contract_invocation' exactly once",
+    )
+    missing = [fragment for fragment in guard_fragments if text.count(fragment) != 1]
+    if missing:
+        raise ContractError(
+            "tests/toolchain_contract.sh must independently guard its Blacksmith "
+            "contract invocation: "
+            f"missing_or_repeated={missing!r} script={text!r}"
         )
 
 
@@ -326,10 +353,74 @@ def replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+def linux_cell(runner: str, provider: str, feature: str, check_name: str) -> str:
+    cargo_args = '""' if feature == "default" else "--no-default-features"
+    return (
+        f"          - runner: {runner}\n"
+        "            platform: ubuntu-24.04\n"
+        f"            provider: {provider}\n"
+        f"            feature_name: {feature}\n"
+        f"            cargo_args: {cargo_args}\n"
+        f"            check_name: {check_name}\n"
+    )
+
+
+def as_final(text: str) -> str:
+    mode = validate_workflow(text)
+    if mode == "final":
+        return text
+    for feature in FEATURES:
+        text = replace_once(
+            text,
+            linux_cell(
+                "ubuntu-24.04", "github", feature, AB_LINUX_NAMES[("github", feature)]
+            ),
+            "",
+        )
+        text = replace_once(
+            text,
+            f"            check_name: {AB_LINUX_NAMES[('blacksmith', feature)]}",
+            f"            check_name: {FINAL_LINUX_NAMES[feature]}",
+        )
+    if validate_workflow(text) != "final":
+        raise AssertionError("A/B-to-final test fixture conversion did not reach final mode")
+    return text
+
+
+def as_ab(text: str) -> str:
+    mode = validate_workflow(text)
+    if mode == "temporary-ab":
+        return text
+    for feature in FEATURES:
+        final_cell = linux_cell(
+            BLACKSMITH_RUNNER,
+            "blacksmith",
+            feature,
+            FINAL_LINUX_NAMES[feature],
+        )
+        ab_cells = linux_cell(
+            "ubuntu-24.04",
+            "github",
+            feature,
+            AB_LINUX_NAMES[("github", feature)],
+        ) + linux_cell(
+            BLACKSMITH_RUNNER,
+            "blacksmith",
+            feature,
+            AB_LINUX_NAMES[("blacksmith", feature)],
+        )
+        text = replace_once(text, final_cell, ab_cells)
+    if validate_workflow(text) != "temporary-ab":
+        raise AssertionError("final-to-A/B test fixture conversion did not reach A/B mode")
+    return text
+
+
 class BlacksmithRunnerContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
+        cls.toolchain_contract = TOOLCHAIN_CONTRACT.read_text(encoding="utf-8")
+        cls.manifest = json.loads(WORKFLOW_MANIFEST.read_text(encoding="utf-8"))
 
     def assert_rejected(self, text: str, diagnostic: str) -> None:
         with self.assertRaises(
@@ -352,6 +443,83 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
             f"validator returned an unknown migration mode: mode={mode!r}",
         )
 
+    def test_toolchain_contract_invokes_runner_contract_exactly_once(self) -> None:
+        validate_toolchain_wiring(self.toolchain_contract)
+        invocation = "python3 tests/test_blacksmith_runner_contract.py\n"
+        without_invocation = replace_once(self.toolchain_contract, invocation, "")
+        with self.assertRaisesRegex(
+            ContractError,
+            "production-boundary contract exactly once",
+            msg=(
+                "removing the Blacksmith contract invocation from the CI-wired shell "
+                "boundary must be rejected"
+            ),
+        ):
+            validate_toolchain_wiring(without_invocation)
+        with tempfile.NamedTemporaryFile("w", suffix=".sh") as mutated_script:
+            mutated_script.write(without_invocation)
+            mutated_script.flush()
+            result = subprocess.run(
+                ["bash", mutated_script.name],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(
+            result.returncode,
+            1,
+            "shell guard must reject a removed Python contract invocation before any "
+            "later toolchain work: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+        self.assertIn(
+            "must invoke 'python3 tests/test_blacksmith_runner_contract.py' exactly once; "
+            "found 0",
+            result.stderr,
+            "shell guard rejection must name the missing production-boundary command: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}",
+        )
+
+    def test_manifest_fixtures_keep_final_stable_linux_names_and_counts(self) -> None:
+        fixtures = self.manifest.get("fixtures")
+        self.assertIsInstance(
+            fixtures,
+            dict,
+            f"workflow manifest must contain a fixtures mapping: manifest={self.manifest!r}",
+        )
+        ci_record = self.manifest.get("workflows", {}).get("ci.yml", {})
+        self.assertEqual(
+            set(ci_record.get("activated_fixtures", [])),
+            set(fixtures),
+            "manifest stable-name checks assume every fixture activates canonical CI: "
+            f"ci_record={ci_record!r} fixture_names={sorted(fixtures)!r}",
+        )
+        stable_names = set(FINAL_LINUX_NAMES.values())
+        for fixture_name, fixture in fixtures.items():
+            with self.subTest(fixture=fixture_name):
+                checks = fixture.get("expected_checks", [])
+                self.assertEqual(
+                    fixture.get("expected_count"),
+                    len(checks),
+                    "manifest fixture count must equal its visible check inventory: "
+                    f"fixture={fixture_name!r} declared={fixture.get('expected_count')!r} "
+                    f"actual={len(checks)} checks={checks!r}",
+                )
+                self.assertEqual(
+                    {name for name in checks if name in stable_names},
+                    stable_names,
+                    "every canonical-CI fixture must retain both stable Linux names: "
+                    f"fixture={fixture_name!r} stable={sorted(stable_names)!r} "
+                    f"checks={checks!r}",
+                )
+                self.assertFalse(
+                    any(name.startswith("Test A/B ") for name in checks),
+                    "final manifest inventory must not retain temporary A/B names: "
+                    f"fixture={fixture_name!r} checks={checks!r}",
+                )
+
     def test_runner_label_mutations_are_rejected(self) -> None:
         for replacement in (
             "blacksmth-2vcpu-ubuntu-2404",
@@ -362,18 +530,19 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
                 self.assert_rejected(mutated, "reviewed x64 runner label")
 
     def test_absent_or_duplicate_linux_feature_provider_cells_are_rejected(self) -> None:
-        cell = (
-            "          - runner: blacksmith-2vcpu-ubuntu-2404\n"
-            "            platform: ubuntu-24.04\n"
-            "            provider: blacksmith\n"
-            "            feature_name: default\n"
-            '            cargo_args: ""\n'
-            "            check_name: Test A/B Blacksmith (ubuntu-24.04, default)\n"
-        )
-        self.assert_rejected(replace_once(self.workflow, cell, ""), "exactly once")
-        self.assert_rejected(
-            replace_once(self.workflow, cell, cell + cell), "exactly once"
-        )
+        fixtures = (("temporary-ab", as_ab(self.workflow)), ("final", as_final(self.workflow)))
+        for mode, fixture in fixtures:
+            with self.subTest(mode=mode):
+                name = (
+                    AB_LINUX_NAMES[("blacksmith", "default")]
+                    if mode == "temporary-ab"
+                    else FINAL_LINUX_NAMES["default"]
+                )
+                cell = linux_cell(BLACKSMITH_RUNNER, "blacksmith", "default", name)
+                self.assert_rejected(replace_once(fixture, cell, ""), "exactly once")
+                self.assert_rejected(
+                    replace_once(fixture, cell, cell + cell), "exactly once"
+                )
 
     def test_macos_windows_and_release_runner_migrations_are_rejected(self) -> None:
         mutations = (
@@ -392,14 +561,19 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
                 "macOS feature cells",
             ),
             (
-                replace_once(self.workflow, "    runs-on: windows-2025\n", "    runs-on: blacksmith-2vcpu-windows-2025\n"),
+                replace_once(
+                    self.workflow,
+                    "    runs-on: windows-2025\n",
+                    "    runs-on: blacksmith-2vcpu-windows-2025\n",
+                ),
                 "Windows formatting",
             ),
             (
                 replace_once(
                     self.workflow,
                     "          - os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n",
-                    "          - os: blacksmith-2vcpu-ubuntu-2404\n            target: x86_64-unknown-linux-gnu\n",
+                    "          - os: blacksmith-2vcpu-ubuntu-2404\n"
+                    "            target: x86_64-unknown-linux-gnu\n",
                 ),
                 "release jobs",
             ),
@@ -420,34 +594,40 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
         )
 
     def test_concurrency_group_keeps_pr_key_and_independent_push_identity(self) -> None:
-        for token in (
-            "github.event.pull_request.number",
-            "github.ref",
-            "github.run_id",
-        ):
-            with self.subTest(token=token):
+        broken_groups = (
+            (
+                "ci-${{ github.event_name == 'pull_request' && "
+                "format('pr-{0}-{1}', github.event.pull_request.number, github.run_id) "
+                "|| format('push-{0}-{1}', github.ref, github.run_id) }}"
+            ),
+            (
+                "ci-${{ github.event_name == 'pull_request' && format('pr-{0}', "
+                "github.event.pull_request.number) || 'push' }}"
+            ),
+        )
+        for broken_group in broken_groups:
+            with self.subTest(group=broken_group):
                 self.assert_rejected(
-                    replace_once(self.workflow, token, "github.workflow"),
-                    "independent ref-qualified group",
+                    replace_once(self.workflow, EXPECTED_CONCURRENCY_GROUP, broken_group),
+                    "only the PR number",
                 )
 
+    def test_temporary_ab_mode_preserves_provider_qualified_names(self) -> None:
+        ab = as_ab(self.workflow)
+        self.assertEqual(
+            validate_workflow(ab),
+            "temporary-ab",
+            "synthetic A/B fixture must be valid before testing visible-name drift",
+        )
+        changed = replace_once(
+            ab,
+            f"            check_name: {AB_LINUX_NAMES[('github', 'default')]}",
+            "            check_name: Test A/B Native Linux default",
+        )
+        self.assert_rejected(changed, "visible names")
+
     def test_final_mode_requires_original_stable_linux_check_names(self) -> None:
-        final = self.workflow
-        for feature in FEATURES:
-            native = (
-                "          - runner: ubuntu-24.04\n"
-                "            platform: ubuntu-24.04\n"
-                "            provider: github\n"
-                f"            feature_name: {feature}\n"
-                f"            cargo_args: {'\"\"' if feature == 'default' else '--no-default-features'}\n"
-                f"            check_name: {AB_LINUX_NAMES[('github', feature)]}\n"
-            )
-            final = replace_once(final, native, "")
-            final = replace_once(
-                final,
-                f"            check_name: {AB_LINUX_NAMES[('blacksmith', feature)]}",
-                f"            check_name: {FINAL_LINUX_NAMES[feature]}",
-            )
+        final = as_final(self.workflow)
         self.assertEqual(
             validate_workflow(final),
             "final",
@@ -461,9 +641,9 @@ class BlacksmithRunnerContractTests(unittest.TestCase):
         self.assert_rejected(changed, "visible names")
 
 
-def revision_text(revision: str) -> str:
+def revision_text(revision: str, path: str) -> str:
     result = subprocess.run(
-        ["git", "show", f"{revision}:.github/workflows/ci.yml"],
+        ["git", "show", f"{revision}:{path}"],
         cwd=ROOT,
         check=False,
         capture_output=True,
@@ -472,8 +652,9 @@ def revision_text(revision: str) -> str:
     )
     if result.returncode != 0:
         raise ContractError(
-            "could not read canonical CI workflow at requested revision: "
-            f"revision={revision!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+            "could not read required contract file at requested revision: "
+            f"revision={revision!r} path={path!r} stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
         )
     return result.stdout
 
@@ -489,7 +670,12 @@ def main() -> int:
         unittest.main(argv=[sys.argv[0], *unittest_arguments])
         return 0
     try:
-        mode = validate_workflow(revision_text(arguments.revision))
+        mode = validate_workflow(
+            revision_text(arguments.revision, ".github/workflows/ci.yml")
+        )
+        validate_toolchain_wiring(
+            revision_text(arguments.revision, "tests/toolchain_contract.sh")
+        )
     except ContractError as error:
         print(f"Blacksmith runner contract failed: {error}", file=sys.stderr)
         return 1
