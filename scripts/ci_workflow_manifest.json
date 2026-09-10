@@ -32,7 +32,7 @@
     "issue-227-setup-preservation.yml": {"sha256": "fdd44d047cb873314156a56c5aa2d977647bd782c179e9e6542344f75d9a4a78", "bytes": 3718, "activated_fixtures": []},
     "issue-245-cargo-slot.yml": {"sha256": "d6dbedb14f71f5e2ead7e2ae2adeaea98adc32d3bbcf8a8abc20a06d5472957f", "bytes": 1224, "activated_fixtures": []},
     "issue-46-atomic-conversation.yml": {"sha256": "a4b698a62f6a90de6a51095b3bfcb57cea1b1b0e5951754ed3c336124aa65e81", "bytes": 2443, "activated_fixtures": []},
-    "issue-56-brain-isolation.yml": {"sha256": "f39e04532ad52aae1ef3f449500d42e13f9e220dbb2b7d8889f3b12378b3cd0d", "bytes": 4700, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api"]},
+    "issue-56-brain-isolation.yml": {"sha256": "58c6de75409a625bb1d9a96ccea4dc51aa9c81723c4e0c3f124a2831034720bc", "bytes": 4583, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api"]},
     "issue-72-capability-contract.yml": {"sha256": "b6502f078270811f9508bffb1378523b7d64cf55f26cac0ef1a37bcd3fbe3b42", "bytes": 1640, "activated_fixtures": []},
     "release.yml": {"sha256": "b443a81265056f549e9d0a7032d4c1bb29bcdd581ab998674faa79325ceeb229", "bytes": 4215, "activated_fixtures": []},
     "repository-hygiene.yml": {"sha256": "7c3c9ddabeaad2eea39076cc27a293c63a5206304742a87babd58968b96e2ac0", "bytes": 943, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
