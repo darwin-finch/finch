@@ -24,40 +24,103 @@ CURRENT_DOCS = (
     Path("docs/AUTOMATIC_TRAINING.md"),
     Path("docs/MCP_USER_GUIDE.md"),
     Path("docs/MACOS_GUI_AUTOMATION.md"),
+    Path("docs/OAUTH.md"),
     Path("docs/chatgpt-subscription-provider.md"),
+    Path("docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md"),
     Path("docs/REPOSITORY_HYGIENE.md"),
 )
 
-# These are precise remnants of superseded public copy, rather than broad words
-# that can legitimately appear in a limitation or migration note.
-STALE_CLAIMS = {
-    r"\bShammah\b(?!\s+Chancellor)": "obsolete product name",
-    r"<100ms startup": "unverified startup metric",
-    r"near-zero marginal cost": "unverified cost claim",
-    r"Grok is the fastest free option": "unverified provider recommendation",
-    r"with your permission before every action": "obsolete blanket approval claim",
-    r"six model families are supported": "configuration mistaken for conformance",
-    r"finch-macos-aarch64\.tar\.gz": "stale release artifact name",
-    r"raw\.githubusercontent\.com/darwin-finch/finch/main/scripts/install\.sh": (
-        "stale installer path"
+# Exact remnants of superseded public copy. These literals deliberately avoid
+# banning legitimate names, configuration examples, limitations, or history.
+STALE_CLAIMS = (
+    ("project name: shammah", "obsolete product name"),
+    ("<100ms startup", "unverified startup metric"),
+    ("near-zero marginal cost", "unverified cost claim"),
+    ("grok is the fastest free option", "unverified provider recommendation"),
+    ("with your permission before every action", "obsolete blanket approval claim"),
+    ("six model families are supported", "configuration mistaken for conformance"),
+    ("finch-macos-aarch64.tar.gz", "stale release artifact name"),
+    (
+        "raw.githubusercontent.com/darwin-finch/finch/main/scripts/install.sh",
+        "stale installer path",
     ),
-    r"gpt-5\.6": "unverified model claim",
-    r"hierarchical memory": (
-        "memory capability claim unsupported by #250: retrieval does not use "
-        "the tree and parents hold a provisional label, not a summary"
+    ("the hierarchical memory tree data structure is there", "unverified memory claim"),
+    ("memtree ann search (cosine similarity)", "unverified ANN claim"),
+    ('model = "gpt-4o"              # optional — default: gpt-4o', "stale model example"),
+    (
+        "finch daemon --bind 127.0.0.1:11435",
+        "background port assigned to foreground daemon",
     ),
-    r"MemTree ANN": (
-        "MemTree::retrieve is a linear scan over every node, not an "
-        "approximate-nearest-neighbour index"
+    (
+        "finch daemon-start 127.0.0.1:8000",
+        "foreground port assigned to background daemon",
     ),
-    r"model\s*=\s*\"(?:gpt|claude|grok|gemini|mistral|qwen|llama|phi|deepseek)[^\"]*\"": (
-        "fixed provider model string"
+)
+
+UNSUPPORTED_MODEL_CLAIM_RES = (
+    re.compile(
+        r"\bFinch\s+(?:supports?|runs?|offers?|provides?)\s+[^.\n]{0,80}"
+        r"gpt-5\.6(?:-sol)?\b",
+        re.IGNORECASE,
     ),
-    r"finch daemon --bind 127\.0\.0\.1:11435": "background port assigned to foreground daemon",
-    r"finch daemon-start(?: --bind)? 127\.0\.0\.1:8000": (
-        "foreground port assigned to background daemon"
+    re.compile(
+        r"\bgpt-5\.6(?:-sol)?\s+(?:is\s+)?"
+        r"(?:supported|available|verified|release-ready)\b",
+        re.IGNORECASE,
     ),
-}
+)
+STALE_PRODUCT_NAME_RE = re.compile(r"\bShammah\b(?!\s+Chancellor\b)", re.IGNORECASE)
+TRANSPORT_DOCUMENT = Path("docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md")
+OAUTH_DOCUMENT = Path("docs/OAUTH.md")
+RESPONSES_REFERENCE = "https://developers.openai.com/api/reference/resources/responses/methods/create"
+MODEL_REFERENCE = "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+BROWSER_PKCE_SOURCE = "https://github.com/openai/codex/commit/3e4707b34b16e139fcb7ad11ab8445993b62bba1"
+OAUTH_SOURCE = "https://github.com/openai/codex/commit/94cbbddafc1776d5e377bca1b05932c697e82238"
+USAGE_EVIDENCE = "https://github.com/darwin-finch/finch/pull/349"
+TOOL_EVIDENCE = "https://github.com/darwin-finch/finch/pull/351"
+DOGFOOD_EVIDENCE = "https://github.com/darwin-finch/finch/issues/180#issuecomment-5557196748"
+EVIDENCE_RULES = (
+    (TRANSPORT_DOCUMENT, RESPONSES_REFERENCE, (("responses api",),)),
+    (TRANSPORT_DOCUMENT, MODEL_REFERENCE, (("gpt-5.6 sol",),)),
+    (OAUTH_DOCUMENT, BROWSER_PKCE_SOURCE, (("browser-pkce", "browser pkce"),)),
+    (
+        OAUTH_DOCUMENT,
+        OAUTH_SOURCE,
+        (("not registered",), ("openai oauth client",)),
+    ),
+    (
+        TRANSPORT_DOCUMENT,
+        USAGE_EVIDENCE,
+        (("response.usage.attribution",), ("2026-09-05",)),
+    ),
+    (
+        TRANSPORT_DOCUMENT,
+        TOOL_EVIDENCE,
+        (("spawn_agent",), ("2026-09-05",), ("never executes", "does not execute")),
+    ),
+    (
+        TRANSPORT_DOCUMENT,
+        DOGFOOD_EVIDENCE,
+        (("spawn_agent",), ("lisp",), ("2026-09-05",)),
+    ),
+    (
+        OAUTH_DOCUMENT,
+        DOGFOOD_EVIDENCE,
+        (("spawn_agent",), ("lisp",), ("2026-09-05",)),
+    ),
+)
+REVISION_RULES = (
+    (
+        TRANSPORT_DOCUMENT,
+        Path("src/providers/chatgpt_subscription.rs"),
+        "CHATGPT_INFERENCE_PROTOCOL_REVISION",
+    ),
+    (
+        OAUTH_DOCUMENT,
+        Path("src/providers/chatgpt_oauth.rs"),
+        "CHATGPT_OAUTH_PROTOCOL_REVISION",
+    ),
+)
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 FENCE_RE = re.compile(r"^```(bash|sh)\s*$\n(.*?)^```\s*$", re.MULTILINE | re.DOTALL)
@@ -86,11 +149,11 @@ def check_links(document: Path, text: str) -> list[str]:
     errors: list[str] = []
     for match in LINK_RE.finditer(text):
         raw = match.group(1)
-        if raw.startswith(("http://", "https://", "mailto:")):
-            continue
         link_path, fragment = split_link(raw)
         if not link_path and not fragment:
             errors.append(f"{document}: unsupported local link syntax: {raw}")
+            continue
+        if link_path.startswith(("http://", "https://", "mailto:")):
             continue
         target = (ROOT / document.parent / link_path).resolve() if link_path else ROOT / document
         try:
@@ -123,6 +186,207 @@ def check_shell_fences(document: Path, text: str) -> list[str]:
     return errors
 
 
+def linked_paragraphs(text: str, url: str) -> list[str]:
+    matches: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        for raw in LINK_RE.findall(paragraph):
+            path, fragment = split_link(raw)
+            destination = f"{path}#{fragment}" if fragment else path
+            if destination == url:
+                matches.append(paragraph)
+                break
+    return matches
+
+
+def normalize_claim(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def rust_string_constant(source: str, name: str) -> str | None:
+    match = re.search(
+        rf"\bpub(?:\(crate\))?\s+const\s+{re.escape(name)}:\s*&str\s*=\s*\"([^\"]+)\";",
+        source,
+        flags=re.DOTALL,
+    )
+    return match.group(1) if match else None
+
+
+def check_truth_claims(
+    document: Path, text: str, source_overrides: dict[Path, str] | None = None
+) -> list[str]:
+    """Reject broad support copy and bind claims to adjacent exact authorities."""
+    errors = [
+        f"{document}: current docs contain an unsupported broad GPT-5.6 claim"
+        for pattern in UNSUPPORTED_MODEL_CLAIM_RES
+        if pattern.search(text)
+    ]
+    for rule_document, url, required_terms in EVIDENCE_RULES:
+        if document != rule_document:
+            continue
+        paragraphs = linked_paragraphs(text, url)
+        if not paragraphs:
+            errors.append(
+                f"{document}: exact evidence URL is missing; url={url!r}"
+            )
+            continue
+        for paragraph in paragraphs:
+            normalized = normalize_claim(paragraph)
+            missing = [
+                alternatives
+                for alternatives in required_terms
+                if not any(normalize_claim(term) in normalized for term in alternatives)
+            ]
+            if missing:
+                observed = re.sub(r"\s+", " ", paragraph)[:240]
+                errors.append(
+                    f"{document}: evidence URL is bound to the wrong claim; url={url!r} "
+                    f"missing={missing!r} observed={observed!r}"
+                )
+
+    for rule_document, source_path, constant_name in REVISION_RULES:
+        if document != rule_document:
+            continue
+        source = (
+            source_overrides[source_path]
+            if source_overrides and source_path in source_overrides
+            else (ROOT / source_path).read_text()
+        )
+        revision = rust_string_constant(source, constant_name)
+        if revision is None:
+            errors.append(f"{source_path}: missing Rust string constant {constant_name}")
+            continue
+        commit = re.search(r"@([0-9a-f]{40})", revision)
+        if commit is None:
+            errors.append(
+                f"{source_path}: {constant_name} lacks a pinned 40-character commit: {revision!r}"
+            )
+            continue
+        url = f"https://github.com/openai/codex/commit/{commit.group(1)}"
+        paragraphs = linked_paragraphs(text, url)
+        if not paragraphs:
+            errors.append(
+                f"{document}: documented {constant_name} does not match current source; "
+                f"expected_revision={revision!r} expected_url={url!r} matches=0"
+            )
+            continue
+        for paragraph in paragraphs:
+            if revision not in paragraph:
+                errors.append(
+                    f"{document}: {constant_name} citation lacks the current source revision; "
+                    f"expected_revision={revision!r} expected_url={url!r}"
+                )
+    return errors
+
+
+def check_stale_claims(text: str) -> list[str]:
+    normalized = text.casefold()
+    errors = [
+        f"current docs contain {description}: {stale_claim!r}"
+        for stale_claim, description in STALE_CLAIMS
+        if stale_claim in normalized
+    ]
+    if STALE_PRODUCT_NAME_RE.search(text):
+        errors.append("current docs contain obsolete standalone product name: 'Shammah'")
+    return errors
+
+
+def self_test() -> int:
+    """Exercise the important positive and negative controls for this gate."""
+    errors: list[str] = []
+    if TRANSPORT_DOCUMENT not in CURRENT_DOCS:
+        errors.append("native ChatGPT transport guide is not enrolled in CURRENT_DOCS")
+
+    documents = {
+        TRANSPORT_DOCUMENT: (ROOT / TRANSPORT_DOCUMENT).read_text(),
+        OAUTH_DOCUMENT: (ROOT / OAUTH_DOCUMENT).read_text(),
+    }
+    for document, text in documents.items():
+        errors.extend(check_truth_claims(document, text))
+
+    for control in ("Finch supports GPT-5.6 Sol.", "GPT-5.6 is verified."):
+        if not check_truth_claims(Path("docs/example.md"), control):
+            errors.append(f"unsupported broad GPT-5.6 control escaped: {control!r}")
+
+    for control in (
+        'model = "gpt-5.6-sol"',
+        "GPT-5.6 Sol is not supported by older packaged releases.",
+    ):
+        if check_truth_claims(Path("docs/example.md"), control):
+            errors.append(f"legitimate GPT-5.6 control was rejected: {control!r}")
+
+    authority_mutants = (
+        (TRANSPORT_DOCUMENT, RESPONSES_REFERENCE, "Responses API authority"),
+        (TRANSPORT_DOCUMENT, MODEL_REFERENCE, "GPT-5.6 model authority"),
+        (OAUTH_DOCUMENT, BROWSER_PKCE_SOURCE, "browser-PKCE source authority"),
+        (OAUTH_DOCUMENT, "not registered", "independent OAuth registration disclaimer"),
+    )
+    for document, removed, label in authority_mutants:
+        mutant = documents[document].replace(removed, "https://example.invalid")
+        if not check_truth_claims(document, mutant):
+            errors.append(f"missing {label} escaped the docs gate")
+
+    swapped = documents[TRANSPORT_DOCUMENT].replace(USAGE_EVIDENCE, "SWAPPED_EVIDENCE", 1)
+    swapped = swapped.replace(TOOL_EVIDENCE, USAGE_EVIDENCE, 1).replace(
+        "SWAPPED_EVIDENCE", TOOL_EVIDENCE, 1
+    )
+    if not check_truth_claims(TRANSPORT_DOCUMENT, swapped):
+        errors.append("swapped live-evidence URLs escaped paragraph-local binding")
+
+    harmless_rephrase = documents[TRANSPORT_DOCUMENT].replace(
+        "never executes it", "DOES   NOT\nEXECUTE it", 1
+    ).replace("Lisp", "lIsP", 1)
+    harmless_rephrase = harmless_rephrase.replace(
+        f"]({TOOL_EVIDENCE})", f"](<{TOOL_EVIDENCE}>)", 1
+    )
+    if check_truth_claims(TRANSPORT_DOCUMENT, harmless_rephrase) or check_links(
+        TRANSPORT_DOCUMENT, harmless_rephrase
+    ):
+        errors.append("case, whitespace, semantic rephrase, or angle-link control was rejected")
+
+    for document, source_path, constant_name in REVISION_RULES:
+        revision = rust_string_constant((ROOT / source_path).read_text(), constant_name)
+        assert revision is not None
+        commit = re.search(r"@([0-9a-f]{40})", revision)
+        assert commit is not None
+        url = f"https://github.com/openai/codex/commit/{commit.group(1)}"
+        paragraph = linked_paragraphs(documents[document], url)[0]
+        duplicated = f"{documents[document]}\n\n{paragraph}\n"
+        if check_truth_claims(document, duplicated):
+            errors.append(f"duplicate truthful {constant_name} citation was rejected")
+
+    source_path = REVISION_RULES[0][1]
+    source = (ROOT / source_path).read_text()
+    revision = rust_string_constant(source, REVISION_RULES[0][2])
+    assert revision is not None
+    mutated_source = source.replace(revision, f"{revision}-source-mutation", 1)
+    if not check_truth_claims(
+        TRANSPORT_DOCUMENT,
+        documents[TRANSPORT_DOCUMENT],
+        {source_path: mutated_source},
+    ):
+        errors.append("source-only transport revision mutation escaped the docs gate")
+
+    if not check_stale_claims("Shammah reads configuration"):
+        errors.append("standalone stale product name escaped")
+    if check_stale_claims("Shammah Chancellor maintains Finch"):
+        errors.append("the maintainer's full name was rejected as stale product copy")
+
+    dead_link = "[missing](definitely-missing-current-doc.md)"
+    if not check_links(TRANSPORT_DOCUMENT, dead_link):
+        errors.append("dead-link probe escaped the enrolled-guide link gate")
+
+    bad_fence = "```sh\nif then\n```\n"
+    if not check_shell_fences(TRANSPORT_DOCUMENT, bad_fence):
+        errors.append("invalid-shell-fence probe escaped the enrolled-guide syntax gate")
+
+    if errors:
+        for error in errors:
+            print(f"docs checker self-test: {error}", file=sys.stderr)
+        return 1
+    print("docs checker self-test: exact claim, authority, link, and shell probes passed")
+    return 0
+
+
 def main() -> int:
     errors: list[str] = []
     combined = ""
@@ -135,6 +399,7 @@ def main() -> int:
         combined += f"\n{text}"
         errors.extend(check_links(document, text))
         errors.extend(check_shell_fences(document, text))
+        errors.extend(check_truth_claims(document, text))
 
     # The package description is published to package indexes and mirrored far
     # more widely than any document here, so it is held to the same standard.
@@ -147,9 +412,7 @@ def main() -> int:
     else:
         errors.append("missing Cargo.toml")
 
-    for pattern, description in STALE_CLAIMS.items():
-        if re.search(pattern, combined, flags=re.IGNORECASE):
-            errors.append(f"current docs contain {description} ({pattern})")
+    errors.extend(check_stale_claims(combined))
 
     if errors:
         for error in errors:
@@ -161,4 +424,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        raise SystemExit(self_test())
+    if sys.argv[1:]:
+        print("usage: check_docs.py [--self-test]", file=sys.stderr)
+        raise SystemExit(2)
     raise SystemExit(main())

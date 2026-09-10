@@ -7,15 +7,16 @@ OpenAI Platform and generic OpenAI-compatible transports.
 
 ## Versioned compatibility contract
 
-The public Responses API documents the message, image, function, encrypted
-reasoning, and streaming item shapes used here:
-
-- <https://developers.openai.com/api/reference/resources/responses/methods/create>
-- <https://developers.openai.com/api/docs/models/gpt-5.6-sol>
+The public [Responses API create method](https://developers.openai.com/api/reference/resources/responses/methods/create)
+documents the message, image, function, encrypted reasoning, and streaming item
+shapes used here; the separate [GPT-5.6 Sol model reference](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
+documents that model's public API settings.
 
 ChatGPT subscription routing is a compatibility contract derived from the
-public OpenAI Codex source at commit
-`6478a751fde8884b2fdc76486fe23175a8e795d4`. The relevant source files are:
+[public OpenAI Codex source at commit `6478a751fde8884b2fdc76486fe23175a8e795d4`](https://github.com/openai/codex/commit/6478a751fde8884b2fdc76486fe23175a8e795d4).
+Finch records that pin as
+`openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4`.
+The relevant source files are:
 
 - `codex-rs/codex-api/src/endpoint/responses.rs`
 - `codex-rs/codex-api/src/endpoint/models.rs`
@@ -24,8 +25,6 @@ public OpenAI Codex source at commit
 - `codex-rs/core/src/client.rs`
 - `codex-rs/protocol/src/openai_models.rs`
 
-Finch records that pin as
-`openai-codex-responses-lite@6478a751fde8884b2fdc76486fe23175a8e795d4`.
 Protocol drift fails closed; it is not silently treated as Platform behavior.
 Catalog discovery sends `client_version=0.151.0`, and both catalog and
 inference requests send `version: 0.151.0`. This is the released Codex
@@ -144,19 +143,25 @@ and payload-limit violations fail visibly before terminal chunks are published.
 Unknown-field errors identify only Finch's static containing-object or event
 label; response-derived field names and values are never reflected. The pinned
 Codex source tolerates `response.usage.extra` as an unknown passive object. A
-Finch-owned live acceptance run on 2026-09-05 additionally observed an object
-named `response.usage.attribution`; this is dated live-service compatibility
-evidence, not a field declared by the pinned public Codex usage struct. Finch
-accepts only those two named passive metadata objects. Attribution is bounded
-to 256 KiB; extra remains bounded by the enclosing stream-event limit. Neither
-can alter Finch's validated input/output token accounting, and other usage
-siblings remain fail-closed.
+[Finch-owned PR acceptance evidence on 2026-09-05](https://github.com/darwin-finch/finch/pull/349)
+additionally observed an object named `response.usage.attribution`; this is
+dated live-service compatibility evidence, not a field declared by the pinned
+public Codex usage struct. Finch accepts only those two named passive metadata
+objects. Attribution is bounded to 256 KiB; extra remains bounded by the
+enclosing stream-event limit. Neither can alter Finch's validated input/output
+token accounting, and other usage siblings remain fail-closed.
 
-A separate Finch-owned live acceptance run on 2026-09-05 requested one
-`spawn_agent` custom function call. The service response passed the namespace
-and advertised-tool checks and rebound to exactly one local `spawn_agent` call
-with the requested arguments. The acceptance test parses the call but never
-executes it.
+A [separate Finch-owned PR acceptance record on 2026-09-05](https://github.com/darwin-finch/finch/pull/351)
+requested one `spawn_agent` custom function call. The service response passed
+the namespace and advertised-tool checks and rebound to exactly one local
+`spawn_agent` call with the requested arguments. The acceptance test parses the
+call but never executes it.
+
+[User dogfood on 2026-09-05 after the collaboration namespace fix](https://github.com/darwin-finch/finch/issues/180#issuecomment-5557196748)
+exercised the full Finch path: a fresh session advertised and executed three
+local `spawn_agent` calls, awaited their results, and produced a final typed
+Lisp response. This is evidence for that exact tested account and date, not a
+general entitlement, provider-parity, or release-readiness claim.
 
 Non-success bodies are consumed only to a small bound and discarded. A
 Responses-Lite rejection retains a typed HTTP status and a compatibility or
