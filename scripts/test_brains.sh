@@ -20,7 +20,7 @@ git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-com
   exit 69
 }
 git_common_dir="$(cd "$git_common_dir" && pwd -P)"
-if [[ "${FINCH_CARGO_SLOT_HELD:-}" != "$git_common_dir" ]]; then
+if ! "$slot_wrapper" --verify-held; then
   exec "$slot_wrapper" "$repo_root/scripts/test_brains.sh" "$@"
 fi
 
@@ -121,8 +121,8 @@ brain_test_parse_cargo_selectors() {
   }
 
   case "$cargo_profile_arg" in
-    '') cargo_profile_dir=debug ;;
-    dev) cargo_profile_dir=debug ;;
+    ''|dev|test) cargo_profile_dir=debug ;;
+    release|bench) cargo_profile_dir=release ;;
     *) cargo_profile_dir="$cargo_profile_arg" ;;
   esac
 }
@@ -223,6 +223,7 @@ brain_test_build_supervisor() {
   esac
 
   if ! build_messages="$(umask 077; cargo "${build_args[@]}")"; then
+    [[ -z "$build_messages" ]] || printf '%s\n' "$build_messages" >&2
     echo "Cargo failed to freshness-build the Brain test supervisor: target=$cargo_target_dir profile=$cargo_profile_dir argv=${build_args[*]}" >&2
     return 74
   fi

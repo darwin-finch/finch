@@ -292,15 +292,20 @@ brain_test_isolation_is_active() {
 }
 
 brain_test_isolation_require_finch_profile() {
-  local finch_bin="$1" finch_path supervisor_path finch_profile supervisor_profile
-  finch_path="$(cd "$(dirname "$finch_bin")" 2>/dev/null && pwd -P)/$(basename "$finch_bin")" || return 1
+  local finch_bin="$1" supervisor_path finch_parent supervisor_parent
+  local finch_real_parent supervisor_real_parent
+  finch_parent="$(cd "$(dirname "$finch_bin")" 2>/dev/null && pwd -P)" || return 1
   supervisor_path="${FINCH_TEST_SUPERVISOR_BIN:-}";
   [[ -n "$supervisor_path" ]] || return 1
-  supervisor_path="$(cd "$(dirname "$supervisor_path")" 2>/dev/null && pwd -P)/$(basename "$supervisor_path")" || return 1
-  finch_profile="$(basename "$(dirname "$finch_path")")"
-  supervisor_profile="$(basename "$(dirname "$supervisor_path")")"
-  [[ "$finch_profile" == debug || "$finch_profile" == release ]] || return 1
-  [[ "$finch_profile" == "$supervisor_profile" ]] || return 1
+  supervisor_parent="$(cd "$(dirname "$supervisor_path")" 2>/dev/null && pwd -P)" || return 1
+  [[ "$(basename "$finch_parent")" == "$(basename "$supervisor_parent")" ]] || return 1
+  finch_real_parent="$(perl -MCwd=abs_path -MFile::Basename=dirname -e '
+    my $path = abs_path($ARGV[0]); exit 1 unless defined $path; print dirname($path)
+  ' "$finch_bin")" || return 1
+  supervisor_real_parent="$(perl -MCwd=abs_path -MFile::Basename=dirname -e '
+    my $path = abs_path($ARGV[0]); exit 1 unless defined $path; print dirname($path)
+  ' "$supervisor_path")" || return 1
+  [[ "$finch_real_parent" == "$supervisor_real_parent" ]] || return 1
 }
 
 brain_test_isolation_reexec_launcher() {

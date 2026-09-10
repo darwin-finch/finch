@@ -6,11 +6,22 @@ source_wrapper="$script_dir/with-cargo-slot"
 source_root="$(cd "$script_dir/../../../.." && pwd -P)"
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch cargo slot [test].XXXXXX")"
 holder_pid=''
+holder_descendant_pid=''
+holder_release_open=0
 
 cleanup() {
     if [[ -n "$holder_pid" ]]; then
-        kill "$holder_pid" 2>/dev/null || true
+        if [[ "$holder_release_open" -eq 1 ]]; then
+            printf 'cleanup\n' >&8 2>/dev/null || true
+        elif [[ -n "$holder_descendant_pid" ]]; then
+            kill "$holder_descendant_pid" 2>/dev/null || true
+        else
+            kill "$holder_pid" 2>/dev/null || true
+        fi
         wait "$holder_pid" 2>/dev/null || true
+    fi
+    if [[ "$holder_release_open" -eq 1 ]]; then
+        exec 8>&-
     fi
     rm -rf -- "$fixture_root"
 }
@@ -61,6 +72,55 @@ worktree_launcher="$worktree/scripts/test_brains.sh"
 common_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)"
 common_dir="$(cd "$common_dir" && pwd -P)"
 
+# Run the real EXIT trap in a bounded subshell. It must release its sentinel,
+# wait for the recorded holder and descendant, and only then remove its root.
+cleanup_record="$fixture_root/forced-cleanup.record"
+cleanup_probe_root="$fixture_root/forced-cleanup-root"
+set +e
+(
+    fixture_root="$cleanup_probe_root"
+    holder_pid=''
+    holder_descendant_pid=''
+    holder_release_open=0
+    trap cleanup EXIT
+    mkdir -p "$fixture_root"
+    cleanup_release="$fixture_root/release.fifo"
+    mkfifo "$cleanup_release"
+    exec 8<>"$cleanup_release"
+    holder_release_open=1
+    sh -c '
+        sh -c '\''IFS= read -r _ <"$1"'\'' sh "$2" &
+        child=$!
+        printf "%s %s %s\n" "$$" "$child" "$3" >"$1"
+        wait "$child"
+    ' sh "$cleanup_record" "$cleanup_release" "$fixture_root" 8>&- &
+    holder_pid=$!
+    for _ in $(seq 1 100); do [[ -s "$cleanup_record" ]] && break; sleep 0.02; done
+    [[ -s "$cleanup_record" ]] || exit 98
+    exit 97
+) &
+cleanup_probe_pid=$!
+for _ in $(seq 1 250); do
+    ! kill -0 "$cleanup_probe_pid" 2>/dev/null && break
+    sleep 0.02
+done
+if kill -0 "$cleanup_probe_pid" 2>/dev/null; then
+    kill "$cleanup_probe_pid" 2>/dev/null || true
+    wait "$cleanup_probe_pid" 2>/dev/null || true
+    set -e
+    fail "forced-failure cleanup did not finish within five seconds: pid=$cleanup_probe_pid"
+fi
+wait "$cleanup_probe_pid"
+status=$?
+set -e
+[[ "$status" -eq 97 ]] || fail "cleanup probe changed forced failure status: expected=97 actual=$status"
+read -r cleanup_holder cleanup_descendant cleanup_root <"$cleanup_record"
+[[ ! -e "$cleanup_root" ]] || fail "cleanup probe left its disposable directory: path=$cleanup_root"
+for cleaned_pid in "$cleanup_holder" "$cleanup_descendant"; do
+    ! kill -0 "$cleaned_pid" 2>/dev/null || fail \
+        "cleanup probe returned before a recorded process exited: pid=$cleaned_pid record=$cleanup_record"
+done
+
 jobs="$(cd "$repo" && env -u CARGO_BUILD_JOBS "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
 [[ "$jobs" == 2 ]] || fail "expected default CARGO_BUILD_JOBS=2, actual=$jobs"
 jobs="$(cd "$repo" && CARGO_BUILD_JOBS=1 "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
@@ -98,11 +158,13 @@ mkfifo "$crash_ready"
     'printf "%s\n" "$$" >"$READY"; exec sleep 30') &
 holder_pid=$!
 IFS= read -r holder_command_pid <"$crash_ready"
+holder_descendant_pid="$holder_command_pid"
 kill "$holder_command_pid"
 set +e
 wait "$holder_pid"
 set -e
 holder_pid=''
+holder_descendant_pid=''
 (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
     fail "slot remained held after wrapped command death: killed_pid=$holder_command_pid lock=$common_dir/finch-cargo-slot.lock"
 
@@ -118,11 +180,33 @@ fi
 if [[ -n "${FAKE_SUPERVISOR_LOG:-}" ]]; then
     printf '%s\0' "$@" >"$FAKE_SUPERVISOR_LOG"
 fi
+if [[ -n "${FAKE_SUPERVISOR_ENV_LOG:-}" ]]; then
+    printf 'target\t%s\n' "${CARGO_TARGET_DIR:-<unset>}" >"$FAKE_SUPERVISOR_ENV_LOG"
+fi
 if [[ "${FAKE_SUPERVISOR_EXEC:-1}" == 1 ]]; then
     exec "$@"
 fi
 FAKE_SUPERVISOR
 chmod 0755 "$fake_supervisor_source"
+
+# Custom profiles are safe when the test executable and authenticated
+# supervisor have the exact same canonical parent. Equal basenames in
+# different target roots are not sufficient.
+# shellcheck source=scripts/lib/brain_test_isolation.sh
+source "$repo/scripts/lib/brain_test_isolation.sh"
+same_profile_dir="$fixture_root/profile-check/target/contract"
+other_profile_dir="$fixture_root/profile-check/other-target/contract"
+mkdir -p "$same_profile_dir" "$other_profile_dir"
+cp "$fake_supervisor_source" "$same_profile_dir/finch"
+cp "$fake_supervisor_source" "$same_profile_dir/finch-test-supervisor"
+cp "$fake_supervisor_source" "$other_profile_dir/finch-test-supervisor"
+FINCH_TEST_SUPERVISOR_BIN="$same_profile_dir/finch-test-supervisor" \
+    brain_test_isolation_require_finch_profile "$same_profile_dir/finch" ||
+    fail "same custom-profile directory was rejected: directory=$same_profile_dir"
+if FINCH_TEST_SUPERVISOR_BIN="$other_profile_dir/finch-test-supervisor" \
+    brain_test_isolation_require_finch_profile "$same_profile_dir/finch"; then
+    fail "different canonical profile directories were accepted because their basenames matched: test=$same_profile_dir supervisor=$other_profile_dir"
+fi
 
 cat >"$fake_bin/strip" <<'FAKE_STRIP'
 #!/usr/bin/env bash
@@ -152,7 +236,7 @@ case "${1:-}" in
         ;;
     build)
         if [[ "${FAKE_BUILD_FAIL:-0}" == 1 ]]; then
-            echo 'synthetic Cargo build failure' >&2
+            printf '%s\n' '{"reason":"compiler-message","message":{"rendered":"unique rendered compiler failure sentinel"}}'
             exit 42
         fi
         if [[ -n "${FAKE_ARTIFACT_LIST_FILE:-}" && -f "$FAKE_ARTIFACT_LIST_FILE" ]]; then
@@ -181,6 +265,7 @@ run_launcher() {
     FAKE_ARTIFACT_LIST_FILE="$case_artifacts" \
     FAKE_SUPERVISOR_SOURCE="$case_source" \
     FAKE_SUPERVISOR_LOG="$case_supervisor_log" \
+    FAKE_SUPERVISOR_ENV_LOG="$case_supervisor_env_log" \
     "$launcher" "$@"
 }
 
@@ -190,6 +275,7 @@ prepare_case() {
     case_target="$case_dir/target"
     case_cargo_log="$case_dir/cargo.log"
     case_supervisor_log="$case_dir/supervisor.args"
+    case_supervisor_env_log="$case_dir/supervisor.env"
     case_artifacts="$case_dir/artifacts"
     case_source="$case_dir/supervisor-source"
     mkdir -p "$case_target"
@@ -219,6 +305,8 @@ holder_release="$fixture_root/launcher-holder-release.fifo"
 holder_args="$fixture_root/launcher-holder.args"
 holder_observation="$fixture_root/launcher-holder.observation"
 mkfifo "$holder_ready" "$holder_release"
+exec 8<>"$holder_release"
+holder_release_open=1
 (cd "$repo" && PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$fixture_root/holder-cargo.log" \
     FAKE_SUPERVISOR_LOG="$holder_args" FINCH_TEST_SUPERVISOR_BIN="$fake_supervisor_source" \
     READY="$holder_ready" RELEASE="$holder_release" OBSERVATION="$holder_observation" \
@@ -226,7 +314,7 @@ mkfifo "$holder_ready" "$holder_release"
         printf "%s|%s\n" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS" >"$OBSERVATION"
         sh -c '\''printf "ready\n" >"$READY"; IFS= read -r _ <"$RELEASE"'\'' &
         wait "$!"
-    ') &
+    ') 8>&- &
 holder_pid=$!
 IFS= read -r ready <"$holder_ready"
 [[ "$ready" == ready ]] || fail "launcher holder readiness handshake was corrupted: actual=$ready"
@@ -242,17 +330,20 @@ cp "$fake_supervisor_source" "$case_source"
 printf '%s\n' "$case_target/debug/finch-test-supervisor" >"$case_artifacts"
 set +e
 (cd "$worktree" && PATH="$fake_bin:$PATH" FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 \
+    FINCH_CARGO_SLOT_HELD="$common_dir" \
     FAKE_CARGO_LOG="$case_cargo_log" FAKE_CARGO_TARGET_DIR="$case_target" \
     FAKE_ARTIFACT_LIST_FILE="$case_artifacts" FAKE_SUPERVISOR_SOURCE="$case_source" \
     FAKE_SUPERVISOR_LOG="$case_supervisor_log" "$worktree_launcher" cargo test --lib)
 status=$?
 set -e
-[[ "$status" -ne 0 ]] || fail 'contender B acquired the slot before holder A and its sentinel exited'
-assert_no_file "$case_cargo_log" 'blocked contender reached Cargo metadata/build before holder exit'
-assert_no_file "$case_supervisor_log" 'blocked contender reached supervisor launch before holder exit'
-printf 'release\n' >"$holder_release"
+[[ "$status" -ne 0 ]] || fail 'forged matching marker bypassed holder A before its sentinel exited'
+assert_no_file "$case_cargo_log" 'forged-marker contender reached Cargo metadata/build before holder exit'
+assert_no_file "$case_supervisor_log" 'forged-marker contender reached supervisor launch before holder exit'
+printf 'release\n' >&8
 wait "$holder_pid"
 holder_pid=''
+exec 8>&-
+holder_release_open=0
 [[ "$(cat "$holder_observation")" == "$common_dir|2" ]] || fail \
     "holder lost lock marker/jobs inside nested launcher: actual=$(cat "$holder_observation")"
 assert_no_file "$fixture_root/holder-cargo.log" 'explicit holder unexpectedly invoked Cargo'
@@ -261,6 +352,7 @@ cmp -s "$fixture_root/holder-expected.args" "$holder_args" || fail \
     "explicit holder supervisor did not receive exact argv: expected=$fixture_root/holder-expected.args actual=$holder_args"
 
 (cd "$worktree" && PATH="$fake_bin:$PATH" FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 \
+    FINCH_CARGO_SLOT_HELD="$common_dir" \
     FAKE_CARGO_LOG="$case_cargo_log" FAKE_CARGO_TARGET_DIR="$case_target" \
     FAKE_ARTIFACT_LIST_FILE="$case_artifacts" FAKE_SUPERVISOR_SOURCE="$case_source" \
     FAKE_SUPERVISOR_LOG="$case_supervisor_log" "$worktree_launcher" cargo test --lib)
@@ -321,6 +413,23 @@ run_launcher cargo test "--target-dir=$case_target" --lib
 assert_contains "$case_cargo_log" $'env-target\t'"$case_target" \
     'equals --target-dir was not normalized consistently for metadata'
 
+# A command-local selector outranks an inherited target. Metadata receives the
+# command root, build carries the explicit selector, and the supervised launch
+# receives Cargo's canonical result without touching the poison directory.
+prepare_case target-dir-over-env "$fixture_root/cases/target-dir-over-env/target/debug/finch-test-supervisor"
+poison_target="$case_dir/inherited-poison"
+mkdir -p "$poison_target"
+CARGO_TARGET_DIR="$poison_target" run_launcher cargo test --target-dir "$case_target" --lib
+canonical_case_target="$(cd "$case_target" && pwd -P)"
+assert_contains "$case_cargo_log" $'env-target\t'"$case_target" \
+    'command --target-dir did not override inherited CARGO_TARGET_DIR for metadata'
+assert_contains "$case_cargo_log" $'argv\tbuild\t--bin\tfinch-test-supervisor\t--message-format=json-render-diagnostics\t--target-dir\t'"$case_target" \
+    'command --target-dir did not override inherited CARGO_TARGET_DIR for build'
+assert_contains "$case_supervisor_env_log" $'target\t'"$canonical_case_target" \
+    'supervised launch did not inherit the command-selected canonical target'
+[[ -z "$(find "$poison_target" -mindepth 1 -print -quit)" ]] || fail \
+    "inherited poison target was modified despite command precedence: target=$poison_target"
+
 # Profile and explicit-target selectors must build the supervisor beside the
 # eventual Cargo test executable. Cover split/equal target and profile forms.
 prepare_case release "$fixture_root/cases/release/target/release/finch-test-supervisor"
@@ -331,6 +440,18 @@ assert_contains "$case_cargo_log" $'argv\tbuild\t--bin\tfinch-test-supervisor\t-
 prepare_case custom-profile "$fixture_root/cases/custom-profile/target/contract/finch-test-supervisor"
 run_launcher cargo test --profile contract --lib
 assert_contains "$case_cargo_log" $'--profile\tcontract' 'split custom profile was not applied to the supervisor build'
+
+for profile_case in dev test release bench; do
+    case "$profile_case" in
+        dev|test) profile_directory=debug ;;
+        release|bench) profile_directory=release ;;
+    esac
+    prepare_case "builtin-profile-$profile_case" \
+        "$fixture_root/cases/builtin-profile-$profile_case/target/$profile_directory/finch-test-supervisor"
+    run_launcher cargo test --profile "$profile_case" --lib
+    assert_contains "$case_cargo_log" $'--profile\t'"$profile_case" \
+        "built-in profile was not passed to supervisor build: profile=$profile_case"
+done
 
 host_target=fixture-host-target
 prepare_case target-profile "$fixture_root/cases/target-profile/target/$host_target/release/finch-test-supervisor"
@@ -394,6 +515,8 @@ status=$?
 set -e
 [[ "$status" -eq 74 ]] || fail "freshness failure should stop with 74: status=$status diagnostics=$case_dir/out"
 assert_contains "$case_dir/out" 'Cargo failed to freshness-build' 'freshness failure did not name target/profile/build argv'
+assert_contains "$case_dir/out" 'unique rendered compiler failure sentinel' \
+    'freshness failure discarded Cargo compiler diagnostics captured on stdout'
 assert_no_file "$case_supervisor_log" 'stale supervisor executed after failed freshness build'
 
 prepare_case zero-artifact "$fixture_root/cases/zero-artifact/unused"

@@ -5,7 +5,12 @@ usage() {
     echo "usage: with-cargo-slot <command> [args...]" >&2
 }
 
-if [[ $# -eq 0 ]]; then
+verify_only=0
+if [[ "${1:-}" == --verify-held ]]; then
+    verify_only=1
+    shift
+fi
+if [[ $# -eq 0 && "$verify_only" -eq 0 ]]; then
     usage
     exit 64
 fi
@@ -23,18 +28,46 @@ lock_path="$git_common_dir/finch-cargo-slot.lock"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 lock_marker="${FINCH_CARGO_SLOT_HELD:-}"
 
-# The marker is set by the command that the kernel lock starts, never by the
-# caller waiting to acquire it. It makes nested use idempotent so launchers can
-# require the repository slot without deadlocking an already-wrapped command.
-# This is coordination state only; Brain-test authority still comes solely
-# from the Rust supervisor's sealed proof and owned process group.
+slot_marker_is_live() {
+    local owner_pid="${FINCH_CARGO_SLOT_OWNER_PID:-}"
+    local proof_fd="${FINCH_CARGO_SLOT_PROOF_FD:-}"
+    local ancestor="$$"
+    [[ "$owner_pid" =~ ^[1-9][0-9]*$ && "$proof_fd" == 107 ]] || return 1
+    while [[ "$ancestor" -gt 1 && "$ancestor" != "$owner_pid" ]]; do
+        ancestor="$(/bin/ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d '[:space:]')" || return 1
+        [[ "$ancestor" =~ ^[1-9][0-9]*$ ]] || return 1
+    done
+    [[ "$ancestor" == "$owner_pid" ]] || return 1
+    perl -MFcntl=:mode -e '
+        my @metadata = stat(STDIN);
+        exit 1 unless @metadata && S_ISREG($metadata[2]);
+        exit 1 unless $metadata[3] == 0 && $metadata[4] == $< && ($metadata[2] & 0777) == 0400;
+    ' <&107 || return 1
+    case "$(uname -s)" in
+        Darwin) ! lockf -t 0 "$lock_path" true >/dev/null 2>&1 ;;
+        Linux) ! flock -w 0 "$lock_path" true >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The marker and private inherited descriptor are set by the command that the
+# kernel lock starts, never by the caller waiting to acquire it. Re-entry also
+# proves the recorded owner is still an ancestor and the exact lock is live;
+# an environment marker alone cannot bypass acquisition. This is coordination
+# state only; Brain-test authority still comes solely from the Rust
+# supervisor's sealed proof and owned process group.
 if [[ -n "$lock_marker" ]]; then
     if [[ "$lock_marker" != "$git_common_dir" ]]; then
         echo "with-cargo-slot: inherited slot marker names a different Git common directory: expected=$git_common_dir actual=$lock_marker" >&2
         exit 69
     fi
-    exec "$@"
+    if slot_marker_is_live; then
+        [[ "$verify_only" -eq 0 ]] || exit 0
+        exec "$@"
+    fi
 fi
+[[ "$verify_only" -eq 0 ]] || exit 1
+unset FINCH_CARGO_SLOT_HELD FINCH_CARGO_SLOT_OWNER_PID FINCH_CARGO_SLOT_PROOF_FD
 
 timeout_seconds="${FINCH_CARGO_SLOT_TIMEOUT_SECONDS:-900}"
 if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
@@ -42,7 +75,18 @@ if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
     exit 64
 fi
 
-locked_exec='export FINCH_CARGO_SLOT_HELD="$1"; shift; exec "$@"'
+locked_exec='
+    proof_path="$(umask 077; mktemp "$1/finch-cargo-slot-proof.XXXXXX")" || exit 69
+    printf "%s\n" "$1" >"$proof_path" || exit 69
+    chmod 0400 "$proof_path" || exit 69
+    exec 107<"$proof_path" || exit 69
+    rm -f -- "$proof_path" || exit 69
+    export FINCH_CARGO_SLOT_HELD="$1"
+    export FINCH_CARGO_SLOT_OWNER_PID="$$"
+    export FINCH_CARGO_SLOT_PROOF_FD=107
+    shift
+    exec "$@"
+'
 
 case "$(uname -s)" in
     Darwin)
