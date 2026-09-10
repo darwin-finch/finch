@@ -85,8 +85,22 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// Whether a provider authenticates with an inline API key held in the config.
+///
+/// Three do not. A ChatGPT subscription authenticates through a named credential
+/// binding, an Ollama server is unauthenticated, and a remote Finch daemon is
+/// addressed rather than authenticated. For all three an empty `api_key` is the
+/// normal, fully-configured state and says nothing about whether the provider is
+/// set up — which is exactly the inference that destroyed providers in #419.
+fn provider_requires_inline_api_key(provider: &str) -> bool {
+    !matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "chatgpt" | "ollama" | "finch"
+    )
+}
+
 fn remote_api_key_input(provider: &str) -> Option<String> {
-    (!provider.eq_ignore_ascii_case("chatgpt")).then(String::new)
+    provider_requires_inline_api_key(provider).then(String::new)
 }
 
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
@@ -608,6 +622,47 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
                 enabled: true,
                 persisted: Some(provider.clone()),
             }),
+    }
+}
+
+/// True only for the placeholder the wizard shows when a provider slot has not
+/// been configured yet.
+///
+/// The question this has to answer is not "is anything filled in" but "does this
+/// provider take an inline API key, and is it missing?" Emptiness alone cannot
+/// tell a genuinely unconfigured Claude row from a ChatGPT subscription, whose
+/// `api_key` is empty precisely because it authenticates through a named
+/// credential binding. Mistaking the second for the first is #419: a provider
+/// destroyed because it authenticated the more secure way.
+///
+/// `remote_api_key_input` already encodes which providers take an inline key, so
+/// ask it rather than inferring from emptiness.
+fn is_unconfigured_placeholder(model: &ModelConfig) -> bool {
+    let ModelConfig::Remote {
+        provider,
+        api_key,
+        persisted,
+        ..
+    } = model
+    else {
+        // A local model is always a real, usable provider.
+        return false;
+    };
+    if !api_key.is_empty() {
+        return false;
+    }
+    match persisted {
+        // Never saved. Only a provider that takes an inline key and has none is
+        // the unconfigured placeholder; one that never takes a key — a ChatGPT
+        // subscription, an Ollama server, a discovered Finch daemon — is real.
+        None => provider_requires_inline_api_key(provider),
+        // Persisted. `to_teacher_entry` returns `None` for credential-backed,
+        // Ollama, remote-daemon and local entries, each of which authenticates or
+        // addresses itself without an inline key; only a legacy key-based entry
+        // holding no key is the "[Not configured]" empty state.
+        Some(entry) => entry
+            .to_teacher_entry()
+            .is_some_and(|teacher| teacher.api_key.is_empty()),
     }
 }
 
@@ -2944,10 +2999,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                         slot.set_enabled(enabled);
                                     }
                                     *selected_idx = index;
-                                } else if matches!(
-                                    primary_model,
-                                    ModelConfig::Remote { api_key: ref k, .. } if k.is_empty()
-                                ) && tool_models.is_empty()
+                                } else if tool_models.is_empty()
+                                    && is_unconfigured_placeholder(primary_model)
                                 {
                                     *primary_model = edited;
                                     *selected_idx = 0;
@@ -2966,10 +3019,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             execution,
                             ..
                         }) => {
-                            let replace_primary = matches!(
-                                primary_model,
-                                ModelConfig::Remote { api_key, .. } if api_key.is_empty()
-                            ) && tool_models.is_empty();
+                            let replace_primary = tool_models.is_empty()
+                                && is_unconfigured_placeholder(primary_model);
                             if replace_primary {
                                 *primary_model = ModelConfig::Local {
                                     family,
@@ -4793,11 +4844,26 @@ fn render_add_provider_overlay(
     let overlay_y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
     let overlay = Rect::new(overlay_x, overlay_y, overlay_width, overlay_height);
 
+    // The wizard already knows which operation it is performing; say so rather
+    // than telling someone editing a working provider that they are adding one
+    // (#418). Only the remote form is ever reopened for an existing provider.
+    let editing_existing_provider = matches!(
+        step,
+        AddProviderStep::ConfigureRemote {
+            editing_idx: Some(_),
+            ..
+        }
+    );
+
     // Clear the overlay area with a filled block
     let background = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Add AI Provider ")
+        .title(if editing_existing_provider {
+            " Edit AI Provider "
+        } else {
+            " Add AI Provider "
+        })
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -4883,7 +4949,7 @@ fn render_add_provider_overlay(
                 ]));
             }
             let list = List::new(items).block(
-                Block::default().title("Add AI provider  ↑/↓: Move | Enter: Select | Esc: Cancel"),
+                Block::default().title("Add AI Provider  ↑/↓: Move | Enter: Select | Esc: Cancel"),
             );
             f.render_widget(list, inner);
         }
@@ -9419,6 +9485,335 @@ mod tests {
                 "{invocation:?}"
             );
         }
+    }
+
+    // ── #419: adding a provider must append, never replace ───────────────────
+
+    fn chatgpt_subscription_provider() -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "chatgpt:default".into(),
+                audience: Some(crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::ChatgptSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("ChatGPT Personal".into()),
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+        }
+    }
+
+    fn chatgpt_subscription_credential() -> crate::config::ProviderCredential {
+        crate::config::ProviderCredential {
+            name: "chatgpt:default".into(),
+            kind: crate::config::CredentialKind::OauthDevice,
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            issuer: "openai-chatgpt".into(),
+            audience: crate::config::AudienceBinding::standard(
+                crate::config::EndpointFamily::ChatgptSubscription,
+            ),
+            tenant: None,
+            project: None,
+            account: Some("account-123".into()),
+            scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            secret_ref: "oauth-store:chatgpt:default".into(),
+            lifecycle: crate::config::CredentialLifecycle::Active {
+                expires_at: Some("2099-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap()),
+                refreshable: true,
+            },
+            revocation: Default::default(),
+        }
+    }
+
+    fn expected_grok_provider() -> ProviderEntry {
+        ProviderEntry::Grok {
+            api_key: "xai-test-preserved".into(),
+            model: Some("grok-code-fast-1".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("grok".into()),
+        }
+    }
+
+    fn provider_graph_diagnostics(
+        label: &str,
+        providers: &[ProviderEntry],
+        credentials: &[crate::config::ProviderCredential],
+    ) -> String {
+        format!("{label}\nproviders: {providers:#?}\ncredentials: {credentials:#?}")
+    }
+
+    fn cloud_provider_index(provider_id: &str) -> usize {
+        CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == provider_id)
+            .unwrap_or_else(|| panic!("unknown cloud provider {provider_id}"))
+    }
+
+    /// Drive Models → Add → provider → model → key → confirm through the real reducer.
+    fn add_cloud_provider_through_reducer(
+        state: &mut WizardState,
+        provider_id: &str,
+        model_id: &str,
+        api_key: &str,
+    ) {
+        let target = cloud_provider_index(provider_id);
+        handle_models_input(state, key(KeyCode::Char('a'))).unwrap();
+        for _ in 0..target {
+            handle_models_input(state, key(KeyCode::Down)).unwrap();
+        }
+        handle_models_input(state, key(KeyCode::Enter)).unwrap();
+
+        // Normalize focus at the provider row, then move to model and API key.
+        for _ in 0..3 {
+            handle_models_input(state, key(KeyCode::Up)).unwrap();
+        }
+        for _ in 0..2 {
+            handle_models_input(state, key(KeyCode::Down)).unwrap();
+        }
+        for character in model_id.chars() {
+            handle_models_input(state, key(KeyCode::Char(character))).unwrap();
+        }
+        handle_models_input(state, key(KeyCode::Down)).unwrap();
+        for character in api_key.chars() {
+            handle_models_input(state, key(KeyCode::Char(character))).unwrap();
+        }
+        handle_models_input(state, key(KeyCode::Enter)).unwrap();
+        assert!(
+            get_step(state).is_none(),
+            "confirming {provider_id} must close the add overlay; remaining step: {:?}",
+            get_step(state)
+        );
+    }
+
+    fn persisted_subscription_config(
+        directory: &std::path::Path,
+    ) -> (
+        crate::config::Config,
+        ProviderEntry,
+        crate::config::ProviderCredential,
+    ) {
+        let provider = chatgpt_subscription_provider();
+        let credential = chatgpt_subscription_credential();
+        let metrics_dir = directory.join("metrics");
+        let path = directory.join("before.toml");
+        crate::config::Config::with_providers_and_paths(
+            vec![provider.clone()],
+            metrics_dir.clone(),
+            None,
+        )
+        .with_credentials(vec![credential.clone()])
+        .save_to(&path)
+        .unwrap();
+        let loaded = crate::config::load_config_from_path_with_paths(&path, metrics_dir, None)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the persisted one-provider fixture at {} must load: {error:#}",
+                    path.display()
+                )
+            });
+        (loaded, provider, credential)
+    }
+
+    fn save_and_reload_wizard_state(
+        state: &WizardState,
+        directory: &std::path::Path,
+        name: &str,
+    ) -> crate::config::Config {
+        let path = directory.join(name);
+        let result = build_setup_result(state).expect("build setup result after provider add");
+        config_from_setup_result_with_paths(&result, directory.join("metrics"), None)
+            .save_to(&path)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the provider graph must save to {} after the real reducer: {error:#}\n{:#?}",
+                    path.display(),
+                    result.providers
+                )
+            });
+        crate::config::load_config_from_path_with_paths(&path, directory.join("metrics"), None)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the provider graph written to {} must reload: {error:#}",
+                    path.display()
+                )
+            })
+    }
+
+    #[test]
+    fn test_remote_add_preserves_persisted_subscription_through_save_and_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (loaded, subscription, credential) = persisted_subscription_config(directory.path());
+        let mut state = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
+        state.current_section = WizardSection::Models;
+
+        add_cloud_provider_through_reducer(
+            &mut state,
+            "grok",
+            "grok-code-fast-1",
+            "xai-test-preserved",
+        );
+        let reloaded = save_and_reload_wizard_state(&state, directory.path(), "after-grok.toml");
+        let diagnostics = provider_graph_diagnostics(
+            "remote add beside a persisted ChatGPT subscription",
+            &reloaded.providers,
+            reloaded.credentials(),
+        );
+
+        assert_eq!(
+            reloaded.providers,
+            vec![subscription, expected_grok_provider()],
+            "adding Grok must append without changing the subscription's order, model, name, \
+             reasoning effort, or credential binding. {diagnostics}"
+        );
+        assert_eq!(
+            reloaded.credentials(),
+            &[credential],
+            "adding Grok must preserve the subscription credential metadata. {diagnostics}"
+        );
+    }
+
+    #[test]
+    fn test_local_add_uses_the_same_append_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let (loaded, subscription, credential) = persisted_subscription_config(directory.path());
+        let mut state = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
+        state.current_section = WizardSection::Models;
+
+        handle_models_input(&mut state, key(KeyCode::Char('a'))).unwrap();
+        for _ in 0..CLOUD_PROVIDERS.len() {
+            handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
+        }
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        let reloaded = save_and_reload_wizard_state(&state, directory.path(), "after-local.toml");
+        let diagnostics = provider_graph_diagnostics(
+            "local add beside a persisted ChatGPT subscription",
+            &reloaded.providers,
+            reloaded.credentials(),
+        );
+        assert_eq!(
+            reloaded.providers.first(),
+            Some(&subscription),
+            "the local-add path must not replace the configured subscription. {diagnostics}"
+        );
+        assert!(
+            matches!(reloaded.providers.get(1), Some(ProviderEntry::Local { .. })),
+            "the local model must be appended at index 1. {diagnostics}"
+        );
+        assert_eq!(
+            reloaded.providers.len(),
+            2,
+            "the local-add path must append exactly one provider. {diagnostics}"
+        );
+        assert_eq!(
+            reloaded.credentials(),
+            &[credential],
+            "the local-add path must preserve credential metadata. {diagnostics}"
+        );
+    }
+
+    fn unsaved_remote(provider: &str, model: &str) -> ModelConfig {
+        ModelConfig::Remote {
+            provider: provider.into(),
+            name: provider.into(),
+            api_key: String::new(),
+            model: model.into(),
+            enabled: true,
+            persisted: None,
+        }
+    }
+
+    #[test]
+    fn test_placeholder_classification_preserves_keyless_providers() {
+        let persisted_chatgpt =
+            model_config_from_provider(&chatgpt_subscription_provider()).unwrap();
+        let persisted_finch = model_config_from_provider(&ProviderEntry::RemoteDaemon {
+            address: "127.0.0.1:11435".into(),
+            name: Some("Finch daemon".into()),
+        })
+        .unwrap();
+        let persisted_ollama = model_config_from_provider(&ProviderEntry::Ollama {
+            model: "qwen2.5:7b".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            name: Some("Ollama".into()),
+        })
+        .unwrap();
+
+        let cases = [
+            ("persisted ChatGPT", persisted_chatgpt, false),
+            (
+                "unsaved ChatGPT",
+                unsaved_remote("chatgpt", "gpt-5.6-sol"),
+                false,
+            ),
+            ("persisted Finch daemon", persisted_finch, false),
+            (
+                "unsaved Finch daemon",
+                unsaved_remote("finch", "127.0.0.1:11435"),
+                false,
+            ),
+            ("persisted Ollama", persisted_ollama, false),
+            (
+                "unsaved Ollama",
+                unsaved_remote("ollama", "qwen2.5:7b"),
+                false,
+            ),
+            (
+                "blank key-required Claude placeholder",
+                unsaved_remote("claude", ""),
+                true,
+            ),
+        ];
+
+        for (label, model, expected_placeholder) in cases {
+            assert_eq!(
+                is_unconfigured_placeholder(&model),
+                expected_placeholder,
+                "{label} classification controls whether the next add preserves or replaces the \
+                 primary provider. Model was: {model:#?}"
+            );
+        }
+    }
+
+    // ── #418: the dialog must say which operation it is performing ───────────
+
+    #[test]
+    fn test_provider_dialog_is_titled_add_when_adding_and_edit_when_editing() {
+        let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
+        state.current_section = WizardSection::Models;
+        let adding = render_wizard_text(&state);
+        assert!(
+            adding.contains("Add AI Provider")
+                && !adding.contains("Edit AI Provider")
+                && !adding.contains("Add AI provider"),
+            "the add overlay must use consistent add-specific wording. Frame was:\n{adding}"
+        );
+
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: cloud_provider_index("grok"),
+            name: "Grok Build".into(),
+            model: "grok-code-fast-1".into(),
+            api_key: Some("xai-test-preserved".into()),
+            focused_field: 1,
+            editing_idx: Some(0),
+        });
+        state.current_section = WizardSection::Models;
+        let editing = render_wizard_text(&state);
+        assert!(
+            editing.contains("Edit AI Provider") && !editing.contains("Add AI Provider"),
+            "the edit overlay must not tell the user they are adding a provider. Frame was:\n{editing}"
+        );
     }
 
     #[test]
