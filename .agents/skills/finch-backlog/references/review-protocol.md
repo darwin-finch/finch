@@ -36,7 +36,9 @@ immutable contract revision and approval, then append-only claim-scope revision.
 
 ## 2. Derive implementation perspectives from the diff
 
-Review `git diff <claim-base>...<exact-tip>` and include every matching row. Recompute
+Review `git diff <integration-base>...<exact-tip>` and include every matching row. The
+claim base is used only for lineage and fail-before proof; using it for the current panel
+would import unrelated upstream changes after `main` advances. Recompute
 after each repair because the panel is not inherited. Record every selected perspective
 and why every skipped perspective does not apply.
 
@@ -130,9 +132,10 @@ Before a split event, create and link disjoint child issues, allocate every orig
 exactly once, preserve or transfer valuable commits, establish collision-free claims and
 worktrees for every child, and start the immediate next slice. Only then append `SPLIT-TO`
 and any parent claim-scope revision. The collision-free order is: repository-wide claim
-check; immutable child contracts/approvals; child claim events and collision recheck;
-gate/proof mapping; parent finding transition; parent scope-revision event. A proposed
-future split or closed pull request is not executable.
+check; immutable child contracts/approvals; parent split reservation; nonauthorizing child
+reservations and collision recheck; exact gate/proof mapping; parent activation; parent
+finding transition; parent scope-revision event. Until activation the parent remains the
+only mutation owner. A proposed future split or closed pull request is not executable.
 
 Completion performs an exhaustive partition of every original acceptance gate: each gate must be directly proven at current main or mapped exactly once through a valid successor
 chain whose leaves are proven there. Reject omitted, duplicated, unclaimed, cyclic, or
@@ -174,6 +177,67 @@ One append-only pull-request comment per round records exact tip; claim and inte
 bases; selected/skipped perspectives; every finding ID and five axes; scenario and
 verification; correction vector; successor links; transitive unresolved ledger; and
 whether repair, recontract, split, or fallback is underway.
+
+Use the durable records below. GitHub `createdAt`, numeric comment ID, then block order is
+the canonical event order. Retain author, edit metadata, raw-body digest, and URL alongside
+each record. Validate authentication, structure, enums, cross-record identity, and prior
+event before admitting an event. Invalid attempts are diagnostics and do not consume IDs
+or create forks; changed/deleted accepted history, incomplete retrieval, or multiple valid
+successors makes the affected history `INDETERMINATE` and nonauthorizing.
+
+```text
+<!-- finch-review-round:v1
+event-id: <lowercase UUID>
+round-id: <stable ID>
+ledger-id: <stable ID>
+issue: <number>
+pull-request: <number>
+claim-id: <claim ID>
+contract-id: <contract ID>
+contract-url: <immutable URL>
+contract-digest: <SHA-256>
+claim-base: <full SHA>
+integration-base: <full current-main SHA>
+exact-tip: <full SHA>
+round-number: <positive integer>
+selected-perspectives: <comma-separated set>
+skipped-perspectives: <comma-separated set with reasons in prose>
+status: <DISCOVERY|VERIFICATION|REPAIR_IN_PROGRESS|CONVERGED>
+verdict: <none|SAFE_TO_MERGE|ESCALATE_WITH_EXECUTABLE_REPAIR_OR_SPLIT>
+finding-event-ids: <comma-separated IDs or none>
+gate-evidence-url: <immutable URL>
+timestamp: <UTC RFC 3339>
+-->
+```
+
+```text
+<!-- finch-review-finding:v1
+event-id: <lowercase UUID>
+finding-id: <stable ID>
+ledger-id: <ledger ID>
+round-id: <round ID>
+prior-event-id: <previous event for this finding or none>
+confidence: <CONFIRMED|PLAUSIBLE>
+severity: <CRITICAL|HIGH|MEDIUM|LOW>
+locality: <SAME_CONTRACT|INDEPENDENT>
+obligation: <BLOCKER|REGRESSION_DEBT|NONBLOCKING>
+state: <OPEN|RESOLVED|REPLACED-BY|SPLIT-TO>
+exact-tip: <full SHA>
+scenario-evidence-url: <immutable scenario/proof URL>
+affected-gate-ids: <comma-separated IDs or none>
+successor-finding-ids: <comma-separated IDs or none>
+child-claim-ids: <comma-separated IDs or none>
+owner: <accountable worker/person>
+timestamp: <UTC RFC 3339>
+-->
+```
+
+Every finding event repeats all five axes; an update may change one without implicitly
+changing any other. A newly discovered finding uses `prior-event-id: none`. Later events
+must name the single accepted predecessor. Round/finding issue, contract, ledger, tip, and
+successor identities must agree. Only `CONFIRMED + SAME_CONTRACT + (BLOCKER or required
+REGRESSION_DEBT) + non-RESOLVED` enters the blocking ledger. A PLAUSIBLE BLOCKER therefore
+retains identity and evidence but cannot prevent merge unless later confirmed.
 
 There are exactly two final review verdicts:
 

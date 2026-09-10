@@ -31,6 +31,11 @@ Authority and scope
 - Must not edit: <overlapping work or excluded areas>
 - Role: <implementer, plan reviewer, finding reviewer, verifier, or coordinator>
 - Prototype authority: <none, or disposable exact-tip worktree/branch only>
+- Merge authority: <accountable actor and exact scope, or none>
+- Issue-close authority: <accountable actor and exact issue, or none>
+- Claim-terminal authority: <original issuer/proxy and permitted event/disposition, or none>
+- Worktree-cleanup authority: <accountable actor and proven-safe targets, or none>
+- External-effect authority: <specific permitted action, target, and credential boundary, or none>
 - No credential access, destructive cleanup, external messages, or merge authority unless explicitly stated.
 - Reviewer prototypes must not mutate the frozen worktree, push, use credentials, perform
   external effects, merge, or cherry-pick; the implementer reproduces any correction.
@@ -54,3 +59,14 @@ Expected deliverable
 - Do not merge, close issues, or remove the worktree unless explicitly authorized.
 - Publish the required claim terminal event when ownership ends.
 ```
+
+## Discovery task packet
+
+`NEEDS_SPECIFICATION` work uses a smaller packet and never an implementation packet or
+production claim. Name the issue, discovery-contract URL/digest, exact missing decision,
+concrete question, decision owner, nearest minimally specified outcome, bounded commands,
+and evidence destination. Authority is either read-only inspection or a disposable local
+worktree/branch. It excludes production-worktree mutation, push, credentials, undeclared
+network or external effects, merge, cherry-pick, and retention of prototype commits.
+Record the command/result, useful evidence, and proven cleanup; a prototype cannot be
+promoted by cherry-pick and must be reproduced after READY under a production claim.

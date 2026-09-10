@@ -8,6 +8,7 @@ CONTRACT="$ROOT/.agents/skills/finch-backlog/references/solution-contract.md"
 READINESS="$ROOT/.agents/skills/finch-backlog/references/issue-readiness.md"
 PACKET="$ROOT/.agents/skills/finch-backlog/references/task-packet.md"
 CLAIMS="$ROOT/.agents/skills/finch-backlog/references/work-claims.md"
+REDUCER="$ROOT/.agents/skills/finch-backlog/scripts/workflow_protocol.py"
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -34,7 +35,7 @@ reject_literal() {
     fi
 }
 
-for path in "$SKILL" "$REVIEW" "$CONTRACT" "$READINESS" "$PACKET" "$CLAIMS"; do
+for path in "$SKILL" "$REVIEW" "$CONTRACT" "$READINESS" "$PACKET" "$CLAIMS" "$REDUCER"; do
     require_file "$path"
 done
 
@@ -251,5 +252,216 @@ completion_allowed() {
 completion_allowed merged-current-main all-successors-resolved issue-closed claim-terminal artifact-identified user-visible-proof cleanup-safe frontier-recomputed || fail "$READINESS: complete current-main evidence did not reach COMPLETE"
 if completion_allowed reviewed-tip all-successors-resolved issue-closed claim-terminal artifact-identified user-visible-proof cleanup-safe frontier-recomputed; then fail "$READINESS: an unmerged reviewed tip incorrectly reached COMPLETE"; fi
 if completion_allowed merged-current-main child-open issue-closed claim-terminal artifact-identified user-visible-proof cleanup-safe frontier-recomputed; then fail "$READINESS: an open inherited child obligation incorrectly reached COMPLETE"; fi
+
+# Behavioral proof uses the canonical reducer. These fixtures exercise admitted structured
+# records; the literal checks above are documentation smoke, not the regression boundary.
+python3 - "$ROOT" <<'PY'
+import importlib.util
+import sys
+from copy import deepcopy
+from pathlib import Path
+
+root = Path(sys.argv[1])
+path = root / ".agents/skills/finch-backlog/scripts/workflow_protocol.py"
+spec = importlib.util.spec_from_file_location("workflow_protocol", path)
+wp = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = wp
+spec.loader.exec_module(wp)
+
+def check(value, message):
+    if not value:
+        raise AssertionError(message)
+
+def immutable(**kw):
+    base = dict(immutable=True, body_digest="d" * 64, created_at="2026-01-01T00:00:00Z", comment_id=1, block_order=0)
+    base.update(kw)
+    return base
+
+# HTML blocks parse deterministically, normalize field names, retain block order, and
+# fail closed on edit/digest evidence before reducers see them.
+raw = """summary
+<!-- finch-solution-contract:v1
+event-id: one
+contract-id: c
+-->
+<!-- finch-solution-contract-approval:v1
+event-id: two
+contract-id: c
+-->
+"""
+observation = {"created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:00Z",
+               "comment_id":7, "author":"alice"}
+parsed, parse_diag = wp.parse_event_blocks(raw, observation)
+check(not parse_diag and [r["event_id"] for r in parsed] == ["one", "two"]
+      and [r["block_order"] for r in parsed] == [0, 1] and parsed[0]["immutable"],
+      "canonical HTML parser lost normalized fields, immutable metadata, or block order")
+edited, _ = wp.parse_event_blocks(raw, dict(observation, updated_at="2026-01-02T00:00:00Z"))
+check(not edited[0]["immutable"], "edited REST observation was accepted as immutable")
+changed, changed_diag = wp.parse_event_blocks(raw, dict(observation, saved_digest="0"*64))
+check(not changed and changed_diag, "changed saved digest was not rejected")
+malformed, malformed_diag = wp.parse_event_blocks("<!-- finch-review-round:v1\nevent-id: x\nevent-id: y\n-->", observation)
+check(not malformed and malformed_diag, "duplicate event field was admitted")
+
+# Contract approval binds identity and rejects self-review/proxy invention.
+sections = {"observed_failure", "intended_behavior", "non_goals", "invariants", "boundaries",
+            "regression_proof", "integration_proof", "reversion_plan", "hostile_cases", "gate_ownership"}
+contract = immutable(event_id="c1", contract_id="contract", issue=406, revision=11,
+    implementation_base="a" * 40, owner_worker="owner", owner_actor="alice", scope="workflow", sections=sections)
+approval = immutable(event_id="a1", contract_id="contract", contract_url="url",
+    contract_digest=contract["body_digest"], revision=11, implementation_base="a" * 40,
+    reviewer_worker="reviewer", reviewer_actor="bob", poster_actor="bob", verdict="APPROVE", review_output="url")
+authority = {"author_workers": ["author"], "coordinator_worker": "coord", "implementer_worker": "impl"}
+check(not wp.validate_contract(contract, approval, authority), "valid immutable independent contract approval was rejected")
+bad = dict(approval, reviewer_worker="impl")
+check(wp.validate_contract(contract, bad, authority), "implementer self-review was accepted")
+bad = dict(approval, contract_digest="wrong")
+check(wp.validate_contract(contract, bad, authority), "approval with mismatched contract digest was accepted")
+
+# Every closed-matrix edge accepts its named role/evidence and rejects an unrelated role.
+for index, ((prior, destination), (roles, required)) in enumerate(wp.readiness_matrix().items(), 1):
+    event = {"new_state": destination, "authenticated_role": sorted(roles)[0], "claim_id": "claim"}
+    for field in required:
+        event[field] = {"disposition": {"READY":"return-ready", "NEEDS_SPECIFICATION":"needs-specification",
+            "BLOCKED_EXTERNAL":"blocked-external", "INFEASIBLE":"infeasible", "DECLINED":"declined"}.get(destination),
+            "claim_id":"claim", "authority_valid":True, "evidence_matches":True} if field == "terminal_pair" else True
+    check(not wp.validate_readiness_attempt(prior, event), f"documented matrix edge {prior}->{destination} rejected")
+    event["authenticated_role"] = "unrelated"
+    check(wp.validate_readiness_attempt(prior, event), f"unauthorized role accepted for {prior}->{destination}")
+check(wp.validate_readiness_attempt("DRAFT", {"new_state":"COMPLETE", "authenticated_role":"issue_author"}),
+      "unlisted DRAFT->COMPLETE transition was accepted")
+
+# Invalid attempts are ignored before reduction, correction works, and two valid successors taint history.
+draft = immutable(event_id="r1", prior_event_id=None, prior_state=None, new_state="DRAFT",
+    authenticated_role="issue_author", outcome=True, issue_author=True, next_clarification=True,
+    issue=406, owner="owner", evidence_kind="draft", evidence_digest="e")
+typo = immutable(event_id="bad", comment_id=2, prior_event_id="r1", prior_state="DRAFT",
+    new_state="READY", authenticated_role="unrelated", approved_contract=True,
+    issue=406, owner="owner", evidence_kind="contract", evidence_digest="e")
+ready = immutable(event_id="r2", comment_id=3, prior_event_id="r1", prior_state="DRAFT",
+    new_state="READY", authenticated_role="contract_owner", approved_contract=True,
+    issue=406, owner="owner", evidence_kind="contract", evidence_digest="e")
+result = wp.reduce_readiness([draft, typo, ready])
+check(result.state == "READY" and result.admitted_ids == ("r1", "r2"), "authorized correction after invalid attempt did not reduce to READY")
+other = immutable(event_id="r3", comment_id=4, prior_event_id="r1", prior_state="DRAFT",
+    new_state="NEEDS_SPECIFICATION", authenticated_role="issue_author", discovery_packet=True,
+    issue=406, owner="owner", evidence_kind="discovery", evidence_digest="e")
+check(wp.reduce_readiness([draft, ready, other]).indeterminate, "two valid successors did not produce INDETERMINATE")
+tainted = dict(draft, previously_accepted_changed=True)
+check(wp.reduce_readiness([tainted]).indeterminate, "changed accepted history fell back to an authorizing state")
+
+# All active states have exact terminal dispositions; missing/mismatched pairs never authorize.
+for state in wp.ACTIVE:
+    for destination, disposition in wp._PAIR_DISPOSITION.items():
+        terminal = {"disposition": disposition, "claim_id":"c", "authority_valid":True,
+                    "url":"terminal", "evidence_digest":"e"}
+        readiness = {"new_state":destination, "claim_id":"c", "terminal_url":"terminal", "evidence_digest":"e"}
+        check(wp.terminal_pair_status(terminal, readiness) == "ACCEPTED", f"valid {state} terminal pair was rejected")
+        check(wp.terminal_pair_status(terminal, None) == "PAIRING_REQUIRED", "missing readiness pair was treated as terminal")
+        check(wp.terminal_pair_status(terminal, dict(readiness, claim_id="wrong")) == "INVALID", "mismatched claim pair was accepted")
+
+# Legacy work enters ordinary READY then IN_PROGRESS and requires the complete retained inventory.
+legacy = {key: True for key in ("cutover_identity", "claim_predates_cutover", "preserved_claim", "preserved_pr",
+    "preserved_branch", "preserved_worktree", "preserved_tip", "preserved_base", "approved_contract",
+    "collision_recheck", "exact_tip_review")}
+check(wp.legacy_bootstrap_valid(legacy), "complete pre-cutover bootstrap packet was rejected")
+for key in list(legacy):
+    mutant = dict(legacy); del mutant[key]
+    check(not wp.legacy_bootstrap_valid(mutant), f"legacy bootstrap survived missing {key}")
+
+# Atomic split/handoff activates all exact reservations or none.
+child = {"claim_id":"child", "scope":"b", "nonauthorizing_reservation":True}
+transfer = {"parent_authorized":True, "expected_children":[child], "child_reservations":[dict(child)],
+            "activation":True, "expected_gates":["g"],
+            "gate_map":[{"gate_id":"g", "child_claim_id":"child", "proof_path":"test"}]}
+check(wp.atomic_transfer(transfer, "split"), "complete split transaction was rejected")
+check(wp.atomic_transfer(transfer, "handoff"), "complete handoff transaction was rejected")
+check(not wp.atomic_transfer(dict(transfer, activation=False), "split"), "incomplete split activated children")
+check(not wp.atomic_transfer(dict(transfer, child_reservations=[]), "handoff"), "handoff created unowned interval")
+check(not wp.atomic_transfer(dict(transfer, expected_gates=["g", "g"]), "split"), "duplicate transfer gate was accepted")
+check(not wp.atomic_transfer(dict(transfer, gate_map=[]), "split"), "missing transfer gate map was accepted")
+
+# Terminal events have a closed post-cutover disposition set and issuer/owner authority.
+terminal = dict(event="release", claim_id="c", worker="w", original_worker="w",
+    poster_actor="owner", original_author="owner", disposition="return-ready",
+    post_cutover=True, evidence_url="url")
+check(wp.terminal_event_valid(terminal), "valid issuer-authored terminal was rejected")
+check(not wp.terminal_event_valid(dict(terminal, disposition="stuck")), "unknown terminal disposition was accepted")
+check(not wp.terminal_event_valid(dict(terminal, disposition="legacy")), "post-cutover terminal used legacy escape")
+check(not wp.terminal_event_valid(dict(terminal, poster_actor="proxy")), "unauthorized terminal proxy was accepted")
+for disposition in ("infeasible", "declined"):
+    check(not wp.terminal_event_valid(dict(terminal, disposition=disposition)), f"{disposition} lacked owner disposition")
+    check(wp.terminal_event_valid(dict(terminal, disposition=disposition, owner_disposition=True)), f"owner-authorized {disposition} was rejected")
+
+# Scope proxy authority must be prior, operation-specific, exact, and collision checked.
+scope = dict(poster_actor="proxy", original_author="owner", delegation_prior=True,
+    delegation_operation="scope-revise", delegation_claim_id="c", claim_id="c",
+    delegation_scope="new", new_scope="new", delegation_contract_revision=2, contract_revision=2,
+    prior_scope_matches=True, contract_approved=True, collision_check_complete=True)
+check(wp.scope_revision_allowed(scope), "valid narrow scope delegation was rejected")
+for key, value in (("delegation_prior", False), ("delegation_operation", "terminal"),
+                   ("delegation_scope", "broader"), ("collision_check_complete", False)):
+    check(not wp.scope_revision_allowed(dict(scope, **{key:value})), f"scope revision survived invalid {key}")
+
+# Finding identity/axes are append-only; only the exact verified tuple blocks.
+finding = immutable(event_id="f1", finding_id="F", ledger_id="L", round_id="R", prior_event_id=None,
+    confidence="PLAUSIBLE", severity="CRITICAL", locality="SAME_CONTRACT", obligation="BLOCKER",
+    state="OPEN", exact_tip="a"*40, scenario="s", proof="p", owner="o")
+resolved = immutable(**dict(finding, event_id="f2", comment_id=2, prior_event_id="f1", confidence="CONFIRMED",
+    state="RESOLVED", independently_verified=True, proof_tip="a"*40, proof_integration_base="b"*40))
+finding_result = wp.reduce_findings([finding, resolved])
+check(not finding_result.diagnostics and finding_result.current["F"]["state"] == "RESOLVED" and finding_result.current["F"]["severity"] == "CRITICAL",
+      "finding update did not preserve explicit independent axes")
+unproven = dict(resolved, event_id="f3", prior_event_id="f1", independently_verified=False)
+check(wp.reduce_findings([finding, unproven]).current["F"]["state"] == "OPEN", "unproven RESOLVED event discharged a finding")
+fork = dict(resolved, event_id="f4", comment_id=3, prior_event_id="f1")
+check(wp.reduce_findings([finding, resolved, fork]).indeterminate, "two valid finding successors did not taint history")
+check(not wp.finding_blocks(finding), "PLAUSIBLE severity was promoted into a blocker")
+for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+    check(wp.finding_blocks(dict(finding, confidence="CONFIRMED", severity=severity)),
+          f"severity {severity} changed an open confirmed blocker")
+
+# Successors require unique references, claims, exactly-once gates, and current-main proof.
+root_f = {"root":{"state":"SPLIT-TO", "successors":["a", "b"], "affected_gates":["g1", "g2"]}}
+children = {"a":{"active_claim":True, "current_main_proof":True, "gates":["g1"]},
+            "b":{"active_claim":True, "current_main_proof":True, "gates":["g2"]}}
+check(wp.successor_obligation_complete("root", root_f, children), "complete successor gate partition was rejected")
+for mutant in (
+    {"a":children["a"]},
+    {"a":children["a"], "b":dict(children["b"], active_claim=False)},
+    {"a":children["a"], "b":dict(children["b"], current_main_proof=False)},
+    {"a":children["a"], "b":dict(children["b"], gates=["g1"])},
+):
+    check(not wp.successor_obligation_complete("root", root_f, mutant), "invalid/missing/duplicate/unproven successor completed parent")
+cyclic = {"root":{"state":"REPLACED-BY", "successors":["a"]}, "a":{"state":"REPLACED-BY", "successors":["root"]}}
+check(not wp.successor_obligation_complete("root", cyclic, {}), "cyclic successors completed parent")
+
+# Exact-tip round identity uses integration base; all completion axes are independently required.
+round_record = immutable(event_id="rr", round_id="r", ledger_id="l", issue=406, pull_request=542,
+    claim_id="c", contract_id="contract", contract_url="url", contract_digest="d", claim_base="a"*40,
+    integration_base="b"*40, panel_diff_base="b"*40, exact_tip="c"*40, round_number=2,
+    selected_perspectives=["correctness"], skipped_perspectives=["concurrency: no async"],
+    status="CONVERGED", verdict="SAFE_TO_MERGE", finding_event_ids=["none"], gate_evidence="url")
+check(not wp.validate_review_round(round_record), "valid exact-tip review round was rejected")
+check(wp.review_diff_base(round_record) == "b"*40, "panel derivation used claim base instead of integration base")
+check(wp.validate_review_round(dict(round_record, panel_diff_base="a"*40)), "claim-base panel mutant survived")
+
+complete = {field: True for field in ("merged_current_main", "all_successors_resolved", "issue_closed",
+    "claim_terminal", "artifact_identity", "user_visible_proof", "cleanup_safe", "frontier_recomputed")}
+check(wp.completion_allowed(complete), "complete current-main evidence was rejected")
+for field in complete:
+    mutant = dict(complete); mutant[field] = False
+    check(not wp.completion_allowed(mutant), f"COMPLETE survived missing {field}")
+slice_packet = {field:True for field in ("reached_ready_to_merge", "merged_slice_proof", "parent_repair_event",
+    "active_successor_claims", "claim_terminal_after_parent_event", "issue_remains_open")}
+check(wp.scoped_slice_completion_allowed(slice_packet), "valid scoped slice completion was rejected")
+check(not wp.scoped_slice_completion_allowed(dict(slice_packet, issue_remains_open=False)), "slice completion falsely completed parent outcome")
+
+# The original explicit contradictory-policy mutant must be rejected.
+mutant = "production may begin before READY; CRITICAL automatically cancels; SPLIT-TO immediately resolves; COMPLETE does not require user-visible proof"
+check(set(wp.policy_contradictions(mutant)) == {"pre-ready production", "severity cancellation", "immediate successor discharge", "proofless completion"},
+      "explicit contradictory workflow mutant was not rejected")
+
+print("PASS: canonical workflow reducer structured fixtures")
+PY
 
 printf 'PASS: Finch IMPCD and issue-readiness workflow contract holds under %s\n' "$ROOT"

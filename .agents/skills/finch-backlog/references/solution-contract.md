@@ -21,6 +21,53 @@ task handoff, production edit, scope revision, and merge. The immutable claim ba
 the historical base for regression and review lineage; record the current integration base separately
 and never rewrite the claim or contract to make them match.
 
+The contract and its review are separate append-only events. GitHub observation metadata
+(`author`, `createdAt`, `updatedAt`/`lastEditedAt`, numeric comment ID, raw body digest, and
+block order) is retained outside the block and verified before admission. The digest is of
+the complete raw contract comment, so it is recorded by the approval rather than inside the
+body it hashes.
+
+```text
+<!-- finch-solution-contract:v1
+event-id: <lowercase UUID>
+contract-id: <stable ID>
+issue: <number>
+revision: <positive integer>
+supersedes-url: <prior immutable contract URL or none>
+implementation-base: <full SHA>
+owner-worker: <stable worker/person identity>
+owner-github-actor: <GitHub login>
+scope: <bounded single-line file and semantic scope>
+timestamp: <UTC RFC 3339>
+-->
+```
+
+```text
+<!-- finch-solution-contract-approval:v1
+event-id: <lowercase UUID>
+issue: <number>
+contract-id: <stable ID>
+contract-url: <immutable numeric-comment URL>
+contract-digest: <SHA-256 of exact raw contract comment>
+contract-revision: <positive integer>
+implementation-base: <full SHA>
+reviewer-worker: <fresh independent worker identity>
+reviewer-github-actor: <responsible GitHub login>
+verdict: <APPROVE|REVISE>
+review-output-url: <immutable review evidence URL>
+authority-comment: <prior operation-specific delegation URL or none>
+timestamp: <UTC RFC 3339>
+-->
+```
+
+An approval is admitted only after its contract is admitted. It must bind the exact ID,
+URL, digest, revision, and base. Its GitHub author must be the reviewer actor, unless an
+earlier immutable delegation names the contract, reviewer worker, substitute poster, one
+verdict, and output identity. The contract author, coordinator, and implementer workers
+cannot approve their own contract. Invalid attempts do not consume IDs or predecessors.
+Edited/deleted accepted events, incomplete retrieval, or two valid successors from one
+revision make the affected history `INDETERMINATE` and nonauthorizing.
+
 ## Required content
 
 Both compact and full contracts state:

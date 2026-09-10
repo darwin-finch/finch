@@ -35,6 +35,12 @@ Reduce the append-only `finch-issue-readiness:v1` history using
 candidate correction, and finding attributes are three orthogonal layers; never use a
 review result or failed implementation as an issue disposition.
 
+Use the pure canonical reducer in `scripts/workflow_protocol.py` for admitted structured
+records. GitHub/status tooling gathers complete immutable observations; the reducer owns
+transition, authority, pairing, finding, successor, and completion semantics and performs
+no discovery or mutation. Validate before admission. Invalid attempts are diagnostics;
+tainted accepted history or incomplete retrieval is nonauthorizing `INDETERMINATE`.
+
 Only `READY` work may acquire a production branch or `finch-work-claim:v1` claim. `READY`
 requires the immutable, explicitly approved [solution contract](references/solution-contract.md),
 including its URL/comment ID, digest, revision, implementation base, plan reviewer, and
@@ -171,6 +177,11 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
    child slice completes only part of a broader parent outcome, close the child ticket
    and update the parent with the remaining gates rather than pretending the parent is
    complete.
+   Claim-slice completion and outcome completion are separate. Follow the ordered
+   terminal/readiness pairings in `issue-readiness.md`: terminal first for return-to-ready,
+   external pause, specification, infeasible, and declined dispositions; READY_TO_MERGE,
+   merge, claim terminal, issue close, then COMPLETE for success. A merged narrow slice
+   with active successors returns the parent to REPAIR_IN_PROGRESS and leaves it open.
 4. Remove clean worktrees after merge or proven supersession. Preserve unique work by committing and pushing it first.
 5. Recompute the ready frontier and immediately continue while an unblocked gate remains.
 
