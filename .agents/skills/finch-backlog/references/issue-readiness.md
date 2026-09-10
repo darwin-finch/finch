@@ -24,10 +24,14 @@ Every state and transition record uses exactly one actor expression:
 - `ROLE(x)`: role `x` alone is accountable.
 - `ANY_OF(x,y,...)`: one explicitly named role acts and the record says which one.
 - `ALL_OF(x,y,...)`: every role is a distinct named principal with distinct independently
-  supplied evidence; one identity or reused evidence cannot satisfy two independent roles.
+  supplied evidence identity; the record carries each principal's stable account/session identity,
+  and one principal, role alias, empty identity, or reused evidence cannot satisfy two independent
+  roles.
 - `DECISION_BY(x); RECORDED_BY(y)`: either `x` directly posts an immutable owner-signed decision,
-  or `y` mechanically records and verifies a linked prior immutable owner-signed decision by `x`.
-  A recorder-only assertion is invalid.
+  whose author identity is the named owner and which has no second actor, or `y` mechanically
+  records and verifies a linked prior immutable owner-signed decision by `x`. The link includes a
+  canonical comment identity, unedited metadata, and exact body digest. A recorder-only assertion,
+  edited/wrong-author decision, empty evidence identity, or extra actor is invalid.
 
 The symbols `/`, `+`, commas, and phrases such as “with approval” are not actor operators. Roles do
 not grant authority. `proposer` records the desired outcome; `coordinator` collects evidence and
@@ -41,12 +45,18 @@ Finch mutation authority.
 
 A state is valid only while every field in its row remains true. The accountable owner records the
 next action but gains no mutation, merge, closure, or disposition authority from the state.
+Each state record is structured as `state`, accountable actor expression plus principal identity,
+the row's individually named entry/continuing-evidence fields, one permitted next action, the
+target-specific exit predicate, and the issue condition. Opaque placeholders such as `evidence`,
+`next-action`, and `exit-evidence` do not satisfy a field. Missing, empty, unknown, or contradictory
+fields invalidate the record. Each named immutable URL, comment ID, Git tip, and digest uses the
+canonical identity forms required by the referenced protocol.
 
 | State | Accountable state owner | Required entry and continuing evidence | Permitted next actions/destinations | Exit condition | Issue condition |
 |---|---|---|---|---|---|
 | `DRAFT` | `ROLE(proposer)` | Named proposer, desired outcome, initial evidence or report, and next discovery/specification action. An empty or ownerless issue is invalid. | Clarify to `NEEDS_SPECIFICATION`; admit directly to `READY`; owner-decline to `DECLINED`. | One permitted transition has complete actor and evidence records. | Open. |
 | `NEEDS_SPECIFICATION` | `ROLE(contract_owner)` | Exact missing decision among behavior, scope, authority, data shape, invariant, boundary, or proof; concrete question; decision owner; bounded investigation; nearest minimally specified outcome; next action. | Approve to `READY`; wait in `BLOCKED_EXTERNAL`; accept evidence as `INFEASIBLE`; choose `DECLINED`. | Missing decision resolves into an approved contract or authorized side-state disposition. | Open. |
-| `READY` | `ROLE(contract_owner)` | Complete immutable solution contract plus exact URL, digest, revision, implementation base, independent approval, owner, boundaries, regression/integration/reversion proof, no unresolved specification gap, and next action. | Claim into `IN_PROGRESS`; return to `NEEDS_SPECIFICATION`; wait in `BLOCKED_EXTERNAL`; owner-dispose to `INFEASIBLE`, `DECLINED`, or `SUPERSEDED`. | A valid transition record is accepted; production mutation remains forbidden until `IN_PROGRESS`. | Open. |
+| `READY` | `ROLE(contract_owner)` | Complete immutable solution contract plus exact URL, digest, revision, implementation base, independent approval, owner, boundaries, regression/integration/reversion proof, no unresolved specification gap, and next action to publish and verify the exact-scope v1 claim and enter `IN_PROGRESS`. | Claim into `IN_PROGRESS`; return to `NEEDS_SPECIFICATION`; wait in `BLOCKED_EXTERNAL`; owner-dispose to `INFEASIBLE`, `DECLINED`, or `SUPERSEDED`. | A valid transition record is accepted; production mutation remains forbidden until `IN_PROGRESS`. | Open. |
 | `IN_PROGRESS` | `ROLE(claim_owner)` | All `READY` evidence remains current; dedicated branch/worktree; valid active v1 claim for exact scope; complete collision checks; edit grant; preserved current tip; next implementation action. | Enter `REPAIR_IN_PROGRESS`; prove `READY_TO_MERGE`; release to `READY`; respecify; wait; or owner-dispose. | Candidate advances through a permitted transition or ownership is terminalized/preserved. | Open. |
 | `REPAIR_IN_PROGRESS` | `ROLE(claim_owner)` | Applicable `IN_PROGRESS` invariants; frozen reviewed tip; stable append-only finding ledger; correction vector/proof path for each open same-contract obligation; current strategy epoch; next repair action. | Continue a new repair epoch; prove `READY_TO_MERGE`; release to `READY`; respecify; wait; or owner-dispose. | One listed transition has valid actor and evidence records. | Open. |
 | `READY_TO_MERGE` | `ROLE(coordinator)` | Current valid claim; contract satisfied; base-negative/tip-positive regression; every transitive required leaf resolved; exactly one fresh blocker-free exact-tip pass; affected gates; current-main integration; artifact proof; explicit merge/closure authority; next merge or evidence-repair action. All evidence remains current. | Enter `COMPLETION_IN_PROGRESS`; fall back to `REPAIR_IN_PROGRESS`; release to `READY`; respecify to `NEEDS_SPECIFICATION`; wait in `BLOCKED_EXTERNAL`; or owner-dispose to `DECLINED`/`SUPERSEDED`. | One listed transition has valid actor and evidence records. | Open. |
@@ -126,6 +136,12 @@ fallbacks are `READY` when the contract is current but ownership absent (`BE-F-R
 (`BE-F-RIP`), and owner-directed `NEEDS_SPECIFICATION` when the contract is invalid (`BE-F-NS`).
 Otherwise remain blocked with an updated recheck. A terminalized claim cannot resume directly to
 implementation/repair, and stale merge evidence cannot resume directly to merge readiness.
+A completion-origin wait resumes only to `COMPLETION_IN_PROGRESS` after the same structured
+completion-prefix validator proves cursor 2 through 7, every successful evidence identity, and
+the cursor-exact claim/worktree/issue facts. Failed completion attempts append diagnostics but
+must preserve those prefix facts byte-for-byte; later restoration does not cure an intervening
+mutation. `READY_TO_MERGE` likewise requires an active claim, including after a wait; a terminal
+claim deterministically falls back to `READY` rather than resuming merge readiness.
 
 State records communicate accountable conclusions. They do not independently grant mutation,
 external-action, push, merge, close, terminal-event, or cleanup authority.
@@ -167,6 +183,9 @@ the candidate graph for exact set and identity equality, then verify leaves recu
 is merged and proven on current main. Missing, extra, duplicate, cross-gate, arbitrary-owner,
 arbitrary-claim, overlapping, cyclic, edited, or merely linked successors never discharge an
 obligation. If a child cannot be validly claimed, the retained gate stays open.
+Each gate has exactly one current child per generation and one current leaf owner/claim/proof path.
+Serial replacement history is append-only, but two concurrent current leaves are invalid even if
+the expected inventory lists both.
 
 Finding creation and every later disposition are separate immutable PR comments. A disposition
 repeats the stable finding ID and full origin-failing tip, separately names the full disposition-

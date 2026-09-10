@@ -60,6 +60,11 @@ Each finding has a stable ID that survives restatement and repair, plus:
   `obligation = BLOCKER | REGRESSION_DEBT | NONBLOCKING`, and
   `state = OPEN | RESOLVED | REPLACED-BY | SPLIT-TO`.
 
+The stable ID is nonempty and immutable. Comment identities use canonical numeric GitHub comment
+URLs and matching positive-decimal IDs; Git tips are full lowercase 40-hex commit identities and
+body digests are full lowercase 64-hex SHA-256 values. Placeholders, uppercase/short identities,
+or an empty set of stable finding IDs are invalid.
+
 A separate verifier tries to disprove the finding by tracing guards, callers, authority, and
 tests at the exact tip. `CONFIRMED` means the failure survives; `PLAUSIBLE` records the open
 question and counterargument. The axes never imply one another. Finding count and severity
@@ -87,6 +92,16 @@ matching numeric comment ID, and 64-hex SHA-256 body digest. Its proof identity 
 `disposition-reviewed-tip`, not the origin tip. It preserves every unchanged axis literally and
 names each changed axis with its old and new value.
 
+The disposition has its own later comment ID and creation time, never the creation record's
+identity. Every creation and disposition value belongs to the five enumerations above. A changed
+value follows a legal transition: confidence may move `PLAUSIBLE -> CONFIRMED`, lifecycle may move
+`OPEN -> RESOLVED|REPLACED-BY|SPLIT-TO`, and another reclassification requires an explicit
+owner-reviewed correction that preserves the prior value in the change declaration. Before a code
+disposition can resolve, prove the reviewed tip is a descendant of the `origin-failing-tip`,
+belongs to the candidate branch ancestry, and is based on or integrated with the recorded current
+integration base. Merely distinct, earlier, unrelated, or stale-base 40-hex tips do not establish
+freshness.
+
 Each predecessor has at most one direct successor. A later change extends that single chain by
 linking the immediately preceding disposition; it never creates a sibling. Conflicting siblings,
 a missing or non-immediate predecessor, mismatched URL/ID/digest/finding/origin tip, an edited
@@ -102,14 +117,15 @@ verifies findings, and records the ledger. The implementer reproduces coherent c
 vectors on the implementation worktree. Any production change creates a new tip and requires
 affected tests and review again.
 
-Track attempts in an append-only ledger keyed by stable finding ID and strategy epoch. Each attempt
-records competence, exact repair tip, and result `SURVIVED` or `RESOLVED`. Only two competent
-`SURVIVED` results for the same still-open finding in the same epoch end that epoch and require one
-bounded independent diagnosis or disposable prototype before a third repair. A resolved second
-attempt, incompetent attempt, or attempt for another finding does not count toward that trigger.
-After diagnosis, record a new epoch and change strategy, representation, contract, assignment, or
-executable split. Repeating the same repair is not progress, and agent failure never proves
-infeasibility.
+Track attempts as ordered append-only events keyed by nonempty stable finding ID and strategy
+epoch. An `ATTEMPT` event records the next positive attempt ordinal, competence, exact full repair
+tip, and result `SURVIVED` or `RESOLVED`. Exactly the second competent `SURVIVED` result for the
+same still-open finding and epoch ends that epoch. A later `DIAGNOSIS` event must follow those two
+survivals, name their exhausted epoch and an immutable independent proof identity, and precede any
+further repair. The next `ATTEMPT` names a new epoch plus a nonempty changed-strategy identity; it
+cannot use the exhausted epoch or repeat the prior strategy. Diagnosis before exhaustion, a third
+same-epoch repair, a placeholder tip, a resolved second attempt, incompetent attempt, or an attempt
+for another finding never satisfies the trigger. Agent failure never proves infeasibility.
 
 The finite convergence rule is exact:
 

@@ -107,6 +107,12 @@ recursively verified, merged current-main leaf while the parent remains open. Us
 serialized claim procedure in [work claims](work-claims.md); do not represent the transition as
 atomic or treat a replacement record as proof that a gate was discharged.
 
+For each inherited gate and each graph generation, exactly one child may be current and exactly
+one current leaf may carry its owner, claim, and proof path. Append-only serial replacement history
+is retained by terminal predecessors pointing to their single later successor; two concurrent
+current children or leaves for one gate are invalid even when an expected inventory was rewritten
+to list both. Inventory agreement cannot waive this cardinality invariant.
+
 Completion is current-main and user-visible, not a contract, status, or review declaration.
 It requires every accepted gate, merge/current-main identity, current artifact or visible proof,
 claim terminal, ticket closure, safe cleanup, and post-closure frontier accounting in the order
