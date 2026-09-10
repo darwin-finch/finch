@@ -11,11 +11,12 @@ authority engine.
 
 Before production work, record:
 
-- the user-visible outcome and a concrete example of the current failure;
+- the accepted outcome and a concrete example of the current failure or motivating need;
 - the smallest acceptable behavior change and explicit non-goals;
 - affected files or boundaries, likely risks, and rollback approach;
-- the regression that should fail before and pass after;
-- required integration or user-visible proof;
+- the named regression or proof, including fail-before/pass-after for a bug fix;
+- required outcome-appropriate proof: user-visible behavior, refactor equivalence/integration,
+  deletion reachability plus tests, or a usable downstream seam;
 - the person accountable for unresolved product or scope decisions; and
 - a conflict check against active work in the same files or semantics.
 
@@ -42,7 +43,7 @@ Use only the state needed to make the next action clear:
   consequences, and preservation plan.
 - `SUPERSEDED`: the owner replaces the outcome with genuinely separable, explicitly owned work;
   inherited acceptance obligations remain visible until proven.
-- `COMPLETE`: current-main merge and user-visible evidence are present where applicable, and issue,
+- `COMPLETE`: current-main merge and outcome-appropriate evidence are present, and issue,
   claim, cleanup, and follow-up accounting are truthful.
 
 These labels communicate status; they do not grant edit, merge, closure, or disposition authority.
@@ -57,4 +58,4 @@ locality, obligation, and
 lifecycle. Neither finding count nor worst severity automatically changes readiness or closes work.
 
 Completion is based on the integrated result, not paperwork: verify the reviewed change on current
-main, run the affected checks, and collect user-visible evidence when the change affects users.
+main, run the affected checks, and collect the proof appropriate to the accepted outcome.

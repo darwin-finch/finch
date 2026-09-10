@@ -41,20 +41,33 @@ done
 DOCS=$(for file in "$SKILL" "$REFS"/*.md; do normalized < "$file"; printf ' '; done)
 require_pattern "direct requests bypass backlog ceremony" 'direct[^.]{0,160}(skip|without)[^.]{0,160}(issue|claim)[^.]{0,160}(worktree|GitHub)' "$DOCS"
 require_pattern "backlog wrapper retains coordination steps" 'backlog wrapper[^.]{0,200}(issue readiness|readiness)[^.]{0,120}claim[^.]{0,120}worktree' "$DOCS"
+require_pattern "workflow optimizes coherent architecture rather than diff size" 'simplest coherent (resulting )?architecture[^.]{0,160}(not|rather than)[^.]{0,100}(fewest changed lines|diff)' "$DOCS"
+require_pattern "replacement sequence creates, integrates, then deletes" 'replacement[^.]{0,200}(integration points|production integration)[^.]{0,200}(predecessor|old implementation)[^.]{0,80}(delete|deleted)' "$DOCS"
+require_pattern "temporary coexistence has an owner and removal trigger" 'temporary coexistence[^.]{0,160}owner[^.]{0,160}removal trigger' "$DOCS"
+require_pattern "refactor proof covers equivalence and integration" 'refactor(ing|s)?[^.]{0,100}equivalence[^.]{0,100}integration' "$DOCS"
+require_pattern "deletion proof covers reachability and tests" 'deletion[^.]{0,100}(reference/reachability|reachability)[^.]{0,100}tests' "$DOCS"
+require_pattern "enabling work proves a downstream seam" 'enabling work[^.]{0,100}(usable )?downstream seam' "$DOCS"
+require_pattern "architectural boundaries support local reasoning" 'narrow deliberate facade[^.]{0,180}dependency direction[^.]{0,180}(co-located|integration)' "$DOCS"
 
 COUNT_CANCEL='(auto|automatic(ally)?)[- ]*(cancel|close|waive)[^.]{0,100}(count|severity)|(count|severity)[^.]{0,100}(auto|automatic(ally)?)[- ]*(cancel|close|waive)'
 FIXED_REVIEW='(require(d)?|exactly|fixed)[^.]{0,80}(two|three|[2-9])[^.]{0,50}(review(er)?s?|rounds?|passes?)'
 TOOL_AUTH='(script|linter|tool)[^.]{0,100}(grants|authorizes|declares)[^.]{0,80}(ready|ownership|merge|approval)'
+INDEFINITE_DUAL='(allow|leave|permit)[^.]{0,100}(indefinite|permanent)[^.]{0,80}(dual architecture|coexistence|compatibility)'
+SMALLEST_DIFF='(always|must|should)[^.]{0,80}(smallest|fewest)[^.]{0,60}(diff|changed lines)'
 forbid_pattern "exact-tip ritual is absent" 'exact[- ]+tip' "$DOCS"
 forbid_pattern "count or severity cannot auto-cancel" "$COUNT_CANCEL" "$DOCS"
 forbid_pattern "fixed review counts are absent" "$FIXED_REVIEW" "$DOCS"
 forbid_pattern "tooling cannot confer authority" "$TOOL_AUTH" "$DOCS"
+forbid_pattern "indefinite dual architecture is forbidden" "$INDEFINITE_DUAL" "$DOCS"
+forbid_pattern "smallest diff is not the architectural objective" "$SMALLEST_DIFF" "$DOCS"
 reject_fixture "newline-split exact-tip rule is rejected" 'exact[- ]+tip' 'Require an exact
 tip before merge.'
 reject_fixture "automatic count cancellation is rejected" "$COUNT_CANCEL" 'Automatically cancel review when finding count is high.'
 reject_fixture "fixed review count is rejected" "$FIXED_REVIEW" 'Require three review rounds for every patch.'
 reject_fixture "tool authority is rejected" "$TOOL_AUTH" 'The linter grants READY status.'
 accept_fixture "equivalent advisory wording remains valid" "$TOOL_AUTH" 'People decide readiness; a checker only reports documentation gaps.'
+reject_fixture "indefinite coexistence is rejected" "$INDEFINITE_DUAL" 'Allow indefinite coexistence of both architectures.'
+reject_fixture "smallest-diff mandate is rejected" "$SMALLEST_DIFF" 'Always choose the smallest diff even when it preserves competing representations.'
 
 extract_block() {
     awk -v wanted="$1" '
