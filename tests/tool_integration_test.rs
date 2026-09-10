@@ -245,6 +245,7 @@ fn write_fake_editor(path: &std::path::Path, identity: &str) {
          printf '%s' '{identity}' > \"$FINCH_EDITOR_SELECTED\"\n\
          printf '%s' \"$#\" > \"$FINCH_EDITOR_ARGC\"\n\
          printf '%s' \"$1\" > \"$FINCH_EDITOR_ARGV\"\n\
+         test ! -x \"$1\"\n\
          cp \"$1\" \"$FINCH_EDITOR_CAPTURE\"\n\
          case \"$FINCH_EDITOR_ACTION\" in\n\
            accept) : ;;\n\
