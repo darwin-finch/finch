@@ -1,12 +1,39 @@
 # Finch review protocol
 
-Use this whenever the skill requires independent review: security, authority, persistence, provider protocol, credential, destructive, or concurrency changes.
+Use this whenever the skill requires independent review: first for the solution contract
+of nontrivial or risky work, then for the exact implementation tip of security,
+authority, persistence, provider protocol, credential, destructive, or concurrency
+changes.
 
 The method is iterative and multi-perspective: several reviewers each examine the change from one named angle, a separate pass checks each of their findings before it counts, and the whole thing repeats against the fixed code until a pass turns up nothing new. It adapts the plan-critique loop of #22 to code review; nothing below assumes you have read that issue.
 
-A single unverified pass produces confident nonsense. The two properties that make review mean something are **adversarial verification of every finding** and **an explicit convergence rule**.
+A single unverified pass produces confident nonsense. The properties that make review
+mean something are **a reviewed solution boundary**, **adversarial verification of every
+finding**, and **an explicit unresolved-blocker model**.
 
 Throughout, the *exact tip* means the full 40-character SHA of the commit under review, never a branch name. A branch moves; a review names a commit.
+
+## 0. Review the solution before code
+
+After the work claim and before production edits, record the solution contract required
+by the backlog skill. For an obvious local change this can be compact, but it must still
+name the failure boundary, outcome, invariants, proposed files, regression, and
+integration proof. Nontrivial, risky, cross-subsystem, or broad work gets independent
+fresh reviewers selected from:
+
+- **Correctness:** will the proposed behavior actually resolve the reproduction?
+- **Architecture and scope:** does ownership belong here, and is the API/file boundary narrow?
+- **Lifecycle, authority, and persistence:** can cancellation, restart, identity, permission,
+  or durable-state transitions invalidate the design?
+- **Testability:** can the regression fail on the claimed base and can integration be proved
+  through the real boundary?
+
+A plan finding must name a concrete failure scenario or architectural contradiction.
+Resolve confirmed design blockers in the contract before implementation. Reviewers may
+request a narrower contract or already-defined child slices; they do not turn speculative
+concerns into implementation requirements. If implementation reveals that the boundary
+is wrong, stop editing, revise the contract, repeat the claim check when scope changes,
+and review the revised plan before continuing.
 
 ## 1. Derive the panel from the diff
 
@@ -42,18 +69,34 @@ A reviewer inspects a frozen commit: nothing is pushed to the branch between the
 
 Each reviewer returns a list of findings. A finding names the file and the function or line it concerns, what goes wrong there, and the perspective that raised it.
 
-## 3. Verify every finding adversarially
+## 3. Verify and classify every finding adversarially
 
 No finding is reported on suspicion alone. Each one must carry a concrete failure scenario: specific inputs, state, or interleaving, leading to a specific wrong outcome.
 
 Verification is a separate pass from discovery, run by an agent that did not produce the finding. Asking the finder to justify its own finding reproduces its original reasoning. *Adversarially* means the verifier's job is to make the finding false — to find the guard, the caller that cannot supply that input, the lock already held. What survives the attempt is what gets reported.
 
-Every finding leaves this pass carrying exactly one of two labels:
+Every finding first leaves this pass carrying exactly one of two verification labels:
 
 - **CONFIRMED** — the verifier traced the code path at the exact tip and can state the failure concretely.
 - **PLAUSIBLE** — the concern is real but the scenario is unproven, including when the verifier's counter-argument is itself unproven.
 
-Downgrade rather than discard, and record the verifier's counter-argument next to anything downgraded. A PLAUSIBLE finding is a question for the author, not a defect, and must not block a merge on its own. Only CONFIRMED findings drive fixes and decide convergence.
+Downgrade rather than discard, and record the verifier's counter-argument next to anything downgraded. A PLAUSIBLE finding is a question for the author, not a defect, and must not block a merge on its own.
+
+Then classify every CONFIRMED finding by effect:
+
+- **Production blocker:** a concrete wrong outcome in the declared solution boundary,
+  including security, data, lifecycle, compatibility, or user-visible integration failure.
+- **Regression-strengthening debt:** production behavior is correct, but a declared
+  invariant lacks a deterministic regression or an existing regression does not exercise
+  its promised equivalence class. This blocks only while the invariant remains unprotected
+  under `AGENTS.md`.
+- **Nonblocking follow-up:** useful hardening, cleanup, or a different concern that is not
+  required for the declared outcome and does not invalidate it. Create or link an issue
+  when it is actionable; do not expand the current change implicitly.
+
+Record PLAUSIBLE concerns separately as nonblocking questions. Only unresolved confirmed
+production blockers and regression debt protecting declared invariants decide final
+convergence.
 
 ## 4. Iterate to convergence
 
@@ -65,31 +108,73 @@ A **round** is one complete pass of sections 1 through 3 against a single frozen
 4. **verifies** every finding in the separate pass of section 3, labeling each CONFIRMED or PLAUSIBLE;
 5. **ends** once every selected perspective's findings have been verified and collected. Its artifact is the **round record**: the exact tip, the perspectives selected and skipped, and every finding with its label and failure scenario.
 
-Between rounds the implementer fixes what the round confirmed and pushes; the resulting exact tip is the subject of the next round. A review of the previous tip says nothing about the current one.
+Between rounds the implementer fixes confirmed blockers and required regression debt
+inside the reviewed contract, then pushes; the resulting exact tip is the subject of the
+next round. Nonblocking follow-ups do not silently widen the patch. A review of the
+previous tip says nothing about the current one.
 
 A finding is **new** in a round when no earlier round record of this review already holds it — same code location, same failure. Restating a known finding, or re-confirming that a fixed one is fixed, is not new.
 
 **Converged** means a round record contains no new CONFIRMED findings. Convergence takes at least two rounds; one round is a smoke test. If the first round produces no CONFIRMED findings, and so no fixes, run the second round at the same tip with freshly instantiated reviewers, so that it is an independent sample rather than a replay.
 
-**Continue only while the review is improving.** After each round from the second onward, compare its record with the previous one. The round must be **strictly better on both counts**: fewer new CONFIRMED findings, and a less severe worst finding. A run that goes 8 findings to 4, with the worst dropping from a security regression to a recovery-path edge case, is converging and has earned another round. A run that goes 8 to 9, or that trades four small findings for one that corrupts data, is not converging and no number of further rounds will fix it — the change itself is wrong, too large, or the implementer keeps reaching for the same wrong shape.
+Maintain an **unresolved-blocker ledger** across rounds. It names each unresolved
+production blocker or regression debt item, its concrete scenario, owning concern, first
+round, attempted repair, and current disposition. Continue repairs while that ledger is
+shrinking and the reviewed solution boundary remains sound. A same-severity remaining
+blocker, a larger raw finding count from a deeper probe, or findings on newly repaired
+lines do not by themselves stop useful work.
 
-Stop as soon as a round fails that comparison, even if it is only the second. Waiting for a fixed round count lets a pathological run burn two more rounds before anyone looks at it.
+Use locality and causality to decide repair versus split:
 
-**Six rounds is the backstop, not the test.** It exists so a run that improves by a hair each time still terminates. Reaching it means the same thing as failing the comparison.
+- A finding caused by the original implementation or by lines changed to repair it is
+  normal iteration. Keep it in the current repair ledger.
+- A finding that introduces a new concern, subsystem, owner, or independently testable
+  outcome belongs in a child slice. Narrow the current contract rather than smuggling the
+  second project into the fix.
+- A finding that proves the selected ownership or API cannot satisfy the outcome
+  invalidates the solution contract. Return to section 0 before more code.
 
-Each round's fixes are new code and can introduce new defects — in practice they often do, at the exact lines the previous round's fix touched. That is normal once or twice and is why rounds continue at all; it is also why "keep going until it is clean" is not a safe rule on its own.
+Escalate after repeated rounds that do not reduce unresolved blockers, when the
+architecture is invalidated, or at six rounds. Six rounds is a backstop for coordinator
+intervention, not an automatic cancellation: if a sound repair or executable split is
+already progressing, continue that concrete path under updated contracts and claims.
 
-Escalate instead. Post the round records per section 5 with the verdict DO NOT MERGE, and hand the coordinator, named one by one, every CONFIRMED finding still unresolved with its failure scenario, the round that raised it, and what was attempted for it. Include the per-round counts and worst severity, so the coordinator can see the trend that triggered the stop rather than only the final state. The coordinator decides what happens next — split the change, narrow its scope, or accept a named risk explicitly. Continuing to loop, dropping the findings, or declaring success anyway are each a failure of this protocol.
+A split is executable only after the coordinator has created and linked child issues with
+disjoint acceptance gates, preserved or transferred valuable commits, established valid
+claims and worktrees for the replacement work, and continued the immediate next slice.
+Do not close the original pull request merely to describe a future split. “Reviewed and
+closed” is not a valid terminal outcome.
+
+Mutation review is bounded by the named invariants and relevant equivalence classes in
+the solution contract. Every mutant must state which invariant it challenges and why its
+class is distinct. Arbitrary mutant counts, blind input enumeration, and demands for
+exhaustive sampling are not evidence of better coverage.
+
+Final convergence still requires at least two independent rounds in the review, a final
+round against the exact tip being integrated, and zero unresolved confirmed production
+blockers at that tip. Regression-strengthening debt blocks only when it leaves a declared
+invariant unprotected under `AGENTS.md`. If the first round has no blocking findings, run
+a fresh independent second round at the same tip.
 
 ## 5. Record the outcome where it can be checked
 
 Post one pull request comment per round, carrying that round's record:
 
-- the exact commit reviewed, and the round number as `round N of at most 3`;
+- the exact commit reviewed and the round number as `round N`;
 - the perspectives selected, and each skipped one with its reason;
-- every CONFIRMED finding with its failure scenario, and its resolution once a later round confirms the fix;
+- every CONFIRMED finding with its failure scenario, classification, owning concern,
+  and resolution once a later round confirms the fix;
 - every PLAUSIBLE finding, explicitly left open;
-- on the final round only: whether the review converged or hit the round cap, and the verdict — SAFE TO MERGE, MERGE WITH FIXES, or DO NOT MERGE. A review that hit the cap is DO NOT MERGE plus the escalation of section 4.
+- the unresolved-blocker ledger and whether it shrank, plus any repair, contract revision,
+  or executable split underway;
+- on the final round only: whether the review converged or escalated, and the verdict —
+  SAFE TO MERGE, MERGE WITH FIXES, or ESCALATE WITH EXECUTABLE REPAIR/SPLIT. Review alone
+  never terminalizes the work.
+
+Before a SAFE TO MERGE verdict, rebase on current `main`, run the affected gates there,
+and review the resulting exact tip. Exercise the actual binary, generated artifact, or
+user-visible boundary where relevant, and record its source identity. A successful test
+against an obsolete base or a stale deployed build is not integration evidence.
 
 "Independently reviewed" in a merge comment must point at these comments. Without them the claim is unfalsifiable, which is the failure mode `AGENTS.md` names: configuration or intent is not conformance.
 

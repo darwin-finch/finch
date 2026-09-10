@@ -52,9 +52,30 @@ Recompute this frontier after every merge, newly discovered blocker, or changed 
 - Avoid two implementers editing the same files. A reviewer may inspect another agent's frozen branch without editing it.
 - Use safe parallelism up to the configured thread limit, but stay within the machine's memory budget. On the 16 GB Finch development host, run at most one local Cargo command at a time with `CARGO_BUILD_JOBS=2` unless the user declares a different budget. Enforce that limit across agents and worktrees with `.agents/skills/finch-backlog/scripts/with-cargo-slot`; prose coordination and Cargo's per-target locks are not substitutes for the repository-wide slot. Run every local command that can launch Cargo or `rustc` through the wrapper, including `cargo build`, `cargo test`, `cargo check`, `cargo clippy`, `cargo run`, and scripts that invoke Cargo. Formatting and read-only source inspection do not need the slot. If the slot times out or the platform has no supported lock utility, fail closed instead of bypassing it. Prefer focused supervised regressions locally; use CI for broad platform and feature matrices. Never make remote CI a substitute for a live workflow that only the local host can exercise.
 
+## Review the solution contract before implementation
+
+After claiming work and before editing production code, write a solution contract. For
+nontrivial, risky, cross-subsystem, or broad work, have fresh reviewers challenge it
+before implementation begins. The contract records:
+
+- the reproduced failure and production boundary;
+- the observable user outcome and explicit non-goals;
+- the invariants that must remain true;
+- proposed ownership, API boundaries, and files to change;
+- the deterministic regression and why it fails on the claimed base;
+- the current-main integration and user-visible proof; and
+- how inherited or obsolete work will be reduced, reused, or superseded.
+
+Select plan-review perspectives from correctness, architecture/scope,
+lifecycle/authority/persistence, and testability as applicable. Resolve every confirmed
+design blocker in the contract before production edits. Obvious local changes may use a
+compact contract in the issue or task packet, but the step is never silently skipped.
+The reviewed contract constrains implementation; widening it requires another claim
+check and review of the changed boundary.
+
 ## Implement narrowly
 
-1. Reproduce a bug before fixing it whenever deterministic reproduction is possible.
+1. Implement the reviewed solution contract. Reproduce a bug before fixing it whenever deterministic reproduction is possible.
 2. Add a regression that fails on the base revision and passes with the fix. Exercise the production boundary named by `AGENTS.md`, not merely a helper.
 3. Keep coherent fixes in separate commits. Avoid repository-wide formatting or unrelated cleanup.
 4. Push valuable branches promptly.
@@ -70,7 +91,7 @@ For every fix, record the exact commit and exact evidence:
 - source identity when a temporary CI-only commit/workflow is removed;
 - known inherited failures, clearly separated from branch-caused failures.
 
-Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Run it with [the review protocol](references/review-protocol.md): derive the reviewer panel from the diff, review each perspective in its own context, verify every finding against a concrete failure scenario before reporting it, iterate at the new exact tip while each round is strictly better than the last in both count and worst severity, stopping the moment it is not, stopping after at most three rounds and escalating any still-unresolved confirmed findings to the coordinator, and record the panel, findings, rounds, and verdict on the pull request. Freeze the reviewed commit; if production code changes, repeat review and affected tests.
+Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Run it with [the review protocol](references/review-protocol.md): derive the reviewer panel from the diff, review each perspective in its own context, verify every finding against a concrete failure scenario before reporting it, classify verified findings by whether they block production or strengthen a declared regression invariant, and repair confirmed blockers while the solution boundary remains sound and the unresolved-blocker ledger is shrinking. Use locality and causality to decide whether a finding belongs in the repair or requires an executable child slice. Do not cancel work merely because a later round found the same severity or ran a deeper probe. Freeze the reviewed commit; if production code changes, repeat exact-tip review and affected tests.
 
 Do not describe compilation, mocks, or configuration as live provider/model conformance. Keep manual or live acceptance issues open until the exact real-world workflow succeeds.
 
@@ -85,7 +106,8 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
    Merge when every one of these holds:
 
    - the review protocol reached convergence with no unresolved confirmed
-     finding, at the exact tip being merged;
+     production blocker at the exact tip being merged, and no declared invariant
+     remains without its required regression protection;
    - the named regression and the affected suites pass at that same tip, run
      through the Cargo slot;
    - every repository gate the change touches passes locally or in CI, and any
@@ -93,20 +115,35 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
    - a failing check unrelated to the change is shown to be unrelated by
      evidence, not assumption — reproduce it on an untouched branch or on
      `main` before discounting it;
-   - the branch is rebased on current `main` and the claim check has been
-     repeated immediately beforehand.
+   - the branch is rebased on current `main`, affected gates pass on that base,
+     and the claim check has been repeated immediately beforehand;
+   - where the change produces a binary, generated artifact, deployed process,
+     or visible interface, the actual result has been exercised and its source
+     identity recorded so a stale build cannot masquerade as the merged work.
 
-   Stop and ask only for: an unresolved confirmed finding, a gate that cannot
-   be run at all, a material product choice, or authority the user has not
-   granted. "This change feels significant" is not a reason to ask.
+   Repair unresolved confirmed findings under the reviewed contract. Stop and
+   ask only when one cannot be repaired or split within the granted authority,
+   a gate cannot be run at all, a material product choice is required, or the
+   user has not granted necessary authority. "This change feels significant"
+   is not a reason to ask.
 2. Synchronize `main` and verify the merge commit.
-3. Update or close the GitHub issue with commit, regression, review, CI, remaining-gap evidence, and a completion/release event for its work claim.
+3. Update or close the GitHub issue with commit, regression, review, current-main CI,
+   actual artifact or user-visible evidence where applicable, and a completion/release
+   event for its work claim.
 4. Remove clean worktrees after merge or proven supersession. Preserve unique work by committing and pushing it first.
 5. Recompute the ready frontier and immediately continue while an unblocked gate remains.
 
 ## Stop conditions
 
 Stop successfully only when the requested dogfood/release outcome has passed its explicit automated and manual gates, not merely when one batch merges.
+
+Every claim must end in one of three accountable outcomes: merged and observable;
+superseded by already-created, linked, disjoint, claimed replacement slices whose
+immediate next slice is continuing; or genuinely blocked by an external dependency or
+missing authority. Review, cancellation, a closed pull request, or a preserved branch is
+not by itself a terminal outcome. If a solution must split, preserve or transfer valuable
+commits and establish the immediate replacement work before closing the superseded pull
+request. Do not leave a queue of review-complete but unintegrated work.
 
 Stop for user direction only when continuing requires new authority, a material product choice, credentials/live action the user has not authorized, or an external state change. A hard or slow issue is not itself a blocker.
 
