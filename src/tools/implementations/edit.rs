@@ -412,13 +412,7 @@ fn ensure_review_representation_is_exact(label: &str, text: &str) -> Result<()> 
     Ok(())
 }
 
-/// Header lines stating everything the diff below does not faithfully show.
-///
-/// `FileDiff` is bounded: it gives up on very large or pathological inputs,
-/// truncates over-long lines, and refuses to line-diff binary content. An
-/// approval surface must never let someone approve a change they were shown
-/// only part of, so each of those cases is stated *above* the diff — where
-/// the reader meets it before deciding — rather than only in the footer.
+/// Describe the scale of the accepted review, including binary size changes.
 fn fidelity_notes(diff: &FileDiff, original: &str, planned: &str) -> Vec<String> {
     let mut notes = Vec::new();
     if diff.binary {
@@ -440,27 +434,8 @@ fn fidelity_notes(diff: &FileDiff, original: &str, planned: &str) -> Vec<String>
     if let Some(elided) = &diff.elided {
         notes.push(format!("NOTE: {}", elided));
     }
-    if !diff.counts_are_exact() {
-        notes.push(
-            "WARNING: this diff is incomplete — the line counts are approximate and part of \
-             the change is not shown below. Do not approve unless you can see all of it."
-                .to_string(),
-        );
-    } else if !diff.binary {
+    if !diff.binary {
         notes.push(format!("+{} -{} lines.", diff.added(), diff.removed()));
-    }
-    let longest = original
-        .lines()
-        .chain(planned.lines())
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
-    if longest > MAX_DIFF_LINE_CHARS {
-        notes.push(format!(
-            "NOTE: a line of {} characters exceeds the {} character display limit and is shown \
-             cut off, marked with … [line truncated].",
-            longest, MAX_DIFF_LINE_CHARS
-        ));
     }
     notes
 }
@@ -495,6 +470,15 @@ fn verify_render_is_faithful(
         // Binary content is presented as prose with byte sizes, which is a
         // complete description rather than a partial diff.
         return Ok(());
+    }
+    if !file_diff.counts_are_exact() {
+        let detail = file_diff.elided.as_deref().unwrap_or("reason not reported");
+        anyhow::bail!(
+            "Refusing to edit {}: the diff is incomplete or elided ({detail}), so the review \
+             would hide part of the change. Make a smaller edit.\n{}",
+            file_diff.display_path(),
+            interim
+        );
     }
     if rendered
         .lines()
@@ -1314,6 +1298,50 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             format!("{bulk}MARKER\n"),
             "a refused edit must leave the file untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_more_than_128_separate_replacements_are_refused_before_editor() {
+        let original: String = (0..129)
+            .map(|index| format!("TARGET {index}\n{}", "unchanged\n".repeat(10)))
+            .collect();
+        let planned = original.replace("TARGET", "REPLACED");
+        let diff = FileDiff::from_texts("many-hunks.txt", &original, &planned);
+        assert!(
+            !diff.counts_are_exact(),
+            "fixture must exceed the renderer's bounded review capacity; diff: {diff:?}"
+        );
+        let elision = diff
+            .elided
+            .clone()
+            .expect("bounded diff must explain elision");
+
+        let (_dir, path) = temp_file("many-hunks.txt", &original);
+        let opened = Arc::new(Mutex::new(None));
+        let error = review_and_apply_edit(
+            &path,
+            "TARGET",
+            "REPLACED",
+            true,
+            capturing_editor(opened.clone(), Some),
+        )
+        .await
+        .expect_err("an elided multi-hunk diff must fail closed");
+
+        assert!(
+            opened.lock().unwrap().is_none(),
+            "an incomplete review must be refused before opening the editor; error: {error:#}"
+        );
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("incomplete or elided") && detail.contains(&elision),
+            "refusal must name the incomplete review and renderer limit; error: {detail}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "refusing an elided review must leave the target unchanged"
         );
     }
 
