@@ -26,3 +26,12 @@ jobs:
         run: python3 scripts/check_repository_hygiene.py
       - name: Run repository hygiene regressions
         run: python3 scripts/test_repository_hygiene.py
+      - name: Reject restoration of the removed SSH surface
+        run: python3 scripts/check_no_ssh_surface.py
+      - name: Run removed SSH surface regressions
+        run: python3 scripts/test_no_ssh_surface.py
+      - name: Verify reviewed workflow inventory
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/check_ci_workflow_manifest.py
+          python3 scripts/test_ci_workflow_manifest.py

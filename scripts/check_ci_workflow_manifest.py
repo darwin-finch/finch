@@ -51,29 +51,6 @@ BRAIN_CHECKS = (
     "Isolation boundaries (macos-14)",
     "Isolation boundaries (ubuntu-24.04)",
 )
-LEGACY_SPREADSHEET_CHECKS = ("Spreadsheet advisory audit",)
-LEGACY_SSH_CHECKS = (
-    "Compile and test (macos-14, default)",
-    "Compile and test (macos-14, no-default-features)",
-    "Compile and test (ubuntu-24.04, default)",
-    "Compile and test (ubuntu-24.04, no-default-features)",
-    "Dependency graph (aarch64-apple-darwin, default)",
-    "Dependency graph (aarch64-apple-darwin, no-default-features)",
-    "Dependency graph (x86_64-pc-windows-msvc, default)",
-    "Dependency graph (x86_64-pc-windows-msvc, no-default-features)",
-    "Dependency graph (x86_64-unknown-linux-gnu, default)",
-    "Dependency graph (x86_64-unknown-linux-gnu, no-default-features)",
-    "Downstream API absence (macos-14, default)",
-    "Downstream API absence (macos-14, no-default-features)",
-    "Downstream API absence (ubuntu-24.04, default)",
-    "Downstream API absence (ubuntu-24.04, no-default-features)",
-    "Release build (aarch64-apple-darwin)",
-    "Release build (x86_64-unknown-linux-gnu)",
-    "SSH absence contract (macos-14)",
-    "SSH absence contract (ubuntu-24.04)",
-    "SSH absence contract (windows-2025)",
-    "SSH advisory audit",
-)
 OAUTH_CHECKS = ("macos-oauth", "oauth", "windows-compile")
 CHATGPT_AUTH_CHECKS = (
     "focused-auth (macos-14)",
@@ -86,24 +63,20 @@ def checks(*groups: tuple[str, ...]) -> list[str]:
     return sorted(item for group in groups for item in group)
 
 
-BASELINE_CHECKS = (LEGACY_SPREADSHEET_CHECKS, LEGACY_SSH_CHECKS)
 EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
     "readme_only": {
         "changed_paths": ["README.md"],
         "expected_checks": checks(
             CANONICAL_CHECKS,
             HYGIENE_CHECKS,
-            *BASELINE_CHECKS,
             ("Current docs links, claims, and shell syntax",),
         ),
-        "expected_count": 34,
+        "expected_count": 13,
     },
     "ordinary_source": {
         "changed_paths": ["src/models/mod.rs"],
-        "expected_checks": checks(
-            CANONICAL_CHECKS, HYGIENE_CHECKS, BRAIN_CHECKS, *BASELINE_CHECKS
-        ),
-        "expected_count": 35,
+        "expected_checks": checks(CANONICAL_CHECKS, HYGIENE_CHECKS, BRAIN_CHECKS),
+        "expected_count": 14,
     },
     "brain_effect": {
         "changed_paths": ["src/brain/store.rs", "src/server/handlers.rs"],
@@ -111,10 +84,9 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             CANONICAL_CHECKS,
             HYGIENE_CHECKS,
             BRAIN_CHECKS,
-            *BASELINE_CHECKS,
             ("effect-audit",),
         ),
-        "expected_count": 36,
+        "expected_count": 15,
     },
     "manifest_dependency": {
         "changed_paths": ["Cargo.toml", "Cargo.lock"],
@@ -122,11 +94,10 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             CANONICAL_CHECKS,
             HYGIENE_CHECKS,
             BRAIN_CHECKS,
-            *BASELINE_CHECKS,
             OAUTH_CHECKS,
             CHATGPT_AUTH_CHECKS,
         ),
-        "expected_count": 41,
+        "expected_count": 20,
     },
     "public_api": {
         "changed_paths": ["src/lib.rs"],
@@ -134,10 +105,9 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             CANONICAL_CHECKS,
             HYGIENE_CHECKS,
             BRAIN_CHECKS,
-            *BASELINE_CHECKS,
             OAUTH_CHECKS,
         ),
-        "expected_count": 38,
+        "expected_count": 17,
     },
 }
 
@@ -146,8 +116,6 @@ EXPECTED_PR_ACTIVE_WORKFLOWS = [
     "docs.yml",
     "issue-105-oauth.yml",
     "issue-163-effect-audit.yml",
-    "issue-185-spreadsheet-advisories.yml",
-    "issue-186-ssh-removal.yml",
     "issue-187-subagent-fanout.yml",
     "issue-201-chatgpt-auth.yml",
     "issue-227-setup-preservation.yml",
@@ -163,8 +131,6 @@ EXPECTED_FIXTURE_MEMBERSHIP = {
     "issue-104-chooser-catalog.yml": [],
     "issue-105-oauth.yml": ["manifest_dependency", "public_api"],
     "issue-163-effect-audit.yml": ["brain_effect"],
-    "issue-185-spreadsheet-advisories.yml": sorted(EXPECTED_FIXTURES),
-    "issue-186-ssh-removal.yml": sorted(EXPECTED_FIXTURES),
     "issue-187-subagent-fanout.yml": [],
     "issue-201-chatgpt-auth.yml": ["manifest_dependency"],
     "issue-227-setup-preservation.yml": [],

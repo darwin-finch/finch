@@ -426,8 +426,8 @@ class WorkflowManifestTests(unittest.TestCase):
     def test_missing_reviewed_workflow_is_actionable(self) -> None:
         repository = WorkflowRepository()
         try:
-            repository.workflow("issue-186-ssh-removal.yml").unlink()
-            self.assert_rejected(repository, "issue-186-ssh-removal.yml", "is missing")
+            repository.workflow("ci.yml").unlink()
+            self.assert_rejected(repository, "ci.yml", "is missing")
         finally:
             repository.close()
 
@@ -852,12 +852,12 @@ class WorkflowManifestTests(unittest.TestCase):
         repository = WorkflowRepository()
         try:
             paths = sorted((repository.root / ".github/workflows").glob("*.y*ml"))
-            initial_size = 65_500
             self.assertEqual(
                 len(paths),
-                16,
-                f"aggregate-race fixture assumes 16 reviewed workflows: paths={paths!r}",
+                14,
+                f"aggregate-race fixture assumes 14 reviewed workflows: paths={paths!r}",
             )
+            initial_size = MAX_TOTAL_WORKFLOW_BYTES // len(paths) - 25
             for path in paths:
                 path.write_bytes(b"x" * initial_size)
 

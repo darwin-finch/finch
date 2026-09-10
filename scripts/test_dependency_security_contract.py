@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for Finch's resolved HTTP dependency contract."""
+"""Regression tests for Finch's resolved dependency security contract."""
 
 from __future__ import annotations
 
@@ -11,17 +11,19 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-CHECKER = ROOT / "scripts/check_http_dependency_contract.py"
+CHECKER = ROOT / "scripts/check_dependency_security_contract.py"
 
 
 def lockfile(*packages: tuple[str, str]) -> str:
+    if not any(name == "quick-xml" for name, _ in packages):
+        packages = (*packages, ("quick-xml", "0.41.0"))
     sections = ['version = 4\n']
     for name, version in packages:
         sections.append(f'[[package]]\nname = "{name}"\nversion = "{version}"\n')
     return "\n".join(sections)
 
 
-class HttpDependencyContractTests(unittest.TestCase):
+class DependencySecurityContractTests(unittest.TestCase):
     def run_contract(
         self, contents: str
     ) -> tuple[subprocess.CompletedProcess[str], tempfile.TemporaryDirectory[str]]:
@@ -59,6 +61,7 @@ class HttpDependencyContractTests(unittest.TestCase):
             self.assertIn("reqwest=0.12.28", result.stdout)
             self.assertIn("h2=0.4.19", result.stdout)
             self.assertIn("tokio-tungstenite=0.24.0", result.stdout)
+            self.assertIn("quick-xml=0.41.0", result.stdout)
         finally:
             temporary.cleanup()
 
@@ -163,6 +166,7 @@ class HttpDependencyContractTests(unittest.TestCase):
             "tokio-tungstenite": "0.24.0",
             "rustls": "0.23.43",
             "rustls-webpki": "0.103.15",
+            "quick-xml": "0.41.0",
         }
         for package, version in stable.items():
             with self.subTest(package=package):
@@ -174,6 +178,69 @@ class HttpDependencyContractTests(unittest.TestCase):
                     lockfile(*packages),
                     f"{package} {version}-alpha.1 is a prerelease; security floors require stable releases",
                 )
+
+    def test_rejects_each_removed_ssh_dependency_with_named_diagnostic(self) -> None:
+        advisories = {
+            "rsa": "RUSTSEC-2023-0071",
+            "russh-cryptovec": "RUSTSEC-2026-0153",
+            "russh": "RUSTSEC-2026-0154",
+            "russh-keys": "removed SSH dependency surface",
+        }
+        required = (
+            ("reqwest", "0.12.28"),
+            ("h2", "0.4.19"),
+            ("tokio-tungstenite", "0.24.0"),
+            ("rustls", "0.23.43"),
+            ("rustls-webpki", "0.103.15"),
+        )
+        for package, diagnostic in advisories.items():
+            with self.subTest(package=package):
+                self.assert_rejected(
+                    lockfile(*required, (package, "1.0.0")),
+                    f"forbidden dependency {package} 1.0.0 remains resolved ({diagnostic})",
+                )
+
+    def test_enforces_quick_xml_advisory_floor(self) -> None:
+        required = (
+            ("reqwest", "0.12.28"),
+            ("h2", "0.4.19"),
+            ("tokio-tungstenite", "0.24.0"),
+            ("rustls", "0.23.43"),
+            ("rustls-webpki", "0.103.15"),
+        )
+        self.assert_rejected(
+            lockfile(*required, ("quick-xml", "0.40.0")),
+            "quick-xml 0.40.0 is below the fixed 0.41.0 floor for "
+            "RUSTSEC-2026-0194 and RUSTSEC-2026-0195",
+        )
+        for version in ("0.41.0", "0.42.0"):
+            with self.subTest(version=version):
+                result, temporary = self.run_contract(
+                    lockfile(*required, ("quick-xml", version))
+                )
+                try:
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        "quick-xml at or above the reviewed floor must pass: "
+                        f"version={version} stdout={result.stdout!r} stderr={result.stderr!r}",
+                    )
+                finally:
+                    temporary.cleanup()
+
+    def test_requires_quick_xml_so_the_advisory_floor_is_not_vacuous(self) -> None:
+        self.assert_rejected(
+            lockfile(
+                ("reqwest", "0.12.28"),
+                ("h2", "0.4.19"),
+                ("tokio-tungstenite", "0.24.0"),
+                ("rustls", "0.23.43"),
+                ("rustls-webpki", "0.103.15"),
+            ).replace(
+                '[[package]]\nname = "quick-xml"\nversion = "0.41.0"\n', ""
+            ),
+            "no quick-xml package is resolved; the spreadsheet advisory floor would be vacuous",
+        )
 
     def test_rejects_split_tls_and_websocket_generations(self) -> None:
         self.assert_rejected(

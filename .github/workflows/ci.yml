@@ -108,6 +108,11 @@ jobs:
     - name: Compile all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} --no-run
 
+    - name: Prove the removed finch::ssh API stays absent downstream
+      env:
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      run: python3 scripts/check_removed_ssh_api.py ${{ matrix.cargo_args }}
+
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
 
@@ -195,17 +200,21 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Verify reviewed workflow inventory
+      run: |
+        python3 scripts/check_ci_workflow_manifest.py
+        python3 scripts/test_ci_workflow_manifest.py
+
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
 
-    - name: Verify resolved HTTP dependency contract
+    - name: Verify resolved dependency security contract
       run: |
-        cargo generate-lockfile
-        python3 scripts/test_http_dependency_contract.py
-        python3 scripts/check_http_dependency_contract.py
+        python3 scripts/test_dependency_security_contract.py
+        python3 scripts/check_dependency_security_contract.py
 
     - name: Run cargo audit
       run: cargo audit
