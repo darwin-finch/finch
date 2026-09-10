@@ -2,10 +2,6 @@
 // Library exports
 
 /// One-line description of what Finch is, shown by `finch --help`.
-///
-/// Kept here rather than inline in `main.rs` so it can be pinned by a test.
-/// See `tests::about_makes_no_unevidenced_capability_claim` for the invariant:
-/// this string must not advertise a capability the project has not evidenced.
 pub const ABOUT: &str = "Terminal coding assistant with typed programs, named Brains, and tool use";
 
 use std::sync::atomic::{AtomicBool, Ordering};
