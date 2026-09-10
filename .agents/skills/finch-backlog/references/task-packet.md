@@ -1,42 +1,24 @@
-# Finch implementation task packet
+# Implementation task packet
 
-Give each independent collaborator all of the following. Replace every placeholder; do not send a collaborator to rediscover the coordination state.
+Give a collaborator enough context to act safely without making them reconstruct the project plan.
+Keep the packet proportional to the delegated change.
 
-```text
-Issue and outcome
-- GitHub issue: #<number> — <title>
-- Concrete outcome: <observable behavior and acceptance gate>
-- Work claim: <claim id and issue-comment URL>
+## Minimum packet
 
-Starting point
-- Repository: <absolute path>
-- Branch/worktree: <dedicated branch and absolute worktree>
-- Base commit: <exact origin/main SHA>
-- Relevant files/docs/commits: <paths and immutable SHAs>
+- Issue and user-visible outcome.
+- Compact solution contract or equivalent accepted behavior.
+- Repository, branch/worktree, starting commit, and exact allowed files.
+- Dependencies, known risks, and work that must remain untouched.
+- Required regression, integration check, and user-visible proof.
+- Who owns implementation, review, integration, and unresolved decisions.
+- Explicit permission or prohibition for edits, prototypes, external messages, push, merge, issue
+  closure, claim termination, and cleanup.
+- Expected handoff: commit, changed files, tests, failures, residual risks, and next action.
 
-Dependencies and assumptions
-- Depends on: <issues/commits>
-- Blocks: <issues/gates>
-- Confirmed facts: <facts the agent may rely on>
-- Unverified assumptions: <claims that require tests or live acceptance>
+Authority comes from the responsible person or controlling instruction, not from this packet, a
+role name, a status label, review, or CI. Tooling is advisory mechanical lint, never an authority
+engine. When authority is unclear, say so and ask rather than manufacturing a proof structure.
 
-Authority and scope
-- May edit: <bounded areas>
-- Must not edit: <overlapping work or excluded areas>
-- No credential access, destructive cleanup, external messages, or merge authority unless explicitly stated.
-- Preserve unrelated changes and avoid broad formatting.
-
-Required verification
-- Regression that fails before and passes after: <production boundary>
-- Focused tests/static checks: <commands or CI jobs>
-- Cross-platform/feature/release coverage: <required matrix>
-- Independent review: <security/authority/persistence/provider/etc. or not required>
-- Resource constraints: <local/remote build and memory limits>
-
-Expected deliverable
-- Coherent commits pushed to the assigned branch.
-- Clean worktree and exact final SHA.
-- PR or handoff with changed files, named regression, test/CI links, residual risks, and merge recommendation.
-- Do not merge, close issues, or remove the worktree unless explicitly authorized.
-- Publish the required claim terminal event when ownership ends.
-```
+Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost
+proportional to the change; otherwise remove it. For a small local edit, the packet should be short.
+Add isolation, concurrency, rollout, or recovery detail only when the actual risk requires it.

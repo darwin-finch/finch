@@ -1,0 +1,88 @@
+#!/bin/sh
+# Mechanical lint for Finch's advisory backlog documentation. Humans retain authority.
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DEFAULT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../../.." && pwd)
+case $# in
+    0) ROOT=$DEFAULT_ROOT ;;
+    1) ROOT=$1 ;;
+    *) printf 'ERROR: usage: %s [repository-root]\n' "$0" >&2; exit 2 ;;
+esac
+
+SKILL="$ROOT/.agents/skills/finch-backlog/SKILL.md"
+REFS="$ROOT/.agents/skills/finch-backlog/references"
+CLAIMS="$REFS/work-claims.md"
+WORKFLOW="$ROOT/.github/workflows/docs.yml"
+checks=0 failures=0
+
+pass() { checks=$((checks + 1)); printf 'ok %s - %s\n' "$checks" "$1"; }
+fail() { checks=$((checks + 1)); failures=$((failures + 1)); printf 'not ok %s - %s\n' "$checks" "$1" >&2; }
+require_file() { test -f "$2" && pass "$1" || fail "$1: missing $2"; }
+normalized() { tr '\n' ' ' | tr -s '[:space:]' ' '; }
+matches() { printf '%s\n' "$2" | normalized | grep -E -i -q -- "$1"; }
+require_pattern() { matches "$2" "$3" && pass "$1" || fail "$1: required structure absent"; }
+forbid_pattern() { matches "$2" "$3" && fail "$1: harmful rule matched" || pass "$1"; }
+reject_fixture() { matches "$2" "$3" && pass "$1" || fail "$1: harmful fixture was accepted"; }
+accept_fixture() { matches "$2" "$3" && fail "$1: harmless fixture was rejected" || pass "$1"; }
+
+for path in \
+    .agents/skills/finch-backlog/SKILL.md \
+    .agents/skills/finch-backlog/references/review-protocol.md \
+    .agents/skills/finch-backlog/references/solution-contract.md \
+    .agents/skills/finch-backlog/references/issue-readiness.md \
+    .agents/skills/finch-backlog/references/task-packet.md \
+    .agents/skills/finch-backlog/references/work-claims.md \
+    .github/workflows/docs.yml scripts/ci_workflow_manifest.json
+do
+    require_file "required process file exists: $path" "$ROOT/$path"
+done
+
+DOCS=$(for file in "$SKILL" "$REFS"/*.md; do normalized < "$file"; printf ' '; done)
+require_pattern "direct requests bypass backlog ceremony" 'direct[^.]{0,160}(skip|without)[^.]{0,160}(issue|claim)[^.]{0,160}(worktree|GitHub)' "$DOCS"
+require_pattern "backlog wrapper retains coordination steps" 'backlog wrapper[^.]{0,200}(issue readiness|readiness)[^.]{0,120}claim[^.]{0,120}worktree' "$DOCS"
+
+COUNT_CANCEL='(auto|automatic(ally)?)[- ]*(cancel|close|waive)[^.]{0,100}(count|severity)|(count|severity)[^.]{0,100}(auto|automatic(ally)?)[- ]*(cancel|close|waive)'
+FIXED_REVIEW='(require(d)?|exactly|fixed)[^.]{0,80}(two|three|[2-9])[^.]{0,50}(review(er)?s?|rounds?|passes?)'
+TOOL_AUTH='(script|linter|tool)[^.]{0,100}(grants|authorizes|declares)[^.]{0,80}(ready|ownership|merge|approval)'
+forbid_pattern "exact-tip ritual is absent" 'exact[- ]+tip' "$DOCS"
+forbid_pattern "count or severity cannot auto-cancel" "$COUNT_CANCEL" "$DOCS"
+forbid_pattern "fixed review counts are absent" "$FIXED_REVIEW" "$DOCS"
+forbid_pattern "tooling cannot confer authority" "$TOOL_AUTH" "$DOCS"
+reject_fixture "newline-split exact-tip rule is rejected" 'exact[- ]+tip' 'Require an exact
+tip before merge.'
+reject_fixture "automatic count cancellation is rejected" "$COUNT_CANCEL" 'Automatically cancel review when finding count is high.'
+reject_fixture "fixed review count is rejected" "$FIXED_REVIEW" 'Require three review rounds for every patch.'
+reject_fixture "tool authority is rejected" "$TOOL_AUTH" 'The linter grants READY status.'
+accept_fixture "equivalent advisory wording remains valid" "$TOOL_AUTH" 'People decide readiness; a checker only reports documentation gaps.'
+
+extract_block() {
+    awk -v wanted="$1" '
+        /<!-- finch-work-claim:v1/ { number++; active=(number == wanted) }
+        active { print }
+        active && /-->/ { exit }
+    ' "$CLAIMS"
+}
+expected_claim=$(printf '%s\n' '<!-- finch-work-claim:v1' 'event: claim' 'claim-id: <globally unique stable id>' 'worker: <tool/person and stable session or agent identity>' 'github-actor: <responsible @user or none>' 'branch: <remote branch>' 'worktree: <absolute path or remote environment id>' 'base: <full commit SHA>' 'scope: <single-line bounded scope>' 'timestamp: <UTC RFC 3339>' '-->')
+expected_terminal=$(printf '%s\n' '<!-- finch-work-claim:v1' 'event: <release|complete|supersede>' 'claim-id: <the original claim id>' 'worker: <the exact worker value from the original claim>' 'timestamp: <UTC RFC 3339>' 'replacement-claim: <claim id or none>' 'authority-comment: <none or immutable prior GitHub comment URL>' '-->')
+test "$(extract_block 1)" = "$expected_claim" && pass "v1 claim schema is preserved" || fail "v1 claim schema changed"
+test "$(extract_block 2)" = "$expected_terminal" && pass "v1 terminal schema is preserved" || fail "v1 terminal schema changed"
+claim_markers=$(grep -F -c '<!-- finch-work-claim:v1' "$CLAIMS" || true)
+test "$claim_markers" = 2 && pass "v1 has exactly claim and terminal examples" || fail "v1 marker count expected=2 actual=$claim_markers"
+CLAIM_TEXT=$(normalized < "$CLAIMS")
+require_pattern "v1 is the sole backlog ownership record" 'v1[^.]{0,100}sole recorded ownership mechanism' "$CLAIM_TEXT"
+require_pattern "claim collision winner is deterministic" 'earlier GitHub `createdAt` wins[^.]*equal[^.]*lower numeric comment ID wins' "$CLAIM_TEXT"
+
+invocations=$(grep -F -c 'run: .agents/skills/finch-backlog/scripts/test-review-protocol "$GITHUB_WORKSPACE"' "$WORKFLOW" || true)
+test "$invocations" = 1 && pass "Documentation runs the linter once" || fail "Documentation linter invocation expected=1 actual=$invocations"
+for path in '**.md' scripts/check_docs.py .agents/skills/finch-backlog/scripts/test-review-protocol .github/workflows/docs.yml scripts/ci_workflow_manifest.json; do
+    occurrences=$(grep -F -c -- "\"$path\"" "$WORKFLOW" || true)
+    test "$occurrences" = 2 && pass "Documentation watches $path on pull and push" || fail "Documentation path occurrences expected=2 actual=$occurrences path=$path"
+done
+for path in .agents/skills/finch-backlog/SKILL.md .agents/skills/finch-backlog/references/review-protocol.md .agents/skills/finch-backlog/references/solution-contract.md .agents/skills/finch-backlog/references/issue-readiness.md .agents/skills/finch-backlog/references/task-packet.md .agents/skills/finch-backlog/references/work-claims.md; do
+    occurrences=$(grep -F -c -- "\"$path\"" "$WORKFLOW" || true)
+    test "$occurrences" = 0 && pass "Markdown path relies on the shared glob: $path" || fail "redundant Markdown path remains: $path"
+done
+
+test "$failures" -eq 0 || { printf 'FAILED: %s of %s mechanical checks failed\n' "$failures" "$checks" >&2; exit 1; }
+printf 'PASS: %s mechanical documentation checks; no authority decisions made\n' "$checks"
