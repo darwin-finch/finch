@@ -1,0 +1,255 @@
+#!/bin/sh
+set -eu
+
+ROOT=${1:-$(CDPATH= cd -- "$(dirname -- "$0")/../../../.." && pwd)}
+SKILL="$ROOT/.agents/skills/finch-backlog/SKILL.md"
+REVIEW="$ROOT/.agents/skills/finch-backlog/references/review-protocol.md"
+CONTRACT="$ROOT/.agents/skills/finch-backlog/references/solution-contract.md"
+READINESS="$ROOT/.agents/skills/finch-backlog/references/issue-readiness.md"
+PACKET="$ROOT/.agents/skills/finch-backlog/references/task-packet.md"
+CLAIMS="$ROOT/.agents/skills/finch-backlog/references/work-claims.md"
+
+fail() {
+    printf 'FAIL: %s\n' "$1" >&2
+    exit 1
+}
+
+require_file() {
+    [ -f "$1" ] || fail "$1: required workflow artifact is missing"
+}
+
+require_literal() {
+    path=$1
+    literal=$2
+    invariant=$3
+    grep -Fq -- "$literal" "$path" || fail "$path: $invariant; missing [$literal]"
+}
+
+reject_literal() {
+    path=$1
+    literal=$2
+    invariant=$3
+    if grep -Fq -- "$literal" "$path"; then
+        fail "$path: $invariant; forbidden legacy text remains [$literal]"
+    fi
+}
+
+for path in "$SKILL" "$REVIEW" "$CONTRACT" "$READINESS" "$PACKET" "$CLAIMS"; do
+    require_file "$path"
+done
+
+# Universal immutable reviewed contracts and distinct base identities.
+require_literal "$CONTRACT" 'Every production change starts from an immutable, explicitly approved solution contract.' 'production edits require a universal reviewed contract'
+require_literal "$CONTRACT" 'An obvious isolated fix may use a compact contract' 'small fixes retain the compact-contract path'
+require_literal "$CONTRACT" 'one fresh independent plan reviewer' 'small fixes require a fresh plan reviewer'
+require_literal "$CONTRACT" 'Risk determines additional perspectives' 'expanded plan review is risk-derived'
+require_literal "$CONTRACT" 'issue-comment URL and numeric comment ID' 'contract identity includes URL and comment ID'
+require_literal "$CONTRACT" 'SHA-256 digest' 'contract identity includes an exact-body digest'
+require_literal "$CONTRACT" 'revision' 'contract identity includes a revision'
+require_literal "$CONTRACT" 'implementation-base SHA' 'contract identity includes an immutable implementation base'
+require_literal "$CONTRACT" 'plan-reviewer identity' 'contract identity includes the reviewer'
+require_literal "$CONTRACT" 'explicit `APPROVE` verdict' 'contract identity includes approval'
+require_literal "$CONTRACT" 'current integration base separately' 'claim base and integration base stay distinct'
+require_literal "$PACKET" 'Solution contract: <contract ID, URL/numeric comment ID, SHA-256 body digest, revision>' 'task packet carries immutable contract identity'
+require_literal "$PACKET" 'Current integration base: <full 40-character current-main SHA>' 'task packet carries integration base separately'
+require_literal "$PACKET" 'Finding/ledger IDs:' 'task packet carries stable ledger identity'
+require_literal "$PACKET" 'Prototype authority:' 'task packet carries explicit prototype authority'
+
+# IMPCD roles, stable independent axes, and append-only lifecycle.
+require_literal "$REVIEW" 'iterative multi-perspective correction (IMPCD)' 'review uses the approved correction model'
+require_literal "$REVIEW" 'reviewers return the smallest credible' 'reviewers provide a correction vector'
+require_literal "$REVIEW" 'The implementer must' 'the implementer owns reproduction of corrections'
+require_literal "$REVIEW" '**confidence:** `CONFIRMED | PLAUSIBLE`' 'confidence has exactly its two values'
+require_literal "$REVIEW" '**severity:** `CRITICAL | HIGH | MEDIUM | LOW`' 'severity has exactly its four values'
+require_literal "$REVIEW" '**locality:** `SAME_CONTRACT | INDEPENDENT`' 'locality is independent from confidence and severity'
+require_literal "$REVIEW" '**obligation:** `BLOCKER | REGRESSION_DEBT | NONBLOCKING`' 'obligation has its own axis'
+require_literal "$REVIEW" '**state:** `OPEN | RESOLVED | REPLACED-BY | SPLIT-TO`' 'lifecycle excludes NONBLOCKING'
+require_literal "$REVIEW" 'one stable finding ID when first recorded, including PLAUSIBLE' 'both confidence classes receive stable identity'
+require_literal "$REVIEW" 'never overwrites history or implicitly changes another axis' 'finding transitions are append-only and axes independent'
+require_literal "$REVIEW" '`NONBLOCKING` is an obligation, not a state.' 'NONBLOCKING cannot masquerade as resolution'
+require_literal "$REVIEW" 'Severity and finding count never independently block, resolve, terminate, reject, or cancel' 'count and severity only prioritize'
+
+# Positive locality paths and exhaustive, recursively non-discharging successors.
+require_literal "$REVIEW" 'caused by the claimed implementation or any repair' 'causal lineage makes repair residuals same-contract'
+require_literal "$REVIEW" 'repair-caused cross-subsystem' 'file locality cannot detach a causal blocker'
+require_literal "$REVIEW" '`SAME_CONTRACT` describes obligation, not implementation ownership.' 'same-contract work may transfer to a child'
+require_literal "$REVIEW" 'by a child through `SPLIT-TO`' 'same-contract transfer has a positive child path'
+require_literal "$REVIEW" '`INDEPENDENT` requires evidence that the concern is causally separable' 'independent locality has a positive evidence path'
+require_literal "$REVIEW" 'Independent findings do not use' 'independent follow-ups stay outside split obligations'
+require_literal "$REVIEW" 'Both are' 'replacement and split share non-discharging semantics'
+require_literal "$REVIEW" 'recursively unresolved until every successor leaf is' 'successor graph resolves transitively'
+require_literal "$REVIEW" 'reject missing or cyclic references' 'successor graph rejects broken lineage'
+require_literal "$REVIEW" 'each gate must be directly proven at current main or mapped exactly once' 'completion partitions all original gates exhaustively'
+require_literal "$REVIEW" 'Reject omitted, duplicated, unclaimed, cyclic, or' 'invalid gate partitions cannot complete'
+require_literal "$CLAIMS" 'Never narrow the parent first' 'split transfer has no unowned interval'
+require_literal "$CLAIMS" 'Never claim children after narrowing' 'split transfer ordering is collision-free'
+require_literal "$CLAIMS" 'event: scope-revise' 'claim scope revision is append-only and explicit'
+
+# Bounded repair, safe prototypes, reviewer fallback, and finite verdicts.
+require_literal "$REVIEW" 'same stable blocker survives two competent repair attempts' 'stalled repair has a deterministic trigger'
+require_literal "$REVIEW" 'exactly one bounded independent diagnosis or safe reviewer prototype' 'stalled repair receives one bounded fallback'
+require_literal "$REVIEW" 'immutable strategy revision or perform the executable split' 'fallback changes representation'
+require_literal "$REVIEW" 'genuinely `BLOCKED_EXTERNAL`' 'failed fallback remains honestly open'
+require_literal "$REVIEW" 'Six implementation rounds in one epoch force the same representation change' 'six rounds trigger recontract or split, not cancellation'
+require_literal "$REVIEW" 'disposable isolated worktree' 'reviewer prototypes are isolated'
+require_literal "$REVIEW" 'excludes pushes, credentials, undeclared' 'prototype authority excludes push, credentials, and external effects'
+require_literal "$REVIEW" 'merge, cherry-pick, and mutation of the implementation worktree' 'prototype work never mutates or integrates into the frozen branch'
+require_literal "$REVIEW" 'one bounded replacement attempt' 'unavailable-reviewer fallback is bounded'
+require_literal "$REVIEW" 'There are exactly two final review verdicts:' 'final verdict set is closed'
+require_literal "$REVIEW" '**SAFE TO MERGE**' 'safe integration has a final verdict'
+require_literal "$REVIEW" '**ESCALATE WITH EXECUTABLE REPAIR/SPLIT**' 'unfinished repair has an executable escalation verdict'
+require_literal "$REVIEW" '`REPAIR IN PROGRESS` is a nonfinal status.' 'repair cannot be mistaken for a terminal verdict'
+require_literal "$REVIEW" '`MERGE WITH FIXES` and `DO NOT MERGE` are not' 'ambiguous legacy verdicts are forbidden'
+require_literal "$REVIEW" 'one fresh clean exact-tip pass finds no new blocking obligation' 'clean confirmation terminates review finitely'
+reject_literal "$REVIEW" 'strictly better on both counts' 'raw trend comparison must not stop review'
+reject_literal "$REVIEW" 'round N of at most 3' 'fixed review cap must not reject work'
+reject_literal "$REVIEW" 'verdict — SAFE TO MERGE, MERGE WITH FIXES' 'MERGE WITH FIXES must not remain a final option'
+
+# Readiness is a separate, authorized, observable lifecycle.
+require_literal "$READINESS" 'orthogonal to candidate correction' 'readiness stays separate from candidate findings'
+for state in DRAFT NEEDS_SPECIFICATION READY IN_PROGRESS REPAIR_IN_PROGRESS READY_TO_MERGE COMPLETE BLOCKED_EXTERNAL INFEASIBLE DECLINED SUPERSEDED; do
+    require_literal "$READINESS" "\`$state\`" "readiness state $state is defined"
+done
+require_literal "$READINESS" 'No production claim or production implementation branch is permitted.' 'underspecified work cannot acquire production authority'
+require_literal "$READINESS" 'exact missing decision, concrete question, decision owner' 'discovery names the decision and its owner'
+require_literal "$READINESS" 'Only `READY` work may acquire a production claim or branch.' 'READY gates production ownership'
+require_literal "$READINESS" 'It is progress, never rejection' 'repair status cannot become issue disposition'
+require_literal "$READINESS" 'exact resumption condition' 'external blockers are resumable'
+require_literal "$READINESS" 'age never implies abandonment or infeasibility' 'blocked work does not expire by age'
+require_literal "$READINESS" 'Agent or implementation failure is insufficient.' 'agent failure cannot prove infeasibility'
+require_literal "$READINESS" 'Only the contract owner may authorize this state.' 'declining an outcome requires owner authority'
+require_literal "$READINESS" 'A proposed rewrite is insufficient.' 'supersession requires real replacements'
+require_literal "$READINESS" '<!-- finch-issue-readiness:v1' 'readiness has a machine-readable append-only event'
+require_literal "$READINESS" 'Invalid transition' 'invalid readiness transitions are diagnostics'
+require_literal "$READINESS" '`finch-work-claim:v1` remains the' 'readiness evidence never grants mutation authority'
+
+# Completion is merged current-main behavior, not merely a review result.
+require_literal "$READINESS" 'Current-main merge; every original gate including transferred successors satisfied' 'COMPLETE includes transitive current-main gates'
+require_literal "$READINESS" 'valid claim terminal event' 'COMPLETE accounts for ownership'
+require_literal "$READINESS" 'user-visible proof' 'COMPLETE proves the observable outcome'
+require_literal "$READINESS" 'frontier recomputation' 'COMPLETE continues queue draining'
+require_literal "$REVIEW" 'After merge,' 'completion requires post-merge evidence'
+require_literal "$REVIEW" 'tree is equivalent to the reviewed tip' 'documentation artifacts require tree-equivalence proof'
+
+# Executable hostile cases demonstrate the normative decisions, not just vocabulary.
+classify_locality() {
+    caused=$1
+    gate_required=$2
+    if [ "$caused" = yes ] || [ "$gate_required" = yes ]; then
+        printf '%s\n' SAME_CONTRACT
+    else
+        printf '%s\n' INDEPENDENT
+    fi
+}
+
+[ "$(classify_locality yes no)" = SAME_CONTRACT ] || fail "$REVIEW: a repair-caused cross-subsystem finding escaped the parent contract"
+[ "$(classify_locality no yes)" = SAME_CONTRACT ] || fail "$REVIEW: an acceptance-gate finding escaped the parent contract"
+[ "$(classify_locality no no)" = INDEPENDENT ] || fail "$REVIEW: a causally separable follow-up polluted the parent ledger"
+
+finding_blocks() {
+    confidence=$1
+    locality=$2
+    obligation=$3
+    lifecycle=$4
+    [ "$confidence" = CONFIRMED ] &&
+        [ "$locality" = SAME_CONTRACT ] &&
+        { [ "$obligation" = BLOCKER ] || [ "$obligation" = REGRESSION_DEBT ]; } &&
+        [ "$lifecycle" != RESOLVED ]
+}
+
+finding_blocks CONFIRMED SAME_CONTRACT BLOCKER OPEN || fail "$REVIEW: an open confirmed same-contract blocker did not block"
+finding_blocks CONFIRMED SAME_CONTRACT REGRESSION_DEBT OPEN || fail "$REVIEW: required regression debt did not block"
+if finding_blocks PLAUSIBLE SAME_CONTRACT BLOCKER OPEN; then fail "$REVIEW: confidence axis alone promoted PLAUSIBLE to verified blocker"; fi
+if finding_blocks CONFIRMED INDEPENDENT NONBLOCKING OPEN; then fail "$REVIEW: independent follow-up entered the parent completion ledger"; fi
+# Severity is intentionally absent from finding_blocks: changing it cannot discharge an obligation.
+for severity in CRITICAL HIGH MEDIUM LOW; do
+    finding_blocks CONFIRMED SAME_CONTRACT BLOCKER OPEN || fail "$REVIEW: severity $severity changed blocker lifecycle"
+done
+
+review_action() {
+    unresolved=$1
+    clean_pass=$2
+    # Prior/current counts and worst severities are observations, not inputs.
+    if [ "$unresolved" -gt 0 ]; then printf '%s\n' REPAIR; return; fi
+    if [ "$clean_pass" = yes ]; then printf '%s\n' SAFE_TO_MERGE; return; fi
+    printf '%s\n' CLEAN_PASS
+}
+
+[ "$(review_action 2 no 7 12 HIGH HIGH)" = REPAIR ] || fail "$REVIEW: rising finding count auto-cancelled a repairable candidate"
+[ "$(review_action 0 no 9 0 CRITICAL LOW)" = CLEAN_PASS ] || fail "$REVIEW: zero ledger skipped the required fresh clean pass"
+[ "$(review_action 0 yes 9 0 CRITICAL LOW)" = SAFE_TO_MERGE ] || fail "$REVIEW: fresh clean exact-tip pass failed to terminate review"
+
+prototype_action_allowed() {
+    case "$1" in
+        inspect|disposable-edit|deterministic-test) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+for forbidden_action in frozen-edit push credentials external-effect merge cherry-pick; do
+    if prototype_action_allowed "$forbidden_action"; then fail "$REVIEW: reviewer prototype improperly permits $forbidden_action"; fi
+done
+
+readiness_transition_allowed() {
+    from=$1
+    to=$2
+    evidence=$3
+    case "$from:$to:$evidence" in
+        DRAFT:NEEDS_SPECIFICATION:discovery|NEEDS_SPECIFICATION:READY:approved-contract|READY:IN_PROGRESS:valid-claim) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if readiness_transition_allowed NEEDS_SPECIFICATION IN_PROGRESS branch-only; then fail "$READINESS: production began before READY contract approval"; fi
+readiness_transition_allowed NEEDS_SPECIFICATION READY approved-contract || fail "$READINESS: approved specification could not become READY"
+readiness_transition_allowed READY IN_PROGRESS valid-claim || fail "$READINESS: READY work with a valid claim could not begin"
+
+# Fixture format is "node:state:successors". Only RESOLVED leaves discharge; all
+# REPLACED-BY/SPLIT-TO sources remain unresolved until every transitive leaf resolves.
+graph_complete() {
+    fixture=$1
+    awk -F: '
+        { state[$1]=$2; nexts[$1]=$3; seen_node[$1]=1 }
+        function visit(n,    count,a,i) {
+            if (!seen_node[n] || visiting[n]) return 0
+            if (state[n] == "RESOLVED") return nexts[n] == ""
+            if (state[n] != "REPLACED-BY" && state[n] != "SPLIT-TO") return 0
+            if (nexts[n] == "") return 0
+            visiting[n]=1
+            count=split(nexts[n],a,",")
+            for (i=1;i<=count;i++) if (!visit(a[i])) { visiting[n]=0; return 0 }
+            visiting[n]=0
+            return 1
+        }
+        END { exit visit("root") ? 0 : 1 }
+    ' "$fixture"
+}
+
+fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/finch-review-protocol.XXXXXX")
+trap 'rm -rf "$fixture_dir"' EXIT HUP INT TERM
+printf '%s\n' 'root:SPLIT-TO:child' 'child:OPEN:' >"$fixture_dir/open"
+printf '%s\n' 'root:REPLACED-BY:a,b' 'a:RESOLVED:' 'b:SPLIT-TO:c' 'c:RESOLVED:' >"$fixture_dir/resolved"
+printf '%s\n' 'root:REPLACED-BY:missing' >"$fixture_dir/missing"
+printf '%s\n' 'root:SPLIT-TO:a' 'a:REPLACED-BY:root' >"$fixture_dir/cycle"
+
+if graph_complete "$fixture_dir/open"; then fail "$REVIEW: SPLIT-TO incorrectly discharged an open child"; fi
+graph_complete "$fixture_dir/resolved" || fail "$REVIEW: fully resolved transitive successors did not discharge the source"
+if graph_complete "$fixture_dir/missing"; then fail "$REVIEW: missing successor reference incorrectly completed"; fi
+if graph_complete "$fixture_dir/cycle"; then fail "$REVIEW: cyclic successor graph incorrectly completed"; fi
+
+completion_allowed() {
+    [ "$1" = merged-current-main ] &&
+        [ "$2" = all-successors-resolved ] &&
+        [ "$3" = issue-closed ] &&
+        [ "$4" = claim-terminal ] &&
+        [ "$5" = artifact-identified ] &&
+        [ "$6" = user-visible-proof ] &&
+        [ "$7" = cleanup-safe ] &&
+        [ "$8" = frontier-recomputed ]
+}
+
+completion_allowed merged-current-main all-successors-resolved issue-closed claim-terminal artifact-identified user-visible-proof cleanup-safe frontier-recomputed || fail "$READINESS: complete current-main evidence did not reach COMPLETE"
+if completion_allowed reviewed-tip all-successors-resolved issue-closed claim-terminal artifact-identified user-visible-proof cleanup-safe frontier-recomputed; then fail "$READINESS: an unmerged reviewed tip incorrectly reached COMPLETE"; fi
+if completion_allowed merged-current-main child-open issue-closed claim-terminal artifact-identified user-visible-proof cleanup-safe frontier-recomputed; then fail "$READINESS: an open inherited child obligation incorrectly reached COMPLETE"; fi
+
+printf 'PASS: Finch IMPCD and issue-readiness workflow contract holds under %s\n' "$ROOT"

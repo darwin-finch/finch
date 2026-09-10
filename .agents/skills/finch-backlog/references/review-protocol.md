@@ -1,210 +1,199 @@
 # Finch review protocol
 
-Use this whenever the skill requires independent review: first for the solution contract
-of nontrivial or risky work, then for the exact implementation tip of security,
-authority, persistence, provider protocol, credential, destructive, or concurrency
-changes.
+Review is iterative multi-perspective correction (IMPCD): the immutable reviewed solution
+contract is the target; a frozen implementation tip is an approximation; independently
+verified findings estimate residual error; reviewers return the smallest credible
+correction vector and deterministic proof; implementers reproduce coherent corrections;
+and the next exact-tip review measures the new approximation. Review is not an outcome and
+severity is not a rejection switch.
 
-The method is iterative and multi-perspective: several reviewers each examine the change from one named angle, a separate pass checks each of their findings before it counts, and the whole thing repeats against the fixed code until a pass turns up nothing new. It adapts the plan-critique loop of #22 to code review; nothing below assumes you have read that issue.
+Use this protocol for every solution contract and for exact-tip implementation review.
+An obvious isolated fix uses one fresh independent plan reviewer. Derive an expanded panel
+for broader or riskier work. See [solution contracts](solution-contract.md) and
+[issue readiness](issue-readiness.md).
 
-A single unverified pass produces confident nonsense. The properties that make review
-mean something are **a reviewed solution boundary**, **adversarial verification of every
-finding**, and **an explicit unresolved-blocker model**.
+The **claim base** is the immutable full SHA in the approved contract and work claim. It
+anchors historical diff and fail-before evidence. The **integration base** is current
+`main` used for the candidate that will merge. Record both; rebasing never rewrites the
+claim base. The **exact tip** is always a full commit SHA, never a moving branch name.
 
-Throughout, the *exact tip* means the full 40-character SHA of the commit under review, never a branch name. A branch moves; a review names a commit.
+## 1. Review the solution before production edits
 
-## 0. Review the solution before code
+After a valid claim and before editing production files, verify the contract identity,
+approval, and required content. Give each selected plan perspective a fresh reviewer:
 
-After the work claim and before production edits, record the solution contract required
-by the backlog skill. For an obvious local change this can be compact, but it must still
-name the failure boundary, outcome, invariants, proposed files, regression, and
-integration proof. Nontrivial, risky, cross-subsystem, or broad work gets independent
-fresh reviewers selected from:
+- **Correctness:** the behavior resolves the reproduction and gates.
+- **Architecture and scope:** ownership/API/file boundaries are coherent and narrow.
+- **Lifecycle, authority, and persistence:** cancellation, restart, identity, permission,
+  concurrency, or durable transitions cannot invalidate the plan.
+- **Testability:** regression fails on the claim base and current-main integration is
+  demonstrable at the real boundary.
 
-- **Correctness:** will the proposed behavior actually resolve the reproduction?
-- **Architecture and scope:** does ownership belong here, and is the API/file boundary narrow?
-- **Lifecycle, authority, and persistence:** can cancellation, restart, identity, permission,
-  or durable-state transitions invalidate the design?
-- **Testability:** can the regression fail on the claimed base and can integration be proved
-  through the real boundary?
+Every plan finding names a concrete failure or architectural contradiction and a smallest
+credible correction. Resolve confirmed design blockers and record immutable `APPROVE`
+before edits. A scope-changing discovery stops edits and requires collision recheck,
+immutable contract revision and approval, then append-only claim-scope revision.
 
-A plan finding must name a concrete failure scenario or architectural contradiction.
-Resolve confirmed design blockers in the contract before implementation. Reviewers may
-request a narrower contract or already-defined child slices; they do not turn speculative
-concerns into implementation requirements. If implementation reveals that the boundary
-is wrong, stop editing, revise the contract, repeat the claim check when scope changes,
-and review the revised plan before continuing.
+## 2. Derive implementation perspectives from the diff
 
-## 1. Derive the panel from the diff
-
-The panel is the set of perspectives reviewed in one round, one reviewer per perspective.
-
-Produce the diff before choosing anything:
-
-```sh
-git diff <base>...<tip>
-```
-
-where `<base>` is the `base` SHA recorded in the change's work claim and `<tip>` is the exact tip. Do not run a fixed checklist. Walk the table once and include every row whose condition the diff actually matches; when a row is arguable, include it. A perspective with nothing to examine is noise that dilutes the findings that matter.
+Review `git diff <claim-base>...<exact-tip>` and include every matching row. Recompute
+after each repair because the panel is not inherited. Record every selected perspective
+and why every skipped perspective does not apply.
 
 | Perspective | Include when the diff contains |
 |---|---|
 | Correctness | any behavioral change |
 | Concurrency and timing | shared state, locks, async tasks, cancellation, retries, process lifecycle |
 | Persistence and format | on-disk layout, schema, serialization, migration, retention |
-| Authority and permission | capability checks, credentials, tool gating, peer or remote surfaces |
-| Resource and lifecycle | file descriptors, processes, memory growth, unbounded accumulation |
-| Compatibility | public API, wire protocol, config surface, anything another agent's branch consumes |
-| Test quality | always — including whether the regression genuinely fails on the base revision |
+| Authority and permission | capabilities, credentials, tool gating, peer or remote surfaces |
+| Resource and lifecycle | descriptors, processes, memory growth, unbounded accumulation |
+| Compatibility | public API, protocol, config, or another branch's consumed surface |
+| Test quality | always, including fail-before evidence on the claim base |
 
-Record the selected perspectives, and each skipped one with a line naming what the diff does not contain, in the round record of section 5. A skipped perspective with a stated reason is evidence; an unexamined one is a gap.
+## 3. Review independently and safely
 
-## 2. Review perspectives independently
+Each perspective gets its own fresh context and complete [task packet](task-packet.md).
+Reviewers do not see one another's findings before discovery completes. They verify the
+exact tip exists and keep the implementation branch/worktree frozen and read-only for the
+whole round. They must not edit, commit, push, merge, or cherry-pick there.
 
-Give each selected perspective its own agent with its own context and a complete [task packet](task-packet.md). The packet names the single perspective that agent owns, the exact tip, the base SHA and the diff command above, and states that the agent must not edit, commit, or push.
+A reviewer may prototype only at the frozen exact tip in a disposable isolated worktree
+and disposable branch. Prototype authority excludes pushes, credentials, undeclared
+external effects, merge, cherry-pick, and mutation of the implementation worktree. Delete
+or abandon the disposable prototype after retaining only its finding ID, minimal sketch,
+affected invariant, deterministic command/result, and contract fit. The implementer must
+reproduce the correction on the unfrozen implementation branch; prototype commits are
+never integrated directly.
 
-Do not let one perspective see another's findings before reporting, and do not pass along the implementer's framing of what is risky. The implementer's own list of concerns may be supplied as *additional* items to check, never as the scope.
+If an assigned independent reviewer is unavailable, make one bounded replacement attempt
+with a fresh reviewer holding the same packet and perspective. Never substitute author
+self-review or omit a required perspective. If the replacement or separate verifier is
+also unavailable, record the attempts, exact missing evidence, resumption condition, and
+nearest independent work; transition the outcome to `BLOCKED_EXTERNAL` and keep the issue,
+pull request, claim evidence, and ledger open.
 
-A reviewer inspects a frozen commit: nothing is pushed to the branch between the start of a round and its end. A review of "the branch" is not a review of anything specific.
+## 4. Verify findings and maintain stable identity
 
-Each reviewer returns a list of findings. A finding names the file and the function or
-line it concerns, what goes wrong there, the perspective that raised it, and the smallest
-credible repair that preserves the reviewed solution contract. When the repair cannot
-fit that contract, the reviewer names the independently testable child slice and the
-current change that can be removed or narrowed. Reviewers remain read-only against the
-frozen branch so the reviewed identity stays meaningful, but they may build and test a
-candidate patch in disposable work and return that patch or design sketch to the
-implementer. Finding defects without helping drive them to resolution is incomplete
-review work.
+Discovery and verification are separate passes. A verifier who did not originate the
+finding tries to disprove its concrete input/state/interleaving-to-wrong-outcome scenario.
+Every concern receives one stable finding ID when first recorded, including PLAUSIBLE
+concerns. Each append-only event for that ID carries five independent axes:
 
-## 3. Verify and classify every finding adversarially
+- **confidence:** `CONFIRMED | PLAUSIBLE`;
+- **severity:** `CRITICAL | HIGH | MEDIUM | LOW`;
+- **locality:** `SAME_CONTRACT | INDEPENDENT`;
+- **obligation:** `BLOCKER | REGRESSION_DEBT | NONBLOCKING`;
+- **state:** `OPEN | RESOLVED | REPLACED-BY | SPLIT-TO`.
 
-No finding is reported on suspicion alone. Each one must carry a concrete failure scenario: specific inputs, state, or interleaving, leading to a specific wrong outcome.
+Changing confidence, severity, locality, obligation, or state appends an event under the
+same finding ID. It never overwrites history or implicitly changes another axis.
+`NONBLOCKING` is an obligation, not a state. A confirmed failure of an approved gate may
+not be `NONBLOCKING`. `PLAUSIBLE` records the verifier's counterargument and cannot block
+on confidence alone; `CONFIRMED` records the verified scenario and proof.
 
-Verification is a separate pass from discovery, run by an agent that did not produce the finding. Asking the finder to justify its own finding reproduces its original reasoning. *Adversarially* means the verifier's job is to make the finding false — to find the guard, the caller that cannot supply that input, the lock already held. What survives the attempt is what gets reported.
+Severity estimates impact only and orders repair/escalation priority:
 
-Every finding first leaves this pass carrying exactly one of two verification labels:
+- `CRITICAL`: security, privacy, authority, credentials, unrecoverable data loss, or
+  equivalent catastrophic failure;
+- `HIGH`: material user-visible correctness, durability, compatibility, or lifecycle;
+- `MEDIUM`: bounded correctness, recovery, portability, or required-regression failure;
+- `LOW`: diagnostics, maintainability, or test clarity without a current wrong outcome.
 
-- **CONFIRMED** — the verifier traced the code path at the exact tip and can state the failure concretely.
-- **PLAUSIBLE** — the concern is real but the scenario is unproven, including when the verifier's counter-argument is itself unproven.
+Severity and finding count never independently block, resolve, terminate, reject, or cancel
+an outcome. Confidence says whether evidence verifies the scenario; obligation says whether
+the contract must discharge it; lifecycle state records its append-only progress.
 
-Downgrade rather than discard, and record the verifier's counter-argument next to anything downgraded. A PLAUSIBLE finding is a question for the author, not a defect, and must not block a merge on its own.
+## 5. Classify locality, obligation, and successors
 
-Then classify every CONFIRMED finding by effect:
+Causal lineage and approved acceptance gates take precedence over changed-file or
+subsystem location. A finding caused by the claimed implementation or any repair, or
+required for a parent gate, is `SAME_CONTRACT`, including a repair-caused cross-subsystem
+finding. If it exceeds the current branch scope, revise the immutable contract and claim or
+transfer it to a separately claimed child; never relabel it independent to unblock a merge.
 
-- **Production blocker:** a concrete wrong outcome in the declared solution boundary,
-  including security, data, lifecycle, compatibility, or user-visible integration failure.
-- **Regression-strengthening debt:** production behavior is correct, but a declared
-  invariant lacks a deterministic regression or an existing regression does not exercise
-  its promised equivalence class. This blocks only while the invariant remains unprotected
-  under `AGENTS.md`.
-- **Nonblocking follow-up:** useful hardening, cleanup, or a different concern that is not
-  required for the declared outcome and does not invalidate it. Create or link an issue
-  when it is actionable; do not expand the current change implicitly.
+`SAME_CONTRACT` describes obligation, not implementation ownership. It may be implemented
+by a child through `SPLIT-TO` while remaining in the parent's completion ledger.
+`INDEPENDENT` requires evidence that the concern is causally separable and every approved
+parent gate stands without it. Record an actionable independent concern as a durable
+`NONBLOCKING` follow-up with its own issue/owner. Independent findings do not use
+`SPLIT-TO`, because they transfer no parent obligation.
 
-Record PLAUSIBLE concerns separately as nonblocking questions. Only unresolved confirmed
-production blockers and regression debt protecting declared invariants decide final
-convergence.
+Only an independently verified `RESOLVED` event with current-main proof discharges an
+obligation. `REPLACED-BY` names one or more successor finding IDs and transfers all source
+obligation/evidence. `SPLIT-TO` names one or more already-created child issue and claim IDs,
+maps every inherited gate and proof, and transfers implementation ownership. Both are
+non-discharging: the source remains recursively unresolved until every successor leaf is
+independently `RESOLVED` on current main. Follow replacement, return, and nested split
+chains transitively; reject missing or cyclic references.
 
-## 4. Iterate to convergence
+Before a split event, create and link disjoint child issues, allocate every original gate
+exactly once, preserve or transfer valuable commits, establish collision-free claims and
+worktrees for every child, and start the immediate next slice. Only then append `SPLIT-TO`
+and any parent claim-scope revision. The collision-free order is: repository-wide claim
+check; immutable child contracts/approvals; child claim events and collision recheck;
+gate/proof mapping; parent finding transition; parent scope-revision event. A proposed
+future split or closed pull request is not executable.
 
-A **round** is one complete pass of sections 1 through 3 against a single frozen commit. Concretely, a round:
+Completion performs an exhaustive partition of every original acceptance gate: each gate must be directly proven at current main or mapped exactly once through a valid successor
+chain whose leaves are proven there. Reject omitted, duplicated, unclaimed, cyclic, or
+unresolved leaves. Independent follow-ups remain outside this parent partition.
 
-1. **starts** when the coordinator names the exact tip to review and the branch is frozen — no pushes until the round ends;
-2. **re-derives the panel** from the diff at that tip. A fix can add code that earns a perspective the previous round skipped, so the panel is recomputed each round and never inherited;
-3. **runs each selected perspective** in its own context per section 2, producing one findings list per perspective;
-4. **verifies** every finding in the separate pass of section 3, labeling each CONFIRMED or PLAUSIBLE;
-5. **ends** once every selected perspective's findings have been verified and collected. Its artifact is the **round record**: the exact tip, the perspectives selected and skipped, and every finding with its label and failure scenario.
+## 6. Run bounded repair epochs
 
-Between rounds the implementer fixes confirmed blockers and required regression debt
-inside the reviewed contract, then pushes; the resulting exact tip is the subject of the
-next round. Nonblocking follow-ups do not silently widen the patch. A review of the
-previous tip says nothing about the current one.
+A round starts by freezing and naming the exact tip and ends only after all selected
+perspectives report, separate verification completes, and an append-only round record and
+ledger events exist. Each finding carries its stable ID, five axes, scenario, owning
+concern, first round, correction vector, regression proof, and disposition.
 
-A finding is **new** in a round when no earlier round record of this review already holds it — same code location, same failure. Restating a known finding, or re-confirming that a fixed one is fixed, is not new.
+The implementer applies confirmed same-contract `BLOCKER` corrections and required
+`REGRESSION_DEBT`; reviewers do not. `NONBLOCKING` work does not silently widen the patch.
+Rising counts, unchanged worst severity, a vague concern decomposing into several precise
+ones, and defects revealed on repaired lines are evidence to classify and prioritize—not
+automatic stop conditions.
 
-**Converged** means the exact-tip blocker ledger is empty: the round confirms every
-earlier blocker is resolved and contains no new confirmed production blocker or required
-regression debt. Convergence takes at least two rounds; one round is a smoke test. If the
-first round produces no blocking findings, and so no fixes, run the second round at the
-same tip with freshly instantiated reviewers, so that it is an independent sample rather
-than a replay.
+When the same stable blocker survives two competent repair attempts, end that repair
+epoch and run exactly one bounded independent diagnosis or safe reviewer prototype. Then
+publish and approve an immutable strategy revision or perform the executable split above.
+If the fallback fails, cannot run, or requires missing authority, report the exact blocker
+and resumption condition as genuinely `BLOCKED_EXTERNAL`; keep the outcome and evidence
+open. Never cancel, reject, close, or waive the blocker.
 
-Maintain an **unresolved-blocker ledger** across rounds. It names each unresolved
-production blocker or regression debt item, its concrete scenario, owning concern, first
-round, attempted repair, and current disposition. Continue repairs while that ledger is
-shrinking and the reviewed solution boundary remains sound. A same-severity remaining
-blocker, a larger raw finding count from a deeper probe, or findings on newly repaired
-lines do not by themselves stop useful work.
+Six implementation rounds in one epoch force the same representation change: bounded
+diagnosis followed by immutable recontract or executable split. Six is not a merge cap,
+`DO NOT MERGE` trigger, cancellation rule, or permission to waive findings.
 
-Use locality and causality to decide repair versus split:
+Review converges when all transitive same-contract `BLOCKER` and required
+`REGRESSION_DEBT` leaves are independently resolved on the current integration base, then
+one fresh clean exact-tip pass finds no new blocking obligation. This clean pass is the
+finite endpoint; do not repeat it indefinitely. If the first implementation pass is clean,
+one fresh independent second pass at the same tip supplies this confirmation.
 
-- A finding caused by the original implementation or by lines changed to repair it is
-  normal iteration. Keep it in the current repair ledger.
-- A finding that introduces a new concern, subsystem, owner, or independently testable
-  outcome belongs in a child slice. Narrow the current contract rather than smuggling the
-  second project into the fix.
-- A finding that proves the selected ownership or API cannot satisfy the outcome
-  invalidates the solution contract. Return to section 0 before more code.
+## 7. Record the round and verdict
 
-Escalate after repeated rounds that do not reduce unresolved blockers, when the
-architecture is invalidated, or at six rounds. Six rounds is a backstop for coordinator
-intervention, not an automatic cancellation: if a sound repair or executable split is
-already progressing, continue that concrete path under updated contracts and claims.
+One append-only pull-request comment per round records exact tip; claim and integration
+bases; selected/skipped perspectives; every finding ID and five axes; scenario and
+verification; correction vector; successor links; transitive unresolved ledger; and
+whether repair, recontract, split, or fallback is underway.
 
-A split is executable only after the coordinator has created and linked child issues with
-disjoint acceptance gates, preserved or transferred valuable commits, established valid
-claims and worktrees for the replacement work, and continued the immediate next slice.
-Do not close the original pull request merely to describe a future split. “Reviewed and
-closed” is not a valid terminal outcome.
+There are exactly two final review verdicts:
 
-Mutation review is bounded by the named invariants and relevant equivalence classes in
-the solution contract. Every mutant must state which invariant it challenges and why its
-class is distinct. Arbitrary mutant counts, blind input enumeration, and demands for
-exhaustive sampling are not evidence of better coverage.
+- **SAFE TO MERGE** — convergence and every merge gate are satisfied at the exact tip.
+- **ESCALATE WITH EXECUTABLE REPAIR/SPLIT** — a concrete correction, recontract, or already
+  executable split continues, or the exact external blocker/resumption condition is open.
 
-Reviewers are adversarial collaborators, not rejection gates. For each confirmed blocker
-they recommend a concrete repair, deletion, narrowing, or executable split and identify
-the regression that would prove it. The coordinator assigns those repairs and keeps the
-ledger moving toward zero. A reviewer may supply a tested candidate diff from disposable
-work, but the implementer applies it to the unfrozen branch so authorship, scope, and
-exact-tip review remain explicit.
+`REPAIR IN PROGRESS` is a nonfinal status. `MERGE WITH FIXES` and `DO NOT MERGE` are not
+final verdicts. Review never terminalizes an issue or claim.
 
-Final convergence still requires at least two independent rounds in the review, a final
-round against the exact tip being integrated, and zero unresolved confirmed production
-blockers at that tip. Regression-strengthening debt blocks only when it leaves a declared
-invariant unprotected under `AGENTS.md`. If the first round has no blocking findings, run
-a fresh independent second round at the same tip.
+Before `SAFE TO MERGE`, integrate onto current `main`, record the integration-base SHA,
+rerun affected gates, independently review that exact tip, and exercise the actual binary,
+generated artifact, deployed process, or documentation tree as applicable. After merge,
+synchronize current main and prove the merged artifact was rebuilt from the merge commit
+or that its tree is equivalent to the reviewed tip; then demonstrate the user-visible
+outcome. Only this post-merge current-main identity proof can support issue completion.
 
-## 5. Record the outcome where it can be checked
+## Reviewer constraints
 
-Post one pull request comment per round, carrying that round's record:
-
-- the exact commit reviewed and the round number as `round N`;
-- the perspectives selected, and each skipped one with its reason;
-- every CONFIRMED finding with its failure scenario, classification, owning concern,
-  and resolution once a later round confirms the fix;
-- every PLAUSIBLE finding, explicitly left open;
-- the unresolved-blocker ledger and whether it shrank, plus any repair, contract revision,
-  or executable split underway;
-- on the final round only: whether the review converged or escalated, and the verdict —
-  SAFE TO MERGE, MERGE WITH FIXES, or ESCALATE WITH EXECUTABLE REPAIR/SPLIT. Review alone
-  never terminalizes the work.
-
-Before a SAFE TO MERGE verdict, rebase on current `main`, run the affected gates there,
-and review the resulting exact tip. Exercise the actual binary, generated artifact, or
-user-visible boundary where relevant, and record its source identity. A successful test
-against an obsolete base or a stale deployed build is not integration evidence.
-
-The workflow succeeds when the reviewed patch merges from current `main`, the claimed
-ticket closes with its evidence, and the observable result matches that merged identity.
-A review verdict, including SAFE TO MERGE, earns no terminal credit until integration and
-ticket closure actually happen.
-
-"Independently reviewed" in a merge comment must point at these comments. Without them the claim is unfalsifiable, which is the failure mode `AGENTS.md` names: configuration or intent is not conformance.
-
-## Constraints on reviewers
-
-- Reviewers run no Cargo command outside `.agents/skills/finch-backlog/scripts/with-cargo-slot`, and generally should not build at all — reading is the work.
-- A reviewer that cannot reach the exact tip commit reports that and stops, rather than reviewing a nearby revision.
-- Findings about work owned by another active `finch-work-claim:v1` claim are reported to the coordinator, not fixed.
+- Run Cargo only through `scripts/with-cargo-slot`; reading normally needs no build.
+- Stop if the exact tip is unavailable instead of reviewing a nearby revision.
+- Report work owned by another active claim; do not fix it.
+- Never access credentials or perform undeclared external effects.

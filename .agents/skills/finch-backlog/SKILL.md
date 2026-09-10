@@ -28,11 +28,29 @@ the missing repository discovery path instead.
 
 If repository state contradicts the issue tracker or user direction, report the evidence and resolve the contradiction before merging.
 
+## Establish issue readiness
+
+Reduce the append-only `finch-issue-readiness:v1` history using
+[the issue-readiness protocol](references/issue-readiness.md). Readiness/feasibility,
+candidate correction, and finding attributes are three orthogonal layers; never use a
+review result or failed implementation as an issue disposition.
+
+Only `READY` work may acquire a production branch or `finch-work-claim:v1` claim. `READY`
+requires the immutable, explicitly approved [solution contract](references/solution-contract.md),
+including its URL/comment ID, digest, revision, implementation base, plan reviewer, and
+approval URL. An obvious isolated fix still uses a complete compact contract and one fresh
+independent plan reviewer; derive an expanded panel from actual risk.
+
+When an issue is not ready, transition it to `NEEDS_SPECIFICATION` and perform only bounded
+read-only investigation or disposable prototyping under a discovery contract. Record the
+missing decision, question, decision owner, nearest minimally specified outcome, and exit
+condition. Do not create a production implementation branch or production claim.
+
 ## Build the ready frontier
 
 1. Translate the goal into explicit acceptance gates: functional, regression, review, dogfood/manual, and release gates.
 2. Build a dependency graph from issue bodies and comments.
-3. Select the highest-priority unblocked issues. Prefer work that closes a dogfood or release gate, enables several dependents, or repairs a reproduced user failure.
+3. Select the highest-priority unblocked `READY` issues. Prefer work that closes a dogfood or release gate, enables several dependents, or repairs a reproduced user failure.
 4. Create smaller issues only for independently testable work needed by an outcome-level parent. Link parent and dependency edges. Do not manufacture speculative busywork.
 5. Assign independent issues in parallel only when their files and semantic ownership do not overlap.
 
@@ -42,7 +60,11 @@ Recompute this frontier after every merge, newly discovered blocker, or changed 
 
 1. Query and parse active `finch-work-claim:v1` events across all open repository issues, including immutable comment metadata and issuer authority, then inspect assignees, open pull requests, branches, worktrees, and running agents before taking an issue. If claim discovery is unavailable, edited, or incomplete, do not mutate; retry or ask the coordinator.
 2. If another active claim overlaps the files or semantic scope, coordinate with that worker or choose another ready issue. Do not create a competing implementation merely because the other worker is a different tool or person.
-3. After creating the dedicated branch/worktree and before editing production files, post exactly one `finch-work-claim:v1` GitHub issue comment using [the work-claim protocol](references/work-claims.md). This versioned comment is the sole authoritative ownership mechanism; do not substitute an assignee, label, project field, branch, draft PR, or unstructured prose.
+3. After verifying the immutable approved contract and `READY` event, create the dedicated
+   production branch/worktree and, before editing production files, post exactly one
+   `finch-work-claim:v1` GitHub issue comment using [the work-claim protocol](references/work-claims.md).
+   This versioned comment is the sole authoritative ownership mechanism; do not substitute
+   a readiness event, assignee, label, project field, branch, draft PR, or prose.
 4. Require the returned issue-comment URL, then repeat the repository-wide claim query and apply the protocol's deterministic collision rule. If the comment cannot be posted or verified, do not begin implementation; ask a coordinator to establish the claim.
 5. Optionally assign the responsible GitHub user for human accountability. Assignment is informational and never establishes or releases ownership.
 6. Repeat the repository-wide authoritative-claim check immediately before widening scope and immediately before merging. Publish the exact append-only, issuer-authorized terminal event when ownership ends so stale claims do not strand work.
@@ -57,9 +79,9 @@ Recompute this frontier after every merge, newly discovered blocker, or changed 
 
 ## Review the solution contract before implementation
 
-After claiming work and before editing production code, write a solution contract. For
-nontrivial, risky, cross-subsystem, or broad work, have fresh reviewers challenge it
-before implementation begins. The contract records:
+Before a production branch or claim, write and approve the immutable solution contract.
+Before editing production code, reverify that exact contract and approval against the
+claim. The contract records:
 
 - the reproduced failure and production boundary;
 - the observable user outcome and explicit non-goals;
@@ -71,10 +93,11 @@ before implementation begins. The contract records:
 
 Select plan-review perspectives from correctness, architecture/scope,
 lifecycle/authority/persistence, and testability as applicable. Resolve every confirmed
-design blocker in the contract before production edits. Obvious local changes may use a
-compact contract in the issue or task packet, but the step is never silently skipped.
-The reviewed contract constrains implementation; widening it requires another claim
-check and review of the changed boundary.
+design blocker and record explicit immutable approval before production edits. Obvious
+local changes use one fresh plan reviewer and a compact contract; the review is never
+skipped. The reviewed contract constrains implementation. Changing the outcome, gates,
+files, authority, API boundary, or proof requires edits to stop, another claim check, a new
+immutable contract revision and approval, then an append-only claim-scope revision.
 
 ## Implement narrowly
 
@@ -94,7 +117,15 @@ For every fix, record the exact commit and exact evidence:
 - source identity when a temporary CI-only commit/workflow is removed;
 - known inherited failures, clearly separated from branch-caused failures.
 
-Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Run it with [the review protocol](references/review-protocol.md): derive the reviewer panel from the diff, review each perspective in its own context, verify every finding against a concrete failure scenario before reporting it, and require each confirmed blocker to carry the smallest credible repair or split direction. Reviewers may develop and test candidate fixes in disposable work, but never mutate the frozen branch; the implementer owns integration. Classify verified findings by whether they block production or strengthen a declared regression invariant, and repair confirmed blockers while the solution boundary remains sound and the unresolved-blocker ledger is shrinking. Use locality and causality to decide whether a finding belongs in the repair or requires an executable child slice. Do not cancel work merely because a later round found the same severity or ran a deeper probe. Freeze the reviewed commit; if production code changes, repeat exact-tip review and affected tests.
+Run implementation review with [the IMPCD review protocol](references/review-protocol.md).
+Derive the panel from the diff and risk, independently verify every finding, preserve its
+stable five-axis identity and append-only successor history, and return a concrete
+correction vector or executable split for each confirmed obligation. Reviewers may test
+only in disposable exact-tip work; they never mutate the frozen implementation worktree,
+and the implementer reproduces corrections. Count and severity prioritize work but never
+cancel it. One fresh clean exact-tip convergence pass after the transitive ledger reaches
+zero is the finite merge endpoint. Freeze the reviewed commit; production changes require
+affected tests and exact-tip review again.
 
 Do not describe compilation, mocks, or configuration as live provider/model conformance. Keep manual or live acceptance issues open until the exact real-world workflow succeeds.
 
@@ -118,7 +149,8 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
    - a failing check unrelated to the change is shown to be unrelated by
      evidence, not assumption — reproduce it on an untouched branch or on
      `main` before discounting it;
-   - the branch is rebased on current `main`, affected gates pass on that base,
+   - the branch is rebased on current `main`, that distinct integration-base SHA is
+     recorded, affected gates pass on that base,
      and the claim check has been repeated immediately beforehand;
    - where the change produces a binary, generated artifact, deployed process,
      or visible interface, the actual result has been exercised and its source
@@ -129,7 +161,10 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
    a gate cannot be run at all, a material product choice is required, or the
    user has not granted necessary authority. "This change feels significant"
    is not a reason to ask.
-2. Synchronize `main` and verify the merge commit.
+2. Synchronize current `main`, verify the merge commit, and prove the resulting artifact
+   was rebuilt from that commit or its tree is equivalent to the reviewed tip. Repeat the
+   user-visible proof against that identity; pre-merge or stale-artifact evidence cannot
+   complete the issue.
 3. Close the claimed GitHub ticket when its acceptance gates are met, recording the
    merge commit, regression, review, current-main CI, actual artifact or user-visible
    evidence where applicable, and a completion event for its work claim. When a claimed
@@ -150,6 +185,12 @@ missing authority. Review, cancellation, a closed pull request, or a preserved b
 not by itself a terminal outcome. If a solution must split, preserve or transfer valuable
 commits and establish the immediate replacement work before closing the superseded pull
 request. Do not leave a queue of review-complete but unintegrated work.
+
+Readiness side states follow the evidence and authority rules in `issue-readiness.md`.
+`BLOCKED_EXTERNAL` remains open with an exact resumption condition; age is not abandonment.
+Agent failure does not prove `INFEASIBLE`; `INFEASIBLE` and `DECLINED` require the contract
+owner's disposition. `SUPERSEDED` requires actual replacement contracts and claims for
+every inherited gate.
 
 Stop for user direction only when continuing requires new authority, a material product choice, credentials/live action the user has not authorized, or an external state change. A hard or slow issue is not itself a blocker.
 

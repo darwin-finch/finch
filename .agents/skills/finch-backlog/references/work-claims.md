@@ -54,9 +54,46 @@ Do not treat age alone as proof that a claim is abandoned. Cross-check the named
 
 Two claims conflict when their promised file sets or semantic authority overlap, even if their issue numbers differ. Two claims on the same parent issue may coexist only when their scopes are independently testable and explicitly disjoint. When overlap is uncertain, treat it as a conflict until the workers or coordinator record disjoint scopes.
 
+## Revise a claim's scope
+
+Never edit a claim event or silently reinterpret its `scope`. A contract revision that
+widens, narrows, or transfers production authority requires an append-only scope event by
+the original claim issuer:
+
+```text
+<!-- finch-work-claim:v1
+event: scope-revise
+claim-id: <the original claim id>
+worker: <the exact worker value from the original claim>
+prior-scope: <the exact currently effective scope>
+new-scope: <single-line bounded replacement scope>
+contract-id: <approved revised contract ID>
+contract-url: <immutable contract comment URL>
+approval-url: <immutable approval comment URL>
+timestamp: <UTC RFC 3339>
+authority-comment: <none or immutable prior authorization URL>
+-->
+```
+
+Verify the revised contract and approval, issuer authority, and exact `prior-scope` before
+accepting the event. A mismatch is invalid and leaves the earlier scope effective. Before
+widening, repeat the repository-wide collision check and establish that no active claim
+overlaps the added files or semantic authority; only then append `scope-revise` and repeat
+the collision check before mutation.
+
+For a same-contract split, use this collision-free order: check all active claims; create
+and approve immutable disjoint child contracts; publish every child claim; repeat the
+repository-wide collision check; map every inherited acceptance gate and proof to exactly
+one child; append the finding's non-discharging `SPLIT-TO` event; then append any parent
+`scope-revise` event. Never narrow the parent first: doing so creates an unowned interval.
+Never claim children after narrowing: doing so permits an ownership collision. Parent and
+children remain open until the recursive successor obligations resolve on current main.
+
 ## End or transfer ownership
 
-Post exactly one terminal event when the work merges, pauses indefinitely, is handed off, or is proven superseded:
+Post exactly one terminal event when the work merges, pauses indefinitely, is handed off,
+or is proven superseded. A same-contract split is not by itself terminal; terminal
+supersession requires already-created replacement claims covering every inherited gate:
 
 ```text
 `<worker>` (<github-actor>) is releasing claim `<claim-id>`: <merged, handed off, blocked, or superseded reason and evidence>.
