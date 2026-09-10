@@ -56,28 +56,6 @@ reject_fixture "fixed review count is rejected" "$FIXED_REVIEW" 'Require three r
 reject_fixture "tool authority is rejected" "$TOOL_AUTH" 'The linter grants READY status.'
 accept_fixture "equivalent advisory wording remains valid" "$TOOL_AUTH" 'People decide readiness; a checker only reports documentation gaps.'
 
-TRACE_FIXTURE='backlog|readiness
-backlog|claim
-backlog|worktree
-backlog|pr
-generic|understand
-generic|implement
-generic|compress
-generic|test
-generic|review
-generic|integrate
-generic|verify
-backlog|terminal
-backlog|frontier'
-instruction_trace() {
-    printf '%s\n' "$TRACE_FIXTURE" | awk -F '|' -v mode="$1" '
-        $1 == "generic" || $1 == mode { output = output separator $2; separator = ">" }
-        END { print output }
-    '
-}
-test "$(instruction_trace direct)" = 'understand>implement>compress>test>review>integrate>verify' && pass "direct instruction trace has no backlog steps" || fail "direct instruction trace is wrong"
-test "$(instruction_trace backlog)" = 'readiness>claim>worktree>pr>understand>implement>compress>test>review>integrate>verify>terminal>frontier' && pass "backlog instruction trace includes coordination wrapper" || fail "backlog instruction trace is wrong"
-
 extract_block() {
     awk -v wanted="$1" '
         /<!-- finch-work-claim:v1/ { number++; active=(number == wanted) }
