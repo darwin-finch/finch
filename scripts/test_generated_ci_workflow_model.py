@@ -315,6 +315,12 @@ class GeneratedCiWorkflowModelTests(unittest.TestCase):
 
     def test_environment_bindings_are_exact_even_with_coordinated_output(self):
         cases = {
+            "cursor bound to token": (
+                {"CONTINUATION_CURSOR": "github.token", "TOKEN": "github.token"},
+                GOLDEN_YAML.replace(
+                    b"${{ inputs.continuation_cursor }}", b"${{ github.token }}", 1
+                ),
+            ),
             "token bound to a secret": (
                 {"CONTINUATION_CURSOR": "inputs.continuation_cursor", "TOKEN": "secrets.ADMIN"},
                 GOLDEN_YAML.replace(b"${{ github.token }}", b"${{ secrets.ADMIN }}"),
@@ -348,20 +354,55 @@ class GeneratedCiWorkflowModelTests(unittest.TestCase):
 
     def test_fixed_heredoc_terminator_and_script_scalars_are_rejected_coordinately(self):
         cases = {
-            "fixed heredoc terminator": (
+            "fixed heredoc terminator first line": (
+                "PYTHON\npass\n",
+                "fixed PYTHON heredoc terminator",
+                b"          PYTHON\n          pass",
+            ),
+            "fixed heredoc terminator middle line": (
                 "print('before')\nPYTHON\nprint('after')\n",
                 "fixed PYTHON heredoc terminator",
                 b"          print('before')\n          PYTHON\n          print('after')",
             ),
-            "GitHub expression": (
-                'print("${{ secrets.ADMIN }}")\n',
+            "fixed heredoc terminator last line": (
+                "pass\nPYTHON\n",
+                "fixed PYTHON heredoc terminator",
+                b"          pass\n          PYTHON",
+            ),
+            "GitHub expression opening delimiter": (
+                '# ${{ without a closing delimiter\npass\n',
                 "forbidden GitHub expression delimiter",
-                b'          print("${{ secrets.ADMIN }}")',
+                b"          # ${{ without a closing delimiter\n          pass",
+            ),
+            "GitHub expression closing delimiter": (
+                "# unmatched }} delimiter\npass\n",
+                "forbidden GitHub expression delimiter",
+                b"          # unmatched }} delimiter\n          pass",
             ),
             "NUL": ("# nul:\x00\npass\n", "U+0000", b"          # nul:\x00\n          pass"),
             "CR": ("# carriage\rreturn\npass\n", "U+000D", b"          # carriage\rreturn\n          pass"),
             "tab": ("\tpass\n", "U+0009", b"          \tpass"),
+            "DEL lower boundary": (
+                "# del:\u007f\npass\n",
+                "U+007F",
+                "          # del:\u007f\n          pass".encode(),
+            ),
+            "C1 lower interior": (
+                "# c1:\u0080\npass\n",
+                "U+0080",
+                "          # c1:\u0080\n          pass".encode(),
+            ),
             "NEL": ("# nel:\u0085\npass\n", "U+0085", "          # nel:\u0085\n          pass".encode()),
+            "C1 narrowed-mutant escape": (
+                "# c1:\u0090\npass\n",
+                "U+0090",
+                "          # c1:\u0090\n          pass".encode(),
+            ),
+            "C1 upper boundary": (
+                "# c1:\u009f\npass\n",
+                "U+009F",
+                "          # c1:\u009f\n          pass".encode(),
+            ),
             "line separator": (
                 "# line:\u2028\npass\n",
                 "U+2028",
@@ -415,6 +456,89 @@ class GeneratedCiWorkflowModelTests(unittest.TestCase):
                 source = canonical_json(changed)
                 with self.assertRaisesRegex(model_module.ContractError, re.escape(diagnostic)):
                     model_module.parse_and_render(source, source_name=f"{context}.json")
+
+    def test_script_rejects_encoding_declarations_that_change_byte_execution(self):
+        body = '# coding: ascii\nprint("café")\n'
+        ast.parse(body, filename="decoded-controller.py", mode="exec")
+        with self.assertRaises(
+            SyntaxError,
+            msg="probe no longer demonstrates decoded-text/UTF-8-byte execution drift",
+        ):
+            compile(body.encode("utf-8"), "executed-controller.py", "exec")
+
+        for context, declared_body in (
+            ("first physical line", body),
+            ("second physical line", "#!/usr/bin/env python3\n" + body),
+        ):
+            with self.subTest(context=context):
+                changed = self.model()
+                changed["workflow"]["script"]["body"] = declared_body
+                with self.assertRaisesRegex(
+                    model_module.ContractError,
+                    "forbidden Python encoding declaration",
+                    msg=f"{context}: model accepted execution semantics different from reviewed text",
+                ):
+                    model_module.render_workflow(changed, source_name=context)
+
+    def test_script_grammar_is_pinned_to_supported_python_3_9(self):
+        body = "match value:\n    case 1:\n        pass\n"
+        ast.parse(body, filename="current-host.py", mode="exec")
+        changed = self.model()
+        changed["workflow"]["script"]["body"] = body
+        with self.assertRaisesRegex(
+            model_module.ContractError,
+            "syntactically valid Python body",
+            msg="model accepted grammar unavailable on Finch's supported Python 3.9 floor",
+        ):
+            model_module.render_workflow(changed, source_name="python-3.9 grammar")
+
+    def test_decoded_object_bounds_precede_encoding_and_diagnostics_stay_bounded(self):
+        probes = []
+
+        oversize_script = self.model()
+        oversize_script["workflow"]["script"]["body"] = "x" * (2 * 1024 * 1024)
+        probes.append(("oversize script", oversize_script, "cannot fit"))
+
+        huge_integer = self.model()
+        huge_integer["workflow"]["timeout_minutes"] = 1 << 40000
+        probes.append(("huge integer", huge_integer, "bit_length=40001"))
+
+        huge_unknown_key = self.model()
+        huge_unknown_key["x" * (2 * 1024 * 1024)] = None
+        probes.append(("huge unknown key", huge_unknown_key, "character_count=2097152"))
+
+        for context, changed, diagnostic in probes:
+            with self.subTest(context=context):
+                with self.assertRaises(model_module.ContractError) as caught:
+                    model_module.render_workflow(changed, source_name=context)
+                message = str(caught.exception)
+                self.assertIn(
+                    diagnostic,
+                    message,
+                    f"{context}: bounded rejection omitted actionable size/type evidence; "
+                    f"diagnostic={message!r}",
+                )
+                self.assertLess(
+                    len(message),
+                    1024,
+                    f"{context}: diagnostic copied hostile input without a bound; "
+                    f"diagnostic_length={len(message)}",
+                )
+
+        valid = self.model()
+        for public_entry, arguments in (
+            (model_module.validate_model, (valid,)),
+            (model_module.render_workflow, (valid,)),
+            (model_module.parse_model, (SOURCE_BYTES,)),
+            (model_module.parse_and_render, (SOURCE_BYTES,)),
+        ):
+            with self.subTest(public_entry=public_entry.__name__):
+                with self.assertRaisesRegex(
+                    model_module.ContractError,
+                    "source_name exceeds",
+                    msg=f"{public_entry.__name__}: unbounded diagnostic label was accepted",
+                ):
+                    public_entry(*arguments, source_name="s" * 257)
 
     def test_timeout_bound_is_validated_with_coordinated_output(self):
         for timeout in (0, 6, True, "5"):

@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from typing import Any
 
 
 MAX_SOURCE_BYTES = 64 * 1024
 MAX_SCRIPT_BYTES = 48 * 1024
 MAX_OUTPUT_BYTES = 128 * 1024
+MAX_SOURCE_NAME_CHARS = 256
+MAX_DIAGNOSTIC_VALUE_CHARS = 80
+_PYTHON_ENCODING_DECLARATION = re.compile(
+    r"^[ \t\f]*#.*?coding[:=][ \t]*[-_.a-zA-Z0-9]+"
+)
 
 WORKFLOW_NAME = "Cancel superseded CI runs"
 JOB_ID = "cancel-superseded"
@@ -36,6 +42,53 @@ ENVIRONMENT = (
 
 class ContractError(ValueError):
     """A workflow-envelope source or model violated the closed contract."""
+
+
+def _bounded_type_name(value: Any) -> str:
+    name = type(value).__name__
+    if len(name) <= MAX_DIAGNOSTIC_VALUE_CHARS:
+        return name
+    return f"{name[:MAX_DIAGNOSTIC_VALUE_CHARS]}...(character_count={len(name)})"
+
+
+def _validate_source_name(value: Any) -> str:
+    if type(value) is not str:
+        raise ContractError(
+            f"source_name must be a string; found {_bounded_type_name(value)}"
+        )
+    if len(value) > MAX_SOURCE_NAME_CHARS:
+        raise ContractError(
+            f"source_name exceeds the {MAX_SOURCE_NAME_CHARS}-character diagnostic bound; "
+            f"found character_count={len(value)}"
+        )
+    return value
+
+
+def _bounded_value_description(value: Any) -> str:
+    """Describe hostile decoded input without formatting it without a bound."""
+
+    if type(value) is str:
+        prefix = value[:MAX_DIAGNOSTIC_VALUE_CHARS]
+        suffix = "..." if len(value) > MAX_DIAGNOSTIC_VALUE_CHARS else ""
+        return (
+            f"string(character_count={len(value)}, "
+            f"prefix={prefix!r}{suffix})"
+        )
+    if type(value) is int:
+        return f"int(bit_length={value.bit_length()})"
+    if type(value) in (bool, type(None)):
+        return repr(value)
+    if type(value) in (bytes, bytearray, list, tuple, dict, set, frozenset):
+        return f"{_bounded_type_name(value)}(item_count={len(value)})"
+    return f"value(type={_bounded_type_name(value)})"
+
+
+def _bounded_key_description(value: Any) -> str:
+    if type(value) is str:
+        if len(value) <= MAX_DIAGNOSTIC_VALUE_CHARS:
+            return value
+        return _bounded_value_description(value)
+    return f"<{_bounded_type_name(value)} key>"
 
 
 def _reject_noninteger_number(value: str) -> None:
@@ -76,13 +129,13 @@ def _first_difference(expected: bytes, actual: bytes) -> tuple[int, int, int]:
 
 def _exact_object(value: Any, expected: set[str], label: str) -> dict[str, Any]:
     if type(value) is not dict:
-        raise ContractError(f"{label} must be an object; found {type(value).__name__}")
+        raise ContractError(f"{label} must be an object; found {_bounded_type_name(value)}")
     missing = sorted(key for key in expected if key not in value)
     unknown: list[str] = []
     for key in value:
         if type(key) is str and key in expected:
             continue
-        unknown.append(key if type(key) is str else f"<{type(key).__name__} key>")
+        unknown.append(_bounded_key_description(key))
         if len(unknown) == 8:
             break
     if len(value) != len(expected) or missing or unknown:
@@ -96,15 +149,19 @@ def _exact_object(value: Any, expected: set[str], label: str) -> dict[str, Any]:
 def _exact_value(value: Any, expected: Any, label: str) -> None:
     if type(value) is not type(expected):
         raise ContractError(
-            f"{label} must be exactly {expected!r}; found value of type {type(value).__name__}"
+            f"{label} must be exactly {expected!r}; "
+            f"found value of type {_bounded_type_name(value)}"
         )
     if value != expected:
-        raise ContractError(f"{label} must be exactly {expected!r}; found {value!r}")
+        raise ContractError(
+            f"{label} must be exactly {expected!r}; "
+            f"found {_bounded_value_description(value)}"
+        )
 
 
 def _exact_string_list(value: Any, expected: tuple[str, ...], label: str) -> None:
     if type(value) is not list:
-        raise ContractError(f"{label} must be a list; found {type(value).__name__}")
+        raise ContractError(f"{label} must be a list; found {_bounded_type_name(value)}")
     if len(value) != len(expected):
         raise ContractError(
             f"{label} must contain exactly {list(expected)!r}; found item_count={len(value)}"
@@ -115,7 +172,12 @@ def _exact_string_list(value: Any, expected: tuple[str, ...], label: str) -> Non
 
 def _validate_script_body(value: Any, label: str) -> str:
     if type(value) is not str:
-        raise ContractError(f"{label} must be a string; found {type(value).__name__}")
+        raise ContractError(f"{label} must be a string; found {_bounded_type_name(value)}")
+    if len(value) > MAX_SCRIPT_BYTES:
+        raise ContractError(
+            f"{label} cannot fit in 1..{MAX_SCRIPT_BYTES} UTF-8 bytes; "
+            f"found character_count={len(value)}"
+        )
     if not value.endswith("\n"):
         raise ContractError(f"{label} must end with exactly one usable LF boundary")
     if "${{" in value or "}}" in value:
@@ -128,6 +190,12 @@ def _validate_script_body(value: Any, label: str) -> str:
         raise ContractError(
             f"{label} must contain 1..{MAX_SCRIPT_BYTES} UTF-8 bytes; found {size}"
         )
+    for line_number, line in enumerate(value.split("\n", 2)[:2], start=1):
+        if _PYTHON_ENCODING_DECLARATION.match(line):
+            raise ContractError(
+                f"{label} contains a forbidden Python encoding declaration "
+                f"on physical line {line_number}; execution is fixed to UTF-8"
+            )
     for character in value:
         codepoint = ord(character)
         if character == "\n":
@@ -145,7 +213,7 @@ def _validate_script_body(value: Any, label: str) -> str:
     if any(line == "PYTHON" for line in value.splitlines()):
         raise ContractError(f"{label} contains the fixed PYTHON heredoc terminator")
     try:
-        ast.parse(value, filename=label, mode="exec")
+        ast.parse(value, filename=label, mode="exec", feature_version=(3, 9))
     except (SyntaxError, ValueError, MemoryError, RecursionError) as error:
         raise ContractError(f"{label} must be one syntactically valid Python body: {error}") from error
     return value
@@ -159,6 +227,7 @@ def validate_model(value: Any, *, source_name: str = "workflow envelope") -> dic
     producing bytes.
     """
 
+    source_name = _validate_source_name(source_name)
     root = _exact_object(value, {"schema_version", "workflow"}, source_name)
     _exact_value(root["schema_version"], 1, f"{source_name}.schema_version")
 
@@ -193,7 +262,7 @@ def validate_model(value: Any, *, source_name: str = "workflow envelope") -> dic
     if type(timeout) is not int or not 1 <= timeout <= 5:
         raise ContractError(
             f"{source_name}.workflow.timeout_minutes must be an integer from 1 through 5; "
-            f"found {timeout!r}"
+            f"found {_bounded_value_description(timeout)}"
         )
 
     trigger = _exact_object(
@@ -272,8 +341,9 @@ def validate_model(value: Any, *, source_name: str = "workflow envelope") -> dic
 def parse_model(source: bytes, *, source_name: str = "workflow envelope JSON") -> dict[str, Any]:
     """Parse bounded, duplicate-free, canonical UTF-8 JSON into the closed model."""
 
+    source_name = _validate_source_name(source_name)
     if type(source) is not bytes:
-        raise ContractError(f"{source_name} must be bytes; found {type(source).__name__}")
+        raise ContractError(f"{source_name} must be bytes; found {_bounded_type_name(source)}")
     if not source:
         raise ContractError(f"{source_name} must not be empty")
     if len(source) > MAX_SOURCE_BYTES:
