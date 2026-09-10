@@ -7,7 +7,29 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DEFAULT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../../.." && pwd)
-ROOT=${FINCH_PROTOCOL_ROOT:-$DEFAULT_ROOT}
+SELF="$SCRIPT_DIR/test-review-protocol"
+
+# Usage: test-review-protocol [repository-root]
+# An explicit positional root is authoritative. With no argument, the documented
+# FINCH_PROTOCOL_ROOT override is used, otherwise the script's repository is used.
+case $# in
+    0) ROOT=${FINCH_PROTOCOL_ROOT:-$DEFAULT_ROOT} ;;
+    1) ROOT=$1 ;;
+    *)
+        printf 'ERROR: usage: %s [repository-root]; got %s arguments\n' "$0" "$#" >&2
+        exit 2
+        ;;
+esac
+
+if test -d "$ROOT"; then
+    ROOT=$(CDPATH= cd -- "$ROOT" && pwd)
+fi
+
+if test ! -f "$ROOT/.agents/skills/finch-backlog/SKILL.md"; then
+    printf 'ERROR: repository root missing required policy file: %s\n' \
+        "$ROOT/.agents/skills/finch-backlog/SKILL.md" >&2
+    exit 2
+fi
 
 SKILL="$ROOT/.agents/skills/finch-backlog/SKILL.md"
 REFS="$ROOT/.agents/skills/finch-backlog/references"
@@ -81,10 +103,33 @@ forbid_text() {
     fi
 }
 
+# Prove that the positional repository-root argument is not silently ignored. The
+# guard prevents recursion while the child checks a deliberately empty root.
+if test "${FINCH_PROTOCOL_ROOT_SELFTEST:-run}" = run; then
+    wrong_root="$TMP/explicit-wrong-root"
+    mkdir -p "$wrong_root"
+    wrong_root=$(CDPATH= cd -- "$wrong_root" && pwd)
+    if FINCH_PROTOCOL_ROOT_SELFTEST=skip "$SELF" "$wrong_root" >"$TMP/root-argument.out" 2>&1; then
+        fail "explicit repository-root argument was ignored; empty root unexpectedly passed"
+    elif grep -F -q \
+        "repository root missing required policy file: $wrong_root/.agents/skills/finch-backlog/SKILL.md" \
+        "$TMP/root-argument.out"; then
+        pass "explicit repository-root argument is honored and a wrong root fails actionably"
+    else
+        fail "wrong-root diagnostic did not name the supplied root: $(tr '\n' ';' <"$TMP/root-argument.out")"
+    fi
+fi
+
 DOCS="$SKILL $REVIEW $CONTRACT $READINESS $PACKET $CLAIMS"
 for path in $DOCS; do
     require_file "policy file exists" "$path"
 done
+
+if test "$failures" -ne 0; then
+    printf 'FAILED: %s required policy file checks failed for supplied root %s\n' \
+        "$failures" "$ROOT" >&2
+    exit 1
+fi
 
 if test ! -e "$REDUCER"; then
     pass "obsolete workflow_protocol.py is deleted"
