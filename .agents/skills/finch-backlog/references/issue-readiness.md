@@ -97,6 +97,9 @@ and independently review the exact tip. Then append `none -> READY` with a typed
 `legacy-bootstrap` packet and append ordinary `READY -> IN_PROGRESS` using that preserved
 claim. If obligations exist, enter `REPAIR_IN_PROGRESS` normally. Malformed, edited,
 unverifiable, post-cutover, or uncorroborated claims are ineligible.
+The packet binds the cutover SHA/timestamp and immutable claim `createdAt`; the reducer
+itself proves claim time is earlier. A text value such as `"false"` cannot assert that
+comparison, collision recheck, or exact-tip review.
 
 ### Terminal pairing and scoped completion
 
@@ -168,6 +171,25 @@ integration base, tip, zero transitive ledger, clean round, gates, and artifact.
 binds merge/tree identity, claim terminal, closure, all successor gates, artifact/user
 proof, cleanup, and frontier evidence. External, infeasible, declined, and superseded
 packets contain every field named in the lifecycle table.
+
+The referenced packet itself is an immutable structured record. Its GitHub URL, raw-body
+digest, issue, and kind must exactly equal the readiness event. Boolean fields accept only
+lowercase `true` or `false`; a nonempty string such as `"false"` is never truthy evidence.
+
+```text
+<!-- finch-workflow-evidence:v1
+packet-id: <stable ID>
+issue: <number>
+kind: <destination-specific packet kind>
+<typed fields required by the matrix and destination validator>
+timestamp: <UTC RFC 3339>
+-->
+```
+
+The canonical parser normalizes documented hyphenated names once, attaches trusted
+GitHub observation metadata, and passes that same typed record to admission and reduction.
+Tests and status tooling must not construct privileged synthetic dictionaries that bypass
+the raw-block path.
 
 `INFEASIBLE`, `DECLINED`, issue closure, and ownership substitution require an immutable
 authority comment from the contract owner when the posting actor differs. Verify that

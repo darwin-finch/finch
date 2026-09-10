@@ -323,7 +323,10 @@ for index, ((prior, destination), (roles, required)) in enumerate(wp.readiness_m
     for field in required:
         event[field] = {"disposition": {"READY":"return-ready", "NEEDS_SPECIFICATION":"needs-specification",
             "BLOCKED_EXTERNAL":"blocked-external", "INFEASIBLE":"infeasible", "DECLINED":"declined"}.get(destination),
-            "claim_id":"claim", "authority_valid":True, "evidence_matches":True} if field == "terminal_pair" else True
+            "claim_id":"claim", "authority_valid":True, "evidence_matches":True} if field == "terminal_pair" else (
+            {name:True for name in ("merged_current_main", "all_successors_resolved", "issue_closed", "claim_terminal",
+             "artifact_identity", "user_visible_proof", "cleanup_safe", "frontier_recomputed")}
+            if field == "completion_packet" else True)
     check(not wp.validate_readiness_attempt(prior, event), f"documented matrix edge {prior}->{destination} rejected")
     event["authenticated_role"] = "unrelated"
     check(wp.validate_readiness_attempt(prior, event), f"unauthorized role accepted for {prior}->{destination}")
@@ -353,26 +356,30 @@ check(wp.reduce_readiness([tainted]).indeterminate, "changed accepted history fe
 for state in wp.ACTIVE:
     for destination, disposition in wp._PAIR_DISPOSITION.items():
         terminal = {"disposition": disposition, "claim_id":"c", "authority_valid":True,
-                    "url":"terminal", "evidence_digest":"e"}
-        readiness = {"new_state":destination, "claim_id":"c", "terminal_url":"terminal", "evidence_digest":"e"}
+                    "url":"terminal", "evidence_digest":"e", "issue":406,
+                    "created_at":"2026-01-01T00:00:00Z", "comment_id":1, "block_order":0}
+        readiness = {"new_state":destination, "claim_id":"c", "terminal_url":"terminal", "evidence_digest":"e",
+                     "issue":406, "created_at":"2026-01-02T00:00:00Z", "comment_id":2, "block_order":0}
         check(wp.terminal_pair_status(terminal, readiness) == "ACCEPTED", f"valid {state} terminal pair was rejected")
         check(wp.terminal_pair_status(terminal, None) == "PAIRING_REQUIRED", "missing readiness pair was treated as terminal")
         check(wp.terminal_pair_status(terminal, dict(readiness, claim_id="wrong")) == "INVALID", "mismatched claim pair was accepted")
 
 # Legacy work enters ordinary READY then IN_PROGRESS and requires the complete retained inventory.
-legacy = {key: True for key in ("cutover_identity", "claim_predates_cutover", "preserved_claim", "preserved_pr",
-    "preserved_branch", "preserved_worktree", "preserved_tip", "preserved_base", "approved_contract",
-    "collision_recheck", "exact_tip_review")}
+legacy = {key: key for key in ("cutover_identity", "preserved_claim", "preserved_pr",
+    "preserved_branch", "preserved_worktree", "preserved_tip", "preserved_base", "approved_contract")}
+legacy.update(cutover_created_at="2026-01-02T00:00:00Z", claim_created_at="2026-01-01T00:00:00Z",
+              claim_predates_cutover=True, collision_recheck=True, exact_tip_review=True)
 check(wp.legacy_bootstrap_valid(legacy), "complete pre-cutover bootstrap packet was rejected")
 for key in list(legacy):
     mutant = dict(legacy); del mutant[key]
     check(not wp.legacy_bootstrap_valid(mutant), f"legacy bootstrap survived missing {key}")
 
 # Atomic split/handoff activates all exact reservations or none.
-child = {"claim_id":"child", "scope":"b", "nonauthorizing_reservation":True}
+child = {"claim_id":"child", "scope_items":["b"], "nonauthorizing_reservation":True}
 transfer = {"parent_authorized":True, "expected_children":[child], "child_reservations":[dict(child)],
             "activation":True, "expected_gates":["g"],
-            "gate_map":[{"gate_id":"g", "child_claim_id":"child", "proof_path":"test"}]}
+            "gate_map":[{"gate_id":"g", "child_claim_id":"child", "proof_path":"test"}],
+            "retained_scope_items":["a"], "parent_scope_items":["a", "b"]}
 check(wp.atomic_transfer(transfer, "split"), "complete split transaction was rejected")
 check(wp.atomic_transfer(transfer, "handoff"), "complete handoff transaction was rejected")
 check(not wp.atomic_transfer(dict(transfer, activation=False), "split"), "incomplete split activated children")
@@ -394,7 +401,9 @@ for disposition in ("infeasible", "declined"):
 
 # Scope proxy authority must be prior, operation-specific, exact, and collision checked.
 scope = dict(poster_actor="proxy", original_author="owner", delegation_prior=True,
+    worker="worker", original_worker="worker",
     delegation_operation="scope-revise", delegation_claim_id="c", claim_id="c",
+    delegation_substitute_actor="proxy",
     delegation_scope="new", new_scope="new", delegation_contract_revision=2, contract_revision=2,
     prior_scope_matches=True, contract_approved=True, collision_check_complete=True)
 check(wp.scope_revision_allowed(scope), "valid narrow scope delegation was rejected")
@@ -405,7 +414,8 @@ for key, value in (("delegation_prior", False), ("delegation_operation", "termin
 # Finding identity/axes are append-only; only the exact verified tuple blocks.
 finding = immutable(event_id="f1", finding_id="F", ledger_id="L", round_id="R", prior_event_id=None,
     confidence="PLAUSIBLE", severity="CRITICAL", locality="SAME_CONTRACT", obligation="BLOCKER",
-    state="OPEN", exact_tip="a"*40, scenario="s", proof="p", owner="o")
+    state="OPEN", exact_tip="a"*40, scenario_evidence="url", owner="o", issue=406,
+    pull_request=542, claim_id="c", contract_id="contract")
 resolved = immutable(**dict(finding, event_id="f2", comment_id=2, prior_event_id="f1", confidence="CONFIRMED",
     state="RESOLVED", independently_verified=True, proof_tip="a"*40, proof_integration_base="b"*40))
 finding_result = wp.reduce_findings([finding, resolved])
@@ -421,18 +431,18 @@ for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
           f"severity {severity} changed an open confirmed blocker")
 
 # Successors require unique references, claims, exactly-once gates, and current-main proof.
-root_f = {"root":{"state":"SPLIT-TO", "successors":["a", "b"], "affected_gates":["g1", "g2"]}}
-children = {"a":{"active_claim":True, "current_main_proof":True, "gates":["g1"]},
-            "b":{"active_claim":True, "current_main_proof":True, "gates":["g2"]}}
+root_f = {"root":{"state":"SPLIT-TO", "child_claim_ids":["a", "b"], "affected_gate_ids":["g1", "g2"]}}
+children = {"a":{"terminal_claim":True, "disposition":"slice-complete", "merge_proof":True, "ownership_valid":True, "current_main_proof":True, "affected_gate_ids":["g1"]},
+            "b":{"terminal_claim":True, "disposition":"slice-complete", "merge_proof":True, "ownership_valid":True, "current_main_proof":True, "affected_gate_ids":["g2"]}}
 check(wp.successor_obligation_complete("root", root_f, children), "complete successor gate partition was rejected")
 for mutant in (
     {"a":children["a"]},
-    {"a":children["a"], "b":dict(children["b"], active_claim=False)},
+    {"a":children["a"], "b":dict(children["b"], ownership_valid=False)},
     {"a":children["a"], "b":dict(children["b"], current_main_proof=False)},
-    {"a":children["a"], "b":dict(children["b"], gates=["g1"])},
+    {"a":children["a"], "b":dict(children["b"], affected_gate_ids=["g1"])},
 ):
     check(not wp.successor_obligation_complete("root", root_f, mutant), "invalid/missing/duplicate/unproven successor completed parent")
-cyclic = {"root":{"state":"REPLACED-BY", "successors":["a"]}, "a":{"state":"REPLACED-BY", "successors":["root"]}}
+cyclic = {"root":{"state":"REPLACED-BY", "successor_finding_ids":["a"]}, "a":{"state":"REPLACED-BY", "successor_finding_ids":["root"]}}
 check(not wp.successor_obligation_complete("root", cyclic, {}), "cyclic successors completed parent")
 
 # Exact-tip round identity uses integration base; all completion axes are independently required.
@@ -440,7 +450,8 @@ round_record = immutable(event_id="rr", round_id="r", ledger_id="l", issue=406, 
     claim_id="c", contract_id="contract", contract_url="url", contract_digest="d", claim_base="a"*40,
     integration_base="b"*40, panel_diff_base="b"*40, exact_tip="c"*40, round_number=2,
     selected_perspectives=["correctness"], skipped_perspectives=["concurrency: no async"],
-    status="CONVERGED", verdict="SAFE_TO_MERGE", finding_event_ids=["none"], gate_evidence="url")
+    status="CONVERGED", verdict="SAFE_TO_MERGE", finding_event_ids=["none"], gate_evidence="url",
+    fresh_clean_pass=True, zero_ledger=True, prior_zero_ledger_round_id="prior")
 check(not wp.validate_review_round(round_record), "valid exact-tip review round was rejected")
 check(wp.review_diff_base(round_record) == "b"*40, "panel derivation used claim base instead of integration base")
 check(wp.validate_review_round(dict(round_record, panel_diff_base="a"*40)), "claim-base panel mutant survived")
@@ -455,6 +466,451 @@ slice_packet = {field:True for field in ("reached_ready_to_merge", "merged_slice
     "active_successor_claims", "claim_terminal_after_parent_event", "issue_remains_open")}
 check(wp.scoped_slice_completion_allowed(slice_packet), "valid scoped slice completion was rejected")
 check(not wp.scoped_slice_completion_allowed(dict(slice_packet, issue_remains_open=False)), "slice completion falsely completed parent outcome")
+
+# Round-two regressions start from literal documented HTML blocks. No synthetic event
+# dictionary may bypass parsing, normalization, immutable observation, and typed reduction.
+def parsed_block(raw, url, comment_id, author, created_at, issue=406, pull_request=None):
+    observation = {"url":url, "comment_id":comment_id, "author":author,
+                   "created_at":created_at, "updated_at":created_at, "issue":issue}
+    if pull_request is not None:
+        observation["pull_request"] = pull_request
+    records, diagnostics = wp.parse_event_blocks(raw, observation)
+    check(not diagnostics and len(records) == 1, f"raw fixture did not parse: {diagnostics} / {raw}")
+    return records[0]
+
+base_sha = "a" * 40
+tip_sha = "b" * 40
+contract_raw = f"""<!-- finch-solution-contract:v1
+event-id: contract-event
+contract-id: contract
+issue: 406
+revision: 11
+supersedes-url: none
+implementation-base: {base_sha}
+owner-worker: owner-worker
+owner-github-actor: alice
+scope: workflow
+sections: observed_failure,intended_behavior,non_goals,invariants,boundaries,regression_proof,integration_proof,reversion_plan,hostile_cases,gate_ownership
+timestamp: 2026-01-01T00:00:00Z
+-->"""
+raw_contract = parsed_block(contract_raw, "contract-url", 10, "alice", "2026-01-01T00:00:00Z")
+approval_raw = f"""<!-- finch-solution-contract-approval:v1
+event-id: approval-event
+issue: 406
+contract-id: contract
+contract-url: contract-url
+contract-digest: {raw_contract['body_digest']}
+contract-revision: 11
+implementation-base: {base_sha}
+reviewer-worker: reviewer-worker
+reviewer-github-actor: bob
+verdict: APPROVE
+review-output-url: review-output
+authority-comment: none
+timestamp: 2026-01-02T00:00:00Z
+-->"""
+raw_approval = parsed_block(approval_raw, "approval-url", 11, "bob", "2026-01-02T00:00:00Z")
+raw_authority = {"author_workers":["owner-worker"], "coordinator_worker":"coordinator-worker",
+                 "implementer_worker":"implementer-worker"}
+check(not wp.validate_contract(raw_contract, raw_approval, raw_authority),
+      "documented contract/approval blocks did not round-trip through canonical validator")
+
+claim_raw = f"""<!-- finch-work-claim:v1
+event: claim
+claim-id: claim
+worker: claim-worker
+github-actor: alice
+branch: branch
+worktree: /tmp/worktree
+base: {base_sha}
+scope: workflow
+scope-items: workflow
+timestamp: 2026-01-03T00:00:00Z
+-->"""
+raw_claim = parsed_block(claim_raw, "claim-url", 12, "alice", "2026-01-03T00:00:00Z")
+raw_claim, claim_error = wp.admit_claim(raw_claim, 406)
+check(not claim_error and raw_claim["active"], "documented claim block did not enter typed claim state")
+
+def evidence_raw(kind, fields, url, comment_id, created_at, issue=406):
+    lines = ["<!-- finch-workflow-evidence:v1", f"packet-id: {url}", f"issue: {issue}", f"kind: {kind}"]
+    lines.extend(f"{key.replace('_','-')}: {str(value).lower() if isinstance(value, bool) else value}" for key, value in fields.items())
+    lines.extend([f"timestamp: {created_at}", "-->"])
+    return parsed_block("\n".join(lines), url, comment_id, "alice", created_at, issue=issue)
+
+ready_evidence = evidence_raw("approved-contract", {}, "ready-evidence", 20, "2026-01-04T00:00:00Z")
+progress_evidence = evidence_raw("active-claim", {}, "progress-evidence", 21, "2026-01-05T00:00:00Z")
+merge_evidence = evidence_raw("merge-ready", {"gate_evidence":True, "artifact_evidence":True},
+                              "merge-evidence", 22, "2026-01-06T00:00:00Z")
+complete_fields = {name:True for name in ("merged_current_main", "all_successors_resolved", "issue_closed",
+    "claim_terminal", "artifact_identity", "user_visible_proof", "cleanup_safe", "frontier_recomputed")}
+complete_evidence = evidence_raw("complete", complete_fields, "complete-evidence", 23, "2026-01-07T00:00:00Z")
+
+def readiness_raw(event_id, prior_id, prior_state, new_state, evidence, comment_id, created_at,
+                  claim_url="claim-url", issue=406, identity_overrides=None):
+    identity_overrides = identity_overrides or {}
+    event_contract = identity_overrides.get("contract_id", "contract")
+    event_claim = identity_overrides.get("claim_id", "claim")
+    event_ledger = identity_overrides.get("ledger_id", "ledger")
+    event_round = identity_overrides.get("round_id", "round")
+    event_tip = identity_overrides.get("exact_tip", tip_sha)
+    return parsed_block(f"""<!-- finch-issue-readiness:v1
+event-id: {event_id}
+issue: {issue}
+prior-state: {prior_state or 'none'}
+prior-event-id: {prior_id or 'none'}
+new-state: {new_state}
+actor: coordinator-worker
+owner: alice
+evidence-url: {evidence['url']}
+evidence-kind: {evidence['kind']}
+evidence-digest: {evidence['body_digest']}
+contract-id: {event_contract}
+contract-url: contract-url
+contract-digest: {raw_contract['body_digest']}
+contract-revision: 11
+implementation-base: {base_sha}
+plan-reviewer: reviewer-worker
+approval-url: approval-url
+claim-id: {event_claim}
+claim-url: {claim_url}
+ledger-id: {event_ledger}
+round-id: {event_round}
+exact-tip: {event_tip}
+integration-base: {base_sha}
+next-action: continue
+authority-comment: none
+timestamp: {created_at}
+-->""", f"{event_id}-url", comment_id, "alice", created_at, issue=issue)
+
+ready_event = readiness_raw("ready", None, None, "READY", ready_evidence, 30, "2026-01-08T00:00:00Z")
+progress_event = readiness_raw("progress", "ready", "READY", "IN_PROGRESS", progress_evidence, 31, "2026-01-09T00:00:00Z")
+
+round_raw = f"""<!-- finch-review-round:v1
+event-id: review-event
+round-id: round
+ledger-id: ledger
+issue: 406
+pull-request: 542
+claim-id: claim
+contract-id: contract
+contract-url: contract-url
+contract-digest: {raw_contract['body_digest']}
+claim-base: {base_sha}
+integration-base: {base_sha}
+panel-diff-base: {base_sha}
+exact-tip: {tip_sha}
+round-number: 3
+selected-perspectives: correctness,test-quality
+skipped-perspectives: concurrency-no-runtime
+status: CONVERGED
+verdict: SAFE_TO_MERGE
+finding-event-ids: none
+zero-ledger: true
+fresh-clean-pass: true
+prior-zero-ledger-round-id: prior-round
+gate-evidence-url: merge-evidence
+timestamp: 2026-01-10T00:00:00Z
+-->"""
+raw_round = parsed_block(round_raw, "round-url", 32, "alice", "2026-01-10T00:00:00Z", pull_request=542)
+prior_round_raw = (round_raw.replace("event-id: review-event", "event-id: prior-review-event")
+    .replace("round-id: round", "round-id: prior-round")
+    .replace("round-number: 3", "round-number: 2")
+    .replace("status: CONVERGED", "status: VERIFICATION")
+    .replace("verdict: SAFE_TO_MERGE", "verdict: none")
+    .replace("fresh-clean-pass: true", "fresh-clean-pass: false")
+    .replace("prior-zero-ledger-round-id: prior-round", "prior-zero-ledger-round-id: none"))
+prior_raw_round = parsed_block(prior_round_raw, "prior-round-url", 31, "alice", "2026-01-09T12:00:00Z", pull_request=542)
+expected_review = {"issue":406, "pull_request":542, "claim_id":"claim", "contract_id":"contract",
+                   "ledger_id":"ledger", "exact_tip":tip_sha}
+review_result = wp.reduce_review_history([prior_raw_round, raw_round], [], expected_review)
+check(review_result.safe_to_merge, f"raw zero-ledger clean round did not converge: {review_result.diagnostics}")
+
+context = dict(raw_authority, issue=406, owner="alice", roles_by_actor={"alice":["contract_owner", "coordinator", "claim_worker"]},
+    contract_id="contract", contract_digest=raw_contract["body_digest"], contract_revision=11,
+    implementation_base=base_sha, claim_id="claim", ledger_id="ledger", round_id="round",
+    exact_tip=tip_sha, integration_base=base_sha,
+    contracts_by_url={"contract-url":raw_contract}, approvals_by_url={"approval-url":raw_approval},
+    claims_by_url={"claim-url":raw_claim}, evidence_by_url={e["url"]:e for e in
+    (ready_evidence, progress_evidence, merge_evidence, complete_evidence)}, review_reduction=review_result)
+merge_event = readiness_raw("merge", "progress", "IN_PROGRESS", "READY_TO_MERGE", merge_evidence, 33, "2026-01-11T00:00:00Z")
+complete_event = readiness_raw("complete", "merge", "READY_TO_MERGE", "COMPLETE", complete_evidence, 34, "2026-01-12T00:00:00Z")
+raw_readiness = wp.reduce_readiness([ready_event, progress_event, merge_event, complete_event], context)
+check(raw_readiness.state == "COMPLETE", f"documented raw readiness history did not complete: {raw_readiness.diagnostics}")
+
+# Cross-issue and every one-axis COMPLETE mutant remain at READY_TO_MERGE.
+foreign_evidence = evidence_raw("complete", complete_fields, "foreign-complete", 40, "2026-01-13T00:00:00Z", issue=999)
+foreign_complete = readiness_raw("foreign", "merge", "READY_TO_MERGE", "COMPLETE", foreign_evidence, 41,
+                                 "2026-01-14T00:00:00Z", issue=999)
+foreign_context = dict(context, evidence_by_url=dict(context["evidence_by_url"], **{"foreign-complete":foreign_evidence}))
+foreign_result = wp.reduce_readiness([ready_event, progress_event, merge_event, foreign_complete], foreign_context)
+check(foreign_result.state == "READY_TO_MERGE", "cross-issue COMPLETE event was admitted")
+for offset, (identity_key, wrong_value) in enumerate((("contract_id","other"), ("claim_id","other"),
+        ("ledger_id","other"), ("round_id","other"), ("exact_tip","c"*40)), 42):
+    wrong = readiness_raw(f"wrong-{identity_key}", "merge", "READY_TO_MERGE", "COMPLETE", complete_evidence,
+                          offset, f"2026-01-{offset-27:02d}T00:00:00Z",
+                          identity_overrides={identity_key:wrong_value})
+    result = wp.reduce_readiness([ready_event, progress_event, merge_event, wrong], context)
+    check(result.state == "READY_TO_MERGE", f"mismatched raw {identity_key} reached COMPLETE")
+for offset, missing in enumerate(complete_fields, 50):
+    fields = dict(complete_fields); fields[missing] = False
+    evidence = evidence_raw("complete", fields, f"complete-{missing}", offset, f"2026-02-{offset-49:02d}T00:00:00Z")
+    event = readiness_raw(f"complete-{missing}", "merge", "READY_TO_MERGE", "COMPLETE", evidence,
+                          offset + 20, f"2026-03-{offset-49:02d}T00:00:00Z")
+    mutant_context = dict(context, evidence_by_url=dict(context["evidence_by_url"], **{evidence["url"]:evidence}))
+    result = wp.reduce_readiness([ready_event, progress_event, merge_event, event], mutant_context)
+    check(result.state == "READY_TO_MERGE", f"raw COMPLETE admitted without {missing}")
+
+# Raw terminal streams produce PAIRING_REQUIRED until an exact later readiness pair exists.
+release_evidence = evidence_raw("return-ready", {"recovery_evidence":True}, "release-evidence", 80, "2026-04-01T00:00:00Z")
+terminal_raw = f"""<!-- finch-work-claim:v1
+event: release
+claim-id: claim
+worker: claim-worker
+disposition: return-ready
+timestamp: 2026-04-02T00:00:00Z
+replacement-claim: none
+evidence-url: release-evidence
+evidence-digest: {release_evidence['body_digest']}
+authority-comment: none
+-->"""
+raw_terminal = parsed_block(terminal_raw, "terminal-url", 81, "alice", "2026-04-02T00:00:00Z")
+raw_terminal = wp.prepare_terminal_event(raw_terminal, raw_claim, release_evidence)
+check(wp.terminal_event_valid(raw_terminal), f"prepared raw terminal invalid: {raw_terminal}")
+pair_context = dict(context, evidence_by_url=dict(context["evidence_by_url"], **{"release-evidence":release_evidence}))
+unmatched = wp.reduce_readiness_with_terminals([ready_event, progress_event], [raw_terminal], pair_context)
+check(unmatched.pairing_required and unmatched.state == "IN_PROGRESS", "unmatched raw terminal did not report PAIRING_REQUIRED")
+return_event = readiness_raw("returned", "progress", "IN_PROGRESS", "READY", release_evidence, 82,
+                             "2026-04-03T00:00:00Z", claim_url="terminal-url")
+check(wp.terminal_pair_status(raw_terminal, {"new_state":"READY", "claim_id":"claim",
+    "terminal_url":"terminal-url", "evidence_digest":release_evidence["body_digest"], "issue":406,
+    "created_at":return_event["created_at"], "comment_id":return_event["comment_id"], "block_order":0}) == "ACCEPTED",
+    f"prepared raw terminal/readiness identities mismatch: {raw_terminal} / {return_event}")
+paired = wp.reduce_readiness_with_terminals([ready_event, progress_event, return_event], [raw_terminal], pair_context)
+check(paired.state == "READY" and not paired.pairing_required, f"exact ordered terminal pair failed: {paired.diagnostics}")
+
+# Raw claim reservations prove atomic scope/gate transfer and handoff cardinality.
+reserve_raw = """<!-- finch-work-claim:v1
+event: split-reserve
+event-id: reserve
+transfer-id: transfer
+claim-id: claim
+worker: claim-worker
+contract-id: contract
+retained-scope-items: a
+expected-children: child|child-worker|bob|child-contract|child-branch|/tmp/child|b
+expected-gates: gate
+gate-map: gate=child@test
+timestamp: 2026-05-01T00:00:00Z
+authority-comment: none
+-->"""
+child_raw = """<!-- finch-work-claim:v1
+event: split-child-reserve
+event-id: child-reserve
+transfer-id: transfer
+claim-id: child
+worker: child-worker
+contract-id: child-contract
+branch: child-branch
+worktree: /tmp/child
+scope-items: b
+nonauthorizing: true
+timestamp: 2026-05-02T00:00:00Z
+authority-comment: none
+-->"""
+activate_raw = """<!-- finch-work-claim:v1
+event: split-activate
+event-id: activate
+transfer-id: transfer
+claim-id: claim
+worker: claim-worker
+contract-id: contract
+timestamp: 2026-05-03T00:00:00Z
+authority-comment: none
+-->"""
+reserve = parsed_block(reserve_raw, "reserve-url", 90, "alice", "2026-05-01T00:00:00Z")
+child_reserve = parsed_block(child_raw, "child-url", 91, "bob", "2026-05-02T00:00:00Z")
+activation = parsed_block(activate_raw, "activate-url", 92, "alice", "2026-05-03T00:00:00Z")
+parent_for_transfer = dict(raw_claim, scope_items=["a", "b"], contract_id="contract")
+check(wp.reduce_atomic_transfer([reserve, child_reserve, activation], parent_for_transfer, "split", {"child-contract"}),
+      "raw exact split transaction did not activate")
+overlap_reserve = dict(reserve, retained_scope_items=["a", "b"])
+check(not wp.reduce_atomic_transfer([overlap_reserve, child_reserve, activation], parent_for_transfer, "split", {"child-contract"}),
+      "overlapping retained/delegated raw scopes activated")
+handoff_reserve = dict(reserve, event="handoff-reserve", expected_children=reserve["expected_children"] * 2)
+handoff_child = dict(child_reserve, event="handoff-child-reserve")
+handoff_activate = dict(activation, event="handoff-activate")
+check(not wp.reduce_atomic_transfer([handoff_reserve, handoff_child, handoff_activate], parent_for_transfer, "handoff", {"child-contract"}),
+      "raw handoff accepted multiple successors")
+check(not wp.reduce_atomic_transfer([reserve, child_reserve, activation], parent_for_transfer, "split", set()),
+      "raw transfer activated without approved child contract identity")
+
+# Raw successor records preserve separate finding and child-claim namespaces. A merged,
+# terminalized child is valid ownership history, while duplicate gates never discharge.
+replacement_root = parsed_block(f"""<!-- finch-review-finding:v1
+event-id: replacement-root
+finding-id: root
+ledger-id: ledger
+round-id: round
+issue: 406
+pull-request: 542
+claim-id: claim
+contract-id: contract
+prior-event-id: none
+confidence: CONFIRMED
+severity: HIGH
+locality: SAME_CONTRACT
+obligation: BLOCKER
+state: REPLACED-BY
+exact-tip: {tip_sha}
+scenario-evidence-url: scenario
+affected-gate-ids: gate
+successor-finding-ids: leaf
+child-claim-ids: none
+owner: owner
+timestamp: 2026-06-01T00:00:00Z
+-->""", "replacement-root-url", 100, "alice", "2026-06-01T00:00:00Z", pull_request=542)
+replacement_leaf = parsed_block(f"""<!-- finch-review-finding:v1
+event-id: replacement-leaf
+finding-id: leaf
+ledger-id: ledger
+round-id: round
+issue: 406
+pull-request: 542
+claim-id: claim
+contract-id: contract
+prior-event-id: none
+confidence: CONFIRMED
+severity: HIGH
+locality: SAME_CONTRACT
+obligation: BLOCKER
+state: RESOLVED
+exact-tip: {tip_sha}
+scenario-evidence-url: scenario
+affected-gate-ids: gate
+successor-finding-ids: none
+child-claim-ids: none
+owner: owner
+current-main-proof: true
+timestamp: 2026-06-02T00:00:00Z
+-->""", "replacement-leaf-url", 101, "bob", "2026-06-02T00:00:00Z", pull_request=542)
+check(wp.successor_obligation_complete("root", {"root":replacement_root, "leaf":replacement_leaf}, {}),
+      "raw replacement-finding lineage did not discharge")
+split_root = dict(replacement_root, state="SPLIT-TO", successor_finding_ids=[], child_claim_ids=["child"])
+terminal_child = parsed_block("""<!-- finch-successor-claim-proof:v1
+claim-id: child
+ownership-valid: true
+active-claim: false
+terminal-claim: true
+disposition: slice-complete
+merge-proof: true
+current-main-proof: true
+affected-gate-ids: gate
+timestamp: 2026-06-03T00:00:00Z
+-->""", "child-proof-url", 102, "alice", "2026-06-03T00:00:00Z")
+check(wp.successor_obligation_complete("root", {"root":split_root}, {"child":terminal_child}),
+      "correctly terminalized merged child claim was rejected")
+check(not wp.successor_obligation_complete("root", {"root":dict(split_root, affected_gate_ids=["gate", "gate"])}, {"child":terminal_child}),
+      "duplicate raw parent gate completed successor graph")
+check(not wp.successor_obligation_complete("root", {"root":dict(replacement_root, child_claim_ids=["child"])}, {"child":terminal_child}),
+      "replacement-finding lineage consumed a child claim")
+
+# Raw review records bind status/verdict, identity, and the exact reduced ledger.
+discovery_safe = parsed_block(round_raw.replace("status: CONVERGED", "status: DISCOVERY"),
+                              "bad-round-url", 110, "alice", "2026-07-01T00:00:00Z", pull_request=542)
+check(wp.validate_review_round(discovery_safe), "DISCOVERY + SAFE_TO_MERGE raw round validated")
+open_finding_raw = f"""<!-- finch-review-finding:v1
+event-id: open-finding-event
+finding-id: open-finding
+ledger-id: ledger
+round-id: round
+issue: 406
+pull-request: 542
+claim-id: claim
+contract-id: contract
+prior-event-id: none
+confidence: CONFIRMED
+severity: CRITICAL
+locality: SAME_CONTRACT
+obligation: BLOCKER
+state: OPEN
+exact-tip: {tip_sha}
+scenario-evidence-url: scenario
+affected-gate-ids: gate
+successor-finding-ids: none
+child-claim-ids: none
+owner: owner
+timestamp: 2026-07-02T00:00:00Z
+-->"""
+open_finding = parsed_block(open_finding_raw, "finding-url", 111, "bob", "2026-07-02T00:00:00Z", pull_request=542)
+round_with_open = dict(raw_round, finding_event_ids=["open-finding-event"])
+open_review = wp.reduce_review_history([prior_raw_round, round_with_open], [open_finding], expected_review)
+check(not open_review.safe_to_merge, "CONVERGED raw round with open blocker reached SAFE_TO_MERGE")
+foreign_finding = dict(open_finding, issue=999)
+foreign_review = wp.reduce_review_history([prior_raw_round, round_with_open], [foreign_finding], expected_review)
+check(not foreign_review.safe_to_merge and foreign_review.diagnostics, "foreign raw finding entered converged ledger")
+
+# Raw proxy/terminal/legacy evidence is closed, actor-bound, and boolean-typed.
+bad_event_terminal = dict(raw_terminal, event="complete", disposition="return-ready")
+bad_event_terminal = wp.prepare_terminal_event(bad_event_terminal, raw_claim, release_evidence)
+check(not wp.terminal_event_valid(bad_event_terminal), "raw event/disposition mismatch authorized terminal")
+false_success = evidence_raw("slice-complete", {"reached_ready_to_merge":True, "merge_proof":False},
+                             "false-success", 120, "2026-08-01T00:00:00Z")
+slice_terminal = dict(raw_terminal, event="complete", disposition="slice-complete",
+                      evidence_digest=false_success["body_digest"], evidence_url="false-success")
+slice_terminal = wp.prepare_terminal_event(slice_terminal, raw_claim, false_success)
+check(not wp.terminal_event_valid(slice_terminal), "string false merge proof authorized slice completion")
+false_supersession = evidence_raw("outcome-superseded", {"atomic_transfer":True, "replacement_packet":False},
+                                  "false-supersession", 124, "2026-08-01T06:00:00Z")
+supersede_terminal = dict(raw_terminal, event="supersede", disposition="outcome-superseded",
+    evidence_digest=false_supersession["body_digest"], evidence_url="false-supersession")
+supersede_terminal = wp.prepare_terminal_event(supersede_terminal, raw_claim, false_supersession)
+check(not wp.terminal_event_valid(supersede_terminal), "unproven raw whole-outcome supersession authorized terminal")
+delegation = {"created_at":"2026-01-01T00:00:00Z", "claim_id":"claim", "operation":"release",
+              "substitute_actor":"mallory", "disposition":"return-ready"}
+proxy_terminal = dict(raw_terminal, author="proxy")
+proxy_terminal = wp.prepare_terminal_event(proxy_terminal, raw_claim, release_evidence, delegation)
+check(not wp.terminal_event_valid(proxy_terminal), "delegation naming another substitute authorized proxy")
+scope_raw = """<!-- finch-work-claim:v1
+event: scope-revise
+claim-id: claim
+worker: claim-worker
+prior-scope: workflow
+new-scope: workflow-narrow
+contract-id: contract
+contract-url: contract-url
+contract-revision: 11
+approval-url: approval-url
+timestamp: 2026-08-01T12:00:00Z
+authority-comment: delegation-url
+-->"""
+raw_scope = parsed_block(scope_raw, "scope-url", 123, "proxy", "2026-08-01T12:00:00Z")
+delegation_raw = """<!-- finch-workflow-authority:v1
+claim-id: claim
+operation: scope-revise
+substitute-actor: proxy
+new-scope: workflow-narrow
+contract-revision: 11
+timestamp: 2026-08-01T00:00:00Z
+-->"""
+raw_delegation = parsed_block(delegation_raw, "delegation-url", 122, "alice", "2026-08-01T00:00:00Z")
+prepared_scope = wp.prepare_scope_revision(raw_scope, raw_claim, raw_contract, raw_approval,
+                                           raw_authority, raw_delegation, True)
+check(wp.scope_revision_allowed(prepared_scope), "raw exact scope proxy delegation was rejected")
+wrong_delegate = dict(raw_delegation, substitute_actor="mallory")
+check(not wp.scope_revision_allowed(wp.prepare_scope_revision(raw_scope, raw_claim, raw_contract,
+      raw_approval, raw_authority, wrong_delegate, True)), "raw delegation naming another scope proxy was accepted")
+legacy_fields = {"cutover_identity":"cutover", "cutover_created_at":"2026-01-02T00:00:00Z",
+    "claim_created_at":"2026-01-01T00:00:00Z", "claim_predates_cutover":True, "preserved_claim":"claim",
+    "preserved_pr":"pr", "preserved_branch":"branch", "preserved_worktree":"worktree", "preserved_tip":"tip",
+    "preserved_base":"base", "approved_contract":"contract", "collision_recheck":True, "exact_tip_review":True}
+legacy_evidence = evidence_raw("legacy-bootstrap", legacy_fields, "legacy-evidence", 121, "2026-08-02T00:00:00Z")
+check(wp.legacy_bootstrap_valid(legacy_evidence), "complete raw legacy bootstrap evidence was rejected")
+false_legacy = evidence_raw("legacy-bootstrap", dict(legacy_fields, claim_predates_cutover=False),
+                            "false-legacy", 122, "2026-08-03T00:00:00Z")
+check(not wp.legacy_bootstrap_valid(false_legacy), "string false pre-cutover evidence authorized legacy bootstrap")
+late_legacy = evidence_raw("legacy-bootstrap", dict(legacy_fields, claim_created_at="2026-01-03T00:00:00Z"),
+                           "late-legacy", 125, "2026-08-04T00:00:00Z")
+check(not wp.legacy_bootstrap_valid(late_legacy), "post-cutover claim timestamp authorized legacy bootstrap")
 
 # The original explicit contradictory-policy mutant must be rejected.
 mutant = "production may begin before READY; CRITICAL automatically cancels; SPLIT-TO immediately resolves; COMPLETE does not require user-visible proof"

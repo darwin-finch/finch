@@ -198,6 +198,7 @@ contract-url: <immutable URL>
 contract-digest: <SHA-256>
 claim-base: <full SHA>
 integration-base: <full current-main SHA>
+panel-diff-base: <same full integration-base SHA>
 exact-tip: <full SHA>
 round-number: <positive integer>
 selected-perspectives: <comma-separated set>
@@ -205,6 +206,9 @@ skipped-perspectives: <comma-separated set with reasons in prose>
 status: <DISCOVERY|VERIFICATION|REPAIR_IN_PROGRESS|CONVERGED>
 verdict: <none|SAFE_TO_MERGE|ESCALATE_WITH_EXECUTABLE_REPAIR_OR_SPLIT>
 finding-event-ids: <comma-separated IDs or none>
+zero-ledger: <true only after transitive reduction reaches zero>
+fresh-clean-pass: <true only for the required post-zero independent pass>
+prior-zero-ledger-round-id: <earlier exact-tip round that first proved zero, or none>
 gate-evidence-url: <immutable URL>
 timestamp: <UTC RFC 3339>
 -->
@@ -216,6 +220,10 @@ event-id: <lowercase UUID>
 finding-id: <stable ID>
 ledger-id: <ledger ID>
 round-id: <round ID>
+issue: <number>
+pull-request: <number>
+claim-id: <claim ID>
+contract-id: <contract ID>
 prior-event-id: <previous event for this finding or none>
 confidence: <CONFIRMED|PLAUSIBLE>
 severity: <CRITICAL|HIGH|MEDIUM|LOW>
@@ -232,12 +240,43 @@ timestamp: <UTC RFC 3339>
 -->
 ```
 
+A `RESOLVED` event's immutable scenario/proof evidence must additionally bind the
+independent verifier, exact tip, integration base, and current-main proof when completing
+an outcome. `REPLACED-BY` may populate only successor finding IDs. `SPLIT-TO` may populate
+only child claim IDs. Mixing those namespaces is invalid.
+
+Child-claim leaves use a typed proof record. Prior ownership must remain verifiable after
+the child terminalizes; only `slice-complete` plus merge and current-main proof discharges
+it. An active but unmerged child remains unresolved.
+
+```text
+<!-- finch-successor-claim-proof:v1
+claim-id: <child claim ID>
+ownership-valid: <true after claim-history reduction>
+active-claim: <true|false>
+terminal-claim: <true|false>
+disposition: <slice-complete or none>
+merge-proof: <true|false>
+current-main-proof: <true|false>
+affected-gate-ids: <unique comma-separated IDs>
+timestamp: <UTC RFC 3339>
+-->
+```
+
 Every finding event repeats all five axes; an update may change one without implicitly
 changing any other. A newly discovered finding uses `prior-event-id: none`. Later events
 must name the single accepted predecessor. Round/finding issue, contract, ledger, tip, and
 successor identities must agree. Only `CONFIRMED + SAME_CONTRACT + (BLOCKER or required
 REGRESSION_DEBT) + non-RESOLVED` enters the blocking ledger. A PLAUSIBLE BLOCKER therefore
 retains identity and evidence but cannot prevent merge unless later confirmed.
+
+Round reduction binds every admitted finding to the round's issue, pull request, claim,
+contract, ledger, and exact tip. `DISCOVERY` and `VERIFICATION` have no final verdict;
+`REPAIR_IN_PROGRESS` may record the executable-escalation verdict; only `CONVERGED` may
+record `SAFE_TO_MERGE`, and only when `zero-ledger` and `fresh-clean-pass` are true and the
+named prior zero-ledger round has the same issue/PR/claim/contract/ledger/base/tip identity.
+The round's finding-event set must equal the reduced ledger. Foreign, omitted, open, or
+transitively unresolved obligations prevent convergence.
 
 There are exactly two final review verdicts:
 

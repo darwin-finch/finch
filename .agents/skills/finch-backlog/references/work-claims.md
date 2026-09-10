@@ -20,11 +20,16 @@ branch: <remote branch>
 worktree: <absolute path or remote environment id>
 base: <full commit SHA>
 scope: <single-line bounded scope>
+scope-items: <comma-separated normalized non-overlapping owned paths/semantic atoms>
 timestamp: <UTC RFC 3339>
 -->
 ```
 
 Use a lowercase UUID for `claim-id`, a full 40-character commit for `base`, a single-line `scope`, and UTC RFC 3339 seconds for `timestamp`. Make `worker` identify the tool and session distinctly enough that a reader can tell two concurrent workers apart, including when both post under the same `github-actor`. Every field is required; use the literal `none` only for `github-actor` or `worktree` when genuinely unavailable. Never put credentials, host secrets, private prompts, or untrusted multiline content in the block.
+
+`scope-items` is required after workflow cutover. Legacy eligible claims retain their
+original prose scope; the bootstrap inventory normalizes it conservatively before any
+transfer rather than editing the historical claim.
 
 Save the returned GitHub comment URL. Immediately reread all `finch-work-claim:v1` events on the issue before editing. If two active claims overlap, the claim whose GitHub comment has the earlier `createdAt` wins; if equal, the lower numeric GitHub comment ID wins. The later claimant must post a `release` event and select non-overlapping work. Client-supplied `timestamp` never decides a collision.
 
@@ -95,7 +100,8 @@ the collision check before mutation.
 
 Delegated `scope-revise` uses the terminal-event author binding. A substitute needs an
 earlier immutable authorization from the original author naming the claim ID, substitute
-login, `scope-revise`, approved contract revision, and exact permitted new scope. Late,
+login, original worker, `scope-revise`, approved contract ID/URL/revision, and exact
+permitted new scope. The event must retain that original worker byte-for-byte. Late,
 edited, general, unrelated, or broader authorization is invalid.
 
 ## Transfer scope atomically
@@ -116,9 +122,12 @@ event-id: <lowercase UUID>
 transfer-id: <stable transfer UUID>
 claim-id: <parent or reserved child claim ID>
 worker: <exact worker identity>
-scope: <exact retained/delegated scope>
+retained-scope-items: <parent reservation only; comma-separated normalized atoms>
+expected-children: <parent reservation only; semicolon-separated claim|worker|github-actor|contract|branch|worktree|scope+atoms>
+expected-gates: <parent reservation only; comma-separated unique gate IDs>
+gate-map: <parent reservation only; comma-separated gate=child-claim@proof-path entries>
+scope-items: <child reservation only; comma-separated normalized atoms>
 contract-id: <approved contract ID>
-gate-map-url: <immutable exhaustive map URL>
 branch: <branch or none for parent reservation>
 worktree: <worktree or none>
 nonauthorizing: <true for child reservation; false otherwise>
@@ -133,6 +142,11 @@ with `handoff-reserve`, one `handoff-child-reserve`, and `handoff-activate`. Act
 atomically terminalizes the old claim and activates its exact successor; readiness then
 uses the corresponding IN_PROGRESS or REPAIR_IN_PROGRESS self-edge. Incomplete handoff
 leaves the original owner active. Client timestamps never decide either transaction.
+The retained scope plus all child scopes must be an exact, duplicate-free partition of the
+parent's normalized scope. Every expected gate appears exactly once, names an expected
+child, and has a proof path. A handoff has exactly one successor; a split may have several.
+Every expected child contract ID must resolve to an already admitted immutable approval;
+a contract-shaped string in the reservation is not approval evidence.
 
 For a same-contract split, use this collision-free order: check all active claims; create
 and approve immutable disjoint child contracts; append the parent reservation; append
@@ -162,6 +176,7 @@ disposition: <return-ready|blocked-external|needs-specification|infeasible|decli
 timestamp: <UTC RFC 3339>
 replacement-claim: <claim id or none>
 evidence-url: <immutable recovery/merge/disposition evidence URL>
+evidence-digest: <SHA-256 of that exact immutable evidence packet>
 authority-comment: <none or immutable prior GitHub comment URL>
 -->
 ```
@@ -172,6 +187,13 @@ After workflow cutover, this disposition set is closed. A voluntary release uses
 successful scoped work uses `slice-complete`; whole-outcome replacement uses
 `outcome-superseded`. `legacy` describes only valid pre-cutover terminal events. No other
 post-cutover disposition authorizes a terminal.
+
+The event/disposition matrix is closed: `release` accepts only `return-ready`,
+`blocked-external`, `needs-specification`, `infeasible`, or `declined`; `complete` accepts
+only `slice-complete`; and `supersede` accepts only `outcome-superseded`. A legacy terminal
+is valid only before cutover. `slice-complete` requires prior READY_TO_MERGE plus merge/tree
+proof. `outcome-superseded` requires the valid atomic whole-outcome transaction and typed
+replacement packet. A string-valued placeholder is not proof.
 
 For `return-ready`, `blocked-external`, `needs-specification`, `infeasible`, and
 `declined`, post the terminal first and the matching readiness event second. That event
@@ -189,7 +211,7 @@ author, and its `worker` must byte-for-byte equal the original claim's `worker`.
 Use `authority-comment: none` in that ordinary case. A different GitHub author is
 valid only when `authority-comment` links to an earlier, unedited comment by the
 original claim author that explicitly names the claim ID, the substitute GitHub
-login, and the permitted terminal event. Verify the linked comment directly and
+login, permitted terminal event and disposition. Verify the linked comment directly and
 record its immutable metadata before accepting the terminal event. A repository
 role, assignee, label, branch, or claimed coordinator title does not substitute
 for that authorization.

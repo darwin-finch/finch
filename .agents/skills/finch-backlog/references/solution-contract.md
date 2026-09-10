@@ -38,6 +38,7 @@ implementation-base: <full SHA>
 owner-worker: <stable worker/person identity>
 owner-github-actor: <GitHub login>
 scope: <bounded single-line file and semantic scope>
+sections: <observed_failure,intended_behavior,non_goals,invariants,boundaries,regression_proof,integration_proof,reversion_plan,hostile_cases,gate_ownership>
 timestamp: <UTC RFC 3339>
 -->
 ```
