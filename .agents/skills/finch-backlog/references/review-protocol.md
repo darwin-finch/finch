@@ -1,302 +1,124 @@
-# Finch review protocol
+# Finch corrective review protocol
 
-Review is iterative multi-perspective correction (IMPCD): the immutable reviewed solution
-contract is the target; a frozen implementation tip is an approximation; independently
-verified findings estimate residual error; reviewers return the smallest credible
-correction vector and deterministic proof; implementers reproduce coherent corrections;
-and the next exact-tip review measures the new approximation. Review is not an outcome and
-severity is not a rejection switch.
+Review is iterative multi-perspective correction (IMPCD). The approved immutable solution
+contract is the target, the frozen exact-tip patch is the current approximation, verified
+findings estimate residual error, correction sketches are correction vectors, and regressions
+and integration checks are objective measurements. Reviewers find and help repair; review is
+neither punishment nor an outcome by itself.
 
-Use this protocol for every solution contract and for exact-tip implementation review.
-An obvious isolated fix uses one fresh independent plan reviewer. Derive an expanded panel
-for broader or riskier work. See [solution contracts](solution-contract.md) and
-[issue readiness](issue-readiness.md).
+Use this for solution-contract review and exact-tip implementation review. The **claim base**
+is the immutable full SHA in the contract and claim; it anchors lineage and fail-before proof.
+The **integration base** is current `main` used for the candidate that will merge. The **exact
+tip** is a full commit SHA, never a moving branch.
 
-The **claim base** is the immutable full SHA in the approved contract and work claim. It
-anchors historical diff and fail-before evidence. The **integration base** is current
-`main` used for the candidate that will merge. Record both; rebasing never rewrites the
-claim base. The **exact tip** is always a full commit SHA, never a moving branch name.
+## Review the solution before production work
 
-## 1. Review the solution before production edits
+Before any production branch, worktree, claim, mutation, or implementation, a fresh reviewer
+tries to disprove the contract's behavior, scope, authority, and proof. An obvious isolated fix
+uses one reviewer and a compact but complete contract. Expand perspectives only for actual risk.
+Every confirmed design blocker receives a concrete failure and smallest credible correction.
+Record immutable `APPROVE` only after all blockers are repaired. A changed outcome, gate, file,
+authority boundary, or proof requires a new contract revision, approval, collision check, and
+whole-claim replacement before edits resume.
 
-After a valid claim and before editing production files, verify the contract identity,
-approval, and required content. Give each selected plan perspective a fresh reviewer:
+## Derive independent perspectives from the diff
 
-- **Correctness:** the behavior resolves the reproduction and gates.
-- **Architecture and scope:** ownership/API/file boundaries are coherent and narrow.
-- **Lifecycle, authority, and persistence:** cancellation, restart, identity, permission,
-  concurrency, or durable transitions cannot invalidate the plan.
-- **Testability:** regression fails on the claim base and current-main integration is
-  demonstrable at the real boundary.
-
-Every plan finding names a concrete failure or architectural contradiction and a smallest
-credible correction. Resolve confirmed design blockers and record immutable `APPROVE`
-before edits. A scope-changing discovery stops edits and requires collision recheck,
-immutable contract revision and approval, then append-only claim-scope revision.
-
-## 2. Derive implementation perspectives from the diff
-
-Review `git diff <integration-base>...<exact-tip>` and include every matching row. The
-claim base is used only for lineage and fail-before proof; using it for the current panel
-would import unrelated upstream changes after `main` advances. Recompute
-after each repair because the panel is not inherited. Record every selected perspective
-and why every skipped perspective does not apply.
+Review `git diff <integration-base>...<exact-tip>` and include each applicable perspective:
 
 | Perspective | Include when the diff contains |
 |---|---|
 | Correctness | any behavioral change |
-| Concurrency and timing | shared state, locks, async tasks, cancellation, retries, process lifecycle |
-| Persistence and format | on-disk layout, schema, serialization, migration, retention |
-| Authority and permission | capabilities, credentials, tool gating, peer or remote surfaces |
-| Resource and lifecycle | descriptors, processes, memory growth, unbounded accumulation |
-| Compatibility | public API, protocol, config, or another branch's consumed surface |
-| Test quality | always, including fail-before evidence on the claim base |
+| Concurrency/timing | shared state, async work, cancellation, retries, process lifecycle |
+| Persistence/format | durable data, serialization, migration, retention |
+| Authority/permission | capabilities, credentials, tools, claims, remote effects |
+| Resource/lifecycle | descriptors, processes, memory, unbounded accumulation |
+| Compatibility | public API, protocol, config, or another branch's interface |
+| Test quality | always; prove the regression fails on the claim base |
+| User-visible integration | artifacts, TUI/CLI/API behavior, deployment, release path |
 
-## 3. Review independently and safely
+Record selected perspectives and a concrete reason for every skip. Give each selected
+perspective a fresh context and complete task packet. Reviewers inspect a frozen commit and do
+not mutate the implementation worktree. Disposable exact-tip copies may be used for bounded
+tests or prototypes but may not push, read credentials, perform undeclared external actions,
+merge/cherry-pick, or retain production commits.
 
-Each perspective gets its own fresh context and complete [task packet](task-packet.md).
-Reviewers do not see one another's findings before discovery completes. They verify the
-exact tip exists and keep the implementation branch/worktree frozen and read-only for the
-whole round. They must not edit, commit, push, merge, or cherry-pick there.
+A required unavailable reviewer is recorded `UNAVAILABLE` with the reason. Try at most one
+bounded fresh-context fallback. If it also fails, the gate remains unresolved unless the
+repository owner explicitly accepts the named risk.
 
-A reviewer may prototype only at the frozen exact tip in a disposable isolated worktree
-and disposable branch. Prototype authority excludes pushes, credentials, undeclared
-external effects, merge, cherry-pick, and mutation of the implementation worktree. Delete
-or abandon the disposable prototype after retaining only its finding ID, minimal sketch,
-affected invariant, deterministic command/result, and contract fit. The implementer must
-reproduce the correction on the unfrozen implementation branch; prototype commits are
-never integrated directly.
+## Record and verify findings
 
-If an assigned independent reviewer is unavailable, make one bounded replacement attempt
-with a fresh reviewer holding the same packet and perspective. Never substitute author
-self-review or omit a required perspective. If the replacement or separate verifier is
-also unavailable, record the attempts, exact missing evidence, resumption condition, and
-nearest independent work; transition the outcome to `BLOCKED_EXTERNAL` and keep the issue,
-pull request, claim evidence, and ledger open.
+Each finding has a stable ID that survives restatement and repair, plus:
 
-## 4. Verify findings and maintain stable identity
+- concrete input/state/interleaving and wrong outcome;
+- smallest credible correction vector and deterministic proof;
+- affected invariant and whether the repair fits the approved contract;
+- five independent axes:
+  `confidence = CONFIRMED | PLAUSIBLE`,
+  `severity = CRITICAL | HIGH | MEDIUM | LOW`,
+  `locality = SAME_CONTRACT | INDEPENDENT`,
+  `obligation = BLOCKER | REGRESSION_DEBT | NONBLOCKING`, and
+  `state = OPEN | RESOLVED | REPLACED-BY | SPLIT-TO`.
 
-Discovery and verification are separate passes. A verifier who did not originate the
-finding tries to disprove its concrete input/state/interleaving-to-wrong-outcome scenario.
-Every concern receives one stable finding ID when first recorded, including PLAUSIBLE
-concerns. Each append-only event for that ID carries five independent axes:
+A separate verifier tries to disprove the finding by tracing guards, callers, authority, and
+tests at the exact tip. `CONFIRMED` means the failure survives; `PLAUSIBLE` records the open
+question and counterargument. The axes never imply one another. Finding count and severity
+prioritize repair but never cancel, close, waive, resolve, reject, or automatically split a
+finding. Replacement and split records do not discharge an obligation.
 
-- **confidence:** `CONFIRMED | PLAUSIBLE`;
-- **severity:** `CRITICAL | HIGH | MEDIUM | LOW`;
-- **locality:** `SAME_CONTRACT | INDEPENDENT`;
-- **obligation:** `BLOCKER | REGRESSION_DEBT | NONBLOCKING`;
-- **state:** `OPEN | RESOLVED | REPLACED-BY | SPLIT-TO`.
+Every confirmed `SAME_CONTRACT` `BLOCKER` and required `REGRESSION_DEBT` stays in bounded
+same-contract repair. Only a causally separable concern may become an independent follow-up,
+and then it needs an approved contract, disjoint claim, owner, regression, and integration
+proof. Each original acceptance gate retains exactly one current owner and proof path through
+successor leaves until the leaf is merged and proven on current main. Reviewers check this
+accounting explicitly; no tool derives it.
 
-Changing confidence, severity, locality, obligation, or state appends an event under the
-same finding ID. It never overwrites history or implicitly changes another axis.
-`NONBLOCKING` is an obligation, not a state. A confirmed failure of an approved gate may
-not be `NONBLOCKING`. `PLAUSIBLE` records the verifier's counterargument and cannot block
-on confidence alone; `CONFIRMED` records the verified scenario and proof.
+## Repair and converge finitely
 
-Severity estimates impact only and orders repair/escalation priority:
+A review round freezes one exact tip, re-derives perspectives, independently samples them,
+verifies findings, and records the ledger. The implementer reproduces coherent correction
+vectors on the implementation worktree. Any production change creates a new tip and requires
+affected tests and review again.
 
-- `CRITICAL`: security, privacy, authority, credentials, unrecoverable data loss, or
-  equivalent catastrophic failure;
-- `HIGH`: material user-visible correctness, durability, compatibility, or lifecycle;
-- `MEDIUM`: bounded correctness, recovery, portability, or required-regression failure;
-- `LOW`: diagnostics, maintainability, or test clarity without a current wrong outcome.
+Track attempts by stable finding ID. If the same blocker survives two competent repairs, stop
+that implementation epoch. Run one bounded independent diagnosis or disposable prototype, then
+change strategy, representation, contract, assignment, or executable split. Repeating the same
+repair is not progress, and agent failure never proves infeasibility.
 
-Severity and finding count never independently block, resolve, terminate, reject, or cancel
-an outcome. Confidence says whether evidence verifies the scenario; obligation says whether
-the contract must discharge it; lifecycle state records its append-only progress.
+The finite convergence rule is exact:
 
-## 5. Classify locality, obligation, and successors
+1. resolve every transitive confirmed same-contract blocker and required regression-debt leaf;
+2. verify that ledger is zero;
+3. run exactly one fresh independent clean pass against the frozen exact tip;
+4. converge only if it finds no new confirmed blocker.
 
-Causal lineage and approved acceptance gates take precedence over changed-file or
-subsystem location. A finding caused by the claimed implementation or any repair, or
-required for a parent gate, is `SAME_CONTRACT`, including a repair-caused cross-subsystem
-finding. If it exceeds the current branch scope, revise the immutable contract and claim or
-transfer it to a separately claimed child; never relabel it independent to unblock a merge.
+Do not run another review of that unchanged blocker-free tip. There is no fixed-round
+cancellation and no requirement that count or worst severity monotonically decrease. If the
+clean pass finds a blocker, reopen its stable ledger entry, repair it, and repeat from a new tip.
 
-`SAME_CONTRACT` describes obligation, not implementation ownership. It may be implemented
-by a child through `SPLIT-TO` while remaining in the parent's completion ledger.
-`INDEPENDENT` requires evidence that the concern is causally separable and every approved
-parent gate stands without it. Record an actionable independent concern as a durable
-`NONBLOCKING` follow-up with its own issue/owner. Independent findings do not use
-`SPLIT-TO`, because they transfer no parent obligation.
+## Frozen-tip corrective disposition
 
-Only an independently verified `RESOLVED` event with current-main proof discharges an
-obligation. `REPLACED-BY` names one or more successor finding IDs and transfers all source
-obligation/evidence. `SPLIT-TO` names one or more already-created child issue and claim IDs,
-maps every inherited gate and proof, and transfers implementation ownership. Both are
-non-discharging: the source remains recursively unresolved until every successor leaf is
-independently `RESOLVED` on current main. Follow replacement, return, and nested split
-chains transitively; reject missing or cyclic references.
+The seven confirmed findings at frozen tip
+`372f32e08614b99083072356b2d004a510d9cca9` are repaired, not waived:
 
-Before a split event, create and link disjoint child issues, allocate every original gate
-exactly once, preserve or transfer valuable commits, establish collision-free claims and
-worktrees for every child, and start the immediate next slice. Only then append `SPLIT-TO`
-and any parent claim-scope revision. The collision-free order is: repository-wide claim
-check; immutable child contracts/approvals; parent split reservation; nonauthorizing child
-reservations and collision recheck; exact gate/proof mapping; parent activation; parent
-finding transition; parent scope-revision event. Until activation the parent remains the
-only mutation owner. A proposed future split or closed pull request is not executable.
+- `F406-R3-001`: remove machine admission of contract approvals; retain literal immutable
+  contract identity and independent procedural verification.
+- `F406-R3-002`: remove caller booleans and prepared-proof inputs that purported to authorize
+  readiness or supersession; use the reviewed readiness checklist.
+- `F406-R3-003`: remove terminal pairing automation; retain v1 issuer, worker, and immutability
+  verification in the existing claim procedure.
+- `F406-R3-004`: remove purported atomic handoff; use serialized no-overlap transfer.
+- `F406-R3-005`: do not let wrong, edited, duplicate, or merely linked successors discharge
+  gates; require exhaustive ownership and proof through current-main leaves.
+- `F406-R3-006`: remove evidence-derived convergence; use recorded exact-tip review and tests.
+- `F406-R3-007`: remove proxy, legacy-bootstrap, and cutover mechanisms that trusted invented
+  identities. Any future authenticated audit service is separate approved product work.
 
-Completion performs an exhaustive partition of every original acceptance gate: each gate must be directly proven at current main or mapped exactly once through a valid successor
-chain whose leaves are proven there. Reject omitted, duplicated, unclaimed, cyclic, or
-unresolved leaves. Independent follow-ups remain outside this parent partition.
+## Verdict and record
 
-## 6. Run bounded repair epochs
-
-A round starts by freezing and naming the exact tip and ends only after all selected
-perspectives report, separate verification completes, and an append-only round record and
-ledger events exist. Each finding carries its stable ID, five axes, scenario, owning
-concern, first round, correction vector, regression proof, and disposition.
-
-The implementer applies confirmed same-contract `BLOCKER` corrections and required
-`REGRESSION_DEBT`; reviewers do not. `NONBLOCKING` work does not silently widen the patch.
-Rising counts, unchanged worst severity, a vague concern decomposing into several precise
-ones, and defects revealed on repaired lines are evidence to classify and prioritize—not
-automatic stop conditions.
-
-When the same stable blocker survives two competent repair attempts, end that repair
-epoch and run exactly one bounded independent diagnosis or safe reviewer prototype. Then
-publish and approve an immutable strategy revision or perform the executable split above.
-If the fallback fails, cannot run, or requires missing authority, report the exact blocker
-and resumption condition as genuinely `BLOCKED_EXTERNAL`; keep the outcome and evidence
-open. Never cancel, reject, close, or waive the blocker.
-
-Six implementation rounds in one epoch force the same representation change: bounded
-diagnosis followed by immutable recontract or executable split. Six is not a merge cap,
-`DO NOT MERGE` trigger, cancellation rule, or permission to waive findings.
-
-Review converges when all transitive same-contract `BLOCKER` and required
-`REGRESSION_DEBT` leaves are independently resolved on the current integration base, then
-one fresh clean exact-tip pass finds no new blocking obligation. This clean pass is the
-finite endpoint; do not repeat it indefinitely. If the first implementation pass is clean,
-one fresh independent second pass at the same tip supplies this confirmation.
-
-## 7. Record the round and verdict
-
-One append-only pull-request comment per round records exact tip; claim and integration
-bases; selected/skipped perspectives; every finding ID and five axes; scenario and
-verification; correction vector; successor links; transitive unresolved ledger; and
-whether repair, recontract, split, or fallback is underway.
-
-Use the durable records below. GitHub `createdAt`, numeric comment ID, then block order is
-the canonical event order. Retain author, edit metadata, raw-body digest, and URL alongside
-each record. Validate authentication, structure, enums, cross-record identity, and prior
-event before admitting an event. Invalid attempts are diagnostics and do not consume IDs
-or create forks; changed/deleted accepted history, incomplete retrieval, or multiple valid
-successors makes the affected history `INDETERMINATE` and nonauthorizing.
-
-```text
-<!-- finch-review-round:v1
-event-id: <lowercase UUID>
-round-id: <stable ID>
-ledger-id: <stable ID>
-issue: <number>
-pull-request: <number>
-claim-id: <claim ID>
-contract-id: <contract ID>
-contract-url: <immutable URL>
-contract-digest: <SHA-256>
-claim-base: <full SHA>
-integration-base: <full current-main SHA>
-panel-diff-base: <same full integration-base SHA>
-exact-tip: <full SHA>
-round-number: <positive integer>
-selected-perspectives: <comma-separated set>
-skipped-perspectives: <comma-separated set with reasons in prose>
-status: <DISCOVERY|VERIFICATION|REPAIR_IN_PROGRESS|CONVERGED>
-verdict: <none|SAFE_TO_MERGE|ESCALATE_WITH_EXECUTABLE_REPAIR_OR_SPLIT>
-finding-event-ids: <comma-separated IDs or none>
-zero-ledger: <true only after transitive reduction reaches zero>
-fresh-clean-pass: <true only for the required post-zero independent pass>
-prior-zero-ledger-round-id: <earlier exact-tip round that first proved zero, or none>
-gate-evidence-url: <immutable URL>
-timestamp: <UTC RFC 3339>
--->
-```
-
-```text
-<!-- finch-review-finding:v1
-event-id: <lowercase UUID>
-finding-id: <stable ID>
-ledger-id: <ledger ID>
-round-id: <round ID>
-issue: <number>
-pull-request: <number>
-claim-id: <claim ID>
-contract-id: <contract ID>
-prior-event-id: <previous event for this finding or none>
-confidence: <CONFIRMED|PLAUSIBLE>
-severity: <CRITICAL|HIGH|MEDIUM|LOW>
-locality: <SAME_CONTRACT|INDEPENDENT>
-obligation: <BLOCKER|REGRESSION_DEBT|NONBLOCKING>
-state: <OPEN|RESOLVED|REPLACED-BY|SPLIT-TO>
-exact-tip: <full SHA>
-scenario-evidence-url: <immutable scenario/proof URL>
-affected-gate-ids: <comma-separated IDs or none>
-successor-finding-ids: <comma-separated IDs or none>
-child-claim-ids: <comma-separated IDs or none>
-owner: <accountable worker/person>
-timestamp: <UTC RFC 3339>
--->
-```
-
-A `RESOLVED` event's immutable scenario/proof evidence must additionally bind the
-independent verifier, exact tip, integration base, and current-main proof when completing
-an outcome. `REPLACED-BY` may populate only successor finding IDs. `SPLIT-TO` may populate
-only child claim IDs. Mixing those namespaces is invalid.
-
-Child-claim leaves use a typed proof record. Prior ownership must remain verifiable after
-the child terminalizes; only `slice-complete` plus merge and current-main proof discharges
-it. An active but unmerged child remains unresolved.
-
-```text
-<!-- finch-successor-claim-proof:v1
-claim-id: <child claim ID>
-ownership-valid: <true after claim-history reduction>
-active-claim: <true|false>
-terminal-claim: <true|false>
-disposition: <slice-complete or none>
-merge-proof: <true|false>
-current-main-proof: <true|false>
-affected-gate-ids: <unique comma-separated IDs>
-timestamp: <UTC RFC 3339>
--->
-```
-
-Every finding event repeats all five axes; an update may change one without implicitly
-changing any other. A newly discovered finding uses `prior-event-id: none`. Later events
-must name the single accepted predecessor. Round/finding issue, contract, ledger, tip, and
-successor identities must agree. Only `CONFIRMED + SAME_CONTRACT + (BLOCKER or required
-REGRESSION_DEBT) + non-RESOLVED` enters the blocking ledger. A PLAUSIBLE BLOCKER therefore
-retains identity and evidence but cannot prevent merge unless later confirmed.
-
-Round reduction binds every admitted finding to the round's issue, pull request, claim,
-contract, ledger, and exact tip. `DISCOVERY` and `VERIFICATION` have no final verdict;
-`REPAIR_IN_PROGRESS` may record the executable-escalation verdict; only `CONVERGED` may
-record `SAFE_TO_MERGE`, and only when `zero-ledger` and `fresh-clean-pass` are true and the
-named prior zero-ledger round has the same issue/PR/claim/contract/ledger/base/tip identity.
-The round's finding-event set must equal the reduced ledger. Foreign, omitted, open, or
-transitively unresolved obligations prevent convergence.
-
-There are exactly two final review verdicts:
-
-- **SAFE TO MERGE** — convergence and every merge gate are satisfied at the exact tip.
-- **ESCALATE WITH EXECUTABLE REPAIR/SPLIT** — a concrete correction, recontract, or already
-  executable split continues, or the exact external blocker/resumption condition is open.
-
-`REPAIR IN PROGRESS` is a nonfinal status. `MERGE WITH FIXES` and `DO NOT MERGE` are not
-final verdicts. Review never terminalizes an issue or claim.
-
-Before `SAFE TO MERGE`, integrate onto current `main`, record the integration-base SHA,
-rerun affected gates, independently review that exact tip, and exercise the actual binary,
-generated artifact, deployed process, or documentation tree as applicable. After merge,
-synchronize current main and prove the merged artifact was rebuilt from the merge commit
-or that its tree is equivalent to the reviewed tip; then demonstrate the user-visible
-outcome. Only this post-merge current-main identity proof can support issue completion.
-
-## Reviewer constraints
-
-- Run Cargo only through `scripts/with-cargo-slot`; reading normally needs no build.
-- Stop if the exact tip is unavailable instead of reviewing a nearby revision.
-- Report work owned by another active claim; do not fix it.
-- Never access credentials or perform undeclared external effects.
+Record the claim base, integration base, exact tip, selected/skipped perspectives, reviewer
+identities, `UNAVAILABLE` fallbacks, every finding and successor, repair attempts, regressions,
+zero-ledger proof, and the single clean pass. `SAFE TO MERGE` is a coordinator/reviewer
+procedural conclusion only after these checks and all contract gates pass. It is not ownership,
+authentication, or merge authority. The active `finch-work-claim:v1` and explicit task authority
+remain controlling.

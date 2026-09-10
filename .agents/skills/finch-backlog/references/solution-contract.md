@@ -1,31 +1,45 @@
 # Finch solution-contract protocol
 
-Every production change starts from an immutable, explicitly approved solution contract.
-The contract is the outcome and constraint boundary against which claims, implementation,
-review findings, regressions, integration, and completion are evaluated. A branch or pull
-request is not a contract.
+Every production change starts from an immutable, explicitly approved solution contract. It
+defines the observable outcome, constraints, gates, and proof against which claims,
+implementation, findings, integration, and completion are reviewed. A branch or PR is not a
+contract, and a contract is not mutation ownership.
 
-## Contract identity
+## Identity and approval checklist
 
-Publish the contract as an append-only GitHub issue comment. Record all of:
+Publish the contract as an append-only GitHub issue comment and independently verify:
 
-- contract ID, revision, issue-comment URL and numeric comment ID;
-- SHA-256 digest of the exact comment body and its unedited GitHub metadata;
-- full 40-character claimed implementation-base SHA;
-- contract owner and plan-reviewer identity;
-- immutable approval-comment URL and explicit `APPROVE` verdict.
+- stable contract ID and revision, numeric comment URL/ID, unedited metadata, and SHA-256 of
+  the exact raw body;
+- full claim-base SHA, owner identity, exact bounded scope, and superseded revision if any;
+- a separate immutable approval comment binding that ID, URL, digest, revision, and base;
+- a fresh independent reviewer identity and explicit `APPROVE` verdict; and
+- complete retrieval with no edited, deleted, mismatched, duplicate, or ambiguous artifact.
 
-A revision is a new immutable comment that names the contract it supersedes. Never edit a
-contract or approval. Verify both comments and their digests before a readiness transition,
-task handoff, production edit, scope revision, and merge. The immutable claim base remains
-the historical base for regression and review lineage; record the current integration base separately
-and never rewrite the claim or contract to make them match.
+The coordinator records the checklist decision. A parser, status tool, label, or caller-provided
+boolean cannot authenticate the artifacts or grant `READY`. Recheck the literal immutable
+identities before task handoff, production edit, scope change, and merge. Keep the claim base
+for historical regression lineage and record current integration base separately.
 
-The contract and its review are separate append-only events. GitHub observation metadata
-(`author`, `createdAt`, `updatedAt`/`lastEditedAt`, numeric comment ID, raw body digest, and
-block order) is retained outside the block and verified before admission. The digest is of
-the complete raw contract comment, so it is recorded by the approval rather than inside the
-body it hashes.
+## Retained PR #542 protocol gates
+
+- `P542-01`: issue readiness, candidate correction, and finding attributes are distinct concepts.
+- `P542-02`: procedural READY requires an immutable solution contract and fresh independent approval before any production branch, worktree, claim, mutation, or implementation. The coordinator records the checklist decision; no status script grants authority.
+- `P542-03`: reviewers are find-and-help partners; every confirmed finding includes a stable ID, concrete failure, smallest credible correction vector, deterministic proof, affected invariant, and contract-fit assessment.
+- `P542-04`: confidence, severity, locality, obligation, and lifecycle axes remain independent and append-only.
+- `P542-05`: severity and finding count prioritize work but never cancel, close, waive, resolve, reject, or automatically split it.
+- `P542-06`: confirmed same-contract blockers and required regression debt stay in bounded repair; only causally separable concerns become owned independent follow-ups.
+- `P542-07`: replacement and split records do not discharge obligations. Every original acceptance gate keeps exactly one current owner and proof path until its leaf is merged and proven. This is an accounting discipline checked by reviewers/coordinator, not a reducer-derived fact.
+- `P542-08`: when the same stable blocker survives two competent repair attempts, end the implementation epoch, run one bounded independent diagnosis/prototype, and change strategy, representation, contract, assignment, or executable split. Agent failure never proves infeasibility.
+- `P542-09`: review converges only when the transitive same-contract blocker/regression ledger is zero and exactly one fresh independent clean exact-tip pass finds no new confirmed blocker. Do not keep reviewing that frozen blocker-free tip.
+- `P542-10`: task packets explicitly name edit, prototype, external action, push, merge, issue closure, terminal-event, and cleanup authority.
+- `P542-11`: outcome completion requires current-main merge, every accepted gate, ticket closure, current artifact/user-visible proof, valid claim terminal, safe cleanup, and frontier recomputation.
+- `P542-12`: a narrowed PR slice may merge while a broader parent remains open for concretely owned successors; PR integration and outcome completion are distinct.
+- `P542-13`: `finch-work-claim:v1` remains the sole mutation-ownership authority. There is no deferred cutover.
+- `P542-14`: obvious isolated fixes use compact contracts and one fresh plan reviewer; additional perspectives are derived only from actual diff risk.
+- `P542-15`: reviewer/discovery prototypes use an isolated disposable worktree/copy at the frozen tip and never mutate the implementation worktree, push, read credentials, perform undeclared external effects, merge/cherry-pick, or retain production commits.
+- `P542-16`: a required unavailable reviewer is recorded `UNAVAILABLE` with reason and gets at most one bounded fresh-context fallback; failure leaves the gate unresolved unless the repository owner explicitly accepts the named risk.
+- `P542-17`: pre-cutover wording is removed. Any scope expansion requires a revised immutable approved contract, a complete repository-wide v1 collision check, and an issuer-authorized whole-claim replacement covering the new scope before edits, followed by another collision check.
 
 ```text
 <!-- finch-solution-contract:v1
@@ -43,61 +57,54 @@ timestamp: <UTC RFC 3339>
 -->
 ```
 
-```text
-<!-- finch-solution-contract-approval:v1
-event-id: <lowercase UUID>
-issue: <number>
-contract-id: <stable ID>
-contract-url: <immutable numeric-comment URL>
-contract-digest: <SHA-256 of exact raw contract comment>
-contract-revision: <positive integer>
-implementation-base: <full SHA>
-reviewer-worker: <fresh independent worker identity>
-reviewer-github-actor: <responsible GitHub login>
-verdict: <APPROVE|REVISE>
-review-output-url: <immutable review evidence URL>
-authority-comment: <prior operation-specific delegation URL or none>
-timestamp: <UTC RFC 3339>
--->
-```
-
-An approval is admitted only after its contract is admitted. It must bind the exact ID,
-URL, digest, revision, and base. Its GitHub author must be the reviewer actor, unless an
-earlier immutable delegation names the contract, reviewer worker, substitute poster, one
-verdict, and output identity. The contract author, coordinator, and implementer workers
-cannot approve their own contract. Invalid attempts do not consume IDs or predecessors.
-Edited/deleted accepted events, incomplete retrieval, or two valid successors from one
-revision make the affected history `INDETERMINATE` and nonauthorizing.
+Approval is recorded in human-readable immutable prose with the exact identity fields above,
+reviewer, verdict, failure analysis, and correction disposition. It deliberately does not form
+a machine admission or proxy-authorization record. If a coordinator posts a reviewer's result,
+the prose names both identities and reviewers independently verify the record.
 
 ## Required content
 
-Both compact and full contracts state:
+Compact and expanded contracts both state:
 
-- reproduced failure at the production boundary and the observable user outcome;
-- explicit non-goals and accepted constraints;
-- invariants and every acceptance gate, each with exactly one current owner and proof path;
-- ownership, API boundary, and exact files allowed and excluded;
+- reproduced failure at the production boundary and observable user outcome;
+- explicit non-goals, accepted constraints, invariants, hostile cases, and assumptions;
+- every acceptance gate, each with exactly one current owner and proof path;
+- ownership/API boundary and exact allowed/excluded files;
 - deterministic fail-before/pass-after regression and why the claim base fails;
-- current-main integration plus artifact, tree-equivalence, or user-visible proof;
-- inherited work and how it is reused, narrowed, or superseded;
-- finite hostile cases, deletion/reversion plan, and assumptions needing validation.
+- current-main integration plus artifact/tree-equivalence/user-visible proof;
+- inherited work and how it is reused, narrowed, or conservatively superseded; and
+- finite review, reversion/deletion, safe cleanup, closure, and frontier accounting.
 
-An obvious isolated fix may use a compact contract, but it still contains every item above
-and receives one fresh independent plan reviewer. Risk determines additional perspectives:
-nontrivial, broad, cross-subsystem, security, authority, persistence, provider, credential,
-destructive, concurrency, compatibility, or lifecycle work gets the applicable expanded
-panel from [the review protocol](review-protocol.md). Resolve every confirmed design blocker
-and record explicit approval before production edits.
+An obvious isolated fix may use a compact expression of every item and one fresh plan reviewer.
+Additional perspectives are derived only from actual correctness, authority, persistence,
+compatibility, lifecycle, concurrency, or test risk.
 
-The reviewed contract is immutable. If evidence changes the outcome, constraints, files,
-ownership, API boundary, gates, or proof, stop production edits. Recheck repository-wide
-claim collisions, publish a new contract revision, obtain fresh approval, then append the
-corresponding claim-scope revision before resuming.
+The approved contract is immutable. If evidence changes outcome, constraints, files, ownership,
+API boundary, gates, or proof, stop edits. Publish a new revision and obtain fresh approval,
+perform a repository-wide v1 collision check, publish an issuer-authorized whole-claim
+replacement covering the complete new scope, and repeat collision checking before edits.
 
-## Discovery contract
+## Discovery and unavailable review
 
-Work in `NEEDS_SPECIFICATION` uses a compact discovery contract, not a production solution
-contract. It records reproduction evidence, the exact missing decision, a concrete question,
-the decision owner, the nearest minimally specified outcome, and a bounded read-only or
-disposable-prototype plan. It grants no production mutation authority. See
-[issue readiness](issue-readiness.md).
+`NEEDS_SPECIFICATION` may use a compact discovery contract recording reproduction evidence,
+the exact missing decision, a concrete question, decision owner, nearest minimally specified
+outcome, and a bounded read-only or isolated disposable-prototype plan. It grants no production
+mutation authority. Prototypes never alter the implementation worktree, push, read credentials,
+make undeclared external effects, merge/cherry-pick, or retain production commits.
+
+Record a required unavailable reviewer as `UNAVAILABLE` with the reason and try at most one
+bounded fresh-context fallback. Failure keeps the gate open unless the repository owner
+explicitly accepts the named risk.
+
+## Successor and completion discipline
+
+Splits and replacements never discharge acceptance obligations. Before handoff, enumerate
+exhaustive disjoint scopes and preserve one owner/proof path for every gate through its merged,
+current-main leaf. Use the conservative serialized claim procedure in
+[work claims](work-claims.md); do not represent the transition as atomic.
+
+Completion is current-main and user-visible, not a contract, status, or review declaration.
+It requires every accepted gate, merge/current-main identity, current artifact or visible proof,
+claim terminal, ticket closure, safe cleanup, and post-closure frontier accounting in the order
+the controlling contract specifies. A narrow PR may integrate while its parent remains open for
+owned successors.

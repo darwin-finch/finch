@@ -1,199 +1,106 @@
-# Finch issue-readiness protocol
+# Finch issue-readiness checklist
 
-Issue readiness answers whether an outcome is sufficiently defined and feasible. It is
-orthogonal to candidate correction and to a review finding's attributes: readiness is never
-a finding label or blocker state, and a review finding never silently changes feasibility.
-Append one immutable `finch-issue-readiness:v1` event for each valid transition.
+Issue readiness asks whether an outcome is sufficiently defined and feasible. Candidate
+correction asks whether a proposed change meets the contract. Finding attributes describe one
+review concern. These are independent concepts: no finding count, severity, candidate result,
+or failed attempt changes readiness or feasibility by implication.
+
+This is a procedural checklist recorded by accountable workers. It does not authenticate
+GitHub, grant mutation ownership, authorize merge, or derive a state from caller assertions.
+`finch-work-claim:v1` remains the sole mutation-ownership authority.
 
 ## Lifecycle
 
-| State | Required evidence and owner | Permitted exits and open/closed rule |
+The primary communication sequence is:
+
+`DRAFT -> NEEDS_SPECIFICATION -> READY -> IN_PROGRESS -> REPAIR_IN_PROGRESS -> READY_TO_MERGE -> COMPLETE`
+
+Evidence-backed side states are `BLOCKED_EXTERNAL`, `INFEASIBLE`, `DECLINED`, and
+`SUPERSEDED`. Each record names the entry evidence, accountable owner, permitted next action,
+exit condition, and whether the issue remains open.
+
+| State | Entry evidence and owner | Exit and next action |
 |---|---|---|
-| `DRAFT` | Desired outcome; proposer or coordinator owns clarification. | `NEEDS_SPECIFICATION` for bounded discovery, or `READY` after approval. Remains open. |
-| `NEEDS_SPECIFICATION` | Discovery contract with reproduction evidence, exact missing decision, concrete question, decision owner, nearest minimally specified outcome, and bounded read-only/disposable-prototype plan. | `READY` through an immutable approved solution contract; `BLOCKED_EXTERNAL`; `INFEASIBLE` evidence awaiting owner decision; owner-authorized `DECLINED`; or concrete `SUPERSEDED`. Remains open. No production claim or production implementation branch is permitted. |
-| `READY` | Immutable approved solution contract; event names its URL/comment ID, digest, revision, implementation base, plan reviewer, and approval URL. | `IN_PROGRESS` after a valid production claim, or an evidenced side state. Remains open. Only `READY` work may acquire a production claim or branch. |
-| `IN_PROGRESS` | Valid active `finch-work-claim:v1` whose bounded scope implements the approved contract. | `REPAIR_IN_PROGRESS`, `READY_TO_MERGE`, or an evidenced side state. Remains open. |
-| `REPAIR_IN_PROGRESS` | Frozen exact tip, round record, nonempty same-contract obligation ledger, and assigned correction vectors. | `IN_PROGRESS` after recontract/split, `READY_TO_MERGE` after convergence, or `BLOCKED_EXTERNAL`. It is progress, never rejection; remains open. |
-| `READY_TO_MERGE` | Narrowed contract satisfied; fail-before/pass-after regression; all transitive `BLOCKER` and required `REGRESSION_DEBT` leaves independently `RESOLVED`; one fresh clean exact-tip convergence pass; affected gates on the current integration base; and actual artifact or tree-identity proof. | `COMPLETE` after integration, or back to `REPAIR_IN_PROGRESS` if the tip/base changes or a blocker opens. Remains open. |
-| `COMPLETE` | Current-main merge; every original gate including transferred successors satisfied; issue closed; valid claim terminal event; rebuilt/deployed artifact where applicable; user-visible proof; proven-safe worktree cleanup; frontier recomputation. | Terminal successful state. The outcome closes only when the event and issue closure agree. |
-| `BLOCKED_EXTERNAL` | Evidence, attempted work, external owner, exact resumption condition, and nearest independent work. | Resume to the last justified primary state when the condition holds, or another evidenced side state. Keep open and recheck on every frontier recomputation; age never implies abandonment or infeasibility. |
-| `INFEASIBLE` | Desired outcome, accepted constraints, reproduction, attempted approaches and why each fails, contradiction/platform evidence, nearest achievable alternative, and smallest constraint change. | Contract owner accepts the disposition and decides closure, revises constraints back to `NEEDS_SPECIFICATION`, or supersedes it. Agent or implementation failure is insufficient. Keep open until owner disposition. |
-| `DECLINED` | Contract-owner decision that a technically possible outcome will not be pursued, with rationale, consequences, and nearest alternative. | Owner may authorize closure or return it to specification. Only the contract owner may authorize this state. |
-| `SUPERSEDED` | Existing replacement issue, approved contract, and valid claim ownership for every inherited gate, plus recovery information for valuable commits/evidence. | Closes only after exhaustive ownership transfer. A proposed rewrite is insufficient. |
+| `DRAFT` | Desired outcome; proposer/coordinator owns clarification. | Remain open; specify it or complete the readiness checklist. |
+| `NEEDS_SPECIFICATION` | Reproduction, missing decision, concrete question, decision owner, nearest outcome, bounded discovery plan. | Remain open; read-only discovery or disposable prototype only, then contract review. Reject production mutation. |
+| `READY` | Coordinator verified the exact immutable complete contract and fresh approval, including URL, digest, revision, claim base, scope, gates, reviewer, and approval URL. | Remain open; acquire and collision-check a valid v1 claim before production work. |
+| `IN_PROGRESS` | Valid active v1 claim implementing the approved contract. | Remain open; prove the candidate, enter repair, or record an evidenced side state. |
+| `REPAIR_IN_PROGRESS` | Frozen exact tip, verified findings, stable ledger IDs, correction vectors, owners, and attempt counts. | Remain open; repair under the same contract, change strategy after two failed competent attempts, or reach merge readiness. |
+| `READY_TO_MERGE` | Zero transitive same-contract blocker/regression ledger, exactly one fresh clean exact-tip pass, regressions and affected gates on current integration base, and artifact/tree proof. | Remain open; merge if task authority permits, or return to repair when tip/base/evidence changes. |
+| `COMPLETE` | All controlling ordered completion evidence exists on current main, including gates, claim terminal, closure, visible proof, safe cleanup, frontier, and immutable final proof where required. | Successful terminal outcome; no earlier event alone suffices. |
+| `BLOCKED_EXTERNAL` | Attempts, external owner, exact resumption condition, nearest independent work. | Keep open and recheck on each frontier scan; resume when the condition holds. Age is not abandonment. |
+| `INFEASIBLE` | Desired outcome/constraints, attempts, contradiction or platform evidence, nearest alternative, smallest constraint change; contract owner decides. | Keep open until owner disposition. Agent failure is insufficient. |
+| `DECLINED` | Contract-owner choice not to pursue a feasible outcome, rationale, consequence, alternative. | Owner may close or return it to specification. |
+| `SUPERSEDED` | Actual approved replacements and valid disjoint claims owning every inherited gate, plus recovery of valuable work/evidence. | Close only after exhaustive conservative transfer; a proposal or record alone is insufficient. |
 
-The primary sequence is `DRAFT -> NEEDS_SPECIFICATION -> READY -> IN_PROGRESS ->
-REPAIR_IN_PROGRESS -> READY_TO_MERGE -> COMPLETE`. The only direct primary skips are
-`DRAFT -> READY` with an approved contract and `IN_PROGRESS -> READY_TO_MERGE` with a zero
-ledger and clean convergence pass. Side-state evidence never manufactures ownership or
-discharges an acceptance gate.
+State records communicate accountable conclusions. They do not independently grant mutation,
+external-action, push, merge, close, terminal-event, or cleanup authority.
 
-## Closed transition and authority matrix
+## Procedural READY checklist
 
-Every edge not listed below is invalid. Roles are authenticated from immutable GitHub and
-claim/contract observations, never trusted from the event's self-declared `actor` field.
-Invalid transition attempts are diagnostics and never grant authority.
-`owner` is the issue/contract owner; `coordinator` is the stable worker and responsible
-actor named by the contract; `claim worker` is the active claim's exact worker/actor.
-Initial ownership comes from the issue author or their earlier immutable delegation. A
-proxy must have earlier, unedited, operation-specific authorization naming the issue,
-event, destination, substitute login, and bounded evidence identity.
+Before recording `READY`, the coordinator and fresh plan reviewer independently inspect:
 
-| From | To | Authorized poster | Typed evidence |
-|---|---|---|---|
-| none | DRAFT | issue author/coordinator | outcome, author identity, next clarification |
-| none | NEEDS_SPECIFICATION | issue author/coordinator | discovery packet and decision owner |
-| none | READY | owner/coordinator | approved contract identity; `legacy-bootstrap` packet when retaining pre-cutover work |
-| DRAFT | NEEDS_SPECIFICATION | issue author/coordinator | discovery packet |
-| DRAFT | READY | owner/coordinator | approved contract identity |
-| DRAFT | DECLINED | issue author | decision packet |
-| DRAFT | SUPERSEDED | issue author | exhaustive replacement/gate map |
-| NEEDS_SPECIFICATION | READY | owner/coordinator | approved contract identity |
-| NEEDS_SPECIFICATION | BLOCKED_EXTERNAL | decision owner/coordinator | external packet |
-| NEEDS_SPECIFICATION | INFEASIBLE | owner | infeasibility packet and owner disposition |
-| NEEDS_SPECIFICATION | DECLINED | owner | decision packet |
-| NEEDS_SPECIFICATION | SUPERSEDED | owner | exhaustive replacement/gate map |
-| READY | IN_PROGRESS | coordinator/claim worker | approved contract and active claim |
-| READY | NEEDS_SPECIFICATION | owner/coordinator | invalidated contract and question |
-| READY | BLOCKED_EXTERNAL | owner/coordinator | external packet |
-| READY | INFEASIBLE | owner | infeasibility packet and owner disposition |
-| READY | DECLINED | owner | decision packet |
-| READY | SUPERSEDED | owner | exhaustive replacement/gate map |
-| IN_PROGRESS | REPAIR_IN_PROGRESS | coordinator/claim worker | exact tip, review round, ledger, correction owner |
-| IN_PROGRESS | READY_TO_MERGE | coordinator | zero ledger, fresh clean review, integration base, tip, gates, artifact |
-| REPAIR_IN_PROGRESS | IN_PROGRESS | coordinator/claim worker | approved new epoch/contract and active claim |
-| REPAIR_IN_PROGRESS | READY_TO_MERGE | coordinator | zero ledger, fresh clean review, integration base, tip, gates, artifact |
-| READY_TO_MERGE | REPAIR_IN_PROGRESS | coordinator | changed tip/base, opened blocker, or merged slice with active successors |
-| READY_TO_MERGE | COMPLETE | owner/coordinator | complete outcome packet |
-| any active primary | READY | coordinator | prior `return-ready` terminal and recovery evidence |
-| any active primary | NEEDS_SPECIFICATION | owner/coordinator | prior `needs-specification` terminal, invalidated contract, recovery identity |
-| any active primary | BLOCKED_EXTERNAL | owner/coordinator | prior `blocked-external` terminal and external packet |
-| any active primary | INFEASIBLE | owner | prior `infeasible` terminal, infeasibility packet, owner disposition |
-| any active primary | DECLINED | owner | prior `declined` terminal and decision packet |
-| any active primary | SUPERSEDED | owner | atomic whole-outcome transfer and exhaustive replacement/gate map |
-| IN_PROGRESS | IN_PROGRESS | coordinator/new claim worker | atomic handoff activation, successor claim, contract |
-| REPAIR_IN_PROGRESS | REPAIR_IN_PROGRESS | coordinator/new claim worker | atomic handoff activation, successor claim, unchanged ledger/corrections |
-| BLOCKED_EXTERNAL | NEEDS_SPECIFICATION | decision owner/coordinator | changed question/constraints |
-| BLOCKED_EXTERNAL | READY | owner/coordinator | resumption proof and approved contract; claim still required |
-| BLOCKED_EXTERNAL | INFEASIBLE | owner | infeasibility packet and disposition |
-| BLOCKED_EXTERNAL | DECLINED | owner | decision packet |
-| BLOCKED_EXTERNAL | SUPERSEDED | owner | exhaustive replacement/gate map |
-| INFEASIBLE | NEEDS_SPECIFICATION | owner | revised constraints/question |
-| INFEASIBLE | DECLINED | owner | decision packet |
-| INFEASIBLE | SUPERSEDED | owner | exhaustive replacement/gate map |
-| DECLINED | NEEDS_SPECIFICATION | owner | resumed intent/question |
-| DECLINED | SUPERSEDED | owner | exhaustive replacement/gate map |
+- the exact unedited contract and approval comments, raw-body digest, IDs, URLs, revision,
+  claim base, authors/posters, reviewer identity, and explicit verdict;
+- production-boundary failure, observable outcome, non-goals, constraints, hostile cases,
+  exact allowed/excluded scope, and reversion;
+- every accepted gate with one owner and deterministic proof path;
+- fail-before proof on the named base and current-main integration/user-visible proof;
+- dependencies, conflicts, inherited work, reviewer availability, and resource limits; and
+- whether a compact contract is proportional or actual risk requires more perspectives.
 
-“Any active primary” means each of `IN_PROGRESS`, `REPAIR_IN_PROGRESS`, and
-`READY_TO_MERGE`; the reducer expands and tests all fifteen edges independently. `COMPLETE`
-and `SUPERSEDED` are terminal. `INFEASIBLE` and `DECLINED` retain their side-state identity
-if the owner closes the issue; they never masquerade as successful `COMPLETE`.
+Any mismatch, edit, missing field, incomplete retrieval, unresolved design blocker, or ambiguous
+owner leaves the issue in `DRAFT`/`NEEDS_SPECIFICATION`. No script or synthetic fixture may turn
+unverified inputs into `READY`.
 
-### Legacy bootstrap
+## Production admission checklist
 
-After the workflow cutover event, only an immutable valid claim created before the cutoff
-may migrate. Preserve its PR, branch, worktree, tip, base, and commits. Before mutation,
-record an inventory, approve a contract covering the retained diff, recompute collisions,
-and independently review the exact tip. Then append `none -> READY` with a typed
-`legacy-bootstrap` packet and append ordinary `READY -> IN_PROGRESS` using that preserved
-claim. If obligations exist, enter `REPAIR_IN_PROGRESS` normally. Malformed, edited,
-unverifiable, post-cutover, or uncorroborated claims are ineligible.
-The packet binds the cutover SHA/timestamp and immutable claim `createdAt`; the reducer
-itself proves claim time is earlier. A text value such as `"false"` cannot assert that
-comparison, collision recheck, or exact-tip review.
+Even a procedurally ready issue is rejected for production work until all of these separately
+hold: explicit edit authority; dedicated production branch/worktree; one valid active
+`finch-work-claim:v1`; complete repository-wide immutable claim retrieval; no file or semantic
+collision; and a second collision check after the claim. A readiness record is never a claim.
 
-### Terminal pairing and scoped completion
+## Repair and successor checklist
 
-A claim terminal accounts for one implementation slice; readiness accounts for the whole
-outcome. Post the terminal first for `return-ready`, `blocked-external`,
-`needs-specification`, `infeasible`, or `declined`, then append the matching readiness
-event referencing the exact terminal URL, claim ID, disposition, worker/author authority,
-and evidence identity. Until the pair is admitted, mutation is unauthorized and status is
-`PAIRING_REQUIRED`; an incomplete or mismatched pair does not invent a readiness state.
+For every finding, preserve stable identity and independent confidence, severity, locality,
+obligation, and lifecycle axes. Count and severity prioritize attention but cannot cancel,
+close, waive, resolve, reject, or split it. Confirmed same-contract blockers and required
+regression debt remain repair work; a new exact tip repeats affected tests and review.
 
-For a successful complete outcome: reach `READY_TO_MERGE`, merge, post claim `complete`
-with disposition `slice-complete`, close the issue with all acceptance evidence, then post
-`COMPLETE`. For a successful narrow slice with successors: reach `READY_TO_MERGE`, merge,
-append `READY_TO_MERGE -> REPAIR_IN_PROGRESS` naming merge/tree proof and already-active
-successor claims, then terminalize that scoped claim as `slice-complete`; the parent stays
-open. Implementation decomposition never means `SUPERSEDED`; that state requires atomic
-replacement of the entire outcome and every gate.
+For `REPLACED-BY` or `SPLIT-TO`, enumerate every original gate and assign exactly one current
+owner and proof path. Verify leaves recursively until each is merged and proven on current main.
+A record, successor label, duplicate link, wrong identity, missing claim, overlap, or cycle never
+discharges an obligation. If a child cannot be validly claimed, the retained gate stays open.
 
-## Append-only event
+## Conservative claim transition
 
-Post a human-readable summary followed by:
+Keep the parent claim active while planning and approving exhaustive disjoint children. Then
+the original issuer publishes an allowed v1 terminal/supersession or a covering whole-claim
+replacement; recompute all open-issue claims; child workers claim released disjoint scope; and
+recompute before any edit. A temporary no-owner interval authorizes no mutation. Never permit
+overlapping active claims or describe this sequence as atomic.
 
-```text
-<!-- finch-issue-readiness:v1
-event-id: <globally unique lowercase UUID>
-issue: <issue number>
-prior-state: <state or none for the first event>
-prior-event-id: <last accepted readiness event ID or none>
-new-state: <state>
-actor: <tool/person and stable identity>
-owner: <contract owner>
-evidence-url: <immutable issue or pull-request comment URL>
-evidence-kind: <typed packet/event kind required by the matrix>
-evidence-digest: <SHA-256 of immutable evidence body>
-contract-id: <contract ID or none>
-contract-url: <contract URL with numeric comment ID or none>
-contract-digest: <SHA-256 or none>
-contract-revision: <revision or none>
-implementation-base: <full SHA or none>
-plan-reviewer: <worker identity or none>
-approval-url: <immutable approval URL or none>
-claim-id: <active/terminal claim ID or none>
-claim-url: <immutable active/terminal claim URL or none>
-ledger-id: <ledger identity or none>
-round-id: <review round or none>
-exact-tip: <full SHA or none>
-integration-base: <full SHA or none>
-next-action: <single-line action or exact resumption condition>
-authority-comment: <immutable owner authorization URL or none>
-timestamp: <UTC RFC 3339>
--->
-```
+## Completion checklist
 
-Events are append-only and processed by GitHub `createdAt`, numeric comment ID, then block
-order. Apply the claim protocol's immutable metadata, digest, retrieval, and
-issuer-authority checks. Authenticate and validate an attempted event before admitting its
-ID or predecessor. Malformed, unauthorized, unknown, or semantically invalid attempts are
-diagnostics and leave the last accepted state intact; a corrected event can reference the
-last accepted predecessor. An edited/deleted/digest-changed previously accepted event,
-incomplete authoritative retrieval, or two individually valid successors from one accepted
-predecessor makes history `INDETERMINATE`. It never falls back to an authorizing state and
-cannot authorize mutation, merge, closure, or further reduction. Recovery requires restored
-evidence or an owner-authorized bootstrap rooted in a proven nonauthorizing state.
+Outcome completion normally requires current-main merge, all accepted gates, ticket closure,
+current artifact/user-visible proof, valid issuer-authorized claim terminal, safe cleanup, and
+frontier recomputation. PR integration and parent outcome completion are distinct.
 
-Destination evidence is typed, not satisfied by generic `evidence-url`. READY binds the
-contract, digest, revision, base, plan reviewer, and approval. IN_PROGRESS binds the active
-claim. REPAIR binds tip, round, ledger, and correction owner. READY_TO_MERGE binds the
-integration base, tip, zero transitive ledger, clean round, gates, and artifact. COMPLETE
-binds merge/tree identity, claim terminal, closure, all successor gates, artifact/user
-proof, cleanup, and frontier evidence. External, infeasible, declined, and superseded
-packets contain every field named in the lifecycle table.
+For PR #542 and issue #406, verify these eight events in this exact order:
 
-The referenced packet itself is an immutable structured record. Its GitHub URL, raw-body
-digest, issue, and kind must exactly equal the readiness event. Boolean fields accept only
-lowercase `true` or `false`; a nonempty string such as `"false"` is never truthy evidence.
+1. PR #542 merged into then-current `main`; local main synchronized.
+2. Merged/current-main identity, reviewed policy tree, affected tests, and CI recorded.
+3. Replacement #406 claim terminal published and verified issuer-authorized.
+4. Only the clean, pushed, fully integrated PR #542 worktree removed.
+5. Issue #406 closed with all already-available integration/accounting evidence.
+6. Repository-wide claim ledger and ready frontier recomputed after closure.
+7. One immutable retrospective/completion comment posted to closed #406, binding steps 1–6,
+   exact-tip review and policy paths. It answers which rules produced corrections; which caused
+   delay without changing the solution; which were ambiguous or unenforceable; whether any state
+   permitted abandonment or false completion; and the smallest evidence-backed follow-up, if any.
+8. That comment retrieved, verified unedited, and its exact body digest recorded.
 
-```text
-<!-- finch-workflow-evidence:v1
-packet-id: <stable ID>
-issue: <number>
-kind: <destination-specific packet kind>
-<typed fields required by the matrix and destination validator>
-timestamp: <UTC RFC 3339>
--->
-```
-
-The canonical parser normalizes documented hyphenated names once, attaches trusted
-GitHub observation metadata, and passes that same typed record to admission and reduction.
-Tests and status tooling must not construct privileged synthetic dictionaries that bypass
-the raw-block path.
-
-`INFEASIBLE`, `DECLINED`, issue closure, and ownership substitution require an immutable
-authority comment from the contract owner when the posting actor differs. Verify that
-comment directly. `SUPERSEDED` additionally requires the exhaustive replacement evidence
-in the table. A readiness event is status evidence only: `finch-work-claim:v1` remains the
-sole production mutation authority, and branch, pull-request, label, or assignee state does
-not substitute for it.
+Removing or permuting a prerequisite rejects completion and names the missing/out-of-order event.
+The valid final state is exactly: PR #542 integrated and accounted; issue #406 complete; issue
+#543 still open and independent. Issue #543 is never an acceptance gate, successor obligation,
+proof path, or completion dependency for PR #542 or issue #406.

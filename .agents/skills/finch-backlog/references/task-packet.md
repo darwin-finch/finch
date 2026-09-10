@@ -1,72 +1,55 @@
 # Finch implementation task packet
 
-Give each independent collaborator all of the following. Replace every placeholder; do not send a collaborator to rediscover the coordination state.
+Give each collaborator the complete packet below. Replace every placeholder; never rely on
+shared conversational memory or ask the recipient to rediscover coordination state.
 
 ```text
 Issue and outcome
-- GitHub issue: #<number> — <title>
-- Concrete outcome: <observable behavior and acceptance gate>
-- Readiness state/event: <state and immutable finch-issue-readiness:v1 event URL>
-- Work claim: <claim id and issue-comment URL>
-- Effective claim scope/revision event: <scope and immutable URL, or original claim>
-- Solution contract: <contract ID, URL/numeric comment ID, SHA-256 body digest, revision>
-- Contract approval: <APPROVE comment URL and plan-reviewer identity>
+- GitHub issue: #<number> — <plain-language title>
+- Observable outcome and acceptance gates: <behavior and every gate>
+- Approved solution contract: <ID, revision, immutable URL, digest, approval URL>
+- Work claim: <claim ID and immutable issue-comment URL>
 
 Starting point
-- Repository: <absolute path>
-- Branch/worktree: <dedicated branch and absolute worktree>
-- Immutable claim/implementation base: <full 40-character SHA>
-- Current integration base: <full 40-character current-main SHA>
-- Exact candidate tip: <full 40-character SHA or none before implementation>
-- Relevant files/docs/commits: <paths and immutable SHAs>
+- Repository/worktree: <absolute path>
+- Branch: <dedicated remote branch>
+- Claim base: <exact full SHA used for fail-before proof>
+- Integration base: <current-main SHA, or who must establish it and when>
+- Frozen tip: <exact full SHA when reviewing>
+- Relevant files/docs/commits: <paths and immutable identities>
 
-Dependencies and assumptions
-- Depends on: <issues/commits>
-- Blocks: <issues/gates>
-- Confirmed facts: <facts the agent may rely on>
-- Unverified assumptions: <claims that require tests or live acceptance>
+Dependencies and accounting
+- Depends on / blocks: <issues with plain-language outcomes>
+- Original gates and current owner/proof path for each: <exhaustive map>
+- Confirmed facts: <facts the worker may rely on>
+- Unverified assumptions: <facts requiring tests or live acceptance>
 
-Authority and scope
-- May edit: <bounded areas>
-- Must not edit: <overlapping work or excluded areas>
-- Role: <implementer, plan reviewer, finding reviewer, verifier, or coordinator>
-- Prototype authority: <none, or disposable exact-tip worktree/branch only>
-- Merge authority: <accountable actor and exact scope, or none>
-- Issue-close authority: <accountable actor and exact issue, or none>
-- Claim-terminal authority: <original issuer/proxy and permitted event/disposition, or none>
-- Worktree-cleanup authority: <accountable actor and proven-safe targets, or none>
-- External-effect authority: <specific permitted action, target, and credential boundary, or none>
-- No credential access, destructive cleanup, external messages, or merge authority unless explicitly stated.
-- Reviewer prototypes must not mutate the frozen worktree, push, use credentials, perform
-  external effects, merge, or cherry-pick; the implementer reproduces any correction.
-- Preserve unrelated changes and avoid broad formatting.
+Authority (write explicit yes/no and bounds for every row)
+- Edit authority: <allowed files/semantics; yes/no>
+- Disposable prototype authority: <location/effects/retention; yes/no>
+- External-action/message authority: <service and operations; yes/no>
+- Push authority: <remote branch; yes/no>
+- Merge authority: <PR/branch and prerequisites; yes/no>
+- Issue-close authority: <issue and prerequisites; yes/no>
+- Claim-terminal authority: <claim/event/issuer evidence; yes/no>
+- Cleanup authority: <exact worktree/artifacts and safety proof; yes/no>
+- Forbidden scope: <overlap, credentials, destructive or unrelated work>
 
 Required verification
-- Regression that fails before and passes after: <production boundary>
-- Focused tests/static checks: <commands or CI jobs>
-- Cross-platform/feature/release coverage: <required matrix>
-- Independent review: <security/authority/persistence/provider/etc. or not required>
-- Finding/ledger IDs: <stable finding IDs, ledger identity, successor issue/claim IDs>
-- Acceptance-gate ownership: <each gate's one current owner and current-main proof path>
-- Resource constraints: <local/remote build and memory limits>
+- Named regression and why it fails on the claim base: <production boundary>
+- Focused checks and useful failure diagnostics: <commands>
+- Integration/artifact/user-visible proof: <identity and method>
+- Independent review perspectives and exact convergence rule: <requirements>
+- Cross-platform/feature/CI and resource limits: <matrix/budget>
 
 Expected deliverable
-- Coherent commits pushed to the assigned branch.
-- Clean worktree and exact final SHA.
-- PR or handoff with changed files, named regression, test/CI links, residual risks, and merge recommendation.
-- Final evidence: <SAFE TO MERGE or ESCALATE WITH EXECUTABLE REPAIR/SPLIT; post-merge
-  current-main artifact/tree-equivalence and user-visible proof when completing>
-- Do not merge, close issues, or remove the worktree unless explicitly authorized.
-- Publish the required claim terminal event when ownership ends.
+- Coherent pushed commit(s), clean worktree, exact final SHA.
+- Changed-file list, fail-before/pass-after evidence, review record, residual risks.
+- Do not exercise any authority marked no or omitted.
 ```
 
-## Discovery task packet
-
-`NEEDS_SPECIFICATION` work uses a smaller packet and never an implementation packet or
-production claim. Name the issue, discovery-contract URL/digest, exact missing decision,
-concrete question, decision owner, nearest minimally specified outcome, bounded commands,
-and evidence destination. Authority is either read-only inspection or a disposable local
-worktree/branch. It excludes production-worktree mutation, push, credentials, undeclared
-network or external effects, merge, cherry-pick, and retention of prototype commits.
-Record the command/result, useful evidence, and proven cleanup; a prototype cannot be
-promoted by cherry-pick and must be reproduced after READY under a production claim.
+Reviewer/discovery packets additionally state that prototypes use an isolated disposable copy at
+the frozen tip and cannot mutate the implementation worktree, push, read credentials, perform
+undeclared external effects, merge/cherry-pick, or retain production commits. If a required
+reviewer is unavailable, record `UNAVAILABLE`, try at most one bounded fresh-context fallback,
+and leave the gate unresolved absent explicit repository-owner risk acceptance.
