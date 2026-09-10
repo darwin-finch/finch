@@ -5,7 +5,10 @@ description: Autonomously work Finch's highest-priority unblocked GitHub issues 
 
 # Finch Backlog Driver
 
-Drive an outcome-level Finch goal until its stated gate is genuinely satisfied. Treat a merged patch as progress, not as the terminal condition.
+Drive an outcome-level Finch goal until its stated gate is genuinely satisfied. The
+working reward is a correct patch merged from current `main`, its claimed ticket closed,
+and the resulting behavior proved at the user-visible boundary. Reviews, branches, and
+pull requests are means to that outcome, never substitute outcomes.
 
 This is a repository-maintenance skill for Codex and Claude Code. It is not Finch's
 `finch agent` command, `src/agent` loop, or `.finch/tasks.toml` runtime. Do not fall
@@ -91,7 +94,7 @@ For every fix, record the exact commit and exact evidence:
 - source identity when a temporary CI-only commit/workflow is removed;
 - known inherited failures, clearly separated from branch-caused failures.
 
-Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Run it with [the review protocol](references/review-protocol.md): derive the reviewer panel from the diff, review each perspective in its own context, verify every finding against a concrete failure scenario before reporting it, classify verified findings by whether they block production or strengthen a declared regression invariant, and repair confirmed blockers while the solution boundary remains sound and the unresolved-blocker ledger is shrinking. Use locality and causality to decide whether a finding belongs in the repair or requires an executable child slice. Do not cancel work merely because a later round found the same severity or ran a deeper probe. Freeze the reviewed commit; if production code changes, repeat exact-tip review and affected tests.
+Require independent exact-tip review before merging security, authority, persistence, provider protocol, credential, destructive, or concurrency changes. Run it with [the review protocol](references/review-protocol.md): derive the reviewer panel from the diff, review each perspective in its own context, verify every finding against a concrete failure scenario before reporting it, and require each confirmed blocker to carry the smallest credible repair or split direction. Reviewers may develop and test candidate fixes in disposable work, but never mutate the frozen branch; the implementer owns integration. Classify verified findings by whether they block production or strengthen a declared regression invariant, and repair confirmed blockers while the solution boundary remains sound and the unresolved-blocker ledger is shrinking. Use locality and causality to decide whether a finding belongs in the repair or requires an executable child slice. Do not cancel work merely because a later round found the same severity or ran a deeper probe. Freeze the reviewed commit; if production code changes, repeat exact-tip review and affected tests.
 
 Do not describe compilation, mocks, or configuration as live provider/model conformance. Keep manual or live acceptance issues open until the exact real-world workflow succeeds.
 
@@ -127,9 +130,12 @@ Do not describe compilation, mocks, or configuration as live provider/model conf
    user has not granted necessary authority. "This change feels significant"
    is not a reason to ask.
 2. Synchronize `main` and verify the merge commit.
-3. Update or close the GitHub issue with commit, regression, review, current-main CI,
-   actual artifact or user-visible evidence where applicable, and a completion/release
-   event for its work claim.
+3. Close the claimed GitHub ticket when its acceptance gates are met, recording the
+   merge commit, regression, review, current-main CI, actual artifact or user-visible
+   evidence where applicable, and a completion event for its work claim. When a claimed
+   child slice completes only part of a broader parent outcome, close the child ticket
+   and update the parent with the remaining gates rather than pretending the parent is
+   complete.
 4. Remove clean worktrees after merge or proven supersession. Preserve unique work by committing and pushing it first.
 5. Recompute the ready frontier and immediately continue while an unblocked gate remains.
 

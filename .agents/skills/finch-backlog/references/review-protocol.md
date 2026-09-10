@@ -67,7 +67,15 @@ Do not let one perspective see another's findings before reporting, and do not p
 
 A reviewer inspects a frozen commit: nothing is pushed to the branch between the start of a round and its end. A review of "the branch" is not a review of anything specific.
 
-Each reviewer returns a list of findings. A finding names the file and the function or line it concerns, what goes wrong there, and the perspective that raised it.
+Each reviewer returns a list of findings. A finding names the file and the function or
+line it concerns, what goes wrong there, the perspective that raised it, and the smallest
+credible repair that preserves the reviewed solution contract. When the repair cannot
+fit that contract, the reviewer names the independently testable child slice and the
+current change that can be removed or narrowed. Reviewers remain read-only against the
+frozen branch so the reviewed identity stays meaningful, but they may build and test a
+candidate patch in disposable work and return that patch or design sketch to the
+implementer. Finding defects without helping drive them to resolution is incomplete
+review work.
 
 ## 3. Verify and classify every finding adversarially
 
@@ -115,7 +123,12 @@ previous tip says nothing about the current one.
 
 A finding is **new** in a round when no earlier round record of this review already holds it — same code location, same failure. Restating a known finding, or re-confirming that a fixed one is fixed, is not new.
 
-**Converged** means a round record contains no new CONFIRMED findings. Convergence takes at least two rounds; one round is a smoke test. If the first round produces no CONFIRMED findings, and so no fixes, run the second round at the same tip with freshly instantiated reviewers, so that it is an independent sample rather than a replay.
+**Converged** means the exact-tip blocker ledger is empty: the round confirms every
+earlier blocker is resolved and contains no new confirmed production blocker or required
+regression debt. Convergence takes at least two rounds; one round is a smoke test. If the
+first round produces no blocking findings, and so no fixes, run the second round at the
+same tip with freshly instantiated reviewers, so that it is an independent sample rather
+than a replay.
 
 Maintain an **unresolved-blocker ledger** across rounds. It names each unresolved
 production blocker or regression debt item, its concrete scenario, owning concern, first
@@ -150,6 +163,13 @@ the solution contract. Every mutant must state which invariant it challenges and
 class is distinct. Arbitrary mutant counts, blind input enumeration, and demands for
 exhaustive sampling are not evidence of better coverage.
 
+Reviewers are adversarial collaborators, not rejection gates. For each confirmed blocker
+they recommend a concrete repair, deletion, narrowing, or executable split and identify
+the regression that would prove it. The coordinator assigns those repairs and keeps the
+ledger moving toward zero. A reviewer may supply a tested candidate diff from disposable
+work, but the implementer applies it to the unfrozen branch so authorship, scope, and
+exact-tip review remain explicit.
+
 Final convergence still requires at least two independent rounds in the review, a final
 round against the exact tip being integrated, and zero unresolved confirmed production
 blockers at that tip. Regression-strengthening debt blocks only when it leaves a declared
@@ -175,6 +195,11 @@ Before a SAFE TO MERGE verdict, rebase on current `main`, run the affected gates
 and review the resulting exact tip. Exercise the actual binary, generated artifact, or
 user-visible boundary where relevant, and record its source identity. A successful test
 against an obsolete base or a stale deployed build is not integration evidence.
+
+The workflow succeeds when the reviewed patch merges from current `main`, the claimed
+ticket closes with its evidence, and the observable result matches that merged identity.
+A review verdict, including SAFE TO MERGE, earns no terminal credit until integration and
+ticket closure actually happen.
 
 "Independently reviewed" in a merge comment must point at these comments. Without them the claim is unfalsifiable, which is the failure mode `AGENTS.md` names: configuration or intent is not conformance.
 
