@@ -10,19 +10,39 @@ if [[ $# -eq 0 ]]; then
     exit 64
 fi
 
+if ! git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    echo "with-cargo-slot: run from a Finch Git worktree" >&2
+    exit 69
+fi
+if ! git_common_dir="$(cd "$git_common_dir" 2>/dev/null && pwd -P)"; then
+    echo "with-cargo-slot: could not canonicalize the Git common directory" >&2
+    exit 69
+fi
+
+lock_path="$git_common_dir/finch-cargo-slot.lock"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+lock_marker="${FINCH_CARGO_SLOT_HELD:-}"
+
+# The marker is set by the command that the kernel lock starts, never by the
+# caller waiting to acquire it. It makes nested use idempotent so launchers can
+# require the repository slot without deadlocking an already-wrapped command.
+# This is coordination state only; Brain-test authority still comes solely
+# from the Rust supervisor's sealed proof and owned process group.
+if [[ -n "$lock_marker" ]]; then
+    if [[ "$lock_marker" != "$git_common_dir" ]]; then
+        echo "with-cargo-slot: inherited slot marker names a different Git common directory: expected=$git_common_dir actual=$lock_marker" >&2
+        exit 69
+    fi
+    exec "$@"
+fi
+
 timeout_seconds="${FINCH_CARGO_SLOT_TIMEOUT_SECONDS:-900}"
 if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]]; then
     echo "with-cargo-slot: FINCH_CARGO_SLOT_TIMEOUT_SECONDS must be a non-negative integer" >&2
     exit 64
 fi
 
-if ! git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
-    echo "with-cargo-slot: run from a Finch Git worktree" >&2
-    exit 69
-fi
-
-lock_path="$git_common_dir/finch-cargo-slot.lock"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+locked_exec='export FINCH_CARGO_SLOT_HELD="$1"; shift; exec "$@"'
 
 case "$(uname -s)" in
     Darwin)
@@ -30,14 +50,16 @@ case "$(uname -s)" in
             echo "with-cargo-slot: macOS requires lockf; refusing an unlocked build" >&2
             exit 69
         fi
-        exec lockf -k -t "$timeout_seconds" "$lock_path" "$@"
+        exec lockf -k -t "$timeout_seconds" "$lock_path" \
+            /bin/bash -c "$locked_exec" finch-cargo-slot "$git_common_dir" "$@"
         ;;
     Linux)
         if ! command -v flock >/dev/null 2>&1; then
             echo "with-cargo-slot: Linux requires flock; refusing an unlocked build" >&2
             exit 69
         fi
-        exec flock -w "$timeout_seconds" "$lock_path" "$@"
+        exec flock -w "$timeout_seconds" "$lock_path" \
+            /bin/bash -c "$locked_exec" finch-cargo-slot "$git_common_dir" "$@"
         ;;
     *)
         echo "with-cargo-slot: unsupported platform $(uname -s); refusing an unlocked build" >&2

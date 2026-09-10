@@ -3,6 +3,38 @@
 # Shell launchers never own or signal test processes. The Rust supervisor is
 # the sole process-group authority and removes filesystem state only after the
 # owned group is terminated, quiescent, and reaped.
+brain_isolation_require_private_path() {
+  perl -MCwd=abs_path -MFcntl=:mode -MFile::Basename=dirname -e '
+    use strict;
+    use warnings;
+    my ($input, $strict_leaf, $immutable_leaf) = @ARGV;
+    my $path = abs_path($input);
+    die "Brain test supervisor path could not be resolved: $input\n" unless defined $path;
+    my $euid = $<;
+    my $leaf = 1;
+    while (1) {
+      my @metadata = lstat($path);
+      die "Brain test supervisor path disappeared during validation: $path\n"
+        unless @metadata;
+      my $owner = $metadata[4];
+      my $mode = $metadata[2] & 07777;
+      my $sticky_directory = S_ISDIR($metadata[2]) && ($mode & 01000);
+      my $wrong_owner = $owner != 0 && $owner != $euid;
+      $wrong_owner = 1 if $leaf && $strict_leaf && $owner != $euid;
+      my $unsafe_write = ($mode & 0022) && (!$sticky_directory || ($leaf && $strict_leaf));
+      $unsafe_write = 1 if $leaf && $immutable_leaf && ($mode & 0222);
+      if ($wrong_owner || $unsafe_write) {
+        printf STDERR "Brain test supervisor path is not private: path=%s owner=%d mode=%04o expected_owner=%d\n",
+          $path, $owner, $mode, $euid;
+        exit 1;
+      }
+      last if $path eq "/";
+      $path = dirname($path);
+      $leaf = 0;
+    }
+  ' "$1" "${2:-}" "${3:-}"
+}
+
 brain_test_isolation_run() {
   local supervisor="${FINCH_TEST_SUPERVISOR_BIN:-}"
   [[ "$#" -gt 0 ]] || { echo 'brain_test_isolation_run requires a command' >&2; return 64; }
@@ -46,24 +78,66 @@ brain_isolation_proof_rejected() {
 }
 
 # Validate the supervisor profile and bind a content-addressed filename to the
-# bytes it names. Kept as a separate predicate so the shell layer can be tested
-# independently of the Rust proof verifier that normally runs before it.
+# bytes it names. The Rust verifier first proves that a content-addressed image
+# is beside the current test executable; this shell predicate additionally
+# requires that externally located authority to be owned, immutable, and on a
+# private path. Kept separate so the shell layer can be tested independently.
 brain_isolation_supervisor_digest_for_profile() {
   local library_root="$1" supervisor_executable="$2"
   local actual_supervisor_digest supervisor_name supervisor_path_digest=''
+  local cargo_target_root='' supervisor_relative=''
   case "$supervisor_executable" in
     "$library_root/target/debug/finch-test-supervisor"|\
     "$library_root/target/debug/finch-test-supervisor-pinned"|\
     "$library_root/target/release/finch-test-supervisor"|\
     "$library_root/target/release/finch-test-supervisor-pinned") ;;
-    "$library_root/target/debug/finch-test-supervisor-pinned-sha256-"*|\
-    "$library_root/target/release/finch-test-supervisor-pinned-sha256-"*)
+    */finch-test-supervisor-pinned-sha256-*)
       supervisor_name="$(basename "$supervisor_executable")"
       supervisor_path_digest="${supervisor_name#finch-test-supervisor-pinned-sha256-}"
       if [[ ! "$supervisor_path_digest" =~ ^[0-9a-f]{64}$ ]]; then
         brain_isolation_proof_rejected supervisor-content-path-shape
         return 1
       fi
+      if [[ ! -f "$supervisor_executable" || -L "$supervisor_executable" ]] ||
+        ! brain_isolation_require_private_path "$supervisor_executable" strict immutable; then
+        brain_isolation_proof_rejected supervisor-image-authority
+        return 1
+      fi
+      case "$supervisor_executable" in
+        "$library_root/target/"*) cargo_target_root="$library_root/target" ;;
+        *) cargo_target_root='' ;;
+      esac
+      if [[ -z "$cargo_target_root" && -n "${CARGO_TARGET_DIR:-}" ]]; then
+        cargo_target_root="$(cd "$CARGO_TARGET_DIR" 2>/dev/null && pwd -P)" || {
+          brain_isolation_proof_rejected supervisor-target-directory
+          return 1
+        }
+      fi
+      [[ -n "$cargo_target_root" ]] || {
+        brain_isolation_proof_rejected supervisor-target-directory
+        return 1
+      }
+      case "$supervisor_executable" in
+        "$cargo_target_root/"*)
+          supervisor_relative="${supervisor_executable#"$cargo_target_root/"}"
+          ;;
+        *)
+          brain_isolation_proof_rejected supervisor-profile
+          return 1
+          ;;
+      esac
+      case "$supervisor_relative" in
+        */finch-test-supervisor-pinned-sha256-*) ;;
+        *)
+          brain_isolation_proof_rejected supervisor-profile
+          return 1
+          ;;
+      esac
+      supervisor_relative="${supervisor_relative%/*}"
+      [[ -n "$supervisor_relative" && "$supervisor_relative" != */*/* ]] || {
+        brain_isolation_proof_rejected supervisor-profile
+        return 1
+      }
       ;;
     *)
       brain_isolation_proof_rejected supervisor-profile
