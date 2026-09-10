@@ -207,6 +207,17 @@ if FINCH_TEST_SUPERVISOR_BIN="$other_profile_dir/finch-test-supervisor" \
     brain_test_isolation_require_finch_profile "$same_profile_dir/finch"; then
     fail "different canonical profile directories were accepted because their basenames matched: test=$same_profile_dir supervisor=$other_profile_dir"
 fi
+FINCH_TEST_SUPERVISOR_BIN="$same_profile_dir/finch-test-supervisor" \
+    brain_test_isolation_require_finch_profile "$same_profile_dir/missing-finch" ||
+    fail "missing Finch leaf prevented its shared custom-profile parent from being validated: directory=$same_profile_dir"
+if FINCH_TEST_SUPERVISOR_BIN="$same_profile_dir/finch-test-supervisor" \
+    brain_test_isolation_require_finch_profile "$other_profile_dir/missing-finch"; then
+    fail "missing Finch leaf bypassed canonical parent matching: finch=$other_profile_dir/missing-finch supervisor=$same_profile_dir/finch-test-supervisor"
+fi
+for caller in scripts/test_server.sh scripts/test_tool_passthrough.sh; do
+    assert_contains "$source_root/$caller" 'same shared Cargo target/profile directory: finch=' \
+        "$caller does not explain the canonical target/profile mismatch"
+done
 
 cat >"$fake_bin/strip" <<'FAKE_STRIP'
 #!/usr/bin/env bash

@@ -299,6 +299,10 @@ brain_test_isolation_require_finch_profile() {
   [[ -n "$supervisor_path" ]] || return 1
   supervisor_parent="$(cd "$(dirname "$supervisor_path")" 2>/dev/null && pwd -P)" || return 1
   [[ "$(basename "$finch_parent")" == "$(basename "$supervisor_parent")" ]] || return 1
+  if [[ ! -e "$finch_bin" && ! -L "$finch_bin" ]]; then
+    [[ "$finch_parent" == "$supervisor_parent" ]] || return 1
+    return 0
+  fi
   finch_real_parent="$(perl -MCwd=abs_path -MFile::Basename=dirname -e '
     my $path = abs_path($ARGV[0]); exit 1 unless defined $path; print dirname($path)
   ' "$finch_bin")" || return 1

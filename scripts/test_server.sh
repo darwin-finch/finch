@@ -21,7 +21,7 @@ echo
 
 # Check if binary exists
 brain_test_isolation_require_finch_profile "$finch_bin" || {
-    echo 'Finch binary and test supervisor must use the same debug/release profile' >&2
+    echo "Finch binary and test supervisor must use the same shared Cargo target/profile directory: finch=$finch_bin supervisor=${FINCH_TEST_SUPERVISOR_BIN:-<unset>}" >&2
     exit 64
 }
 if [ ! -x "$finch_bin" ]; then

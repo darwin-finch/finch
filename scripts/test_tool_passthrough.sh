@@ -19,7 +19,7 @@ fi
 brain_test_isolation_reexec_launcher "$script_path" "$@"
 
 brain_test_isolation_require_finch_profile "$finch_bin" || {
-  echo 'Finch binary and test supervisor must use the same debug/release profile' >&2
+  echo "Finch binary and test supervisor must use the same shared Cargo target/profile directory: finch=$finch_bin supervisor=${FINCH_TEST_SUPERVISOR_BIN:-<unset>}" >&2
   exit 64
 }
 [[ -x "$finch_bin" ]] || { echo "Error: Binary not found. Run 'cargo build --release' first." >&2; exit 1; }
