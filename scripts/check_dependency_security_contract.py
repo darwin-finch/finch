@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject vulnerable or unreviewed versions in Finch's resolved HTTP/TLS graph."""
+"""Reject vulnerable or unreviewed packages in Finch's resolved dependency graph."""
 
 from __future__ import annotations
 
@@ -13,6 +13,13 @@ ROOT = Path(__file__).resolve().parent.parent
 H2_MINIMUM = (0, 4, 16)
 RUSTLS_MINIMUM = (0, 23, 0)
 WEBPKI_MINIMUM = (0, 103, 13)
+QUICK_XML_MINIMUM = (0, 41, 0)
+FORBIDDEN_PACKAGES = {
+    "rsa": "RUSTSEC-2023-0071",
+    "russh-cryptovec": "RUSTSEC-2026-0153",
+    "russh": "RUSTSEC-2026-0154",
+    "russh-keys": "removed SSH dependency surface",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +59,12 @@ def contract_errors(lock: object) -> list[str]:
         versions.setdefault(name, set()).add(version)
 
     errors: list[str] = []
+
+    for package, advisory in FORBIDDEN_PACKAGES.items():
+        for version in sorted(versions.get(package, set())):
+            errors.append(
+                f"forbidden dependency {package} {version} remains resolved ({advisory})"
+            )
 
     def stable_versions(package: str, resolved: set[str]) -> list[str]:
         stable = []
@@ -130,6 +143,16 @@ def contract_errors(lock: object) -> list[str]:
                 "RUSTSEC-2026-0049, -0098, -0099, and -0104"
             )
 
+    quick_xml_versions = versions.get("quick-xml", set())
+    if not quick_xml_versions:
+        errors.append("no quick-xml package is resolved; the spreadsheet advisory floor would be vacuous")
+    for version in stable_versions("quick-xml", quick_xml_versions):
+        if version_tuple(version) < QUICK_XML_MINIMUM:
+            errors.append(
+                f"quick-xml {version} is below the fixed 0.41.0 floor for "
+                "RUSTSEC-2026-0194 and RUSTSEC-2026-0195"
+            )
+
     return errors
 
 
@@ -139,19 +162,29 @@ def main() -> int:
         lock = tomllib.loads(args.lockfile.read_text(encoding="utf-8"))
         errors = contract_errors(lock)
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError) as error:
-        print(f"HTTP dependency contract could not inspect {args.lockfile}: {error}", file=sys.stderr)
+        print(
+            f"Dependency security contract could not inspect {args.lockfile}: {error}",
+            file=sys.stderr,
+        )
         return 2
 
     if errors:
         for error in errors:
-            print(f"HTTP dependency contract violation: {error}", file=sys.stderr)
+            print(f"Dependency security contract violation: {error}", file=sys.stderr)
         return 1
 
     packages = {
         package["name"]: set()
         for package in lock["package"]
         if package["name"]
-        in {"reqwest", "h2", "tokio-tungstenite", "rustls", "rustls-webpki"}
+        in {
+            "reqwest",
+            "h2",
+            "tokio-tungstenite",
+            "rustls",
+            "rustls-webpki",
+            "quick-xml",
+        }
     }
     for package in lock["package"]:
         if package["name"] in packages:
@@ -159,7 +192,7 @@ def main() -> int:
     summary = ", ".join(
         f"{name}={'+'.join(sorted(resolved))}" for name, resolved in sorted(packages.items())
     )
-    print(f"HTTP dependency contract passed: {summary}")
+    print(f"Dependency security contract passed: {summary}")
     return 0
 
 

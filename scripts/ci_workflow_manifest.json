@@ -13,8 +13,6 @@
     "docs.yml",
     "issue-105-oauth.yml",
     "issue-163-effect-audit.yml",
-    "issue-185-spreadsheet-advisories.yml",
-    "issue-186-ssh-removal.yml",
     "issue-187-subagent-fanout.yml",
     "issue-201-chatgpt-auth.yml",
     "issue-227-setup-preservation.yml",
@@ -24,13 +22,11 @@
     "repository-hygiene.yml"
   ],
   "workflows": {
-    "ci.yml": {"sha256": "9faf7c66ec2ecfcd2338b0b48dc701be37c0eaaa56d398221bd990b8167f9207", "bytes": 6848, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
+    "ci.yml": {"sha256": "97d7f02ac1d2caffd6a05be7da9b7b72c59d711a1f8d81f9d17e2f2f4cd14eb1", "bytes": 7211, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
     "docs.yml": {"sha256": "96181877d60f1622ca5a00025953dc38116c414ed5f338e25e601e347c4db374", "bytes": 885, "activated_fixtures": ["readme_only"]},
     "issue-104-chooser-catalog.yml": {"sha256": "bf003cf3f7258a9430ee38fdf22d68d42b5cbf106259a79f0979b75ee17f98ad", "bytes": 1619, "activated_fixtures": []},
     "issue-105-oauth.yml": {"sha256": "b8ebc77ab828544d150322232084aff5dbeecd1a815483e29e7b59a674c19ebb", "bytes": 2216, "activated_fixtures": ["manifest_dependency", "public_api"]},
     "issue-163-effect-audit.yml": {"sha256": "7a6f90111748c2b5f2bcaa10145fa3a79cec28474d0914fbb57c56865e9aa32b", "bytes": 1899, "activated_fixtures": ["brain_effect"]},
-    "issue-185-spreadsheet-advisories.yml": {"sha256": "5ccc9219bb18734ddcbfdb6b7d096ae15a5dcfd13c4cf6da2432a197d9df8c62", "bytes": 3962, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
-    "issue-186-ssh-removal.yml": {"sha256": "ec14ecc9c0b5ef39851e762654e4971a427047b3f8c7cb0e6f592040f2d2e1b5", "bytes": 9165, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
     "issue-187-subagent-fanout.yml": {"sha256": "1723341a97456d2dfaf2de145e8468cc1ab599fb631aecf92b8512bd2ac43643", "bytes": 972, "activated_fixtures": []},
     "issue-201-chatgpt-auth.yml": {"sha256": "1c5060df306712b11921a3ba948a6d3a469dc7d290a09c0f9d172b12b54d0eea", "bytes": 4869, "activated_fixtures": ["manifest_dependency"]},
     "issue-227-setup-preservation.yml": {"sha256": "fdd44d047cb873314156a56c5aa2d977647bd782c179e9e6542344f75d9a4a78", "bytes": 3718, "activated_fixtures": []},
@@ -39,119 +35,74 @@
     "issue-56-brain-isolation.yml": {"sha256": "018c3e3360739bfa79cab39f4cfc02375a18754aa1d8e88b1bec03d2419d2b02", "bytes": 4818, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api"]},
     "issue-72-capability-contract.yml": {"sha256": "b6502f078270811f9508bffb1378523b7d64cf55f26cac0ef1a37bcd3fbe3b42", "bytes": 1640, "activated_fixtures": []},
     "release.yml": {"sha256": "b443a81265056f549e9d0a7032d4c1bb29bcdd581ab998674faa79325ceeb229", "bytes": 4215, "activated_fixtures": []},
-    "repository-hygiene.yml": {"sha256": "33b301cc31e337e00e2c8c2940977f4930f3dc3bff91112f6be3cb878f64381d", "bytes": 649, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
+    "repository-hygiene.yml": {"sha256": "bc383c979b4f1405639cd2775fb799f3a4a1bf2e3c051944d21aa31d10955bb1", "bytes": 1072, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
   },
   "fixtures": {
     "readme_only": {
       "changed_paths": ["README.md"],
       "expected_checks": [
         "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Compile and test (macos-14, default)", "Compile and test (macos-14, no-default-features)",
-        "Compile and test (ubuntu-24.04, default)", "Compile and test (ubuntu-24.04, no-default-features)",
         "Current docs links, claims, and shell syntax",
-        "Dependency graph (aarch64-apple-darwin, default)", "Dependency graph (aarch64-apple-darwin, no-default-features)",
-        "Dependency graph (x86_64-pc-windows-msvc, default)", "Dependency graph (x86_64-pc-windows-msvc, no-default-features)",
-        "Dependency graph (x86_64-unknown-linux-gnu, default)", "Dependency graph (x86_64-unknown-linux-gnu, no-default-features)",
-        "Downstream API absence (macos-14, default)", "Downstream API absence (macos-14, no-default-features)",
-        "Downstream API absence (ubuntu-24.04, default)", "Downstream API absence (ubuntu-24.04, no-default-features)",
-        "Release build (aarch64-apple-darwin)", "Release build (x86_64-unknown-linux-gnu)",
-        "Runtime Authority (Ubuntu)", "SSH absence contract (macos-14)", "SSH absence contract (ubuntu-24.04)",
-        "SSH absence contract (windows-2025)", "SSH advisory audit", "Security Audit", "Spreadsheet advisory audit",
+        "Runtime Authority (Ubuntu)", "Security Audit",
         "Test (macos-14, default)", "Test (macos-14, no-default-features)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
         "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)"
       ],
-      "expected_count": 34
+      "expected_count": 13
     },
     "ordinary_source": {
       "changed_paths": ["src/models/mod.rs"],
       "expected_checks": [
         "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Compile and test (macos-14, default)", "Compile and test (macos-14, no-default-features)",
-        "Compile and test (ubuntu-24.04, default)", "Compile and test (ubuntu-24.04, no-default-features)",
-        "Dependency graph (aarch64-apple-darwin, default)", "Dependency graph (aarch64-apple-darwin, no-default-features)",
-        "Dependency graph (x86_64-pc-windows-msvc, default)", "Dependency graph (x86_64-pc-windows-msvc, no-default-features)",
-        "Dependency graph (x86_64-unknown-linux-gnu, default)", "Dependency graph (x86_64-unknown-linux-gnu, no-default-features)",
-        "Downstream API absence (macos-14, default)", "Downstream API absence (macos-14, no-default-features)",
-        "Downstream API absence (ubuntu-24.04, default)", "Downstream API absence (ubuntu-24.04, no-default-features)",
         "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
-        "Release build (aarch64-apple-darwin)", "Release build (x86_64-unknown-linux-gnu)",
-        "Runtime Authority (Ubuntu)", "SSH absence contract (macos-14)", "SSH absence contract (ubuntu-24.04)",
-        "SSH absence contract (windows-2025)", "SSH advisory audit", "Security Audit", "Spreadsheet advisory audit",
+        "Runtime Authority (Ubuntu)", "Security Audit",
         "Test (macos-14, default)", "Test (macos-14, no-default-features)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
         "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)"
       ],
-      "expected_count": 35
+      "expected_count": 14
     },
     "brain_effect": {
       "changed_paths": ["src/brain/store.rs", "src/server/handlers.rs"],
       "expected_checks": [
         "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Compile and test (macos-14, default)", "Compile and test (macos-14, no-default-features)",
-        "Compile and test (ubuntu-24.04, default)", "Compile and test (ubuntu-24.04, no-default-features)",
-        "Dependency graph (aarch64-apple-darwin, default)", "Dependency graph (aarch64-apple-darwin, no-default-features)",
-        "Dependency graph (x86_64-pc-windows-msvc, default)", "Dependency graph (x86_64-pc-windows-msvc, no-default-features)",
-        "Dependency graph (x86_64-unknown-linux-gnu, default)", "Dependency graph (x86_64-unknown-linux-gnu, no-default-features)",
-        "Downstream API absence (macos-14, default)", "Downstream API absence (macos-14, no-default-features)",
-        "Downstream API absence (ubuntu-24.04, default)", "Downstream API absence (ubuntu-24.04, no-default-features)",
         "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
-        "Release build (aarch64-apple-darwin)", "Release build (x86_64-unknown-linux-gnu)",
-        "Runtime Authority (Ubuntu)", "SSH absence contract (macos-14)", "SSH absence contract (ubuntu-24.04)",
-        "SSH absence contract (windows-2025)", "SSH advisory audit", "Security Audit", "Spreadsheet advisory audit",
+        "Runtime Authority (Ubuntu)", "Security Audit",
         "Test (macos-14, default)", "Test (macos-14, no-default-features)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
         "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)", "effect-audit"
       ],
-      "expected_count": 36
+      "expected_count": 15
     },
     "manifest_dependency": {
       "changed_paths": ["Cargo.toml", "Cargo.lock"],
       "expected_checks": [
         "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Compile and test (macos-14, default)", "Compile and test (macos-14, no-default-features)",
-        "Compile and test (ubuntu-24.04, default)", "Compile and test (ubuntu-24.04, no-default-features)",
-        "Dependency graph (aarch64-apple-darwin, default)", "Dependency graph (aarch64-apple-darwin, no-default-features)",
-        "Dependency graph (x86_64-pc-windows-msvc, default)", "Dependency graph (x86_64-pc-windows-msvc, no-default-features)",
-        "Dependency graph (x86_64-unknown-linux-gnu, default)", "Dependency graph (x86_64-unknown-linux-gnu, no-default-features)",
-        "Downstream API absence (macos-14, default)", "Downstream API absence (macos-14, no-default-features)",
-        "Downstream API absence (ubuntu-24.04, default)", "Downstream API absence (ubuntu-24.04, no-default-features)",
         "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
-        "Release build (aarch64-apple-darwin)", "Release build (x86_64-unknown-linux-gnu)",
-        "Runtime Authority (Ubuntu)", "SSH absence contract (macos-14)", "SSH absence contract (ubuntu-24.04)",
-        "SSH absence contract (windows-2025)", "SSH advisory audit", "Security Audit", "Spreadsheet advisory audit",
+        "Runtime Authority (Ubuntu)", "Security Audit",
         "Test (macos-14, default)", "Test (macos-14, no-default-features)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
         "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)",
         "focused-auth (macos-14)", "focused-auth (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile", "windows-verifier-compile"
       ],
-      "expected_count": 41
+      "expected_count": 20
     },
     "public_api": {
       "changed_paths": ["src/lib.rs"],
       "expected_checks": [
         "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Compile and test (macos-14, default)", "Compile and test (macos-14, no-default-features)",
-        "Compile and test (ubuntu-24.04, default)", "Compile and test (ubuntu-24.04, no-default-features)",
-        "Dependency graph (aarch64-apple-darwin, default)", "Dependency graph (aarch64-apple-darwin, no-default-features)",
-        "Dependency graph (x86_64-pc-windows-msvc, default)", "Dependency graph (x86_64-pc-windows-msvc, no-default-features)",
-        "Dependency graph (x86_64-unknown-linux-gnu, default)", "Dependency graph (x86_64-unknown-linux-gnu, no-default-features)",
-        "Downstream API absence (macos-14, default)", "Downstream API absence (macos-14, no-default-features)",
-        "Downstream API absence (ubuntu-24.04, default)", "Downstream API absence (ubuntu-24.04, no-default-features)",
         "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
-        "Release build (aarch64-apple-darwin)", "Release build (x86_64-unknown-linux-gnu)",
-        "Runtime Authority (Ubuntu)", "SSH absence contract (macos-14)", "SSH absence contract (ubuntu-24.04)",
-        "SSH absence contract (windows-2025)", "SSH advisory audit", "Security Audit", "Spreadsheet advisory audit",
+        "Runtime Authority (Ubuntu)", "Security Audit",
         "Test (macos-14, default)", "Test (macos-14, no-default-features)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
         "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile"
       ],
-      "expected_count": 38
+      "expected_count": 17
     }
   }
 }
