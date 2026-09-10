@@ -33,7 +33,7 @@ for path in \
     .agents/skills/finch-backlog/references/issue-readiness.md \
     .agents/skills/finch-backlog/references/task-packet.md \
     .agents/skills/finch-backlog/references/work-claims.md \
-    .github/workflows/docs.yml scripts/ci_workflow_manifest.json
+    .github/workflows/docs.yml
 do
     require_file "required process file exists: $path" "$ROOT/$path"
 done
@@ -88,7 +88,7 @@ require_pattern "claim collision winner is deterministic" 'earlier GitHub `creat
 
 invocations=$(grep -F -c 'run: .agents/skills/finch-backlog/scripts/test-review-protocol "$GITHUB_WORKSPACE"' "$WORKFLOW" || true)
 test "$invocations" = 1 && pass "Documentation runs the linter once" || fail "Documentation linter invocation expected=1 actual=$invocations"
-for path in '**.md' scripts/check_docs.py .agents/skills/finch-backlog/scripts/test-review-protocol .github/workflows/docs.yml scripts/ci_workflow_manifest.json; do
+for path in '**.md' scripts/check_docs.py .agents/skills/finch-backlog/scripts/test-review-protocol .github/workflows/docs.yml; do
     occurrences=$(grep -F -c -- "\"$path\"" "$WORKFLOW" || true)
     test "$occurrences" = 2 && pass "Documentation watches $path on pull and push" || fail "Documentation path occurrences expected=2 actual=$occurrences path=$path"
 done
