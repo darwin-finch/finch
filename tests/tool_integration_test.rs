@@ -380,111 +380,41 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
             "{case}: interactive diff approval must not execute the undisclosed HOME post-save hook"
         );
 
-        match case {
-            "blank-context" => {
-                assert_eq!(
-                    result["ok"], true,
-                    "{case}: readable blank-context edit must succeed; report: {result}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.replacen("before", new_string, 1).as_bytes(),
-                    "{case}: final payload must equal the reviewed proposal; report: {result}"
-                );
-            }
-            "tab" => {
-                assert_eq!(
-                    result["ok"], false,
-                    "{case}: a tab-changing edit must fail closed before a lossy artifact opens; report: {result}"
-                );
-                assert!(
-                    detail.contains("TAB") && detail.contains("byte"),
-                    "{case}: refusal must name the unrepresentable byte and offset; detail: {detail}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.as_bytes(),
-                    "{case}: refusal wrote the file"
-                );
-            }
-            "control" => {
-                assert_eq!(
-                    result["ok"], false,
-                    "{case}: ANSI/control-changing edit must fail closed; report: {result}"
-                );
-                assert!(
-                    detail.contains("ESCAPE") || detail.contains("U+001B"),
-                    "{case}: refusal must identify the hidden ANSI/control byte; detail: {detail}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.as_bytes(),
-                    "{case}: refusal wrote the file"
-                );
-            }
-            "cancel" => {
-                assert!(
-                    detail.contains("aborted by user"),
-                    "{case}: directive change must be reported as rejection; detail: {detail}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.as_bytes(),
-                    "{case}: rejection wrote the file"
-                );
-            }
-            "body-change" => {
-                assert!(
-                    detail.contains("was edited during review"),
-                    "{case}: body mutation must be refused; detail: {detail}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.as_bytes(),
-                    "{case}: body mutation wrote the file"
-                );
-            }
-            "changed-whitespace" => {
-                assert!(
-                    detail.contains("was edited during review"),
-                    "{case}: stripping meaningful changed-line whitespace must be refused; detail: {detail}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.as_bytes(),
-                    "{case}: editor-hidden trailing whitespace was applied; detail: {detail}"
-                );
-            }
-            "nonzero" => {
-                let observed_exit = fs::read_to_string(&editor_exit).unwrap_or_else(|error| {
-                    panic!("{case}: fake editor did not record its exit status: {error}")
-                });
-                assert_eq!(
-                    observed_exit, "37",
-                    "{case}: fixture did not exercise the requested editor exit status"
-                );
-                assert!(
-                    detail.contains("aborted by user"),
-                    "{case}: nonzero editor exit must fail closed; detail: {detail}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.as_bytes(),
-                    "{case}: failed editor wrote the file"
-                );
-            }
-            "editor-fallback" => {
-                assert_eq!(
-                    result["ok"], true,
-                    "{case}: EDITOR fallback edit must succeed; report: {result}"
-                );
-                assert_eq!(
-                    final_bytes,
-                    original.replacen("before", new_string, 1).as_bytes(),
-                    "{case}: EDITOR fallback applied the wrong payload"
-                );
-            }
+        let applies = matches!(case, "blank-context" | "editor-fallback");
+        let (expected_ok, diagnostic) = match case {
+            "tab" => (false, Some("TAB")),
+            "control" => (false, Some("ESCAPE")),
+            "cancel" | "nonzero" => (true, Some("aborted by user")),
+            "body-change" | "changed-whitespace" => (true, Some("was edited during review")),
+            "blank-context" | "editor-fallback" => (true, None),
             _ => unreachable!(),
+        };
+        assert_eq!(
+            result["ok"], expected_ok,
+            "{case}: tool outcome disagrees with the boundary contract; report: {result}"
+        );
+        if let Some(expected) = diagnostic {
+            assert!(
+                detail.contains(expected),
+                "{case}: refusal must explain itself with {expected:?}; detail: {detail}"
+            );
+        }
+        let expected_bytes = if applies {
+            original.replacen("before", new_string, 1)
+        } else {
+            original.to_string()
+        };
+        assert_eq!(
+            final_bytes,
+            expected_bytes.as_bytes(),
+            "{case}: final file bytes disagree with the reviewed decision; report: {result}"
+        );
+        if case == "nonzero" {
+            assert_eq!(
+                fs::read_to_string(&editor_exit).unwrap_or_default(),
+                "37",
+                "{case}: fixture did not exercise the requested editor exit status"
+            );
         }
 
         let editor_should_open = !matches!(case, "tab" | "control");
