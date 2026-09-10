@@ -25,7 +25,7 @@
   ],
   "workflows": {
     "ci.yml": {"sha256": "9faf7c66ec2ecfcd2338b0b48dc701be37c0eaaa56d398221bd990b8167f9207", "bytes": 6848, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
-    "docs.yml": {"sha256": "c44710f1a8b926ec087761e02886b5766db002da10ba6db72548af4578a9cd2a", "bytes": 1659, "activated_fixtures": ["readme_only"]},
+    "docs.yml": {"sha256": "96181877d60f1622ca5a00025953dc38116c414ed5f338e25e601e347c4db374", "bytes": 885, "activated_fixtures": ["readme_only"]},
     "issue-104-chooser-catalog.yml": {"sha256": "bf003cf3f7258a9430ee38fdf22d68d42b5cbf106259a79f0979b75ee17f98ad", "bytes": 1619, "activated_fixtures": []},
     "issue-105-oauth.yml": {"sha256": "b8ebc77ab828544d150322232084aff5dbeecd1a815483e29e7b59a674c19ebb", "bytes": 2216, "activated_fixtures": ["manifest_dependency", "public_api"]},
     "issue-163-effect-audit.yml": {"sha256": "7a6f90111748c2b5f2bcaa10145fa3a79cec28474d0914fbb57c56865e9aa32b", "bytes": 1899, "activated_fixtures": ["brain_effect"]},

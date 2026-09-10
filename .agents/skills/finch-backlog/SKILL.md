@@ -21,7 +21,11 @@ already-specified user request, the request plus a short plan is the contract; d
 or claim ceremony. When the backlog wrapper is active, preserve its procedural collision and claim
 rules.
 
-## Prepare the issue
+## Backlog wrapper: prepare shared issue
+
+This section applies only when the GitHub backlog wrapper is active. Direct already-specified
+requests skip issue readiness, claim publication, dedicated-worktree requirements, pull-request
+bookkeeping, terminal events, and frontier tracking.
 
 1. Read `AGENTS.md`, the issue, relevant module docs, and current code.
 2. Run the [lightweight readiness check](references/issue-readiness.md). Record what is known,
@@ -37,10 +41,12 @@ ownership, approval, merge, and closure.
 
 ## Implement narrowly
 
-Use a dedicated branch/worktree and the existing
-[`finch-work-claim:v1`](references/work-claims.md) syntax. Keep conflict checks procedural and
-human-verifiable. Implement the contracted outcome, add a regression that fails before and passes
-after, and avoid unrelated cleanup. Follow the repository's resource-safe test launchers.
+For direct specified requests, follow the generic focused implementation, compression, tests,
+review, integration, and verification loop without GitHub ceremony. When the backlog wrapper is
+active, use a dedicated branch/worktree and the existing
+[`finch-work-claim:v1`](references/work-claims.md) syntax, with procedural conflict checks. In both
+cases, implement the requested outcome, add an appropriate regression, avoid unrelated cleanup,
+and follow the repository's resource-safe test launchers.
 
 If the desired behavior, scope, authority, or boundary is still unclear, return to specification.
 If an external dependency blocks progress, name it. If evidence shows the outcome cannot be

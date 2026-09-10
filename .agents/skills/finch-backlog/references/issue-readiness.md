@@ -51,8 +51,9 @@ and next action in plain language.
 
 ## Candidate and finding separation
 
-Issue readiness does not imply that a patch is correct. Candidate review asks whether the exact
-tip meets the contract. Findings separately carry confidence, severity, locality, obligation, and
+Issue readiness does not imply that a patch is correct. Candidate review asks whether the
+identified current candidate meets the contract. Findings separately carry confidence, severity,
+locality, obligation, and
 lifecycle. Neither finding count nor worst severity automatically changes readiness or closes work.
 
 Completion is based on the integrated result, not paperwork: verify the reviewed change on current

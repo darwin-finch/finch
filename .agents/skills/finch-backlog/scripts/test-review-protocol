@@ -1,7 +1,5 @@
 #!/bin/sh
-# Advisory checks for Finch's issue/readiness/review documentation.
-# This catches missing or harmful prose. It never grants authority, readiness, or approval.
-
+# Mechanical lint for Finch's advisory backlog documentation. Humans retain authority.
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -14,124 +12,99 @@ esac
 
 SKILL="$ROOT/.agents/skills/finch-backlog/SKILL.md"
 REFS="$ROOT/.agents/skills/finch-backlog/references"
-READINESS="$REFS/issue-readiness.md"
-REVIEW="$REFS/review-protocol.md"
-CONTRACT="$REFS/solution-contract.md"
-PACKET="$REFS/task-packet.md"
 CLAIMS="$REFS/work-claims.md"
 WORKFLOW="$ROOT/.github/workflows/docs.yml"
-MANIFEST="$ROOT/scripts/ci_workflow_manifest.json"
-checks=0
-failures=0
+checks=0 failures=0
 
 pass() { checks=$((checks + 1)); printf 'ok %s - %s\n' "$checks" "$1"; }
 fail() { checks=$((checks + 1)); failures=$((failures + 1)); printf 'not ok %s - %s\n' "$checks" "$1" >&2; }
-require_file() { if test -f "$2"; then pass "$1"; else fail "$1: missing $2"; fi; }
-require_text() {
-    label=$1 needle=$2
-    shift 2
-    for file do
-        if test -f "$file" && grep -F -q -- "$needle" "$file"; then pass "$label"; return; fi
-    done
-    fail "$label: missing [$needle]"
-}
-forbid_regex() {
-    label=$1 pattern=$2
-    shift 2
-    for file do
-        if test -f "$file" && grep -E -i -q -- "$pattern" "$file"; then fail "$label: harmful rule matched in $file"; return; fi
-    done
-    pass "$label"
-}
-reject_fixture() {
-    label=$1 pattern=$2 text=$3
-    if printf '%s\n' "$text" | grep -E -i -q -- "$pattern"; then pass "$label"; else fail "$label: harmful fixture was accepted"; fi
-}
+require_file() { test -f "$2" && pass "$1" || fail "$1: missing $2"; }
+normalized() { tr '\n' ' ' | tr -s '[:space:]' ' '; }
+matches() { printf '%s\n' "$2" | normalized | grep -E -i -q -- "$1"; }
+require_pattern() { matches "$2" "$3" && pass "$1" || fail "$1: required structure absent"; }
+forbid_pattern() { matches "$2" "$3" && fail "$1: harmful rule matched" || pass "$1"; }
+reject_fixture() { matches "$2" "$3" && pass "$1" || fail "$1: harmful fixture was accepted"; }
+accept_fixture() { matches "$2" "$3" && fail "$1: harmless fixture was rejected" || pass "$1"; }
 
-for file in "$SKILL" "$READINESS" "$REVIEW" "$CONTRACT" "$PACKET" "$CLAIMS" "$WORKFLOW" "$MANIFEST"; do
-    require_file "required process file exists" "$file"
-done
-
-DOCS="$SKILL $READINESS $REVIEW $CONTRACT $PACKET $CLAIMS"
-require_text "process is proportional to shipping risk" "Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost proportional to the change" $DOCS
-require_text "tooling is advisory" "Tooling is advisory mechanical lint, never an authority engine" $DOCS
-require_text "generic engineering loop is explicit" "The generic engineering loop is" "$SKILL"
-require_text "backlog wrapper is scoped to shared issue work" "only when selecting or coordinating shared issue work" "$SKILL"
-require_text "direct requests avoid issue ceremony" "the request plus a short plan is the contract" "$SKILL"
-require_text "active backlog work preserves conflict checks" "preserve its procedural collision and claim" "$SKILL"
-require_text "readiness is lightweight" "lightweight readiness check" "$SKILL" "$READINESS"
-require_text "small changes use compact contracts" "compact solution contract" "$SKILL" "$CONTRACT"
-require_text "every PR receives compression" "Every pull request gets a compression pass before review and merge" "$SKILL"
-require_text "compression removes safe scaffolding" "compatibility scaffolding, speculative abstractions, dead paths" "$SKILL" "$REVIEW"
-require_text "compression prefers behavior preservation" "smallest behavior-preserving patch" "$SKILL" "$REVIEW"
-require_text "compression judges net complexity" "Judge net complexity, not raw line count" "$SKILL"
-require_text "compression preserves wanted behavior and tests" "Never delete wanted functionality, weaken meaningful" "$SKILL"
-require_text "compression does not mix unrelated work" "combine unrelated work merely to shrink a diff" "$SKILL"
-require_text "compression prerequisites stay separate" "separate focused prerequisite pull request" "$SKILL" "$REVIEW"
-require_text "reviewers find and help repair" "find-and-help partner" "$SKILL" "$REVIEW"
-require_text "finding axes remain independent" "independent axes" "$SKILL" "$REVIEW"
-require_text "same-contract findings stay in repair" "same-contract" "$SKILL" "$REVIEW"
-require_text "splits require genuine separation" "genuinely separable" "$SKILL" "$REVIEW"
-require_text "review uses risk-derived perspectives" "Review the current candidate with risk-derived perspectives" "$SKILL"
-require_text "material repairs receive review" "review again after any material repair" "$SKILL"
-require_text "review stops at first blocker-free complete round" "first complete round with zero confirmed in-scope blockers" "$SKILL" "$REVIEW"
-require_text "extra confidence rounds are excluded" "do not add confidence rounds" "$REVIEW"
-require_text "optional items remain follow-ups" "Speculative or optional items are nonblocking follow-ups" "$SKILL" "$REVIEW"
-require_text "defective prerequisites stay separate" "separate prerequisite change" "$SKILL" "$REVIEW"
-require_text "repeated defects change strategy" "change strategy or narrow the change" "$SKILL" "$REVIEW"
-require_text "ordinary trunk flow is direct" "focused patch, relevant affected/integration tests" "$SKILL" "$REVIEW"
-require_text "ordinary changes squash merge" "squash merge" "$SKILL" "$REVIEW"
-require_text "current main is checked for mergeability" "current main for conflicts and mergeability" "$SKILL" "$REVIEW"
-require_text "identity-only rebases are not ritualized" "do not require ritual rebases or review restarts" "$SKILL"
-require_text "main regressions fix forward" "fix it forward" "$SKILL" "$REVIEW"
-require_text "completion is current-main and visible" "current-main merge and user-visible evidence" "$SKILL" "$READINESS"
-require_text "unspecified state is explicit" "UNSPECIFIED" "$READINESS"
-require_text "external block state is explicit" "BLOCKED_EXTERNAL" "$READINESS"
-require_text "infeasible state is explicit" "INFEASIBLE" "$READINESS"
-require_text "declined state is explicit" "DECLINED" "$READINESS"
-
-forbid_regex "count cannot auto-cancel work" '(auto|automatic(ally)?)[- ]*(cancel|close|waive).*(count|severity)|(count|severity).*(auto|automatic(ally)?)[- ]*(cancel|close|waive)' $DOCS
-forbid_regex "severity cannot resolve findings" 'severity[^.]*\b(resolves|discharges|waives)\b[^.]*finding' $DOCS
-forbid_regex "three-round review churn is absent" '(three|3)[- ]+(review )?rounds|third[- ]round cancellation' $DOCS
-forbid_regex "exact-tip ritual terminology is absent" 'exact-tip|exact tip' $DOCS
-forbid_regex "review has no universal one-pass cap" 'exactly one (reviewer|review pass)|only one (reviewer|review pass)' $DOCS
-forbid_regex "scripts cannot grant READY" '(script|linter|tool)[^.]*(grants|authorizes|declares)[^.]*(READY)' $DOCS
-forbid_regex "scripts cannot grant ownership or merge" '(script|linter|tool)[^.]*(grants|authorizes)[^.]*(ownership|merge)' $DOCS
-reject_fixture "automatic count cancellation fixture is rejected" '(auto|automatic(ally)?)[- ]*(cancel|close|waive).*(count|severity)|(count|severity).*(auto|automatic(ally)?)[- ]*(cancel|close|waive)' "Automatically cancel review when finding count is high."
-reject_fixture "fixed three-round churn fixture is rejected" '(three|3)[- ]+(review )?rounds|third[- ]round cancellation' "Require three review rounds for every patch."
-reject_fixture "tool authority fixture is rejected" '(script|linter|tool)[^.]*(grants|authorizes|declares)[^.]*(READY)' "The linter grants READY status."
-reject_fixture "raw-line-count compression fixture is rejected" '(always|must)[^.]*minimi[sz]e[^.]*raw line count' "Always minimize raw line count even when behavior becomes obscure."
-reject_fixture "destructive compression fixture is rejected" '(delete|remove)[^.]*wanted functionality[^.]*shrink' "Delete wanted functionality to shrink every pull request."
-
-require_text "v1 claim marker is preserved" "<!-- finch-work-claim:v1" "$CLAIMS"
-for field in "event: claim" "claim-id:" "worker:" "github-actor:" "branch:" "worktree:" "base:" "scope:" "timestamp:"; do
-    require_text "v1 claim field is preserved: $field" "$field" "$CLAIMS"
-done
-for field in "event: <release|complete|supersede>" "replacement-claim:" "authority-comment:"; do
-    require_text "v1 terminal field is preserved: $field" "$field" "$CLAIMS"
-done
-require_text "claim conflicts remain procedural" "procedural conflict check" "$CLAIMS"
-
-invocations=$(grep -F -c -- 'run: .agents/skills/finch-backlog/scripts/test-review-protocol "$GITHUB_WORKSPACE"' "$WORKFLOW" || true)
-if test "$invocations" = 1; then pass "Documentation runs the advisory linter once"; else fail "Documentation linter invocation expected=1 actual=$invocations"; fi
-
-for owned_path in \
+for path in \
     .agents/skills/finch-backlog/SKILL.md \
     .agents/skills/finch-backlog/references/review-protocol.md \
     .agents/skills/finch-backlog/references/solution-contract.md \
     .agents/skills/finch-backlog/references/issue-readiness.md \
     .agents/skills/finch-backlog/references/task-packet.md \
     .agents/skills/finch-backlog/references/work-claims.md \
-    .agents/skills/finch-backlog/scripts/test-review-protocol \
-    .github/workflows/docs.yml \
-    scripts/ci_workflow_manifest.json
+    .github/workflows/docs.yml scripts/ci_workflow_manifest.json
 do
-    occurrences=$(grep -F -c -- "\"$owned_path\"" "$WORKFLOW" || true)
-    if test "$occurrences" = 2; then pass "Documentation watches $owned_path on pull and push"; else fail "Documentation path occurrences expected=2 actual=$occurrences path=$owned_path"; fi
+    require_file "required process file exists: $path" "$ROOT/$path"
 done
 
-if test "$failures" -ne 0; then
-    printf 'FAILED: %s of %s advisory documentation checks failed\n' "$failures" "$checks" >&2
-    exit 1
-fi
-printf 'PASS: %s advisory documentation checks; no authority decisions made\n' "$checks"
+DOCS=$(for file in "$SKILL" "$REFS"/*.md; do normalized < "$file"; printf ' '; done)
+require_pattern "direct requests bypass backlog ceremony" 'direct[^.]{0,160}(skip|without)[^.]{0,160}(issue|claim)[^.]{0,160}(worktree|GitHub)' "$DOCS"
+require_pattern "backlog wrapper retains coordination steps" 'backlog wrapper[^.]{0,200}(issue readiness|readiness)[^.]{0,120}claim[^.]{0,120}worktree' "$DOCS"
+
+COUNT_CANCEL='(auto|automatic(ally)?)[- ]*(cancel|close|waive)[^.]{0,100}(count|severity)|(count|severity)[^.]{0,100}(auto|automatic(ally)?)[- ]*(cancel|close|waive)'
+FIXED_REVIEW='(require(d)?|exactly|fixed)[^.]{0,80}(two|three|[2-9])[^.]{0,50}(review(er)?s?|rounds?|passes?)'
+TOOL_AUTH='(script|linter|tool)[^.]{0,100}(grants|authorizes|declares)[^.]{0,80}(ready|ownership|merge|approval)'
+forbid_pattern "exact-tip ritual is absent" 'exact[- ]+tip' "$DOCS"
+forbid_pattern "count or severity cannot auto-cancel" "$COUNT_CANCEL" "$DOCS"
+forbid_pattern "fixed review counts are absent" "$FIXED_REVIEW" "$DOCS"
+forbid_pattern "tooling cannot confer authority" "$TOOL_AUTH" "$DOCS"
+reject_fixture "newline-split exact-tip rule is rejected" 'exact[- ]+tip' 'Require an exact
+tip before merge.'
+reject_fixture "automatic count cancellation is rejected" "$COUNT_CANCEL" 'Automatically cancel review when finding count is high.'
+reject_fixture "fixed review count is rejected" "$FIXED_REVIEW" 'Require three review rounds for every patch.'
+reject_fixture "tool authority is rejected" "$TOOL_AUTH" 'The linter grants READY status.'
+accept_fixture "equivalent advisory wording remains valid" "$TOOL_AUTH" 'People decide readiness; a checker only reports documentation gaps.'
+
+TRACE_FIXTURE='backlog|readiness
+backlog|claim
+backlog|worktree
+backlog|pr
+generic|understand
+generic|implement
+generic|compress
+generic|test
+generic|review
+generic|integrate
+generic|verify
+backlog|terminal
+backlog|frontier'
+instruction_trace() {
+    printf '%s\n' "$TRACE_FIXTURE" | awk -F '|' -v mode="$1" '
+        $1 == "generic" || $1 == mode { output = output separator $2; separator = ">" }
+        END { print output }
+    '
+}
+test "$(instruction_trace direct)" = 'understand>implement>compress>test>review>integrate>verify' && pass "direct instruction trace has no backlog steps" || fail "direct instruction trace is wrong"
+test "$(instruction_trace backlog)" = 'readiness>claim>worktree>pr>understand>implement>compress>test>review>integrate>verify>terminal>frontier' && pass "backlog instruction trace includes coordination wrapper" || fail "backlog instruction trace is wrong"
+
+extract_block() {
+    awk -v wanted="$1" '
+        /<!-- finch-work-claim:v1/ { number++; active=(number == wanted) }
+        active { print }
+        active && /-->/ { exit }
+    ' "$CLAIMS"
+}
+expected_claim=$(printf '%s\n' '<!-- finch-work-claim:v1' 'event: claim' 'claim-id: <globally unique stable id>' 'worker: <tool/person and stable session or agent identity>' 'github-actor: <responsible @user or none>' 'branch: <remote branch>' 'worktree: <absolute path or remote environment id>' 'base: <full commit SHA>' 'scope: <single-line bounded scope>' 'timestamp: <UTC RFC 3339>' '-->')
+expected_terminal=$(printf '%s\n' '<!-- finch-work-claim:v1' 'event: <release|complete|supersede>' 'claim-id: <the original claim id>' 'worker: <the exact worker value from the original claim>' 'timestamp: <UTC RFC 3339>' 'replacement-claim: <claim id or none>' 'authority-comment: <none or immutable prior GitHub comment URL>' '-->')
+test "$(extract_block 1)" = "$expected_claim" && pass "v1 claim schema is preserved" || fail "v1 claim schema changed"
+test "$(extract_block 2)" = "$expected_terminal" && pass "v1 terminal schema is preserved" || fail "v1 terminal schema changed"
+claim_markers=$(grep -F -c '<!-- finch-work-claim:v1' "$CLAIMS" || true)
+test "$claim_markers" = 2 && pass "v1 has exactly claim and terminal examples" || fail "v1 marker count expected=2 actual=$claim_markers"
+CLAIM_TEXT=$(normalized < "$CLAIMS")
+require_pattern "v1 is the sole backlog ownership record" 'v1[^.]{0,100}sole recorded ownership mechanism' "$CLAIM_TEXT"
+require_pattern "claim collision winner is deterministic" 'earlier GitHub `createdAt` wins[^.]*equal[^.]*lower numeric comment ID wins' "$CLAIM_TEXT"
+
+invocations=$(grep -F -c 'run: .agents/skills/finch-backlog/scripts/test-review-protocol "$GITHUB_WORKSPACE"' "$WORKFLOW" || true)
+test "$invocations" = 1 && pass "Documentation runs the linter once" || fail "Documentation linter invocation expected=1 actual=$invocations"
+for path in '**.md' scripts/check_docs.py .agents/skills/finch-backlog/scripts/test-review-protocol .github/workflows/docs.yml scripts/ci_workflow_manifest.json; do
+    occurrences=$(grep -F -c -- "\"$path\"" "$WORKFLOW" || true)
+    test "$occurrences" = 2 && pass "Documentation watches $path on pull and push" || fail "Documentation path occurrences expected=2 actual=$occurrences path=$path"
+done
+for path in .agents/skills/finch-backlog/SKILL.md .agents/skills/finch-backlog/references/review-protocol.md .agents/skills/finch-backlog/references/solution-contract.md .agents/skills/finch-backlog/references/issue-readiness.md .agents/skills/finch-backlog/references/task-packet.md .agents/skills/finch-backlog/references/work-claims.md; do
+    occurrences=$(grep -F -c -- "\"$path\"" "$WORKFLOW" || true)
+    test "$occurrences" = 0 && pass "Markdown path relies on the shared glob: $path" || fail "redundant Markdown path remains: $path"
+done
+
+test "$failures" -eq 0 || { printf 'FAILED: %s of %s mechanical checks failed\n' "$failures" "$checks" >&2; exit 1; }
+printf 'PASS: %s mechanical documentation checks; no authority decisions made\n' "$checks"

@@ -1,13 +1,15 @@
 # Finch work-claim protocol
 
-Work claims help people avoid editing the same files or semantics concurrently. The existing
-`finch-work-claim:v1` comment syntax is retained for compatibility. Claims are a procedural
-coordination record; they do not make GitHub comments a cryptographic authority system.
+For backlog-wrapper work, the existing `finch-work-claim:v1` comment is the sole recorded ownership
+mechanism. It helps people avoid editing the same files or semantics concurrently while remaining a
+coordination record, not cryptographic authentication.
 
 Before editing, perform a procedural conflict check across open work: inspect active claim comments,
 branches, pull requests, worktrees, and reachable workers. Compare both file scope and semantic
 scope. If evidence is incomplete or overlap is plausible, pause and coordinate. Age, assignment,
 labels, branches, and status reports do not by themselves release a claim.
+When active backlog claims overlap, the earlier GitHub `createdAt` wins; if those timestamps are
+equal, the lower numeric comment ID wins. The later claimant stops and coordinates.
 
 ## Claim an issue
 
