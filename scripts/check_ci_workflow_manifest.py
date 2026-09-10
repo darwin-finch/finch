@@ -1,630 +1,367 @@
 #!/usr/bin/env python3
-"""Verify the exact bounded bytes of Finch's reviewed GitHub workflows."""
+"""Check the reviewed semantic shape of Finch pull-request workflows."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+import itertools
 import json
-import os
-import stat
+import re
+import subprocess
 import sys
 from pathlib import Path
-from collections.abc import Callable
-from typing import Any, BinaryIO
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKFLOW_DIRECTORY = Path(".github/workflows")
-MANIFEST_PATH = Path("scripts/ci_workflow_manifest.json")
-SCHEMA = "finch-ci-workflow-manifest:v3"
-WORKFLOW_CANONICAL_EOL = "lf"
-MAX_WORKFLOW_BYTES = 128 * 1024
-MAX_TOTAL_WORKFLOW_BYTES = 1024 * 1024
-MAX_WORKFLOW_FILES = 64
-MAX_WORKFLOW_DIRECTORY_ENTRIES = 128
-MAX_MANIFEST_BYTES = 512 * 1024
-HASH_CHUNK_BYTES = 64 * 1024
+WORKFLOWS = Path(".github/workflows")
+
+EXPECTED_WORKFLOWS = (
+    "ci.yml", "docs.yml", "issue-104-chooser-catalog.yml", "issue-105-oauth.yml",
+    "issue-163-effect-audit.yml", "issue-187-subagent-fanout.yml",
+    "issue-201-chatgpt-auth.yml", "issue-227-setup-preservation.yml",
+    "issue-245-cargo-slot.yml", "issue-46-atomic-conversation.yml",
+    "issue-56-brain-isolation.yml", "issue-72-capability-contract.yml", "release.yml",
+    "repository-hygiene.yml",
+)
+
+# Exact triggers are reviewed separately from fixture activation so a path change cannot hide
+# merely because none of the representative fixtures exercises it.
+EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
+    "ci.yml": None,
+    "docs.yml": (
+        "**.md", "scripts/check_docs.py",
+        ".agents/skills/finch-backlog/scripts/test-review-protocol",
+        ".github/workflows/docs.yml",
+    ),
+    "issue-105-oauth.yml": (
+        "Cargo.toml", "src/lib.rs", "src/oauth/**", "src/providers/chatgpt_oauth.rs",
+        "src/providers/mod.rs", ".github/issue-105-windows-probe/**",
+        ".github/workflows/issue-105-oauth.yml",
+    ),
+    "issue-163-effect-audit.yml": (
+        ".github/workflows/issue-163-effect-audit.yml", "schema/finch_ipc.capnp",
+        "src/brain/effect_audit_archive.rs", "src/brain/mod.rs", "src/brain/remote.rs",
+        "src/brain/store.rs", "src/cli/repl_event/**", "src/ipc/**",
+        "src/runtime/effect_log.rs", "src/runtime/mod.rs", "src/server/brain_runner.rs",
+        "src/server/brain_service.rs", "src/server/handlers.rs", "src/server/mod.rs",
+        "src/tools/executor.rs", "src/tools/types.rs",
+        "src/tools/implementations/program.rs",
+    ),
+    "issue-187-subagent-fanout.yml": (
+        "src/tools/implementations/spawn.rs",
+        ".github/workflows/issue-187-subagent-fanout.yml",
+    ),
+    "issue-201-chatgpt-auth.yml": (
+        "Cargo.toml", "src/oauth/**", "src/config/**", "src/providers/chatgpt_oauth.rs",
+        "src/providers/model_catalog.rs", "src/providers/openai_jwks.rs",
+        "src/cli/chatgpt_auth.rs", "src/cli/setup_wizard.rs", "src/main.rs", "docs/OAUTH.md",
+        ".github/issue-201-windows-probe/**",
+        ".github/workflows/issue-201-chatgpt-auth.yml",
+    ),
+    "issue-227-setup-preservation.yml": (
+        "src/config/**", "src/cli/setup_wizard.rs", "src/main.rs",
+        ".github/workflows/issue-227-setup-preservation.yml",
+    ),
+    "issue-245-cargo-slot.yml": (
+        ".agents/skills/finch-backlog/**", ".claude/skills/finch-backlog",
+        ".github/workflows/issue-245-cargo-slot.yml",
+    ),
+    "issue-46-atomic-conversation.yml": (
+        ".github/workflows/issue-46-atomic-conversation.yml", "src/cli/conversation.rs",
+        "src/cli/memtree_console/event_handler.rs", "src/cli/repl_event/**",
+        "src/providers/claude.rs",
+    ),
+    "issue-56-brain-isolation.yml": (
+        ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
+        "build.rs", "schema/**", "src/**", "scripts/**", "tests/**",
+    ),
+    "repository-hygiene.yml": None,
+}
+
+EXPECTED_CHECKS = {
+    "ci.yml": (
+        "Build Release (x86_64-unknown-linux-gnu)", "Runtime Authority (Ubuntu)",
+        "Security Audit", "Test (macos-14, default)",
+        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
+    ),
+    "docs.yml": ("Current docs links, claims, and shell syntax",),
+    "issue-105-oauth.yml": ("macos-oauth", "oauth", "windows-compile"),
+    "issue-163-effect-audit.yml": ("effect-audit",),
+    "issue-187-subagent-fanout.yml": (
+        "Focused spawn tests (macos-14)", "Focused spawn tests (ubuntu-24.04)",
+    ),
+    "issue-201-chatgpt-auth.yml": (
+        "focused-auth (macos-14)", "focused-auth (ubuntu-24.04)",
+        "windows-verifier-compile",
+    ),
+    "issue-227-setup-preservation.yml": (
+        "setup-preservation (macos-14)", "setup-preservation (ubuntu-24.04)",
+        "windows-auth-contract",
+    ),
+    "issue-245-cargo-slot.yml": (
+        "macos-latest repository-wide lock", "ubuntu-latest repository-wide lock",
+    ),
+    "issue-46-atomic-conversation.yml": (
+        "atomic-rounds (macos-14)", "atomic-rounds (ubuntu-24.04)",
+    ),
+    "issue-56-brain-isolation.yml": ("Isolation boundaries (ubuntu-24.04)",),
+    "repository-hygiene.yml": ("Tracked tree (ubuntu-24.04)",),
+}
+
+EXPECTED_FIXTURES = {
+    "readme_only": (("README.md",), (
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Current docs links, claims, and shell syntax", "Runtime Authority (Ubuntu)",
+        "Security Audit", "Test (macos-14, default)", "Test (ubuntu-24.04, default)",
+        "Test (ubuntu-24.04, no-default-features)", "Toolchain and formatting contract",
+        "Toolchain and formatting contract (Windows)", "Tracked tree (ubuntu-24.04)",
+    )),
+    "ordinary_source": (("src/models/mod.rs",), (
+        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
+        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
+        "Tracked tree (ubuntu-24.04)",
+    )),
+    "brain_effect": (("src/brain/store.rs", "src/server/handlers.rs"), (
+        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
+        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
+        "Tracked tree (ubuntu-24.04)", "effect-audit",
+    )),
+    "manifest_dependency": (("Cargo.toml", "Cargo.lock"), (
+        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
+        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
+        "Tracked tree (ubuntu-24.04)", "focused-auth (macos-14)",
+        "focused-auth (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile",
+        "windows-verifier-compile",
+    )),
+    "public_api": (("src/lib.rs",), (
+        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
+        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
+        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
+        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
+        "Tracked tree (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile",
+    )),
+}
 
 
 class ContractError(Exception):
-    """Actionable failure in the reviewed workflow contract."""
+    pass
 
 
-FileIdentity = tuple[int, int, int, int, int]
-
-
-CANONICAL_CHECKS = (
-    "Build Release (x86_64-unknown-linux-gnu)",
-    "Runtime Authority (Ubuntu)",
-    "Security Audit",
-    "Test (macos-14, default)",
-    "Test (ubuntu-24.04, default)",
-    "Test (ubuntu-24.04, no-default-features)",
-    "Toolchain and formatting contract",
-    "Toolchain and formatting contract (Windows)",
-)
-HYGIENE_CHECKS = ("Tracked tree (ubuntu-24.04)",)
-BRAIN_CHECKS = ("Isolation boundaries (ubuntu-24.04)",)
-OAUTH_CHECKS = ("macos-oauth", "oauth", "windows-compile")
-CHATGPT_AUTH_CHECKS = (
-    "focused-auth (macos-14)",
-    "focused-auth (ubuntu-24.04)",
-    "windows-verifier-compile",
-)
-
-
-def checks(*groups: tuple[str, ...]) -> list[str]:
-    return sorted(item for group in groups for item in group)
-
-
-EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
-    "readme_only": {
-        "changed_paths": ["README.md"],
-        "expected_checks": checks(
-            CANONICAL_CHECKS,
-            HYGIENE_CHECKS,
-            ("Current docs links, claims, and shell syntax",),
-        ),
-        "expected_count": 10,
-    },
-    "ordinary_source": {
-        "changed_paths": ["src/models/mod.rs"],
-        "expected_checks": checks(CANONICAL_CHECKS, HYGIENE_CHECKS, BRAIN_CHECKS),
-        "expected_count": 10,
-    },
-    "brain_effect": {
-        "changed_paths": ["src/brain/store.rs", "src/server/handlers.rs"],
-        "expected_checks": checks(
-            CANONICAL_CHECKS,
-            HYGIENE_CHECKS,
-            BRAIN_CHECKS,
-            ("effect-audit",),
-        ),
-        "expected_count": 11,
-    },
-    "manifest_dependency": {
-        "changed_paths": ["Cargo.toml", "Cargo.lock"],
-        "expected_checks": checks(
-            CANONICAL_CHECKS,
-            HYGIENE_CHECKS,
-            BRAIN_CHECKS,
-            OAUTH_CHECKS,
-            CHATGPT_AUTH_CHECKS,
-        ),
-        "expected_count": 16,
-    },
-    "public_api": {
-        "changed_paths": ["src/lib.rs"],
-        "expected_checks": checks(
-            CANONICAL_CHECKS,
-            HYGIENE_CHECKS,
-            BRAIN_CHECKS,
-            OAUTH_CHECKS,
-        ),
-        "expected_count": 13,
-    },
-}
-
-EXPECTED_PR_ACTIVE_WORKFLOWS = [
-    "ci.yml",
-    "docs.yml",
-    "issue-105-oauth.yml",
-    "issue-163-effect-audit.yml",
-    "issue-187-subagent-fanout.yml",
-    "issue-201-chatgpt-auth.yml",
-    "issue-227-setup-preservation.yml",
-    "issue-245-cargo-slot.yml",
-    "issue-46-atomic-conversation.yml",
-    "issue-56-brain-isolation.yml",
-    "repository-hygiene.yml",
-]
-
-EXPECTED_FIXTURE_MEMBERSHIP = {
-    "ci.yml": sorted(EXPECTED_FIXTURES),
-    "docs.yml": ["readme_only"],
-    "issue-104-chooser-catalog.yml": [],
-    "issue-105-oauth.yml": ["manifest_dependency", "public_api"],
-    "issue-163-effect-audit.yml": ["brain_effect"],
-    "issue-187-subagent-fanout.yml": [],
-    "issue-201-chatgpt-auth.yml": ["manifest_dependency"],
-    "issue-227-setup-preservation.yml": [],
-    "issue-245-cargo-slot.yml": [],
-    "issue-46-atomic-conversation.yml": [],
-    "issue-56-brain-isolation.yml": [
-        "brain_effect",
-        "manifest_dependency",
-        "ordinary_source",
-        "public_api",
-    ],
-    "issue-72-capability-contract.yml": [],
-    "release.yml": [],
-    "repository-hygiene.yml": sorted(EXPECTED_FIXTURES),
-}
-
-
-def json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ContractError(f"manifest contains duplicate JSON key {key!r}")
-        result[key] = value
-    return result
-
-
-def regular_file_metadata(path: Path, display: str, maximum: int) -> os.stat_result:
-    try:
-        metadata = path.lstat()
-    except OSError as error:
-        raise ContractError(f"{display}: file metadata could not be read: {error}") from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise ContractError(f"{display}: must be a regular file, not a symbolic link")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ContractError(
-            f"{display}: must be a regular file; found mode {stat.filemode(metadata.st_mode)!r}"
-        )
-    if metadata.st_size > maximum:
-        raise ContractError(
-            f"{display}: {metadata.st_size} bytes exceeds the reviewed {maximum}-byte bound"
-        )
-    return metadata
-
-
-def file_identity(metadata: os.stat_result) -> FileIdentity:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
+def load_yaml(path: Path) -> dict[str, Any]:
+    """Use Ruby's stock Psych parser; Python's standard library has no YAML parser."""
+    program = (
+        "require 'yaml'; require 'json'; "
+        "print JSON.generate(YAML.safe_load(STDIN.read, permitted_classes: [], aliases: false))"
     )
-
-
-def open_path_descriptor(path: Path, display: str) -> int:
-    """Open ``path`` without following links or blocking; the caller owns the fd."""
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise ContractError(
-            f"{display}: O_NOFOLLOW is unavailable; refusing to open path={path}"
-        )
-    nonblock = getattr(os, "O_NONBLOCK", None)
-    if nonblock is None:
-        raise ContractError(
-            f"{display}: O_NONBLOCK is unavailable; refusing to open path={path}"
-        )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | nonblock
     try:
-        return os.open(path, flags)
-    except OSError as error:
-        raise ContractError(
-            f"{display}: path={path} could not be opened with no-follow nonblocking "
-            f"read-only flags: {error}"
-        ) from error
-
-
-def open_regular_file(
-    path: Path,
-    root: Path,
-    maximum: int,
-    before_open_hook: Callable[[Path], None] | None = None,
-) -> tuple[BinaryIO, os.stat_result, str]:
-    display = path.relative_to(root).as_posix()
-    metadata = regular_file_metadata(path, display, maximum)
-    if before_open_hook is not None:
-        before_open_hook(path)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        result = subprocess.run(
+            ["ruby", "-e", program], input=path.read_text(), text=True,
+            capture_output=True, check=False,
+        )
+    except (OSError, UnicodeError) as error:
+        raise ContractError(f"{path}: cannot parse workflow YAML with Ruby Psych: {error}") from error
+    if result.returncode:
+        raise ContractError(f"{path}: invalid workflow YAML: {result.stderr.strip()}")
     try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ContractError(
-            f"{display}: regular file could not be opened safely: {error}"
-        ) from error
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ContractError(f"{display}: opened path is not a regular file")
-        if file_identity(opened) != file_identity(metadata):
-            raise ContractError(f"{display}: file identity changed before reading")
-        return os.fdopen(descriptor, "rb"), opened, display
-    except Exception:
-        os.close(descriptor)
-        raise
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ContractError(f"{path}: YAML parser returned invalid JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise ContractError(f"{path}: workflow document must be a mapping")
+    return document
 
 
-def read_exact_bytes(stream: BinaryIO, expected_size: int, display: str) -> bytes:
-    contents = stream.read(expected_size + 1)
-    if len(contents) != expected_size:
-        raise ContractError(
-            f"{display}: file size changed while reading; expected={expected_size} "
-            f"actual={len(contents)}"
-        )
-    return contents
+def pull_request_paths(document: dict[str, Any], display: str) -> tuple[str, ...] | None | bool:
+    # Psych implements YAML 1.1 and therefore decodes the plain key `on` as true.
+    triggers = document.get("on", document.get("true"))
+    if not isinstance(triggers, dict) or "pull_request" not in triggers:
+        return False
+    pull_request = triggers["pull_request"]
+    if pull_request is None:
+        return None
+    if not isinstance(pull_request, dict):
+        raise ContractError(f"{display}: on.pull_request must be a mapping or null")
+    unsupported = set(pull_request) - {"branches", "branches-ignore", "types", "paths"}
+    if unsupported:
+        raise ContractError(f"{display}: unsupported pull_request keys affecting activation: {sorted(unsupported)}")
+    paths = pull_request.get("paths")
+    if paths is None:
+        return None
+    if not isinstance(paths, list) or not paths or not all(isinstance(item, str) for item in paths):
+        raise ContractError(f"{display}: on.pull_request.paths must be a nonempty string list")
+    return tuple(paths)
 
 
-def hash_canonical_workflow_stream(
-    stream: BinaryIO, expected_size: int, display: str
-) -> tuple[str, int]:
-    """Hash reviewed workflow bytes with Git's declared CRLF-to-LF checkout semantics."""
-    digest = hashlib.sha256()
-    consumed = 0
-    canonical_size = 0
-    pending_carriage_return = False
-    while consumed < expected_size:
-        request_bytes = min(HASH_CHUNK_BYTES, expected_size - consumed)
-        chunk = stream.read(request_bytes)
-        if not chunk:
-            break
-        consumed += len(chunk)
-        if pending_carriage_return:
-            chunk = b"\r" + chunk
-            pending_carriage_return = False
-        if chunk.endswith(b"\r"):
-            chunk = chunk[:-1]
-            pending_carriage_return = True
-        canonical = chunk.replace(b"\r\n", b"\n")
-        canonical_size += len(canonical)
-        digest.update(canonical)
-    if consumed != expected_size:
-        raise ContractError(
-            f"{display}: file size changed while hashing; expected={expected_size} "
-            f"actual={consumed}"
-        )
-    if pending_carriage_return:
-        canonical_size += 1
-        digest.update(b"\r")
-    if stream.read(1):
-        raise ContractError(f"{display}: file grew while its reviewed bytes were hashed")
-    return digest.hexdigest(), canonical_size
+MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
 
 
-def exact_digest(
-    path: Path,
-    root: Path,
-    maximum: int,
-    before_open_hook: Callable[[Path], None] | None = None,
-    after_open_hook: Callable[[Path], None] | None = None,
-) -> tuple[str, int, int, FileIdentity]:
-    stream, opened, display = open_regular_file(
-        path, root, maximum, before_open_hook
-    )
-    with stream:
-        if after_open_hook is not None:
-            after_open_hook(path)
-        digest, canonical_size = hash_canonical_workflow_stream(
-            stream, opened.st_size, display
-        )
-    return digest, canonical_size, opened.st_size, file_identity(opened)
+def expanded_checks(document: dict[str, Any], display: str) -> tuple[str, ...]:
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        raise ContractError(f"{display}: jobs must be a nonempty mapping")
+    names: list[str] = []
+    for job_id, job in jobs.items():
+        if not isinstance(job_id, str) or not isinstance(job, dict):
+            raise ContractError(f"{display}: each job must have a string id and mapping body")
+        explicit_name = job.get("name")
+        if explicit_name is not None and not isinstance(explicit_name, str):
+            raise ContractError(f"{display}: job {job_id!r} name must be a string")
+        strategy = job.get("strategy", {})
+        if not isinstance(strategy, dict):
+            raise ContractError(f"{display}: job {job_id!r} strategy must be a mapping")
+        matrix = strategy.get("matrix")
+        if matrix is None:
+            rows = [{}]
+        else:
+            if not isinstance(matrix, dict) or not matrix:
+                raise ContractError(f"{display}: job {job_id!r} matrix must be a nonempty mapping")
+            if "exclude" in matrix:
+                raise ContractError(f"{display}: job {job_id!r} uses unsupported matrix.exclude allocation syntax")
+            axes = [(key, value) for key, value in matrix.items() if key != "include"]
+            includes = matrix.get("include")
+            if axes and includes is not None:
+                raise ContractError(f"{display}: job {job_id!r} mixes axes and matrix.include; allocation is unsupported")
+            if includes is not None:
+                if not isinstance(includes, list) or not includes or not all(isinstance(row, dict) for row in includes):
+                    raise ContractError(f"{display}: job {job_id!r} matrix.include must be a nonempty mapping list")
+                rows = includes
+            else:
+                if not all(isinstance(key, str) and isinstance(values, list) and values for key, values in axes):
+                    raise ContractError(f"{display}: job {job_id!r} matrix axes must be nonempty lists")
+                keys = [key for key, _ in axes]
+                rows = [dict(zip(keys, values)) for values in itertools.product(*(values for _, values in axes))]
+        for row in rows:
+            if not all(isinstance(key, str) and isinstance(value, (str, int, float, bool)) for key, value in row.items()):
+                raise ContractError(f"{display}: job {job_id!r} matrix rows must contain scalar values")
+            if explicit_name is None:
+                name = job_id if not row else f"{job_id} ({', '.join(map(str, row.values()))})"
+            else:
+                def replace(match: re.Match[str]) -> str:
+                    key = match.group(1)
+                    if key not in row:
+                        raise ContractError(f"{display}: job {job_id!r} name references missing matrix key {key!r}")
+                    return str(row[key]).lower() if isinstance(row[key], bool) else str(row[key])
+                name = MATRIX_REFERENCE.sub(replace, explicit_name)
+                if "${{" in name:
+                    raise ContractError(f"{display}: job {job_id!r} name uses unsupported allocation expression {name!r}")
+            names.append(name)
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ContractError(f"{display}: duplicate expanded check names: {duplicates}")
+    return tuple(sorted(names))
 
 
-def workflow_paths(
-    root: Path, post_scan_hook: Callable[[], None] | None = None
-) -> tuple[FileIdentity, list[Path]]:
-    directory = root / WORKFLOW_DIRECTORY
-    try:
-        directory_metadata = directory.lstat()
-    except OSError as error:
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory metadata failed: {error}") from error
-    if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(directory_metadata.st_mode):
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: must be a real directory, not a link")
-    paths: list[Path] = []
-    entry_count = 0
-    try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                entry_count += 1
-                if entry_count > MAX_WORKFLOW_DIRECTORY_ENTRIES:
-                    raise ContractError(
-                        f"{WORKFLOW_DIRECTORY}: directory entry count exceeds the reviewed "
-                        f"{MAX_WORKFLOW_DIRECTORY_ENTRIES}-entry bound"
-                    )
-                if not entry.name.endswith((".yml", ".yaml")):
-                    continue
-                paths.append(directory / entry.name)
-                if len(paths) > MAX_WORKFLOW_FILES:
-                    raise ContractError(
-                        f"{WORKFLOW_DIRECTORY}: workflow count exceeds the reviewed "
-                        f"{MAX_WORKFLOW_FILES}-file bound"
-                    )
-            if post_scan_hook is not None:
-                post_scan_hook()
-    except OSError as error:
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: enumeration failed: {error}") from error
-    try:
-        post_scan_metadata = directory.lstat()
-    except OSError as error:
-        raise ContractError(
-            f"{WORKFLOW_DIRECTORY}: post-enumeration directory metadata failed: {error}"
-        ) from error
-    if (
-        stat.S_ISLNK(post_scan_metadata.st_mode)
-        or not stat.S_ISDIR(post_scan_metadata.st_mode)
-    ):
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: must remain a real directory, not a link")
-    if file_identity(post_scan_metadata) != file_identity(directory_metadata):
-        raise ContractError(
-            f"{WORKFLOW_DIRECTORY}: directory identity changed during enumeration"
-        )
-    paths.sort()
-    if not paths:
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: no workflow documents were found")
-    return file_identity(post_scan_metadata), paths
+def glob_matches(pattern: str, path: str) -> bool:
+    source = pattern[1:] if pattern.startswith("!") else pattern
+    if not source or any(character in source for character in "[]{}\\"):
+        raise ContractError(f"unsupported pull_request.paths pattern {pattern!r}")
+    pieces: list[str] = []
+    index = 0
+    while index < len(source):
+        if source[index:index + 3] == "**/":
+            pieces.append("(?:.*/)?")
+            index += 3
+        elif source[index:index + 2] == "**":
+            pieces.append(".*")
+            index += 2
+        elif source[index] == "*":
+            pieces.append("[^/]*")
+            index += 1
+        elif source[index] == "?":
+            pieces.append("[^/]")
+            index += 1
+        else:
+            pieces.append(re.escape(source[index]))
+            index += 1
+    return re.fullmatch("".join(pieces), path) is not None
 
 
-def workflow_records(
-    root: Path,
-    phase_hook: Callable[[], None] | None = None,
-    after_hash_hook: Callable[[], None] | None = None,
-    before_open_hook: Callable[[Path], None] | None = None,
-    after_open_hook: Callable[[Path], None] | None = None,
-    final_scan_hook: Callable[[], None] | None = None,
-) -> dict[str, dict[str, Any]]:
-    directory_identity, paths = workflow_paths(root)
-    metadata_by_path = {
-        path: regular_file_metadata(
-            path, path.relative_to(root).as_posix(), MAX_WORKFLOW_BYTES
-        )
-        for path in paths
-    }
-    total_bytes = sum(metadata.st_size for metadata in metadata_by_path.values())
-    if total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
-        raise ContractError(
-            f"{WORKFLOW_DIRECTORY}: {total_bytes} aggregate bytes exceeds the reviewed "
-            f"{MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
-        )
-    if phase_hook is not None:
-        phase_hook()
-    records: dict[str, dict[str, Any]] = {}
-    opened_identities: dict[Path, FileIdentity] = {}
-    opened_total_bytes = 0
-    for path in paths:
-        digest, canonical_size, physical_size, opened_identity = exact_digest(
-            path,
-            root,
-            MAX_WORKFLOW_BYTES,
-            before_open_hook,
-            after_open_hook,
-        )
-        opened_total_bytes += physical_size
-        if opened_total_bytes > MAX_TOTAL_WORKFLOW_BYTES:
-            raise ContractError(
-                f"{WORKFLOW_DIRECTORY}: {opened_total_bytes} aggregate opened bytes exceeds "
-                f"the reviewed {MAX_TOTAL_WORKFLOW_BYTES}-byte bound"
-            )
-        initial_identity = file_identity(metadata_by_path[path])
-        if opened_identity != initial_identity:
-            raise ContractError(
-                f"{path.relative_to(root)}: file identity changed after enumeration"
-            )
-        opened_identities[path] = opened_identity
-        records[path.name] = {
-            "sha256": digest,
-            "bytes": canonical_size,
-            "activated_fixtures": EXPECTED_FIXTURE_MEMBERSHIP.get(path.name),
-        }
-    if after_hash_hook is not None:
-        after_hash_hook()
-    final_directory_identity, final_paths = workflow_paths(root, final_scan_hook)
-    initial_names = [path.name for path in paths]
-    final_names = [path.name for path in final_paths]
-    if final_names != initial_names:
-        raise ContractError(
-            f"{WORKFLOW_DIRECTORY}: workflow entry set changed while checking; "
-            f"before={initial_names!r} after={final_names!r}"
-        )
-    for path in final_paths:
-        display = path.relative_to(root).as_posix()
-        final_metadata = regular_file_metadata(path, display, MAX_WORKFLOW_BYTES)
-        if file_identity(final_metadata) != opened_identities[path]:
-            raise ContractError(f"{display}: file identity changed after hashing")
-    if final_directory_identity != directory_identity:
-        raise ContractError(f"{WORKFLOW_DIRECTORY}: directory identity changed while checking")
-    return records
+def workflow_activates(paths: tuple[str, ...] | None, changed: tuple[str, ...]) -> bool:
+    if paths is None:
+        return True
+    def path_matches(path: str) -> bool:
+        active = False
+        for pattern in paths:
+            if glob_matches(pattern, path):
+                active = not pattern.startswith("!")
+        return active
+
+    return any(path_matches(path) for path in changed)
 
 
-def load_manifest(
-    root: Path,
-    before_open_hook: Callable[[Path], None] | None = None,
-    after_open_hook: Callable[[Path], None] | None = None,
-) -> tuple[dict[str, Any], FileIdentity]:
-    path = root / MANIFEST_PATH
-    display = MANIFEST_PATH.as_posix()
-    try:
-        stream, metadata, display = open_regular_file(
-            path, root, MAX_MANIFEST_BYTES, before_open_hook
-        )
-        with stream:
-            if after_open_hook is not None:
-                after_open_hook(path)
-            contents = read_exact_bytes(stream, metadata.st_size, display).decode("utf-8")
-        manifest = json.loads(contents, object_pairs_hook=json_object)
-    except (
-        OSError,
-        UnicodeError,
-        ValueError,
-        json.JSONDecodeError,
-        ContractError,
-        RecursionError,
-    ) as error:
-        raise ContractError(f"{display}: reviewed manifest could not be loaded: {error}") from error
-    if not isinstance(manifest, dict):
-        raise ContractError(f"{display}: manifest root must be an object")
-    return manifest, file_identity(metadata)
-
-
-def revalidate_manifest(root: Path, initial_identity: FileIdentity) -> None:
-    path = root / MANIFEST_PATH
-    display = MANIFEST_PATH.as_posix()
-    metadata = regular_file_metadata(path, display, MAX_MANIFEST_BYTES)
-    if file_identity(metadata) != initial_identity:
-        raise ContractError(
-            f"{display}: file identity changed while workflows were being checked"
-        )
-
-
-def evidence_errors(actual_names: set[str]) -> list[str]:
+def compare_contract(root: Path) -> list[str]:
+    directory = root / WORKFLOWS
+    actual_files = tuple(sorted(path.name for path in directory.glob("*.y*ml")))
     errors: list[str] = []
-    if EXPECTED_PR_ACTIVE_WORKFLOWS != sorted(set(EXPECTED_PR_ACTIVE_WORKFLOWS)):
-        errors.append("internal PR-active workflow inventory must be sorted and unique")
-    missing_active = set(EXPECTED_PR_ACTIVE_WORKFLOWS) - actual_names
-    if missing_active:
-        errors.append(
-            "internal PR-active workflow inventory names missing files: "
-            f"{sorted(missing_active)!r}"
-        )
-    if set(EXPECTED_FIXTURE_MEMBERSHIP) != actual_names:
-        errors.append(
-            "internal workflow-to-fixture inventory does not cover the exact workflow set: "
-            f"expected={sorted(actual_names)!r} actual={sorted(EXPECTED_FIXTURE_MEMBERSHIP)!r}"
-        )
-    fixture_names = set(EXPECTED_FIXTURES)
-    for name, fixture in EXPECTED_FIXTURES.items():
-        if set(fixture) != {"changed_paths", "expected_checks", "expected_count"}:
-            errors.append(f"internal fixture {name!r} has unexpected fields")
+    if actual_files != EXPECTED_WORKFLOWS:
+        errors.append(f"workflow inventory changed; expected={EXPECTED_WORKFLOWS!r} actual={actual_files!r}")
+    parsed: dict[str, tuple[tuple[str, ...] | None, tuple[str, ...]]] = {}
+    for name in sorted(set(actual_files) & set(EXPECTED_WORKFLOWS)):
+        display = (WORKFLOWS / name).as_posix()
+        try:
+            document = load_yaml(directory / name)
+            paths = pull_request_paths(document, display)
+            if paths is False:
+                continue
+            checks = expanded_checks(document, display)
+            parsed[name] = (paths, checks)
+        except ContractError as error:
+            errors.append(str(error))
+    actual_pr = set(parsed)
+    expected_pr = set(EXPECTED_PATHS)
+    if actual_pr != expected_pr:
+        errors.append(f"PR-active workflow inventory changed; expected={sorted(expected_pr)!r} actual={sorted(actual_pr)!r}")
+    for name in sorted(actual_pr & expected_pr):
+        paths, checks = parsed[name]
+        if paths != EXPECTED_PATHS[name]:
+            errors.append(f"{WORKFLOWS / name}: pull_request.paths changed; expected={EXPECTED_PATHS[name]!r} actual={paths!r}")
+        expected = tuple(sorted(EXPECTED_CHECKS[name]))
+        if checks != expected:
+            errors.append(f"{WORKFLOWS / name}: expanded check allocation changed; expected={expected!r} actual={checks!r}")
+    all_checks = [check for _, checks in parsed.values() for check in checks]
+    duplicates = sorted({name for name in all_checks if all_checks.count(name) > 1})
+    if duplicates:
+        errors.append(f"PR-active workflows have duplicate expanded check names: {duplicates}")
+    for fixture, (changed, expected) in EXPECTED_FIXTURES.items():
+        try:
+            actual = tuple(sorted(
+                check for paths, checks in parsed.values() if workflow_activates(paths, changed)
+                for check in checks
+            ))
+        except ContractError as error:
+            errors.append(f"fixture {fixture!r}: {error}")
             continue
-        paths = fixture["changed_paths"]
-        expected_checks = fixture["expected_checks"]
-        if not isinstance(paths, list) or not paths or len(paths) != len(set(paths)):
-            errors.append(f"internal fixture {name!r} changed paths must be nonempty and unique")
-        if not isinstance(expected_checks, list) or expected_checks != sorted(set(expected_checks)):
-            errors.append(f"internal fixture {name!r} check names must be sorted and unique")
-        if fixture["expected_count"] != len(expected_checks):
+        duplicates = sorted({name for name in actual if actual.count(name) > 1})
+        if duplicates:
+            errors.append(f"fixture {fixture!r}: duplicate check names: {duplicates}")
+        wanted = tuple(sorted(expected))
+        if actual != wanted:
             errors.append(
-                f"internal fixture {name!r} count does not match its check names: "
-                f"count={fixture['expected_count']!r} names={len(expected_checks)}"
+                f"fixture {fixture!r}: expected check names/count changed; "
+                f"expected_count={len(wanted)} actual_count={len(actual)} "
+                f"missing={sorted(set(wanted) - set(actual))!r} "
+                f"unexpected={sorted(set(actual) - set(wanted))!r}"
             )
-    for workflow, membership in EXPECTED_FIXTURE_MEMBERSHIP.items():
-        if membership != sorted(set(membership)) or not set(membership) <= fixture_names:
-            errors.append(
-                f"internal workflow {workflow!r} fixture membership must be sorted, unique, "
-                "and name only reviewed fixtures"
-            )
-    return errors
-
-
-def compare_contract(
-    root: Path,
-    workflow_phase_hook: Callable[[], None] | None = None,
-    after_workflow_hook: Callable[[], None] | None = None,
-    workflow_before_open_hook: Callable[[Path], None] | None = None,
-    workflow_after_open_hook: Callable[[Path], None] | None = None,
-    manifest_before_open_hook: Callable[[Path], None] | None = None,
-    manifest_after_open_hook: Callable[[Path], None] | None = None,
-) -> list[str]:
-    try:
-        manifest, manifest_identity = load_manifest(
-            root, manifest_before_open_hook, manifest_after_open_hook
-        )
-        actual = workflow_records(
-            root,
-            phase_hook=workflow_phase_hook,
-            before_open_hook=workflow_before_open_hook,
-            after_open_hook=workflow_after_open_hook,
-        )
-        if after_workflow_hook is not None:
-            after_workflow_hook()
-        revalidate_manifest(root, manifest_identity)
-    except ContractError as error:
-        return [str(error)]
-
-    errors: list[str] = []
-    errors.extend(evidence_errors(set(actual)))
-    expected_root_keys = {
-        "schema",
-        "workflow_canonical_eol",
-        "limits",
-        "pr_active_workflows",
-        "workflows",
-        "fixtures",
-    }
-    if set(manifest) != expected_root_keys:
-        errors.append(
-            f"{MANIFEST_PATH}: root keys changed; expected={sorted(expected_root_keys)!r} "
-            f"actual={sorted(manifest)!r}"
-        )
-    if manifest.get("schema") != SCHEMA:
-        errors.append(
-            f"{MANIFEST_PATH}: schema must be {SCHEMA!r}, "
-            f"found {manifest.get('schema')!r}"
-        )
-    if manifest.get("workflow_canonical_eol") != WORKFLOW_CANONICAL_EOL:
-        errors.append(
-            f"{MANIFEST_PATH}: workflow canonical EOL must be "
-            f"{WORKFLOW_CANONICAL_EOL!r}, "
-            f"found {manifest.get('workflow_canonical_eol')!r}"
-        )
-    expected_limits = {
-        "max_workflow_bytes": MAX_WORKFLOW_BYTES,
-        "max_total_workflow_bytes": MAX_TOTAL_WORKFLOW_BYTES,
-        "max_workflow_files": MAX_WORKFLOW_FILES,
-        "max_workflow_directory_entries": MAX_WORKFLOW_DIRECTORY_ENTRIES,
-        "max_manifest_bytes": MAX_MANIFEST_BYTES,
-    }
-    if manifest.get("limits") != expected_limits:
-        errors.append(
-            f"{MANIFEST_PATH}: reviewed limits changed; expected={expected_limits!r} "
-            f"actual={manifest.get('limits')!r}"
-        )
-
-    reviewed = manifest.get("workflows")
-    if not isinstance(reviewed, dict):
-        return errors + [f"{MANIFEST_PATH}: 'workflows' must be a filename-to-record object"]
-    actual_names = set(actual)
-    expected_names = set(reviewed)
-    for name in sorted(expected_names - actual_names):
-        errors.append(f"{WORKFLOW_DIRECTORY / name}: reviewed workflow file is missing")
-    for name in sorted(actual_names - expected_names):
-        errors.append(
-            f"{WORKFLOW_DIRECTORY / name}: unreviewed workflow file was added; "
-            f"review actual GitHub allocation before updating {MANIFEST_PATH}"
-        )
-    for name in sorted(actual_names & expected_names):
-        expected = reviewed[name]
-        if not isinstance(expected, dict):
-            errors.append(f"{MANIFEST_PATH}: workflow record {name!r} must be an object")
-            continue
-        if set(expected) != {"sha256", "bytes", "activated_fixtures"}:
-            errors.append(f"{MANIFEST_PATH}: workflow record {name!r} has unexpected keys")
-        for field in ("sha256", "bytes", "activated_fixtures"):
-            if expected.get(field) != actual[name][field]:
-                errors.append(
-                    f"{WORKFLOW_DIRECTORY / name}: reviewed {field} changed; "
-                    f"expected={expected.get(field)!r} actual={actual[name][field]!r}; "
-                    f"review actual GitHub allocation before updating {MANIFEST_PATH}"
-                )
-
-    if manifest.get("pr_active_workflows") != EXPECTED_PR_ACTIVE_WORKFLOWS:
-        errors.append(
-            f"{MANIFEST_PATH}: PR-active workflow inventory changed; "
-            f"expected={EXPECTED_PR_ACTIVE_WORKFLOWS!r} "
-            f"actual={manifest.get('pr_active_workflows')!r}"
-        )
-    if manifest.get("fixtures") != EXPECTED_FIXTURES:
-        errors.append(
-            f"{MANIFEST_PATH}: representative fixture inventories changed; "
-            f"expected={EXPECTED_FIXTURES!r} actual={manifest.get('fixtures')!r}"
-        )
     return errors
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--print-records", action="store_true")
     arguments = parser.parse_args()
-    root = arguments.root.resolve()
-    if arguments.print_records:
-        try:
-            print(json.dumps(workflow_records(root), indent=2, sort_keys=True))
-            return 0
-        except ContractError as error:
-            print(f"CI workflow manifest: {error}", file=sys.stderr)
-            return 1
-    errors = compare_contract(root)
+    errors = compare_contract(arguments.root.resolve())
     if errors:
         for error in errors:
-            print(f"CI workflow manifest: {error}", file=sys.stderr)
+            print(f"CI workflow contract: {error}", file=sys.stderr)
         return 1
-    print("CI workflow manifest: exact bounded workflow inventory passed")
+    print("CI workflow contract: semantic inventory and check allocation passed")
     return 0
 
 

@@ -7,7 +7,6 @@ on:
       - "scripts/check_docs.py"
       - ".agents/skills/finch-backlog/scripts/test-review-protocol"
       - ".github/workflows/docs.yml"
-      - "scripts/ci_workflow_manifest.json"
   push:
     branches: [main]
     paths:
@@ -15,7 +14,6 @@ on:
       - "scripts/check_docs.py"
       - ".agents/skills/finch-backlog/scripts/test-review-protocol"
       - ".github/workflows/docs.yml"
-      - "scripts/ci_workflow_manifest.json"
 
 permissions:
   contents: read
