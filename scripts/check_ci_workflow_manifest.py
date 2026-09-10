@@ -78,6 +78,14 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
     "repository-hygiene.yml": None,
 }
 
+EXPECTED_PULL_REQUEST_OPTIONS = {
+    name: ({"branches": ("main",)} if name in {
+        "ci.yml", "issue-105-oauth.yml", "issue-187-subagent-fanout.yml",
+        "issue-201-chatgpt-auth.yml", "issue-227-setup-preservation.yml",
+    } else {})
+    for name in EXPECTED_PATHS
+}
+
 EXPECTED_CHECKS = {
     "ci.yml": (
         "Build Release (x86_64-unknown-linux-gnu)", "Runtime Authority (Ubuntu)",
@@ -156,10 +164,40 @@ class ContractError(Exception):
 
 def load_yaml(path: Path) -> dict[str, Any]:
     """Use Ruby's stock Psych parser; Python's standard library has no YAML parser."""
-    program = (
-        "require 'yaml'; require 'json'; "
-        "print JSON.generate(YAML.safe_load(STDIN.read, permitted_classes: [], aliases: false))"
-    )
+    program = r"""
+require 'yaml'; require 'json'
+begin
+  source = STDIN.read
+  stream = Psych.parse_stream(source)
+  raise 'workflow must contain exactly one YAML document' unless stream.children.length == 1
+  root = stream.children[0].root
+  raise 'workflow document must be a mapping' unless root.is_a?(Psych::Nodes::Mapping)
+  visit = lambda do |node|
+    if node.is_a?(Psych::Nodes::Mapping)
+      keys = node.children.each_slice(2).map do |key, value|
+        raise "mapping key at line #{key.start_line + 1} must be a scalar" unless key.is_a?(Psych::Nodes::Scalar)
+        visit.call(value)
+        key
+      end
+      duplicate = keys.group_by(&:value).find { |_, matches| matches.length > 1 }
+      raise "duplicate YAML key #{duplicate[0].inspect} at line #{duplicate[1][1].start_line + 1}" if duplicate
+    elsif node.respond_to?(:children) && node.children
+      node.children.each { |child| visit.call(child) }
+    end
+  end
+  visit.call(root)
+  on_key = root.children.each_slice(2).map(&:first).find { |key| key.value == 'on' }
+  raise "workflow root is missing the actual 'on' key" unless on_key
+  document = YAML.safe_load(source, permitted_classes: [], aliases: false)
+  raise 'YAML key conversion collision is unsupported' unless document.length == root.children.length / 2
+  converted_on = on_key.plain ? true : 'on'
+  document['on'] = document.delete(converted_on) unless converted_on == 'on'
+  print JSON.generate(document)
+rescue => error
+  warn error.message
+  exit 1
+end
+"""
     try:
         result = subprocess.run(
             ["ruby", "-e", program], input=path.read_text(), text=True,
@@ -178,25 +216,32 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return document
 
 
-def pull_request_paths(document: dict[str, Any], display: str) -> tuple[str, ...] | None | bool:
-    # Psych implements YAML 1.1 and therefore decodes the plain key `on` as true.
-    triggers = document.get("on", document.get("true"))
-    if not isinstance(triggers, dict) or "pull_request" not in triggers:
+def pull_request_contract(document: dict[str, Any], display: str) -> dict[str, tuple[str, ...]] | bool:
+    triggers = document["on"]
+    if not isinstance(triggers, dict):
+        raise ContractError(f"{display}: on must be a mapping")
+    if "pull_request_target" in triggers:
+        raise ContractError(f"{display}: on.pull_request_target is unsupported by the reviewed PR allocation")
+    if "pull_request" not in triggers:
         return False
     pull_request = triggers["pull_request"]
     if pull_request is None:
-        return None
+        return {}
     if not isinstance(pull_request, dict):
         raise ContractError(f"{display}: on.pull_request must be a mapping or null")
-    unsupported = set(pull_request) - {"branches", "branches-ignore", "types", "paths"}
+    supported = {"branches", "branches-ignore", "types", "paths", "paths-ignore"}
+    unsupported = set(pull_request) - supported
     if unsupported:
         raise ContractError(f"{display}: unsupported pull_request keys affecting activation: {sorted(unsupported)}")
-    paths = pull_request.get("paths")
-    if paths is None:
-        return None
-    if not isinstance(paths, list) or not paths or not all(isinstance(item, str) for item in paths):
-        raise ContractError(f"{display}: on.pull_request.paths must be a nonempty string list")
-    return tuple(paths)
+    for alternatives in (("branches", "branches-ignore"), ("paths", "paths-ignore")):
+        if set(alternatives) <= set(pull_request):
+            raise ContractError(f"{display}: on.pull_request cannot combine {alternatives[0]} and {alternatives[1]}")
+    contract: dict[str, tuple[str, ...]] = {}
+    for key, values in pull_request.items():
+        if not isinstance(values, list) or not values or not all(isinstance(item, str) for item in values):
+            raise ContractError(f"{display}: on.pull_request.{key} must be a nonempty string list")
+        contract[key] = tuple(values)
+    return contract
 
 
 MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
@@ -283,9 +328,13 @@ def glob_matches(pattern: str, path: str) -> bool:
     return re.fullmatch("".join(pieces), path) is not None
 
 
-def workflow_activates(paths: tuple[str, ...] | None, changed: tuple[str, ...]) -> bool:
-    if paths is None:
+def workflow_activates(contract: dict[str, tuple[str, ...]], changed: tuple[str, ...]) -> bool:
+    paths = contract.get("paths")
+    ignored = contract.get("paths-ignore")
+    if paths is None and ignored is None:
         return True
+    if ignored is not None:
+        return any(not any(glob_matches(pattern, path) for pattern in ignored) for path in changed)
     def path_matches(path: str) -> bool:
         active = False
         for pattern in paths:
@@ -302,16 +351,16 @@ def compare_contract(root: Path) -> list[str]:
     errors: list[str] = []
     if actual_files != EXPECTED_WORKFLOWS:
         errors.append(f"workflow inventory changed; expected={EXPECTED_WORKFLOWS!r} actual={actual_files!r}")
-    parsed: dict[str, tuple[tuple[str, ...] | None, tuple[str, ...]]] = {}
+    parsed: dict[str, tuple[dict[str, tuple[str, ...]], tuple[str, ...]]] = {}
     for name in sorted(set(actual_files) & set(EXPECTED_WORKFLOWS)):
         display = (WORKFLOWS / name).as_posix()
         try:
             document = load_yaml(directory / name)
-            paths = pull_request_paths(document, display)
-            if paths is False:
+            contract = pull_request_contract(document, display)
+            if contract is False:
                 continue
             checks = expanded_checks(document, display)
-            parsed[name] = (paths, checks)
+            parsed[name] = (contract, checks)
         except ContractError as error:
             errors.append(str(error))
     actual_pr = set(parsed)
@@ -319,9 +368,16 @@ def compare_contract(root: Path) -> list[str]:
     if actual_pr != expected_pr:
         errors.append(f"PR-active workflow inventory changed; expected={sorted(expected_pr)!r} actual={sorted(actual_pr)!r}")
     for name in sorted(actual_pr & expected_pr):
-        paths, checks = parsed[name]
-        if paths != EXPECTED_PATHS[name]:
-            errors.append(f"{WORKFLOWS / name}: pull_request.paths changed; expected={EXPECTED_PATHS[name]!r} actual={paths!r}")
+        contract, checks = parsed[name]
+        expected_contract = dict(EXPECTED_PULL_REQUEST_OPTIONS[name])
+        if EXPECTED_PATHS[name] is not None:
+            expected_contract["paths"] = EXPECTED_PATHS[name]
+        for key in sorted(set(contract) | set(expected_contract)):
+            if contract.get(key) != expected_contract.get(key):
+                errors.append(
+                    f"{WORKFLOWS / name}: pull_request.{key} changed; "
+                    f"expected={expected_contract.get(key)!r} actual={contract.get(key)!r}"
+                )
         expected = tuple(sorted(EXPECTED_CHECKS[name]))
         if checks != expected:
             errors.append(f"{WORKFLOWS / name}: expanded check allocation changed; expected={expected!r} actual={checks!r}")
@@ -332,7 +388,7 @@ def compare_contract(root: Path) -> list[str]:
     for fixture, (changed, expected) in EXPECTED_FIXTURES.items():
         try:
             actual = tuple(sorted(
-                check for paths, checks in parsed.values() if workflow_activates(paths, changed)
+                check for contract, checks in parsed.values() if workflow_activates(contract, changed)
                 for check in checks
             ))
         except ContractError as error:

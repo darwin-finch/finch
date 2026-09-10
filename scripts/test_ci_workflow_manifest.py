@@ -85,11 +85,57 @@ class WorkflowContractTests(unittest.TestCase):
     def test_negative_path_filters_are_applied_per_changed_path(self) -> None:
         self.assertTrue(
             workflow_activates(
-                ("docs/**", "!docs/generated/**"),
+                {"paths": ("docs/**", "!docs/generated/**")},
                 ("docs/generated/index.md", "docs/guide.md"),
             ),
             "one excluded file must not hide a different included changed path",
         )
+
+    def test_branch_filter_drift_fails_actionably(self) -> None:
+        self.repository.replace(
+            "ci.yml", "  pull_request:\n    branches: [ main ]",
+            "  pull_request:\n    branches: [ release ]",
+        )
+        self.assert_fails("ci.yml: pull_request.branches changed", "expected=('main',)", "actual=('release',)")
+
+    def test_pull_request_type_drift_fails_actionably(self) -> None:
+        self.repository.replace(
+            "ci.yml", "  pull_request:\n    branches: [ main ]",
+            "  pull_request:\n    branches: [ main ]\n    types: [closed]",
+        )
+        self.assert_fails("ci.yml: pull_request.types changed", "expected=None", "actual=('closed',)")
+
+    def test_conflicting_branch_filters_fail_actionably(self) -> None:
+        self.repository.replace(
+            "ci.yml", "  pull_request:\n    branches: [ main ]",
+            "  pull_request:\n    branches: [ main ]\n    branches-ignore: [ release ]",
+        )
+        self.assert_fails("ci.yml: on.pull_request cannot combine branches and branches-ignore")
+
+    def test_pull_request_target_fails_closed(self) -> None:
+        self.repository.replace("release.yml", "  push:\n", "  pull_request_target:\n\n  push:\n")
+        self.assert_fails("release.yml: on.pull_request_target is unsupported")
+
+    def test_psych_key_conflation_and_duplicates_fail_before_conversion(self) -> None:
+        mutations = (
+            ("ci.yml", "on:\n", '"true":\n', "missing the actual 'on' key"),
+            ("ci.yml", "on:\n", "on: {}\non:\n", 'duplicate YAML key "on"'),
+            ("docs.yml", "jobs:\n", "jobs: {}\njobs:\n", 'duplicate YAML key "jobs"'),
+            ("docs.yml", "  current-docs:\n", "  current-docs: {}\n  current-docs:\n", 'duplicate YAML key "current-docs"'),
+            ("docs.yml", "    name: Current docs", "    name: duplicate\n    name: Current docs", 'duplicate YAML key "name"'),
+            ("docs.yml", "  pull_request:\n", "  pull_request: {}\n  pull_request:\n", 'duplicate YAML key "pull_request"'),
+            ("docs.yml", "    paths:\n", "    paths: []\n    paths:\n", 'duplicate YAML key "paths"'),
+        )
+        for name, old, new, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                repository = Repository()
+                try:
+                    repository.replace(name, old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"duplicate-key mutant passed: {diagnostic}")
+                    self.assertIn(diagnostic, result.stderr, f"diagnostic was not actionable: {result.stderr}")
+                finally:
+                    repository.close()
 
     def test_job_name_drift_reports_missing_and_unexpected_checks(self) -> None:
         self.repository.replace("docs.yml", "Current docs links, claims, and shell syntax", "Renamed docs check")
