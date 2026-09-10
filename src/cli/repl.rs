@@ -65,6 +65,11 @@ enum ConfirmationChoice {
     Deny,
 }
 
+/// Shared identity for interactive and redirected startup banners.
+pub fn startup_identity_line() -> String {
+    format!("finch {} - {}", env!("CARGO_PKG_VERSION"), crate::ABOUT)
+}
+
 #[cfg(test)]
 mod disabled_training_tests {
     use super::*;
@@ -2366,7 +2371,7 @@ impl Repl {
     pub async fn run(&mut self) -> Result<()> {
         if self.is_interactive {
             // Fancy startup for interactive mode
-            self.output_status("Shammah v0.1.0 - Constitutional AI Proxy");
+            self.output_status(startup_identity_line());
             self.output_status("Using API key from: ~/.finch/config.toml ✓");
             self.output_status("Loaded crisis detection keywords ✓");
             self.output_status("Online learning: ENABLED (threshold models) ✓");
@@ -2375,7 +2380,7 @@ impl Repl {
             self.print_status_line().await;
         } else {
             // Minimal output for non-interactive mode (pipes, scripts)
-            output_status!("# Shammah v0.1.0 - Non-interactive mode");
+            output_status!("# {} - non-interactive mode", startup_identity_line());
         }
 
         // Register Ctrl+C handler for graceful shutdown

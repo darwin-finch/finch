@@ -2276,7 +2276,8 @@ impl TuiRenderer {
     pub fn startup_header(model: &str, cwd: &str, session_label: &str) -> String {
         let version = env!("CARGO_PKG_VERSION");
         format!(
-            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲"
+            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n{}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲",
+            crate::ABOUT
         )
     }
 }
@@ -3870,10 +3871,15 @@ mod tests {
     #[test]
     fn startup_header_is_plain_scrollback_content() {
         let header = TuiRenderer::startup_header("grok-code-fast-1", "~/repo", "amber-river");
-        assert!(header.contains("finch v"));
+        assert!(header.contains(&format!("finch v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(header.contains(crate::ABOUT));
         assert!(header.contains("grok-code-fast-1"));
         assert!(header.contains("amber-river  ·  ~/repo"));
         assert!(!header.contains('\x1b'));
+        assert!(
+            header.lines().all(|line| line.chars().count() <= 80),
+            "startup header must remain readable in an 80-column terminal; header={header:?}"
+        );
     }
 
     // ── count_status_lines ────────────────────────────────────────────────────

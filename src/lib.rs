@@ -1,5 +1,8 @@
-// Shammah - Local-first Constitutional AI Proxy
+// finch - terminal coding assistant
 // Library exports
+
+/// One-line description of what Finch is, shown by `finch --help`.
+pub const ABOUT: &str = "Terminal coding assistant with typed programs, named Brains, and tool use";
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
