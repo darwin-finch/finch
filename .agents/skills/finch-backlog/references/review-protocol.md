@@ -117,15 +117,23 @@ verifies findings, and records the ledger. The implementer reproduces coherent c
 vectors on the implementation worktree. Any production change creates a new tip and requires
 affected tests and review again.
 
+Disposable review fixtures use a private restrictive directory allocated by `mktemp -d`, reject a
+symlink in place of that directory, and retain the allocated directory's inode identity. Normal and
+signal exits remove only that same non-symlink inode. Predictable PID paths, inherited permissive
+modes, and cleanup through a replaced path are forbidden.
+
 Track attempts as ordered append-only events keyed by nonempty stable finding ID and strategy
 epoch. An `ATTEMPT` event records the next positive attempt ordinal, competence, exact full repair
-tip, and result `SURVIVED` or `RESOLVED`. Exactly the second competent `SURVIVED` result for the
+tip, proof that it is a distinct descendant candidate tip, and result `SURVIVED` or `RESOLVED`.
+The same tip never counts twice for one finding. Exactly the second competent `SURVIVED` result for the
 same still-open finding and epoch ends that epoch. A later `DIAGNOSIS` event must follow those two
 survivals, name their exhausted epoch and an immutable independent proof identity, and precede any
 further repair. The next `ATTEMPT` names a new epoch plus a nonempty changed-strategy identity; it
 cannot use the exhausted epoch or repeat the prior strategy. Diagnosis before exhaustion, a third
 same-epoch repair, a placeholder tip, a resolved second attempt, incompetent attempt, or an attempt
-for another finding never satisfies the trigger. Agent failure never proves infeasibility.
+for another finding never satisfies the trigger. Retain every epoch identity ever used for that
+finding: once exhausted, an epoch name can never be reused after any number of later epochs. Agent
+failure never proves infeasibility.
 
 The finite convergence rule is exact:
 

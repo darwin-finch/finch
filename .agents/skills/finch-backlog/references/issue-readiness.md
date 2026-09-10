@@ -30,8 +30,11 @@ Every state and transition record uses exactly one actor expression:
 - `DECISION_BY(x); RECORDED_BY(y)`: either `x` directly posts an immutable owner-signed decision,
   whose author identity is the named owner and which has no second actor, or `y` mechanically
   records and verifies a linked prior immutable owner-signed decision by `x`. The link includes a
-  canonical comment identity, unedited metadata, and exact body digest. A recorder-only assertion,
-  edited/wrong-author decision, empty evidence identity, or extra actor is invalid.
+  canonical GitHub comment URL and matching numeric comment ID, unedited metadata, and exact
+  64-lowercase-hex body digest. The expected owner principal is supplied independently; the linked
+  author must equal it exactly and must differ from the recorder principal. A recorder-only
+  assertion, edited/wrong-author decision, malformed identity/digest, empty evidence identity, or
+  extra actor is invalid.
 
 The symbols `/`, `+`, commas, and phrases such as “with approval” are not actor operators. Roles do
 not grant authority. `proposer` records the desired outcome; `coordinator` collects evidence and
@@ -51,6 +54,13 @@ target-specific exit predicate, and the issue condition. Opaque placeholders suc
 `next-action`, and `exit-evidence` do not satisfy a field. Missing, empty, unknown, or contradictory
 fields invalidate the record. Each named immutable URL, comment ID, Git tip, and digest uses the
 canonical identity forms required by the referenced protocol.
+The record's state schema is closed: every row-specific key occurs exactly once and no unknown key
+is accepted. A comment reference is its canonical GitHub issue-comment URL plus matching positive
+decimal comment ID; a Git identity is 40 lowercase hexadecimal; a SHA-256 digest is 64 lowercase
+hexadecimal; a revision is a positive decimal; and a claim ID is a lowercase UUID. Contract and
+approval URL/ID/digest values bind the same independently retrieved artifacts, and the recorded
+contract owner must equal the independently supplied expected owner. Other evidence fields carry a
+named stable evidence identity rather than an opaque truth value.
 
 | State | Accountable state owner | Required entry and continuing evidence | Permitted next actions/destinations | Exit condition | Issue condition |
 |---|---|---|---|---|---|
@@ -224,7 +234,16 @@ For PR #542 and issue #406, verify these eight events in this exact order:
    permitted abandonment or false completion; and the smallest evidence-backed follow-up, if any.
 8. That comment retrieved, verified unedited, and its exact body digest recorded.
 
-Removing or permuting a prerequisite rejects completion and names the missing/out-of-order event.
+Every successful row carries a unique 64-lowercase-hex event identity, exact state facts, a
+`CURRENT_CANDIDATE` binding, and step-specific typed evidence: merge/main tips at step 1; tree tip,
+tests digest, and canonical CI comment at step 2; the exact claim UUID plus canonical immutable
+issuer-authorized terminal at step 3; worktree identity, integration tip, clean and pushed proofs at
+step 4; issue identity and canonical closure comment at step 5; scan digest at step 6; canonical
+retrospective identity and digest at step 7; and the same retrieved unedited retrospective identity
+and digest at step 8. Empty, placeholder, unknown, stale-bound, mistyped, wrong-author, or mismatched
+URL/ID evidence rejects the row. Step 8 is terminal: no later success, failure, or side effect may be
+appended. Removing or permuting a prerequisite rejects completion and names the
+missing/out-of-order event.
 The valid result is exactly: PR #542 integrated and accounted and issue #406 complete. Issue #543
 is independent: its lifecycle state is never read and it is never an acceptance gate, successor
 obligation, proof path, or completion dependency for PR #542 or issue #406.

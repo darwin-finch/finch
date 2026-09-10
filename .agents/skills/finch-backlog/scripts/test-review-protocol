@@ -41,9 +41,30 @@ CLAIMS="$REFS/work-claims.md"
 WORKFLOW="$ROOT/.github/workflows/docs.yml"
 MANIFEST="$ROOT/scripts/ci_workflow_manifest.json"
 REDUCER="$ROOT/.agents/skills/finch-backlog/scripts/workflow_protocol.py"
-TMP=${TMPDIR:-/tmp}/finch-review-protocol.$$
-trap 'rm -rf "$TMP"' EXIT HUP INT TERM
-mkdir -p "$TMP"
+umask 077
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/finch-review-protocol.XXXXXXXX") || {
+    printf 'ERROR: failed to allocate private review-protocol directory under %s\n' "${TMPDIR:-/tmp}" >&2
+    exit 2
+}
+if test ! -d "$TMP" || test -L "$TMP"; then
+    printf 'ERROR: review-protocol temporary path is not a private directory: %s\n' "$TMP" >&2
+    exit 2
+fi
+chmod 700 "$TMP" || exit 2
+TMP_INODE=$(ls -di "$TMP" | awk '{ print $1 }')
+cleanup_tmp() {
+    if test -d "$TMP" && test ! -L "$TMP" && test "$(ls -di "$TMP" | awk '{ print $1 }')" = "$TMP_INODE"; then
+        rm -rf -- "$TMP"
+    fi
+}
+trap 'cleanup_tmp' EXIT
+trap 'cleanup_tmp; exit 129' HUP
+trap 'cleanup_tmp; exit 130' INT
+trap 'cleanup_tmp; exit 143' TERM
+case "${FINCH_PROTOCOL_TMP_PROBE:-run}" in
+    interrupt) kill -HUP $$ ;;
+    normal-exit) exit 2 ;;
+esac
 
 checks=0
 failures=0
@@ -71,6 +92,7 @@ failures=0
 # F406-A4FB-07 -> real clause-level operative-policy contradiction mutants.
 # F406-A4FB-08 -> shared canonical identity validators and hostile placeholder fixtures.
 # F406-A4FB-09 -> mandatory focused workflow step plus manifest-refreshed disable mutants.
+# F406-47B-TEMP-01 -> private mktemp allocation, symlink resistance, and inode-bound cleanup.
 
 pass() {
     checks=$((checks + 1))
@@ -160,6 +182,41 @@ expect_reject() {
         fail "$label: expected diagnostic [$diagnostic], got [$(tr '\n' ';' <"$err")]"
     fi
 }
+
+# The executable boundary must allocate a private unpredictable directory and clean only it.
+temp_attack_root="$TMP/temp-attack"
+mkdir "$temp_attack_root" "$temp_attack_root/victim"
+printf '%s\n' 'sentinel-must-survive' >"$temp_attack_root/victim/sentinel"
+cp "$temp_attack_root/victim/sentinel" "$TMP/sentinel.expected"
+if sh -c 'ln -s "$1/victim" "$1/finch-review-protocol.$$"; TMPDIR="$1" FINCH_PROTOCOL_ROOT_SELFTEST=skip FINCH_PROTOCOL_TMP_PROBE=normal-exit exec "$2" "$3"' sh "$temp_attack_root" "$SELF" "$ROOT" >"$TMP/temp-symlink.out" 2>&1; then
+    fail "hostile TMPDIR cleanup probe unexpectedly returned success"
+elif cmp -s "$TMP/sentinel.expected" "$temp_attack_root/victim/sentinel" &&
+     test "$(find "$temp_attack_root" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 2 &&
+     test "$(find "$temp_attack_root" -mindepth 1 -maxdepth 1 -type l | wc -l | tr -d ' ')" = 1; then
+    pass "private mktemp allocation ignores predictable symlink and preserves unrelated sentinel without residue"
+else
+    fail "temporary-directory symlink isolation failed: $(find "$temp_attack_root" -mindepth 1 -maxdepth 2 -print | tr '\n' ';')"
+fi
+
+normal_temp_root="$TMP/temp-normal"
+mkdir "$normal_temp_root"
+if TMPDIR="$normal_temp_root" FINCH_PROTOCOL_ROOT_SELFTEST=skip FINCH_PROTOCOL_TMP_PROBE=normal-exit "$SELF" "$ROOT" >"$TMP/temp-normal.out" 2>&1; then
+    fail "normal temporary cleanup probe unexpectedly returned success"
+elif test -z "$(find "$normal_temp_root" -mindepth 1 -print -quit)"; then
+    pass "normal exit removes the validated private temporary directory"
+else
+    fail "normal exit leaked private temporary residue: $(find "$normal_temp_root" -mindepth 1 -print | tr '\n' ';')"
+fi
+
+interrupt_temp_root="$TMP/temp-interrupt"
+mkdir "$interrupt_temp_root"
+if TMPDIR="$interrupt_temp_root" FINCH_PROTOCOL_ROOT_SELFTEST=skip FINCH_PROTOCOL_TMP_PROBE=interrupt "$SELF" "$ROOT" >"$TMP/temp-interrupt.out" 2>&1; then
+    fail "interrupt cleanup probe unexpectedly returned success"
+elif test -z "$(find "$interrupt_temp_root" -mindepth 1 -print -quit)"; then
+    pass "interrupted exit removes the validated private temporary directory"
+else
+    fail "interrupted exit leaked private temporary residue: $(find "$interrupt_temp_root" -mindepth 1 -print | tr '\n' ';')"
+fi
 
 # Prove that the positional repository-root argument is not silently ignored. The
 # guard prevents recursion while the child checks a deliberately empty root.
@@ -799,7 +856,7 @@ attempt_ledger_ok() {
       function stable(s) { return s ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ }
       function tip(s) { return length(s)==40 && s !~ /[^0-9a-f]/ }
       function digest(s) { return length(s)==64 && s !~ /[^0-9a-f]/ }
-      NF != 8 { problem("attempt event field count expected=8 actual=" NF " line=" NR); next }
+      NF != 9 { problem("attempt event field count expected=9 actual=" NF " line=" NR); next }
       !stable($2) { problem("attempt stable finding ID expected=nonempty-token actual=" $2 " line=" NR) }
       $1 == "ATTEMPT" {
         if (!stable($3)) problem("attempt epoch expected=nonempty-token actual=" $3)
@@ -808,14 +865,17 @@ attempt_ledger_ok() {
         if ($6 != "SURVIVED" && $6 != "RESOLVED") problem("attempt result invalid finding=" $2 " actual=" $6)
         if (!tip($7)) problem("attempt repair tip expected=40-lowercase-hex actual=" $7)
         if (!stable($8)) problem("attempt strategy identity expected=nonempty-token actual=" $8)
+        if ($9 != "DESCENDANT_CANDIDATE") problem("attempt ancestry expected=DESCENDANT_CANDIDATE actual=" $9)
+        if (seen_tip[$2,$7]++) problem("attempt repair tip must be distinct finding=" $2 " tip=" $7)
         if (resolved[$2]) problem("attempt after resolution finding=" $2)
         if (exhausted[$2] && $3 == current_epoch[$2]) problem("third repair in exhausted epoch forbidden finding=" $2 " epoch=" $3)
         if (exhausted[$2] && $3 != current_epoch[$2]) {
           if (!diagnosed[$2]) problem("new epoch requires prior diagnosis finding=" $2 " prior-epoch=" current_epoch[$2])
           if ($8 == current_strategy[$2]) problem("new epoch strategy must change finding=" $2 " strategy=" $8)
-          exhausted[$2]=0; diagnosed[$2]=0; current_epoch[$2]=$3; current_strategy[$2]=$8
+          if (used_epoch[$2,$3]) problem("exhausted epoch identity cannot be reused finding=" $2 " epoch=" $3)
+          exhausted[$2]=0; diagnosed[$2]=0; current_epoch[$2]=$3; current_strategy[$2]=$8; used_epoch[$2,$3]=1
         }
-        if (current_epoch[$2] == "") { current_epoch[$2]=$3; current_strategy[$2]=$8 }
+        if (current_epoch[$2] == "") { current_epoch[$2]=$3; current_strategy[$2]=$8; used_epoch[$2,$3]=1 }
         if ($3 != current_epoch[$2]) problem("attempt epoch changed before exhaustion finding=" $2 " expected=" current_epoch[$2] " actual=" $3)
         if ($8 != current_strategy[$2]) problem("strategy identity changed inside epoch finding=" $2 " expected=" current_strategy[$2] " actual=" $8)
         ordinal[$2,$3]++
@@ -827,7 +887,7 @@ attempt_ledger_ok() {
       $1 == "DIAGNOSIS" {
         if ($3 != current_epoch[$2] || !exhausted[$2] || survived[$2,$3] != 2) problem("diagnosis must follow two competent survivals finding=" $2 " epoch=" $3)
         if (diagnosed[$2]) problem("duplicate diagnosis finding=" $2 " epoch=" $3)
-        if ($4 != "-" || $5 != "INDEPENDENT" || $6 != "DIAGNOSED" || !digest($7) || !stable($8)) problem("diagnosis identity invalid finding=" $2 " epoch=" $3)
+        if ($4 != "-" || $5 != "INDEPENDENT" || $6 != "DIAGNOSED" || !digest($7) || !stable($8) || $9 != "-") problem("diagnosis identity invalid finding=" $2 " epoch=" $3)
         diagnosed[$2]=1; next
       }
       { problem("attempt event kind expected=ATTEMPT-or-DIAGNOSIS actual=" $1) }
@@ -837,29 +897,49 @@ attempt_ledger_ok() {
 tip_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 tip_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 tip_c=cccccccccccccccccccccccccccccccccccccccc
+tip_d=dddddddddddddddddddddddddddddddddddddddd
+tip_e=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+tip_f=ffffffffffffffffffffffffffffffffffffffff
 diagnosis_digest=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
-printf '%s\n' "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_a|strategy-a" "ATTEMPT|F-1|epoch-1|2|COMPETENT|RESOLVED|$tip_b|strategy-a" >"$TMP/attempt.resolved-second"
+diagnosis_digest_b=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+printf '%s\n' "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_a|strategy-a|DESCENDANT_CANDIDATE" "ATTEMPT|F-1|epoch-1|2|COMPETENT|RESOLVED|$tip_b|strategy-a|DESCENDANT_CANDIDATE" >"$TMP/attempt.resolved-second"
 if attempt_ledger_ok "$TMP/attempt.resolved-second"; then pass "resolved second attempt does not force a strategy change"; else fail "resolved second attempt was miscounted"; fi
-printf '%s\n' "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_a|strategy-a" "ATTEMPT|F-2|epoch-1|1|COMPETENT|SURVIVED|$tip_b|strategy-b" >"$TMP/attempt.distinct"
+printf '%s\n' "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_a|strategy-a|DESCENDANT_CANDIDATE" "ATTEMPT|F-2|epoch-1|1|COMPETENT|SURVIVED|$tip_b|strategy-b|DESCENDANT_CANDIDATE" >"$TMP/attempt.distinct"
 if attempt_ledger_ok "$TMP/attempt.distinct"; then pass "attempts for distinct stable finding IDs do not combine"; else fail "cross-ID attempts were combined"; fi
-printf '%s\n' "ATTEMPT|F-1|epoch-1|1|INCOMPETENT|SURVIVED|$tip_a|strategy-a" "ATTEMPT|F-1|epoch-1|2|COMPETENT|SURVIVED|$tip_b|strategy-a" >"$TMP/attempt.incompetent"
+printf '%s\n' "ATTEMPT|F-1|epoch-1|1|INCOMPETENT|SURVIVED|$tip_a|strategy-a|DESCENDANT_CANDIDATE" "ATTEMPT|F-1|epoch-1|2|COMPETENT|SURVIVED|$tip_b|strategy-a|DESCENDANT_CANDIDATE" >"$TMP/attempt.incompetent"
 if attempt_ledger_ok "$TMP/attempt.incompetent"; then pass "incompetent attempt does not count toward epoch trigger"; else fail "incompetent attempt was counted"; fi
-printf '%s\n' "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_a|strategy-a" "ATTEMPT|F-1|epoch-1|2|COMPETENT|SURVIVED|$tip_b|strategy-a" >"$TMP/attempt.survived"
+printf '%s\n' "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_a|strategy-a|DESCENDANT_CANDIDATE" "ATTEMPT|F-1|epoch-1|2|COMPETENT|SURVIVED|$tip_b|strategy-a|DESCENDANT_CANDIDATE" >"$TMP/attempt.survived"
 if attempt_ledger_ok "$TMP/attempt.survived"; then pass "second competent survival validly ends its strategy epoch"; else fail "valid two-survival sequence was rejected"; fi
-{ cat "$TMP/attempt.survived"; printf '%s\n' "DIAGNOSIS|F-1|epoch-1|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest|diagnosis-a" "ATTEMPT|F-1|epoch-2|1|COMPETENT|SURVIVED|$tip_c|strategy-b"; } >"$TMP/attempt.new-epoch"
+{ cat "$TMP/attempt.survived"; printf '%s\n' "DIAGNOSIS|F-1|epoch-1|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest|diagnosis-a|-" "ATTEMPT|F-1|epoch-2|1|COMPETENT|SURVIVED|$tip_c|strategy-b|DESCENDANT_CANDIDATE"; } >"$TMP/attempt.new-epoch"
 if attempt_ledger_ok "$TMP/attempt.new-epoch"; then pass "diagnosis permits a new strategy epoch after two surviving attempts"; else fail "valid new strategy epoch was rejected"; fi
-printf '%s\n' "DIAGNOSIS|F-1|epoch-1|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest|diagnosis-a" >"$TMP/attempt.early-diagnosis"
+printf '%s\n' "DIAGNOSIS|F-1|epoch-1|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest|diagnosis-a|-" >"$TMP/attempt.early-diagnosis"
 expect_reject "diagnosis before two competent survivals is rejected" "diagnosis must follow two competent survivals" attempt_ledger_ok "$TMP/attempt.early-diagnosis"
-{ cat "$TMP/attempt.survived"; printf '%s\n' "ATTEMPT|F-1|epoch-1|3|COMPETENT|SURVIVED|$tip_c|strategy-a"; } >"$TMP/attempt.third-same-epoch"
+{ cat "$TMP/attempt.survived"; printf '%s\n' "ATTEMPT|F-1|epoch-1|3|COMPETENT|SURVIVED|$tip_c|strategy-a|DESCENDANT_CANDIDATE"; } >"$TMP/attempt.third-same-epoch"
 expect_reject "third repair in exhausted epoch is rejected" "third repair in exhausted epoch forbidden" attempt_ledger_ok "$TMP/attempt.third-same-epoch"
-{ cat "$TMP/attempt.survived"; printf '%s\n' "DIAGNOSIS|F-1|epoch-1|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest|diagnosis-a" "ATTEMPT|F-1|epoch-2|1|COMPETENT|SURVIVED|$tip_c|strategy-a"; } >"$TMP/attempt.unchanged-strategy"
+{ cat "$TMP/attempt.survived"; printf '%s\n' "DIAGNOSIS|F-1|epoch-1|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest|diagnosis-a|-" "ATTEMPT|F-1|epoch-2|1|COMPETENT|SURVIVED|$tip_c|strategy-a|DESCENDANT_CANDIDATE"; } >"$TMP/attempt.unchanged-strategy"
 expect_reject "new epoch must change strategy identity" "new epoch strategy must change" attempt_ledger_ok "$TMP/attempt.unchanged-strategy"
-{ cat "$TMP/attempt.survived"; printf '%s\n' "ATTEMPT|F-1|epoch-2|1|COMPETENT|SURVIVED|$tip_c|strategy-b"; } >"$TMP/attempt.missing-diagnosis"
+{ cat "$TMP/attempt.survived"; printf '%s\n' "ATTEMPT|F-1|epoch-2|1|COMPETENT|SURVIVED|$tip_c|strategy-b|DESCENDANT_CANDIDATE"; } >"$TMP/attempt.missing-diagnosis"
 expect_reject "new epoch before diagnosis is rejected" "new epoch requires prior diagnosis" attempt_ledger_ok "$TMP/attempt.missing-diagnosis"
 sed "1s/$tip_a/tip-a/" "$TMP/attempt.survived" >"$TMP/attempt.placeholder-tip"
 expect_reject "placeholder repair tip is rejected" "attempt repair tip expected=40-lowercase-hex" attempt_ledger_ok "$TMP/attempt.placeholder-tip"
 sed '1s/|F-1|/||/' "$TMP/attempt.survived" >"$TMP/attempt.empty-finding"
 expect_reject "attempt requires nonempty stable finding identity" "attempt stable finding ID expected=nonempty-token" attempt_ledger_ok "$TMP/attempt.empty-finding"
+sed "2s/$tip_b/$tip_a/" "$TMP/attempt.survived" >"$TMP/attempt.duplicate-tip"
+expect_reject "two attempts cannot count the same repair tip twice" "attempt repair tip must be distinct" attempt_ledger_ok "$TMP/attempt.duplicate-tip"
+sed '2s/DESCENDANT_CANDIDATE/STALE_OR_UNRELATED/' "$TMP/attempt.survived" >"$TMP/attempt.stale-tip"
+expect_reject "later attempt requires a descendant candidate tip" "attempt ancestry expected=DESCENDANT_CANDIDATE" attempt_ledger_ok "$TMP/attempt.stale-tip"
+{ cat "$TMP/attempt.new-epoch"; printf '%s\n' \
+ "ATTEMPT|F-1|epoch-2|2|COMPETENT|SURVIVED|$tip_d|strategy-b|DESCENDANT_CANDIDATE" \
+ "DIAGNOSIS|F-1|epoch-2|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest_b|diagnosis-b|-" \
+ "ATTEMPT|F-1|epoch-1|1|COMPETENT|SURVIVED|$tip_e|strategy-c|DESCENDANT_CANDIDATE"; } >"$TMP/attempt.reused-epoch"
+expect_reject "an exhausted epoch identity can never be reused" "exhausted epoch identity cannot be reused" attempt_ledger_ok "$TMP/attempt.reused-epoch"
+{ cat "$TMP/attempt.new-epoch"; printf '%s\n' \
+ "ATTEMPT|F-1|epoch-2|2|COMPETENT|SURVIVED|$tip_d|strategy-b|DESCENDANT_CANDIDATE" \
+ "DIAGNOSIS|F-1|epoch-2|-|INDEPENDENT|DIAGNOSED|$diagnosis_digest_b|diagnosis-b|-" \
+ "ATTEMPT|F-1|epoch-3|1|COMPETENT|SURVIVED|$tip_f|strategy-c|DESCENDANT_CANDIDATE"; } >"$TMP/attempt.fresh-epoch-three"
+if attempt_ledger_ok "$TMP/attempt.fresh-epoch-three"; then pass "fresh epoch 3 begins at ordinal 1 with a changed strategy and descendant tip"; else fail "valid fresh epoch-3 sequence rejected"; fi
+require_text "attempt fixtures bind permanent epoch identity retention" 'Retain every epoch identity ever used for that' "$REVIEW"
+require_text "temporary fixture policy requires private mktemp and inode-bound cleanup" 'Disposable review fixtures use a private restrictive directory allocated by `mktemp -d`' "$REVIEW"
 
 # Production admission: each prerequisite has its own one-fault negative.
 production_allowed() {
@@ -904,12 +984,48 @@ else
     fail "operative state table signature mismatch expected=[1169857548 5907] actual=[$state_signature]"
 fi
 
+state_entry_schema_ok() {
+    schema_state=$1 schema_required=$2 schema_entry=$3
+    awk -v state="$schema_state" -v required="$schema_required" -v entry="$schema_entry" '
+      function problem(s) { print "state=" state " " s > "/dev/stderr"; bad=1 }
+      function token(s) { return s ~ /^[A-Za-z0-9][A-Za-z0-9._:-]*$/ }
+      function git(s) { return length(s)==40 && s !~ /[^0-9a-f]/ }
+      function digest(s) { return length(s)==64 && s !~ /[^0-9a-f]/ }
+      function uuid(s) { return s ~ /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/ }
+      function comment_url(s,id, copy) { copy=s; sub(/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(issues|pull)\/[1-9][0-9]*#issuecomment-/, "", copy); return id ~ /^[1-9][0-9]*$/ && copy==id }
+      BEGIN {
+        count=split(required, required_keys, ","); for (i=1;i<=count;i++) allowed[required_keys[i]]=1
+        supplied=split(entry, fields, ",")
+        for (i=1;i<=supplied;i++) {
+          equals=split(fields[i], pair, "="); key=pair[1]; value=pair[2]
+          if (equals != 2 || key=="" || value=="") { problem("entry field expected=key=typed-value actual=" fields[i]); continue }
+          if (!(key in allowed)) problem("unknown entry field=" key)
+          if (seen[key]++) problem("duplicate entry field=" key)
+          values[key]=value
+          if (key !~ /url$/ && !token(value)) problem("entry identity expected=stable-token field=" key " actual=" value)
+          if ((key ~ /(^|-)tip$/ || key=="base") && !git(value)) problem("entry Git identity expected=40-lowercase-hex field=" key " actual=" value)
+          if ((key=="digest" || key ~ /-digest$/) && !digest(value)) problem("entry SHA-256 expected=64-lowercase-hex field=" key " actual=" value)
+          if (key=="revision" && value !~ /^[1-9][0-9]*$/) problem("entry revision expected=positive-decimal actual=" value)
+          if (key=="cursor" && value !~ /^[2-7]$/) problem("entry completion cursor expected=2..7 actual=" value)
+          if ((key=="claim" || key=="claim-id") && !uuid(value)) problem("entry claim identity expected=lowercase-UUID field=" key " actual=" value)
+        }
+        for (key in allowed) if (seen[key] != 1) problem("entry field cardinality expected=1 actual=" seen[key] " field=" key)
+        if (state=="READY") {
+          if (!comment_url(values["contract-url"],values["contract-comment-id"])) problem("contract URL/comment-ID binding invalid url=" values["contract-url"] " id=" values["contract-comment-id"])
+          if (!comment_url(values["approval-url"],values["approval-comment-id"])) problem("approval URL/comment-ID binding invalid url=" values["approval-url"] " id=" values["approval-comment-id"])
+          if (values["owner"] != values["expected-owner"]) problem("contract owner binding mismatch owner=" values["owner"] " expected=" values["expected-owner"])
+        }
+        exit bad
+      }
+    '
+}
+
 state_record_ok() {
     record_state=$1 record_owner=$2 record_principal=$3 record_entry=$4 record_next=$5 record_exit=$6 record_issue=$7
     case "$record_state" in
       DRAFT) expected_owner='ROLE(proposer)'; required='proposer,outcome,report'; expected_next=clarify-or-admit-or-decline; expected_exit=permitted-transition-complete; expected_issue=Open ;;
       NEEDS_SPECIFICATION) expected_owner='ROLE(contract_owner)'; required='missing-decision,question,decision-owner,investigation,nearest-outcome'; expected_next=resolve-or-side-state; expected_exit=decision-resolved; expected_issue=Open ;;
-      READY) expected_owner='ROLE(contract_owner)'; required='contract-url,contract-id,digest,revision,base,approval,owner,boundaries,regression,integration,reversion'; expected_next=publish-verify-claim-enter-IN_PROGRESS; expected_exit=valid-transition-no-mutation; expected_issue=Open ;;
+      READY) expected_owner='ROLE(contract_owner)'; required='contract-url,contract-comment-id,contract-id,digest,revision,base,approval-url,approval-comment-id,approval-digest,owner,expected-owner,boundaries,regression,integration,reversion'; expected_next=publish-verify-claim-enter-IN_PROGRESS; expected_exit=valid-transition-no-mutation; expected_issue=Open ;;
       IN_PROGRESS) expected_owner='ROLE(claim_owner)'; required='ready-proof,branch,worktree,claim,collision-pre,collision-post,edit-grant,tip'; expected_next=implement-or-transition; expected_exit=candidate-or-terminal-ownership; expected_issue=Open ;;
       REPAIR_IN_PROGRESS) expected_owner='ROLE(claim_owner)'; required='in-progress-proof,frozen-tip,finding-ledger,correction-proof,epoch'; expected_next=repair-or-transition; expected_exit=valid-transition; expected_issue=Open ;;
       READY_TO_MERGE) expected_owner='ROLE(coordinator)'; required='claim,contract,base-negative,tip-positive,leaves,clean-pass,gates,integration,artifact,merge-authority,close-authority'; expected_next=merge-or-repair-evidence; expected_exit=valid-transition; expected_issue=Open ;;
@@ -923,14 +1039,7 @@ state_record_ok() {
     esac
     test "$record_owner" = "$expected_owner" || { printf 'state=%s owner expected=%s actual=%s\n' "$record_state" "$expected_owner" "$record_owner" >&2; return 1; }
     case "$record_principal" in ''|placeholder|CONTRADICTORY) printf 'state=%s accountable principal expected=stable-nonempty actual=%s\n' "$record_state" "$record_principal" >&2; return 1 ;; esac
-    old_ifs=$IFS; IFS=','; set -- $required; IFS=$old_ifs
-    for field_name do
-        case ",$record_entry," in *",$field_name="*) ;;
-          *) printf 'state=%s entry field missing expected=%s actual=%s\n' "$record_state" "$field_name" "$record_entry" >&2; return 1 ;;
-        esac
-        field_value=${record_entry#*${field_name}=}; field_value=${field_value%%,*}
-        case "$field_value" in ''|evidence|placeholder|CONTRADICTORY) printf 'state=%s entry field invalid field=%s actual=%s\n' "$record_state" "$field_name" "$field_value" >&2; return 1 ;; esac
-    done
+    state_entry_schema_ok "$record_state" "$required" "$record_entry" || return 1
     test "$record_next" = "$expected_next" || { printf 'state=%s next-action expected=%s actual=%s\n' "$record_state" "$expected_next" "$record_next" >&2; return 1; }
     test "$record_exit" = "$expected_exit" || { printf 'state=%s exit-condition expected=%s actual=%s\n' "$record_state" "$expected_exit" "$record_exit" >&2; return 1; }
     test "$record_issue" = "$expected_issue" || { printf 'state=%s issue-condition expected=%s actual=%s\n' "$record_state" "$expected_issue" "$record_issue" >&2; return 1; }
@@ -938,10 +1047,10 @@ state_record_ok() {
 printf '%s\n' \
 'DRAFT|ROLE(proposer)|principal-proposer|proposer=p1,outcome=o1,report=r1|clarify-or-admit-or-decline|permitted-transition-complete|Open' \
 'NEEDS_SPECIFICATION|ROLE(contract_owner)|principal-owner|missing-decision=m1,question=q1,decision-owner=d1,investigation=i1,nearest-outcome=n1|resolve-or-side-state|decision-resolved|Open' \
-'READY|ROLE(contract_owner)|principal-owner|contract-url=u1,contract-id=c1,digest=d1,revision=r1,base=b1,approval=a1,owner=o1,boundaries=x1,regression=g1,integration=i1,reversion=v1|publish-verify-claim-enter-IN_PROGRESS|valid-transition-no-mutation|Open' \
-'IN_PROGRESS|ROLE(claim_owner)|principal-claimant|ready-proof=r1,branch=b1,worktree=w1,claim=c1,collision-pre=p1,collision-post=p2,edit-grant=e1,tip=t1|implement-or-transition|candidate-or-terminal-ownership|Open' \
-'REPAIR_IN_PROGRESS|ROLE(claim_owner)|principal-claimant|in-progress-proof=i1,frozen-tip=t1,finding-ledger=l1,correction-proof=p1,epoch=e1|repair-or-transition|valid-transition|Open' \
-'READY_TO_MERGE|ROLE(coordinator)|principal-coordinator|claim=c1,contract=k1,base-negative=b1,tip-positive=t1,leaves=l1,clean-pass=p1,gates=g1,integration=i1,artifact=a1,merge-authority=m1,close-authority=o1|merge-or-repair-evidence|valid-transition|Open' \
+'READY|ROLE(contract_owner)|principal-owner|contract-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-100,contract-comment-id=100,contract-id=issue-406-v20,digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,revision=20,base=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,approval-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-101,approval-comment-id=101,approval-digest=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,owner=principal-owner,expected-owner=principal-owner,boundaries=scope-v20,regression=proof-regression,integration=proof-integration,reversion=proof-reversion|publish-verify-claim-enter-IN_PROGRESS|valid-transition-no-mutation|Open' \
+'IN_PROGRESS|ROLE(claim_owner)|principal-claimant|ready-proof=r1,branch=b1,worktree=w1,claim=11111111-1111-4111-8111-111111111111,collision-pre=p1,collision-post=p2,edit-grant=e1,tip=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|implement-or-transition|candidate-or-terminal-ownership|Open' \
+'REPAIR_IN_PROGRESS|ROLE(claim_owner)|principal-claimant|in-progress-proof=i1,frozen-tip=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,finding-ledger=l1,correction-proof=p1,epoch=e1|repair-or-transition|valid-transition|Open' \
+'READY_TO_MERGE|ROLE(coordinator)|principal-coordinator|claim=11111111-1111-4111-8111-111111111111,contract=k1,base-negative=b1,tip-positive=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,leaves=l1,clean-pass=p1,gates=g1,integration=i1,artifact=a1,merge-authority=m1,close-authority=o1|merge-or-repair-evidence|valid-transition|Open' \
 'COMPLETION_IN_PROGRESS|ROLE(coordinator)|principal-coordinator|merged-main=m1,prefix=p1,cursor=2,next-step=3,claim-fact=active,worktree-fact=preserved,issue-fact=open|next-numbered-step|step8-verified|CURSOR_DEPENDENT' \
 'BLOCKED_EXTERNAL|ROLE(coordinator)|principal-coordinator|source=s1,resume-to=r1,condition=c1,external-owner=o1,attempts=a1,resumption=x1,ownership=n1,preservation=p1,independent-work=i1,recheck=z1|recheck-condition|revalidate-or-fallback|SOURCE_CURSOR_DEPENDENT' \
 'INFEASIBLE|ROLE(contract_owner)|principal-owner|owner-decision=d1,outcome=o1,constraints=c1,reproduction=r1,attempts=a1,contradiction=x1,alternative=l1,constraint-change=h1|revise-or-decline|owner-decision|Open' \
@@ -954,14 +1063,34 @@ while IFS='|' read -r state owner principal entry next_action exit_condition iss
     for omitted_token do
         omitted_field=${omitted_token%%=*}
         bad_entry=$(printf '%s\n' "$entry" | awk -F ',' -v omit="$omitted_field" 'BEGIN { ORS="" } { for (i=1;i<=NF;i++) if ($i !~ "^" omit "=") { if (written++) printf ","; printf "%s", $i } } END { print "\n" }')
-        expect_reject "state row $state rejects missing required evidence field $omitted_field" "state=$state entry field missing expected=$omitted_field" state_record_ok "$state" "$owner" "$principal" "$bad_entry" "$next_action" "$exit_condition" "$issue"
+        expect_reject "state row $state rejects missing required evidence field $omitted_field" "state=$state entry field cardinality expected=1" state_record_ok "$state" "$owner" "$principal" "$bad_entry" "$next_action" "$exit_condition" "$issue"
     done
-    expect_reject "state row $state rejects opaque evidence placeholders" "state=$state entry field missing" state_record_ok "$state" "$owner" "$principal" evidence "$next_action" "$exit_condition" "$issue"
+    expect_reject "state row $state rejects opaque evidence placeholders" "state=$state entry field expected=key=typed-value" state_record_ok "$state" "$owner" "$principal" evidence "$next_action" "$exit_condition" "$issue"
     expect_reject "state row $state rejects missing accountable principal" "accountable principal" state_record_ok "$state" "$owner" '' "$entry" "$next_action" "$exit_condition" "$issue"
     expect_reject "state row $state rejects wrong next action" "state=$state next-action expected=" state_record_ok "$state" "$owner" "$principal" "$entry" wrong-action "$exit_condition" "$issue"
     expect_reject "state row $state rejects wrong exit predicate" "state=$state exit-condition expected=" state_record_ok "$state" "$owner" "$principal" "$entry" "$next_action" wrong-exit "$issue"
     expect_reject "state row $state rejects wrong issue condition" "state=$state issue-condition expected=" state_record_ok "$state" "$owner" "$principal" "$entry" "$next_action" "$exit_condition" wrong-issue
 done <"$TMP/state-records"
+ready_record=$(grep '^READY|' "$TMP/state-records")
+old_ifs=$IFS; IFS='|'; set -- $ready_record; IFS=$old_ifs
+ready_state=$1 ready_owner=$2 ready_principal=$3 ready_entry=$4 ready_next=$5 ready_exit=$6 ready_issue=$7
+ready_short_digest=$(printf '%s\n' "$ready_entry" | sed -E 's/digest=[0-9a-f]{64}/digest=abc/')
+expect_reject "READY rejects short contract digest" "entry SHA-256 expected=64-lowercase-hex field=digest" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_short_digest" "$ready_next" "$ready_exit" "$ready_issue"
+ready_nonhex_digest=$(printf '%s\n' "$ready_entry" | sed -E 's/digest=[0-9a-f]{64}/digest=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg/')
+expect_reject "READY rejects nonhex contract digest" "entry SHA-256 expected=64-lowercase-hex field=digest" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_nonhex_digest" "$ready_next" "$ready_exit" "$ready_issue"
+ready_noncanonical_url=$(printf '%s\n' "$ready_entry" | sed 's@contract-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-100@contract-url=https://example.test/comment/100@')
+expect_reject "READY rejects noncanonical contract URL" "contract URL/comment-ID binding invalid" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_noncanonical_url" "$ready_next" "$ready_exit" "$ready_issue"
+ready_short_base=$(printf '%s\n' "$ready_entry" | sed -E 's/base=[0-9a-f]{40}/base=abc/')
+expect_reject "READY rejects short implementation base" "entry Git identity expected=40-lowercase-hex field=base" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_short_base" "$ready_next" "$ready_exit" "$ready_issue"
+ready_zero_revision=$(printf '%s\n' "$ready_entry" | sed 's/revision=20/revision=0/')
+expect_reject "READY rejects nonpositive revision" "entry revision expected=positive-decimal" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_zero_revision" "$ready_next" "$ready_exit" "$ready_issue"
+expect_reject "READY rejects duplicate state key" "duplicate entry field=owner" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_entry,owner=principal-owner" "$ready_next" "$ready_exit" "$ready_issue"
+expect_reject "READY rejects unknown state key" "unknown entry field=surprise" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_entry,surprise=value" "$ready_next" "$ready_exit" "$ready_issue"
+ready_wrong_owner=$(printf '%s\n' "$ready_entry" | sed 's/expected-owner=principal-owner/expected-owner=principal-other/')
+expect_reject "READY rejects contradictory contract owner identity" "contract owner binding mismatch" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_wrong_owner" "$ready_next" "$ready_exit" "$ready_issue"
+ready_wrong_approval_id=$(printf '%s\n' "$ready_entry" | sed 's/approval-comment-id=101/approval-comment-id=102/')
+expect_reject "READY rejects approval URL and comment-ID mismatch" "approval URL/comment-ID binding invalid" state_record_ok "$ready_state" "$ready_owner" "$ready_principal" "$ready_wrong_approval_id" "$ready_next" "$ready_exit" "$ready_issue"
+require_text "state-schema fixtures bind the closed typed state policy" "The record's state schema is closed" "$READINESS"
 
 # Every transition row is exercised independently. Its line ordinal is the stable fixture variant,
 # because multiple rows intentionally share from/to pairs but carry different evidence variants.
@@ -1022,6 +1151,7 @@ expect_reject "ordinary lifecycle cannot bypass completion accounting" "lifecycl
 
 actor_evidence_ok() {
     expression=$1 shape=$2 actor1=$3 principal1=$4 actor2=$5 principal2=$6 evidence1=$7 evidence2=$8 decision_link=$9 decision_maker=${10} decision_author=${11} immutability=${12} extra_actor=${13}
+    expected_owner=${14:-none} decision_url=${15:-none} decision_id=${16:-none} decision_digest=${17:-none}
     for required_identity in "$principal1" "$evidence1"; do case "$required_identity" in ''|none|placeholder) printf 'actor principal/evidence identity expected=nonempty actual=%s\n' "$required_identity" >&2; return 1 ;; esac; done
     case "$expression" in
       'ROLE(coordinator)'|'ROLE(claim_owner)') expected_role=${expression#ROLE(}; expected_role=${expected_role%)}; test "$shape" = single && test "$actor1" = "$expected_role" && test "$actor2" = none && test "$extra_actor" = none || { printf 'ROLE actor expected=sole %s actual=%s/%s/%s extra=%s\n' "$expected_role" "$shape" "$actor1" "$actor2" "$extra_actor" >&2; return 1; } ;;
@@ -1031,7 +1161,13 @@ actor_evidence_ok() {
       'ALL_OF(implementation_reviewer,coordinator)') test "$shape" = all && test "$actor1" = implementation_reviewer && test "$actor2" = coordinator && test -n "$principal2" && test "$principal2" != none && test "$principal1" != "$principal2" && test -n "$evidence2" && test "$evidence2" != none && test "$evidence1" != "$evidence2" && test "$extra_actor" = none || { printf 'ALL_OF implementation expected=distinct principal/evidence identities actual=%s/%s/%s/%s/%s/%s/%s\n' "$shape" "$actor1" "$principal1" "$actor2" "$principal2" "$evidence1" "$evidence2" >&2; return 1; } ;;
       'DECISION_BY(contract_owner); RECORDED_BY(coordinator)')
         if test "$shape" = direct; then test "$actor1" = contract_owner && test "$decision_maker" = contract_owner && test "$decision_author" = "$principal1" && test "$immutability" = UNEDITED && test "$actor2" = none && test "$extra_actor" = none || { printf 'DECISION_BY direct expected=owner-author+unedited+sole actual=%s/%s/%s/%s extra=%s\n' "$actor1" "$decision_maker" "$decision_author" "$immutability" "$extra_actor" >&2; return 1; }
-        elif test "$shape" = recorded; then test "$actor1" = coordinator && test "$decision_link" = VERIFIED_OWNER_LINK && test "$decision_maker" = contract_owner && test -n "$decision_author" && test "$immutability" = UNEDITED && test "$actor2" = none && test "$extra_actor" = none || { printf 'RECORDED_BY expected=coordinator+verified-immutable-owner-link actual=%s/%s/%s/%s/%s\n' "$actor1" "$decision_link" "$decision_maker" "$decision_author" "$immutability" >&2; return 1; }
+        elif test "$shape" = recorded; then
+            test "$actor1" = coordinator && test "$decision_link" = VERIFIED_OWNER_LINK && test "$decision_maker" = contract_owner && test "$decision_author" = "$expected_owner" && test "$decision_author" != "$principal1" && test "$immutability" = UNEDITED && test "$actor2" = none && test "$extra_actor" = none || { printf 'RECORDED_BY expected=coordinator+independent-exact-owner+unedited actual=recorder:%s/%s owner:%s/%s immutable:%s\n' "$principal1" "$decision_link" "$decision_author" "$expected_owner" "$immutability" >&2; return 1; }
+            printf '%s|%s\n' "$decision_url" "$decision_id" | awk -F '|' '
+              function comment_url(s,id, copy) { copy=s; sub(/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(issues|pull)\/[1-9][0-9]*#issuecomment-/, "", copy); return id ~ /^[1-9][0-9]*$/ && copy==id }
+              !comment_url($1,$2) { print "RECORDED_BY canonical URL/ID binding invalid url=" $1 " id=" $2 > "/dev/stderr"; exit 1 }
+            ' || return 1
+            test "${#decision_digest}" = 64 && case "$decision_digest" in *[!0-9a-f]*) false ;; *) true ;; esac || { printf 'RECORDED_BY decision digest expected=64-lowercase-hex actual=%s\n' "$decision_digest" >&2; return 1; }
         else printf 'decision record shape expected=direct-or-recorded actual=%s\n' "$shape" >&2; return 1; fi ;;
       *) printf 'actor expression expected=normative grammar actual=%s\n' "$expression" >&2; return 1 ;;
     esac
@@ -1047,12 +1183,21 @@ expect_reject "ALL_OF rejects same-principal role aliases" "ALL_OF expected=dist
 expect_reject "ALL_OF rejects empty second evidence identity" "ALL_OF expected=distinct principal/evidence" actor_evidence_ok 'ALL_OF(contract_owner,fresh_plan_reviewer)' all contract_owner principal-owner fresh_plan_reviewer principal-reviewer owner-proof '' none none none none none
 expect_reject "ALL_OF rejects reused evidence" "ALL_OF expected=distinct principal/evidence" actor_evidence_ok 'ALL_OF(contract_owner,fresh_plan_reviewer)' all contract_owner principal-owner fresh_plan_reviewer principal-reviewer same-proof same-proof none none none none none
 if actor_evidence_ok 'ALL_OF(implementation_reviewer,coordinator)' all implementation_reviewer principal-reviewer coordinator principal-c reviewer-proof coordinator-proof none none none none none; then pass "merge ALL_OF accepts independent principals and evidence"; else fail "valid merge ALL_OF rejected"; fi
-if actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' direct contract_owner principal-owner none none owner-proof none none contract_owner principal-owner UNEDITED none && actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-c none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner UNEDITED none; then pass "DECISION_BY/RECORDED_BY accepts direct owner or verified immutable owner record"; else fail "valid decision record rejected"; fi
+owner_decision_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+owner_decision_url=https://github.com/darwin-finch/finch/issues/406#issuecomment-301
+if actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' direct contract_owner principal-owner none none owner-proof none none contract_owner principal-owner UNEDITED none && actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-recorder none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner UNEDITED none principal-owner "$owner_decision_url" 301 "$owner_decision_digest"; then pass "DECISION_BY/RECORDED_BY accepts direct owner or verified immutable owner record"; else fail "valid decision record rejected"; fi
 expect_reject "direct decision rejects wrong author" "DECISION_BY direct expected=owner-author" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' direct contract_owner principal-owner none none owner-proof none none contract_owner principal-other UNEDITED none
 expect_reject "direct decision rejects edited evidence" "DECISION_BY direct expected=owner-author" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' direct contract_owner principal-owner none none owner-proof none none contract_owner principal-owner EDITED none
 expect_reject "direct decision rejects extra actor" "DECISION_BY direct expected=owner-author" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' direct contract_owner principal-owner none none owner-proof none none contract_owner principal-owner UNEDITED coordinator
 expect_reject "decision grammar rejects recorder-only judgment" "RECORDED_BY expected=" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-c none none proof-c none absent coordinator principal-c UNEDITED none
 expect_reject "decision grammar rejects absent owner link" "RECORDED_BY expected=" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-c none none proof-c none absent contract_owner principal-owner UNEDITED none
+expect_reject "recorded decision rejects wrong owner author" "independent-exact-owner" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-recorder none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-other UNEDITED none principal-owner "$owner_decision_url" 301 "$owner_decision_digest"
+expect_reject "recorded decision rejects recorder impersonating owner" "independent-exact-owner" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-owner none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner UNEDITED none principal-owner "$owner_decision_url" 301 "$owner_decision_digest"
+expect_reject "recorded decision rejects URL/comment-ID mismatch" "canonical URL/ID binding invalid" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-recorder none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner UNEDITED none principal-owner "$owner_decision_url" 302 "$owner_decision_digest"
+expect_reject "recorded decision rejects malformed digest" "decision digest expected=64-lowercase-hex" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-recorder none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner UNEDITED none principal-owner "$owner_decision_url" 301 abc
+expect_reject "recorded decision rejects missing digest" "decision digest expected=64-lowercase-hex" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-recorder none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner UNEDITED none principal-owner "$owner_decision_url" 301 none
+expect_reject "recorded decision rejects edited evidence" "independent-exact-owner" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' recorded coordinator principal-recorder none none record-proof none VERIFIED_OWNER_LINK contract_owner principal-owner EDITED none principal-owner "$owner_decision_url" 301 "$owner_decision_digest"
+require_text "recorded-owner fixtures bind independent expected-owner policy" 'The expected owner principal is supplied independently' "$READINESS"
 for disposition in INFEASIBLE DECLINED SUPERSEDED; do
     for unauthorized_actor in coordinator claim_owner implementation_reviewer; do
         expect_reject "$unauthorized_actor cannot assign $disposition" "DECISION_BY direct expected=" actor_evidence_ok 'DECISION_BY(contract_owner); RECORDED_BY(coordinator)' direct "$unauthorized_actor" principal-x none none proof-x none none "$unauthorized_actor" principal-x UNEDITED none
@@ -1063,14 +1208,41 @@ done
 completion_history_ok() {
     completion_file=$1 expected_cursor=$2 expected_state=$3
     awk -F '|' -v expected_cursor="$expected_cursor" -v expected_state="$expected_state" '
+      function problem(s) { print s > "/dev/stderr"; bad=1 }
+      function git(s) { return length(s)==40 && s !~ /[^0-9a-f]/ }
+      function digest(s) { return length(s)==64 && s !~ /[^0-9a-f]/ }
+      function uuid(s) { return s ~ /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/ }
+      function comment_url(s,id, copy) { copy=s; sub(/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/(issues|pull)\/[1-9][0-9]*#issuecomment-/, "", copy); return id ~ /^[1-9][0-9]*$/ && copy==id }
+      function evidence_ok(step,s, required,n,i,p,key,value) {
+        delete ev; delete allowed; delete seen_ev
+        required=(step==1?"merge-tip,main-tip,binding":step==2?"tree-tip,tests-digest,ci-url,ci-id,binding":step==3?"claim-id,expected-claim-id,terminal-url,terminal-id,issuer,expected-issuer,terminal-digest,immutability,binding":step==4?"worktree-id,integration-tip,clean,pushed,binding":step==5?"issue-id,closure-url,closure-id,binding":step==6?"scan-digest,binding":step==7?"retrospective-url,retrospective-id,retrospective-digest,binding":step==8?"retrospective-url,retrospective-id,retrospective-digest,immutability,binding":"")
+        n=split(required,r,","); for(i=1;i<=n;i++) allowed[r[i]]=1
+        n=split(s,pairs,","); for(i=1;i<=n;i++) { split(pairs[i],p,"="); key=p[1]; value=p[2]; if (!(key in allowed)) problem("completion evidence unknown field=" key " step=" step); if (seen_ev[key]++) problem("completion evidence duplicate field=" key " step=" step); if (value=="" || value=="placeholder") problem("completion evidence empty/placeholder field=" key " step=" step); ev[key]=value }
+        for(key in allowed) if(seen_ev[key]!=1) problem("completion evidence field cardinality expected=1 actual=" seen_ev[key] " field=" key " step=" step)
+        for(key in ev) { if(key ~ /-tip$/ && !git(ev[key])) problem("completion evidence Git tip invalid field=" key " step=" step " actual=" ev[key]); if(key ~ /-digest$/ && !digest(ev[key])) problem("completion evidence SHA-256 invalid field=" key " step=" step " actual=" ev[key]) }
+        if (ev["binding"] != "CURRENT_CANDIDATE") problem("completion evidence binding expected=CURRENT_CANDIDATE actual=" ev["binding"] " step=" step)
+        if (step==1) { if(ev["merge-tip"]!=ev["main-tip"]) problem("completion merge/current-main tip mismatch"); saved_main_tip=ev["main-tip"] }
+        if (step==2) { if(!comment_url(ev["ci-url"],ev["ci-id"])) problem("completion CI URL/ID binding invalid"); if(ev["tree-tip"]!=saved_main_tip) problem("completion reviewed tree/current-main tip mismatch") }
+        if (step==3) { if(!uuid(ev["claim-id"]) || ev["claim-id"]!=ev["expected-claim-id"]) problem("completion step3 exact claim identity mismatch actual=" ev["claim-id"] " expected=" ev["expected-claim-id"]); if(!comment_url(ev["terminal-url"],ev["terminal-id"])) problem("completion terminal URL/ID binding invalid"); if(ev["issuer"]!=ev["expected-issuer"]) problem("completion terminal issuer mismatch actual=" ev["issuer"] " expected=" ev["expected-issuer"]); if(ev["immutability"]!="UNEDITED") problem("completion terminal immutability expected=UNEDITED actual=" ev["immutability"]) }
+        if (step==4) { if(ev["clean"]!="YES" || ev["pushed"]!="YES") problem("completion cleanup proof expected=clean+pushed actual=" ev["clean"] "/" ev["pushed"]); if(ev["integration-tip"]!=saved_main_tip) problem("completion cleanup integration/current-main tip mismatch") }
+        if (step==5 && (ev["issue-id"]!="406" || !comment_url(ev["closure-url"],ev["closure-id"]))) problem("completion closure identity invalid")
+        if ((step==7 || step==8) && !comment_url(ev["retrospective-url"],ev["retrospective-id"])) problem("completion retrospective URL/ID binding invalid step=" step)
+        if (step==7) { saved_retrospective_url=ev["retrospective-url"]; saved_retrospective_id=ev["retrospective-id"]; saved_retrospective_digest=ev["retrospective-digest"] }
+        if (step==8) { if(ev["immutability"]!="UNEDITED") problem("completion final immutability expected=UNEDITED actual=" ev["immutability"]); if(ev["retrospective-url"]!=saved_retrospective_url || ev["retrospective-id"]!=saved_retrospective_id || ev["retrospective-digest"]!=saved_retrospective_digest) problem("completion final retrospective tuple mismatch") }
+      }
       BEGIN { events[1]="merge-current-main"; events[2]="tree-tests-ci"; events[3]="claim-terminal"; events[4]="safe-cleanup"; events[5]="issue-closure"; events[6]="post-closure-frontier"; events[7]="retrospective"; events[8]="immutable-digest" }
+      cursor==8 { problem("completion is terminal; post-COMPLETE row forbidden line=" NR); next }
       NF != 8 { print "completion row field count expected=8 actual=" NF " line=" NR > "/dev/stderr"; bad=1; next }
+      {
+        if (!digest($3)) problem("completion event identity expected=64-lowercase-hex actual=" $3 " step=" $1)
+        if (event_identity[$3]++) problem("completion event identity must be unique actual=" $3 " step=" $1)
+      }
       $4 == "FAILED" {
         if ($1 != cursor+1) { print "failed attempt step expected=" cursor+1 " actual=" $1 > "/dev/stderr"; bad=1 }
         if ($2 != events[$1]) { print "failed attempt event expected=" events[$1] " actual=" $2 > "/dev/stderr"; bad=1 }
         expected_claim=(cursor<3?"active":"terminal"); expected_worktree=(cursor<4?"preserved":"removed"); expected_issue=(cursor<5?"open":"closed")
         if ($5 != expected_claim || $6 != expected_worktree || $7 != expected_issue) { print "failed attempt mutated successful-prefix facts cursor=" cursor " claim=" $5 "/" expected_claim " worktree=" $6 "/" expected_worktree " issue=" $7 "/" expected_issue > "/dev/stderr"; bad=1 }
-        if ($3 == "" || $8 == "") { print "failed attempt diagnostic identity/evidence must be nonempty step=" $1 > "/dev/stderr"; bad=1 }
+        if ($8 == "" || $8 == "placeholder") { print "failed attempt diagnostic evidence invalid step=" $1 > "/dev/stderr"; bad=1 }
         next
       }
       $4 != "SUCCESS" { print "completion status expected=SUCCESS-or-FAILED actual=" $4 " step=" $1 > "/dev/stderr"; bad=1; next }
@@ -1078,16 +1250,13 @@ completion_history_ok() {
         expected_step=cursor+1
         if ($1 != expected_step) { print "completion step expected=" expected_step " actual=" $1 " line=" NR > "/dev/stderr"; bad=1; next }
         if ($2 != events[$1]) { print "completion event expected=" events[$1] " actual=" $2 " step=" $1 > "/dev/stderr"; bad=1 }
-        if ($3 != "id-" $1) { print "completion identity expected=id-" $1 " actual=" $3 " step=" $1 > "/dev/stderr"; bad=1 }
         if ($1 < 3 && $5 != "active") { print "completion claim expected=active before step3 actual=" $5 " step=" $1 > "/dev/stderr"; bad=1 }
         if ($1 >= 3 && $5 != "terminal") { print "completion claim expected=terminal from step3 actual=" $5 " step=" $1 > "/dev/stderr"; bad=1 }
         if ($1 < 4 && $6 != "preserved") { print "completion worktree expected=preserved before step4 actual=" $6 " step=" $1 > "/dev/stderr"; bad=1 }
         if ($1 >= 4 && $6 != "removed") { print "completion worktree expected=removed from step4 actual=" $6 " step=" $1 > "/dev/stderr"; bad=1 }
         if ($1 < 5 && $7 != "open") { print "completion issue expected=open before step5 actual=" $7 " step=" $1 > "/dev/stderr"; bad=1 }
         if ($1 >= 5 && $7 != "closed") { print "completion issue expected=closed from step5 actual=" $7 " step=" $1 > "/dev/stderr"; bad=1 }
-        if ($1 == 6 && $8 != "scan-recorded") { print "completion step6 evidence expected=scan-recorded actual=" $8 > "/dev/stderr"; bad=1 }
-        if ($1 == 7 && $8 != "retrospective-recorded") { print "completion step7 evidence expected=retrospective-recorded actual=" $8 > "/dev/stderr"; bad=1 }
-        if ($1 == 8 && $8 != "verified-immutable-sha256") { print "completion step8 evidence expected=verified-immutable-sha256 actual=" $8 > "/dev/stderr"; bad=1 }
+        evidence_ok($1,$8)
         cursor=$1
       }
       END {
@@ -1111,12 +1280,23 @@ completion_prefix_facts_ok() {
         printf 'completion prefix facts mismatch cursor=%s claim=%s/%s worktree=%s/%s issue=%s/%s\n' "$cursor" "$claim" "$expected_claim" "$worktree" "$expected_worktree" "$issue" "$expected_issue" >&2; return 1
     }
 }
+event_1=1111111111111111111111111111111111111111111111111111111111111111
+event_2=2222222222222222222222222222222222222222222222222222222222222222
+event_3=3333333333333333333333333333333333333333333333333333333333333333
+event_4=4444444444444444444444444444444444444444444444444444444444444444
+event_5=5555555555555555555555555555555555555555555555555555555555555555
+event_6=6666666666666666666666666666666666666666666666666666666666666666
+event_7=7777777777777777777777777777777777777777777777777777777777777777
+event_8=8888888888888888888888888888888888888888888888888888888888888888
+completion_claim=11111111-1111-4111-8111-111111111111
+completion_tip=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+completion_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 printf '%s\n' \
- '1|merge-current-main|id-1|SUCCESS|active|preserved|open|merge-proof' \
- '2|tree-tests-ci|id-2|SUCCESS|active|preserved|open|tree-proof' \
- '3|claim-terminal|id-3|SUCCESS|terminal|preserved|open|terminal-proof' \
- '4|safe-cleanup|id-4|SUCCESS|terminal|removed|open|cleanup-proof' \
- '5|issue-closure|id-5|SUCCESS|terminal|removed|closed|closure-proof' >"$TMP/blocked-completion-prefix"
+ "1|merge-current-main|$event_1|SUCCESS|active|preserved|open|merge-tip=$completion_tip,main-tip=$completion_tip,binding=CURRENT_CANDIDATE" \
+ "2|tree-tests-ci|$event_2|SUCCESS|active|preserved|open|tree-tip=$completion_tip,tests-digest=$completion_digest,ci-url=https://github.com/darwin-finch/finch/pull/542#issuecomment-201,ci-id=201,binding=CURRENT_CANDIDATE" \
+ "3|claim-terminal|$event_3|SUCCESS|terminal|preserved|open|claim-id=$completion_claim,expected-claim-id=$completion_claim,terminal-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-202,terminal-id=202,issuer=principal-issuer,expected-issuer=principal-issuer,terminal-digest=$completion_digest,immutability=UNEDITED,binding=CURRENT_CANDIDATE" \
+ "4|safe-cleanup|$event_4|SUCCESS|terminal|removed|open|worktree-id=worktree-406,integration-tip=$completion_tip,clean=YES,pushed=YES,binding=CURRENT_CANDIDATE" \
+ "5|issue-closure|$event_5|SUCCESS|terminal|removed|closed|issue-id=406,closure-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-203,closure-id=203,binding=CURRENT_CANDIDATE" >"$TMP/blocked-completion-prefix"
 blocked_resume_ok() {
     variant=$1 stored=$2 destination=$3 condition=$4 invariants=$5 claim=$6 contract=$7 owner_decision=$8 cursor=$9 worktree=${10:-none} issue=${11:-none} prefix_file=${12:-none}
     test "$condition" = satisfied || { printf 'blocked variant=%s condition expected=satisfied actual=%s\n' "$variant" "$condition" >&2; return 1; }
@@ -1156,8 +1336,8 @@ expect_reject "stale evidence cannot resume directly to merge readiness" "implem
 expect_reject "terminal claim cannot resume READY_TO_MERGE" "implementation invariants expected=fresh/active" blocked_resume_ok BE-R-RTM READY_TO_MERGE READY_TO_MERGE satisfied fresh terminal current none none none none
 expect_reject "completion blocked resume rejects cursor 99" "completion prefix cursor expected=2..7 actual=99" blocked_resume_ok BE-R-CIP COMPLETION_IN_PROGRESS COMPLETION_IN_PROGRESS satisfied fresh terminal current none 99 removed closed "$TMP/blocked-completion-prefix"
 expect_reject "completion wait at cursor 2 rejects closed terminal removed facts" "completion prefix facts mismatch cursor=2" blocked_resume_ok BE-R-CIP COMPLETION_IN_PROGRESS COMPLETION_IN_PROGRESS satisfied fresh terminal current none 2 removed closed "$TMP/blocked-completion-prefix"
-sed '5s/id-5/wrong-id/' "$TMP/blocked-completion-prefix" >"$TMP/blocked-completion-wrong-id"
-expect_reject "completion blocked resume rejects wrong successful-prefix identity" "completion identity expected=id-5 actual=wrong-id" blocked_resume_ok BE-R-CIP COMPLETION_IN_PROGRESS COMPLETION_IN_PROGRESS satisfied fresh terminal current none 5 removed closed "$TMP/blocked-completion-wrong-id"
+sed "5s/$event_5/wrong-id/" "$TMP/blocked-completion-prefix" >"$TMP/blocked-completion-wrong-id"
+expect_reject "completion blocked resume rejects wrong successful-prefix identity" "completion event identity expected=64-lowercase-hex actual=wrong-id step=5" blocked_resume_ok BE-R-CIP COMPLETION_IN_PROGRESS COMPLETION_IN_PROGRESS satisfied fresh terminal current none 5 removed closed "$TMP/blocked-completion-wrong-id"
 merge_ready_block_storage_ok() {
     claim=$1 stored=$2
     case "$claim" in active) expected=READY_TO_MERGE ;; terminal) expected=READY ;; *) printf 'merge-ready block claim expected=active-or-terminal actual=%s\n' "$claim" >&2; return 1 ;; esac
@@ -1224,15 +1404,10 @@ require_text "task packets make ambiguous authority NO" 'Ambiguity is recorded `
 
 # Completion fixtures below use the same structured validator as blocked resumption.
 # Row fields are step|event|identity|status|claim|worktree|issue|evidence.
-printf '%s\n' \
- '1|merge-current-main|id-1|SUCCESS|active|preserved|open|merge-proof' \
- '2|tree-tests-ci|id-2|SUCCESS|active|preserved|open|tree-proof' \
- '3|claim-terminal|id-3|SUCCESS|terminal|preserved|open|terminal-proof' \
- '4|safe-cleanup|id-4|SUCCESS|terminal|removed|open|cleanup-proof' \
- '5|issue-closure|id-5|SUCCESS|terminal|removed|closed|closure-proof' \
- '6|post-closure-frontier|id-6|SUCCESS|terminal|removed|closed|scan-recorded' \
- '7|retrospective|id-7|SUCCESS|terminal|removed|closed|retrospective-recorded' \
- '8|immutable-digest|id-8|SUCCESS|terminal|removed|closed|verified-immutable-sha256' >"$TMP/complete"
+{ cat "$TMP/blocked-completion-prefix"; printf '%s\n' \
+ "6|post-closure-frontier|$event_6|SUCCESS|terminal|removed|closed|scan-digest=$completion_digest,binding=CURRENT_CANDIDATE" \
+ "7|retrospective|$event_7|SUCCESS|terminal|removed|closed|retrospective-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-204,retrospective-id=204,retrospective-digest=$completion_digest,binding=CURRENT_CANDIDATE" \
+ "8|immutable-digest|$event_8|SUCCESS|terminal|removed|closed|retrospective-url=https://github.com/darwin-finch/finch/issues/406#issuecomment-204,retrospective-id=204,retrospective-digest=$completion_digest,immutability=UNEDITED,binding=CURRENT_CANDIDATE"; } >"$TMP/complete"
 cursor=2
 while test "$cursor" -le 7; do
     sed -n "1,${cursor}p" "$TMP/complete" >"$TMP/complete-prefix"
@@ -1248,8 +1423,8 @@ expect_reject "skipped successful step is rejected" "completion step expected=2 
 expect_reject "duplicated successful step is rejected" "completion step expected=3 actual=2" completion_history_ok "$TMP/complete-duplicate" 2 COMPLETION_IN_PROGRESS
 { sed -n '2p' "$TMP/complete"; sed -n '1p' "$TMP/complete"; } >"$TMP/complete-reordered"
 expect_reject "reordered successful steps are rejected" "completion step expected=1 actual=2" completion_history_ok "$TMP/complete-reordered" 2 COMPLETION_IN_PROGRESS
-sed '2s/id-2/wrong-id/' "$TMP/complete" | sed -n '1,2p' >"$TMP/complete-wrong-id"
-expect_reject "wrong-identity successful step is rejected" "completion identity expected=id-2 actual=wrong-id" completion_history_ok "$TMP/complete-wrong-id" 2 COMPLETION_IN_PROGRESS
+sed "2s/$event_2/wrong-id/" "$TMP/complete" | sed -n '1,2p' >"$TMP/complete-wrong-id"
+expect_reject "wrong-identity successful step is rejected" "completion event identity expected=64-lowercase-hex actual=wrong-id step=2" completion_history_ok "$TMP/complete-wrong-id" 2 COMPLETION_IN_PROGRESS
 sed -n '1,2p' "$TMP/complete" >"$TMP/complete-cursor-two"
 expect_reject "cursor/state disagreement is rejected" "completion cursor expected=3 actual=2" completion_history_ok "$TMP/complete-cursor-two" 3 COMPLETION_IN_PROGRESS
 sed '2s/|active|/|terminal|/' "$TMP/complete" | sed -n '1,2p' >"$TMP/complete-early-terminal"
@@ -1264,20 +1439,29 @@ sed '4s/|open|/|closed|/' "$TMP/complete" | sed -n '1,4p' >"$TMP/complete-early-
 expect_reject "closure before step 5 is rejected" "issue expected=open before step5" completion_history_ok "$TMP/complete-early-close" 4 COMPLETION_IN_PROGRESS
 sed '5s/|closed|/|open|/' "$TMP/complete" | sed -n '1,5p' >"$TMP/complete-open-after-close"
 expect_reject "open issue after step 5 is rejected" "issue expected=closed from step5" completion_history_ok "$TMP/complete-open-after-close" 5 COMPLETION_IN_PROGRESS
-sed '6s/scan-recorded/missing/' "$TMP/complete" | sed -n '1,6p' >"$TMP/complete-no-scan"
-expect_reject "missing post-closure scan at step 6 is rejected" "step6 evidence expected=scan-recorded" completion_history_ok "$TMP/complete-no-scan" 6 COMPLETION_IN_PROGRESS
-sed '7s/retrospective-recorded/missing/' "$TMP/complete" | sed -n '1,7p' >"$TMP/complete-no-retrospective"
-expect_reject "missing retrospective at step 7 is rejected" "step7 evidence expected=retrospective-recorded" completion_history_ok "$TMP/complete-no-retrospective" 7 COMPLETION_IN_PROGRESS
-sed '8s/verified-immutable-sha256/missing/' "$TMP/complete" >"$TMP/complete-no-digest"
-expect_reject "completion without verified immutable digest is rejected" "step8 evidence expected=verified-immutable-sha256" completion_history_ok "$TMP/complete-no-digest" 8 COMPLETE
+sed "6s/scan-digest=$completion_digest/scan-digest=missing/" "$TMP/complete" | sed -n '1,6p' >"$TMP/complete-no-scan"
+expect_reject "missing post-closure scan at step 6 is rejected" "completion evidence SHA-256 invalid field=scan-digest" completion_history_ok "$TMP/complete-no-scan" 6 COMPLETION_IN_PROGRESS
+sed "7s/retrospective-digest=$completion_digest/retrospective-digest=missing/" "$TMP/complete" | sed -n '1,7p' >"$TMP/complete-no-retrospective"
+expect_reject "missing retrospective at step 7 is rejected" "completion evidence SHA-256 invalid field=retrospective-digest" completion_history_ok "$TMP/complete-no-retrospective" 7 COMPLETION_IN_PROGRESS
+sed "8s/retrospective-digest=$completion_digest/retrospective-digest=missing/" "$TMP/complete" >"$TMP/complete-no-digest"
+expect_reject "completion without verified immutable digest is rejected" "completion evidence SHA-256 invalid field=retrospective-digest" completion_history_ok "$TMP/complete-no-digest" 8 COMPLETE
 step=1
 while test "$step" -le 8; do
     awk -F '|' -v step="$step" '$1 != step' "$TMP/complete" >"$TMP/complete-step-missing"
     expect_reject "completion step $step omission is rejected" "completion" completion_history_ok "$TMP/complete-step-missing" 8 COMPLETE
     awk -F '|' -v step="$step" '{ print; if ($1 == step) print }' "$TMP/complete" >"$TMP/complete-step-duplicate"
-    expect_reject "completion step $step duplication is rejected" "completion step expected=" completion_history_ok "$TMP/complete-step-duplicate" 8 COMPLETE
+    if test "$step" = 8; then duplicate_diagnostic='completion is terminal; post-COMPLETE row forbidden'; else duplicate_diagnostic='completion step expected='; fi
+    expect_reject "completion step $step duplication is rejected" "$duplicate_diagnostic" completion_history_ok "$TMP/complete-step-duplicate" 8 COMPLETE
     awk -F '|' -v step="$step" 'BEGIN { OFS="|" } { if ($1 == step) $3="wrong-id"; print }' "$TMP/complete" >"$TMP/complete-step-wrong-id"
-    expect_reject "completion step $step wrong identity is rejected" "completion identity expected=id-$step actual=wrong-id" completion_history_ok "$TMP/complete-step-wrong-id" 8 COMPLETE
+    expect_reject "completion step $step wrong identity is rejected" "completion event identity expected=64-lowercase-hex actual=wrong-id step=$step" completion_history_ok "$TMP/complete-step-wrong-id" 8 COMPLETE
+    awk -F '|' -v step="$step" 'BEGIN { OFS="|" } { if ($1 == step) $8=""; print }' "$TMP/complete" >"$TMP/complete-step-empty"
+    expect_reject "completion step $step rejects empty evidence" "completion evidence" completion_history_ok "$TMP/complete-step-empty" 8 COMPLETE
+    awk -F '|' -v step="$step" 'BEGIN { OFS="|" } { if ($1 == step) $8="placeholder"; print }' "$TMP/complete" >"$TMP/complete-step-placeholder"
+    expect_reject "completion step $step rejects placeholder evidence" "completion evidence" completion_history_ok "$TMP/complete-step-placeholder" 8 COMPLETE
+    awk -F '|' -v step="$step" 'BEGIN { OFS="|" } { if ($1 == step) $8=$8 ",unknown-artifact=value"; print }' "$TMP/complete" >"$TMP/complete-step-wrong-artifact"
+    expect_reject "completion step $step rejects wrong evidence artifact" "completion evidence unknown field=unknown-artifact step=$step" completion_history_ok "$TMP/complete-step-wrong-artifact" 8 COMPLETE
+    awk -F '|' -v step="$step" 'BEGIN { OFS="|" } { if ($1 == step) sub(/binding=CURRENT_CANDIDATE/,"binding=STALE_CANDIDATE",$8); print }' "$TMP/complete" >"$TMP/complete-step-stale-binding"
+    expect_reject "completion step $step rejects stale evidence binding" "completion evidence binding expected=CURRENT_CANDIDATE" completion_history_ok "$TMP/complete-step-stale-binding" 8 COMPLETE
     step=$((step + 1))
 done
 step=1
@@ -1286,10 +1470,20 @@ while test "$step" -le 7; do
     expect_reject "completion steps $step/$((step + 1)) reordering is rejected" "completion step expected=$step actual=$((step + 1))" completion_history_ok "$TMP/complete-step-reordered" 8 COMPLETE
     step=$((step + 1))
 done
-{ sed -n '1,2p' "$TMP/complete"; printf '%s\n' '3|claim-terminal|attempt-bad|FAILED|active|preserved|open|wrong-author'; sed -n '3p' "$TMP/complete"; } >"$TMP/complete-retry"
+failed_event=9999999999999999999999999999999999999999999999999999999999999999
+{ sed -n '1,2p' "$TMP/complete"; printf '%s\n' "3|claim-terminal|$failed_event|FAILED|active|preserved|open|wrong-author"; sed -n '3p' "$TMP/complete"; } >"$TMP/complete-retry"
 if completion_history_ok "$TMP/complete-retry" 3 COMPLETION_IN_PROGRESS; then pass "failed accounting attempt remains visible without advancing before corrected retry"; else fail "valid same-step accounting retry rejected"; fi
-{ sed -n '1,2p' "$TMP/complete"; printf '%s\n' '3|claim-terminal|attempt-bad|FAILED|terminal|removed|closed|wrong-author'; sed -n '3p' "$TMP/complete"; } >"$TMP/complete-mutated-failure"
+{ sed -n '1,2p' "$TMP/complete"; printf '%s\n' "3|claim-terminal|$failed_event|FAILED|terminal|removed|closed|wrong-author"; sed -n '3p' "$TMP/complete"; } >"$TMP/complete-mutated-failure"
 expect_reject "failed completion attempt cannot mutate facts then restore them" "failed attempt mutated successful-prefix facts cursor=2" completion_history_ok "$TMP/complete-mutated-failure" 3 COMPLETION_IN_PROGRESS
+sed '3s/issuer=principal-issuer/issuer=principal-other/' "$TMP/complete" >"$TMP/complete-wrong-terminal-author"
+expect_reject "claim terminal step rejects wrong issuer" "completion terminal issuer mismatch" completion_history_ok "$TMP/complete-wrong-terminal-author" 8 COMPLETE
+sed '3s/expected-claim-id=11111111-1111-4111-8111-111111111111/expected-claim-id=22222222-2222-4222-8222-222222222222/' "$TMP/complete" >"$TMP/complete-wrong-claim"
+expect_reject "claim terminal step rejects a different valid claim UUID" "completion step3 exact claim identity mismatch" completion_history_ok "$TMP/complete-wrong-claim" 8 COMPLETE
+sed '8s/retrospective-digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/retrospective-digest=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' "$TMP/complete" >"$TMP/complete-wrong-final-tuple"
+expect_reject "final retrieval rejects a different valid SHA-256" "completion final retrospective tuple mismatch" completion_history_ok "$TMP/complete-wrong-final-tuple" 8 COMPLETE
+{ cat "$TMP/complete"; printf '%s\n' "9|post-complete|$failed_event|FAILED|terminal|removed|closed|late-effect"; } >"$TMP/complete-post-terminal"
+expect_reject "completion is terminal after step 8" "completion is terminal; post-COMPLETE row forbidden" completion_history_ok "$TMP/complete-post-terminal" 8 COMPLETE
+require_text "completion fixtures bind typed evidence and terminality policy" 'Every successful row carries a unique 64-lowercase-hex event identity' "$READINESS"
 
 completion_wait_resume_ok() {
     cursor=$1 before_issue=$2 after_issue=$3 before_claim=$4 after_claim=$5 before_worktree=$6 after_worktree=$7
@@ -1346,20 +1540,53 @@ expect_reject "issue #543 dependency edge is rejected" "relationship expected=no
 workflow_protocol_gate_ok() {
     workflow_file=$1
     awk '
-      /^  pull_request:/ { mode="pull"; next }
-      /^  push:/ { mode="push"; next }
-      /^permissions:/ { mode="" }
-      mode != "" && /^      - "/ { line=$0; sub(/^      - "/, "", line); sub(/"$/, "", line); seen[mode,line]++ }
-      $0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"" { invocation++; focused=1; next }
-      focused && /^      - / { focused=0 }
-      focused && /^[[:space:]]+if:/ { print "Documentation focused step must be unconditional actual=" $0 > "/dev/stderr"; disabled++ }
-      focused && /^[[:space:]]+continue-on-error:[[:space:]]*true/ { print "Documentation focused step must fail closed actual=" $0 > "/dev/stderr"; softened++ }
+      function problem(s) { print s > "/dev/stderr"; bad=1 }
+      function flush_step() {
+        if (!in_step) return
+        if (focused_run) {
+          invocation++
+          if (step_if) problem("Documentation focused step must be unconditional actual=" step_if)
+          if (step_shell) problem("Documentation focused step shell override forbidden actual=" step_shell)
+          if (step_continue) problem("Documentation focused step must fail closed; continue-on-error forbidden actual=" step_continue)
+        }
+        in_step=focused_run=step_if=step_shell=step_continue=0
+      }
+      /^  pull_request:/ { event_mode="pull"; pull_events++; next }
+      /^  push:/ { event_mode="push"; push_events++; next }
+      event_mode=="pull" && /^    types:/ { problem("Documentation pull_request types restriction forbidden actual=" $0) }
+      event_mode=="push" && /^    branches:/ { push_branches++; if ($0 != "    branches: [main]") problem("Documentation push branches expected=[main] actual=" $0) }
+      event_mode != "" && /^      - "/ { line=$0; sub(/^      - "/, "", line); sub(/"$/, "", line); seen[event_mode,line]++ }
+      /^permissions:/ { event_mode="" }
+      /^jobs:/ { jobs=1; next }
+      jobs && /^  [A-Za-z0-9_-]+:/ {
+        flush_step(); line=$0; sub(/^  /,"",line); sub(/:.*$/,"",line); current_job=line; in_steps=0
+        if (current_job=="current-docs") current_docs++
+        next
+      }
+      current_job=="current-docs" && /^    if:/ { problem("Documentation current-docs job must be unconditional actual=" $0) }
+      current_job=="current-docs" && /^    steps:/ { in_steps=1; next }
+      current_job=="current-docs" && in_steps && /^      - / {
+        flush_step(); in_step=1
+        if ($0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"") focused_run=1
+        if ($0 ~ /^      - if:/) step_if=$0
+        if ($0 ~ /^      - shell:/) step_shell=$0
+        if ($0 ~ /^      - continue-on-error:/) step_continue=$0
+        next
+      }
+      current_job=="current-docs" && in_step {
+        if ($0 == "        run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"") focused_run=1
+        if ($0 ~ /^        if:/) step_if=$0
+        if ($0 ~ /^        shell:/) step_shell=$0
+        if ($0 ~ /^        continue-on-error:/) step_continue=$0
+      }
       END {
+        flush_step()
         split(".agents/skills/finch-backlog/SKILL.md .agents/skills/finch-backlog/references/review-protocol.md .agents/skills/finch-backlog/references/solution-contract.md .agents/skills/finch-backlog/references/issue-readiness.md .agents/skills/finch-backlog/references/task-packet.md .agents/skills/finch-backlog/references/work-claims.md .agents/skills/finch-backlog/scripts/test-review-protocol", paths, " ")
         for (i=1;i<=7;i++) for (j=1;j<=2;j++) { mode_name=(j==1?"pull":"push"); if (seen[mode_name,paths[i]] != 1) { print "Documentation trigger cardinality expected=1 actual=" seen[mode_name,paths[i]] " event=" mode_name " path=" paths[i] > "/dev/stderr"; bad=1 } }
+        if (pull_events != 1 || push_events != 1) { print "Documentation event cardinality expected=pull:1/push:1 actual=pull:" pull_events "/push:" push_events > "/dev/stderr"; bad=1 }
+        if (push_branches != 1) { print "Documentation push branches cardinality expected=1 actual=" push_branches > "/dev/stderr"; bad=1 }
+        if (current_docs != 1) { print "Documentation current-docs job cardinality expected=1 actual=" current_docs > "/dev/stderr"; bad=1 }
         if (invocation != 1) { print "Documentation focused invocation cardinality expected=1 actual=" invocation > "/dev/stderr"; bad=1 }
-        if (disabled != 0) bad=1
-        if (softened != 0) bad=1
         exit bad
       }
     ' "$workflow_file"
@@ -1387,6 +1614,19 @@ docs_manifest_identity_ok() {
     actual_record=$(sed -n -E 's/.*"docs.yml": \{"sha256": "([0-9a-f]+)", "bytes": ([0-9]+).*/\1|\2/p' "$manifest_file")
     test "$actual_record" = "$expected_digest|$expected_bytes" || { printf 'docs manifest identity mismatch expected=%s|%s actual=%s\n' "$expected_digest" "$expected_bytes" "$actual_record" >&2; return 1; }
 }
+workflow_mutant_reject() {
+    mutant=$1 label=$2 diagnostic=$3
+    mutant_manifest="$mutant.manifest"
+    refresh_docs_manifest_fixture "$mutant" "$MANIFEST" "$mutant_manifest"
+    if docs_manifest_identity_ok "$mutant" "$mutant_manifest"; then pass "$label mutant has refreshed matching manifest identity"; else fail "$label mutant manifest refresh failed"; fi
+    expect_reject "manifest-refreshed $label is rejected" "$diagnostic" workflow_protocol_gate_ok "$mutant"
+}
+sed 's/branches: \[main\]/branches: [never]/' "$WORKFLOW" >"$TMP/workflow-push-never"
+workflow_mutant_reject "$TMP/workflow-push-never" "push-never workflow" "push branches expected=[main]"
+awk '{ print; if ($0 == "  pull_request:") print "    types: [closed]" }' "$WORKFLOW" >"$TMP/workflow-pr-closed"
+workflow_mutant_reject "$TMP/workflow-pr-closed" "closed-only pull_request workflow" "pull_request types restriction forbidden"
+awk '{ print; if ($0 == "  current-docs:") print "    if: ${{ false }}" }' "$WORKFLOW" >"$TMP/workflow-disabled-job"
+workflow_mutant_reject "$TMP/workflow-disabled-job" "if-false current-docs job" "current-docs job must be unconditional"
 awk '{ print; if ($0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"") print "        if: ${{ false }}" }' "$WORKFLOW" >"$TMP/workflow-disabled-if"
 refresh_docs_manifest_fixture "$TMP/workflow-disabled-if" "$MANIFEST" "$TMP/manifest-disabled-if"
 if docs_manifest_identity_ok "$TMP/workflow-disabled-if" "$TMP/manifest-disabled-if"; then pass "if-false workflow mutant has a refreshed matching manifest identity"; else fail "failed to refresh if-false mutant manifest"; fi
@@ -1395,6 +1635,25 @@ awk '{ print; if ($0 == "      - run: .agents/skills/finch-backlog/scripts/test-
 refresh_docs_manifest_fixture "$TMP/workflow-softened" "$MANIFEST" "$TMP/manifest-softened"
 if docs_manifest_identity_ok "$TMP/workflow-softened" "$TMP/manifest-softened"; then pass "continue-on-error workflow mutant has a refreshed matching manifest identity"; else fail "failed to refresh continue-on-error mutant manifest"; fi
 expect_reject "manifest-refreshed continue-on-error focused step is rejected" "focused step must fail closed" workflow_protocol_gate_ok "$TMP/workflow-softened"
+awk '{ print; if ($0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"") print "        shell: bash {0}" }' "$WORKFLOW" >"$TMP/workflow-shell-override"
+workflow_mutant_reject "$TMP/workflow-shell-override" "shell-overridden focused step" "shell override forbidden"
+awk '{ print; if ($0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"") print "        continue-on-error: ${{ true }}" }' "$WORKFLOW" >"$TMP/workflow-expression-softened"
+workflow_mutant_reject "$TMP/workflow-expression-softened" "expression continue-on-error focused step" "continue-on-error forbidden"
+awk '
+  $0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"" { print "      - continue-on-error: ${{ true }}"; print "        run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\""; next }
+  { print }
+' "$WORKFLOW" >"$TMP/workflow-continue-before-run"
+workflow_mutant_reject "$TMP/workflow-continue-before-run" "continue-on-error-before-run focused step" "continue-on-error forbidden"
+awk '
+  $0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"" { print "      - if: ${{ false }}"; print "        run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\""; next }
+  { print }
+' "$WORKFLOW" >"$TMP/workflow-if-before-run"
+workflow_mutant_reject "$TMP/workflow-if-before-run" "if-before-run focused step" "focused step must be unconditional"
+awk '
+  $0 == "      - run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\"" { print "      - shell: bash {0}"; print "        run: .agents/skills/finch-backlog/scripts/test-review-protocol \"$GITHUB_WORKSPACE\""; next }
+  { print }
+' "$WORKFLOW" >"$TMP/workflow-shell-before-run"
+workflow_mutant_reject "$TMP/workflow-shell-before-run" "shell-before-run focused step" "shell override forbidden"
 
 # Pure fixtures stay bound to their single operative policy sections. Removing the section heading
 # or contradicting its rule makes the focused gate fail even though helper code is unchanged.
