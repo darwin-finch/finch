@@ -1,176 +1,75 @@
-# Finch corrective review protocol
+# Corrective review protocol
 
-Review is iterative multi-perspective correction (IMPCD). The approved immutable solution
-contract is the target, the frozen exact-tip patch is the current approximation, verified
-findings estimate residual error, correction sketches are correction vectors, and regressions
-and integration checks are objective measurements. Reviewers find and help repair; review is
-neither punishment nor an outcome by itself.
+Review is corrective work, not a verdict factory. Every reviewer is a find-and-help partner who
+tries to make the contracted outcome safer and easier to ship.
 
-Use this for solution-contract review and exact-tip implementation review. The **claim base**
-is the immutable full SHA in the contract and claim; it anchors lineage and fail-before proof.
-The **integration base** is current `main` used for the candidate that will merge. The **exact
-tip** is a full commit SHA, never a moving branch.
+## Review the actual risk
 
-## Review the solution before production work
+Choose perspectives from the diff: correctness, security, persistence, compatibility, lifecycle,
+concurrency, accessibility, operations, or test quality. Do not summon extra reviewers or rounds
+just to satisfy a number. Every process step must demonstrably reduce defect risk or improve
+shipping confidence at a cost proportional to the change; otherwise remove it.
 
-Before any production branch, worktree, claim, mutation, or implementation, a fresh reviewer
-tries to disprove the contract's behavior, scope, authority, and proof. An obvious isolated fix
-uses one reviewer and a compact but complete contract. Expand perspectives only for actual risk.
-Every confirmed design blocker receives a concrete failure and smallest credible correction.
-Record immutable `APPROVE` only after all blockers are repaired. A changed outcome, gate, file,
-authority boundary, or proof requires a new contract revision, approval, collision check, and
-whole-claim replacement before edits resume.
+Review an identified current candidate and relevant integration base. Reproduce important failures at the
+boundary users or maintainers actually exercise. Tooling is advisory mechanical lint, never an
+authority engine; people own findings, repairs, acceptance, and merge decisions.
 
-## Derive independent perspectives from the diff
+## Record actionable findings
 
-Review `git diff <integration-base>...<exact-tip>` and include each applicable perspective:
+A useful finding contains:
 
-| Perspective | Include when the diff contains |
-|---|---|
-| Correctness | any behavioral change |
-| Concurrency/timing | shared state, async work, cancellation, retries, process lifecycle |
-| Persistence/format | durable data, serialization, migration, retention |
-| Authority/permission | capabilities, credentials, tools, claims, remote effects |
-| Resource/lifecycle | descriptors, processes, memory, unbounded accumulation |
-| Compatibility | public API, protocol, config, or another branch's interface |
-| Test quality | always; prove the regression fails on the claim base |
-| User-visible integration | artifacts, TUI/CLI/API behavior, deployment, release path |
+- a stable short ID;
+- the concrete failure and why it matters;
+- the smallest credible correction;
+- a deterministic regression or inspection;
+- the affected invariant; and
+- whether it belongs to the current contract.
 
-Record selected perspectives and a concrete reason for every skip. Give each selected
-perspective a fresh context and complete task packet. Reviewers inspect a frozen commit and do
-not mutate the implementation worktree. Disposable exact-tip copies may be used for bounded
-tests or prototypes but may not push, read credentials, perform undeclared external actions,
-merge/cherry-pick, or retain production commits.
+Track five independent axes:
 
-A required unavailable reviewer is recorded `UNAVAILABLE` with the reason. Try at most one
-bounded fresh-context fallback. If it also fails, the gate remains unresolved unless the
-repository owner explicitly accepts the named risk.
+- confidence: confirmed or plausible;
+- severity: critical, high, medium, or low;
+- locality: same-contract or independent;
+- obligation: blocker, regression debt, or nonblocking; and
+- lifecycle: open, resolved, replaced, or split.
 
-## Record and verify findings
+Count and severity prioritize attention. Only evidence and an accountable decision can change a
+finding's lifecycle. Later corrections should retain the stable ID so a maintainer can follow what
+failed, what changed, and what proof now passes. Ordinary links and concise comments are enough;
+do not build cryptographic or executable social-authority machinery around review notes.
 
-Each finding has a stable ID that survives restatement and repair, plus:
+## Repair or split
 
-- concrete input/state/interleaving and wrong outcome;
-- smallest credible correction vector and deterministic proof;
-- affected invariant and whether the repair fits the approved contract;
-- five independent axes:
-  `confidence = CONFIRMED | PLAUSIBLE`,
-  `severity = CRITICAL | HIGH | MEDIUM | LOW`,
-  `locality = SAME_CONTRACT | INDEPENDENT`,
-  `obligation = BLOCKER | REGRESSION_DEBT | NONBLOCKING`, and
-  `state = OPEN | RESOLVED | REPLACED-BY | SPLIT-TO`.
+Keep confirmed same-contract blockers and required regression debt in the current repair loop.
+Make the smallest coherent correction, run the named regression, and review the new tip.
 
-The stable ID is nonempty and immutable. Comment identities use canonical numeric GitHub comment
-URLs and matching positive-decimal IDs; Git tips are full lowercase 40-hex commit identities and
-body digests are full lowercase 64-hex SHA-256 values. Placeholders, uppercase/short identities,
-or an empty set of stable finding IDs are invalid.
+Split only genuinely separable work whose outcome can be implemented and verified independently.
+Give it an owner and proof path, and keep any inherited acceptance obligation visible. A replacement
+issue or link does not itself discharge the original obligation.
 
-A separate verifier tries to disprove the finding by tracing guards, callers, authority, and
-tests at the exact tip. `CONFIRMED` means the failure survives; `PLAUSIBLE` records the open
-question and counterargument. The axes never imply one another. Finding count and severity
-prioritize repair but never cancel, close, waive, resolve, reject, or automatically split a
-finding. Replacement and split records do not discharge an obligation.
+If a repair approach repeatedly fails, diagnose the cause and change the approach. There is no
+fixed attempt count or round count that proves infeasibility, and agent failure is not evidence that
+the requested outcome cannot be built.
 
-Every confirmed `SAME_CONTRACT` `BLOCKER` and required `REGRESSION_DEBT` stays in bounded
-same-contract repair. Only a causally separable concern may become an independent follow-up,
-and then it needs an approved contract, disjoint claim, owner, regression, and integration
-proof. Each original acceptance gate retains exactly one current owner and proof path through
-successor leaves until the leaf is merged and proven on current main. Reviewers check this
-accounting explicitly; no tool derives it.
+## Converge once
 
-### Append-only round and finding records
+Convergence is intentionally simple:
 
-Publish each frozen-tip review round as a new immutable GitHub PR comment. Never edit or delete a
-round or finding to change its confidence, severity, locality, obligation, or lifecycle state.
-The creation record names a stable finding ID, the full `origin-failing-tip` SHA, all five axes,
-the failure, correction vector, deterministic proof, invariant, and contract-fit assessment.
+1. Resolve every concrete in-scope blocker and required regression-debt item.
+2. Review the current candidate with perspectives appropriate to the final diff.
+3. Repair confirmed in-scope blockers, rerun affected tests, and start another round after any
+   material repair.
+4. Merge after the first complete round with zero confirmed in-scope blockers and relevant tests
+   passing. Stop then; do not add confidence rounds.
 
-A later disposition is another immutable comment. It repeats the stable finding ID and original
-full `origin-failing-tip`, names the distinct full `disposition-reviewed-tip` on which the repair
-proof ran, and links exactly one immediate predecessor by canonical numeric GitHub comment URL,
-matching numeric comment ID, and 64-hex SHA-256 body digest. Its proof identity is bound to the
-`disposition-reviewed-tip`, not the origin tip. It preserves every unchanged axis literally and
-names each changed axis with its old and new value.
+A small patch may need only one perspective; higher-risk changes may need several. Speculative or
+optional items are nonblocking follow-ups. Findings are bounded to behavior introduced, changed, or
+relied upon by the patch. If a required out-of-scope prerequisite is defective, create and claim a
+separate prerequisite change, land it first, then resume; do not absorb unrelated code. If the same
+defect repeats, change strategy or narrow the change rather than repeating identical review.
 
-The disposition has its own later comment ID and creation time, never the creation record's
-identity. Every creation and disposition value belongs to the five enumerations above. A changed
-value follows a legal transition: confidence may move `PLAUSIBLE -> CONFIRMED`, lifecycle may move
-`OPEN -> RESOLVED|REPLACED-BY|SPLIT-TO`, and another reclassification requires an explicit
-owner-reviewed correction that preserves the prior value in the change declaration. Before a code
-disposition can resolve, prove the reviewed tip is a descendant of the `origin-failing-tip`,
-belongs to the candidate branch ancestry, and is based on or integrated with the recorded current
-integration base. Merely distinct, earlier, unrelated, or stale-base 40-hex tips do not establish
-freshness.
-
-Each predecessor has at most one direct successor. A later change extends that single chain by
-linking the immediately preceding disposition; it never creates a sibling. Conflicting siblings,
-a missing or non-immediate predecessor, mismatched URL/ID/digest/finding/origin tip, an edited
-record, or a stale/equal repair tip when resolution requires code leaves the original obligation
-open. Restatement, reclassification, `REPLACED-BY`, and `SPLIT-TO` never erase predecessor history.
-The coordinator and independent verifier inspect the literal comment identities; this advisory
-test does not authenticate them.
-
-## Repair and converge finitely
-
-A review round freezes one exact tip, re-derives perspectives, independently samples them,
-verifies findings, and records the ledger. The implementer reproduces coherent correction
-vectors on the implementation worktree. Any production change creates a new tip and requires
-affected tests and review again.
-
-Disposable review fixtures use a private restrictive directory allocated by `mktemp -d`, reject a
-symlink in place of that directory, and retain the allocated directory's inode identity. Normal and
-signal exits remove only that same non-symlink inode. Predictable PID paths, inherited permissive
-modes, and cleanup through a replaced path are forbidden.
-
-Track attempts as ordered append-only events keyed by nonempty stable finding ID and strategy
-epoch. An `ATTEMPT` event records the next positive attempt ordinal, competence, exact full repair
-tip, proof that it is a distinct descendant candidate tip, and result `SURVIVED` or `RESOLVED`.
-The same tip never counts twice for one finding. Exactly the second competent `SURVIVED` result for the
-same still-open finding and epoch ends that epoch. A later `DIAGNOSIS` event must follow those two
-survivals, name their exhausted epoch and an immutable independent proof identity, and precede any
-further repair. The next `ATTEMPT` names a new epoch plus a nonempty changed-strategy identity; it
-cannot use the exhausted epoch or repeat the prior strategy. Diagnosis before exhaustion, a third
-same-epoch repair, a placeholder tip, a resolved second attempt, incompetent attempt, or an attempt
-for another finding never satisfies the trigger. Retain every epoch identity ever used for that
-finding: once exhausted, an epoch name can never be reused after any number of later epochs. Agent
-failure never proves infeasibility.
-
-The finite convergence rule is exact:
-
-1. resolve every transitive confirmed same-contract blocker and required regression-debt leaf;
-2. verify that ledger is zero;
-3. run exactly one fresh independent clean pass against the frozen exact tip and append its full
-   findings record;
-4. converge only if it finds no new confirmed `SAME_CONTRACT` blocker or required regression
-   debt and a post-pass ledger recheck is still zero.
-
-Do not run another review of that unchanged blocker-free tip. There is no fixed-round
-cancellation and no requirement that count or worst severity monotonically decrease. If the
-clean pass finds a blocker, reopen its stable ledger entry, repair it, and repeat from a new tip.
-
-## Frozen-tip corrective disposition
-
-The seven confirmed findings at frozen tip
-`372f32e08614b99083072356b2d004a510d9cca9` are repaired, not waived:
-
-- `F406-R3-001`: remove machine admission of contract approvals; retain literal immutable
-  contract identity and independent procedural verification.
-- `F406-R3-002`: remove caller booleans and prepared-proof inputs that purported to authorize
-  readiness or supersession; use the reviewed readiness checklist.
-- `F406-R3-003`: remove terminal pairing automation; retain v1 issuer, worker, and immutability
-  verification in the existing claim procedure.
-- `F406-R3-004`: remove purported atomic handoff; use serialized no-overlap transfer.
-- `F406-R3-005`: do not let wrong, edited, duplicate, or merely linked successors discharge
-  gates; require exhaustive ownership and proof through current-main leaves.
-- `F406-R3-006`: remove evidence-derived convergence; use recorded exact-tip review and tests.
-- `F406-R3-007`: remove proxy, legacy-bootstrap, and cutover mechanisms that trusted invented
-  identities. Any future authenticated audit service is separate approved product work.
-
-## Verdict and record
-
-Record the claim base, integration base, exact tip, selected/skipped perspectives, reviewer
-identities, `UNAVAILABLE` fallbacks, every finding and successor, repair attempts, regressions,
-zero-ledger proof, and the single clean pass. `SAFE TO MERGE` is a coordinator/reviewer
-procedural conclusion only after these checks and all contract gates pass. It is not ownership,
-authentication, or merge authority. The active `finch-work-claim:v1` and explicit task authority
-remain controlling.
+If review finds a blocker, repair it and review the resulting candidate. The ordinary trunk flow is
+focused patch, relevant affected/integration tests, risk-proportional review, and squash merge.
+Check current main for conflicts and mergeability; do not require a ritual rebase or review restart
+solely for commit identity when GitHub can cleanly squash. If main later exposes a regression, fix
+it forward. Report unavailable required expertise honestly; do not convert absence into approval.

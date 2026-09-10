@@ -13,6 +13,7 @@ on:
       - ".agents/skills/finch-backlog/references/work-claims.md"
       - ".agents/skills/finch-backlog/scripts/test-review-protocol"
       - ".github/workflows/docs.yml"
+      - "scripts/ci_workflow_manifest.json"
   push:
     branches: [main]
     paths:
@@ -26,6 +27,7 @@ on:
       - ".agents/skills/finch-backlog/references/work-claims.md"
       - ".agents/skills/finch-backlog/scripts/test-review-protocol"
       - ".github/workflows/docs.yml"
+      - "scripts/ci_workflow_manifest.json"
 
 permissions:
   contents: read
