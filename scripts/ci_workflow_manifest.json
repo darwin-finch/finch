@@ -22,7 +22,7 @@
     "repository-hygiene.yml"
   ],
   "workflows": {
-    "ci.yml": {"sha256": "97d7f02ac1d2caffd6a05be7da9b7b72c59d711a1f8d81f9d17e2f2f4cd14eb1", "bytes": 7211, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
+    "ci.yml": {"sha256": "0d730343ecec56e4d72cd6ff7a5e113862899546ca697620870e97cc1f1cc667", "bytes": 10951, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]},
     "docs.yml": {"sha256": "96181877d60f1622ca5a00025953dc38116c414ed5f338e25e601e347c4db374", "bytes": 885, "activated_fixtures": ["readme_only"]},
     "issue-104-chooser-catalog.yml": {"sha256": "bf003cf3f7258a9430ee38fdf22d68d42b5cbf106259a79f0979b75ee17f98ad", "bytes": 1619, "activated_fixtures": []},
     "issue-105-oauth.yml": {"sha256": "b8ebc77ab828544d150322232084aff5dbeecd1a815483e29e7b59a674c19ebb", "bytes": 2216, "activated_fixtures": ["manifest_dependency", "public_api"]},
@@ -32,77 +32,77 @@
     "issue-227-setup-preservation.yml": {"sha256": "fdd44d047cb873314156a56c5aa2d977647bd782c179e9e6542344f75d9a4a78", "bytes": 3718, "activated_fixtures": []},
     "issue-245-cargo-slot.yml": {"sha256": "d6dbedb14f71f5e2ead7e2ae2adeaea98adc32d3bbcf8a8abc20a06d5472957f", "bytes": 1224, "activated_fixtures": []},
     "issue-46-atomic-conversation.yml": {"sha256": "a4b698a62f6a90de6a51095b3bfcb57cea1b1b0e5951754ed3c336124aa65e81", "bytes": 2443, "activated_fixtures": []},
-    "issue-56-brain-isolation.yml": {"sha256": "018c3e3360739bfa79cab39f4cfc02375a18754aa1d8e88b1bec03d2419d2b02", "bytes": 4818, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api"]},
+    "issue-56-brain-isolation.yml": {"sha256": "f39e04532ad52aae1ef3f449500d42e13f9e220dbb2b7d8889f3b12378b3cd0d", "bytes": 4700, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api"]},
     "issue-72-capability-contract.yml": {"sha256": "b6502f078270811f9508bffb1378523b7d64cf55f26cac0ef1a37bcd3fbe3b42", "bytes": 1640, "activated_fixtures": []},
     "release.yml": {"sha256": "b443a81265056f549e9d0a7032d4c1bb29bcdd581ab998674faa79325ceeb229", "bytes": 4215, "activated_fixtures": []},
-    "repository-hygiene.yml": {"sha256": "bc383c979b4f1405639cd2775fb799f3a4a1bf2e3c051944d21aa31d10955bb1", "bytes": 1072, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
+    "repository-hygiene.yml": {"sha256": "7c3c9ddabeaad2eea39076cc27a293c63a5206304742a87babd58968b96e2ac0", "bytes": 943, "activated_fixtures": ["brain_effect", "manifest_dependency", "ordinary_source", "public_api", "readme_only"]}
   },
   "fixtures": {
     "readme_only": {
       "changed_paths": ["README.md"],
       "expected_checks": [
-        "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
+        "Build Release (x86_64-unknown-linux-gnu)",
         "Current docs links, claims, and shell syntax",
         "Runtime Authority (Ubuntu)", "Security Audit",
-        "Test (macos-14, default)", "Test (macos-14, no-default-features)",
+        "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)"
+        "Tracked tree (ubuntu-24.04)"
       ],
-      "expected_count": 13
+      "expected_count": 10
     },
     "ordinary_source": {
       "changed_paths": ["src/models/mod.rs"],
       "expected_checks": [
-        "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (ubuntu-24.04)",
         "Runtime Authority (Ubuntu)", "Security Audit",
-        "Test (macos-14, default)", "Test (macos-14, no-default-features)",
+        "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)"
+        "Tracked tree (ubuntu-24.04)"
       ],
-      "expected_count": 14
+      "expected_count": 10
     },
     "brain_effect": {
       "changed_paths": ["src/brain/store.rs", "src/server/handlers.rs"],
       "expected_checks": [
-        "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (ubuntu-24.04)",
         "Runtime Authority (Ubuntu)", "Security Audit",
-        "Test (macos-14, default)", "Test (macos-14, no-default-features)",
+        "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)", "effect-audit"
+        "Tracked tree (ubuntu-24.04)", "effect-audit"
       ],
-      "expected_count": 15
+      "expected_count": 11
     },
     "manifest_dependency": {
       "changed_paths": ["Cargo.toml", "Cargo.lock"],
       "expected_checks": [
-        "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (ubuntu-24.04)",
         "Runtime Authority (Ubuntu)", "Security Audit",
-        "Test (macos-14, default)", "Test (macos-14, no-default-features)",
+        "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)",
+        "Tracked tree (ubuntu-24.04)",
         "focused-auth (macos-14)", "focused-auth (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile", "windows-verifier-compile"
       ],
-      "expected_count": 20
+      "expected_count": 16
     },
     "public_api": {
       "changed_paths": ["src/lib.rs"],
       "expected_checks": [
-        "Build Release (aarch64-apple-darwin)", "Build Release (x86_64-unknown-linux-gnu)",
-        "Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)",
+        "Build Release (x86_64-unknown-linux-gnu)",
+        "Isolation boundaries (ubuntu-24.04)",
         "Runtime Authority (Ubuntu)", "Security Audit",
-        "Test (macos-14, default)", "Test (macos-14, no-default-features)",
+        "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile"
+        "Tracked tree (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile"
       ],
-      "expected_count": 17
+      "expected_count": 13
     }
   }
 }

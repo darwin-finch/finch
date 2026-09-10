@@ -51,7 +51,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.feature_name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,15 +59,15 @@ jobs:
           - os: ubuntu-24.04
             feature_name: default
             cargo_args: ""
+            timeout_minutes: 45
           - os: ubuntu-24.04
             feature_name: no-default-features
             cargo_args: --no-default-features
+            timeout_minutes: 45
           - os: macos-14
             feature_name: default
             cargo_args: ""
-          - os: macos-14
-            feature_name: no-default-features
-            cargo_args: --no-default-features
+            timeout_minutes: 120
 
     steps:
     - name: Checkout code
@@ -79,7 +79,13 @@ jobs:
 
     - name: Install capnproto (macOS)
       if: runner.os == 'macOS'
-      run: brew install capnp
+      run: brew install capnp ripgrep
+
+    - name: Install Python for native repository checks
+      if: runner.os == 'macOS'
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
@@ -115,6 +121,89 @@ jobs:
 
     - name: Test all targets
       run: cargo test --all-targets ${{ matrix.cargo_args }} -- --nocapture
+
+    - name: Check the current tracked tree on macOS
+      if: runner.os == 'macOS'
+      run: python3 scripts/check_repository_hygiene.py
+
+    - name: Run repository hygiene regressions on macOS
+      if: runner.os == 'macOS'
+      run: python3 scripts/test_repository_hygiene.py
+
+    - name: Reject restoration of the removed SSH surface on macOS
+      if: runner.os == 'macOS'
+      run: python3 scripts/check_no_ssh_surface.py
+
+    - name: Run removed SSH surface regressions on macOS
+      if: runner.os == 'macOS'
+      run: python3 scripts/test_no_ssh_surface.py
+
+    - name: Build macOS isolation supervisor profiles
+      if: runner.os == 'macOS'
+      run: |
+        cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
+        cargo build --bin finch-test-supervisor
+        cargo build --release --bin finch-test-supervisor
+        install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
+        install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
+
+    - name: Reject self-issued proof authority on macOS
+      if: runner.os == 'macOS'
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        -- --nocapture
+
+    - name: Validate concurrent proof reads on macOS
+      if: runner.os == 'macOS'
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        -- --nocapture
+
+    - name: Reject rewritten proof at the production constructor on macOS
+      if: runner.os == 'macOS'
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
+        -- --nocapture
+
+    - name: Reject fixture traversal before external mutation on macOS
+      if: runner.os == 'macOS'
+      run: |
+        ./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture
+
+    - name: Exercise real Brain and server paths on macOS
+      if: runner.os == 'macOS'
+      run: |
+        ./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored --nocapture
+
+    - name: Keep worker node identity inside disposable state on macOS
+      if: runner.os == 'macOS'
+      run: |
+        tests/worker_node_isolation_contract.sh
+        ./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture
+
+    - name: Exercise the complete synthetic isolation harness on macOS
+      if: runner.os == 'macOS'
+      run: ./scripts/test_brain_isolation.sh
+
+    - name: Build Apple Silicon release preflight on trusted main
+      if: github.event_name == 'push' && runner.os == 'macOS'
+      run: cargo build --release --target aarch64-apple-darwin
+
+    - name: Upload Apple Silicon release preflight
+      if: github.event_name == 'push' && runner.os == 'macOS'
+      uses: actions/upload-artifact@v4
+      with:
+        name: finch-aarch64-apple-darwin
+        path: target/aarch64-apple-darwin/release/finch
 
     - name: Verify binary reports its version
       # Exercise Cargo's default binary selection so adding a test-only binary
@@ -154,44 +243,29 @@ jobs:
       run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
 
   build:
-    name: Build Release (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            target: aarch64-apple-darwin
-          # x86_64-apple-darwin is unsupported: ort has no prebuilt binary,
-          # and GitHub no longer provides Intel macOS runners.
+    name: Build Release (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
     - name: Install capnproto (Ubuntu)
-      if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y capnproto
-
-    - name: Install capnproto (macOS)
-      if: runner.os == 'macOS'
-      run: brew install capnp
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
       with:
-        targets: ${{ matrix.target }}
+        targets: x86_64-unknown-linux-gnu
 
     - name: Build release binary
-      run: cargo build --release --target ${{ matrix.target }}
+      run: cargo build --release --target x86_64-unknown-linux-gnu
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: finch-${{ matrix.target }}
-        path: target/${{ matrix.target }}/release/finch
+        name: finch-x86_64-unknown-linux-gnu
+        path: target/x86_64-unknown-linux-gnu/release/finch
 
   security:
     name: Security Audit

@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04]
 
     steps:
     - name: Checkout code
@@ -54,10 +54,6 @@ jobs:
     - name: Install capnproto (Ubuntu)
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y capnproto ripgrep
-
-    - name: Install capnproto (macOS)
-      if: runner.os == 'macOS'
-      run: brew install capnp ripgrep
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0

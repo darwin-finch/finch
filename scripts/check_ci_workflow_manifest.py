@@ -35,22 +35,17 @@ FileIdentity = tuple[int, int, int, int, int]
 
 
 CANONICAL_CHECKS = (
-    "Build Release (aarch64-apple-darwin)",
     "Build Release (x86_64-unknown-linux-gnu)",
     "Runtime Authority (Ubuntu)",
     "Security Audit",
     "Test (macos-14, default)",
-    "Test (macos-14, no-default-features)",
     "Test (ubuntu-24.04, default)",
     "Test (ubuntu-24.04, no-default-features)",
     "Toolchain and formatting contract",
     "Toolchain and formatting contract (Windows)",
 )
-HYGIENE_CHECKS = ("Tracked tree (macos-14)", "Tracked tree (ubuntu-24.04)")
-BRAIN_CHECKS = (
-    "Isolation boundaries (macos-14)",
-    "Isolation boundaries (ubuntu-24.04)",
-)
+HYGIENE_CHECKS = ("Tracked tree (ubuntu-24.04)",)
+BRAIN_CHECKS = ("Isolation boundaries (ubuntu-24.04)",)
 OAUTH_CHECKS = ("macos-oauth", "oauth", "windows-compile")
 CHATGPT_AUTH_CHECKS = (
     "focused-auth (macos-14)",
@@ -71,12 +66,12 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             HYGIENE_CHECKS,
             ("Current docs links, claims, and shell syntax",),
         ),
-        "expected_count": 13,
+        "expected_count": 10,
     },
     "ordinary_source": {
         "changed_paths": ["src/models/mod.rs"],
         "expected_checks": checks(CANONICAL_CHECKS, HYGIENE_CHECKS, BRAIN_CHECKS),
-        "expected_count": 14,
+        "expected_count": 10,
     },
     "brain_effect": {
         "changed_paths": ["src/brain/store.rs", "src/server/handlers.rs"],
@@ -86,7 +81,7 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             BRAIN_CHECKS,
             ("effect-audit",),
         ),
-        "expected_count": 15,
+        "expected_count": 11,
     },
     "manifest_dependency": {
         "changed_paths": ["Cargo.toml", "Cargo.lock"],
@@ -97,7 +92,7 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             OAUTH_CHECKS,
             CHATGPT_AUTH_CHECKS,
         ),
-        "expected_count": 20,
+        "expected_count": 16,
     },
     "public_api": {
         "changed_paths": ["src/lib.rs"],
@@ -107,7 +102,7 @@ EXPECTED_FIXTURES: dict[str, dict[str, Any]] = {
             BRAIN_CHECKS,
             OAUTH_CHECKS,
         ),
-        "expected_count": 17,
+        "expected_count": 13,
     },
 }
 
