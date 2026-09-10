@@ -588,17 +588,18 @@ pin_count="$(find "$case_target/debug" -name 'finch-test-supervisor-pinned-sha25
 [[ "$pin_count" -eq 2 && -f "$first_pin" ]] || fail \
     "distinct supervisor bytes did not coexist as immutable pins: expected=2 actual=$pin_count target=$case_target"
 
-# Resolve the current platform normally but hide its required lock utility.
+# Hide the platform-specific lock utility. The wrapper must still serialize
+# through its portable Perl kernel-lock path, matching macOS hosted runners
+# that do not install `lockf`.
 no_lock_bin="$fixture_root/no-lock-bin"
 mkdir "$no_lock_bin"
-ln -s "$(command -v bash)" "$no_lock_bin/bash"
-ln -s "$(command -v git)" "$no_lock_bin/git"
-ln -s "$(command -v uname)" "$no_lock_bin/uname"
-set +e
-(cd "$repo" && PATH="$no_lock_bin" /bin/bash "$wrapper" true >/dev/null 2>&1)
-status=$?
-set -e
-[[ "$status" -eq 69 ]] || fail "missing lock utility should fail closed with 69: actual=$status"
+for utility in bash chmod git mktemp perl rm sh tr true uname; do
+    ln -s "$(command -v "$utility")" "$no_lock_bin/$utility"
+done
+portable_marker="$(cd "$repo" && PATH="$no_lock_bin" /bin/bash "$wrapper" sh -c \
+    'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS"')"
+[[ "$portable_marker" == "$common_dir|2" ]] || fail \
+    "portable lock fallback lost the held marker/jobs: expected=$common_dir|2 actual=$portable_marker"
 
 unsupported_bin="$fixture_root/unsupported-bin"
 mkdir "$unsupported_bin"

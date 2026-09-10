@@ -43,11 +43,14 @@ slot_marker_is_live() {
         exit 1 unless @metadata && S_ISREG($metadata[2]);
         exit 1 unless $metadata[3] == 0 && $metadata[4] == $< && ($metadata[2] & 0777) == 0400;
     ' <&107 || return 1
-    case "$(uname -s)" in
-        Darwin) ! lockf -t 0 "$lock_path" true >/dev/null 2>&1 ;;
-        Linux) ! flock -w 0 "$lock_path" true >/dev/null 2>&1 ;;
-        *) return 1 ;;
-    esac
+    # Perl is already a repository prerequisite for validating the proof
+    # descriptor above. Its flock wrapper gives Linux and macOS one kernel
+    # locking contract without assuming that a hosted macOS image includes
+    # the optional `lockf` command.
+    perl -MFcntl=:flock -e '
+        open my $lock, ">>", $ARGV[0] or exit 2;
+        exit(flock($lock, LOCK_EX | LOCK_NB) ? 1 : 0);
+    ' "$lock_path"
 }
 
 # The marker and private inherited descriptor are set by the command that the
@@ -89,24 +92,33 @@ locked_exec='
 '
 
 case "$(uname -s)" in
-    Darwin)
-        if ! command -v lockf >/dev/null 2>&1; then
-            echo "with-cargo-slot: macOS requires lockf; refusing an unlocked build" >&2
-            exit 69
-        fi
-        exec lockf -k -t "$timeout_seconds" "$lock_path" \
-            /bin/bash -c "$locked_exec" finch-cargo-slot "$git_common_dir" "$@"
-        ;;
-    Linux)
-        if ! command -v flock >/dev/null 2>&1; then
-            echo "with-cargo-slot: Linux requires flock; refusing an unlocked build" >&2
-            exit 69
-        fi
-        exec flock -w "$timeout_seconds" "$lock_path" \
-            /bin/bash -c "$locked_exec" finch-cargo-slot "$git_common_dir" "$@"
-        ;;
+    Darwin|Linux) ;;
     *)
         echo "with-cargo-slot: unsupported platform $(uname -s); refusing an unlocked build" >&2
         exit 69
         ;;
 esac
+
+# Acquire nonblocking in a bounded loop, clear close-on-exec only for the lock
+# descriptor, then replace this process with the caller. The inherited open
+# file description retains the kernel lock throughout the complete command
+# tree and releases it automatically on exit or crash.
+exec perl -MFcntl=:flock,F_SETFD -MTime::HiRes=time,sleep -e '
+    use strict;
+    use warnings;
+    my ($timeout, $path, @command) = @ARGV;
+    open my $lock, ">>", $path
+        or die "with-cargo-slot: could not open lock $path: $!\n";
+    my $deadline = time() + $timeout;
+    while (!flock($lock, LOCK_EX | LOCK_NB)) {
+        die "with-cargo-slot: could not acquire lock $path: $!\n"
+            unless $!{EWOULDBLOCK} || $!{EAGAIN};
+        exit 75 if time() >= $deadline;
+        sleep 0.05;
+    }
+    fcntl($lock, F_SETFD, 0)
+        or die "with-cargo-slot: could not preserve lock descriptor for $path: $!\n";
+    exec {$command[0]} @command
+        or die "with-cargo-slot: could not execute $command[0]: $!\n";
+' "$timeout_seconds" "$lock_path" \
+    /bin/bash -c "$locked_exec" finch-cargo-slot "$git_common_dir" "$@"
