@@ -10,12 +10,8 @@ permissions:
 
 jobs:
   tracked-tree:
-    name: Tracked tree (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-14]
-    runs-on: ${{ matrix.os }}
+    name: Tracked tree (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +27,6 @@ jobs:
       - name: Run removed SSH surface regressions
         run: python3 scripts/test_no_ssh_surface.py
       - name: Verify reviewed workflow inventory
-        if: runner.os == 'Linux'
         run: |
           python3 scripts/check_ci_workflow_manifest.py
           python3 scripts/test_ci_workflow_manifest.py

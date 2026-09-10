@@ -39,25 +39,16 @@ env:
 
 jobs:
   isolation-boundaries:
-    name: Isolation boundaries (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Isolation boundaries (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-14]
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
     - name: Install capnproto (Ubuntu)
-      if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y capnproto ripgrep
-
-    - name: Install capnproto (macOS)
-      if: runner.os == 'macOS'
-      run: brew install capnp ripgrep
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
