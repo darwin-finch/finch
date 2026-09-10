@@ -11,7 +11,15 @@ The first production-shaped adapter is ChatGPT subscription OAuth. It is
 strictly separate from the OpenAI Platform API-key provider:
 
 - OAuth authorization uses the versioned OpenAI public-client compatibility
-  dialect pinned by `CHATGPT_OAUTH_PROTOCOL_REVISION`.
+  dialect and client identity pinned by `CHATGPT_OAUTH_PROTOCOL_REVISION`.
+- Finch owns this implementation and its descriptor-anchored credential store,
+  but it is not registered as an independent OpenAI OAuth client. The client
+  identity and consumer contract are derived from [OpenAI Codex commit
+  `94cbbddafc1776d5e377bca1b05932c697e82238`](https://github.com/openai/codex/commit/94cbbddafc1776d5e377bca1b05932c697e82238),
+  recorded in source as
+  `openai-codex-public-client@94cbbddafc1776d5e377bca1b05932c697e82238+finch-binding-v2`.
+  They remain explicit compatibility risks rather than an OpenAI-supported
+  third-party integration.
 - Subscription inference is bound only to
   `https://chatgpt.com/backend-api/codex` and its named ChatGPT account.
 - `api.openai.com`, Platform API keys, compatible endpoints, and silent account
@@ -36,15 +44,19 @@ header-selected keys, duplicate JSON fields or key IDs, algorithm confusion,
 oversized documents, stale/rotated keys, and issuer/JWKS substitution fail
 closed.
 
-The compatibility fixtures are pinned to OpenAI Codex commit
-`3e4707b34b16e139fcb7ad11ab8445993b62bba1`, specifically
-`codex-rs/login/src/device_code_auth.rs`, `codex-rs/login/src/server.rs`,
-`codex-rs/login/src/auth/default_client.rs`, and
-`codex-rs/login/src/token_data.rs`. That browser flow uses the Codex-only
-`codex_cli_rs` originator. Finch records the exact `/oauth/authorize` endpoint
-and six scopes from the source, but the ChatGPT adapter keeps browser PKCE
-disabled rather than impersonating that originator. The provider-neutral core
-and synthetic dialects still exercise browser PKCE, state, and nonce.
+The active device-login compatibility dialect uses the public client identifier
+recorded by that pinned Codex source for device authorization, token exchange,
+refresh, and revocation. That is disclosure of the compatibility dependency,
+not a claim that OpenAI independently registered or supports Finch as an OAuth
+client.
+
+Earlier browser-PKCE research was pinned to [Codex commit
+`3e4707b34b16e139fcb7ad11ab8445993b62bba1`](https://github.com/openai/codex/commit/3e4707b34b16e139fcb7ad11ab8445993b62bba1),
+specifically the login files under
+`codex-rs/login/`. That browser flow uses the Codex-only `codex_cli_rs`
+originator. Finch keeps browser PKCE disabled rather than impersonating that
+originator; the provider-neutral core and synthetic dialects still exercise
+browser PKCE, state, and nonce.
 
 ## Persistence and #174 binding
 
@@ -94,7 +106,15 @@ is left untouched. Restart can then resume a safely tombstoned transaction.
 Browser PKCE remains disabled because the pinned browser protocol uses a
 Codex-only originator that Finch does not impersonate. Windows token persistence
 also remains fail-closed pending a descriptor/handle-anchored implementation;
-CI compiles the exact provider-neutral and verifier sources there. Direct
-ChatGPT subscription inference, catalog, streaming, allowance, and provenance
-transport remain #202. No live authorization is part of automated tests or
-this compatibility claim.
+CI compiles the exact provider-neutral and verifier sources there.
+
+Current source constructs the credential-bound ChatGPT subscription provider
+and implements its catalog, inference, streaming, allowance, and provenance
+path; see [the native transport contract](CHATGPT_SUBSCRIPTION_TRANSPORT.md).
+The transport remains experimental and version-pinned. [User dogfood on
+2026-09-05 after the collaboration namespace fix](https://github.com/darwin-finch/finch/issues/180#issuecomment-5557196748)
+exercised three local `spawn_agent` calls and a final typed Lisp response through
+a fresh Finch session. That evidence is limited to the tested account and date;
+live authorization is never part of ordinary automated tests. These are
+current-source claims, not evidence that an older packaged release contains the
+transport.

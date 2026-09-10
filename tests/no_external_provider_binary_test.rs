@@ -1,8 +1,26 @@
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
+
+const AMBIENT_PROVIDER_ENVIRONMENT: &[&str] = &[
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "GEMINI_API_KEY",
+    "MISTRAL_API_KEY",
+    "GROQ_API_KEY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
 
 struct BoundedOutput {
     status: ExitStatus,
@@ -11,8 +29,108 @@ struct BoundedOutput {
     timed_out: bool,
 }
 
-fn run_bounded(mut command: Command) -> BoundedOutput {
-    run_bounded_with_timeout(&mut command, std::time::Duration::from_secs(5))
+struct ForeignAuthStoreCanary {
+    path: std::path::PathBuf,
+    read_marker: std::path::PathBuf,
+}
+
+struct ForeignAuthStoreMonitor {
+    path: std::path::PathBuf,
+    child: Option<std::process::Child>,
+}
+
+fn remove_ambient_provider_environment(command: &mut Command) {
+    for variable in AMBIENT_PROVIDER_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+}
+
+impl ForeignAuthStoreCanary {
+    fn start(home: &std::path::Path) -> Self {
+        let codex_dir = home.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let path = codex_dir.join("auth.json");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "foreign credential-store canary is not a FIFO: path={}",
+            path.display(),
+        );
+        let read_marker = codex_dir.join("auth-read-observed");
+
+        Self { path, read_marker }
+    }
+
+    fn start_monitor(&self) -> ForeignAuthStoreMonitor {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "{ : > \"$2\"; printf 'foreign-auth-canary\\n'; } > \"$1\"",
+                "foreign-auth-monitor",
+            ])
+            .arg(&self.path)
+            .arg(&self.read_marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        ForeignAuthStoreMonitor {
+            path: self.path.clone(),
+            child: Some(command.spawn().unwrap()),
+        }
+    }
+
+    fn read_was_observed(&self) -> bool {
+        self.read_marker.exists()
+    }
+}
+
+impl ForeignAuthStoreMonitor {
+    fn finish(&mut self) {
+        if let Err(error) = self.kill_and_reap() {
+            panic!("{error}");
+        }
+    }
+
+    fn kill_and_reap(&mut self) -> Result<(), String> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let kill_result = child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.child = None;
+                    return Ok(());
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {}
+                outcome => {
+                    return Err(format!(
+                        "foreign credential-store canary monitor was not reaped after handle \
+                         kill: path={} kill_result={kill_result:?} wait_outcome={outcome:?}",
+                        self.path.display()
+                    ));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ForeignAuthStoreMonitor {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill_and_reap() {
+            eprintln!("{error}");
+        }
+    }
 }
 
 fn run_bounded_with_timeout(command: &mut Command, timeout: std::time::Duration) -> BoundedOutput {
@@ -60,6 +178,13 @@ fn run_bounded_with_timeout(command: &mut Command, timeout: std::time::Duration)
     }
 }
 
+fn run_bounded_with_canary(mut command: Command, canary: &ForeignAuthStoreCanary) -> BoundedOutput {
+    let mut monitor = canary.start_monitor();
+    let output = run_bounded_with_timeout(&mut command, std::time::Duration::from_secs(15));
+    monitor.finish();
+    output
+}
+
 fn assert_codex_was_not_executed(marker: &std::path::Path, boundary: &str) {
     assert!(
         !marker.exists(),
@@ -77,6 +202,24 @@ fn assert_no_connection(listener: &std::net::TcpListener, boundary: &str) {
     );
 }
 
+fn assert_foreign_auth_was_not_read(
+    canary: &ForeignAuthStoreCanary,
+    boundary: &str,
+    output: &BoundedOutput,
+) {
+    if canary.read_was_observed() {
+        panic!(
+            "Finch read the foreign credential store during {boundary}: path={} status={} \
+             timed_out={} stdout={:?} stderr={:?}",
+            canary.path.display(),
+            output.status,
+            output.timed_out,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn test_bounded_runner_kills_descendant_retaining_output() {
     let started = std::time::Instant::now();
@@ -90,12 +233,88 @@ fn test_bounded_runner_kills_descendant_retaining_output() {
 }
 
 #[test]
+fn test_foreign_auth_store_canary_detects_read_probe() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let canary = ForeignAuthStoreCanary::start(&home);
+
+    let mut probe = Command::new("/bin/cat");
+    probe.env("HOME", &home).arg(&canary.path);
+    let mut monitor = canary.start_monitor();
+    let result = run_bounded_with_timeout(&mut probe, std::time::Duration::from_secs(2));
+    monitor.finish();
+    monitor.finish();
+    assert!(
+        !result.timed_out && result.status.success(),
+        "foreign-store read probe did not complete: path={} \
+         status={} timed_out={} stdout={:?} stderr={:?}",
+        canary.path.display(),
+        result.status,
+        result.timed_out,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        canary.read_was_observed(),
+        "foreign-store read probe escaped the production assertion: path={} status={} \
+         timed_out={} stdout={:?} stderr={:?}",
+        canary.path.display(),
+        result.status,
+        result.timed_out,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn test_foreign_auth_store_monitor_reaps_on_unwind() {
+    let directory = tempfile::tempdir().unwrap();
+    let canary = ForeignAuthStoreCanary::start(&directory.path().join("home"));
+    let monitor = canary.start_monitor();
+    let monitor_pid = nix::unistd::Pid::from_raw(monitor.child.as_ref().unwrap().id() as i32);
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _monitor = monitor;
+        panic!("exercise monitor unwind cleanup");
+    }));
+
+    assert!(unwind.is_err(), "monitor cleanup probe did not unwind");
+    assert!(
+        matches!(
+            nix::sys::signal::kill(monitor_pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        ),
+        "foreign credential-store monitor survived or remained unreaped after unwind: pid={monitor_pid}"
+    );
+}
+
+#[test]
+fn test_ambient_provider_environment_is_removed_from_child() {
+    let mut command = Command::new("/usr/bin/true");
+    for variable in AMBIENT_PROVIDER_ENVIRONMENT {
+        command.env(variable, "host-secret-or-proxy");
+    }
+    remove_ambient_provider_environment(&mut command);
+
+    for variable in AMBIENT_PROVIDER_ENVIRONMENT {
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == *variable && value.is_none()),
+            "ambient provider or proxy variable was inherited by the child: variable={variable}"
+        );
+    }
+}
+
+#[test]
 fn test_hostile_codex_on_path_is_never_spawned_by_cli_boundaries() {
     let directory = tempfile::tempdir().unwrap();
     let bin_dir = directory.path().join("bin");
-    let finch_dir = directory.path().join("home/.finch");
+    let home = directory.path().join("home");
+    let finch_dir = home.join(".finch");
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&finch_dir).unwrap();
+    let foreign_auth_canary = ForeignAuthStoreCanary::start(&home);
 
     let marker = directory.path().join("codex-executed");
     let codex = bin_dir.join("codex");
@@ -145,11 +364,11 @@ prefer_local = true
 
     let finch = env!("CARGO_BIN_EXE_finch");
     let base = |command: &mut Command| {
+        remove_ambient_provider_environment(command);
         command
-            .env("HOME", directory.path().join("home"))
+            .env("HOME", &home)
             .env("PATH", &bin_dir)
             .env("ACCOUNT_A_KEY", "secret-that-must-stay-local")
-            .env_remove("OPENAI_API_KEY")
             .env_remove("CODEX_HOME")
             .env_remove("FINCH_LIVE_CHATGPT_APP_SERVER");
     };
@@ -157,8 +376,19 @@ prefer_local = true
     let mut request = Command::new(finch);
     base(&mut request);
     request.args(["--cloud-only", "query", "do not execute providers"]);
-    let request = run_bounded(request);
-    assert!(!request.timed_out, "query boundary did not terminate");
+    let request = run_bounded_with_canary(request, &foreign_auth_canary);
+    assert_foreign_auth_was_not_read(
+        &foreign_auth_canary,
+        "config load, provider construction, startup, or request",
+        &request,
+    );
+    assert!(
+        !request.timed_out,
+        "query boundary did not terminate: status={} stdout={:?} stderr={:?}",
+        request.status,
+        String::from_utf8_lossy(&request.stdout),
+        String::from_utf8_lossy(&request.stderr)
+    );
     assert!(!request.status.success());
     let stderr = String::from_utf8_lossy(&request.stderr);
     assert!(
@@ -324,7 +554,7 @@ prefer_local = true
         let mut command = Command::new(finch);
         base(&mut command);
         command.args(["--cloud-only", "query", "reject before external activity"]);
-        let result = run_bounded(command);
+        let result = run_bounded_with_canary(command, &foreign_auth_canary);
         assert!(
             !result.timed_out,
             "named rejection {index} did not terminate"
@@ -341,12 +571,17 @@ prefer_local = true
         assert_codex_was_not_executed(&marker, "named credential graph rejection");
         assert_no_connection(&provider_listener, "named credential graph rejection");
         assert_no_connection(&daemon_listener, "named credential graph rejection");
+        assert_foreign_auth_was_not_read(
+            &foreign_auth_canary,
+            "named credential graph rejection",
+            &result,
+        );
     }
 
     let mut auth = Command::new(finch);
     base(&mut auth);
     auth.args(["auth", "status", "chatgpt"]);
-    let auth = run_bounded(auth);
+    let auth = run_bounded_with_canary(auth, &foreign_auth_canary);
     assert!(!auth.timed_out, "local auth status did not terminate");
     assert!(auth.status.success());
     assert_eq!(
@@ -356,12 +591,14 @@ prefer_local = true
     assert_codex_was_not_executed(&marker, "local auth status");
     assert_no_connection(&provider_listener, "local auth status");
     assert_no_connection(&daemon_listener, "local auth status");
+    assert_foreign_auth_was_not_read(&foreign_auth_canary, "local auth status", &auth);
 
     let mut setup = Command::new(finch);
     base(&mut setup);
     setup.arg("setup");
-    let _setup = run_bounded(setup);
+    let setup = run_bounded_with_canary(setup, &foreign_auth_canary);
     assert_codex_was_not_executed(&marker, "interactive setup startup");
     assert_no_connection(&provider_listener, "interactive setup startup");
     assert_no_connection(&daemon_listener, "interactive setup startup");
+    assert_foreign_auth_was_not_read(&foreign_auth_canary, "interactive setup startup", &setup);
 }
