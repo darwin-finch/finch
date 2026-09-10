@@ -31,7 +31,7 @@ exit condition, and whether the issue remains open.
 | `BLOCKED_EXTERNAL` | Attempts, external owner, exact resumption condition, nearest independent work. | Keep open and recheck on each frontier scan; resume when the condition holds. Age is not abandonment. |
 | `INFEASIBLE` | Desired outcome/constraints, attempts, contradiction or platform evidence, nearest alternative, smallest constraint change; contract owner decides. | Keep open until owner disposition. Agent failure is insufficient. |
 | `DECLINED` | Contract-owner choice not to pursue a feasible outcome, rationale, consequence, alternative. | Owner may close or return it to specification. |
-| `SUPERSEDED` | Actual approved replacements and valid disjoint claims owning every inherited gate, plus recovery of valuable work/evidence. | Close only after exhaustive conservative transfer; a proposal or record alone is insufficient. |
+| `SUPERSEDED` | Actual approved replacements and valid disjoint claims owning every inherited gate, plus recovery of valuable work/evidence. | Retain state `SUPERSEDED` and keep the parent open after transfer. Close only after every inherited successor leaf is merged and proven on current main; a proposal, transfer, or record alone is insufficient. |
 
 State records communicate accountable conclusions. They do not independently grant mutation,
 external-action, push, merge, close, terminal-event, or cleanup authority.
@@ -71,6 +71,12 @@ For `REPLACED-BY` or `SPLIT-TO`, enumerate every original gate and assign exactl
 owner and proof path. Verify leaves recursively until each is merged and proven on current main.
 A record, successor label, duplicate link, wrong identity, missing claim, overlap, or cycle never
 discharges an obligation. If a child cannot be validly claimed, the retained gate stays open.
+
+Finding creation and every later disposition are separate immutable PR comments. A disposition
+links the predecessor comment URL/ID and SHA-256 digest, repeats the stable finding ID and exact
+tip, preserves unchanged axes, and explicitly records old/new values for changed axes. Never edit
+an earlier record to reclassify or resolve it. A missing, edited, or mismatched predecessor keeps
+the transitive obligation open.
 
 ## Conservative claim transition
 

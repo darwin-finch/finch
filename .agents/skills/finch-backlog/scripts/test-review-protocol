@@ -46,6 +46,21 @@ mkdir -p "$TMP"
 checks=0
 failures=0
 
+# Round-one ledger proof map (the immutable PR comment remains authoritative):
+# C542-COR-001 -> append-only finding fixtures below.
+# C542-COR-002 -> new-debt and post-pass convergence fixtures.
+# C542-COR-003 -> SUPERSEDED parent closure fixtures.
+# C542-COMPAT-001 -> malformed-attempt recovery and fresh-reuse fixtures.
+# F406-PF-001 -> canonical v1 blocks and immutable-observation fixtures.
+# F542-TQ-001 -> complete P542/R3 records and affirmative-authority negatives.
+# F542-TQ-002 -> isolated recursive successor graph negatives.
+# F542-TQ-003 -> one-omission production-admission negatives.
+# F542-TQ-004 -> one-predicate convergence negatives.
+# F542-TQ-005 -> severity/count classification matrix.
+# F542-TQ-006 -> authority cardinality/value fixtures.
+# F542-TQ-007 -> ordered-completion diagnostics.
+# F542-TQ-008 -> independent issue-543 state fixtures.
+
 pass() {
     checks=$((checks + 1))
     printf 'ok %s - %s\n' "$checks" "$1"
@@ -103,6 +118,38 @@ forbid_text() {
     fi
 }
 
+forbid_regex() {
+    label=$1
+    pattern=$2
+    shift 2
+    hits="$TMP/regex-hits"
+    : >"$hits"
+    for path in "$@"; do
+        if test -f "$path"; then
+            grep -E -i -n -- "$pattern" "$path" >>"$hits" || true
+        fi
+    done
+    if test -s "$hits"; then
+        fail "$label: contradictory authority text matched [$pattern]: $(tr '\n' ';' <"$hits")"
+    else
+        pass "$label"
+    fi
+}
+
+expect_reject() {
+    label=$1
+    diagnostic=$2
+    shift 2
+    err="$TMP/reject.$checks"
+    if "$@" 2>"$err"; then
+        fail "$label: invalid fixture was accepted"
+    elif grep -F -q -- "$diagnostic" "$err"; then
+        pass "$label: $(tr '\n' ';' <"$err")"
+    else
+        fail "$label: expected diagnostic [$diagnostic], got [$(tr '\n' ';' <"$err")]"
+    fi
+}
+
 # Prove that the positional repository-root argument is not silently ignored. The
 # guard prevents recursion while the child checks a deliberately empty root.
 if test "${FINCH_PROTOCOL_ROOT_SELFTEST:-run}" = run; then
@@ -153,6 +200,35 @@ else
     fail "P542 mapping mismatch; expected $(tr '\n' ' ' <"$expected") got $(tr '\n' ' ' <"$ids")"
 fi
 
+# Compare the normative gates as complete records. Presence-only checks would accept a
+# contradictory suffix that reverses the rule while retaining the expected substring.
+p542_records="$TMP/p542.records"
+grep -E '^- `P542-[0-9][0-9]`:' "$CONTRACT" >"$p542_records" || true
+p542_canonical="$TMP/p542.canonical"
+printf '%s\n' \
+'- `P542-01`: issue readiness, candidate correction, and finding attributes are distinct concepts.' \
+'- `P542-02`: procedural READY requires an immutable solution contract and fresh independent approval before any production branch, worktree, claim, mutation, or implementation. The coordinator records the checklist decision; no status script grants authority.' \
+'- `P542-03`: reviewers are find-and-help partners; every confirmed finding includes a stable ID, concrete failure, smallest credible correction vector, deterministic proof, affected invariant, and contract-fit assessment.' \
+'- `P542-04`: confidence, severity, locality, obligation, and lifecycle axes remain independent; immutable finding creation and successor dispositions preserve append-only axis history.' \
+'- `P542-05`: severity and finding count prioritize work but never cancel, close, waive, resolve, reject, or automatically split it.' \
+'- `P542-06`: confirmed same-contract blockers and required regression debt stay in bounded repair; only causally separable concerns become owned independent follow-ups.' \
+'- `P542-07`: replacement and split records do not discharge obligations. Every original acceptance gate keeps exactly one current owner and proof path until its leaf is merged and proven. This is an accounting discipline checked by reviewers/coordinator, not a reducer-derived fact.' \
+'- `P542-08`: when the same stable blocker survives two competent repair attempts, end the implementation epoch, run one bounded independent diagnosis/prototype, and change strategy, representation, contract, assignment, or executable split. Agent failure never proves infeasibility.' \
+'- `P542-09`: review converges only when the transitive same-contract blocker/regression ledger is zero, exactly one fresh independent clean exact-tip pass finds no new confirmed same-contract blocker or required regression debt, and the post-pass ledger recheck remains zero. Do not keep reviewing that frozen blocker-free tip.' \
+'- `P542-10`: task packets explicitly name edit, prototype, external action, push, merge, issue closure, terminal-event, and cleanup authority.' \
+'- `P542-11`: outcome completion requires current-main merge, every accepted gate, ticket closure, current artifact/user-visible proof, valid claim terminal, safe cleanup, and frontier recomputation.' \
+'- `P542-12`: a narrowed PR slice may merge while a broader parent remains open for concretely owned successors; PR integration and outcome completion are distinct.' \
+'- `P542-13`: `finch-work-claim:v1` remains the sole mutation-ownership authority. There is no deferred cutover.' \
+'- `P542-14`: obvious isolated fixes use compact contracts and one fresh plan reviewer; additional perspectives are derived only from actual diff risk.' \
+'- `P542-15`: reviewer/discovery prototypes use an isolated disposable worktree/copy at the frozen tip and never mutate the implementation worktree, push, read credentials, perform undeclared external effects, merge/cherry-pick, or retain production commits.' \
+'- `P542-16`: a required unavailable reviewer is recorded `UNAVAILABLE` with reason and gets at most one bounded fresh-context fallback; failure leaves the gate unresolved unless the repository owner explicitly accepts the named risk.' \
+'- `P542-17`: pre-cutover wording is removed. Any scope expansion requires a revised immutable approved contract, a complete repository-wide v1 collision check, and an issuer-authorized whole-claim replacement covering the new scope before edits, followed by another collision check.' >"$p542_canonical"
+if cmp -s "$p542_canonical" "$p542_records"; then
+    pass "all P542 normative records exactly match the reviewed canonical contract"
+else
+    fail "P542 canonical records changed; expected $(tr '\n' '|' <"$p542_canonical") got $(tr '\n' '|' <"$p542_records")"
+fi
+
 require_text "P542-01 keeps concepts distinct" "issue readiness, candidate correction, and finding attributes are distinct concepts" "$CONTRACT"
 require_text "P542-02 rejects pre-READY production work" "before any production branch, worktree, claim, mutation, or implementation" "$CONTRACT"
 require_text "P542-03 makes reviewers find-and-help partners" "reviewers are find-and-help partners" "$CONTRACT"
@@ -183,12 +259,156 @@ forbid_text "no atomic handoff mechanism" "atomic handoff activation" $DOCS
 forbid_text "no machine-derived completion" "reducer owns" $DOCS
 forbid_text "no count cancellation rule" "strictly better on both counts" $DOCS
 forbid_text "no fixed-round cancellation" "round N of at most" $DOCS
-
 require_text "linter disclaims ownership authority" "not ownership, authentication" "$0"
 require_text "procedure rejects tool-granted READY" 'no script, label, reducer, or status report grants `READY`' "$SKILL"
 require_text "v1 claim block retains base field" "base: <full commit SHA>" "$CLAIMS"
 require_text "claims remain sole authority" "sole authoritative cross-tool" "$CLAIMS"
 require_text "transfer is serialized, not atomic" "do not claim atomic transfer" "$CLAIMS"
+require_text "claim evidence names SHA-256" "SHA-256 of the exact raw body" "$CLAIMS"
+require_text "REST edit predicate is exact" 'REST `updatedAt == createdAt`' "$CLAIMS"
+require_text "GraphQL edit predicate is exact" 'GraphQL `lastEditedAt == null`' "$CLAIMS"
+
+# The two v1 HTML comment blocks remain byte-compatible and field ordered.
+awk -v out="$TMP" '
+  /<!-- finch-work-claim:v1/ { block++; capture=1 }
+  capture { print > (out "/claim-block." block) }
+  capture && /^-->$/ { capture=0 }
+' "$CLAIMS"
+printf '%s\n' \
+'<!-- finch-work-claim:v1' \
+'event: claim' \
+'claim-id: <globally unique stable id>' \
+'worker: <tool/person and stable session or agent identity>' \
+'github-actor: <responsible @user or none>' \
+'branch: <remote branch>' \
+'worktree: <absolute path or remote environment id>' \
+'base: <full commit SHA>' \
+'scope: <single-line bounded scope>' \
+'timestamp: <UTC RFC 3339>' \
+'-->' >"$TMP/claim-block.expected"
+printf '%s\n' \
+'<!-- finch-work-claim:v1' \
+'event: <release|complete|supersede>' \
+'claim-id: <the original claim id>' \
+'worker: <the exact worker value from the original claim>' \
+'timestamp: <UTC RFC 3339>' \
+'replacement-claim: <claim id or none>' \
+'authority-comment: <none or immutable prior GitHub comment URL>' \
+'-->' >"$TMP/terminal-block.expected"
+if cmp -s "$TMP/claim-block.expected" "$TMP/claim-block.1"; then
+    pass "v1 claim template fields and wrappers remain byte-compatible and ordered"
+else
+    fail "v1 claim template mismatch; expected [$(tr '\n' ';' <"$TMP/claim-block.expected")] actual [$(tr '\n' ';' <"$TMP/claim-block.1")]"
+fi
+if cmp -s "$TMP/terminal-block.expected" "$TMP/claim-block.2"; then
+    pass "v1 terminal template fields and wrappers remain byte-compatible and ordered"
+else
+    fail "v1 terminal template mismatch; expected [$(tr '\n' ';' <"$TMP/terminal-block.expected")] actual [$(tr '\n' ';' <"$TMP/claim-block.2")]"
+fi
+
+claim_block_ok() {
+    expected_block=$1
+    actual_block=$2
+    if cmp -s "$expected_block" "$actual_block"; then
+        return 0
+    fi
+    printf 'claim block mismatch expected=[%s] actual=[%s]\n' \
+        "$(tr '\n' ';' <"$expected_block")" "$(tr '\n' ';' <"$actual_block")" >&2
+    return 1
+}
+sed '1s/<!-- finch-work-claim:v1/<!-- finch-work-claim:v2/' "$TMP/claim-block.expected" >"$TMP/claim-block.bad-wrapper"
+expect_reject "changed claim wrapper is rejected" "claim block mismatch" claim_block_ok "$TMP/claim-block.expected" "$TMP/claim-block.bad-wrapper"
+sed 's/^base:/based:/' "$TMP/claim-block.expected" >"$TMP/claim-block.bad-name"
+expect_reject "changed claim field name is rejected" "claim block mismatch" claim_block_ok "$TMP/claim-block.expected" "$TMP/claim-block.bad-name"
+grep -v '^scope:' "$TMP/claim-block.expected" >"$TMP/claim-block.omitted"
+expect_reject "omitted claim field is rejected" "claim block mismatch" claim_block_ok "$TMP/claim-block.expected" "$TMP/claim-block.omitted"
+awk '{ print; if ($0 ~ /^worker:/) print }' "$TMP/claim-block.expected" >"$TMP/claim-block.duplicate"
+expect_reject "duplicate claim field is rejected" "claim block mismatch" claim_block_ok "$TMP/claim-block.expected" "$TMP/claim-block.duplicate"
+sed 's/^replacement-claim:/replacement_claim:/' "$TMP/terminal-block.expected" >"$TMP/terminal-block.bad-name"
+expect_reject "changed terminal field name is rejected" "claim block mismatch" claim_block_ok "$TMP/terminal-block.expected" "$TMP/terminal-block.bad-name"
+
+immutability_evidence_ok() {
+    algorithm=$1 digest=$2 rest_created=$3 rest_updated=$4 graphql_edited=$5
+    if test "$algorithm" != SHA-256; then
+        printf 'body digest algorithm expected=SHA-256 actual=%s\n' "$algorithm" >&2; return 1
+    fi
+    if test -z "$digest"; then
+        printf 'body SHA-256 digest must be nonempty\n' >&2; return 1
+    fi
+    if test "$rest_updated" != "$rest_created"; then
+        printf 'REST immutability expected updatedAt==createdAt actual=%s!=%s\n' "$rest_updated" "$rest_created" >&2; return 1
+    fi
+    if test "$graphql_edited" != null; then
+        printf 'GraphQL immutability expected lastEditedAt=null actual=%s\n' "$graphql_edited" >&2; return 1
+    fi
+}
+if immutability_evidence_ok SHA-256 abc 2026-09-10T00:00:00Z 2026-09-10T00:00:00Z null; then
+    pass "SHA-256 plus REST and GraphQL predicates prove an unedited observation"
+else
+    fail "valid immutable observation was rejected"
+fi
+expect_reject "non-SHA-256 body digest is rejected" "algorithm expected=SHA-256" immutability_evidence_ok SHA-1 abc t t null
+expect_reject "empty body digest is rejected" "digest must be nonempty" immutability_evidence_ok SHA-256 '' t t null
+expect_reject "REST-edited event is rejected" "updatedAt==createdAt" immutability_evidence_ok SHA-256 abc t later null
+expect_reject "GraphQL-edited event is rejected" "lastEditedAt=null" immutability_evidence_ok SHA-256 abc t t later
+
+# Malformed comments never gain terminal semantics. Recovery only proves cessation and preserves
+# evidence; a fresh ready/branch/worktree/claim/scan sequence owns any later reuse.
+malformed_resolved() {
+    author=$1 attestation=$2 comment_url=$3 comment_id=$4 digest=$5 worker=$6 pr=$7 session=$8 preservation=$9 requested_state=${10}
+    if test "$author" != original-author; then printf 'cessation author expected=original-author actual=%s\n' "$author" >&2; return 1; fi
+    if test "$attestation" != UNEDITED; then printf 'cessation attestation expected=UNEDITED actual=%s\n' "$attestation" >&2; return 1; fi
+    if test -z "$comment_url" || test -z "$comment_id"; then printf 'cessation identity requires malformed comment URL and numeric ID\n' >&2; return 1; fi
+    case "$digest" in sha256:?*) ;; *) printf 'cessation body digest expected=sha256:<nonempty> actual=%s\n' "$digest" >&2; return 1 ;; esac
+    if test "$worker" != stopped || test "$pr" != nonmutating || test "$session" != stopped; then
+        printf 'liveness unresolved worker=%s pr=%s session=%s\n' "$worker" "$pr" "$session" >&2; return 1
+    fi
+    if test "$preservation" != preserved; then printf 'valuable work preservation expected=preserved actual=%s\n' "$preservation" >&2; return 1; fi
+    if test "$requested_state" != RESOLVED_MALFORMED_NO_OWNER; then
+        printf 'malformed attempt diagnostic state expected=RESOLVED_MALFORMED_NO_OWNER actual=%s\n' "$requested_state" >&2; return 1
+    fi
+}
+if malformed_resolved original-author UNEDITED https://example.test/comment/42 42 sha256:abc stopped nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER; then
+    pass "original-author cessation, liveness and preservation resolve malformed attempt without ownership"
+else
+    fail "valid malformed-attempt cessation evidence rejected"
+fi
+expect_reject "wrong malformed-comment author cannot attest cessation" "author expected=original-author" malformed_resolved other UNEDITED url 42 sha256:abc stopped nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "edited cessation attestation is rejected" "attestation expected=UNEDITED" malformed_resolved original-author EDITED url 42 sha256:abc stopped nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "missing malformed-comment URL is rejected" "requires malformed comment URL" malformed_resolved original-author UNEDITED '' 42 sha256:abc stopped nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "missing malformed-comment ID is rejected" "requires malformed comment URL" malformed_resolved original-author UNEDITED url '' sha256:abc stopped nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "wrong malformed-comment digest is rejected" "digest expected=sha256" malformed_resolved original-author UNEDITED url 42 sha1:abc stopped nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "live worker keeps malformed attempt blocking" "liveness unresolved" malformed_resolved original-author UNEDITED url 42 sha256:abc running nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "unknown worker keeps malformed attempt blocking" "liveness unresolved" malformed_resolved original-author UNEDITED url 42 sha256:abc unknown nonmutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "mutating PR keeps malformed attempt blocking" "liveness unresolved" malformed_resolved original-author UNEDITED url 42 sha256:abc stopped mutating stopped preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "live session keeps malformed attempt blocking" "liveness unresolved" malformed_resolved original-author UNEDITED url 42 sha256:abc stopped nonmutating live preserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "unpreserved unique work keeps malformed attempt blocking" "preservation expected=preserved" malformed_resolved original-author UNEDITED url 42 sha256:abc stopped nonmutating stopped unpreserved RESOLVED_MALFORMED_NO_OWNER
+expect_reject "guessed v1 terminal cannot resolve malformed comment" "diagnostic state expected=RESOLVED_MALFORMED_NO_OWNER" malformed_resolved original-author UNEDITED url 42 sha256:abc stopped nonmutating stopped preserved complete
+
+malformed_reuse_allowed() {
+    test "$1" = RESOLVED_MALFORMED_NO_OWNER && test "$2" = READY && test "$3" = new-branch &&
+        test "$4" = new-worktree && test "$5" = valid-v1 && test "$6" = complete-clear && test "$7" = complete-clear
+}
+if malformed_reuse_allowed RESOLVED_MALFORMED_NO_OWNER READY new-branch new-worktree valid-v1 complete-clear complete-clear; then
+    pass "malformed-scope reuse requires fresh READY, branch, worktree, valid claim and two scans"
+else
+    fail "valid fresh ownership sequence after malformed recovery was rejected"
+fi
+reuse_must_be_allowed() {
+    malformed_reuse_allowed "$@" || { printf 'fresh malformed-scope reuse prerequisites rejected: %s\n' "$*" >&2; return 1; }
+}
+expect_reject "missing fresh valid claim prevents malformed-scope reuse" "reuse prerequisites rejected" reuse_must_be_allowed RESOLVED_MALFORMED_NO_OWNER READY new-branch new-worktree missing complete-clear complete-clear
+expect_reject "unresolved malformed attempt prevents reuse" "reuse prerequisites rejected" reuse_must_be_allowed BLOCKING READY new-branch new-worktree valid-v1 complete-clear complete-clear
+expect_reject "missing fresh READY decision prevents reuse" "reuse prerequisites rejected" reuse_must_be_allowed RESOLVED_MALFORMED_NO_OWNER DRAFT new-branch new-worktree valid-v1 complete-clear complete-clear
+expect_reject "reusing the old branch prevents reuse" "reuse prerequisites rejected" reuse_must_be_allowed RESOLVED_MALFORMED_NO_OWNER READY old-branch new-worktree valid-v1 complete-clear complete-clear
+expect_reject "reusing the old worktree prevents reuse" "reuse prerequisites rejected" reuse_must_be_allowed RESOLVED_MALFORMED_NO_OWNER READY new-branch old-worktree valid-v1 complete-clear complete-clear
+expect_reject "missing pre-claim collision scan prevents reuse" "reuse prerequisites rejected" reuse_must_be_allowed RESOLVED_MALFORMED_NO_OWNER READY new-branch new-worktree valid-v1 missing complete-clear
+expect_reject "missing post-claim collision scan prevents reuse" "reuse prerequisites rejected" reuse_must_be_allowed RESOLVED_MALFORMED_NO_OWNER READY new-branch new-worktree valid-v1 complete-clear missing
+require_text "claim immutability names SHA-256" "SHA-256 of the exact raw body" "$CLAIMS"
+require_text "REST immutability predicate is explicit" 'REST `updatedAt == createdAt`' "$CLAIMS"
+require_text "GraphQL immutability predicate is explicit" 'GraphQL `lastEditedAt == null`' "$CLAIMS"
+require_text "malformed attempt never becomes a claim" "A malformed comment never becomes a claim" "$CLAIMS"
+require_text "malformed recovery is diagnostic only" '`RESOLVED_MALFORMED_NO_OWNER` is diagnostic only' "$CLAIMS"
 
 # F406-R3-001 through F406-R3-007 require explicit deletion/replacement dispositions.
 fids="$TMP/findings.ids"
@@ -206,105 +426,295 @@ require_text "R3-005 prevents successor discharge" "successors discharge" "$REVI
 require_text "R3-006 removes evidence-derived convergence" "remove evidence-derived convergence" "$REVIEW"
 require_text "R3-007 removes proxy/bootstrap/cutover" "remove proxy, legacy-bootstrap, and cutover mechanisms" "$REVIEW"
 
-# Pure classification example: axes are independent; count/severity do not alter lifecycle.
-classify_finding() {
-    confidence=$1 severity=$2 locality=$3 obligation=$4 state=$5
-    printf '%s|%s|%s|%s|%s\n' "$confidence" "$severity" "$locality" "$obligation" "$state"
-}
-low=$(classify_finding CONFIRMED LOW SAME_CONTRACT BLOCKER OPEN)
-critical=$(classify_finding PLAUSIBLE CRITICAL INDEPENDENT NONBLOCKING OPEN)
-if test "$low" = "CONFIRMED|LOW|SAME_CONTRACT|BLOCKER|OPEN" &&
-   test "$critical" = "PLAUSIBLE|CRITICAL|INDEPENDENT|NONBLOCKING|OPEN"; then
-    pass "severity neither determines confidence nor cancels a low-severity blocker"
+r3_records="$TMP/r3.records"
+awk '
+  /^- `F406-R3-00[1-7]`:/ { if (record != "") print record; record=$0; next }
+  record != "" && /^  / { sub(/^  */, " "); record=record $0; next }
+  record != "" { print record; record="" }
+  END { if (record != "") print record }
+' "$REVIEW" >"$r3_records"
+r3_canonical="$TMP/r3.canonical"
+printf '%s\n' \
+'- `F406-R3-001`: remove machine admission of contract approvals; retain literal immutable contract identity and independent procedural verification.' \
+'- `F406-R3-002`: remove caller booleans and prepared-proof inputs that purported to authorize readiness or supersession; use the reviewed readiness checklist.' \
+'- `F406-R3-003`: remove terminal pairing automation; retain v1 issuer, worker, and immutability verification in the existing claim procedure.' \
+'- `F406-R3-004`: remove purported atomic handoff; use serialized no-overlap transfer.' \
+'- `F406-R3-005`: do not let wrong, edited, duplicate, or merely linked successors discharge gates; require exhaustive ownership and proof through current-main leaves.' \
+'- `F406-R3-006`: remove evidence-derived convergence; use recorded exact-tip review and tests.' \
+'- `F406-R3-007`: remove proxy, legacy-bootstrap, and cutover mechanisms that trusted invented identities. Any future authenticated audit service is separate approved product work.' >"$r3_canonical"
+if cmp -s "$r3_canonical" "$r3_records"; then
+    pass "F406-R3 dispositions are complete canonical records without contradictory suffixes"
 else
-    fail "finding-axis classifier coupled independent axes: low=$low critical=$critical"
+    fail "F406-R3 canonical mismatch; expected [$(tr '\n' ';' <"$r3_canonical")] actual [$(tr '\n' ';' <"$r3_records")]"
 fi
+forbid_regex "no affirmative script ownership grant" '^[[:space:]-]*(The )?(script|linter|reducer) (grants?|authori[sz]es) (READY|ownership|merge)' $DOCS
+forbid_regex "no affirmative machine approval admission" 'machine approval (is )?admitted|machine-approved contracts? (are )?admitted' $DOCS
 
-blocking() {
-    test "$1" = CONFIRMED && test "$3" = SAME_CONTRACT &&
-        { test "$4" = BLOCKER || test "$4" = REGRESSION_DEBT; } && test "$5" = OPEN
-}
-if blocking CONFIRMED LOW SAME_CONTRACT BLOCKER OPEN &&
-   ! blocking PLAUSIBLE CRITICAL SAME_CONTRACT BLOCKER OPEN; then
-    pass "blocking follows confidence/locality/obligation/state, not count or severity"
-else
-    fail "blocker accounting incorrectly used severity or ignored finding axes"
-fi
-
-# Successor examples: replacement labels do not prove ownership or discharge.
-successor_ok() {
-    file=$1
+# Finding history is append-only. A successor must bind the stable ID, exact tip and immutable
+# predecessor, and may change only explicitly named axes.
+finding_disposition_ok() {
+    predecessor=$1
+    successor=$2
+    if test ! -s "$predecessor"; then
+        printf 'immutable predecessor record is missing: %s\n' "$predecessor" >&2
+        return 1
+    fi
+    if test ! -s "$successor"; then
+        printf 'successor disposition record is missing: %s\n' "$successor" >&2
+        return 1
+    fi
     awk -F '|' '
-      NF != 4 { print "malformed successor row at line " NR > "/dev/stderr"; bad=1 }
-      $1 == "" || $2 == "" || $3 == "" { print "missing gate/owner/proof at line " NR > "/dev/stderr"; bad=1 }
-      seen[$1]++ { print "duplicate owner for gate " $1 > "/dev/stderr"; bad=1 }
-      $4 != "MERGED_CURRENT_MAIN" { print "unproven successor leaf for gate " $1 ": " $4 > "/dev/stderr"; bad=1 }
-      $2 == $3 { print "successor cycle for gate " $1 > "/dev/stderr"; bad=1 }
+      NR == FNR {
+        if (NF != 9) { print "predecessor field count expected=9 actual=" NF > "/dev/stderr"; bad=1 }
+        for (i=1;i<=9;i++) old[i]=$i
+        next
+      }
+      {
+        if (NF != 12) { print "successor field count expected=12 actual=" NF > "/dev/stderr"; bad=1; next }
+        if ($1 != old[1]) { print "stable finding ID mismatch expected=" old[1] " actual=" $1 > "/dev/stderr"; bad=1 }
+        if ($2 != old[2]) { print "exact tip mismatch expected=" old[2] " actual=" $2 > "/dev/stderr"; bad=1 }
+        if ($3 != old[3] || $4 != old[4]) { print "predecessor identity mismatch expected=" old[3] "/" old[4] " actual=" $3 "/" $4 > "/dev/stderr"; bad=1 }
+        if ($5 != "UNEDITED") { print "predecessor edited state expected=UNEDITED actual=" $5 > "/dev/stderr"; bad=1 }
+        split($12, description, ":")
+        changed=description[1]
+        split(description[2], change, "->")
+        if (changed < 6 || changed > 10 || change[1] != old[changed-1] || change[2] != $changed) {
+          print "axis disposition mismatch descriptor=" $12 > "/dev/stderr"; bad=1
+        }
+        for (i=6;i<=10;i++) {
+          old_index=i-1
+          if ($i != old[old_index] && changed != i) {
+            print "axis changed without disposition axis=" i " expected=" old[old_index] " actual=" $i > "/dev/stderr"; bad=1
+          }
+        }
+        if ($11 == "") { print "successor disposition proof is empty" > "/dev/stderr"; bad=1 }
+      }
       END { exit bad }
-    ' "$file"
+    ' "$predecessor" "$successor"
 }
-printf 'gate-a|worker-a|proof-a|MERGED_CURRENT_MAIN\ngate-b|worker-b|proof-b|MERGED_CURRENT_MAIN\n' >"$TMP/good-successors"
-printf 'gate-a|worker-a|proof-a|LINKED_ONLY\ngate-a|worker-b|proof-b|MERGED_CURRENT_MAIN\n' >"$TMP/bad-successors"
-if successor_ok "$TMP/good-successors" 2>"$TMP/good.err"; then
-    pass "complete disjoint successor leaves preserve one owner and current-main proof"
+printf '%s\n' 'F-1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://example.test/c/1|sha256:abcd|CONFIRMED|HIGH|SAME_CONTRACT|BLOCKER|OPEN' >"$TMP/finding.old"
+printf '%s\n' 'F-1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://example.test/c/1|sha256:abcd|UNEDITED|CONFIRMED|HIGH|SAME_CONTRACT|BLOCKER|RESOLVED|proof-42|10:OPEN->RESOLVED' >"$TMP/finding.good"
+if finding_disposition_ok "$TMP/finding.old" "$TMP/finding.good" 2>"$TMP/finding.good.err"; then
+    pass "append-only finding successor preserves identity, predecessor and unchanged axes"
 else
-    fail "valid successor example rejected: $(cat "$TMP/good.err")"
+    fail "valid append-only finding disposition rejected: $(tr '\n' ';' <"$TMP/finding.good.err")"
 fi
-if successor_ok "$TMP/bad-successors" 2>"$TMP/bad.err"; then
-    fail "duplicate/unproven successor example incorrectly discharged obligations"
+printf '%s\n' 'F-2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://example.test/c/1|sha256:abcd|UNEDITED|CONFIRMED|HIGH|SAME_CONTRACT|BLOCKER|RESOLVED|proof-42|10:OPEN->RESOLVED' >"$TMP/finding.bad-id"
+expect_reject "changed finding identity is rejected" "stable finding ID mismatch" finding_disposition_ok "$TMP/finding.old" "$TMP/finding.bad-id"
+: >"$TMP/finding.missing"
+expect_reject "missing finding predecessor is rejected" "immutable predecessor record is missing" finding_disposition_ok "$TMP/finding.missing" "$TMP/finding.good"
+printf '%s\n' 'F-1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://example.test/c/1|sha256:abcd|EDITED|CONFIRMED|HIGH|SAME_CONTRACT|BLOCKER|RESOLVED|proof-42|10:OPEN->RESOLVED' >"$TMP/finding.edited"
+expect_reject "edited predecessor is rejected" "predecessor edited state" finding_disposition_ok "$TMP/finding.old" "$TMP/finding.edited"
+printf '%s\n' 'F-1|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|https://example.test/c/1|sha256:abcd|UNEDITED|CONFIRMED|LOW|SAME_CONTRACT|BLOCKER|RESOLVED|proof-42|10:OPEN->RESOLVED' >"$TMP/finding.hidden-axis"
+expect_reject "unrecorded axis reclassification is rejected" "axis changed without disposition" finding_disposition_ok "$TMP/finding.old" "$TMP/finding.hidden-axis"
+
+# Classification must be independent of severity and total finding count.
+blocking() {
+    confidence=$1 severity=$2 locality=$3 obligation=$4 state=$5 count=$6
+    : "$severity" "$count"
+    test "$confidence" = CONFIRMED && test "$locality" = SAME_CONTRACT &&
+        { test "$obligation" = BLOCKER || test "$obligation" = REGRESSION_DEBT; } &&
+        test "$state" = OPEN
+}
+for severity in CRITICAL HIGH MEDIUM LOW; do
+    for count in 1 2 17; do
+        if blocking CONFIRMED "$severity" SAME_CONTRACT BLOCKER OPEN "$count" &&
+           blocking CONFIRMED "$severity" SAME_CONTRACT REGRESSION_DEBT OPEN "$count" &&
+           ! blocking PLAUSIBLE "$severity" SAME_CONTRACT BLOCKER OPEN "$count" &&
+           ! blocking CONFIRMED "$severity" INDEPENDENT BLOCKER OPEN "$count" &&
+           ! blocking CONFIRMED "$severity" SAME_CONTRACT NONBLOCKING OPEN "$count" &&
+           ! blocking CONFIRMED "$severity" SAME_CONTRACT BLOCKER RESOLVED "$count"; then
+            pass "blocking axes remain independent at severity=$severity count=$count"
+        else
+            fail "blocking axes coupled to severity/count or ignored another axis: severity=$severity count=$count"
+        fi
+    done
+done
+
+# A recursive successor graph requires one immutable root per gate, valid node identity, and
+# current-main proof at every leaf. Replacements remain recursively unresolved until then.
+successor_graph_ok() {
+    awk -F '|' '
+      NF != 8 { print "successor row field count expected=8 actual=" NF " line=" NR > "/dev/stderr"; bad=1; next }
+      $1 == "" || $2 == "" || $3 == "" || $4 == "" || $5 == "" || $6 == "" || $7 == "" || $8 == "" {
+        print "missing successor identity field at line " NR ": " $0 > "/dev/stderr"; bad=1
+      }
+      seen[$2]++ { print "duplicate successor node identity=" $2 > "/dev/stderr"; bad=1 }
+      $8 != "UNEDITED" { print "edited successor identity node=" $2 " state=" $8 > "/dev/stderr"; bad=1 }
+      $3 == "ROOT" { roots[$1]++; rootnode[$1]=$2 }
+      $3 != "ROOT" { parent[$2]=$3; children[$3]++ }
+      { gate[$2]=$1; kind[$2]=$7; proof[$2]=$6; owner[$2]=$4; claim[$2]=$5 }
+      END {
+        for (g in roots) if (roots[g] != 1) { print "gate root count expected=1 actual=" roots[g] " gate=" g > "/dev/stderr"; bad=1 }
+        for (n in gate) {
+          if (owner[n] == "wrong-owner" || claim[n] == "wrong-claim") { print "wrong successor identity node=" n " owner=" owner[n] " claim=" claim[n] > "/dev/stderr"; bad=1 }
+          if (parent[n] != "" && !(parent[n] in gate)) { print "missing successor parent=" parent[n] " child=" n > "/dev/stderr"; bad=1 }
+          else if (parent[n] != "" && gate[parent[n]] != gate[n]) { print "successor gate mismatch child=" n " parent=" parent[n] > "/dev/stderr"; bad=1 }
+          if (kind[n] == "REPLACED" && children[n] == 0) { print "replacement has no successor node=" n > "/dev/stderr"; bad=1 }
+          if (kind[n] == "LEAF" && proof[n] != "MERGED_CURRENT_MAIN") { print "unproven successor leaf node=" n " proof=" proof[n] > "/dev/stderr"; bad=1 }
+          if (kind[n] != "LEAF" && kind[n] != "REPLACED") { print "unknown successor state node=" n " state=" kind[n] > "/dev/stderr"; bad=1 }
+          token=n
+          p=n
+          while (p != "ROOT") {
+            if (walk[p] == token) { print "successor cycle at node=" p > "/dev/stderr"; bad=1; break }
+            walk[p]=token
+            p=parent[p]
+            if (p == "") break
+          }
+        }
+        exit bad
+      }
+    ' "$1"
+}
+printf '%s\n' \
+ 'gate-a|root-a|ROOT|worker-a|claim-a|-|REPLACED|UNEDITED' \
+ 'gate-a|child-a|root-a|worker-b|claim-b|-|REPLACED|UNEDITED' \
+ 'gate-a|grandchild-a|child-a|worker-d|claim-d|MERGED_CURRENT_MAIN|LEAF|UNEDITED' \
+ 'gate-b|root-b|ROOT|worker-c|claim-c|MERGED_CURRENT_MAIN|LEAF|UNEDITED' >"$TMP/successors.good"
+if successor_graph_ok "$TMP/successors.good" 2>"$TMP/successors.good.err"; then
+    pass "recursive successor leaves preserve one root and current-main proof"
 else
-    pass "duplicate or unproven successors remain obligations: $(tr '\n' ';' <"$TMP/bad.err")"
+    fail "valid recursive successor graph rejected: $(tr '\n' ';' <"$TMP/successors.good.err")"
+fi
+printf '%s\n' 'gate-a|root-a|ROOT|worker-a|claim-a|-|REPLACED|UNEDITED' >"$TMP/successors.missing"
+expect_reject "replacement without successor remains open" "replacement has no successor" successor_graph_ok "$TMP/successors.missing"
+sed 's/worker-b/wrong-owner/' "$TMP/successors.good" >"$TMP/successors.wrong"
+expect_reject "wrong successor owner is rejected" "wrong successor identity" successor_graph_ok "$TMP/successors.wrong"
+sed 's/claim-b/wrong-claim/' "$TMP/successors.good" >"$TMP/successors.wrong-claim"
+expect_reject "wrong successor claim is rejected" "wrong successor identity" successor_graph_ok "$TMP/successors.wrong-claim"
+awk '{ print; if ($0 ~ /child-a\|root-a/) print }' "$TMP/successors.good" >"$TMP/successors.duplicate"
+expect_reject "duplicate successor identity is rejected" "duplicate successor node identity" successor_graph_ok "$TMP/successors.duplicate"
+sed 's/child-a|root-a/child-a|missing-a/' "$TMP/successors.good" >"$TMP/successors.parent"
+expect_reject "missing successor parent is rejected" "missing successor parent" successor_graph_ok "$TMP/successors.parent"
+sed 's/child-a|root-a/child-a|child-a/' "$TMP/successors.good" >"$TMP/successors.cycle"
+expect_reject "successor cycle is rejected" "successor cycle" successor_graph_ok "$TMP/successors.cycle"
+awk -F '|' 'BEGIN { OFS="|" } { if ($2 == "grandchild-a") $8="EDITED"; print }' "$TMP/successors.good" >"$TMP/successors.edited"
+expect_reject "edited successor identity is rejected" "edited successor identity" successor_graph_ok "$TMP/successors.edited"
+awk -F '|' 'BEGIN { OFS="|" } { if ($2 == "grandchild-a") $6="LINKED_ONLY"; print }' "$TMP/successors.good" >"$TMP/successors.unproven"
+expect_reject "unproven successor leaf remains open" "unproven successor leaf" successor_graph_ok "$TMP/successors.unproven"
+
+parent_closable() {
+    test "$1" = SUPERSEDED && test "$2" = exhaustive-transfer && test "$3" = ALL_LEAVES_MERGED_CURRENT_MAIN
+}
+parent_must_be_closable() {
+    parent_closable "$@" || {
+        printf 'parent lacks current-main successor proof: state=%s transfer=%s leaves=%s\n' "$1" "$2" "$3" >&2
+        return 1
+    }
+}
+expect_reject "SUPERSEDED transfer alone keeps parent open" "parent lacks current-main successor proof" parent_must_be_closable SUPERSEDED exhaustive-transfer TRANSFERRED_ONLY
+if parent_closable SUPERSEDED exhaustive-transfer ALL_LEAVES_MERGED_CURRENT_MAIN; then
+    pass "SUPERSEDED parent closes only after all inherited leaves are current-main proven"
+else
+    fail "fully proven SUPERSEDED parent was not closable"
 fi
 
-# Finite convergence: two failed repairs force strategy change; zero ledger gets one clean pass.
+# Finite convergence isolates every predicate and rechecks required debt after the fresh pass.
 convergence() {
-    ledger=$1 clean_passes=$2 new_blockers=$3 attempts=$4 strategy_changed=$5
+    ledger_before=$1 clean_passes=$2 new_blockers=$3 new_debt=$4 ledger_after=$5 attempts=$6 strategy_changed=$7
     if test "$attempts" -ge 2 && test "$strategy_changed" != yes; then
-        printf 'stable blocker survived two competent attempts; strategy change required\n' >&2
+        printf 'stable blocker attempts=%s requires strategy_changed=yes actual=%s\n' "$attempts" "$strategy_changed" >&2
         return 1
     fi
-    if test "$ledger" -ne 0; then
-        printf 'transitive same-contract ledger is not zero: %s\n' "$ledger" >&2
+    if test "$ledger_before" -ne 0; then
+        printf 'pre-pass transitive ledger expected=0 actual=%s\n' "$ledger_before" >&2
         return 1
     fi
-    if test "$clean_passes" -ne 1 || test "$new_blockers" -ne 0; then
-        printf 'need exactly one clean exact-tip pass and zero new blockers; passes=%s new=%s\n' "$clean_passes" "$new_blockers" >&2
+    if test "$clean_passes" -ne 1; then
+        printf 'fresh clean pass count expected=1 actual=%s\n' "$clean_passes" >&2
+        return 1
+    fi
+    if test "$new_blockers" -ne 0; then
+        printf 'new confirmed same-contract blockers expected=0 actual=%s\n' "$new_blockers" >&2
+        return 1
+    fi
+    if test "$new_debt" -ne 0; then
+        printf 'new required regression debt expected=0 actual=%s\n' "$new_debt" >&2
+        return 1
+    fi
+    if test "$ledger_after" -ne 0; then
+        printf 'post-pass transitive ledger expected=0 actual=%s\n' "$ledger_after" >&2
         return 1
     fi
 }
-if convergence 0 1 0 0 no 2>"$TMP/converged.err"; then
-    pass "zero transitive ledger plus exactly one fresh clean pass converges"
+if convergence 0 1 0 0 0 0 no 2>"$TMP/converged.err"; then
+    pass "zero ledger, exactly one clean pass, no new obligations, and zero recheck converges"
 else
-    fail "valid convergence rejected: $(cat "$TMP/converged.err")"
+    fail "valid convergence rejected: $(tr '\n' ';' <"$TMP/converged.err")"
 fi
-if convergence 1 3 0 2 no 2>"$TMP/stuck.err"; then
-    fail "nonzero repeated blocker incorrectly converged"
+expect_reject "nonzero pre-pass ledger rejects convergence" "pre-pass transitive ledger" convergence 1 1 0 0 0 0 no
+expect_reject "zero clean passes reject convergence" "clean pass count" convergence 0 0 0 0 0 0 no
+expect_reject "multiple clean passes reject convergence" "clean pass count" convergence 0 2 0 0 0 0 no
+expect_reject "new blocker reopens repair" "new confirmed same-contract blockers" convergence 0 1 1 0 1 0 no
+expect_reject "new required debt reopens repair" "new required regression debt" convergence 0 1 0 1 1 0 no
+expect_reject "nonzero post-pass ledger rejects convergence" "post-pass transitive ledger" convergence 0 1 0 0 1 0 no
+expect_reject "two attempts without strategy change reject convergence" "requires strategy_changed=yes" convergence 0 1 0 0 0 2 no
+if convergence 0 1 0 0 0 2 yes 2>"$TMP/changed-strategy.err"; then
+    pass "two attempts may converge after a recorded strategy change and clean evidence"
 else
-    pass "stable blocker forces bounded diagnosis and strategy change: $(cat "$TMP/stuck.err")"
+    fail "valid changed-strategy convergence rejected: $(tr '\n' ';' <"$TMP/changed-strategy.err")"
 fi
 
-# Production admission needs readiness, edit authority, v1 claim, and both collision checks.
+# Production admission: each prerequisite has its own one-fault negative.
 production_allowed() {
-    test "$1" = READY && test "$2" = yes && test "$3" = valid-v1 &&
-        test "$4" = complete-clear && test "$5" = complete-clear
+    test "$1" = READY && test "$2" = yes && test "$3" = dedicated-branch &&
+        test "$4" = dedicated-worktree && test "$5" = valid-v1 && test "$6" = complete &&
+        test "$7" = clear && test "$8" = complete-clear
 }
-if ! production_allowed NEEDS_SPECIFICATION yes valid-v1 complete-clear complete-clear; then
-    pass "pre-READY production work is rejected"
-else
-    fail "NEEDS_SPECIFICATION incorrectly admitted production work"
-fi
-if production_allowed READY yes valid-v1 complete-clear complete-clear; then
-    pass "procedural readiness plus explicit authority and collision proof admits work"
+production_must_be_allowed() {
+    production_allowed "$@" || {
+        printf 'production prerequisite rejected: readiness=%s edit=%s branch=%s worktree=%s claim=%s retrieval=%s collision=%s post_claim=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" >&2
+        return 1
+    }
+}
+if production_allowed READY yes dedicated-branch dedicated-worktree valid-v1 complete clear complete-clear; then
+    pass "complete production-admission checklist admits work procedurally"
 else
     fail "complete production-admission checklist was rejected"
 fi
+expect_reject "non-READY issue rejects production" "production prerequisite rejected" production_must_be_allowed NEEDS_SPECIFICATION yes dedicated-branch dedicated-worktree valid-v1 complete clear complete-clear
+expect_reject "missing edit authority rejects production" "production prerequisite rejected" production_must_be_allowed READY no dedicated-branch dedicated-worktree valid-v1 complete clear complete-clear
+expect_reject "missing dedicated branch rejects production" "production prerequisite rejected" production_must_be_allowed READY yes shared-branch dedicated-worktree valid-v1 complete clear complete-clear
+expect_reject "missing dedicated worktree rejects production" "production prerequisite rejected" production_must_be_allowed READY yes dedicated-branch shared-worktree valid-v1 complete clear complete-clear
+expect_reject "invalid claim rejects production" "production prerequisite rejected" production_must_be_allowed READY yes dedicated-branch dedicated-worktree malformed complete clear complete-clear
+expect_reject "incomplete retrieval rejects production" "production prerequisite rejected" production_must_be_allowed READY yes dedicated-branch dedicated-worktree valid-v1 partial clear complete-clear
+expect_reject "collision rejects production" "production prerequisite rejected" production_must_be_allowed READY yes dedicated-branch dedicated-worktree valid-v1 complete overlap complete-clear
+expect_reject "missing post-claim collision check rejects production" "production prerequisite rejected" production_must_be_allowed READY yes dedicated-branch dedicated-worktree valid-v1 complete clear missing
 
-# Task packet must name each independent authority rather than rely on a blanket grant.
-for field in "Edit authority" "Disposable prototype authority" "External-action/message authority" \
-    "Push authority" "Merge authority" "Issue-close authority" "Claim-terminal authority" \
-    "Cleanup authority"; do
-    require_text "task packet explicitly names $field" "$field:" "$PACKET"
-done
+# Task-packet authority records occur exactly once and contain an explicit decision plus bounds.
+authority_fields_ok() {
+    awk '
+      BEGIN {
+        split("Edit authority|Disposable prototype authority|External-action/message authority|Push authority|Merge authority|Issue-close authority|Claim-terminal authority|Cleanup authority", fields, "|")
+      }
+      /^- (Edit authority|Disposable prototype authority|External-action\/message authority|Push authority|Merge authority|Issue-close authority|Claim-terminal authority|Cleanup authority):/ {
+        line=$0; sub(/^- /, "", line); split(line, pair, ": "); name=pair[1]; seen[name]++
+        value=substr(line, length(name)+3)
+        if (value !~ /^<(YES \| NO)> — <[^>]+>$/ && value !~ /^(YES|NO) — .+$/) {
+          print "authority value requires explicit YES/NO and nonempty bounds field=" name " actual=" value > "/dev/stderr"; bad=1
+        }
+      }
+      END {
+        for (i=1;i<=8;i++) if (seen[fields[i]] != 1) {
+          print "authority field cardinality expected=1 actual=" seen[fields[i]] " field=" fields[i] > "/dev/stderr"; bad=1
+        }
+        exit bad
+      }
+    ' "$1"
+}
+if authority_fields_ok "$PACKET" 2>"$TMP/authority.packet.err"; then
+    pass "task packet names each authority exactly once with decision and bounds"
+else
+    fail "task packet authority schema invalid: $(tr '\n' ';' <"$TMP/authority.packet.err")"
+fi
+printf '%s\n' '- Edit authority: YES — file-a' '- Disposable prototype authority: NO — none' '- External-action/message authority: NO — none' '- Push authority: YES — branch-a' '- Merge authority: NO — none' '- Issue-close authority: NO — none' '- Claim-terminal authority: NO — none' '- Cleanup authority: NO — none' >"$TMP/authority.good"
+if authority_fields_ok "$TMP/authority.good"; then pass "valid concrete task authority fixture passes"; else fail "valid concrete task authority fixture rejected"; fi
+sed 's/Edit authority: YES — file-a/Edit authority:/' "$TMP/authority.good" >"$TMP/authority.empty"
+expect_reject "empty authority value is rejected" "authority value requires explicit YES/NO" authority_fields_ok "$TMP/authority.empty"
+grep -v 'Merge authority:' "$TMP/authority.good" >"$TMP/authority.missing"
+expect_reject "missing authority field is rejected" "authority field cardinality" authority_fields_ok "$TMP/authority.missing"
+{ sed -n '1p' "$TMP/authority.good"; sed -n '1,8p' "$TMP/authority.good"; } >"$TMP/authority.duplicate"
+expect_reject "duplicate authority field is rejected" "authority field cardinality" authority_fields_ok "$TMP/authority.duplicate"
 
 # Ordered PR542/#406 completion proof. Each event must exist once in exact v17 order.
 ordered_completion() {
@@ -334,6 +744,23 @@ printf '%s\n' \
   '6 post-closure-frontier' \
   '7 retrospective' \
   '8 immutable-digest' >"$TMP/permuted"
+printf '%s\n' \
+  '1 merge-current-main' \
+  '2 tree-tests-ci' \
+  '3 claim-terminal' \
+  '4 safe-cleanup' \
+  '5 issue-closure' \
+  '6 post-closure-frontier' \
+  '7 immutable-digest' >"$TMP/missing-event"
+printf '%s\n' \
+  '1 merge-current-main' \
+  'two tree-tests-ci' \
+  '3 claim-terminal' \
+  '4 safe-cleanup' \
+  '5 issue-closure' \
+  '6 post-closure-frontier' \
+  '7 retrospective' \
+  '8 immutable-digest' >"$TMP/bad-ordinal"
 if ordered_completion "$TMP/complete" 2>"$TMP/complete.err"; then
     pass "all eight v17 completion prerequisites occur in exact order"
 else
@@ -344,6 +771,8 @@ if ordered_completion "$TMP/permuted" 2>"$TMP/permuted.err"; then
 else
     pass "out-of-order completion is rejected actionably: $(cat "$TMP/permuted.err")"
 fi
+expect_reject "missing completion event is rejected with expected/actual order" "expected [merge-current-main" ordered_completion "$TMP/missing-event"
+expect_reject "malformed completion ordinal is rejected with offending line" "bad ordinal at line 2: two tree-tests-ci" ordered_completion "$TMP/bad-ordinal"
 
 require_text "policy orders merge/current-main first" '1. Merge PR #542 into then-current `main`' "$SKILL" "$READINESS"
 require_text "policy orders claim terminal before cleanup" "3. Publish and verify the issuer-authorized" "$SKILL"
@@ -354,16 +783,31 @@ require_text "policy requires final retrieval and digest" "8. Retrieve it, verif
 require_text "issue 543 is never consulted" "Issue #543 is never" "$SKILL" "$READINESS"
 require_text "final state keeps issue 543 open" "#543 still open and independent" "$READINESS"
 
-# Contradictory-open-543 fixture: #543 state cannot affect PR542/#406 result.
-pr542=integrated-and-accounted
-issue406=complete
-issue543=open-independent
-if test "$pr542" = integrated-and-accounted && test "$issue406" = complete &&
-   test "$issue543" = open-independent; then
-    pass "exact result: PR #542 complete and issue #406 complete while issue #543 remains open"
+# Completion consumes only #542/#406 evidence; the separately observed final state must retain
+# #543 as open and independent rather than silently making it a gate or consuming it.
+outcome_complete() {
+    test "$1" = integrated-and-accounted && test "$2" = complete
+}
+observed_final_state_ok() {
+    outcome_complete "$1" "$2" && test "$3" = open-independent
+}
+if outcome_complete integrated-and-accounted complete &&
+   outcome_complete integrated-and-accounted complete ignored-543-value; then
+    pass "PR542/issue406 completion predicate does not consume issue #543 state"
 else
-    fail "independent #543 fixture changed PR542/#406 completion: $pr542 $issue406 $issue543"
+    fail "issue #543 unexpectedly became a PR542/issue406 completion input"
 fi
+if observed_final_state_ok integrated-and-accounted complete open-independent; then
+    pass "observed final state retains issue #543 open and independent"
+else
+    fail "valid observed final state rejected: pr542=integrated-and-accounted issue406=complete issue543=open-independent"
+fi
+final_state_must_hold() {
+    observed_final_state_ok "$@" || { printf 'observed final state expected issue543=open-independent actual=%s\n' "$3" >&2; return 1; }
+}
+expect_reject "missing issue #543 state is rejected" "actual=missing" final_state_must_hold integrated-and-accounted complete missing
+expect_reject "closed issue #543 state is rejected" "actual=closed" final_state_must_hold integrated-and-accounted complete closed
+expect_reject "dependent issue #543 state is rejected" "actual=dependent" final_state_must_hold integrated-and-accounted complete dependent
 
 if test "$failures" -ne 0; then
     printf 'FAILED: %s of %s policy checks failed for root %s\n' "$failures" "$checks" "$ROOT" >&2

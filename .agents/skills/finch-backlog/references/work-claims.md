@@ -34,10 +34,12 @@ Use a lowercase UUID, full 40-character base, single-line scope, and UTC RFC 333
 field is required; literal `none` is allowed only for genuinely unavailable `github-actor` or
 `worktree`. Never include credentials, secrets, private prompts, or untrusted multiline content.
 
-Save the returned URL and immutable observation: comment ID, author login, `createdAt`,
-`updatedAt`/`lastEditedAt`, exact-body digest, and original issuer. Never edit/delete an event.
-Accept it only when GitHub directly shows it unedited. A changed digest, edit, missing saved URL,
-or incomplete retrieval is an ownership-integrity failure; stop instead of reconstructing intent.
+Save the returned URL and immutable observation: comment ID, author login, `createdAt`, REST
+`updatedAt`, GraphQL `lastEditedAt`, SHA-256 of the exact raw body, and original issuer. Never
+edit/delete an event. Accept it only when GitHub directly proves REST `updatedAt == createdAt`,
+GraphQL `lastEditedAt == null`, and the retrieved raw body has the saved SHA-256 digest. A changed
+digest, edit, missing saved URL, or incomplete retrieval is an ownership-integrity failure; stop
+instead of reconstructing intent.
 
 ## Repository-wide collision procedure
 
@@ -56,6 +58,27 @@ Fail closed on pagination, authentication, rate limit, network, immutability, re
 response ambiguity. A malformed claim corroborated by live work blocks competing mutation until
 resolved. Age never proves abandonment. If ownership cannot be safely established, ask or choose
 other work.
+
+### Resolve a corroborated malformed attempt
+
+A malformed comment never becomes a claim, cannot receive a v1 terminal, and grants no ownership.
+If its corroborated live work blocks reuse, only the original comment author may publish a new,
+immutable cessation attestation naming the malformed comment URL, numeric comment ID, and SHA-256
+body digest. Verify
+that attestation with REST `updatedAt == createdAt` and GraphQL `lastEditedAt == null`.
+
+Before recording `RESOLVED_MALFORMED_NO_OWNER`, directly inspect or contact every identifiable
+worker and verify there is no running worker, mutating PR, or live session. Record the exact dirty,
+unpushed, and unique-commit state of every branch/worktree, preserve all valuable work, and retain
+the malformed comment and attestation as diagnostics. A clean pushed branch may remain as
+read-only evidence. If the original author is unavailable, liveness is unknown, or unique work is
+not preserved, the malformed attempt remains blocking.
+
+`RESOLVED_MALFORMED_NO_OWNER` is diagnostic only: it is not a claim, terminal, retroactive
+validation, authority grant, or proof that any acceptance gate is discharged. Before anyone
+reuses the scope, require a READY outcome with an approved immutable contract, a new dedicated
+branch/worktree, a fresh valid v1 claim, and complete collision checks both before and after that
+claim. Cherry-pick or reimplement preserved work only after those prerequisites hold.
 
 Two claims conflict when file sets or semantic authority overlap, even on different issues. Same
 parent claims coexist only with independently testable explicitly disjoint scopes. When uncertain,

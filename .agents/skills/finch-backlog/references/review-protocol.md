@@ -73,6 +73,20 @@ proof. Each original acceptance gate retains exactly one current owner and proof
 successor leaves until the leaf is merged and proven on current main. Reviewers check this
 accounting explicitly; no tool derives it.
 
+### Append-only round and finding records
+
+Publish each frozen-tip review round as a new immutable GitHub PR comment. Never edit or delete a
+round or finding to change its confidence, severity, locality, obligation, or lifecycle state.
+The creation record names a stable finding ID, the reviewed exact-tip SHA, all five axes, the
+failure, correction vector, deterministic proof, invariant, and contract-fit assessment.
+
+A later disposition is another immutable comment. It repeats the stable finding ID and reviewed
+exact tip, links the predecessor comment by numeric URL/ID and SHA-256 body digest, preserves every
+unchanged axis literally, and names each changed axis with its old and new value. Missing, edited,
+ambiguous, or digest-mismatched predecessors leave the original obligation open. Restatement,
+reclassification, `REPLACED-BY`, and `SPLIT-TO` never erase predecessor history. The coordinator
+and independent verifier inspect the literal comment identities; no linter authenticates them.
+
 ## Repair and converge finitely
 
 A review round freezes one exact tip, re-derives perspectives, independently samples them,
@@ -89,8 +103,10 @@ The finite convergence rule is exact:
 
 1. resolve every transitive confirmed same-contract blocker and required regression-debt leaf;
 2. verify that ledger is zero;
-3. run exactly one fresh independent clean pass against the frozen exact tip;
-4. converge only if it finds no new confirmed blocker.
+3. run exactly one fresh independent clean pass against the frozen exact tip and append its full
+   findings record;
+4. converge only if it finds no new confirmed `SAME_CONTRACT` blocker or required regression
+   debt and a post-pass ledger recheck is still zero.
 
 Do not run another review of that unchanged blocker-free tip. There is no fixed-round
 cancellation and no requirement that count or worst severity monotonically decrease. If the

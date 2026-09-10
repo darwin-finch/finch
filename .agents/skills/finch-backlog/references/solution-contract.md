@@ -26,12 +26,12 @@ for historical regression lineage and record current integration base separately
 - `P542-01`: issue readiness, candidate correction, and finding attributes are distinct concepts.
 - `P542-02`: procedural READY requires an immutable solution contract and fresh independent approval before any production branch, worktree, claim, mutation, or implementation. The coordinator records the checklist decision; no status script grants authority.
 - `P542-03`: reviewers are find-and-help partners; every confirmed finding includes a stable ID, concrete failure, smallest credible correction vector, deterministic proof, affected invariant, and contract-fit assessment.
-- `P542-04`: confidence, severity, locality, obligation, and lifecycle axes remain independent and append-only.
+- `P542-04`: confidence, severity, locality, obligation, and lifecycle axes remain independent; immutable finding creation and successor dispositions preserve append-only axis history.
 - `P542-05`: severity and finding count prioritize work but never cancel, close, waive, resolve, reject, or automatically split it.
 - `P542-06`: confirmed same-contract blockers and required regression debt stay in bounded repair; only causally separable concerns become owned independent follow-ups.
 - `P542-07`: replacement and split records do not discharge obligations. Every original acceptance gate keeps exactly one current owner and proof path until its leaf is merged and proven. This is an accounting discipline checked by reviewers/coordinator, not a reducer-derived fact.
 - `P542-08`: when the same stable blocker survives two competent repair attempts, end the implementation epoch, run one bounded independent diagnosis/prototype, and change strategy, representation, contract, assignment, or executable split. Agent failure never proves infeasibility.
-- `P542-09`: review converges only when the transitive same-contract blocker/regression ledger is zero and exactly one fresh independent clean exact-tip pass finds no new confirmed blocker. Do not keep reviewing that frozen blocker-free tip.
+- `P542-09`: review converges only when the transitive same-contract blocker/regression ledger is zero, exactly one fresh independent clean exact-tip pass finds no new confirmed same-contract blocker or required regression debt, and the post-pass ledger recheck remains zero. Do not keep reviewing that frozen blocker-free tip.
 - `P542-10`: task packets explicitly name edit, prototype, external action, push, merge, issue closure, terminal-event, and cleanup authority.
 - `P542-11`: outcome completion requires current-main merge, every accepted gate, ticket closure, current artifact/user-visible proof, valid claim terminal, safe cleanup, and frontier recomputation.
 - `P542-12`: a narrowed PR slice may merge while a broader parent remains open for concretely owned successors; PR integration and outcome completion are distinct.

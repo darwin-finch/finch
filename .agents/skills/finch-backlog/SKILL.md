@@ -88,8 +88,10 @@ assignment, or executable split. Agent failure never proves infeasibility.
 
 Review reaches its finite endpoint only when the transitive same-contract blocker/regression
 ledger is zero and exactly one fresh independent clean exact-tip pass finds no new confirmed
-blocker. Do not review that unchanged blocker-free tip again. Production changes require
-affected tests and exact-tip review again.
+same-contract blocker or required regression debt, with a zero post-pass ledger recheck. Record
+rounds, findings, and later dispositions as immutable append-only PR comments; never edit away a
+finding or axis history. Do not review that unchanged blocker-free tip again. Production changes
+require affected tests and exact-tip review again.
 
 ## Split or hand off conservatively
 

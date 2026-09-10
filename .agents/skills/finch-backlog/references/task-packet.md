@@ -24,15 +24,15 @@ Dependencies and accounting
 - Confirmed facts: <facts the worker may rely on>
 - Unverified assumptions: <facts requiring tests or live acceptance>
 
-Authority (write explicit yes/no and bounds for every row)
-- Edit authority: <allowed files/semantics; yes/no>
-- Disposable prototype authority: <location/effects/retention; yes/no>
-- External-action/message authority: <service and operations; yes/no>
-- Push authority: <remote branch; yes/no>
-- Merge authority: <PR/branch and prerequisites; yes/no>
-- Issue-close authority: <issue and prerequisites; yes/no>
-- Claim-terminal authority: <claim/event/issuer evidence; yes/no>
-- Cleanup authority: <exact worktree/artifacts and safety proof; yes/no>
+Authority (each row occurs exactly once; begin with explicit YES or NO and give nonempty bounds)
+- Edit authority: <YES | NO> — <allowed files and semantic bounds>
+- Disposable prototype authority: <YES | NO> — <location, effects, and retention>
+- External-action/message authority: <YES | NO> — <service and allowed operations>
+- Push authority: <YES | NO> — <exact remote branch>
+- Merge authority: <YES | NO> — <PR/branch and prerequisites>
+- Issue-close authority: <YES | NO> — <issue and prerequisites>
+- Claim-terminal authority: <YES | NO> — <claim/event/issuer evidence>
+- Cleanup authority: <YES | NO> — <exact worktree/artifacts and safety proof>
 - Forbidden scope: <overlap, credentials, destructive or unrelated work>
 
 Required verification
