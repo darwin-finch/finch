@@ -10,15 +10,32 @@ concurrency, accessibility, operations, or test quality. Do not summon extra rev
 just to satisfy a number. Every process step must demonstrably reduce defect risk or improve
 shipping confidence at a cost proportional to the change; otherwise remove it.
 
-Review an identified current candidate and relevant integration base. Reproduce important failures at the
-boundary users or maintainers actually exercise. Tooling is advisory mechanical lint, never an
+Review an identified current candidate and relevant integration base. Match proof to the outcome:
+user-facing behavior needs user-visible proof; refactoring needs equivalence, integration, and
+dependency proof; deletion needs reference/reachability evidence plus tests; enabling work needs a
+usable downstream seam. Tooling is advisory mechanical lint, never an
 authority engine; people own findings, repairs, acceptance, and merge decisions.
 
-Before review, confirm that the pull request had a compression pass: remove safe duplication,
-compatibility scaffolding, speculative abstractions, dead paths, and implementation-mirroring tests;
-prefer the smallest behavior-preserving patch. Evaluate net complexity rather than raw line count.
-Compression must not remove wanted behavior, weaken meaningful regression coverage, or mix unrelated
-work. A newly exposed independent prerequisite belongs in its own focused prerequisite pull request.
+Before review, confirm that the pull request had an architecture and compression pass: remove safe
+duplication, speculative abstractions, and implementation-mirroring tests. Prefer the simplest
+coherent resulting architecture, not the fewest changed lines. A bounded larger patch can be better
+when it removes competing representations or compatibility machinery and establishes one clear
+ownership boundary. Compression must not remove wanted behavior, weaken meaningful regression
+coverage, or mix unrelated work.
+
+For a subsystem replacement, verify the complete sequence: the tested equivalent replacement exists;
+production integration points use it; and the predecessor, obsolete adapters, compatibility paths,
+and old-only tests are deleted. Dependent pull requests are acceptable when each intermediate state
+is safe and the temporary coexistence has an owner, immediate successor, removal trigger, and proof.
+The parent outcome is not complete until deletion. A prerequisite may delete only code already dead
+before the replacement; code made obsolete by this work belongs in the change or a dependent
+post-integration cleanup. Incidental pre-existing dead code becomes a concrete separate deletion
+ticket and does not widen this review.
+
+Where architecture is in scope, check that cohesive subsystems have narrow deliberate facades,
+private internals, explicit dependency direction, co-located context and tests, and integration
+proof at their boundaries. Apply this where it improves local reasoning; do not force hierarchy on
+trivial code or funnel unrelated APIs into a generic contracts module.
 
 ## Record actionable findings
 
@@ -26,7 +43,7 @@ A useful finding contains:
 
 - a stable short ID;
 - the concrete failure and why it matters;
-- the smallest credible correction;
+- the simplest coherent correction;
 - a deterministic regression or inspection;
 - the affected invariant; and
 - whether it belongs to the current contract.
@@ -47,7 +64,8 @@ do not build cryptographic or executable social-authority machinery around revie
 ## Repair or split
 
 Keep confirmed same-contract blockers and required regression debt in the current repair loop.
-Make the smallest coherent correction, run the named regression, and review the new tip.
+Make the simplest coherent correction that leaves one clear architectural boundary, run the named
+regression, and review the new tip.
 
 Split only genuinely separable work whose outcome can be implemented and verified independently.
 Give it an owner and proof path, and keep any inherited acceptance obligation visible. A replacement
@@ -69,9 +87,10 @@ Convergence is intentionally simple:
    passing. Stop then; do not add confidence rounds.
 
 A small patch may need only one perspective; higher-risk changes may need several. Speculative or
-optional items are nonblocking follow-ups. Findings are bounded to behavior introduced, changed, or
-relied upon by the patch. If a required out-of-scope prerequisite is defective, create and claim a
-separate prerequisite change, land it first, then resume; do not absorb unrelated code. If the same
+optional items are nonblocking follow-ups. Findings are bounded to behavior introduced, changed,
+relied upon, or made obsolete by the patch. If a required out-of-scope prerequisite is defective,
+create and claim a separate prerequisite change, land it first, then resume; do not absorb
+unrelated code. If the same
 defect repeats, change strategy or narrow the change rather than repeating identical review.
 
 If review finds a blocker, repair it and review the resulting candidate. The ordinary trunk flow is
