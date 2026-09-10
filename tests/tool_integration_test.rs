@@ -298,6 +298,9 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
         let argc = dir.path().join("argc.txt");
         let argv = dir.path().join("argv.txt");
         let editor_exit = dir.path().join("editor-exit.txt");
+        let isolated_home = dir.path().join("home");
+        let hook = isolated_home.join(".finch/hooks/post-save");
+        let hook_canary = dir.path().join("hook-ran.txt");
         let visual = dir.path().join("visual-editor");
         let editor = dir.path().join("fallback-editor");
         let (original, _old_string, new_string) = editor_boundary_case(case);
@@ -305,6 +308,15 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
             .unwrap_or_else(|error| panic!("{case}: failed to seed target: {error}"));
         write_fake_editor(&visual, "VISUAL");
         write_fake_editor(&editor, "EDITOR");
+        fs::create_dir_all(hook.parent().expect("hook parent"))
+            .unwrap_or_else(|error| panic!("{case}: failed to create isolated hook dir: {error}"));
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf ran > {:?}\n", hook_canary),
+        )
+        .unwrap_or_else(|error| panic!("{case}: failed to seed isolated hook: {error}"));
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("{case}: failed to chmod isolated hook: {error}"));
 
         let pty = openpty(None, None).unwrap_or_else(|error| panic!("{case}: openpty: {error}"));
         let mut command = Command::new(std::env::current_exe().expect("integration-test path"));
@@ -330,6 +342,7 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
             .env("FINCH_EDITOR_ARGC", &argc)
             .env("FINCH_EDITOR_ARGV", &argv)
             .env("FINCH_EDITOR_EXIT", &editor_exit)
+            .env("HOME", &isolated_home)
             .env("EDITOR", &editor)
             .stdin(Stdio::from(pty.slave))
             .stdout(Stdio::piped())
@@ -361,6 +374,10 @@ fn test_edit_tool_uses_real_editor_process_boundary_and_fails_closed() {
         });
         let final_bytes = fs::read(&target)
             .unwrap_or_else(|error| panic!("{case}: failed to read final target: {error}"));
+        assert!(
+            !hook_canary.exists(),
+            "{case}: interactive diff approval must not execute the undisclosed HOME post-save hook"
+        );
 
         match case {
             "blank-context" => {

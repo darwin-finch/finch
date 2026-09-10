@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use crossterm::{cursor, event, execute, style::ResetColor, terminal};
-use std::io::{IsTerminal, Write as _};
+use std::io::{IsTerminal, Read as _, Write as _};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -347,6 +347,7 @@ fn edit_artifact(
     suffix: &str,
     executable: bool,
     comment_prefix: &str,
+    read_limit: Option<usize>,
     editor: impl FnOnce(&Path) -> Result<std::process::ExitStatus>,
 ) -> Result<Option<String>> {
     let mut tmp = Builder::new().prefix("finch_").suffix(suffix).tempfile()?;
@@ -367,7 +368,33 @@ fn edit_artifact(
         return Ok(None);
     }
 
-    let modified = std::fs::read_to_string(&path)?;
+    if let Some(limit) = read_limit {
+        let length = std::fs::metadata(&path)?.len();
+        if length > limit as u64 {
+            anyhow::bail!(
+                "$VISUAL/$EDITOR returned a review artifact of {length} bytes, exceeding the \
+                 {limit}-byte safety limit; the proposed edit was not applied"
+            );
+        }
+    }
+    let mut reader = std::fs::File::open(&path)?;
+    let mut bytes = Vec::new();
+    match read_limit {
+        Some(limit) => {
+            reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                anyhow::bail!(
+                    "$VISUAL/$EDITOR returned a review artifact exceeding the {limit}-byte \
+                     safety limit; the proposed edit was not applied"
+                );
+            }
+        }
+        None => {
+            reader.read_to_end(&mut bytes)?;
+        }
+    }
+    let modified = String::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("$VISUAL/$EDITOR returned non-UTF-8 text: {error}"))?;
     let has_source = modified.lines().any(|line| {
         let trimmed = line.trim();
         !trimmed.is_empty() && !line.trim_start().starts_with(comment_prefix)
@@ -412,7 +439,16 @@ async fn propose_in_editor_with_suffix(
         tui_mode,
         Duration::from_millis(50),
         ProductionTerminalControl,
-        move || edit_artifact(&script, suffix, executable, comment_prefix, run_editor),
+        move || {
+            edit_artifact(
+                &script,
+                suffix,
+                executable,
+                comment_prefix,
+                None,
+                run_editor,
+            )
+        },
     )
     .await
 }
@@ -437,6 +473,13 @@ pub async fn open_review_artifact(artifact: &str) -> Result<Option<String>> {
     open_review_artifact_with(artifact, run_editor).await
 }
 
+/// Maximum review artifact accepted back from an editor.
+///
+/// The generated unified diff is already bounded well below this value. The
+/// extra room permits ordinary editor annotations without allowing a replaced
+/// temporary file to force an unbounded allocation before approval parsing.
+const MAX_REVIEW_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
+
 /// `open_review_artifact` with the editor process injected, so a regression
 /// can inspect the exact bytes a human's editor is given without launching
 /// the developer's real `$EDITOR`.
@@ -453,7 +496,16 @@ where
         tui_mode,
         Duration::from_millis(50),
         ProductionTerminalControl,
-        move || edit_artifact(&artifact, ".diff", false, "#", editor),
+        move || {
+            edit_artifact(
+                &artifact,
+                ".diff",
+                false,
+                "#",
+                Some(MAX_REVIEW_ARTIFACT_BYTES),
+                editor,
+            )
+        },
     )
     .await
 }
@@ -547,7 +599,7 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
         tui_mode,
         Duration::from_millis(50),
         ProductionTerminalControl,
-        move || edit_artifact(&content, ".forth", false, "\\", run_editor),
+        move || edit_artifact(&content, ".forth", false, "\\", None, run_editor),
     )
     .await
 }
@@ -686,6 +738,28 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn review_artifact_readback_is_bounded_before_allocation() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let error = open_review_artifact_with("# finch: action=execute\n+small\n", |path| {
+            let oversized = vec![b'x'; MAX_REVIEW_ARTIFACT_BYTES + 1];
+            std::fs::write(path, oversized).expect("fake editor replaces artifact");
+            Ok(std::process::ExitStatus::from_raw(0))
+        })
+        .await
+        .expect_err("an editor-returned artifact over the cap must fail closed");
+
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("review artifact")
+                && detail.contains("safety limit")
+                && detail.contains(&MAX_REVIEW_ARTIFACT_BYTES.to_string()),
+            "oversized-artifact refusal must identify the artifact and exact cap; error: {detail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn lifecycle_restores_after_every_fake_full_screen_editor_outcome() {
         use nix::libc;
         use std::os::unix::process::ExitStatusExt;
@@ -712,7 +786,7 @@ mod tests {
             let child = Arc::clone(&control);
             let result =
                 run_editor_lifecycle(true, Duration::ZERO, Arc::clone(&control), move || {
-                    edit_artifact("before\n", ".txt", false, "#", |path| {
+                    edit_artifact("before\n", ".txt", false, "#", None, |path| {
                         if matches!(outcome, Outcome::LaunchError) {
                             anyhow::bail!("fake editor launch failed");
                         }
