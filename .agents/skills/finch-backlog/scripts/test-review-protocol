@@ -55,8 +55,19 @@ done
 DOCS="$SKILL $READINESS $REVIEW $CONTRACT $PACKET $CLAIMS"
 require_text "process is proportional to shipping risk" "Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost proportional to the change" $DOCS
 require_text "tooling is advisory" "Tooling is advisory mechanical lint, never an authority engine" $DOCS
+require_text "generic engineering loop is explicit" "The generic engineering loop is" "$SKILL"
+require_text "backlog wrapper is scoped to shared issue work" "only when selecting or coordinating shared issue work" "$SKILL"
+require_text "direct requests avoid issue ceremony" "the request plus a short plan is the contract" "$SKILL"
+require_text "active backlog work preserves conflict checks" "preserve its procedural collision and claim" "$SKILL"
 require_text "readiness is lightweight" "lightweight readiness check" "$SKILL" "$READINESS"
 require_text "small changes use compact contracts" "compact solution contract" "$SKILL" "$CONTRACT"
+require_text "every PR receives compression" "Every pull request gets a compression pass before review and merge" "$SKILL"
+require_text "compression removes safe scaffolding" "compatibility scaffolding, speculative abstractions, dead paths" "$SKILL" "$REVIEW"
+require_text "compression prefers behavior preservation" "smallest behavior-preserving patch" "$SKILL" "$REVIEW"
+require_text "compression judges net complexity" "Judge net complexity, not raw line count" "$SKILL"
+require_text "compression preserves wanted behavior and tests" "Never delete wanted functionality, weaken meaningful" "$SKILL"
+require_text "compression does not mix unrelated work" "combine unrelated work merely to shrink a diff" "$SKILL"
+require_text "compression prerequisites stay separate" "separate focused prerequisite pull request" "$SKILL" "$REVIEW"
 require_text "reviewers find and help repair" "find-and-help partner" "$SKILL" "$REVIEW"
 require_text "finding axes remain independent" "independent axes" "$SKILL" "$REVIEW"
 require_text "same-contract findings stay in repair" "same-contract" "$SKILL" "$REVIEW"
@@ -89,6 +100,8 @@ forbid_regex "scripts cannot grant ownership or merge" '(script|linter|tool)[^.]
 reject_fixture "automatic count cancellation fixture is rejected" '(auto|automatic(ally)?)[- ]*(cancel|close|waive).*(count|severity)|(count|severity).*(auto|automatic(ally)?)[- ]*(cancel|close|waive)' "Automatically cancel review when finding count is high."
 reject_fixture "fixed three-round churn fixture is rejected" '(three|3)[- ]+(review )?rounds|third[- ]round cancellation' "Require three review rounds for every patch."
 reject_fixture "tool authority fixture is rejected" '(script|linter|tool)[^.]*(grants|authorizes|declares)[^.]*(READY)' "The linter grants READY status."
+reject_fixture "raw-line-count compression fixture is rejected" '(always|must)[^.]*minimi[sz]e[^.]*raw line count' "Always minimize raw line count even when behavior becomes obscure."
+reject_fixture "destructive compression fixture is rejected" '(delete|remove)[^.]*wanted functionality[^.]*shrink' "Delete wanted functionality to shrink every pull request."
 
 require_text "v1 claim marker is preserved" "<!-- finch-work-claim:v1" "$CLAIMS"
 for field in "event: claim" "claim-id:" "worker:" "github-actor:" "branch:" "worktree:" "base:" "scope:" "timestamp:"; do

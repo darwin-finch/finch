@@ -9,6 +9,18 @@ Help engineers ship reliable changes without turning process into a second produ
 Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost proportional to the change; otherwise remove it.
 Tooling is advisory mechanical lint, never an authority engine.
 
+## Two layers
+
+The generic engineering loop is: understand the requested outcome; make a focused implementation
+and compression pass; run relevant regression and integration tests; perform proportional review
+and repair until clean; integrate or squash; then verify the shipped result.
+
+The GitHub backlog wrapper adds issue readiness, a claim, isolated worktree, pull request, terminal
+event, and frontier tracking only when selecting or coordinating shared issue work. For a direct,
+already-specified user request, the request plus a short plan is the contract; do not invent issue
+or claim ceremony. When the backlog wrapper is active, preserve its procedural collision and claim
+rules.
+
 ## Prepare the issue
 
 1. Read `AGENTS.md`, the issue, relevant module docs, and current code.
@@ -33,6 +45,17 @@ after, and avoid unrelated cleanup. Follow the repository's resource-safe test l
 If the desired behavior, scope, authority, or boundary is still unclear, return to specification.
 If an external dependency blocks progress, name it. If evidence shows the outcome cannot be
 delivered under accepted constraints, record that plainly rather than accumulating ceremony.
+
+## Compress before review
+
+Every pull request gets a compression pass before review and merge. Remove duplication,
+compatibility scaffolding, speculative abstractions, dead paths, and tests that merely mirror the
+implementation where it is safe. Prefer deletion and the smallest behavior-preserving patch.
+
+Judge net complexity, not raw line count. Never delete wanted functionality, weaken meaningful
+regression coverage, or combine unrelated work merely to shrink a diff. If compression exposes an
+independent prerequisite, make it a separate focused prerequisite pull request, land it first, and
+then resume the original change.
 
 ## Review to improve the change
 

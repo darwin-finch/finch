@@ -14,6 +14,12 @@ Review an identified current candidate and relevant integration base. Reproduce 
 boundary users or maintainers actually exercise. Tooling is advisory mechanical lint, never an
 authority engine; people own findings, repairs, acceptance, and merge decisions.
 
+Before review, confirm that the pull request had a compression pass: remove safe duplication,
+compatibility scaffolding, speculative abstractions, dead paths, and implementation-mirroring tests;
+prefer the smallest behavior-preserving patch. Evaluate net complexity rather than raw line count.
+Compression must not remove wanted behavior, weaken meaningful regression coverage, or mix unrelated
+work. A newly exposed independent prerequisite belongs in its own focused prerequisite pull request.
+
 ## Record actionable findings
 
 A useful finding contains:
