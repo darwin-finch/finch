@@ -25,14 +25,14 @@ Dependencies and accounting
 - Unverified assumptions: <facts requiring tests or live acceptance>
 
 Authority (each row occurs exactly once; begin with explicit YES or NO and give nonempty bounds)
-- Edit authority: <YES | NO> — <allowed files and semantic bounds>
-- Disposable prototype authority: <YES | NO> — <location, effects, and retention>
-- External-action/message authority: <YES | NO> — <service and allowed operations>
-- Push authority: <YES | NO> — <exact remote branch>
-- Merge authority: <YES | NO> — <PR/branch and prerequisites>
-- Issue-close authority: <YES | NO> — <issue and prerequisites>
-- Claim-terminal authority: <YES | NO> — <claim/event/issuer evidence>
-- Cleanup authority: <YES | NO> — <exact worktree/artifacts and safety proof>
+- Edit authority: <YES | NO> — <grantor/source; action; allowed files and semantic bounds; prerequisites>
+- Disposable prototype authority: <YES | NO> — <grantor/source; action; location, effects, retention; prerequisites>
+- External-action/message authority: <YES | NO> — <grantor/source; action; service/operations; prerequisites>
+- Push authority: <YES | NO> — <grantor/source; action; exact remote branch; prerequisites>
+- Merge authority: <YES | NO> — <grantor/source; action; PR/branch; prerequisites>
+- Issue-close authority: <YES | NO> — <grantor/source; action; issue; prerequisites>
+- Claim-terminal authority: <YES | NO> — <grantor/source; action; claim/event/issuer evidence; prerequisites>
+- Cleanup authority: <YES | NO> — <grantor/source; action; exact worktree/artifacts and safety proof; prerequisites>
 - Forbidden scope: <overlap, credentials, destructive or unrelated work>
 
 Required verification
@@ -47,6 +47,12 @@ Expected deliverable
 - Changed-file list, fail-before/pass-after evidence, review record, residual risks.
 - Do not exercise any authority marked no or omitted.
 ```
+
+Every `YES` must identify an immutable or controlling grantor/source that the packet sender has
+verified, the exact delegated action, bounded target, and prerequisites. The sender may delegate
+only authority that source already grants. The packet itself, a role or assignment, readiness,
+contract, claim, review, or CI result cannot create or enlarge authority; self-reference, a source
+for a different action, and overbroad or ambiguous bounds are invalid. Ambiguity is recorded `NO`.
 
 Reviewer/discovery packets additionally state that prototypes use an isolated disposable copy at
 the frozen tip and cannot mutate the implementation worktree, push, read credentials, perform

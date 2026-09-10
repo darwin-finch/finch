@@ -112,6 +112,11 @@ or missing authority.
 
 For issue #406 (practical issue readiness and corrective review), the required order is:
 
+After steps 1–2, record `COMPLETION_IN_PROGRESS` at cursor 2. Advance its successful-prefix
+cursor exactly once for each later step; retain failed attempts without advancing. The claim,
+worktree, and issue open/closed facts follow the cursor invariants in `issue-readiness.md`, including
+through `BLOCKED_EXTERNAL`. Only verified step 8 enters `COMPLETE`.
+
 1. Merge PR #542 into then-current `main` and synchronize locally.
 2. Prove the merged tree is the reviewed policy; record current-main commit, tests, and CI.
 3. Publish and verify the issuer-authorized replacement-claim terminal event.
@@ -124,7 +129,8 @@ For issue #406 (practical issue readiness and corrective review), the required o
    workflow outcome complete.
 
 PR #542 is integrated at step 1 and fully accounted at step 7. Issue #406 completes only at
-step 8. Issue #543 remains open and independent and is never consulted for either result.
+step 8. Issue #543 is independent: its lifecycle state is never consulted, and it supplies no
+acceptance gate, successor obligation, proof path, or lifecycle input for either result.
 
 ## Stop conditions
 

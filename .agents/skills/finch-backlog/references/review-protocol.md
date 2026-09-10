@@ -77,15 +77,23 @@ accounting explicitly; no tool derives it.
 
 Publish each frozen-tip review round as a new immutable GitHub PR comment. Never edit or delete a
 round or finding to change its confidence, severity, locality, obligation, or lifecycle state.
-The creation record names a stable finding ID, the reviewed exact-tip SHA, all five axes, the
-failure, correction vector, deterministic proof, invariant, and contract-fit assessment.
+The creation record names a stable finding ID, the full `origin-failing-tip` SHA, all five axes,
+the failure, correction vector, deterministic proof, invariant, and contract-fit assessment.
 
-A later disposition is another immutable comment. It repeats the stable finding ID and reviewed
-exact tip, links the predecessor comment by numeric URL/ID and SHA-256 body digest, preserves every
-unchanged axis literally, and names each changed axis with its old and new value. Missing, edited,
-ambiguous, or digest-mismatched predecessors leave the original obligation open. Restatement,
-reclassification, `REPLACED-BY`, and `SPLIT-TO` never erase predecessor history. The coordinator
-and independent verifier inspect the literal comment identities; no linter authenticates them.
+A later disposition is another immutable comment. It repeats the stable finding ID and original
+full `origin-failing-tip`, names the distinct full `disposition-reviewed-tip` on which the repair
+proof ran, and links exactly one immediate predecessor by canonical numeric GitHub comment URL,
+matching numeric comment ID, and 64-hex SHA-256 body digest. Its proof identity is bound to the
+`disposition-reviewed-tip`, not the origin tip. It preserves every unchanged axis literally and
+names each changed axis with its old and new value.
+
+Each predecessor has at most one direct successor. A later change extends that single chain by
+linking the immediately preceding disposition; it never creates a sibling. Conflicting siblings,
+a missing or non-immediate predecessor, mismatched URL/ID/digest/finding/origin tip, an edited
+record, or a stale/equal repair tip when resolution requires code leaves the original obligation
+open. Restatement, reclassification, `REPLACED-BY`, and `SPLIT-TO` never erase predecessor history.
+The coordinator and independent verifier inspect the literal comment identities; this advisory
+test does not authenticate them.
 
 ## Repair and converge finitely
 
@@ -94,10 +102,14 @@ verifies findings, and records the ledger. The implementer reproduces coherent c
 vectors on the implementation worktree. Any production change creates a new tip and requires
 affected tests and review again.
 
-Track attempts by stable finding ID. If the same blocker survives two competent repairs, stop
-that implementation epoch. Run one bounded independent diagnosis or disposable prototype, then
-change strategy, representation, contract, assignment, or executable split. Repeating the same
-repair is not progress, and agent failure never proves infeasibility.
+Track attempts in an append-only ledger keyed by stable finding ID and strategy epoch. Each attempt
+records competence, exact repair tip, and result `SURVIVED` or `RESOLVED`. Only two competent
+`SURVIVED` results for the same still-open finding in the same epoch end that epoch and require one
+bounded independent diagnosis or disposable prototype before a third repair. A resolved second
+attempt, incompetent attempt, or attempt for another finding does not count toward that trigger.
+After diagnosis, record a new epoch and change strategy, representation, contract, assignment, or
+executable split. Repeating the same repair is not progress, and agent failure never proves
+infeasibility.
 
 The finite convergence rule is exact:
 

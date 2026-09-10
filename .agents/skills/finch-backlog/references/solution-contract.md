@@ -98,10 +98,14 @@ explicitly accepts the named risk.
 
 ## Successor and completion discipline
 
-Splits and replacements never discharge acceptance obligations. Before handoff, enumerate
-exhaustive disjoint scopes and preserve one owner/proof path for every gate through its merged,
-current-main leaf. Use the conservative serialized claim procedure in
-[work claims](work-claims.md); do not represent the transition as atomic.
+Splits and replacements never discharge acceptance obligations. Before handoff, publish a
+separately defined expected successor inventory containing the exact original gate set and, for
+each gate, its one expected owner, claim ID, and proof path. Compare the observed successor graph
+against it for exact gate-set and identity equality; reject missing, extra, duplicate, cross-gate,
+arbitrary-owner, arbitrary-claim, overlapping, or cyclic entries. Preserve each gate through its
+recursively verified, merged current-main leaf while the parent remains open. Use the conservative
+serialized claim procedure in [work claims](work-claims.md); do not represent the transition as
+atomic or treat a replacement record as proof that a gate was discharged.
 
 Completion is current-main and user-visible, not a contract, status, or review declaration.
 It requires every accepted gate, merge/current-main identity, current artifact or visible proof,

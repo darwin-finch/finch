@@ -63,9 +63,12 @@ other work.
 
 A malformed comment never becomes a claim, cannot receive a v1 terminal, and grants no ownership.
 If its corroborated live work blocks reuse, only the original comment author may publish a new,
-immutable cessation attestation naming the malformed comment URL, numeric comment ID, and SHA-256
-body digest. Verify
-that attestation with REST `updatedAt == createdAt` and GraphQL `lastEditedAt == null`.
+immutable cessation attestation naming the malformed comment's canonical
+`https://github.com/<owner>/<repo>/issues/<issue-positive-decimal>#issuecomment-<comment-positive-decimal>`
+URL, the matching numeric `<comment-positive-decimal>` ID, and its exact 64-hexadecimal SHA-256
+body digest. A
+non-comment URL, fragment/ID disagreement, nonnumeric ID, or nonhex/wrong-width digest is invalid.
+Verify that attestation with REST `updatedAt == createdAt` and GraphQL `lastEditedAt == null`.
 
 Before recording `RESOLVED_MALFORMED_NO_OWNER`, directly inspect or contact every identifiable
 worker and verify there is no running worker, mutating PR, or live session. Record the exact dirty,
@@ -114,8 +117,19 @@ or PR does not substitute. Without issuer evidence, leave the claim active and o
 ## Scope expansion and conservative handoff
 
 Scope expansion requires an immutable revised approved contract and complete collision check,
-then an issuer-authorized whole-claim replacement covering the new scope, followed by another
-repository-wide check before edits. Never append a partial scope that obscures retained ownership.
+then this serialized issuer-authorized whole-claim replacement covering the new scope:
+
+1. reserve one unused lowercase replacement UUID without publishing a claim;
+2. have the original issuer publish and verify the old claim's v1 `supersede`, with
+   `replacement-claim` equal to that exact reserved UUID;
+3. run the complete repository-wide scan until it proves the old claim inactive;
+4. during this no-owner interval, perform no production mutation;
+5. publish and verify an ordinary full-scope v1 `claim` whose `claim-id` is the reserved UUID; and
+6. run the complete post-claim collision scan, then and only then edit.
+
+Publishing the new claim first is an ownership collision. A terminal replacement reference never activates
+or authenticates the new claim, and a mismatched UUID fails the replacement. Never append a partial
+scope that obscures retained ownership.
 
 For a split/handoff, do not claim atomic transfer:
 

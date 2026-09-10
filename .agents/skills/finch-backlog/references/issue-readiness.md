@@ -11,27 +11,121 @@ GitHub, grant mutation ownership, authorize merge, or derive a state from caller
 
 ## Lifecycle
 
-The primary communication sequence is:
+The primary user-facing sequence is
+`DRAFT -> NEEDS_SPECIFICATION -> READY -> IN_PROGRESS -> REPAIR_IN_PROGRESS -> READY_TO_MERGE -> COMPLETE`.
+`COMPLETION_IN_PROGRESS` is a coordinator-only transient accounting substate for the non-atomic
+ordered merge/claim/cleanup/closure/evidence sequence. Evidence-backed side states are
+`BLOCKED_EXTERNAL`, `INFEASIBLE`, `DECLINED`, and `SUPERSEDED`.
 
-`DRAFT -> NEEDS_SPECIFICATION -> READY -> IN_PROGRESS -> REPAIR_IN_PROGRESS -> READY_TO_MERGE -> COMPLETE`
+### Actor grammar
 
-Evidence-backed side states are `BLOCKED_EXTERNAL`, `INFEASIBLE`, `DECLINED`, and
-`SUPERSEDED`. Each record names the entry evidence, accountable owner, permitted next action,
-exit condition, and whether the issue remains open.
+Every state and transition record uses exactly one actor expression:
 
-| State | Entry evidence and owner | Exit and next action |
-|---|---|---|
-| `DRAFT` | Desired outcome; proposer/coordinator owns clarification. | Remain open; specify it or complete the readiness checklist. |
-| `NEEDS_SPECIFICATION` | Reproduction, missing decision, concrete question, decision owner, nearest outcome, bounded discovery plan. | Remain open; read-only discovery or disposable prototype only, then contract review. Reject production mutation. |
-| `READY` | Coordinator verified the exact immutable complete contract and fresh approval, including URL, digest, revision, claim base, scope, gates, reviewer, and approval URL. | Remain open; acquire and collision-check a valid v1 claim before production work. |
-| `IN_PROGRESS` | Valid active v1 claim implementing the approved contract. | Remain open; prove the candidate, enter repair, or record an evidenced side state. |
-| `REPAIR_IN_PROGRESS` | Frozen exact tip, verified findings, stable ledger IDs, correction vectors, owners, and attempt counts. | Remain open; repair under the same contract, change strategy after two failed competent attempts, or reach merge readiness. |
-| `READY_TO_MERGE` | Zero transitive same-contract blocker/regression ledger, exactly one fresh clean exact-tip pass, regressions and affected gates on current integration base, and artifact/tree proof. | Remain open; merge if task authority permits, or return to repair when tip/base/evidence changes. |
-| `COMPLETE` | All controlling ordered completion evidence exists on current main, including gates, claim terminal, closure, visible proof, safe cleanup, frontier, and immutable final proof where required. | Successful terminal outcome; no earlier event alone suffices. |
-| `BLOCKED_EXTERNAL` | Attempts, external owner, exact resumption condition, nearest independent work. | Keep open and recheck on each frontier scan; resume when the condition holds. Age is not abandonment. |
-| `INFEASIBLE` | Desired outcome/constraints, attempts, contradiction or platform evidence, nearest alternative, smallest constraint change; contract owner decides. | Keep open until owner disposition. Agent failure is insufficient. |
-| `DECLINED` | Contract-owner choice not to pursue a feasible outcome, rationale, consequence, alternative. | Owner may close or return it to specification. |
-| `SUPERSEDED` | Actual approved replacements and valid disjoint claims owning every inherited gate, plus recovery of valuable work/evidence. | Retain state `SUPERSEDED` and keep the parent open after transfer. Close only after every inherited successor leaf is merged and proven on current main; a proposal, transfer, or record alone is insufficient. |
+- `ROLE(x)`: role `x` alone is accountable.
+- `ANY_OF(x,y,...)`: one explicitly named role acts and the record says which one.
+- `ALL_OF(x,y,...)`: every role is a distinct named principal with distinct independently
+  supplied evidence; one identity or reused evidence cannot satisfy two independent roles.
+- `DECISION_BY(x); RECORDED_BY(y)`: either `x` directly posts an immutable owner-signed decision,
+  or `y` mechanically records and verifies a linked prior immutable owner-signed decision by `x`.
+  A recorder-only assertion is invalid.
+
+The symbols `/`, `+`, commas, and phrases such as “with approval” are not actor operators. Roles do
+not grant authority. `proposer` records the desired outcome; `coordinator` collects evidence and
+integrates; `contract_owner` alone chooses `DECLINED`, accepts `INFEASIBLE`, approves or rescinds
+`SUPERSEDED`, or invalidates the accepted outcome; `fresh_plan_reviewer` independently reviews the
+contract; `claim_owner` is the current valid v1 claimant; `implementation_reviewer` independently
+reviews a frozen tip; and `external_owner` controls a named unavailable condition but gains no
+Finch mutation authority.
+
+### State invariants
+
+A state is valid only while every field in its row remains true. The accountable owner records the
+next action but gains no mutation, merge, closure, or disposition authority from the state.
+
+| State | Accountable state owner | Required entry and continuing evidence | Permitted next actions/destinations | Exit condition | Issue condition |
+|---|---|---|---|---|---|
+| `DRAFT` | `ROLE(proposer)` | Named proposer, desired outcome, initial evidence or report, and next discovery/specification action. An empty or ownerless issue is invalid. | Clarify to `NEEDS_SPECIFICATION`; admit directly to `READY`; owner-decline to `DECLINED`. | One permitted transition has complete actor and evidence records. | Open. |
+| `NEEDS_SPECIFICATION` | `ROLE(contract_owner)` | Exact missing decision among behavior, scope, authority, data shape, invariant, boundary, or proof; concrete question; decision owner; bounded investigation; nearest minimally specified outcome; next action. | Approve to `READY`; wait in `BLOCKED_EXTERNAL`; accept evidence as `INFEASIBLE`; choose `DECLINED`. | Missing decision resolves into an approved contract or authorized side-state disposition. | Open. |
+| `READY` | `ROLE(contract_owner)` | Complete immutable solution contract plus exact URL, digest, revision, implementation base, independent approval, owner, boundaries, regression/integration/reversion proof, no unresolved specification gap, and next action. | Claim into `IN_PROGRESS`; return to `NEEDS_SPECIFICATION`; wait in `BLOCKED_EXTERNAL`; owner-dispose to `INFEASIBLE`, `DECLINED`, or `SUPERSEDED`. | A valid transition record is accepted; production mutation remains forbidden until `IN_PROGRESS`. | Open. |
+| `IN_PROGRESS` | `ROLE(claim_owner)` | All `READY` evidence remains current; dedicated branch/worktree; valid active v1 claim for exact scope; complete collision checks; edit grant; preserved current tip; next implementation action. | Enter `REPAIR_IN_PROGRESS`; prove `READY_TO_MERGE`; release to `READY`; respecify; wait; or owner-dispose. | Candidate advances through a permitted transition or ownership is terminalized/preserved. | Open. |
+| `REPAIR_IN_PROGRESS` | `ROLE(claim_owner)` | Applicable `IN_PROGRESS` invariants; frozen reviewed tip; stable append-only finding ledger; correction vector/proof path for each open same-contract obligation; current strategy epoch; next repair action. | Continue a new repair epoch; prove `READY_TO_MERGE`; release to `READY`; respecify; wait; or owner-dispose. | One listed transition has valid actor and evidence records. | Open. |
+| `READY_TO_MERGE` | `ROLE(coordinator)` | Current valid claim; contract satisfied; base-negative/tip-positive regression; every transitive required leaf resolved; exactly one fresh blocker-free exact-tip pass; affected gates; current-main integration; artifact proof; explicit merge/closure authority; next merge or evidence-repair action. All evidence remains current. | Enter `COMPLETION_IN_PROGRESS`; fall back to `REPAIR_IN_PROGRESS`; release to `READY`; respecify to `NEEDS_SPECIFICATION`; wait in `BLOCKED_EXTERNAL`; or owner-dispose to `DECLINED`/`SUPERSEDED`. | One listed transition has valid actor and evidence records. | Open. |
+| `COMPLETION_IN_PROGRESS` | `ROLE(coordinator)` | Exact merged current-main identity and successful ordered completion prefix. Entry requires steps 1–2. Cursor is exactly 2 through 7; all earlier steps have identity-bound evidence and next action is the next numbered step. Claim is active at cursor 2 and terminal from 3; worktree is preserved through 3 and removed from 4; issue is open through 4 and closed from 5; scan exists from 6; retrospective exists from 7. Failed attempts remain diagnostics and never advance the cursor. | Advance exactly one step; retain and retry the same step after failure; wait in `BLOCKED_EXTERNAL`; after step 8 enter `COMPLETE`. No implementation, respecification, decline, or supersession occurs inside accounting; a discovered product regression starts a separately owned issue while truthful accounting continues. | Step 8 retrieves the retrospective, proves it unedited, and records SHA-256. | Open at cursors 2–4; closed at cursors 5–7. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | Source state; preferred resume destination and completion cursor if applicable; unavailable condition/evidence; named external owner; attempted work; exact resumption condition; ownership/preservation disposition; nearest independent work; next recheck action. | Resume after full destination revalidation; otherwise use the deterministic fallback below; owner may choose `DECLINED` only before merge. | Condition is satisfied and a valid destination/fallback record is accepted, or owner declines where permitted. | Open, except a completion-origin block preserves its cursor's open/closed condition and history. |
+| `INFEASIBLE` | `ROLE(contract_owner)` | Owner-signed acceptance of outcome, constraints, reproduction, attempts and failures, contradiction/platform evidence, nearest alternative, smallest constraint change, and next owner decision. Agent failure is insufficient. | Owner revises to `NEEDS_SPECIFICATION` or chooses `DECLINED`. | Owner records one permitted decision. | Open; evidence alone cannot close it. |
+| `DECLINED` | `ROLE(contract_owner)` | Owner-signed feasible-outcome decision, rationale, consequences, nearest alternative, ownership/preservation disposition, and reopen condition. | Remain terminal or owner reopens to `DRAFT`/`NEEDS_SPECIFICATION` with target-specific evidence. | Terminal unless owner supplies a valid reopen record. | May close only with owner decision and preservation evidence. |
+| `SUPERSEDED` | `ROLE(contract_owner)` | Owner-signed decision; actual approved replacements; exhaustive inherited-gate map; exactly one current owner/proof path per leaf; preservation and claim disposition; next successor-accounting action. | Remain while successors execute, or owner rescinds to `NEEDS_SPECIFICATION`. | Owner validly rescinds and respecifies; successor completion does not exit this state. | Open until all leaves are proven; may then close while remaining `SUPERSEDED`, never `COMPLETE` by transfer. |
+| `COMPLETE` | `ROLE(coordinator)` | Current-main merge; accepted gates; ticket closure; claim terminal; applicable rebuild/deployment; merged-artifact user proof; safe cleanup; frontier recomputation. | None; a regression or changed outcome starts a new issue/contract. | Terminal. | Closed. |
+
+### Transition matrix
+
+Every destination independently satisfies its full state row. No unlisted edge is permitted.
+
+| From | Actor expression | To | Additional transition evidence |
+|---|---|---|---|
+| `DRAFT` | `ANY_OF(proposer,coordinator)` | `NEEDS_SPECIFICATION` | Missing decision, concrete question, decision owner, bounded next action. |
+| `DRAFT` | `ALL_OF(contract_owner,fresh_plan_reviewer)` | `READY` | Owner adopts and reviewer approves exact immutable contract. |
+| `DRAFT` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Target-specific owner decision packet. |
+| `NEEDS_SPECIFICATION` | `ALL_OF(contract_owner,fresh_plan_reviewer)` | `READY` | Missing decision resolved; exact immutable contract approved. |
+| `NEEDS_SPECIFICATION` | `ROLE(coordinator)` | `BLOCKED_EXTERNAL` | Store `resume-to=NEEDS_SPECIFICATION`. |
+| `NEEDS_SPECIFICATION` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `INFEASIBLE` | Complete packet and explicit owner acceptance. |
+| `NEEDS_SPECIFICATION` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Complete feasible-outcome decline packet. |
+| `READY` | `ROLE(coordinator)` | `IN_PROGRESS` | Valid claim plus pre/post collision proof and edit grant. |
+| `READY` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Contract invalidation and missing decision; no active mutation claim. |
+| `READY` | `ROLE(coordinator)` | `BLOCKED_EXTERNAL` | Store `resume-to=READY`. |
+| `READY` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `INFEASIBLE` | Complete evidence and owner acceptance. |
+| `READY` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Complete owner decision. |
+| `READY` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `SUPERSEDED` | Approved replacements and exhaustive transfer proof. |
+| `IN_PROGRESS` | `ROLE(claim_owner)` | `REPAIR_IN_PROGRESS` | Frozen tip and independently confirmed same-contract obligation. |
+| `IN_PROGRESS` | `ALL_OF(implementation_reviewer,coordinator)` | `READY_TO_MERGE` | Full destination evidence. |
+| `IN_PROGRESS` | `ROLE(coordinator)` | `READY` | Claim terminal, preservation proof, current contract. |
+| `IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Contract invalidation, claim terminal, preservation. |
+| `IN_PROGRESS` | `ROLE(coordinator)` | `BLOCKED_EXTERNAL` | Store `resume-to=IN_PROGRESS` with preserved current claim, or `resume-to=READY` after terminal/preservation. |
+| `IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `INFEASIBLE` | Complete evidence, owner acceptance, ownership disposition. |
+| `IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Complete decision and ownership disposition. |
+| `IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `SUPERSEDED` | Approved replacements, exhaustive gates, ownership/preservation. |
+| `REPAIR_IN_PROGRESS` | `ROLE(claim_owner)` | `REPAIR_IN_PROGRESS` | New frozen tip or strategy epoch; append-only attempt/finding links. |
+| `REPAIR_IN_PROGRESS` | `ALL_OF(implementation_reviewer,coordinator)` | `READY_TO_MERGE` | Full destination evidence. |
+| `REPAIR_IN_PROGRESS` | `ROLE(coordinator)` | `READY` | Claim terminal/preservation proof; contract current. |
+| `REPAIR_IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Contract invalidation, claim terminal, preservation. |
+| `REPAIR_IN_PROGRESS` | `ROLE(coordinator)` | `BLOCKED_EXTERNAL` | Preserve claim and store `resume-to=REPAIR_IN_PROGRESS` while current; otherwise terminalize/preserve and store `resume-to=READY`. |
+| `REPAIR_IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `INFEASIBLE` | Complete evidence, owner acceptance, ownership disposition. |
+| `REPAIR_IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Complete decision and ownership disposition. |
+| `REPAIR_IN_PROGRESS` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `SUPERSEDED` | Approved replacements, exhaustive gates, ownership/preservation. |
+| `READY_TO_MERGE` | `ROLE(coordinator)` | `COMPLETION_IN_PROGRESS` | Complete steps 1–2 in order; record cursor 2 and exact next step. |
+| `READY_TO_MERGE` | `ANY_OF(implementation_reviewer,coordinator)` | `REPAIR_IN_PROGRESS` | Stale/failed evidence or new same-contract obligation; valid active claim. |
+| `READY_TO_MERGE` | `ROLE(coordinator)` | `READY` | Claim terminal and preservation proof; contract current. |
+| `READY_TO_MERGE` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Contract invalidation, claim terminal, preservation. |
+| `READY_TO_MERGE` | `ROLE(coordinator)` | `BLOCKED_EXTERNAL` | Preserve claim and merge-ready invariants except named external condition, storing `resume-to=READY_TO_MERGE`; or terminalize/preserve and store `resume-to=READY`. |
+| `READY_TO_MERGE` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Complete decision and ownership disposition. |
+| `READY_TO_MERGE` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `SUPERSEDED` | Approved replacements, exhaustive gates, ownership/preservation. |
+| `COMPLETION_IN_PROGRESS` | `ROLE(coordinator)` | `COMPLETION_IN_PROGRESS` | At cursors 2–6 advance exactly one step with resulting prefix invariants. |
+| `COMPLETION_IN_PROGRESS` | `ROLE(coordinator)` | `COMPLETION_IN_PROGRESS` | Evidence-repair: retain diagnostic, do not advance, retry same next step. |
+| `COMPLETION_IN_PROGRESS` | `ROLE(coordinator)` | `BLOCKED_EXTERNAL` | Store exact cursor/condition and preserve issue/claim/worktree facts. |
+| `COMPLETION_IN_PROGRESS` | `ROLE(coordinator)` | `COMPLETE` | From cursor 7, step 8 verifies retrospective immutability and SHA-256. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `NEEDS_SPECIFICATION` | `BE-R-NS`: stored destination matches; condition and destination invariants freshly proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `READY` | `BE-R-RDY`: stored destination matches; condition and destination invariants freshly proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `IN_PROGRESS` | `BE-R-IP`: stored destination matches; condition, active claim, and invariants freshly proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `REPAIR_IN_PROGRESS` | `BE-R-RIP`: stored destination matches; condition, active claim, ledger/epoch, and invariants freshly proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `READY_TO_MERGE` | `BE-R-RTM`: stored destination matches; condition and merge-ready invariants freshly proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `COMPLETION_IN_PROGRESS` | `BE-R-CIP`: stored destination/cursor match; condition, prefix, and cursor-dependent invariants freshly proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `READY` | `BE-F-RDY`: implementation/merge claim terminalized; contract current; preservation proven. |
+| `BLOCKED_EXTERNAL` | `ROLE(coordinator)` | `REPAIR_IN_PROGRESS` | `BE-F-RIP`: active claim valid but candidate/merge evidence stale; append correction evidence. |
+| `BLOCKED_EXTERNAL` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | `BE-F-NS`: owner invalidates contract; missing decision and ownership/preservation recorded. |
+| `BLOCKED_EXTERNAL` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Owner decision only when source is pre-merge and not completion accounting. |
+| `INFEASIBLE` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Accepted constraint/target changes and revised question/outcome. |
+| `INFEASIBLE` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DECLINED` | Owner accepts consequences and declines constrained outcome. |
+| `DECLINED` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `DRAFT` | Owner reopens with proposer, outcome, evidence, discovery action. |
+| `DECLINED` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Owner reopens with missing decision/question/decision owner. |
+| `SUPERSEDED` | `DECISION_BY(contract_owner); RECORDED_BY(coordinator)` | `NEEDS_SPECIFICATION` | Owner rescinds and records revised outcome plus successor preservation. |
+
+For blocked resumption, the stored destination is preferred but never overrides safety. Direct
+resume requires fresh revalidation of every destination invariant. The only deterministic
+fallbacks are `READY` when the contract is current but ownership absent (`BE-F-RDY`),
+`REPAIR_IN_PROGRESS` when ownership is valid but candidate/merge evidence needs correction
+(`BE-F-RIP`), and owner-directed `NEEDS_SPECIFICATION` when the contract is invalid (`BE-F-NS`).
+Otherwise remain blocked with an updated recheck. A terminalized claim cannot resume directly to
+implementation/repair, and stale merge evidence cannot resume directly to merge readiness.
 
 State records communicate accountable conclusions. They do not independently grant mutation,
 external-action, push, merge, close, terminal-event, or cleanup authority.
@@ -67,24 +161,29 @@ obligation, and lifecycle axes. Count and severity prioritize attention but cann
 close, waive, resolve, reject, or split it. Confirmed same-contract blockers and required
 regression debt remain repair work; a new exact tip repeats affected tests and review.
 
-For `REPLACED-BY` or `SPLIT-TO`, enumerate every original gate and assign exactly one current
-owner and proof path. Verify leaves recursively until each is merged and proven on current main.
-A record, successor label, duplicate link, wrong identity, missing claim, overlap, or cycle never
-discharges an obligation. If a child cannot be validly claimed, the retained gate stays open.
+For `REPLACED-BY` or `SPLIT-TO`, publish a separately defined expected inventory containing the
+exact original gate set and each gate's one expected owner, claim ID, and proof path. Compare it to
+the candidate graph for exact set and identity equality, then verify leaves recursively until each
+is merged and proven on current main. Missing, extra, duplicate, cross-gate, arbitrary-owner,
+arbitrary-claim, overlapping, cyclic, edited, or merely linked successors never discharge an
+obligation. If a child cannot be validly claimed, the retained gate stays open.
 
 Finding creation and every later disposition are separate immutable PR comments. A disposition
-links the predecessor comment URL/ID and SHA-256 digest, repeats the stable finding ID and exact
-tip, preserves unchanged axes, and explicitly records old/new values for changed axes. Never edit
-an earlier record to reclassify or resolve it. A missing, edited, or mismatched predecessor keeps
-the transitive obligation open.
+repeats the stable finding ID and full origin-failing tip, separately names the full disposition-
+reviewed tip to which proof is bound, and links exactly one immediate predecessor by canonical URL,
+matching numeric ID, and 64-hex SHA-256 body digest. One predecessor has at most one direct
+successor; later changes extend that chain. Preserve unchanged axes and record old/new values for
+changed axes. Never edit an earlier record. A missing, edited, stale-tip, sibling, or identity-
+mismatched predecessor keeps the transitive obligation open.
 
 ## Conservative claim transition
 
-Keep the parent claim active while planning and approving exhaustive disjoint children. Then
-the original issuer publishes an allowed v1 terminal/supersession or a covering whole-claim
-replacement; recompute all open-issue claims; child workers claim released disjoint scope; and
-recompute before any edit. A temporary no-owner interval authorizes no mutation. Never permit
-overlapping active claims or describe this sequence as atomic.
+Keep the parent claim active while planning and approving exhaustive disjoint children. A whole-
+claim replacement reserves a UUID, verifies the original issuer's old-claim `supersede` naming it,
+scans until the old claim is inactive, permits no mutation in the no-owner interval, verifies an
+ordinary full-scope v1 claim using that UUID, then scans again before edits. Child workers likewise
+claim only released disjoint scope. Never permit overlap or describe this sequence as atomic; a
+terminal reference alone does not activate its replacement.
 
 ## Completion checklist
 
@@ -107,6 +206,6 @@ For PR #542 and issue #406, verify these eight events in this exact order:
 8. That comment retrieved, verified unedited, and its exact body digest recorded.
 
 Removing or permuting a prerequisite rejects completion and names the missing/out-of-order event.
-The valid final state is exactly: PR #542 integrated and accounted; issue #406 complete; issue
-#543 still open and independent. Issue #543 is never an acceptance gate, successor obligation,
-proof path, or completion dependency for PR #542 or issue #406.
+The valid result is exactly: PR #542 integrated and accounted and issue #406 complete. Issue #543
+is independent: its lifecycle state is never read and it is never an acceptance gate, successor
+obligation, proof path, or completion dependency for PR #542 or issue #406.
