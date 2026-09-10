@@ -113,6 +113,13 @@ const FORBIDDEN_IDENTITY_PHRASES: &[&str] = &[
     "offline",
     "shammah v",
 ];
+const STALE_IDENTITY_PHRASES: &[&str] = &[
+    "proxy",
+    "constitutional",
+    "local-first",
+    "local first",
+    "shammah v",
+];
 
 const SUPERVISOR_AUTHORITY_FDS: &[i32] = &[9, 10, 11, 12, 108, 109, 110, 111, 112];
 const CAPTURE_DIAGNOSTIC_LIMIT: u64 = 64 * 1024;
@@ -667,6 +674,48 @@ fn bounded_capture(file: &mut std::fs::File, label: &str) -> String {
     rendered
 }
 
+fn run_bounded_command(command: &mut Command, deadline: Duration) -> CapturedOutcome {
+    let mut stdout = tempfile::tempfile().expect("temporary stdout capture");
+    let mut stderr = tempfile::tempfile().expect("temporary stderr capture");
+    command
+        .stdout(Stdio::from(
+            stdout.try_clone().expect("clone stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().expect("clone stderr capture"),
+        ));
+    let mut child = command.spawn().expect("spawn bounded child process");
+    let expires = Instant::now() + deadline;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < expires => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let kill = child.kill();
+                let wait = child.wait();
+                let stdout = bounded_capture(&mut stdout, "stdout");
+                let stderr = bounded_capture(&mut stderr, "stderr");
+                panic!(
+                    "bounded child exceeded {deadline:?} and was killed and reaped; \
+                     kill={kill:?} wait={wait:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let wait_after_kill = child.wait();
+                panic!("could not wait for bounded child: {error}; wait_after_kill={wait_after_kill:?}");
+            }
+        }
+    };
+    CapturedOutcome {
+        status,
+        stdout: bounded_capture(&mut stdout, "stdout"),
+        stderr: bounded_capture(&mut stderr, "stderr"),
+    }
+}
+
 fn run_with_redirected_output(fixture: &Fixture, logging: bool) -> CapturedOutcome {
     let pty = nix::pty::openpty(None, None).expect("open pty for terminal stdin");
     let mut stdout = tempfile::tempfile().expect("temporary stdout capture");
@@ -719,12 +768,10 @@ fn run_with_redirected_output(fixture: &Fixture, logging: bool) -> CapturedOutco
     }
 }
 
-fn command_payload(output: &std::process::Output) -> String {
+fn command_payload(output: &CapturedOutcome) -> String {
     format!(
         "status={:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        output.status, output.stdout, output.stderr
     )
 }
 
@@ -732,10 +779,11 @@ fn assert_no_forbidden_identity_phrases(
     context: &str,
     status: std::process::ExitStatus,
     channels: &[(&str, &str)],
+    forbidden_phrases: &[&str],
 ) {
     for (channel, text) in channels {
         let lowered = text.to_ascii_lowercase();
-        for forbidden in FORBIDDEN_IDENTITY_PHRASES {
+        for forbidden in forbidden_phrases {
             assert!(
                 !lowered.contains(forbidden),
                 "{context}: no user-visible channel may restore a stale or \
@@ -750,19 +798,16 @@ fn assert_no_forbidden_identity_phrases(
 #[test]
 fn test_cli_help_reports_the_real_finch_identity() {
     let fixture = Fixture::new(0);
-    let help = isolated_finch_command(&fixture)
-        .arg("--help")
-        .output()
-        .expect("run the built finch --help");
+    let mut command = isolated_finch_command(&fixture);
+    command.arg("--help");
+    let help = run_bounded_command(&mut command, EXIT_DEADLINE);
     let help_payload = command_payload(&help);
     assert!(
         help.status.success(),
         "the built `finch --help` must exit successfully; {help_payload}"
     );
-    let help_stdout = String::from_utf8_lossy(&help.stdout);
-    let help_stderr = String::from_utf8_lossy(&help.stderr);
     assert_eq!(
-        help_stdout.lines().next(),
+        help.stdout.lines().next(),
         Some(EXPECTED_ABOUT),
         "the first line emitted by the real clap parser must be Finch's \
          evidence-backed description; {help_payload}"
@@ -770,7 +815,8 @@ fn test_cli_help_reports_the_real_finch_identity() {
     assert_no_forbidden_identity_phrases(
         "the real `finch --help` process",
         help.status,
-        &[("stdout", &help_stdout), ("stderr", &help_stderr)],
+        &[("stdout", &help.stdout), ("stderr", &help.stderr)],
+        FORBIDDEN_IDENTITY_PHRASES,
     );
 }
 
@@ -795,6 +841,7 @@ fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
         "the real raw interactive REPL",
         interactive_status,
         &[("pty transcript", &interactive_transcript)],
+        FORBIDDEN_IDENTITY_PHRASES,
     );
 
     let redirected_fixture = Fixture::new(0);
@@ -811,6 +858,7 @@ fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
             ("stdout", &redirected.stdout),
             ("stderr", &redirected.stderr),
         ],
+        FORBIDDEN_IDENTITY_PHRASES,
     );
 
     let logged_fixture = Fixture::new(0);
@@ -830,6 +878,7 @@ fn test_real_raw_and_redirected_startup_report_the_same_finch_identity() {
         "the logged redirected REPL",
         logged.status,
         &[("stdout", &logged.stdout), ("stderr", &logged.stderr)],
+        FORBIDDEN_IDENTITY_PHRASES,
     );
 }
 
@@ -873,15 +922,14 @@ fn test_isolated_subprocess_cannot_inherit_supervisor_authority() {
         Command::new(std::env::current_exe().expect("current integration-test executable")),
         &fixture,
     );
-    let output = command
+    command
         .args([
             "--exact",
             "test_isolated_subprocess_cannot_inherit_supervisor_authority",
             "--nocapture",
         ])
-        .env(PROBE, "1")
-        .output()
-        .expect("run child-side supervisor-authority probe");
+        .env(PROBE, "1");
+    let output = run_bounded_command(&mut command, EXIT_DEADLINE);
     let payload = command_payload(&output);
     assert!(
         output.status.success(),
@@ -1269,6 +1317,12 @@ fn test_interactive_startup_reports_every_phase_and_reaches_input_ready() {
          the Cargo package version and evidence-backed description. \
          expected_version={expected_version:?} expected_description={EXPECTED_ABOUT:?} \
          status={status:?} terminal:\n{terminal}"
+    );
+    assert_no_forbidden_identity_phrases(
+        "the default no-argument TUI",
+        status,
+        &[("pty transcript", &terminal)],
+        STALE_IDENTITY_PHRASES,
     );
 }
 
