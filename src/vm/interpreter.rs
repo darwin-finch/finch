@@ -1691,7 +1691,10 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
     }
 }
 
-pub(crate) fn instantiate_requirement(
+/// Instantiate a selector template in a declared capability requirement against the arguments
+/// of a call. Public because the program runtime service instantiates a core word's declared
+/// requirement to compare it with the one actually requested.
+pub fn instantiate_requirement(
     requirement: &CapabilityRequirement,
     arguments: &[TypedValue],
 ) -> Result<CapabilityRequirement, String> {

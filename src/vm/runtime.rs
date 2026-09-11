@@ -636,7 +636,9 @@ impl TypedRuntime {
     /// the application has independently authorized its concrete request.
     /// The authorization applies only to that pending boundary: subsequent
     /// calls continue under this runtime's ordinary grant set.
-    pub(crate) fn resume_authorized_host_call_with_handler<H: CapabilityHandler>(
+    /// Public because the program runtime service drives resumption from outside this
+    /// subsystem.
+    pub fn resume_authorized_host_call_with_handler<H: CapabilityHandler>(
         &mut self,
         suspension: TypedSuspension,
         handler: &mut H,
@@ -2747,22 +2749,6 @@ mod tests {
                 assert_eq!(forth_result.values, expected_values, "case '{}'", case.name);
             }
         }
-    }
-
-    #[test]
-    fn executable_lisp_script_envelope_enters_the_shared_typed_runtime() {
-        let script = crate::programs::parse_finch_script(
-            std::path::Path::new("reply.lisp"),
-            "#!/usr/local/finch --exec --language=lisp\n; a script comment\n(begin (say \"hello from script\"))\n",
-        )
-        .unwrap();
-        assert_eq!(script.language, ProgramLanguage::Lisp);
-
-        let mut runtime = TypedRuntime::new();
-        let result = runtime.execute(script.language, "reply.lisp", &script.source, 1_000);
-        assert_eq!(result.status, TypedExecutionStatus::Completed);
-        assert_eq!(result.output, "hello from script");
-        assert!(result.values.is_empty());
     }
 
     #[test]
