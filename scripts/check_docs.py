@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -22,6 +23,8 @@ CURRENT_DOCS = (
     Path("CONTRIBUTING.md"),
     Path("CLAUDE.md"),
     Path("DESIGN.md"),
+    Path("src/vm/AGENTS.md"),
+    Path("src/memory/AGENTS.md"),
     Path("docs/README.md"),
     Path("docs/AUTOMATIC_TRAINING.md"),
     Path("docs/MCP_USER_GUIDE.md"),
@@ -129,11 +132,11 @@ FENCE_RE = re.compile(r"^```(bash|sh)\s*$\n(.*?)^```\s*$", re.MULTILINE | re.DOT
 HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 
-# The root design index must be reachable from the agent entry point, link every module document
-# the instructions name, and never present historical or planning documents as current authority.
+# The root design index must be reachable from the agent entry point, link every document the
+# subsystem manifest names, and never present historical or planning documents as current authority.
 DESIGN_DOCUMENT = Path("DESIGN.md")
 AGENTS_DOCUMENT = Path("AGENTS.md")
-INSTRUCTIONS_DOCUMENT = Path("CLAUDE.md")
+MANIFEST_DOCUMENT = Path("subsystems.toml")
 DOCS_MAP = Path("docs/README.md")
 DESIGN_PLAN_SECTIONS = ("Intended direction", "Open questions")
 
@@ -316,19 +319,22 @@ def local_links(document: Path, text: str) -> list[tuple[str, str]]:
     return links
 
 
-def module_doc_paths(instructions: str) -> list[str]:
-    """Paths written as code spans in the instructions' Module Docs table."""
-    section = re.search(r"^### Module Docs\s*$(.*?)(?=^#{1,3} )", instructions, re.M | re.S)
-    if section is None:
-        return []
-    return [
-        span for span in re.findall(r"`([^`\s]+)`", section.group(1))
-        if "/" in span and "." in span.rsplit("/", 1)[-1]
-    ]
+def manifest_doc_paths(manifest: str) -> list[str] | None:
+    """Every `docs` entry in the subsystem manifest except DESIGN.md itself; None if unparseable."""
+    try:
+        records = tomllib.loads(manifest).get("subsystem", [])
+    except tomllib.TOMLDecodeError:
+        return None
+    paths: list[str] = []
+    for record in records if isinstance(records, list) else []:
+        for path in record.get("docs", []) if isinstance(record, dict) else []:
+            if isinstance(path, str) and path != DESIGN_DOCUMENT.as_posix() and path not in paths:
+                paths.append(path)
+    return paths
 
 
 def check_design_index(
-    agents: str, instructions: str, design: str, docs_map: str, exists=None,
+    agents: str, manifest: str, design: str, docs_map: str, exists=None,
 ) -> list[str]:
     """Bind the root design index to the agent entry point and the documentation roles."""
     exists = exists or (lambda path: (ROOT / path).exists())
@@ -338,14 +344,17 @@ def check_design_index(
 
     design_links = local_links(DESIGN_DOCUMENT, design)
     linked = {target for target, _ in design_links}
-    paths = module_doc_paths(instructions)
-    if not paths:
-        errors.append(f"{INSTRUCTIONS_DOCUMENT}: Module Docs table not found or lists no paths")
+    paths = manifest_doc_paths(manifest)
+    if paths is None:
+        errors.append(f"{MANIFEST_DOCUMENT}: is not valid TOML")
+        paths = []
+    elif not paths:
+        errors.append(f"{MANIFEST_DOCUMENT}: missing, or lists no subsystem docs entries")
     for path in paths:
         if not exists(path):
-            errors.append(f"{INSTRUCTIONS_DOCUMENT}: Module Docs path does not exist: {path}")
+            errors.append(f"{MANIFEST_DOCUMENT}: docs entry does not exist: {path}")
         if path not in linked:
-            errors.append(f"{DESIGN_DOCUMENT}: does not link module doc named in {AGENTS_DOCUMENT}: {path}")
+            errors.append(f"{DESIGN_DOCUMENT}: does not link docs entry named in {MANIFEST_DOCUMENT}: {path}")
 
     roles = local_links(DOCS_MAP, docs_map)
     historical = {target for target, section in roles if "historical" in section.casefold()}
@@ -373,7 +382,7 @@ def design_index_texts() -> tuple[str, str, str, str]:
 
     return (
         read(ROOT / AGENTS_DOCUMENT),
-        read(ROOT / INSTRUCTIONS_DOCUMENT),
+        read(ROOT / MANIFEST_DOCUMENT),
         read(ROOT / DESIGN_DOCUMENT),
         read(ROOT / DOCS_MAP),
     )
@@ -383,38 +392,43 @@ def design_index_self_test() -> list[str]:
     errors: list[str] = []
     if DESIGN_DOCUMENT not in CURRENT_DOCS:
         errors.append("root design index is not enrolled in CURRENT_DOCS")
-    agents, instructions, design, docs_map = design_index_texts()
-    if check_design_index(agents, instructions, design, docs_map):
+    agents, manifest, design, docs_map = design_index_texts()
+    if check_design_index(agents, manifest, design, docs_map):
         errors.append("current design index was rejected")
-    table = module_doc_paths(instructions)
+    table = manifest_doc_paths(manifest)
     if not table:
-        return errors + ["Module Docs table is empty; design index probes cannot run"]
+        return errors + ["subsystems.toml lists no docs; design index probes cannot run"]
 
     # AGENTS.md is what agents read; if it stops carrying the pointer (for example a real file
     # replacing the symlink), the gate must fail even though CLAUDE.md still links DESIGN.md.
-    unlinked = check_design_index(agents.replace("(DESIGN.md)", "(README.md)"), instructions, design, docs_map)
+    unlinked = check_design_index(
+        re.sub(r"\(DESIGN\.md(?:#[^)]*)?\)", "(README.md)", agents), manifest, design, docs_map
+    )
     if not any("must link the root design index" in error for error in unlinked):
         errors.append("AGENTS.md without the DESIGN.md pointer escaped")
 
     first_path = table[0]
     probes = (
-        ("missing module doc path",
-         (agents, instructions.replace(f"`{first_path}`", "`src/missing/GONE.md`", 1), design, docs_map),
-         "Module Docs path does not exist: src/missing/GONE.md"),
-        ("module doc not linked from DESIGN.md",
-         (agents, instructions, design.replace(f"({first_path})", "(README.md)"), docs_map),
-         f"does not link module doc named in AGENTS.md: {first_path}"),
-        ("renamed Module Docs heading",
-         (agents, instructions.replace("### Module Docs", "### Module Documents", 1), design, docs_map),
-         "Module Docs table not found"),
+        ("missing manifest docs path",
+         (agents, manifest.replace(f'"{first_path}"', '"src/missing/GONE.md"', 1), design, docs_map),
+         "docs entry does not exist: src/missing/GONE.md"),
+        ("manifest doc not linked from DESIGN.md",
+         (agents, manifest, design.replace(f"({first_path})", "(README.md)"), docs_map),
+         f"does not link docs entry named in subsystems.toml: {first_path}"),
+        ("manifest without docs",
+         (agents, manifest.replace("docs = [", "references = ["), design, docs_map),
+         "lists no subsystem docs entries"),
+        ("unparseable manifest",
+         (agents, manifest + "\n[[subsystem\n", design, docs_map),
+         "subsystems.toml: is not valid TOML"),
         ("historical target",
-         (agents, instructions, design.replace("## Composition\n", "## Composition\n\n[old](docs/ARCHITECTURE.md)\n", 1), docs_map),
+         (agents, manifest, design.replace("## Composition\n", "## Composition\n\n[old](docs/ARCHITECTURE.md)\n", 1), docs_map),
          "cites historical or archived document docs/ARCHITECTURE.md"),
         ("archived target",
-         (agents, instructions, design.replace("## Composition\n", "## Composition\n\n[old](docs/archive/x.md)\n", 1), docs_map),
+         (agents, manifest, design.replace("## Composition\n", "## Composition\n\n[old](docs/archive/x.md)\n", 1), docs_map),
          "cites historical or archived document docs/archive/x.md"),
         ("design document outside permitted sections",
-         (agents, instructions, design.replace("## Subsystems\n", "## Subsystems\n\n[plan](docs/ROADMAP.md)\n", 1), docs_map),
+         (agents, manifest, design.replace("## Subsystems\n", "## Subsystems\n\n[plan](docs/ROADMAP.md)\n", 1), docs_map),
          "design document docs/ROADMAP.md cited under 'Subsystems'"),
     )
     for label, texts, diagnostic in probes:
@@ -423,7 +437,7 @@ def design_index_self_test() -> list[str]:
             errors.append(f"design index probe escaped ({label}); errors={found!r}")
 
     allowed = design.replace("## Open questions\n", "## Open questions\n\n[plan](docs/ROADMAP.md)\n", 1)
-    if check_design_index(agents, instructions, allowed, docs_map):
+    if check_design_index(agents, manifest, allowed, docs_map):
         errors.append("a design document under Open questions was rejected")
     if not check_links(DESIGN_DOCUMENT, "[gone](docs/definitely-missing.md)"):
         errors.append("dead-link probe escaped the design index link gate")

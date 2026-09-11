@@ -13,34 +13,21 @@ Finch is under active development. Configuration variants and loader code are no
 end-to-end provider or local-model conformance. Do not repeat performance, offline, model-support,
 or release-readiness claims without dated evidence; see Issues #74, #98, #120, and #147.
 
-## Architecture Overview
+## Architecture and subsystem capsules
 
-```
-CLI / query client
-    ↓
-configured provider graph or daemon client
-    ↓
-provider transport and/or experimental local generator
-    ↓
-typed runtime + capability broker for program effects
-```
+[`DESIGN.md`](DESIGN.md) describes how Finch is composed: subsystem ownership, dependencies,
+module documentation, operating modes, storage layout, and the technology stack.
+[`subsystems.toml`](subsystems.toml) is the authoritative ownership and dependency record.
 
-### Module Docs
+### Subsystem capsules
 
-| Component | Module Doc |
-|-----------|-----------|
-| Local model loader | `src/models/unified_loader.rs` · `src/models/ONNX.md` |
-| Deferred LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
-| Router | `src/router/ROUTING.md` |
-| TUI Renderer | `src/cli/tui/ARCHITECTURE.md` |
-| Tool Execution & Permissions | `src/tools/EXECUTION.md` |
-| Claude Client | `src/claude/CLIENT.md` |
-| Context Assembly | `src/context/ASSEMBLY.md` |
-| Configuration | `src/config/CONFIGURATION.md` |
-| License System | `src/license/LICENSING.md` |
+Before editing under a path listed here, read its capsule. A capsule adds subsystem-specific
+scope, dependency limits, and focused tests to everything in this file; it never replaces it.
 
-For the subsystem map, ownership, current dependency cycles, and intended direction, see the
-root design index [`DESIGN.md`](DESIGN.md).
+| Paths | Capsule |
+|-------|---------|
+| `src/vm/`, `src/lisp/`, `vocabulary/`, `examples/finch/` | [`src/vm/AGENTS.md`](src/vm/AGENTS.md) |
+| `src/memory/`, `src/memory_status.rs`, `src/workbook.rs` | [`src/memory/AGENTS.md`](src/memory/AGENTS.md) |
 
 ## Invariants
 
@@ -86,58 +73,11 @@ Use current provider profiles and pre-trained local artifacts only. Local routin
 remain experimental under Issues #74 and #98. LoRA training and adapter loading are deferred because
 their runtime and ML-toolchain requirements are unsupported; the automatic Python path was disabled
 until a supported path exists. Preserved legacy queues and adapters are not processed automatically.
+Treat the model catalog, setup choices, and loaders as configuration surfaces—not claims that each
+combination has passed conformance.
 
-### Weighted feedback
-
-Three historical weight tiers are retained for explicit feedback: high (10x), medium (3x), normal (1x). `Ctrl+G` = good, `Ctrl+B` = bad. Feedback is private durable data; it does not trigger training.
-
-### Local backend investigation
-
-The source contains ONNX Runtime and Candle loaders. Historical backend experiments are recorded in
-`docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or conformance evidence.
-
-### Storage layout
-
-```
-~/.finch/
-├── config.toml          # User config
-├── adapters/            # Preserved legacy adapters; not loaded automatically
-├── feedback.jsonl       # Private explicit feedback; never a training trigger
-├── training_queue.jsonl # Preserved legacy queue; not processed automatically
-├── metrics/             # Usage metrics
-├── notice_state.toml    # Licence-notice bookkeeping; kept out of config.toml (#76)
-├── tool_patterns.json   # Approved tool patterns
-├── sessions/            # Saved REPL sessions
-└── brains/              # Named Brain event logs and state
-
-~/.cache/huggingface/hub/  # Base models (HF standard)
-```
-
-### Operating modes
-
-- **Interactive REPL:** `finch`
-- **Single query / pipe:** `finch query "..."` or `echo "..." | finch`
-- **Foreground HTTP server:** `finch daemon` (default `127.0.0.1:8000`)
-- **Managed background daemon:** `finch daemon-start` (default `127.0.0.1:11435`)
-- **Restricted remote Brain TLS listener:** configured default `0.0.0.0:11436`; opened only when
-  service advertisement is enabled
-- **Direct typed programs:** `finch --forth`, `finch --lisp`, and `finch --exec`
-
-Brain and daemon tests must use the isolated launchers and kernel-assigned endpoints.
-
-## Technology Stack
-
-- **Language:** Rust (memory safety, performance, Apple Silicon support)
-- **ML frameworks in source:** ONNX Runtime (`ort` crate) and Candle
-- **Async:** Tokio
-- **HTTP server:** Axum (`/v1/chat/completions`, `/v1/models`, `/v1/messages`, and Finch-specific
-  routes; not the full OpenAI API and not the Responses API)
-- **TUI:** Ratatui + crossterm
-- **Key deps:** `hf-hub`, `tokenizers`, `indicatif`, `sysinfo`
-
-Provider profile variants and local model repositories are defined in source. Treat the model
-catalog, setup choices, and loaders as configuration surfaces—not claims that each combination has
-passed conformance.
+Feedback weights, the local backend investigation, storage layout, and operating modes are
+described in [`DESIGN.md`](DESIGN.md#runtime-reference).
 
 ## Development Guidelines
 
@@ -257,23 +197,11 @@ Two related habits, for the same reason:
 
 ## Release Process
 
-```bash
-# 1. Bump version in Cargo.toml
-# 2. Commit
-git add Cargo.toml && git commit -m "chore: bump version to vX.Y.Z"
-# 3. Tag — triggers GitHub Actions release workflow
-git tag vX.Y.Z && git push origin main && git push origin vX.Y.Z
-```
-
-GitHub Actions is configured to build `finch-macos-arm64.tar.gz` (macOS 14 runner) and
-`finch-linux-x86_64.tar.gz` (Ubuntu 24.04 runner). Do not describe a release as ready merely because
-artifacts exist; release and installer reliability are tracked in Issues #119 and #144.
-
-**Platform notes:**
-- Intel macOS: **not supported** (`ort` has no prebuilt binaries; GitHub deprecated Intel Mac runners Jun 2025)
-- Linux: must be `ubuntu-24.04`+ (requires glibc 2.38+)
-- macOS-only dependencies belong **after** the `[target.'cfg(target_os = "macos")'.dependencies]`
-  header so they remain target-scoped
+Follow the steps in [`CONTRIBUTING.md`](CONTRIBUTING.md#release-process). Do not describe a release
+as ready merely because artifacts exist; release reliability is tracked in #119 (signed packages and
+verified rollback) and #144 (newer-release notification). macOS-only dependencies belong **after**
+the `[target.'cfg(target_os = "macos")'.dependencies]` header so they remain target-scoped. The Linux
+release runner must stay on `ubuntu-24.04` or newer (glibc 2.38+), and Intel macOS is unsupported.
 
 ## Current Project Status
 

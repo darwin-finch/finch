@@ -29,6 +29,12 @@ CRATE_GROUP = re.compile(r"\bcrate::\s*\{")
 GROUP_ITEM = re.compile(r"\s*([a-z_][a-z0-9_]*)")
 RAW_STRING = re.compile(r'[bc]?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+ROUTING_HEADING = "### Subsystem capsules"
+# Capsules supplement the root instructions; they may link these sections but never restate them.
+UNIVERSAL_HEADINGS = (
+    "## Invariants", "## Development Guidelines", "### Testing (mandatory)",
+    "### Reporting status to a human", "## Key Principles",
+)
 TEST_MODULE_BLOCK = re.compile(
     r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"
 )
@@ -350,11 +356,77 @@ def dependency_errors(manifest: dict, edges: dict[tuple[str, str], list[str]]) -
     return errors
 
 
-def alias_errors(root: Path) -> list[str]:
-    agents = root / "AGENTS.md"
-    if not agents.is_symlink() or agents.readlink().as_posix() != "CLAUDE.md":
-        return ["AGENTS.md must be a symlink to CLAUDE.md so both agent entry points agree"]
-    return []
+def alias_errors(root: Path, files: list[str]) -> list[str]:
+    """Every directory with instruction files serves the same text under AGENTS.md and CLAUDE.md.
+
+    The root keeps its historical form: AGENTS.md is a symlink to CLAUDE.md. Nested capsules use
+    the import form instead: AGENTS.md holds the text and CLAUDE.md is exactly `@AGENTS.md`
+    (Claude Code expands the import; AGENTS.md-only agents read the file). Symlinks are not
+    allowed below the root because Finch's `tree-list` rejects them, which would break workspace
+    listing of the capsule's directory.
+    """
+    tracked = set(files)
+    errors: list[str] = []
+    if "AGENTS.md" not in tracked:
+        errors.append("AGENTS.md must be a symlink to its sibling CLAUDE.md; the root AGENTS.md is missing")
+    for path in files:
+        name = Path(path).name
+        if name not in ("AGENTS.md", "CLAUDE.md"):
+            continue
+        agents = Path(path).with_name("AGENTS.md").as_posix()
+        claude = Path(path).with_name("CLAUDE.md").as_posix()
+        if "/" not in path:  # repository root
+            if name == "AGENTS.md":
+                link = root / path
+                if not link.is_symlink() or link.readlink().as_posix() != "CLAUDE.md":
+                    errors.append("AGENTS.md must be a symlink to its sibling CLAUDE.md so both agent entry points agree")
+            continue
+        if (root / path).is_symlink():
+            errors.append(
+                f"{path} must not be a symlink: Finch's tree-list rejects symlinks, so use a real "
+                "AGENTS.md and a CLAUDE.md containing only `@AGENTS.md`"
+            )
+        elif name == "AGENTS.md" and claude not in tracked:
+            errors.append(f"{path} needs a sibling CLAUDE.md containing only `@AGENTS.md` so Claude Code reads it too")
+        elif name == "CLAUDE.md":
+            text = (root / path).read_text() if (root / path).is_file() else ""
+            if agents not in tracked or text.strip() != "@AGENTS.md":
+                errors.append(
+                    f"{path} must contain only `@AGENTS.md` next to a real AGENTS.md, so both agent "
+                    "entry points read one text"
+                )
+    return errors
+
+
+def capsule_errors(manifest: dict, root: Path) -> list[str]:
+    """Every capsule is routed from the root instructions and never restates universal sections."""
+    capsules = [
+        (record["id"], path) for record in valid_records(manifest)
+        for path in record.get("instructions", [])
+    ]
+    if not capsules:
+        return []
+    instructions = root / "CLAUDE.md"
+    text = instructions.read_text() if instructions.is_file() else ""
+    section = re.search(
+        rf"^{re.escape(ROUTING_HEADING)}\s*$(.*?)(?=^#{{1,3}} |\Z)", text, re.M | re.S,
+    )
+    errors: list[str] = []
+    if section is None:
+        errors.append(f"CLAUDE.md: the {ROUTING_HEADING!r} routing table is missing; it must list every capsule")
+    for owner, path in capsules:
+        if section is not None and path not in section.group(1):
+            errors.append(f"subsystem {owner!r}: capsule {path} is missing from the root routing table")
+        capsule = root / path
+        body = capsule.read_text() if capsule.is_file() else ""
+        for heading in UNIVERSAL_HEADINGS:
+            # Match the heading text at any level and case, so `### invariants (vm)` also counts.
+            title = re.escape(heading.lstrip("#").strip())
+            if re.search(rf"^#+\s*{title}(?!\w)", body, re.M | re.I):
+                errors.append(
+                    f"{path}: capsule restates the root's universal section {heading!r}; link to it instead"
+                )
+    return errors
 
 
 def check(root: Path) -> list[str]:
@@ -367,7 +439,8 @@ def check(root: Path) -> list[str]:
     edges, scan_errors = observed_edges(manifest, files, root)
     errors += scan_errors
     errors += dependency_errors(manifest, edges)
-    errors += alias_errors(root)
+    errors += alias_errors(root, files)
+    errors += capsule_errors(manifest, root)
     return errors
 
 

@@ -80,6 +80,26 @@ some assistance trailers may appear as linked contributors. Correcting those dis
 rewriting published history. Finch will not rewrite history solely to alter attribution; the policy
 above applies prospectively.
 
+## Release process
+
+```bash
+# 1. Bump version in Cargo.toml
+# 2. Commit
+git add Cargo.toml && git commit -m "chore: bump version to vX.Y.Z"
+# 3. Tag — triggers GitHub Actions release workflow
+git tag vX.Y.Z && git push origin main && git push origin vX.Y.Z
+```
+
+GitHub Actions is configured to build `finch-macos-arm64.tar.gz` (macOS 14 runner) and
+`finch-linux-x86_64.tar.gz` (Ubuntu 24.04 runner). Do not describe a release as ready merely because
+artifacts exist; release and installer reliability are tracked in Issues #119 and #144.
+
+**Platform notes:**
+- Intel macOS: **not supported** (`ort` has no prebuilt binaries; GitHub deprecated Intel Mac runners Jun 2025)
+- Linux: must be `ubuntu-24.04`+ (requires glibc 2.38+)
+- macOS-only dependencies belong **after** the `[target.'cfg(target_os = "macos")'.dependencies]`
+  header so they remain target-scoped
+
 ## Maintainer
 
 Finch was created and is maintained by **Shammah Chancellor**. Anthropic Claude and OpenAI Codex
