@@ -353,7 +353,7 @@ def check_design_index(
     if not historical or not plans:
         errors.append(f"{DOCS_MAP}: historical or design-and-planning section not found")
     for target, section in design_links:
-        if target.startswith("docs/archive/") or target in historical:
+        if target == "docs/archive" or target.startswith("docs/archive/") or target in historical:
             errors.append(
                 f"{DESIGN_DOCUMENT}: cites historical or archived document {target} under "
                 f"{section!r}; reach history through {DOCS_MAP} instead"
@@ -366,13 +366,13 @@ def check_design_index(
     return errors
 
 
-def design_index_texts(agents_path: Path | None = None) -> tuple[str, str, str, str]:
+def design_index_texts() -> tuple[str, str, str, str]:
     """Missing files read as empty so every rule reports what is absent instead of crashing."""
     def read(path: Path) -> str:
         return path.read_text() if path.is_file() else ""
 
     return (
-        read(agents_path or ROOT / AGENTS_DOCUMENT),
+        read(ROOT / AGENTS_DOCUMENT),
         read(ROOT / INSTRUCTIONS_DOCUMENT),
         read(ROOT / DESIGN_DOCUMENT),
         read(ROOT / DOCS_MAP),
@@ -381,19 +381,22 @@ def design_index_texts(agents_path: Path | None = None) -> tuple[str, str, str, 
 
 def design_index_self_test() -> list[str]:
     errors: list[str] = []
+    if DESIGN_DOCUMENT not in CURRENT_DOCS:
+        errors.append("root design index is not enrolled in CURRENT_DOCS")
     agents, instructions, design, docs_map = design_index_texts()
     if check_design_index(agents, instructions, design, docs_map):
         errors.append("current design index was rejected")
+    table = module_doc_paths(instructions)
+    if not table:
+        return errors + ["Module Docs table is empty; design index probes cannot run"]
 
-    # A real AGENTS.md replacing the symlink must still carry the pointer.
-    with tempfile.TemporaryDirectory() as directory:
-        replacement = Path(directory) / "AGENTS.md"
-        replacement.write_text(agents.replace("(DESIGN.md)", "(README.md)"))
-        mutant = check_design_index(replacement.read_text(), instructions, design, docs_map)
-        if not any("must link the root design index" in error for error in mutant):
-            errors.append("non-symlink AGENTS.md without the DESIGN.md pointer escaped")
+    # AGENTS.md is what agents read; if it stops carrying the pointer (for example a real file
+    # replacing the symlink), the gate must fail even though CLAUDE.md still links DESIGN.md.
+    unlinked = check_design_index(agents.replace("(DESIGN.md)", "(README.md)"), instructions, design, docs_map)
+    if not any("must link the root design index" in error for error in unlinked):
+        errors.append("AGENTS.md without the DESIGN.md pointer escaped")
 
-    first_path = module_doc_paths(instructions)[0]
+    first_path = table[0]
     probes = (
         ("missing module doc path",
          (agents, instructions.replace(f"`{first_path}`", "`src/missing/GONE.md`", 1), design, docs_map),
@@ -415,7 +418,7 @@ def design_index_self_test() -> list[str]:
          "design document docs/ROADMAP.md cited under 'Subsystems'"),
     )
     for label, texts, diagnostic in probes:
-        found = check_design_index(*texts, exists=lambda path: (ROOT / path).exists())
+        found = check_design_index(*texts)
         if not any(diagnostic in error for error in found):
             errors.append(f"design index probe escaped ({label}); errors={found!r}")
 

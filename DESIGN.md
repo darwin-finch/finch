@@ -24,7 +24,7 @@ not verify the prose or the cited symbols.
 
 Finch builds as one package that produces the `finch` binary ([`src/main.rs`](src/main.rs)) and a
 test-only isolation supervisor ([`src/bin/finch-test-supervisor.rs`](src/bin/finch-test-supervisor.rs)).
-`main.rs` dispatches to four paths:
+`main.rs` dispatches to four main composition paths:
 
 | Path | Entry in `src/main.rs` | What it wires |
 |------|------------------------|---------------|
@@ -32,6 +32,9 @@ test-only isolation supervisor ([`src/bin/finch-test-supervisor.rs`](src/bin/fin
 | Pipe or `finch query` | `run_query` | Program-shaped input runs directly (`is_clearly_forth`); otherwise `build_query_tool_executor` with `DaemonClient`, or teacher-only |
 | Interactive REPL | `Repl::new`, then `Repl::run_event_loop` | Provider graph (`create_provider_graph_from_config`), HTTP `DaemonClient`, `ipc::IpcClient`; the REPL builds its provider profile again inside `run_event_loop` (`src/cli/repl.rs`) |
 | Daemon (`finch daemon`, `daemon-start`) | `run_daemon` | `DaemonLifecycle::acquire_instance`, provider graph, `BootstrapLoader` background model loading, `AgentServer` over HTTP, `ipc::start_ipc_server` |
+
+`finch agent` (`run_agent`) is a smaller fifth path that drives `agent::AgentLoop`; the remaining
+subcommands are setup, authentication, and maintenance utilities.
 
 Named Brains run on per-Brain runtimes from `BrainStore::program_runtime`
 ([`src/brain/store.rs`](src/brain/store.rs)). HTTP routes are defined in
@@ -45,20 +48,20 @@ Each row names the top-level modules a subsystem owns and its authoritative loca
 code moves. Documents with known stale claims are flagged in
 [documentation status](#documentation-status).
 
-| Subsystem | Modules under `src/` | Local documentation |
-|-----------|----------------------|---------------------|
-| Typed runtime: VM, CoForth, CoLisp | `vm`, `lisp`, `runtime` | Language contracts loaded at runtime: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
-| Programs | `programs`, `poset` | None yet |
-| Memory and local models | `memory`, `models`, `local`, `generators`, `training`, `feedback`, `router`, `logging`, `memory_status.rs`, `workbook.rs` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
-| Frontend: CLI and TUI | `cli`, `main.rs`, `startup.rs`, `samples.rs` | [TUI renderer](src/cli/tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
-| Brain and backend | `brain`, `server`, `daemon`, `client`, `agent`, `review`, `registry` (migration only), `graph` | None yet; see the [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
-| Tools and authority | `tools` (including `tools/mcp`) | [Tool execution and permissions](src/tools/EXECUTION.md), [MCP client guide](docs/MCP_USER_GUIDE.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
-| Providers | `providers`, `claude`, `oauth`, `llms`, `planning` | [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
-| IPC, transport, node | `ipc`, `node`, `network`, `service` (mDNS), `node_name.rs` | None yet; wire schema in [`schema/finch_ipc.capnp`](schema/finch_ipc.capnp) |
-| Config, context, license, metrics | `config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs` | [Configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
-| Tests | `tests/`, `src/bin/finch-test-supervisor.rs` | [Test guide](tests/README.md), [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
-| CI and scripts | `.github/workflows/`, `scripts/`, the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot) | [Repository hygiene](docs/REPOSITORY_HYGIENE.md), [Rust toolchain](docs/RUST_TOOLCHAIN.md) |
-| Release | [`release.yml`](.github/workflows/release.yml) | [Release process](CLAUDE.md#release-process); release and installer reliability are open in [#119](https://github.com/darwin-finch/finch/issues/119) and [#144](https://github.com/darwin-finch/finch/issues/144) |
+| Subsystem and responsibility | Modules under `src/` | Local documentation |
+|------------------------------|----------------------|---------------------|
+| **Typed runtime** (VM, CoForth, CoLisp): parse, verify, and run typed programs under capability authority | `vm`, `lisp`, `runtime` | Language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
+| **Programs**: durable program identity, catalog, and corpus; task-graph planning | `programs`, `poset` | None yet |
+| **Memory and local models**: MemTree storage and retrieval, local model loading, routing, feedback | `memory`, `models`, `local`, `generators`, `training`, `feedback`, `router`, `logging`, `memory_status.rs`, `workbook.rs` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
+| **Frontend** (CLI and TUI): commands, the interactive REPL, rendering, setup | `cli`, `main.rs`, `startup.rs`, `samples.rs` | [TUI renderer](src/cli/tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
+| **Brain and backend**: durable named Brains, the HTTP server and runner, daemon lifecycle | `brain`, `server`, `daemon`, `client`, `agent`, `review`, `registry` (migration only), `graph` | None yet; see the [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
+| **Tools and authority**: tool execution, permissions, MCP client, GUI automation | `tools` (including `tools/mcp`) | [Tool execution and permissions](src/tools/EXECUTION.md), [MCP client guide](docs/MCP_USER_GUIDE.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
+| **Providers**: provider graph and wire transports, OAuth, planning prompts | `providers`, `claude`, `oauth`, `llms`, `planning` | [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
+| **IPC, transport, node**: Cap'n Proto IPC, node identity, service discovery | `ipc`, `node`, `network`, `service` (mDNS), `node_name.rs` | None yet; wire schema in [`schema/finch_ipc.capnp`](schema/finch_ipc.capnp) |
+| **Config, context, license, metrics**: configuration, instruction loading, licensing, metrics | `config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs` | [Configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
+| **Tests**: integration tests and the isolation supervisor | `tests/`, `src/bin/finch-test-supervisor.rs` | [Test guide](tests/README.md), [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
+| **CI and scripts**: workflows, repository checks, the shared Cargo slot | `.github/workflows/`, `scripts/`, the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot) | [Repository hygiene](docs/REPOSITORY_HYGIENE.md), [Rust toolchain](docs/RUST_TOOLCHAIN.md) |
+| **Release**: tagged binary builds | [`release.yml`](.github/workflows/release.yml) | [Release process](CLAUDE.md#release-process); open work: signed packages and verified rollback ([#119](https://github.com/darwin-finch/finch/issues/119)), newer-release notification ([#144](https://github.com/darwin-finch/finch/issues/144)) |
 
 `src/evolution/mod.rs` is tracked but not compiled
 ([#573](https://github.com/darwin-finch/finch/issues/573)).
@@ -80,7 +83,7 @@ Two-way edges that block the first extractions, one import each way:
 | `models` ↔ `cli` | `src/models/bootstrap.rs` imports `cli::OutputManager`; `src/cli/setup_wizard.rs` imports `models` |
 
 Memory has no two-way edge. Its only production import is `crate::programs`
-(`memory::program_registry`), so it joins the component through memory → programs → runtime and
+(`memory::program_registry` and `MemorySystem::save_lisp_define`), so it joins the component through memory → programs → runtime and
 vm. Its separate extraction blocker is heavy dependencies: `memory::neural_embedding` uses ONNX
 Runtime (`ort`), `tokenizers`, and `hf_hub` directly.
 
@@ -114,8 +117,9 @@ local instructions only with proof that every agent working there still receives
 
 The [documentation map](docs/README.md) classifies project-wide documents as current, developer
 reference, design and planning, or historical. When any document conflicts with source or tests,
-source and tests win. Documents the map does not classify, including every co-located
-`src/**/*.md`, [OpenAI transport](docs/OPENAI_TRANSPORT.md), and
+source and tests win. Documents the map does not classify, including most co-located
+`src/**/*.md` (it lists only the configuration, tool execution, context assembly, and TUI
+documents), [OpenAI transport](docs/OPENAI_TRANSPORT.md), and
 [Rust toolchain](docs/RUST_TOOLCHAIN.md), are qualified by hand here.
 
 Known stale or unsupported claims in current-looking documents, awaiting repair in
