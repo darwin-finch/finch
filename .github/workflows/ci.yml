@@ -118,7 +118,6 @@ jobs:
       uses: dtolnay/rust-toolchain@1.98.0
       with:
         components: clippy
-        targets: ${{ matrix.target }}
 
     - name: Restore compatible Cargo dependencies and build artifacts
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -126,7 +125,6 @@ jobs:
       with:
         cache-provider: github
         shared-key: finch-cargo-v5-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-rust-1.98.0-${{ matrix.cache_family }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
-        add-job-id-key: false
         cache-targets: true
         cache-bin: false
         cache-workspace-crates: false
@@ -263,8 +261,6 @@ jobs:
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
-      with:
-        targets: x86_64-unknown-linux-gnu
 
     - name: Restore Linux default-family Cargo state
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -272,7 +268,6 @@ jobs:
       with:
         cache-provider: github
         shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-debug-default_all-features-clippy_release-default-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
-        add-job-id-key: false
         cache-targets: true
         cache-bin: false
         cache-workspace-crates: false
@@ -320,7 +315,6 @@ jobs:
       with:
         cache-provider: github
         shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-release-default-lto-false-codegen-units-16-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
-        add-job-id-key: false
         cache-targets: true
         cache-bin: false
         cache-workspace-crates: false
@@ -359,7 +353,6 @@ jobs:
       with:
         cache-provider: github
         shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-cargo-audit-0.22.2-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
-        add-job-id-key: false
         cache-targets: false
         cache-bin: true
         cache-workspace-crates: false

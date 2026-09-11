@@ -111,7 +111,6 @@ MATRIX_CACHE_KEY = (
 MAIN_SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
 COMMON_CACHE_INPUTS = {
     "cache-provider": "github",
-    "add-job-id-key": False,
     "cache-targets": True,
     "cache-bin": False,
     "cache-workspace-crates": False,
@@ -472,7 +471,11 @@ def cache_action(uses: Any) -> bool:
     if not isinstance(uses, str):
         return False
     lowered = uses.lower()
-    return lowered.startswith("actions/cache@") or "rust-cache@" in lowered
+    return (
+        lowered.startswith("actions/cache@")
+        or "rust-cache@" in lowered
+        or "sccache-action@" in lowered
+    )
 
 
 def relevant_rust_env(value: Any) -> dict[str, Any]:
@@ -529,6 +532,8 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             )
         if step.get("continue-on-error") is not True:
             errors.append(f"{workflow}: job {job_id!r} cache failure must remain nonfatal")
+        if step.get("if") is not None:
+            errors.append(f"{workflow}: job {job_id!r} cache step must run actively")
         expected_inputs = dict(COMMON_CACHE_INPUTS)
         expected_inputs.update({
             "shared-key": spec["shared-key"],
@@ -538,6 +543,8 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             if optional in spec:
                 expected_inputs[optional] = spec[optional]
         actual_inputs = step.get("with")
+        if isinstance(actual_inputs, dict) and actual_inputs.get("add-job-id-key") is False:
+            actual_inputs = {key: value for key, value in actual_inputs.items() if key != "add-job-id-key"}
         if actual_inputs != expected_inputs:
             errors.append(
                 f"{workflow}: job {job_id!r} cache inputs changed; "

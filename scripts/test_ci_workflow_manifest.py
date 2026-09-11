@@ -378,6 +378,11 @@ class WorkflowContractTests(unittest.TestCase):
                 "      with:\n        cache-provider: github",
                 "cache failure must remain nonfatal",
             ),
+            (
+                "      continue-on-error: true\n      with:\n        cache-provider: github",
+                "      continue-on-error: true\n      if: false\n      with:\n        cache-provider: github",
+                "cache step must run actively",
+            ),
         )
         for old, new, diagnostic in mutations:
             with self.subTest(diagnostic=diagnostic):
@@ -406,16 +411,22 @@ class WorkflowContractTests(unittest.TestCase):
         self.assert_fails("cache must run after the pinned toolchain", "Run clippy")
 
     def test_alternate_cache_action_and_release_permission_drift_fail(self) -> None:
-        self.repository.replace(
-            "issue-201-chatgpt-auth.yml",
-            "      - name: Compile exact authentication sources on Windows\n",
-            "      - uses: actions/cache@v4\n"
-            "        with:\n"
-            "          path: target\n"
-            "          key: unsafe\n"
-            "      - name: Compile exact authentication sources on Windows\n",
-        )
-        self.assert_fails("Cargo cache allocation changed", "windows-verifier-compile")
+        for action in ("actions/cache@v4", "mozilla-actions/sccache-action@v0.0.9"):
+            with self.subTest(action=action):
+                repository = Repository()
+                try:
+                    repository.replace(
+                        "issue-201-chatgpt-auth.yml",
+                        "      - name: Compile exact authentication sources on Windows\n",
+                        f"      - uses: {action}\n"
+                        "      - name: Compile exact authentication sources on Windows\n",
+                    )
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, "alternate cache action passed")
+                    self.assertIn("Cargo cache allocation changed", result.stderr, result.stderr)
+                    self.assertIn("windows-verifier-compile", result.stderr, result.stderr)
+                finally:
+                    repository.close()
 
         repository = Repository()
         try:
@@ -428,6 +439,13 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn("job 'build-release' permissions changed", result.stderr, result.stderr)
         finally:
             repository.close()
+
+    def test_redundant_add_job_id_key_false_remains_optional(self) -> None:
+        self.repository.replace(
+            "ci.yml", "        cache-provider: github\n",
+            "        cache-provider: github\n        add-job-id-key: false\n",
+        )
+        self.assert_passes()
 
     def test_cargo_audit_version_and_miss_install_are_bound(self) -> None:
         self.repository.replace(

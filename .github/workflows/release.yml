@@ -48,7 +48,6 @@ jobs:
         with:
           cache-provider: github
           shared-key: finch-cargo-v5-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-rust-1.98.0-${{ matrix.cache_family }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
-          add-job-id-key: false
           cache-targets: true
           cache-bin: false
           cache-workspace-crates: false

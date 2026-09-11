@@ -59,7 +59,6 @@ jobs:
       with:
         cache-provider: github
         shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-debug-default-test-debug-0_supervisor-release-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
-        add-job-id-key: false
         cache-targets: true
         cache-bin: false
         cache-workspace-crates: false
