@@ -272,7 +272,7 @@ marker="$(cd "$repo" && "$wrapper" sh -c 'printf %s "$FINCH_CARGO_SLOT_HELD"')"
 
 # A nested wrapper must observe the held marker and execute directly. A
 # nonblocking timeout makes any attempted reacquisition fail deterministically.
-nested="$(cd "$repo" && INNER="$wrapper" "$wrapper" sh -c \
+nested="$(cd "$repo" && env -u CARGO_BUILD_JOBS INNER="$wrapper" "$wrapper" sh -c \
     'FINCH_CARGO_SLOT_TIMEOUT_SECONDS=not-used "$INNER" sh -c '\''printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS"'\''')"
 [[ "$nested" == "$common_dir|2" ]] || fail "nested entry did not reuse the held slot: expected=$common_dir|2 actual=$nested"
 
