@@ -13,7 +13,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
 sys.path.insert(0, str(ROOT / "scripts"))
-from check_ci_workflow_manifest import workflow_activates  # noqa: E402
+from check_ci_workflow_manifest import (  # noqa: E402
+    EXPECTED_PATHS,
+    event_contract,
+    load_yaml,
+    workflow_activates,
+)
 
 
 class Repository:
@@ -76,11 +81,24 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_path_filter_drift_fails(self) -> None:
         self.repository.replace(
-            "issue-187-subagent-fanout.yml",
-            '      - "src/tools/implementations/spawn.rs"\n',
-            '      - "src/tools/implementations/spawn.rs"\n      - "src/new/**"\n',
+            "issue-201-chatgpt-auth.yml",
+            '      - "src/providers/mod.rs"\n',
+            '      - "src/providers/mod.rs"\n      - "src/new/**"\n',
         )
-        self.assert_fails("issue-187-subagent-fanout.yml: pull_request.paths changed", "src/new/**")
+        self.assert_fails("issue-201-chatgpt-auth.yml", "paths changed", "src/new/**")
+
+    def test_path_order_is_not_behavior_but_duplicates_fail(self) -> None:
+        pair = '      - "Cargo.toml"\n      - "src/lib.rs"\n'
+        self.repository.replace(
+            "issue-201-chatgpt-auth.yml", pair,
+            '      - "src/lib.rs"\n      - "Cargo.toml"\n',
+        )
+        self.assert_passes()
+        self.repository.replace(
+            "issue-201-chatgpt-auth.yml", '      - "src/oauth/**"\n',
+            '      - "src/oauth/**"\n      - "src/oauth/**"\n',
+        )
+        self.assert_fails("on.push.paths contains duplicates")
 
     def test_negative_path_filters_are_applied_per_changed_path(self) -> None:
         self.assertTrue(
@@ -90,6 +108,21 @@ class WorkflowContractTests(unittest.TestCase):
             ),
             "one excluded file must not hide a different included changed path",
         )
+
+    def test_every_auth_path_activates_pull_request_and_push(self) -> None:
+        document = load_yaml(ROOT / ".github/workflows/issue-201-chatgpt-auth.yml")
+        for event in ("pull_request", "push"):
+            contract = event_contract(document, "issue-201-chatgpt-auth.yml", event)
+            self.assertIsInstance(contract, dict, f"{event} contract must be path-filtered")
+            for path in EXPECTED_PATHS["issue-201-chatgpt-auth.yml"] or ():
+                self.assertTrue(
+                    workflow_activates(contract, (path.replace("**", "probe"),)),
+                    f"{event} must activate for contracted path {path}",
+                )
+            self.assertFalse(
+                workflow_activates(contract, ("src/models/mod.rs",)),
+                f"{event} must stay idle for an ordinary non-auth path",
+            )
 
     def test_branch_filter_drift_fails_actionably(self) -> None:
         self.repository.replace(
@@ -146,13 +179,10 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_matrix_fanout_drift_is_caught_outside_representative_fixtures(self) -> None:
         self.repository.replace(
-            "issue-187-subagent-fanout.yml", "os: [ubuntu-24.04, macos-14]",
-            "os: [ubuntu-24.04, macos-14, windows-2022]",
+            "ci.yml", "          - os: macos-14\n            feature_name: default",
+            "          - os: windows-2025\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n            feature_name: default",
         )
-        self.assert_fails(
-            "issue-187-subagent-fanout.yml: expanded check allocation changed",
-            "Focused spawn tests (windows-2022)",
-        )
+        self.assert_fails("ci.yml: expanded check allocation changed", "Test (windows-2025, default)")
 
     def test_cargo_slot_runs_on_exact_supported_linux_and_macos_images(self) -> None:
         self.repository.replace(
@@ -167,17 +197,96 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_duplicate_expanded_check_names_fail_actionably(self) -> None:
         self.repository.replace(
-            "issue-46-atomic-conversation.yml", "os: [ubuntu-24.04, macos-14]",
-            "os: [ubuntu-24.04, ubuntu-24.04]",
+            "ci.yml", "          - os: macos-14\n            feature_name: default",
+            "          - os: ubuntu-24.04\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n            feature_name: default",
         )
-        self.assert_fails("issue-46-atomic-conversation.yml: duplicate expanded check names", "atomic-rounds")
+        self.assert_fails("ci.yml: duplicate expanded check names", "Test (ubuntu-24.04, default)")
 
     def test_unsupported_allocation_syntax_fails_actionably(self) -> None:
         self.repository.replace(
-            "issue-187-subagent-fanout.yml", "matrix:\n        os:",
-            "matrix:\n        exclude: []\n        os:",
+            "ci.yml", "      matrix:\n        include:",
+            "      matrix:\n        exclude: []\n        include:",
         )
-        self.assert_fails("issue-187-subagent-fanout.yml", "unsupported matrix.exclude")
+        self.assert_fails("ci.yml", "unsupported matrix.exclude")
+
+    def test_migrated_canonical_boundaries_reject_inert_or_changed_steps(self) -> None:
+        mutations = (
+            (
+                "cargo test --doc -- ValidatedProviderRequest",
+                "cargo test --lib -- ValidatedProviderRequest",
+                "Prove validated request tokens cannot be forged", "commands changed",
+            ),
+            (
+                "cargo test --release --lib cli::conversation::tests -- --nocapture",
+                "cargo test --lib cli::conversation::tests -- --nocapture",
+                "Run release-mode atomic history regression", "commands changed",
+            ),
+            (
+                "      if: matrix.feature_name == 'default'\n      shell: bash\n      run: |\n        test -L",
+                "      if: false\n      shell: bash\n      run: |\n        test -L",
+                "Verify shared skill discovery", "condition changed",
+            ),
+            (
+                ".agents/skills/finch-backlog/scripts/test-with-cargo-slot\n\n    - name: Check the current",
+                ".agents/skills/finch-backlog/scripts/with-cargo-slot\n\n    - name: Check the current",
+                "Check and exercise the Cargo slot", "commands changed",
+            ),
+        )
+        for old, new, *diagnostics in mutations:
+            with self.subTest(diagnostics=diagnostics):
+                repository = Repository()
+                try:
+                    repository.replace("ci.yml", old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, "migrated-boundary mutant passed")
+                    for diagnostic in diagnostics:
+                        self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_windows_boundary_rejects_wrong_owner_os_inertness_and_manifest(self) -> None:
+        mutations = (
+            ("runs-on: windows-2022", "runs-on: ubuntu-24.04", "must run actively on windows-2022"),
+            ("    timeout-minutes: 30", "    if: false\n    timeout-minutes: 30", "must run actively"),
+            (
+                ".github/issue-105-windows-probe/Cargo.toml",
+                ".github/issue-201-windows-probe/Cargo.toml",
+                "commands changed",
+            ),
+        )
+        for old, new, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                repository = Repository()
+                try:
+                    repository.replace("issue-201-chatgpt-auth.yml", old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, "Windows-boundary mutant passed")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_migrated_commands_cannot_be_duplicated_or_made_nongating(self) -> None:
+        duplicate = """\n    - name: Duplicate doctest\n      run: cargo test --doc -- ValidatedProviderRequest\n"""
+        self.repository.replace(
+            "ci.yml", "\n  runtime-authority:\n", duplicate + "\n  runtime-authority:\n",
+        )
+        self.assert_fails("migrated command ownership count expected=1 actual=2")
+
+        repository = Repository()
+        try:
+            repository.replace(
+                "ci.yml", "    - name: Run release-mode atomic history regression\n",
+                "    - name: Run release-mode atomic history regression\n      continue-on-error: true\n",
+            )
+            result = repository.check()
+            self.assertNotEqual(0, result.returncode, "non-gating migrated step passed")
+            self.assertIn("must gate failure", result.stderr, result.stderr)
+        finally:
+            repository.close()
+
+    def test_windows_push_trigger_and_both_probe_paths_are_required(self) -> None:
+        self.repository.replace("issue-201-chatgpt-auth.yml", "  push:\n", "  deleted_push:\n")
+        self.assert_fails("path-filtered push to main is required")
 
     def test_malformed_yaml_fails_actionably(self) -> None:
         self.repository.workflow("docs.yml").write_text("jobs: [\n")
