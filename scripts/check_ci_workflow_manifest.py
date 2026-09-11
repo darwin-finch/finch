@@ -102,6 +102,84 @@ EXPECTED_FIXTURES = {
     )),
 }
 
+RUST_CACHE_ACTION = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+GRAPH_HASH = "${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}"
+MATRIX_CACHE_KEY = (
+    "finch-cargo-v5-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-"
+    "rust-1.98.0-${{ matrix.cache_family }}-" + GRAPH_HASH
+)
+MAIN_SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+COMMON_CACHE_INPUTS = {
+    "cache-provider": "github",
+    "add-job-id-key": False,
+    "cache-targets": True,
+    "cache-bin": False,
+    "cache-workspace-crates": False,
+    "cache-all-crates": False,
+    "cache-on-failure": False,
+}
+
+
+def literal_cache_key(platform: str, target: str, family: str) -> str:
+    return (
+        f"finch-cargo-v5-{platform}-${{{{ runner.arch }}}}-{target}-"
+        f"rust-1.98.0-{family}-{GRAPH_HASH}"
+    )
+
+
+CACHE_SPECS = {
+    ("ci.yml", "test"): {
+        "name": "Restore compatible Cargo dependencies and build artifacts",
+        "shared-key": MATRIX_CACHE_KEY,
+        "save-if": MAIN_SAVE_IF,
+        "before": "Run clippy (binary only, warnings allowed for now)",
+    },
+    ("ci.yml", "runtime-authority"): {
+        "name": "Restore Linux default-family Cargo state",
+        "shared-key": literal_cache_key(
+            "ubuntu-24.04", "x86_64-unknown-linux-gnu",
+            "debug-default_all-features-clippy_release-default",
+        ),
+        "save-if": False,
+        "before": "Run runtime authority regressions",
+    },
+    ("ci.yml", "build"): {
+        "name": "Restore compatible Linux release Cargo state",
+        "shared-key": literal_cache_key(
+            "ubuntu-24.04", "x86_64-unknown-linux-gnu",
+            "release-default-lto-false-codegen-units-16",
+        ),
+        "save-if": MAIN_SAVE_IF,
+        "before": "Build release binary",
+    },
+    ("ci.yml", "security"): {
+        "name": "Restore cargo-audit 0.22.2",
+        "shared-key": literal_cache_key(
+            "ubuntu-24.04", "x86_64-unknown-linux-gnu", "cargo-audit-0.22.2",
+        ),
+        "save-if": MAIN_SAVE_IF,
+        "before": "Install cargo-audit 0.22.2 on cache miss",
+        "cache-targets": False,
+        "cache-bin": True,
+        "id": "cargo-audit-cache",
+    },
+    ("issue-56-brain-isolation.yml", "isolation-boundaries"): {
+        "name": "Restore compatible isolation Cargo state",
+        "shared-key": literal_cache_key(
+            "ubuntu-24.04", "x86_64-unknown-linux-gnu",
+            "debug-default-test-debug-0_supervisor-release",
+        ),
+        "save-if": MAIN_SAVE_IF,
+        "before": "Check bins and tests",
+    },
+    ("release.yml", "build-release"): {
+        "name": "Restore compatible Cargo dependencies and build artifacts",
+        "shared-key": MATRIX_CACHE_KEY,
+        "save-if": False,
+        "before": "Install Linux dependencies",
+    },
+}
+
 
 class ContractError(Exception):
     pass
@@ -390,6 +468,243 @@ def step_order_errors(
     ]
 
 
+def cache_action(uses: Any) -> bool:
+    if not isinstance(uses, str):
+        return False
+    lowered = uses.lower()
+    return lowered.startswith("actions/cache@") or "rust-cache@" in lowered
+
+
+def relevant_rust_env(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    prefixes = ("CARGO", "CC", "CFLAGS", "CXX", "CMAKE", "RUST")
+    return {key: item for key, item in value.items() if isinstance(key, str) and key.startswith(prefixes)}
+
+
+def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Check the small, explicit cache allocation; do not interpret arbitrary Actions code."""
+    errors: list[str] = []
+    found: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    for workflow, document in documents.items():
+        jobs = document.get("jobs", {})
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+                continue
+            for index, step in enumerate(job["steps"]):
+                if isinstance(step, dict) and cache_action(step.get("uses")):
+                    found.setdefault((workflow, job_id), []).append((index, step))
+
+    expected_locations = set(CACHE_SPECS)
+    actual_locations = set(found)
+    if actual_locations != expected_locations:
+        errors.append(
+            "Cargo cache allocation changed; "
+            f"missing={sorted(expected_locations - actual_locations)!r} "
+            f"unexpected={sorted(actual_locations - expected_locations)!r}"
+        )
+
+    for location in sorted(expected_locations & actual_locations):
+        workflow, job_id = location
+        matches = found[location]
+        if len(matches) != 1:
+            errors.append(
+                f"{workflow}: job {job_id!r} must contain exactly one Cargo cache step; "
+                f"actual={len(matches)}"
+            )
+            continue
+        cache_index, step = matches[0]
+        spec = CACHE_SPECS[location]
+        if step.get("name") != spec["name"]:
+            errors.append(
+                f"{workflow}: job {job_id!r} cache step name changed; "
+                f"expected={spec['name']!r} actual={step.get('name')!r}"
+            )
+        if step.get("uses") != RUST_CACHE_ACTION:
+            errors.append(
+                f"{workflow}: job {job_id!r} must pin the reviewed rust-cache action; "
+                f"actual={step.get('uses')!r}"
+            )
+        if step.get("continue-on-error") is not True:
+            errors.append(f"{workflow}: job {job_id!r} cache failure must remain nonfatal")
+        expected_inputs = dict(COMMON_CACHE_INPUTS)
+        expected_inputs.update({
+            "shared-key": spec["shared-key"],
+            "save-if": spec["save-if"],
+        })
+        for optional in ("cache-targets", "cache-bin"):
+            if optional in spec:
+                expected_inputs[optional] = spec[optional]
+        actual_inputs = step.get("with")
+        if actual_inputs != expected_inputs:
+            errors.append(
+                f"{workflow}: job {job_id!r} cache inputs changed; "
+                f"expected={expected_inputs!r} actual={actual_inputs!r}"
+            )
+        if step.get("id") != spec.get("id"):
+            errors.append(
+                f"{workflow}: job {job_id!r} cache id changed; "
+                f"expected={spec.get('id')!r} actual={step.get('id')!r}"
+            )
+
+        job = documents[workflow]["jobs"][job_id]
+        steps = job["steps"]
+        toolchains = [
+            index for index, candidate in enumerate(steps)
+            if isinstance(candidate, dict)
+            and candidate.get("uses") == "dtolnay/rust-toolchain@1.98.0"
+        ]
+        boundaries = [
+            index for index, candidate in enumerate(steps)
+            if isinstance(candidate, dict) and candidate.get("name") == spec["before"]
+        ]
+        if len(toolchains) != 1 or len(boundaries) != 1:
+            errors.append(
+                f"{workflow}: job {job_id!r} cache ordering boundary is ambiguous; "
+                f"toolchains={toolchains!r} before={boundaries!r}"
+            )
+        elif not toolchains[0] < cache_index < boundaries[0]:
+            errors.append(
+                f"{workflow}: job {job_id!r} cache must run after the pinned toolchain "
+                f"and before {spec['before']!r}"
+            )
+        if relevant_rust_env(job.get("env")) or relevant_rust_env(step.get("env")):
+            errors.append(
+                f"{workflow}: job {job_id!r} must not override action-hashed Rust/Cargo "
+                "environment at the cache boundary"
+            )
+
+    expected_modes = {
+        ("ci.yml", "runtime-authority"): "read",
+        ("release.yml", "build-release"): "read",
+        ("release.yml", "create-release"): "none",
+    }
+    for workflow, document in documents.items():
+        jobs = document.get("jobs", {})
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            expected_mode = expected_modes.get((workflow, job_id))
+            actual_mode = job.get("cache-mode")
+            if actual_mode != expected_mode:
+                errors.append(
+                    f"{workflow}: job {job_id!r} cache-mode changed; "
+                    f"expected={expected_mode!r} actual={actual_mode!r}"
+                )
+
+    ci_env = relevant_rust_env(documents.get("ci.yml", {}).get("env"))
+    release_env = relevant_rust_env(documents.get("release.yml", {}).get("env"))
+    expected_shared_env = {
+        "CARGO_TERM_COLOR": "always",
+        "RUST_BACKTRACE": 1,
+        "CARGO_BUILD_JOBS": 1,
+        "CARGO_PROFILE_RELEASE_LTO": "false",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+    }
+    if ci_env != expected_shared_env or release_env != expected_shared_env:
+        errors.append(
+            "ci.yml and release.yml must retain identical action-hashed Cargo/Rust "
+            f"environment; expected={expected_shared_env!r} ci={ci_env!r} release={release_env!r}"
+        )
+    expected_isolation_env = {
+        "CARGO_BUILD_JOBS": 1,
+        "CARGO_PROFILE_TEST_DEBUG": 0,
+        "CARGO_TERM_COLOR": "always",
+        "RUST_BACKTRACE": 1,
+    }
+    isolation_env = relevant_rust_env(
+        documents.get("issue-56-brain-isolation.yml", {}).get("env")
+    )
+    if isolation_env != expected_isolation_env:
+        errors.append(
+            "issue-56-brain-isolation.yml cache family environment changed; "
+            f"expected={expected_isolation_env!r} actual={isolation_env!r}"
+        )
+
+    expected_test_matrix = [
+        {
+            "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
+            "feature_name": "default",
+            "cache_family": "debug-default_all-features-clippy_release-default",
+            "cargo_args": "", "timeout_minutes": 45,
+        },
+        {
+            "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
+            "feature_name": "no-default-features",
+            "cache_family": "debug-no-default-features",
+            "cargo_args": "--no-default-features", "timeout_minutes": 45,
+        },
+        {
+            "os": "macos-14", "target": "aarch64-apple-darwin",
+            "feature_name": "default",
+            "cache_family": "debug-default_supervisor-release_apple-release-default",
+            "cargo_args": "", "timeout_minutes": 120,
+        },
+    ]
+    actual_test_matrix = (
+        documents.get("ci.yml", {}).get("jobs", {}).get("test", {})
+        .get("strategy", {}).get("matrix", {}).get("include")
+    )
+    if actual_test_matrix != expected_test_matrix:
+        errors.append(
+            "ci.yml: test cache compatibility matrix changed; "
+            f"expected={expected_test_matrix!r} actual={actual_test_matrix!r}"
+        )
+
+    expected_release_matrix = [
+        {
+            "os": "macos-14", "target": "aarch64-apple-darwin",
+            "asset_name": "finch-macos-arm64",
+            "cache_family": "debug-default_supervisor-release_apple-release-default",
+        },
+        {
+            "os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu",
+            "asset_name": "finch-linux-x86_64",
+            "cache_family": "release-default-lto-false-codegen-units-16",
+        },
+    ]
+    actual_release_matrix = (
+        documents.get("release.yml", {}).get("jobs", {}).get("build-release", {})
+        .get("strategy", {}).get("matrix", {}).get("include")
+    )
+    if actual_release_matrix != expected_release_matrix:
+        errors.append(
+            "release.yml: build-release cache compatibility matrix changed; "
+            f"expected={expected_release_matrix!r} actual={actual_release_matrix!r}"
+        )
+
+    release = documents.get("release.yml", {})
+    if "permissions" in release:
+        errors.append("release.yml: workflow-wide permissions must remain absent")
+    release_jobs = release.get("jobs", {})
+    for job_id, expected in (
+        ("build-release", {"contents": "read"}),
+        ("create-release", {"contents": "write"}),
+    ):
+        actual = release_jobs.get(job_id, {}).get("permissions")
+        if actual != expected:
+            errors.append(
+                f"release.yml: job {job_id!r} permissions changed; "
+                f"expected={expected!r} actual={actual!r}"
+            )
+
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "security", "Install cargo-audit 0.22.2 on cache miss",
+        "steps.cargo-audit-cache.outputs.cache-hit != 'true'", None,
+        ("cargo install cargo-audit --version 0.22.2 --locked",),
+    ))
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "security", "Verify cargo-audit 0.22.2",
+        None, None,
+        ('test "$(cargo audit --version)" = "cargo-audit 0.22.2"',),
+    ))
+    return errors
+
+
 def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "${{ matrix.os }}"))
@@ -536,6 +851,7 @@ def compare_contract(root: Path) -> list[str]:
                 f"unexpected={sorted(set(actual) - set(wanted))!r}"
             )
     errors.extend(migrated_boundary_errors(documents))
+    errors.extend(cache_contract_errors(documents))
     return errors
 
 

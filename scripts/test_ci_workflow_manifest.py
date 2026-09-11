@@ -179,8 +179,8 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_matrix_fanout_drift_is_caught_outside_representative_fixtures(self) -> None:
         self.repository.replace(
-            "ci.yml", "          - os: macos-14\n            feature_name: default",
-            "          - os: windows-2025\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n            feature_name: default",
+            "ci.yml", "          - os: macos-14\n",
+            "          - os: windows-2025\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n",
         )
         self.assert_fails("ci.yml: expanded check allocation changed", "Test (windows-2025, default)")
 
@@ -191,7 +191,9 @@ class WorkflowContractTests(unittest.TestCase):
         end = source.index("    - name: Install capnproto (Ubuntu)\n", start)
         preflights = source[start:end]
         source = source[:start] + source[end:]
-        insertion = source.index("    - name: Cache Cargo registry and build\n")
+        insertion = source.index(
+            "    - name: Restore compatible Cargo dependencies and build artifacts\n"
+        )
         path.write_text(source[:insertion] + preflights + source[insertion:])
         self.assert_fails(
             "ci.yml: job 'test' preflight steps must precede "
@@ -201,8 +203,8 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_duplicate_expanded_check_names_fail_actionably(self) -> None:
         self.repository.replace(
-            "ci.yml", "          - os: macos-14\n            feature_name: default",
-            "          - os: ubuntu-24.04\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n            feature_name: default",
+            "ci.yml", "          - os: macos-14\n",
+            "          - os: ubuntu-24.04\n            feature_name: default\n            cargo_args: \"\"\n            timeout_minutes: 45\n          - os: macos-14\n",
         )
         self.assert_fails("ci.yml: duplicate expanded check names", "Test (ubuntu-24.04, default)")
 
@@ -326,6 +328,113 @@ class WorkflowContractTests(unittest.TestCase):
     def test_windows_push_trigger_and_both_probe_paths_are_required(self) -> None:
         self.repository.replace("issue-201-chatgpt-auth.yml", "  push:\n", "  deleted_push:\n")
         self.assert_fails("path-filtered push to main is required")
+
+    def test_cache_pin_provider_mode_and_family_are_bound(self) -> None:
+        mutations = (
+            (
+                "ci.yml",
+                "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+                "Swatinem/rust-cache@v2",
+                "must pin the reviewed rust-cache action",
+            ),
+            (
+                "ci.yml", "cache-provider: github", "cache-provider: warpbuild",
+                "cache inputs changed",
+            ),
+            (
+                "ci.yml", "    cache-mode: read\n", "    cache-mode: write\n",
+                "cache-mode changed",
+            ),
+            (
+                "ci.yml",
+                "debug-default_all-features-clippy_release-default",
+                "debug-default",
+                "test cache compatibility matrix changed",
+            ),
+        )
+        for workflow, old, new, diagnostic in mutations:
+            with self.subTest(workflow=workflow, diagnostic=diagnostic):
+                repository = Repository()
+                try:
+                    repository.replace(workflow, old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, "unsafe cache configuration passed")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_cache_pruning_save_authority_and_nonfatality_are_bound(self) -> None:
+        mutations = (
+            (
+                "save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+                "save-if: true", "cache inputs changed",
+            ),
+            (
+                "cache-workspace-crates: false", "cache-workspace-crates: true",
+                "cache inputs changed",
+            ),
+            (
+                "      continue-on-error: true\n      with:\n        cache-provider: github",
+                "      with:\n        cache-provider: github",
+                "cache failure must remain nonfatal",
+            ),
+        )
+        for old, new, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                repository = Repository()
+                try:
+                    repository.replace("ci.yml", old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, "unsafe cache behavior passed")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_cache_must_precede_the_first_owned_cargo_boundary(self) -> None:
+        path = self.repository.workflow("ci.yml")
+        source = path.read_text()
+        start = source.index(
+            "    - name: Restore compatible Cargo dependencies and build artifacts\n"
+        )
+        end = source.index(
+            "    - name: Run clippy (binary only, warnings allowed for now)\n", start
+        )
+        cache = source[start:end]
+        source = source[:start] + source[end:]
+        insertion = source.index("    - name: Build binary\n")
+        path.write_text(source[:insertion] + cache + source[insertion:])
+        self.assert_fails("cache must run after the pinned toolchain", "Run clippy")
+
+    def test_alternate_cache_action_and_release_permission_drift_fail(self) -> None:
+        self.repository.replace(
+            "issue-201-chatgpt-auth.yml",
+            "      - name: Compile exact authentication sources on Windows\n",
+            "      - uses: actions/cache@v4\n"
+            "        with:\n"
+            "          path: target\n"
+            "          key: unsafe\n"
+            "      - name: Compile exact authentication sources on Windows\n",
+        )
+        self.assert_fails("Cargo cache allocation changed", "windows-verifier-compile")
+
+        repository = Repository()
+        try:
+            repository.replace(
+                "release.yml", "    permissions:\n      contents: read\n",
+                "    permissions:\n      contents: write\n",
+            )
+            result = repository.check()
+            self.assertNotEqual(0, result.returncode, "release build write authority passed")
+            self.assertIn("job 'build-release' permissions changed", result.stderr, result.stderr)
+        finally:
+            repository.close()
+
+    def test_cargo_audit_version_and_miss_install_are_bound(self) -> None:
+        self.repository.replace(
+            "ci.yml", "cargo install cargo-audit --version 0.22.2 --locked",
+            "cargo install cargo-audit --locked",
+        )
+        self.assert_fails("Install cargo-audit 0.22.2 on cache miss", "commands changed")
 
     def test_malformed_yaml_fails_actionably(self) -> None:
         self.repository.workflow("docs.yml").write_text("jobs: [\n")

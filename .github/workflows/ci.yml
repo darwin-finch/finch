@@ -10,6 +10,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+permissions:
+  contents: read
 
 jobs:
   toolchain-contract:
@@ -57,15 +62,21 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             feature_name: default
+            cache_family: debug-default_all-features-clippy_release-default
             cargo_args: ""
             timeout_minutes: 45
           - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             feature_name: no-default-features
+            cache_family: debug-no-default-features
             cargo_args: --no-default-features
             timeout_minutes: 45
           - os: macos-14
+            target: aarch64-apple-darwin
             feature_name: default
+            cache_family: debug-default_supervisor-release_apple-release-default
             cargo_args: ""
             timeout_minutes: 120
 
@@ -107,17 +118,21 @@ jobs:
       uses: dtolnay/rust-toolchain@1.98.0
       with:
         components: clippy
+        targets: ${{ matrix.target }}
 
-    - name: Cache Cargo registry and build
-      uses: actions/cache@v4
+    - name: Restore compatible Cargo dependencies and build artifacts
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      continue-on-error: true
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-rust-1.98.0-${{ matrix.feature_name }}-
+        cache-provider: github
+        shared-key: finch-cargo-v5-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-rust-1.98.0-${{ matrix.cache_family }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        add-job-id-key: false
+        cache-targets: true
+        cache-bin: false
+        cache-workspace-crates: false
+        cache-all-crates: false
+        cache-on-failure: false
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
     - name: Run clippy (binary only, warnings allowed for now)
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
@@ -237,6 +252,7 @@ jobs:
   runtime-authority:
     name: Runtime Authority (Ubuntu)
     runs-on: ubuntu-24.04
+    cache-mode: read
 
     steps:
     - name: Checkout code
@@ -247,6 +263,22 @@ jobs:
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
+      with:
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Restore Linux default-family Cargo state
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      continue-on-error: true
+      with:
+        cache-provider: github
+        shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-debug-default_all-features-clippy_release-default-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        add-job-id-key: false
+        cache-targets: true
+        cache-bin: false
+        cache-workspace-crates: false
+        cache-all-crates: false
+        cache-on-failure: false
+        save-if: false
 
     - name: Run runtime authority regressions
       run: cargo test --lib runtime::tests -- --nocapture
@@ -282,6 +314,20 @@ jobs:
       with:
         targets: x86_64-unknown-linux-gnu
 
+    - name: Restore compatible Linux release Cargo state
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      continue-on-error: true
+      with:
+        cache-provider: github
+        shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-release-default-lto-false-codegen-units-16-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        add-job-id-key: false
+        cache-targets: true
+        cache-bin: false
+        cache-workspace-crates: false
+        cache-all-crates: false
+        cache-on-failure: false
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
     - name: Build release binary
       run: cargo build --release --target x86_64-unknown-linux-gnu
 
@@ -306,8 +352,27 @@ jobs:
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@1.98.0
 
-    - name: Install cargo-audit
-      run: cargo install cargo-audit --locked
+    - name: Restore cargo-audit 0.22.2
+      id: cargo-audit-cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      continue-on-error: true
+      with:
+        cache-provider: github
+        shared-key: finch-cargo-v5-ubuntu-24.04-${{ runner.arch }}-x86_64-unknown-linux-gnu-rust-1.98.0-cargo-audit-0.22.2-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml') }}
+        add-job-id-key: false
+        cache-targets: false
+        cache-bin: true
+        cache-workspace-crates: false
+        cache-all-crates: false
+        cache-on-failure: false
+        save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    - name: Install cargo-audit 0.22.2 on cache miss
+      if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
+      run: cargo install cargo-audit --version 0.22.2 --locked
+
+    - name: Verify cargo-audit 0.22.2
+      run: test "$(cargo audit --version)" = "cargo-audit 0.22.2"
 
     - name: Verify resolved dependency security contract
       run: |
