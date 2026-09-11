@@ -26,6 +26,37 @@ fi
 
 lock_path="$git_common_dir/finch-cargo-slot.lock"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+
+# Shell startup files are not reliably loaded by local agents. Choose one
+# deterministic mutable target for every linked worktree unless the caller
+# explicitly selected one. CI already owns its workspace/cache target layout,
+# so leave an unset target untouched there instead of bypassing restored build
+# artifacts. The Git common directory is already the local lock domain, so
+# hashing its canonical identity also keeps unrelated clones from racing on
+# the same target artifacts by default.
+if [[ "${CARGO_TARGET_DIR+x}" != x && -z "${CI:-}" ]]; then
+    if [[ -n "${XDG_CACHE_HOME:-}" && "$XDG_CACHE_HOME" == /* ]]; then
+        cargo_cache_root="$XDG_CACHE_HOME"
+    else
+        if [[ -z "${HOME:-}" || "$HOME" != /* ]]; then
+            echo "with-cargo-slot: HOME must be an absolute path when XDG_CACHE_HOME is unset or relative" >&2
+            exit 69
+        fi
+        cargo_cache_root="$HOME/.cache"
+    fi
+    if ! target_namespace="$(perl -MDigest::SHA=sha256_hex -e \
+        'print sha256_hex($ARGV[0])' "$git_common_dir")"; then
+        echo "with-cargo-slot: could not derive the Cargo target namespace" >&2
+        exit 69
+    fi
+    CARGO_TARGET_DIR="$cargo_cache_root/cargo-target/$target_namespace"
+    if ! mkdir -p -- "$CARGO_TARGET_DIR"; then
+        echo "with-cargo-slot: could not create Cargo target directory: path=$CARGO_TARGET_DIR" >&2
+        exit 69
+    fi
+    export CARGO_TARGET_DIR
+fi
+
 lock_marker="${FINCH_CARGO_SLOT_HELD:-}"
 
 slot_marker_is_live() {
