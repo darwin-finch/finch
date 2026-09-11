@@ -169,7 +169,12 @@ fn file_identity(_metadata: &fs::Metadata, path: &Path) -> FileIdentity {
 fn inspect(path: PathBuf) -> Option<(InstructionSource, Option<(FileIdentity, String)>)> {
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A symlink whose target is gone still exists; report it rather than vanish.
+            let dangling = fs::symlink_metadata(&path).is_ok();
+            let status = SourceStatus::Unreadable("dangling symlink".into());
+            return dangling.then(|| (InstructionSource { path, status }, None));
+        }
         Err(error) => {
             let status = SourceStatus::Unreadable(error.to_string());
             return Some((InstructionSource { path, status }, None));
@@ -189,13 +194,30 @@ fn inspect(path: PathBuf) -> Option<(InstructionSource, Option<(FileIdentity, St
         let bytes = metadata.len();
         return Some((status(SourceStatus::TooLarge { bytes }), None));
     }
-    match fs::read_to_string(&path) {
+    // Read at most one byte past the cap so a file that grows after `metadata` stays bounded.
+    let read = fs::File::open(&path).and_then(|file| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_INSTRUCTION_FILE_BYTES + 1),
+            &mut bytes,
+        )?;
+        Ok(bytes)
+    });
+    let read = match read {
+        Ok(bytes) if bytes.len() as u64 > MAX_INSTRUCTION_FILE_BYTES => {
+            let bytes = bytes.len() as u64;
+            return Some((status(SourceStatus::TooLarge { bytes }), None));
+        }
+        Ok(bytes) => String::from_utf8(bytes).map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match read {
         Ok(content) if content.trim().is_empty() => Some((status(SourceStatus::Empty), None)),
         Ok(content) => {
             let identity = file_identity(&metadata, &path);
             Some((status(SourceStatus::Loaded), Some((identity, content))))
         }
-        Err(error) => Some((status(SourceStatus::Unreadable(error.to_string())), None)),
+        Err(error) => Some((status(SourceStatus::Unreadable(error)), None)),
     }
 }
 
@@ -403,7 +425,9 @@ mod tests {
             vec![
                 (agents, SourceStatus::SupersededBy(finch.clone())),
                 (finch, SourceStatus::Loaded),
-            ]
+            ],
+            "provenance must report the earlier hardlink superseded by the later one: {:?}",
+            sources.sources
         );
     }
 
@@ -413,9 +437,10 @@ mod tests {
         let tree = Tree::new();
         let project = tree.write("CLAUDE.md", "one-copy");
         fs::create_dir_all(tree.home.path().join(".claude")).unwrap();
+        fs::create_dir_all(tree.home.path().join(".finch")).unwrap();
         let user = tree.home.path().join(".claude/CLAUDE.md");
         std::os::unix::fs::symlink(&project, &user).unwrap();
-        tree.write("FINCH.md", "after-project");
+        fs::write(tree.home.path().join(".finch/FINCH.md"), "user-finch").unwrap();
         let sources = tree.collect("");
         let text = text(&sources);
         assert_eq!(
@@ -423,10 +448,15 @@ mod tests {
             1,
             "linked file must load once:\n{text}"
         );
+        assert!(
+            position(text, "user-finch") < position(text, "one-copy"),
+            "the linked file must sit at its project position, after later user-level files:\n{text}"
+        );
         assert_eq!(
             tree.statuses(&sources)[0],
             (user, SourceStatus::SupersededBy(project)),
-            "the user-level route must be reported as superseded by the project path"
+            "the user-level route must be reported as superseded by the project path: {:?}",
+            sources.sources
         );
     }
 
@@ -465,6 +495,8 @@ mod tests {
                     bytes: MAX_INSTRUCTION_FILE_BYTES + 1
                 }
             ),
+            "an oversized file must be reported as too large, not loaded or truncated: {:?}",
+            sources.sources
         );
     }
 
@@ -475,10 +507,11 @@ mod tests {
         let directory = tree.path("AGENTS.md");
         fs::create_dir_all(&directory).unwrap();
         let sources = tree.collect("");
-        assert_eq!(
-            sources.text(),
-            None,
-            "nothing loadable must yield no text: {:?}",
+        assert!(
+            tree.statuses(&sources)
+                .iter()
+                .all(|(_, status)| *status != SourceStatus::Loaded),
+            "nothing in the tree is loadable, so nothing in it may be loaded: {:?}",
             sources.sources
         );
         assert_eq!(
@@ -489,7 +522,24 @@ mod tests {
                     SourceStatus::Unreadable("not a regular file".into())
                 ),
                 (empty, SourceStatus::Empty),
-            ]
+            ],
+            "empty and non-file candidates must be reported with their reason: {:?}",
+            sources.sources
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_reported_not_skipped() {
+        let tree = Tree::new();
+        let agents = tree.path("AGENTS.md");
+        std::os::unix::fs::symlink("CLAUDE.md", &agents).unwrap();
+        let sources = tree.collect("");
+        assert_eq!(
+            tree.statuses(&sources),
+            vec![(agents, SourceStatus::Unreadable("dangling symlink".into()))],
+            "an AGENTS.md pointing at a missing CLAUDE.md must be visible in provenance: {:?}",
+            sources.sources
         );
     }
 }

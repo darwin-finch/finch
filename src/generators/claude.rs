@@ -317,10 +317,12 @@ mod tests {
     }
 
     /// Records the exact provider request `ClaudeGenerator` sends.
+    #[cfg(unix)]
     struct RecordingProvider {
         requests: std::sync::Mutex<Vec<crate::providers::ProviderRequest>>,
     }
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl crate::providers::ProviderBackend for RecordingProvider {
         async fn send_message_validated(

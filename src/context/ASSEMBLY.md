@@ -41,7 +41,9 @@ elsewhere. Two distinct files with identical text are both included.
 
 Files larger than 256 KiB (`MAX_INSTRUCTION_FILE_BYTES`) are skipped rather than truncated
 mid-rule. Every existing candidate is reported in `InstructionSources::sources` with a status:
-`Loaded`, `Empty`, `SupersededBy(path)`, `TooLarge`, or `Unreadable`.
+`Loaded`, `Empty`, `SupersededBy(path)`, `TooLarge`, or `Unreadable` (including a symlink
+whose target is missing). Reads stop one byte past the cap, so a file that grows while being
+read is still reported as too large.
 
 ## Not yet supported
 
