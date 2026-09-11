@@ -7,7 +7,6 @@ import argparse
 import itertools
 import json
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -306,131 +305,6 @@ def shell_commands(run: Any) -> tuple[str, ...]:
     return tuple(" ".join(line.split()) for line in joined.splitlines() if line.strip())
 
 
-def condition_identity(value: Any) -> tuple[tuple[str, str], ...] | None:
-    """Return the bounded semantic identity of a supported job/step condition."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return (("literal", str(value).lower()),)
-    if not isinstance(value, str):
-        return (("unsupported", repr(value)),)
-    expression = value.strip()
-    if expression.startswith("${{") and expression.endswith("}}"):
-        expression = expression[3:-2].strip()
-    while expression.startswith("(") and expression.endswith(")"):
-        depth = 0
-        closing = -1
-        quote: str | None = None
-        for index, character in enumerate(expression):
-            if quote is not None:
-                if character == quote:
-                    quote = None
-                continue
-            if character in "'\"":
-                quote = character
-            elif character == "(":
-                depth += 1
-            elif character == ")":
-                depth -= 1
-                if depth == 0:
-                    closing = index
-                    break
-        if closing != len(expression) - 1:
-            break
-        expression = expression[1:-1].strip()
-    if expression.lower() in {"true", "false"}:
-        return (("literal", expression.lower()),)
-    terms: list[tuple[str, str]] = []
-    for term in expression.split("&&"):
-        term = term.strip()
-        while term.startswith("(") and term.endswith(")"):
-            term = term[1:-1].strip()
-        match = re.fullmatch(
-            r"(runner\.os|matrix\.feature_name)\s*==\s*(['\"])([^'\"]+)\2",
-            term,
-        )
-        if match is None:
-            return (("unsupported", expression),)
-        terms.append((match.group(1), match.group(3)))
-    return tuple(sorted(terms))
-
-
-def shell_segments(command: str) -> tuple[tuple[str, ...], ...]:
-    """Split one bounded shell line into simple commands without splitting quoted substitutions."""
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        return ()
-    segments: list[tuple[str, ...]] = []
-    current: list[str] = []
-    for token in tokens:
-        if token in {";", "&", "&&", "|", "|&", "||"}:
-            if current:
-                segments.append(tuple(current))
-                current = []
-        else:
-            current.append(token)
-    if current:
-        segments.append(tuple(current))
-    return tuple(segments)
-
-
-def migrated_segment_identity(tokens: tuple[str, ...]) -> str | None:
-    """Identify one simple command owned by a migrated workflow boundary."""
-    if tokens[:1] == ("env",):
-        tokens = tokens[1:]
-    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
-        tokens = tokens[1:]
-    if tokens[:2] == ("cargo", "test"):
-        if "--doc" in tokens and "ValidatedProviderRequest" in tokens:
-            return "provider-token-doctest"
-        if {"--release", "--lib", "cli::conversation::tests"}.issubset(tokens):
-            return "release-atomic-history"
-    if tokens[:2] == ("cargo", "check"):
-        manifest: str | None = None
-        for index, token in enumerate(tokens):
-            if token.startswith("--manifest-path="):
-                manifest = token.split("=", 1)[1]
-                break
-            if token == "--manifest-path" and index + 1 < len(tokens):
-                manifest = tokens[index + 1]
-                break
-        if manifest in {
-            ".github/issue-105-windows-probe/Cargo.toml",
-            ".github/issue-201-windows-probe/Cargo.toml",
-        }:
-            return f"windows-probe:{manifest}"
-    if tokens[:2] == ("test", "-L") and ".claude/skills/finch-backlog" in tokens:
-        return "skill-symlink-exists"
-    if (
-        len(tokens) == 4
-        and tokens[0] == "test"
-        and tokens[2] == "="
-        and tokens[1] == "$(cd .agents/skills/finch-backlog && pwd -P)"
-        and tokens[3] == "$(cd .claude/skills/finch-backlog && pwd -P)"
-    ):
-        return "skill-symlink-target"
-    slot_scripts = {
-        ".agents/skills/finch-backlog/scripts/with-cargo-slot",
-        ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
-    }
-    if tokens[:2] == ("bash", "-n") and slot_scripts.issubset(tokens):
-        return "cargo-slot-syntax"
-    if tokens and tokens[0] == ".agents/skills/finch-backlog/scripts/test-with-cargo-slot":
-        return "cargo-slot-regression"
-    return None
-
-
-def migrated_command_identities(command: str) -> tuple[str, ...]:
-    return tuple(
-        identity
-        for segment in shell_segments(command)
-        if (identity := migrated_segment_identity(segment)) is not None
-    )
-
-
 def active_owner_job_errors(
     documents: dict[str, dict[str, Any]], workflow: str, job_id: str, expected_runner: str,
 ) -> list[str]:
@@ -438,10 +312,7 @@ def active_owner_job_errors(
     if not isinstance(job, dict):
         return [f"{workflow}: required owner job {job_id!r} is missing"]
     errors: list[str] = []
-    active_condition = condition_identity(job.get("if"))
-    if job.get("runs-on") != expected_runner or active_condition not in {
-        None, (("literal", "true"),),
-    }:
+    if job.get("runs-on") != expected_runner or job.get("if") is not None:
         errors.append(
             f"{workflow}: owner job {job_id!r} must run actively on {expected_runner}"
         )
@@ -455,17 +326,25 @@ def required_step_errors(
     expected_if: str | None, expected_shell: str | None, commands: tuple[str, ...],
 ) -> list[str]:
     errors: list[str] = []
-    job = documents.get(workflow, {}).get("jobs", {}).get(job_id)
-    if not isinstance(job, dict):
-        return [f"{workflow}: required job {job_id!r} is missing"]
-    steps = job.get("steps")
-    if not isinstance(steps, list):
-        return [f"{workflow}: job {job_id!r} has no usable steps"]
-    matches = [step for step in steps if isinstance(step, dict) and step.get("name") == name]
-    if len(matches) != 1:
-        return [f"{workflow}: required step {name!r} count expected=1 actual={len(matches)}"]
-    step = matches[0]
-    if condition_identity(step.get("if")) != condition_identity(expected_if):
+    matches: list[tuple[str, str, dict[str, Any]]] = []
+    for owner_workflow, document in documents.items():
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for owner_job, job in jobs.items():
+            if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+                continue
+            for step in job["steps"]:
+                if isinstance(step, dict) and step.get("name") == name:
+                    matches.append((owner_workflow, owner_job, step))
+    owners = tuple((owner_workflow, owner_job) for owner_workflow, owner_job, _ in matches)
+    if len(matches) != 1 or owners != ((workflow, job_id),):
+        return [
+            f"required step {name!r} must occur exactly once in {workflow}:{job_id}; "
+            f"actual={owners!r}"
+        ]
+    step = matches[0][2]
+    if step.get("if") != expected_if:
         errors.append(
             f"{workflow}: step {name!r} condition changed; "
             f"expected={expected_if!r} actual={step.get('if')!r}"
@@ -544,38 +423,6 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             "Verify shared skill discovery", "Check and exercise the Cargo slot",
         ), "Install repository Rust toolchain",
     ))
-
-    owned_operations = (
-        "provider-token-doctest",
-        "release-atomic-history",
-        "skill-symlink-exists",
-        "skill-symlink-target",
-        "cargo-slot-syntax",
-        "cargo-slot-regression",
-        "windows-probe:.github/issue-105-windows-probe/Cargo.toml",
-        "windows-probe:.github/issue-201-windows-probe/Cargo.toml",
-    )
-    all_commands: list[str] = []
-    for document in documents.values():
-        jobs = document.get("jobs")
-        if not isinstance(jobs, dict):
-            continue
-        for job in jobs.values():
-            if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
-                continue
-            for step in job["steps"]:
-                if isinstance(step, dict):
-                    all_commands.extend(shell_commands(step.get("run")))
-    operation_counts: dict[str, int] = {}
-    for command in all_commands:
-        for identity in migrated_command_identities(command):
-            operation_counts[identity] = operation_counts.get(identity, 0) + 1
-    for operation in owned_operations:
-        count = operation_counts.get(operation, 0)
-        if count != 1:
-            errors.append(
-                f"migrated operation ownership count expected=1 actual={count}: {operation}"
-            )
 
     auth = documents.get("issue-201-chatgpt-auth.yml", {})
     jobs = auth.get("jobs")

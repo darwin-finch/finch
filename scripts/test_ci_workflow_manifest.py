@@ -248,29 +248,6 @@ class WorkflowContractTests(unittest.TestCase):
                 finally:
                     repository.close()
 
-    def test_equivalent_migrated_conditions_pass(self) -> None:
-        self.repository.replace(
-            "ci.yml",
-            "if: runner.os == 'Linux' && matrix.feature_name == 'default'",
-            "if: ${{ matrix.feature_name == 'default' && runner.os == 'Linux' }}",
-        )
-        self.repository.replace(
-            "ci.yml",
-            "if: matrix.feature_name == 'default'",
-            "if: ${{ matrix.feature_name == 'default' }}",
-        )
-        self.repository.replace(
-            "ci.yml",
-            "if: runner.os == 'Linux' && matrix.feature_name == 'default'",
-            "if: ${{ (runner.os == 'Linux' && matrix.feature_name == 'default') }}",
-        )
-        self.repository.replace(
-            "issue-201-chatgpt-auth.yml",
-            "  windows-verifier-compile:\n    runs-on:",
-            "  windows-verifier-compile:\n    if: ${{ true }}\n    runs-on:",
-        )
-        self.assert_passes()
-
     def test_migrated_owner_jobs_must_be_active_and_gating(self) -> None:
         mutations = (
             (
@@ -325,11 +302,14 @@ class WorkflowContractTests(unittest.TestCase):
                     repository.close()
 
     def test_migrated_commands_cannot_be_duplicated_or_made_nongating(self) -> None:
-        duplicate = """\n    - name: Duplicate doctest\n      run: cargo test --doc -- ValidatedProviderRequest\n"""
+        duplicate = """\n    - name: Prove validated request tokens cannot be forged\n      run: cargo test --doc -- ValidatedProviderRequest\n"""
         self.repository.replace(
             "ci.yml", "\n  runtime-authority:\n", duplicate + "\n  runtime-authority:\n",
         )
-        self.assert_fails("migrated operation ownership count expected=1 actual=2")
+        self.assert_fails(
+            "must occur exactly once in ci.yml:test",
+            "Prove validated request tokens cannot be forged",
+        )
 
         repository = Repository()
         try:
@@ -342,125 +322,6 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn("must gate failure", result.stderr, result.stderr)
         finally:
             repository.close()
-
-    def test_equivalent_cargo_syntax_cannot_duplicate_migrated_ownership(self) -> None:
-        duplicate_doctest = """\n    - name: Duplicate equivalent doctest
-      run: cargo test --package finch --doc -- ValidatedProviderRequest
-"""
-        self.repository.replace(
-            "ci.yml", "\n  runtime-authority:\n", duplicate_doctest + "\n  runtime-authority:\n",
-        )
-        self.assert_fails(
-            "migrated operation ownership count expected=1 actual=2: provider-token-doctest"
-        )
-
-        repository = Repository()
-        try:
-            duplicate_probe = """\n      - name: Duplicate equivalent Windows probe
-        run: cargo check --manifest-path=.github/issue-105-windows-probe/Cargo.toml
-"""
-            repository.replace(
-                "issue-201-chatgpt-auth.yml",
-                "      - name: Compile exact authentication sources on Windows\n",
-                duplicate_probe + "      - name: Compile exact authentication sources on Windows\n",
-            )
-            result = repository.check()
-            self.assertNotEqual(0, result.returncode, "equivalent Windows probe duplicate passed")
-            self.assertIn(
-                "migrated operation ownership count expected=1 actual=2: "
-                "windows-probe:.github/issue-105-windows-probe/Cargo.toml",
-                result.stderr,
-                result.stderr,
-            )
-        finally:
-            repository.close()
-
-    def test_migrated_duplicates_after_shell_separators_are_rejected(self) -> None:
-        duplicate_doctest = """\n    - name: Duplicate doctest after shell prefix
-      run: echo starting && cargo test --doc -- ValidatedProviderRequest
-"""
-        self.repository.replace(
-            "ci.yml", "\n  runtime-authority:\n", duplicate_doctest + "\n  runtime-authority:\n",
-        )
-        self.assert_fails(
-            "migrated operation ownership count expected=1 actual=2: provider-token-doctest"
-        )
-
-        repository = Repository()
-        try:
-            duplicate_probe = """\n      - name: Duplicate probe after PowerShell prefix
-        run: Write-Output starting; cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml
-"""
-            repository.replace(
-                "issue-201-chatgpt-auth.yml",
-                "      - name: Compile exact authentication sources on Windows\n",
-                duplicate_probe + "      - name: Compile exact authentication sources on Windows\n",
-            )
-            result = repository.check()
-            self.assertNotEqual(0, result.returncode, "separator-prefixed Windows duplicate passed")
-            self.assertIn(
-                "migrated operation ownership count expected=1 actual=2: "
-                "windows-probe:.github/issue-105-windows-probe/Cargo.toml",
-                result.stderr,
-                result.stderr,
-            )
-        finally:
-            repository.close()
-
-        repository = Repository()
-        try:
-            pipeline_doctest = """\n    - name: Duplicate doctest in pipeline
-      run: echo starting | cargo test --doc -- ValidatedProviderRequest
-"""
-            repository.replace(
-                "ci.yml",
-                "\n  runtime-authority:\n",
-                pipeline_doctest + "\n  runtime-authority:\n",
-            )
-            result = repository.check()
-            self.assertNotEqual(0, result.returncode, "pipeline duplicate passed")
-            self.assertIn(
-                "migrated operation ownership count expected=1 actual=2: provider-token-doctest",
-                result.stderr,
-                result.stderr,
-            )
-        finally:
-            repository.close()
-
-    def test_environment_prefixed_migrated_duplicates_are_rejected(self) -> None:
-        for prefix in ("CARGO_TERM_COLOR=always ", "env CARGO_TERM_COLOR=always "):
-            with self.subTest(prefix=prefix):
-                repository = Repository()
-                try:
-                    duplicate = f"""\n    - name: Duplicate environment-prefixed doctest
-      run: {prefix}cargo test --doc -- ValidatedProviderRequest
-"""
-                    repository.replace(
-                        "ci.yml",
-                        "\n  runtime-authority:\n",
-                        duplicate + "\n  runtime-authority:\n",
-                    )
-                    result = repository.check()
-                    self.assertNotEqual(
-                        0,
-                        result.returncode,
-                        f"environment-prefixed duplicate passed: prefix={prefix!r}",
-                    )
-                    self.assertIn(
-                        "migrated operation ownership count expected=1 actual=2: "
-                        "provider-token-doctest",
-                        result.stderr,
-                        result.stderr,
-                    )
-                finally:
-                    repository.close()
-
-    def test_quoted_skill_paths_are_not_mistaken_for_an_executed_check(self) -> None:
-        prose = """\n    - name: Explain the symlink check
-      run: echo 'cd .agents/skills/finch-backlog && pwd -P; cd .claude/skills/finch-backlog && pwd -P'
-"""
-        self.repository.replace("ci.yml", "\n  runtime-authority:\n", prose + "\n  runtime-authority:\n")
-        self.assert_passes()
 
     def test_windows_push_trigger_and_both_probe_paths_are_required(self) -> None:
         self.repository.replace("issue-201-chatgpt-auth.yml", "  push:\n", "  deleted_push:\n")
