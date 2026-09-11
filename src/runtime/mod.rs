@@ -5,7 +5,6 @@ pub mod archive_store;
 pub mod automation;
 pub mod context;
 pub mod effect_log;
-pub mod fiber;
 mod mcp;
 pub mod outcome;
 pub mod scheduler;

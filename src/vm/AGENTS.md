@@ -10,10 +10,11 @@ catalog is `src/programs/`.
 **Interface:** no facade is enforced yet (#541 phase 3); use the `pub use` re-exports in
 `src/vm/mod.rs` and `src/lisp/mod.rs`.
 
-**Dependencies:** layer 0 in [`subsystems.toml`](../../subsystems.toml), no allowed edges. Debt:
-`vm → programs` and `vm → runtime`, both in `src/vm/runtime.rs`. Importing any other subsystem
-fails `scripts/check_subsystems.py`. The debt record allows `programs` and `runtime` imports
-anywhere in this subsystem, so the check will not stop a new one; add none.
+**Dependencies:** layer 0 in [`subsystems.toml`](../../subsystems.toml): `vm` depends on no other
+subsystem, and any `crate::` import of one fails `scripts/check_subsystems.py`. The pure CPU fiber
+scheduler (`fiber.rs`) and `ProgramLanguage` (`language.rs`) live here for that reason; `programs`
+re-exports `ProgramLanguage`. One test in `src/vm/runtime.rs` still calls
+`programs::parse_finch_script` and must move before `finch-vm` becomes its own crate.
 
 **Effects** go through the capability broker, never around it
 ([capability boundaries](../../CLAUDE.md#key-principles)).

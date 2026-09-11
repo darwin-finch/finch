@@ -89,19 +89,18 @@ no longer exists, so the record only shrinks as facade work lands. At the module
 every top-level module still belongs to one strongly connected component (see the
 [snapshot](#snapshot)).
 
-Two-way edges that block the first extractions, one import each way:
+Two-way edges that block the next extractions, one import each way. `vm` has no outgoing edge
+since [#584](https://github.com/darwin-finch/finch/issues/584):
 
 | Edge | Evidence |
 |------|----------|
-| `vm` ↔ `runtime` | `src/vm/runtime.rs` imports `runtime::fiber::CpuFiberScheduler`; `src/runtime/outcome.rs` imports `vm` |
-| `vm` ↔ `programs` | `src/vm/runtime.rs` imports `programs::ProgramLanguage`; `src/programs/mod.rs` imports `vm` |
 | `programs` ↔ `runtime` | `src/programs/corpus.rs` takes `&ProgramRuntime`; `src/runtime/outcome.rs` imports `programs` |
 | `runtime` ↔ `brain` | `src/runtime/scheduler.rs` imports `brain::store::RunId`; `src/brain/store.rs` imports `runtime` |
 | `models` ↔ `cli` | `src/models/bootstrap.rs` imports `cli::OutputManager`; `src/cli/setup_wizard.rs` imports `models` |
 
 Memory has no two-way edge. Its only production import is `crate::programs`
 (`memory::program_registry` and `MemorySystem::save_lisp_define`), so it joins the component
-through memory → programs → runtime and vm. Its separate extraction blocker is heavy dependencies: `memory::neural_embedding` uses ONNX
+through memory → programs → runtime → memory. Its separate extraction blocker is heavy dependencies: `memory::neural_embedding` uses ONNX
 Runtime (`ort`), `tokenizers`, and `hf_hub` directly.
 
 The application layer is knotted mostly through `tools`: `src/tools/types.rs` imports `cli`,
@@ -302,3 +301,5 @@ Measured at commit `cb39ea0f`; re-derive before relying on these numbers.
   removed. A different test-exclusion heuristic gives 25; treat the size as approximate.
 - Subsystem level, at commit `74866238`: 61 cross-subsystem edges, 35 allowed (`depends_on`)
   and 26 recorded as debt in [`subsystems.toml`](subsystems.toml).
+- After [#584](https://github.com/darwin-finch/finch/issues/584): `vm` has no outgoing edge (59 edges,
+  35 allowed, 24 debt) and is no longer part of the module-level component.
