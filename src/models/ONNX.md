@@ -1,6 +1,6 @@
 # ONNX Model Integration
 
-*See `CLAUDE.md §Key Design Decisions` for why ONNX over Candle.*
+*Background: [local backend investigation](../../DESIGN.md#local-backend-investigation) in the design index.*
 
 **Purpose:** Load pre-trained models in ONNX format with KV cache support.
 

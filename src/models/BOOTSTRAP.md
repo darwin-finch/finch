@@ -1,6 +1,6 @@
 # Progressive Bootstrap
 
-*See `CLAUDE.md §Key Design Decisions` for the why.*
+*Background: [local backend investigation](../../DESIGN.md#local-backend-investigation) in the design index.*
 
 **Purpose:** Instant startup with background model loading.
 

@@ -250,7 +250,33 @@ class SubsystemManifestTests(unittest.TestCase):
     def test_agents_alias_must_point_at_claude(self) -> None:
         (self.fixture.root / "AGENTS.md").unlink()
         self.fixture.write("AGENTS.md", "# Diverged\n")
-        self.assert_error("AGENTS.md must be a symlink to CLAUDE.md")
+        self.assert_error("AGENTS.md must be a symlink to its sibling CLAUDE.md")
+
+    def add_vm_capsule(self, body: str = "# vm capsule\n\nScope notes.\n") -> None:
+        self.fixture.write("src/vm/CLAUDE.md", body)
+        (self.fixture.root / "src/vm/AGENTS.md").symlink_to("CLAUDE.md")
+        self.fixture.edit("subsystems.toml", 'docs = ["src/vm/VM.md"]', 'docs = ["src/vm/VM.md"]\ninstructions = ["src/vm/AGENTS.md"]')
+
+    def test_capsule_must_be_routed_from_the_root(self) -> None:
+        self.add_vm_capsule()
+        self.assert_error("the '### Subsystem capsules' routing table is missing")
+        self.fixture.write("CLAUDE.md", "# Instructions\n\n### Subsystem capsules\n\n| Paths | Capsule |\n")
+        self.assert_error("subsystem 'vm': capsule src/vm/AGENTS.md is missing from the root routing table")
+        self.fixture.write(
+            "CLAUDE.md", "# Instructions\n\n### Subsystem capsules\n\n| `src/vm/` | `src/vm/AGENTS.md` |\n",
+        )
+        self.assert_clean()
+
+    def test_capsule_may_not_restate_universal_sections(self) -> None:
+        self.fixture.write("CLAUDE.md", "# Instructions\n\n### Subsystem capsules\n\n`src/vm/AGENTS.md`\n")
+        self.add_vm_capsule("# vm capsule\n\n### Testing (mandatory)\n\nA forked copy.\n")
+        self.assert_error("src/vm/AGENTS.md: capsule restates the root's universal section '### Testing (mandatory)'")
+
+    def test_nested_instruction_files_need_the_alias(self) -> None:
+        self.fixture.write("src/app/CLAUDE.md", "# app notes\n")
+        self.assert_error("src/app/CLAUDE.md needs a sibling AGENTS.md symlink")
+        self.fixture.write("src/app/AGENTS.md", "# diverged copy\n")
+        self.assert_error("src/app/AGENTS.md must be a symlink to its sibling CLAUDE.md")
 
     def test_excluded_entries_need_a_reason(self) -> None:
         self.fixture.edit("subsystems.toml", 'reason = "history"', 'reason = ""')

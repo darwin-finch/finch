@@ -29,6 +29,12 @@ CRATE_GROUP = re.compile(r"\bcrate::\s*\{")
 GROUP_ITEM = re.compile(r"\s*([a-z_][a-z0-9_]*)")
 RAW_STRING = re.compile(r'[bc]?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+ROUTING_HEADING = "### Subsystem capsules"
+# Capsules supplement the root instructions; they may link these sections but never restate them.
+UNIVERSAL_HEADINGS = (
+    "## Invariants", "## Development Guidelines", "### Testing (mandatory)",
+    "### Reporting status to a human", "## Key Principles",
+)
 TEST_MODULE_BLOCK = re.compile(
     r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"
 )
@@ -350,11 +356,53 @@ def dependency_errors(manifest: dict, edges: dict[tuple[str, str], list[str]]) -
     return errors
 
 
-def alias_errors(root: Path) -> list[str]:
-    agents = root / "AGENTS.md"
-    if not agents.is_symlink() or agents.readlink().as_posix() != "CLAUDE.md":
-        return ["AGENTS.md must be a symlink to CLAUDE.md so both agent entry points agree"]
-    return []
+def alias_errors(root: Path, files: list[str]) -> list[str]:
+    """In every directory with instruction files, AGENTS.md is a symlink to its sibling CLAUDE.md."""
+    tracked = set(files)
+    errors: list[str] = []
+    if "AGENTS.md" not in tracked:
+        errors.append("AGENTS.md must be a symlink to its sibling CLAUDE.md; the root AGENTS.md is missing")
+    for path in files:
+        name = Path(path).name
+        sibling = Path(path).with_name("CLAUDE.md" if name == "AGENTS.md" else "AGENTS.md").as_posix()
+        if name == "AGENTS.md":
+            link = root / path
+            if not link.is_symlink() or link.readlink().as_posix() != "CLAUDE.md" or sibling not in tracked:
+                errors.append(
+                    f"{path} must be a symlink to its sibling CLAUDE.md so both agent entry points agree"
+                )
+        elif name == "CLAUDE.md" and sibling not in tracked:
+            errors.append(f"{path} needs a sibling AGENTS.md symlink so AGENTS.md-only agents read it too")
+    return errors
+
+
+def capsule_errors(manifest: dict, root: Path) -> list[str]:
+    """Every capsule is routed from the root instructions and never restates universal sections."""
+    capsules = [
+        (record["id"], path) for record in valid_records(manifest)
+        for path in record.get("instructions", [])
+    ]
+    if not capsules:
+        return []
+    instructions = root / "CLAUDE.md"
+    text = instructions.read_text() if instructions.is_file() else ""
+    section = re.search(
+        rf"^{re.escape(ROUTING_HEADING)}\s*$(.*?)(?=^#{{1,3}} |\Z)", text, re.M | re.S,
+    )
+    errors: list[str] = []
+    if section is None:
+        errors.append(f"CLAUDE.md: the {ROUTING_HEADING!r} routing table is missing; it must list every capsule")
+    for owner, path in capsules:
+        if section is not None and path not in section.group(1):
+            errors.append(f"subsystem {owner!r}: capsule {path} is missing from the root routing table")
+        capsule = root / path
+        body = capsule.read_text() if capsule.is_file() else ""
+        for heading in UNIVERSAL_HEADINGS:
+            if re.search(rf"^{re.escape(heading)}\s*$", body, re.M):
+                errors.append(
+                    f"{path}: capsule restates the root's universal section {heading!r}; link to it instead"
+                )
+    return errors
 
 
 def check(root: Path) -> list[str]:
@@ -367,7 +415,8 @@ def check(root: Path) -> list[str]:
     edges, scan_errors = observed_edges(manifest, files, root)
     errors += scan_errors
     errors += dependency_errors(manifest, edges)
-    errors += alias_errors(root)
+    errors += alias_errors(root, files)
+    errors += capsule_errors(manifest, root)
     return errors
 
 

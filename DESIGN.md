@@ -53,9 +53,9 @@ Documents with known stale claims are flagged in [documentation status](#documen
 | Subsystem (layer): responsibility | Owns | Local documentation |
 |-----------------------------------|------|---------------------|
 | **`config`** (0): configuration, instruction loading, licensing, metrics | `src/config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs`; `data/` personas | [Configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
-| **`vm`** (0): parse, verify, and run CoForth and CoLisp under capability authority | `src/vm`, `lisp`; `vocabulary/`, `examples/finch/` | Language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
+| **`vm`** (0): parse, verify, and run CoForth and CoLisp under capability authority | `src/vm`, `lisp`; `vocabulary/`, `examples/finch/` | Capsule [`src/vm/AGENTS.md`](src/vm/CLAUDE.md); language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
 | **`programs`** (1): durable program identity, catalog, and corpus | `src/programs` | None yet |
-| **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | None yet |
+| **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | Capsule [`src/memory/AGENTS.md`](src/memory/CLAUDE.md) |
 | **`tools`** (1): tool execution, permissions, MCP client, GUI automation | `src/tools` | [Tool execution and permissions](src/tools/EXECUTION.md), [MCP client guide](docs/MCP_USER_GUIDE.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
 | **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset` | None yet |
 | **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
@@ -108,6 +108,89 @@ The application layer is knotted mostly through `tools`: `src/tools/types.rs` im
 `runtime`, `server`, `local`, and `models` types, and each of those imports `tools` back. `ipc`
 ↔ `server` and `claude` ↔ `providers` add further loops. This is why the program forbids
 extracting Brain, runtime, server, and IPC as one change.
+
+## Runtime reference
+
+Descriptive material moved from the root instructions. It describes `main`; it is not evidence that
+every configuration or provider combination has passed conformance.
+
+### Composition sketch
+
+```
+CLI / query client
+    ↓
+configured provider graph or daemon client
+    ↓
+provider transport and/or experimental local generator
+    ↓
+typed runtime + capability broker for program effects
+```
+
+#### Module docs
+
+| Component | Module Doc |
+|-----------|-----------|
+| Local model loader | `src/models/unified_loader.rs` · `src/models/ONNX.md` |
+| Deferred LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
+| Router | `src/router/ROUTING.md` |
+| TUI Renderer | `src/cli/tui/ARCHITECTURE.md` |
+| Tool Execution & Permissions | `src/tools/EXECUTION.md` |
+| Claude Client | `src/claude/CLIENT.md` |
+| Context Assembly | `src/context/ASSEMBLY.md` |
+| Configuration | `src/config/CONFIGURATION.md` |
+| License System | `src/license/LICENSING.md` |
+
+### Weighted feedback
+
+Three historical weight tiers are retained for explicit feedback: high (10x), medium (3x), normal (1x). `Ctrl+G` = good, `Ctrl+B` = bad. Feedback is private durable data; it does not trigger training.
+
+### Local backend investigation
+
+The source contains ONNX Runtime and Candle loaders. Historical backend experiments are recorded in
+`docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or conformance evidence.
+
+### Storage layout
+
+```
+~/.finch/
+├── config.toml          # User config
+├── adapters/            # Preserved legacy adapters; not loaded automatically
+├── feedback.jsonl       # Private explicit feedback; never a training trigger
+├── training_queue.jsonl # Preserved legacy queue; not processed automatically
+├── metrics/             # Usage metrics
+├── notice_state.toml    # Licence-notice bookkeeping; kept out of config.toml (#76)
+├── tool_patterns.json   # Approved tool patterns
+├── sessions/            # Saved REPL sessions
+└── brains/              # Named Brain event logs and state
+
+~/.cache/huggingface/hub/  # Base models (HF standard)
+```
+
+### Operating modes
+
+- **Interactive REPL:** `finch`
+- **Single query / pipe:** `finch query "..."` or `echo "..." | finch`
+- **Foreground HTTP server:** `finch daemon` (default `127.0.0.1:8000`)
+- **Managed background daemon:** `finch daemon-start` (default `127.0.0.1:11435`)
+- **Restricted remote Brain TLS listener:** configured default `0.0.0.0:11436`; opened only when
+  service advertisement is enabled
+- **Direct typed programs:** `finch --forth`, `finch --lisp`, and `finch --exec`
+
+Brain and daemon tests must use the isolated launchers and kernel-assigned endpoints.
+
+### Technology stack
+
+- **Language:** Rust (memory safety, performance, Apple Silicon support)
+- **ML frameworks in source:** ONNX Runtime (`ort` crate) and Candle
+- **Async:** Tokio
+- **HTTP server:** Axum (`/v1/chat/completions`, `/v1/models`, `/v1/messages`, and Finch-specific
+  routes; not the full OpenAI API and not the Responses API)
+- **TUI:** Ratatui + crossterm
+- **Key deps:** `hf-hub`, `tokenizers`, `indicatif`, `sysinfo`
+
+Provider profile variants and local model repositories are defined in source. Treat the model
+catalog, setup choices, and loaders as configuration surfaces—not claims that each combination has
+passed conformance.
 
 ## Invariants
 

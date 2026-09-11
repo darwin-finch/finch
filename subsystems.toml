@@ -65,6 +65,7 @@ name = "Typed VM, CoForth, CoLisp"
 layer = 0
 paths = ["src/vm/", "src/lisp/", "vocabulary/", "examples/finch/"]
 docs = ["vocabulary/language/FINCH_VM.md", "vocabulary/language/FINCH_FORTH.md", "vocabulary/language/FINCH_LISP.md", "docs/TYPED_VM_MIGRATION_AUDIT.md"]
+instructions = ["src/vm/AGENTS.md"]
 depends_on = []
 debt = [
   { to = "programs", issue = 541 },
@@ -87,6 +88,7 @@ id = "memory"
 name = "MemTree memory and retrieval"
 layer = 1
 paths = ["src/memory/", "src/memory_status.rs", "src/workbook.rs"]
+instructions = ["src/memory/AGENTS.md"]
 depends_on = []
 debt = [
   { to = "programs", issue = 541 },
