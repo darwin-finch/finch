@@ -39,6 +39,9 @@ typed runtime + capability broker for program effects
 | Configuration | `src/config/CONFIGURATION.md` |
 | License System | `src/license/LICENSING.md` |
 
+For the subsystem map, ownership, current dependency cycles, and intended direction, see the
+root design index [`DESIGN.md`](DESIGN.md).
+
 ## Invariants
 
 Behaviors that **must always be true**. If a test doesn't exist for a claim below, treat it as a bug.
@@ -288,6 +291,7 @@ See **https://github.com/darwin-finch/finch/issues**
 | Document | Purpose |
 |----------|---------|
 | `README.md` | User-facing documentation |
+| `DESIGN.md` | Root architecture and subsystem index |
 | `CONTRIBUTING.md` | Contributor setup and attribution policy |
 | `docs/README.md` | Current/reference/design/archive documentation map |
 | `CHANGELOG.md` | Version history; not current capability evidence |
