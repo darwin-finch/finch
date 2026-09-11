@@ -73,6 +73,22 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Verify shared skill discovery
+      if: matrix.feature_name == 'default'
+      shell: bash
+      run: |
+        test -L .claude/skills/finch-backlog
+        test "$(cd .agents/skills/finch-backlog && pwd -P)" = "$(cd .claude/skills/finch-backlog && pwd -P)"
+
+    - name: Check and exercise the Cargo slot
+      if: matrix.feature_name == 'default'
+      shell: bash
+      run: |
+        bash -n \
+          .agents/skills/finch-backlog/scripts/with-cargo-slot \
+          .agents/skills/finch-backlog/scripts/test-with-cargo-slot
+        .agents/skills/finch-backlog/scripts/test-with-cargo-slot
+
     - name: Install capnproto (Ubuntu)
       if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y capnproto
@@ -129,22 +145,6 @@ jobs:
     - name: Run release-mode atomic history regression
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
       run: cargo test --release --lib cli::conversation::tests -- --nocapture
-
-    - name: Verify shared skill discovery
-      if: matrix.feature_name == 'default'
-      shell: bash
-      run: |
-        test -L .claude/skills/finch-backlog
-        test "$(cd .agents/skills/finch-backlog && pwd -P)" = "$(cd .claude/skills/finch-backlog && pwd -P)"
-
-    - name: Check and exercise the Cargo slot
-      if: matrix.feature_name == 'default'
-      shell: bash
-      run: |
-        bash -n \
-          .agents/skills/finch-backlog/scripts/with-cargo-slot \
-          .agents/skills/finch-backlog/scripts/test-with-cargo-slot
-        .agents/skills/finch-backlog/scripts/test-with-cargo-slot
 
     - name: Check the current tracked tree on macOS
       if: runner.os == 'macOS'

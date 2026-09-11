@@ -227,8 +227,8 @@ class WorkflowContractTests(unittest.TestCase):
                 "Verify shared skill discovery", "condition changed",
             ),
             (
-                ".agents/skills/finch-backlog/scripts/test-with-cargo-slot\n\n    - name: Check the current",
-                ".agents/skills/finch-backlog/scripts/with-cargo-slot\n\n    - name: Check the current",
+                "        .agents/skills/finch-backlog/scripts/test-with-cargo-slot\n",
+                "        .agents/skills/finch-backlog/scripts/with-cargo-slot\n",
                 "Check and exercise the Cargo slot", "commands changed",
             ),
         )
