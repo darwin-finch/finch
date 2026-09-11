@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CI jobs may deliberately constrain Cargo itself. The regression owns its
+# default-value fixtures and sets non-default values explicitly where needed.
+unset CARGO_BUILD_JOBS
+
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
-source_wrapper="$script_dir/with-cargo-slot"
+source_wrapper="${FINCH_CARGO_SLOT_WRAPPER_UNDER_TEST:-$script_dir/with-cargo-slot}"
 source_root="$(cd "$script_dir/../../../.." && pwd -P)"
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch cargo slot [test].XXXXXX")"
 holder_pid=''
@@ -30,6 +34,37 @@ trap cleanup EXIT
 fail() {
     echo "with-cargo-slot regression: $*" >&2
     exit 1
+}
+
+monotonic_deadline() {
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+        'printf "%.9f\n", clock_gettime(CLOCK_MONOTONIC) + $ARGV[0]' "$1"
+}
+
+monotonic_deadline_passed() {
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+        'exit(clock_gettime(CLOCK_MONOTONIC) >= $ARGV[0] ? 0 : 1)' "$1"
+}
+
+wait_for_file() {
+    local file="$1" seconds="$2"
+    local deadline
+    deadline="$(monotonic_deadline "$seconds")"
+    while [[ ! -s "$file" ]]; do
+        monotonic_deadline_passed "$deadline" && return 1
+        sleep 0.02
+    done
+}
+
+background_job_is_running() {
+    local pid="$1"
+    jobs -pr | grep -Fx -- "$pid" >/dev/null
+}
+
+process_diagnostics() {
+    local label="$1" pid="$2"
+    echo "$label pid=$pid" >&2
+    /bin/ps -o pid=,ppid=,state=,command= -p "$pid" >&2 2>/dev/null || true
 }
 
 assert_contains() {
@@ -176,10 +211,54 @@ holder_descendant_pid="$linger_pid"
 kill "$linger_pid" 2>/dev/null || true
 holder_descendant_pid=''
 
-# The new lock-holder PID is a signal proxy. Signal only that parent, prove the
-# foreground child observes the signal, preserve shell-visible status, reap it,
-# and release the slot before the next worktree enters.
-for signal_case in HUP:1 INT:2 QUIT:3 TERM:15; do
+# The new lock-holder PID is a signal proxy. Enter through a bootstrap which
+# blocks the selected handled signal and SIGUSR1. The proxy must unblock only
+# its handled set in itself and the command, leaving SIGUSR1 blocked in both.
+signal_fixture_dir="$fixture_root/signal-fixture"
+mkdir "$signal_fixture_dir"
+cat >"$signal_fixture_dir/block-and-exec.pl" <<'SIGNAL_BOOTSTRAP'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use POSIX qw(SIG_BLOCK SIGHUP SIGINT SIGQUIT SIGTERM SIGUSR1);
+my ($signal_name, $wrapper, @command) = @ARGV;
+my %number = (HUP => SIGHUP, INT => SIGINT, QUIT => SIGQUIT, TERM => SIGTERM);
+die "unknown signal $signal_name\n" unless exists $number{$signal_name};
+my $blocked = POSIX::SigSet->new($number{$signal_name}, SIGUSR1);
+POSIX::sigprocmask(SIG_BLOCK, $blocked)
+    or die "could not install inherited signal mask: $!\n";
+exec {$wrapper} $wrapper, @command
+    or die "could not exec wrapper $wrapper: $!\n";
+SIGNAL_BOOTSTRAP
+cat >"$signal_fixture_dir/observe-signal.pl" <<'SIGNAL_CHILD'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use POSIX qw(SIG_BLOCK SIGHUP SIGINT SIGQUIT SIGTERM SIGUSR1);
+my %number = (HUP => SIGHUP, INT => SIGINT, QUIT => SIGQUIT, TERM => SIGTERM);
+my $signal_name = $ENV{SIGNAL};
+die "unknown signal $signal_name\n" unless exists $number{$signal_name};
+$SIG{$signal_name} = sub {
+    open my $observed, ">", $ENV{OBSERVED} or die "observed record failed: $!";
+    print {$observed} "$signal_name\n";
+    close $observed;
+    $SIG{$signal_name} = "DEFAULT";
+    kill $number{$signal_name}, $$;
+};
+my $empty = POSIX::SigSet->new();
+my $current = POSIX::SigSet->new();
+POSIX::sigprocmask(SIG_BLOCK, $empty, $current)
+    or die "could not read command signal mask: $!\n";
+open my $ready, ">", $ENV{READY} or die "ready record failed: $!";
+printf {$ready} "pid=%d handled_blocked=%d usr1_blocked=%d\n",
+    $$, $current->ismember($number{$signal_name}), $current->ismember(SIGUSR1);
+close $ready;
+sleep 1 while 1;
+SIGNAL_CHILD
+chmod 0755 "$signal_fixture_dir/block-and-exec.pl" "$signal_fixture_dir/observe-signal.pl"
+
+signal_cases="${FINCH_CARGO_SLOT_SIGNAL_CASES:-HUP:1 INT:2 QUIT:3 TERM:15}"
+for signal_case in $signal_cases; do
     signal_name="${signal_case%%:*}"
     signal_number="${signal_case##*:}"
     signal_ready="$fixture_root/signal-$signal_name.ready"
@@ -187,34 +266,65 @@ for signal_case in HUP:1 INT:2 QUIT:3 TERM:15; do
     (
         cd "$repo"
         exec env SIGNAL="$signal_name" READY="$signal_ready" OBSERVED="$signal_observed" \
-            "$wrapper" sh -c '
-                trap '\''
-                    printf "%s\n" "$SIGNAL" >"$OBSERVED"
-                    trap - "$SIGNAL"
-                    kill -s "$SIGNAL" "$$"
-                '\'' "$SIGNAL"
-                printf "ready\n" >"$READY"
-                while :; do sleep 1; done
-            '
+            perl "$signal_fixture_dir/block-and-exec.pl" "$signal_name" "$wrapper" \
+            perl "$signal_fixture_dir/observe-signal.pl"
     ) &
     holder_pid=$!
-    for _ in $(seq 1 250); do [[ -s "$signal_ready" ]] && break; sleep 0.02; done
-    [[ -s "$signal_ready" ]] || fail \
-        "signal proxy did not become ready within five seconds: signal=$signal_name wrapper_pid=$holder_pid"
+    if ! wait_for_file "$signal_ready" 5; then
+        process_diagnostics wrapper "$holder_pid"
+        kill -TERM "$holder_pid" 2>/dev/null || true
+        wait "$holder_pid" 2>/dev/null || true
+        holder_pid=''
+        fail "signal proxy did not become ready within a real five-second deadline: signal=$signal_name"
+    fi
     signal_state="$(cat "$signal_ready")"
-    [[ "$signal_state" == ready ]] || fail \
-        "signal proxy readiness failed: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid"
+    signal_child_pid="$(printf '%s\n' "$signal_state" | sed -n 's/^pid=\([0-9][0-9]*\) .*/\1/p')"
+    [[ "$signal_child_pid" =~ ^[1-9][0-9]*$ ]] || fail \
+        "signal command readiness omitted its PID: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid"
+    holder_descendant_pid="$signal_child_pid"
+    if [[ "${FINCH_CARGO_SLOT_ALLOW_BLOCKED_HANDLED:-0}" != 1 ]]; then
+        [[ "$signal_state" == *"handled_blocked=0"* ]] || fail \
+            "handled signal remained blocked in command: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid child_pid=$signal_child_pid"
+    fi
+    [[ "$signal_state" == *"usr1_blocked=1"* ]] || fail \
+        "non-handled SIGUSR1 mask was not preserved in command: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid child_pid=$signal_child_pid"
+    kill -USR1 "$holder_pid"
+    sleep 0.1
+    background_job_is_running "$holder_pid" || {
+        kill -TERM "$signal_child_pid" 2>/dev/null || true
+        wait "$holder_pid" 2>/dev/null || true
+        holder_pid=''
+        holder_descendant_pid=''
+        fail "non-handled SIGUSR1 was unblocked in proxy: signal=$signal_name child_pid=$signal_child_pid"
+    }
     kill -s "$signal_name" "$holder_pid"
+    echo "signal phase emitted: signal=$signal_name wrapper_pid=$holder_pid child_pid=$signal_child_pid" >&2
+    signal_deadline="$(monotonic_deadline 5)"
+    while background_job_is_running "$holder_pid"; do
+        if monotonic_deadline_passed "$signal_deadline"; then
+            process_diagnostics wrapper "$holder_pid"
+            process_diagnostics child "$signal_child_pid"
+            kill -TERM "$holder_pid" "$signal_child_pid" 2>/dev/null || true
+            wait "$holder_pid" 2>/dev/null || true
+            holder_pid=''
+            holder_descendant_pid=''
+            fail "signal proxy and direct child exceeded a real five-second deadline after emission: signal=$signal_name"
+        fi
+        sleep 0.02
+    done
     set +e
     wait "$holder_pid"
     status=$?
     set -e
     holder_pid=''
+    holder_descendant_pid=''
     expected_status=$((128 + signal_number))
     [[ "$status" -eq "$expected_status" ]] || fail \
         "signal proxy changed child status: signal=$signal_name expected=$expected_status actual=$status"
     assert_contains "$signal_observed" "$signal_name" \
         "signal proxy did not forward $signal_name to its foreground child"
+    ! kill -0 "$signal_child_pid" 2>/dev/null || fail \
+        "signal proxy returned before its direct child was reaped: signal=$signal_name child_pid=$signal_child_pid"
     (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
         fail "slot remained held after signal proxy reaped child: signal=$signal_name lock=$common_dir/finch-cargo-slot.lock"
 done

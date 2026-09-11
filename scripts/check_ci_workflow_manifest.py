@@ -108,7 +108,7 @@ EXPECTED_CHECKS = {
         "windows-auth-contract",
     ),
     "issue-245-cargo-slot.yml": (
-        "macos-latest repository-wide lock", "ubuntu-latest repository-wide lock",
+        "macos-14 repository-wide lock", "ubuntu-24.04 repository-wide lock",
     ),
     "issue-46-atomic-conversation.yml": (
         "atomic-rounds (macos-14)", "atomic-rounds (ubuntu-24.04)",
