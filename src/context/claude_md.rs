@@ -531,35 +531,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repository_vm_capsule_loads_once_after_the_root_instructions() {
-        // The real tree: root CLAUDE.md with its AGENTS.md alias, and the src/vm capsule with its
-        // own alias. An agent working in src/vm must get both, root first, each exactly once.
+        // The real tree: root CLAUDE.md with its AGENTS.md alias, and the src/vm capsule as a real
+        // AGENTS.md beside a CLAUDE.md that only imports it. An agent working in src/vm must get
+        // the root instructions and then the capsule, each exactly once.
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let home = TempDir::new().unwrap();
         let sources = collect_instructions(&repo.join("src/vm"), Some(home.path()));
         let loaded: Vec<&Path> = sources.loaded().collect();
         let root = repo.join("CLAUDE.md");
-        let capsule = repo.join("src/vm/CLAUDE.md");
+        let capsule = repo.join("src/vm/AGENTS.md");
         let root_at = loaded.iter().position(|path| *path == root);
         let capsule_at = loaded.iter().position(|path| *path == capsule);
         assert!(
             matches!((root_at, capsule_at), (Some(r), Some(c)) if r < c),
             "src/vm must load the root instructions and then the vm capsule; loaded={loaded:?}"
         );
-        for alias in [repo.join("AGENTS.md"), repo.join("src/vm/AGENTS.md")] {
-            let status = sources.sources.iter().find(|source| source.path == alias);
-            assert!(
-                matches!(
-                    status,
-                    Some(InstructionSource {
-                        status: SourceStatus::SupersededBy(_),
-                        ..
-                    })
-                ),
-                "{} must be an alias superseded by its CLAUDE.md, not a second copy: {:?}",
-                alias.display(),
-                sources.sources
-            );
-        }
+        let root_alias = sources
+            .sources
+            .iter()
+            .find(|source| source.path == repo.join("AGENTS.md"));
+        assert!(
+            matches!(
+                root_alias,
+                Some(InstructionSource {
+                    status: SourceStatus::SupersededBy(_),
+                    ..
+                })
+            ),
+            "the root AGENTS.md alias must be superseded by CLAUDE.md, not loaded twice: {:?}",
+            sources.sources
+        );
+        let text = sources.text().expect("instructions must load from src/vm");
+        assert_eq!(
+            text.matches("# vm capsule").count(),
+            1,
+            "the vm capsule text must appear exactly once:\n{text}"
+        );
     }
 
     #[cfg(unix)]

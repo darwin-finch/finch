@@ -26,8 +26,8 @@ scope, dependency limits, and focused tests to everything in this file; it never
 
 | Paths | Capsule |
 |-------|---------|
-| `src/vm/`, `src/lisp/`, `vocabulary/`, `examples/finch/` | [`src/vm/AGENTS.md`](src/vm/CLAUDE.md) |
-| `src/memory/`, `src/memory_status.rs`, `src/workbook.rs` | [`src/memory/AGENTS.md`](src/memory/CLAUDE.md) |
+| `src/vm/`, `src/lisp/`, `vocabulary/`, `examples/finch/` | [`src/vm/AGENTS.md`](src/vm/AGENTS.md) |
+| `src/memory/`, `src/memory_status.rs`, `src/workbook.rs` | [`src/memory/AGENTS.md`](src/memory/AGENTS.md) |
 
 ## Invariants
 

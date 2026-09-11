@@ -357,22 +357,44 @@ def dependency_errors(manifest: dict, edges: dict[tuple[str, str], list[str]]) -
 
 
 def alias_errors(root: Path, files: list[str]) -> list[str]:
-    """In every directory with instruction files, AGENTS.md is a symlink to its sibling CLAUDE.md."""
+    """Every directory with instruction files serves the same text under AGENTS.md and CLAUDE.md.
+
+    The root keeps its historical form: AGENTS.md is a symlink to CLAUDE.md. Nested capsules use
+    the import form instead: AGENTS.md holds the text and CLAUDE.md is exactly `@AGENTS.md`
+    (Claude Code expands the import; AGENTS.md-only agents read the file). Symlinks are not
+    allowed below the root because Finch's `tree-list` rejects them, which would break workspace
+    listing of the capsule's directory.
+    """
     tracked = set(files)
     errors: list[str] = []
     if "AGENTS.md" not in tracked:
         errors.append("AGENTS.md must be a symlink to its sibling CLAUDE.md; the root AGENTS.md is missing")
     for path in files:
         name = Path(path).name
-        sibling = Path(path).with_name("CLAUDE.md" if name == "AGENTS.md" else "AGENTS.md").as_posix()
-        if name == "AGENTS.md":
-            link = root / path
-            if not link.is_symlink() or link.readlink().as_posix() != "CLAUDE.md" or sibling not in tracked:
+        if name not in ("AGENTS.md", "CLAUDE.md"):
+            continue
+        agents = Path(path).with_name("AGENTS.md").as_posix()
+        claude = Path(path).with_name("CLAUDE.md").as_posix()
+        if "/" not in path:  # repository root
+            if name == "AGENTS.md":
+                link = root / path
+                if not link.is_symlink() or link.readlink().as_posix() != "CLAUDE.md":
+                    errors.append("AGENTS.md must be a symlink to its sibling CLAUDE.md so both agent entry points agree")
+            continue
+        if (root / path).is_symlink():
+            errors.append(
+                f"{path} must not be a symlink: Finch's tree-list rejects symlinks, so use a real "
+                "AGENTS.md and a CLAUDE.md containing only `@AGENTS.md`"
+            )
+        elif name == "AGENTS.md" and claude not in tracked:
+            errors.append(f"{path} needs a sibling CLAUDE.md containing only `@AGENTS.md` so Claude Code reads it too")
+        elif name == "CLAUDE.md":
+            text = (root / path).read_text() if (root / path).is_file() else ""
+            if agents not in tracked or text.strip() != "@AGENTS.md":
                 errors.append(
-                    f"{path} must be a symlink to its sibling CLAUDE.md so both agent entry points agree"
+                    f"{path} must contain only `@AGENTS.md` next to a real AGENTS.md, so both agent "
+                    "entry points read one text"
                 )
-        elif name == "CLAUDE.md" and sibling not in tracked:
-            errors.append(f"{path} needs a sibling AGENTS.md symlink so AGENTS.md-only agents read it too")
     return errors
 
 
