@@ -127,3 +127,17 @@ pull request merge is progress, not automatically the completion of a broader ou
 
 At handoff, report the exact commit, tests, remaining risks, ownership, and next action. Do not
 claim provider, model, platform, or release conformance without direct evidence.
+
+## Workspace cleanup
+
+The coordinator owns cleanup; workers never remove another worker's workspace. Create workspaces
+outside the system temporary directory so a reboot cannot discard uncommitted work.
+
+- Remove a verification, mutant, or probe workspace as soon as its verdict is recorded. Its
+  evidence is the recorded result, not the checkout.
+- Remove a worker's workspace, and delete its branch, once `main` contains its accepted change.
+  Squashed integration hides ancestry, so use the recorded integration evidence or a tree
+  comparison against `main` rather than `git branch --merged`.
+- Before removing a workspace that has uncommitted changes or a commit no ref reaches, record that
+  state under `refs/salvage/`.
+- Stop disposable databases and containers with the workspace that created them.
