@@ -5,7 +5,7 @@ use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use crate::runtime::{ProgramRuntime, ProgramSubmission, TypedEffectSink};
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use crate::vm::vocabulary::core_word_documentation as vm_core_word_documentation;
+use crate::vm::core_word_documentation as vm_core_word_documentation;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -128,7 +128,7 @@ fn vocabulary_summary<'a>(
 
 fn vocabulary_surfaces(
     entry: &crate::runtime::VmVocabularyEntry,
-    documentation: crate::vm::vocabulary::CoreWordDocumentation,
+    documentation: crate::vm::CoreWordDocumentation,
 ) -> (String, String, String) {
     if entry.version.is_some() {
         return (

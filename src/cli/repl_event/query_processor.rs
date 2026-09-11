@@ -3338,11 +3338,9 @@ mod tests {
             0,
         );
         assert!(is_repairable_wire_outcome(&outcome));
-        outcome
-            .side_effects
-            .push(crate::vm::interpreter::HostSideEffect::Emit {
-                text: "partial".into(),
-            });
+        outcome.side_effects.push(crate::vm::HostSideEffect::Emit {
+            text: "partial".into(),
+        });
         assert!(!is_repairable_wire_outcome(&outcome));
     }
 
