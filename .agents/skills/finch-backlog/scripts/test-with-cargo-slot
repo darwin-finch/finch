@@ -4,6 +4,7 @@ set -euo pipefail
 # CI jobs may deliberately constrain Cargo itself. The regression owns its
 # default-value fixtures and sets non-default values explicitly where needed.
 unset CARGO_BUILD_JOBS
+unset CI
 
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 source_wrapper="${FINCH_CARGO_SLOT_WRAPPER_UNDER_TEST:-$script_dir/with-cargo-slot}"
@@ -174,6 +175,18 @@ default_target="${default_identity#*|}"
     "default target is not namespaced below the absolute cache root: cache_root=$cache_root actual=$default_target"
 [[ -d "$default_target" ]] || fail \
     "wrapper did not create its selected target directory: target=$default_target"
+
+# Hosted CI owns and restores its target layout separately. An unset target
+# must remain unset there, or supervised/nested commands bypass the restored
+# workspace target and rebuild the dependency graph in a second cache.
+ci_cache_root="$fixture_root/ci-cache-root"
+ci_identity="$(cd "$repo" && CI=true XDG_CACHE_HOME="$ci_cache_root" \
+    env -u CARGO_TARGET_DIR "$wrapper" sh -c \
+    'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "${CARGO_TARGET_DIR+x}"')"
+[[ "$ci_identity" == "$common_dir|" ]] || fail \
+    "CI without an explicit target should retain Cargo workspace-default selection: expected=$common_dir| actual=$ci_identity"
+[[ ! -e "$ci_cache_root/cargo-target" ]] || fail \
+    "CI unexpectedly created the local shared target root: path=$ci_cache_root/cargo-target"
 
 # A separate clone has a different Git common directory. Its default mutable
 # artifacts and lock must not collide with this repository's worktrees.
