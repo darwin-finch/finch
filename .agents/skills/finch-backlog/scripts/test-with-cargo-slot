@@ -156,6 +156,76 @@ launcher="$repo/scripts/test_brains.sh"
 worktree_launcher="$worktree/scripts/test_brains.sh"
 common_dir="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)"
 common_dir="$(cd "$common_dir" && pwd -P)"
+cache_root="$fixture_root/cache-root"
+mkdir -p "$cache_root"
+export XDG_CACHE_HOME="$cache_root"
+
+# The wrapper, rather than shell startup configuration, owns the default target
+# selection. Linked worktrees share the canonical Git common directory and must
+# therefore share one absolute target and lock domain.
+default_identity="$(cd "$repo" && env -u CARGO_TARGET_DIR "$wrapper" sh -c \
+    'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
+worktree_identity="$(cd "$worktree" && env -u CARGO_TARGET_DIR "$wrapper" sh -c \
+    'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
+[[ "$default_identity" == "$worktree_identity" ]] || fail \
+    "linked worktrees selected different lock/target identities: primary=$default_identity linked=$worktree_identity"
+default_target="${default_identity#*|}"
+[[ "$default_target" == "$cache_root/cargo-target/"* ]] || fail \
+    "default target is not namespaced below the absolute cache root: cache_root=$cache_root actual=$default_target"
+[[ -d "$default_target" ]] || fail \
+    "wrapper did not create its selected target directory: target=$default_target"
+
+# A separate clone has a different Git common directory. Its default mutable
+# artifacts and lock must not collide with this repository's worktrees.
+separate_repo="$fixture_root/separate-repo"
+git clone -q "$repo" "$separate_repo"
+separate_wrapper="$separate_repo/.agents/skills/finch-backlog/scripts/with-cargo-slot"
+separate_identity="$(cd "$separate_repo" && env -u CARGO_TARGET_DIR "$separate_wrapper" sh -c \
+    'printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_TARGET_DIR"')"
+[[ "$separate_identity" != "$default_identity" ]] || fail \
+    "separate clones selected the same lock/target identity: primary=$default_identity separate=$separate_identity"
+[[ "${separate_identity%%|*}" != "$common_dir" ]] || fail \
+    "separate clone reused the primary Git common lock namespace: identity=$separate_identity"
+[[ "${separate_identity#*|}" != "$default_target" ]] || fail \
+    "separate clone reused the primary mutable Cargo target: target=$default_target"
+
+# A relative XDG root is ignored in favor of an absolute HOME fallback.
+fallback_home="$fixture_root/fallback-home"
+mkdir -p "$fallback_home"
+fallback_target="$(cd "$repo" && HOME="$fallback_home" XDG_CACHE_HOME=relative-cache \
+    env -u CARGO_TARGET_DIR "$wrapper" sh -c 'printf %s "$CARGO_TARGET_DIR"')"
+[[ "$fallback_target" == "$fallback_home/.cache/cargo-target/"* ]] || fail \
+    "relative XDG_CACHE_HOME did not fall back below absolute HOME: home=$fallback_home actual=$fallback_target"
+
+# Invalid implicit roots fail before the child executes and identify the bad
+# configuration without exposing any unrelated environment contents.
+invalid_child="$fixture_root/invalid-cache-child-ran"
+set +e
+(cd "$repo" && HOME=relative-home XDG_CACHE_HOME=relative-cache env -u CARGO_TARGET_DIR \
+    CHILD_MARKER="$invalid_child" "$wrapper" sh -c ': >"$CHILD_MARKER"' \
+    >"$fixture_root/relative-cache.out" 2>&1)
+status=$?
+set -e
+[[ "$status" -eq 69 ]] || fail \
+    "relative implicit cache roots should fail 69 before execution: status=$status"
+assert_contains "$fixture_root/relative-cache.out" \
+    'HOME must be an absolute path when XDG_CACHE_HOME is unset or relative' \
+    'relative implicit cache-root failure lacked an actionable diagnostic'
+assert_no_file "$invalid_child" 'relative implicit cache roots executed the wrapped child'
+
+blocked_cache_root="$fixture_root/cache-root-file"
+printf 'not a directory\n' >"$blocked_cache_root"
+set +e
+(cd "$repo" && XDG_CACHE_HOME="$blocked_cache_root" env -u CARGO_TARGET_DIR \
+    CHILD_MARKER="$invalid_child" "$wrapper" sh -c ': >"$CHILD_MARKER"' \
+    >"$fixture_root/cache-create.out" 2>&1)
+status=$?
+set -e
+[[ "$status" -eq 69 ]] || fail \
+    "uncreatable default target should fail 69 before execution: status=$status"
+assert_contains "$fixture_root/cache-create.out" 'could not create Cargo target directory' \
+    'cache-directory creation failure lacked an actionable diagnostic'
+assert_no_file "$invalid_child" 'cache-directory creation failure executed the wrapped child'
 
 # Run the real EXIT trap in a bounded subshell. It must release its sentinel,
 # wait for the recorded holder and descendant, and only then remove its root.
@@ -273,8 +343,9 @@ marker="$(cd "$repo" && "$wrapper" sh -c 'printf %s "$FINCH_CARGO_SLOT_HELD"')"
 # A nested wrapper must observe the held marker and execute directly. A
 # nonblocking timeout makes any attempted reacquisition fail deterministically.
 nested="$(cd "$repo" && INNER="$wrapper" "$wrapper" sh -c \
-    'FINCH_CARGO_SLOT_TIMEOUT_SECONDS=not-used "$INNER" sh -c '\''printf "%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS"'\''')"
-[[ "$nested" == "$common_dir|2" ]] || fail "nested entry did not reuse the held slot: expected=$common_dir|2 actual=$nested"
+    'FINCH_CARGO_SLOT_TIMEOUT_SECONDS=not-used "$INNER" sh -c '\''printf "%s|%s|%s" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS" "$CARGO_TARGET_DIR"'\''')"
+[[ "$nested" == "$common_dir|2|$default_target" ]] || fail \
+    "nested entry did not reuse the held slot and target: expected=$common_dir|2|$default_target actual=$nested"
 
 set +e
 (cd "$repo" && FINCH_CARGO_SLOT_HELD="$fixture_root/not-this-repository" "$wrapper" true \
@@ -622,6 +693,19 @@ FAKE_CARGO
 chmod 0755 "$fake_bin/cargo"
 
 run_launcher() {
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR-$case_target}" \
+    PATH="$fake_bin:$PATH" \
+    FAKE_CARGO_LOG="$case_cargo_log" \
+    FAKE_CARGO_TARGET_DIR="$case_target" \
+    FAKE_ARTIFACT_LIST_FILE="$case_artifacts" \
+    FAKE_SUPERVISOR_SOURCE="$case_source" \
+    FAKE_SUPERVISOR_LOG="$case_supervisor_log" \
+    FAKE_SUPERVISOR_ENV_LOG="$case_supervisor_env_log" \
+    "$launcher" "$@"
+}
+
+run_launcher_with_default_target() {
+    env -u CARGO_TARGET_DIR \
     PATH="$fake_bin:$PATH" \
     FAKE_CARGO_LOG="$case_cargo_log" \
     FAKE_CARGO_TARGET_DIR="$case_target" \
@@ -674,7 +758,7 @@ holder_release_open=1
     FAKE_SUPERVISOR_LOG="$holder_args" FINCH_TEST_SUPERVISOR_BIN="$fake_supervisor_source" \
     READY="$holder_ready" RELEASE="$holder_release" OBSERVATION="$holder_observation" \
     "$wrapper" "$launcher" sh -c '
-        printf "%s|%s\n" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS" >"$OBSERVATION"
+        printf "%s|%s|%s\n" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS" "$CARGO_TARGET_DIR" >"$OBSERVATION"
         sh -c '\''printf "ready\n" >"$READY"; IFS= read -r _ <"$RELEASE"'\'' &
         wait "$!"
     ') 8>&- &
@@ -683,12 +767,12 @@ IFS= read -r ready <"$holder_ready"
 [[ "$ready" == ready ]] || fail "launcher holder readiness handshake was corrupted: actual=$ready"
 
 case_dir="$fixture_root/cases/contender"
-case_target="$case_dir/target"
+case_target="$default_target"
 case_cargo_log="$case_dir/cargo.log"
 case_supervisor_log="$case_dir/supervisor.args"
 case_artifacts="$case_dir/artifacts"
 case_source="$case_dir/supervisor-source"
-mkdir -p "$case_target/debug"
+mkdir -p "$case_dir" "$case_target/debug"
 cp "$fake_supervisor_source" "$case_source"
 printf '%s\n' "$case_target/debug/finch-test-supervisor" >"$case_artifacts"
 set +e
@@ -707,10 +791,10 @@ wait "$holder_pid"
 holder_pid=''
 exec 8>&-
 holder_release_open=0
-[[ "$(cat "$holder_observation")" == "$common_dir|2" ]] || fail \
-    "holder lost lock marker/jobs inside nested launcher: actual=$(cat "$holder_observation")"
+[[ "$(cat "$holder_observation")" == "$common_dir|2|$default_target" ]] || fail \
+    "holder lost lock marker/jobs/target inside nested launcher: actual=$(cat "$holder_observation")"
 assert_no_file "$fixture_root/holder-cargo.log" 'explicit holder unexpectedly invoked Cargo'
-printf '%s\0' sh -c $'\n        printf "%s|%s\\n" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS" >"$OBSERVATION"\n        sh -c \'printf "ready\\n" >"$READY"; IFS= read -r _ <"$RELEASE"\' &\n        wait "$!"\n    ' >"$fixture_root/holder-expected.args"
+printf '%s\0' sh -c $'\n        printf "%s|%s|%s\\n" "$FINCH_CARGO_SLOT_HELD" "$CARGO_BUILD_JOBS" "$CARGO_TARGET_DIR" >"$OBSERVATION"\n        sh -c \'printf "ready\\n" >"$READY"; IFS= read -r _ <"$RELEASE"\' &\n        wait "$!"\n    ' >"$fixture_root/holder-expected.args"
 cmp -s "$fixture_root/holder-expected.args" "$holder_args" || fail \
     "explicit holder supervisor did not receive exact argv: expected=$fixture_root/holder-expected.args actual=$holder_args"
 
@@ -751,11 +835,13 @@ assert_contains "$case_cargo_log" $'env-target\t'"$relative_target" 'relative CA
 [[ -n "$(find "$case_target/debug" -name 'finch-test-supervisor-pinned-sha256-*' -type f -print -quit)" ]] ||
     fail "relative target did not receive a content-addressed pin: target=$case_target"
 
-# Cargo-config discovery is represented by metadata without either environment
-# or command selector; the launcher must trust the reported external root.
-prepare_case cargo-config "$fixture_root/cases/cargo-config/target/debug/finch-test-supervisor"
-run_launcher cargo test --lib
-assert_contains "$case_cargo_log" $'env-target\t<unset>' 'Cargo-config target case unexpectedly injected CARGO_TARGET_DIR'
+# The wrapper default intentionally outranks ordinary Cargo-config discovery.
+# The launcher must use that inherited absolute target without synthesizing a
+# command-line selector.
+prepare_case cargo-config "$default_target/debug/finch-test-supervisor"
+run_launcher_with_default_target cargo test --lib
+assert_contains "$case_cargo_log" $'env-target\t'"$default_target" \
+    'wrapper default target was not visible to Cargo metadata/build'
 if grep -F -- '--target-dir' "$case_cargo_log" >/dev/null; then
     fail "Cargo-config target case invented a --target-dir override: log=$case_cargo_log"
 fi
@@ -945,7 +1031,7 @@ pin_count="$(find "$case_target/debug" -name 'finch-test-supervisor-pinned-sha25
 # that do not install `lockf`.
 no_lock_bin="$fixture_root/no-lock-bin"
 mkdir "$no_lock_bin"
-for utility in bash chmod git mktemp perl rm sh tr true uname; do
+for utility in bash chmod git mkdir mktemp perl rm sh tr true uname; do
     ln -s "$(command -v "$utility")" "$no_lock_bin/$utility"
 done
 portable_marker="$(cd "$repo" && PATH="$no_lock_bin" /bin/bash "$wrapper" sh -c \
