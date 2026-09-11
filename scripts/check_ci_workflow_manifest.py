@@ -366,7 +366,7 @@ def shell_segments(command: str) -> tuple[tuple[str, ...], ...]:
     segments: list[tuple[str, ...]] = []
     current: list[str] = []
     for token in tokens:
-        if token in {";", "&", "&&", "||"}:
+        if token in {";", "&", "&&", "|", "|&", "||"}:
             if current:
                 segments.append(tuple(current))
                 current = []
@@ -379,6 +379,10 @@ def shell_segments(command: str) -> tuple[tuple[str, ...], ...]:
 
 def migrated_segment_identity(tokens: tuple[str, ...]) -> str | None:
     """Identify one simple command owned by a migrated workflow boundary."""
+    if tokens[:1] == ("env",):
+        tokens = tokens[1:]
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens = tokens[1:]
     if tokens[:2] == ("cargo", "test"):
         if "--doc" in tokens and "ValidatedProviderRequest" in tokens:
             return "provider-token-doctest"
@@ -484,10 +488,6 @@ def required_step_errors(
 
 def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors: list[str] = []
-    ci = documents.get("ci.yml", {})
-    test_job = ci.get("jobs", {}).get("test") if isinstance(ci.get("jobs"), dict) else None
-    if not isinstance(test_job, dict) or test_job.get("runs-on") != "${{ matrix.os }}":
-        errors.append("ci.yml: migrated boundaries require the canonical matrix test job")
     errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "${{ matrix.os }}"))
 
     errors.extend(required_step_errors(

@@ -403,6 +403,54 @@ class WorkflowContractTests(unittest.TestCase):
         finally:
             repository.close()
 
+        repository = Repository()
+        try:
+            pipeline_doctest = """\n    - name: Duplicate doctest in pipeline
+      run: echo starting | cargo test --doc -- ValidatedProviderRequest
+"""
+            repository.replace(
+                "ci.yml",
+                "\n  runtime-authority:\n",
+                pipeline_doctest + "\n  runtime-authority:\n",
+            )
+            result = repository.check()
+            self.assertNotEqual(0, result.returncode, "pipeline duplicate passed")
+            self.assertIn(
+                "migrated operation ownership count expected=1 actual=2: provider-token-doctest",
+                result.stderr,
+                result.stderr,
+            )
+        finally:
+            repository.close()
+
+    def test_environment_prefixed_migrated_duplicates_are_rejected(self) -> None:
+        for prefix in ("CARGO_TERM_COLOR=always ", "env CARGO_TERM_COLOR=always "):
+            with self.subTest(prefix=prefix):
+                repository = Repository()
+                try:
+                    duplicate = f"""\n    - name: Duplicate environment-prefixed doctest
+      run: {prefix}cargo test --doc -- ValidatedProviderRequest
+"""
+                    repository.replace(
+                        "ci.yml",
+                        "\n  runtime-authority:\n",
+                        duplicate + "\n  runtime-authority:\n",
+                    )
+                    result = repository.check()
+                    self.assertNotEqual(
+                        0,
+                        result.returncode,
+                        f"environment-prefixed duplicate passed: prefix={prefix!r}",
+                    )
+                    self.assertIn(
+                        "migrated operation ownership count expected=1 actual=2: "
+                        "provider-token-doctest",
+                        result.stderr,
+                        result.stderr,
+                    )
+                finally:
+                    repository.close()
+
     def test_quoted_skill_paths_are_not_mistaken_for_an_executed_check(self) -> None:
         prose = """\n    - name: Explain the symlink check
       run: echo 'cd .agents/skills/finch-backlog && pwd -P; cd .claude/skills/finch-backlog && pwd -P'
