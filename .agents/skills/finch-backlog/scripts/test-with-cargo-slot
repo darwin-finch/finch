@@ -14,15 +14,40 @@ holder_descendant_pid=''
 holder_release_open=0
 
 cleanup() {
+    set +e
     if [[ -n "$holder_pid" ]]; then
         if [[ "$holder_release_open" -eq 1 ]]; then
             printf 'cleanup\n' >&8 2>/dev/null || true
-        elif [[ -n "$holder_descendant_pid" ]]; then
-            kill "$holder_descendant_pid" 2>/dev/null || true
-        else
-            kill "$holder_pid" 2>/dev/null || true
         fi
+        [[ -z "$holder_descendant_pid" ]] || kill -TERM "$holder_descendant_pid" 2>/dev/null || true
+        [[ "$holder_release_open" -eq 1 ]] || kill -TERM "$holder_pid" 2>/dev/null || true
+
+        local cleanup_deadline
+        cleanup_deadline="$(monotonic_deadline 1)"
+        while background_job_is_running "$holder_pid"; do
+            monotonic_deadline_passed "$cleanup_deadline" && break
+            sleep 0.02
+        done
+        if background_job_is_running "$holder_pid"; then
+            process_diagnostics cleanup-wrapper "$holder_pid"
+            [[ -z "$holder_descendant_pid" ]] || process_diagnostics cleanup-child "$holder_descendant_pid"
+            kill -KILL "$holder_pid" 2>/dev/null || true
+            [[ -z "$holder_descendant_pid" ]] || kill -KILL "$holder_descendant_pid" 2>/dev/null || true
+        fi
+
+        cleanup_deadline="$(monotonic_deadline 1)"
+        while background_job_is_running "$holder_pid"; do
+            monotonic_deadline_passed "$cleanup_deadline" && break
+            sleep 0.02
+        done
         wait "$holder_pid" 2>/dev/null || true
+        if [[ -n "$holder_descendant_pid" ]]; then
+            wait "$holder_descendant_pid" 2>/dev/null || true
+            if kill -0 "$holder_descendant_pid" 2>/dev/null; then
+                process_diagnostics surviving-cleanup-child "$holder_descendant_pid"
+                kill -KILL "$holder_descendant_pid" 2>/dev/null || true
+            fi
+        fi
     fi
     if [[ "$holder_release_open" -eq 1 ]]; then
         exec 8>&-
@@ -65,6 +90,13 @@ process_diagnostics() {
     local label="$1" pid="$2"
     echo "$label pid=$pid" >&2
     /bin/ps -o pid=,ppid=,state=,command= -p "$pid" >&2 2>/dev/null || true
+}
+
+signal_failure() {
+    local message="$1" expected_status="$2" actual_status="$3"
+    process_diagnostics signal-wrapper "${holder_pid:-<unknown>}"
+    process_diagnostics signal-child "${signal_child_pid:-<unknown>}"
+    fail "$message: signal=${signal_name:-<unknown>} wrapper_pid=${holder_pid:-<unknown>} child_pid=${signal_child_pid:-<unknown>} expected_status=$expected_status actual_status=$actual_status lock=$common_dir/finch-cargo-slot.lock"
 }
 
 assert_contains() {
@@ -135,11 +167,12 @@ set +e
     exit 97
 ) &
 cleanup_probe_pid=$!
-for _ in $(seq 1 250); do
-    ! kill -0 "$cleanup_probe_pid" 2>/dev/null && break
+cleanup_probe_deadline="$(monotonic_deadline 5)"
+while background_job_is_running "$cleanup_probe_pid"; do
+    monotonic_deadline_passed "$cleanup_probe_deadline" && break
     sleep 0.02
 done
-if kill -0 "$cleanup_probe_pid" 2>/dev/null; then
+if background_job_is_running "$cleanup_probe_pid"; then
     kill "$cleanup_probe_pid" 2>/dev/null || true
     wait "$cleanup_probe_pid" 2>/dev/null || true
     set -e
@@ -154,6 +187,50 @@ read -r cleanup_holder cleanup_descendant cleanup_root <"$cleanup_record"
 for cleaned_pid in "$cleanup_holder" "$cleanup_descendant"; do
     ! kill -0 "$cleaned_pid" 2>/dev/null || fail \
         "cleanup probe returned before a recorded process exited: pid=$cleaned_pid record=$cleanup_record"
+done
+
+# A holder and recorded child which both ignore TERM must still be killed,
+# reaped, and removed within cleanup's bounded escalation path.
+stubborn_record="$fixture_root/stubborn-cleanup.record"
+stubborn_probe_root="$fixture_root/stubborn-cleanup-root"
+set +e
+(
+    fixture_root="$stubborn_probe_root"
+    holder_release_open=0
+    mkdir -p "$fixture_root"
+    trap cleanup EXIT
+    stubborn_holder_ready="$fixture_root/holder.ready"
+    stubborn_child_ready="$fixture_root/child.ready"
+    sh -c 'trap "" TERM; printf "ready\n" >"$1"; while :; do sleep 1; done' sh "$stubborn_holder_ready" &
+    holder_pid=$!
+    sh -c 'trap "" TERM; printf "ready\n" >"$1"; while :; do sleep 1; done' sh "$stubborn_child_ready" &
+    holder_descendant_pid=$!
+    wait_for_file "$stubborn_holder_ready" 1 || exit 95
+    wait_for_file "$stubborn_child_ready" 1 || exit 95
+    printf '%s %s %s\n' "$holder_pid" "$holder_descendant_pid" "$fixture_root" >"$stubborn_record"
+    exit 96
+) &
+stubborn_probe_pid=$!
+stubborn_deadline="$(monotonic_deadline 5)"
+while background_job_is_running "$stubborn_probe_pid"; do
+    monotonic_deadline_passed "$stubborn_deadline" && break
+    sleep 0.02
+done
+if background_job_is_running "$stubborn_probe_pid"; then
+    kill -KILL "$stubborn_probe_pid" 2>/dev/null || true
+    wait "$stubborn_probe_pid" 2>/dev/null || true
+    set -e
+    fail "stubborn cleanup did not terminate within a real five-second deadline: pid=$stubborn_probe_pid record=$stubborn_record"
+fi
+wait "$stubborn_probe_pid"
+status=$?
+set -e
+[[ "$status" -eq 96 ]] || fail "stubborn cleanup changed forced failure status: expected=96 actual=$status"
+read -r stubborn_holder stubborn_child stubborn_root <"$stubborn_record"
+[[ ! -e "$stubborn_root" ]] || fail "stubborn cleanup left its disposable directory: path=$stubborn_root"
+for cleaned_pid in "$stubborn_holder" "$stubborn_child"; do
+    ! kill -0 "$cleaned_pid" 2>/dev/null || fail \
+        "stubborn cleanup returned before a recorded process exited: pid=$cleaned_pid record=$stubborn_record"
 done
 
 jobs="$(cd "$repo" && env -u CARGO_BUILD_JOBS "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
@@ -263,6 +340,8 @@ for signal_case in $signal_cases; do
     signal_number="${signal_case##*:}"
     signal_ready="$fixture_root/signal-$signal_name.ready"
     signal_observed="$fixture_root/signal-$signal_name.observed"
+    expected_status=$((128 + signal_number))
+    signal_child_pid=''
     (
         cd "$repo"
         exec env SIGNAL="$signal_name" READY="$signal_ready" OBSERVED="$signal_observed" \
@@ -271,44 +350,37 @@ for signal_case in $signal_cases; do
     ) &
     holder_pid=$!
     if ! wait_for_file "$signal_ready" 5; then
-        process_diagnostics wrapper "$holder_pid"
-        kill -TERM "$holder_pid" 2>/dev/null || true
-        wait "$holder_pid" 2>/dev/null || true
-        holder_pid=''
-        fail "signal proxy did not become ready within a real five-second deadline: signal=$signal_name"
+        signal_failure "signal proxy did not become ready within a real five-second deadline" \
+            "$expected_status" '<not-ready>'
     fi
     signal_state="$(cat "$signal_ready")"
     signal_child_pid="$(printf '%s\n' "$signal_state" | sed -n 's/^pid=\([0-9][0-9]*\) .*/\1/p')"
-    [[ "$signal_child_pid" =~ ^[1-9][0-9]*$ ]] || fail \
-        "signal command readiness omitted its PID: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid"
+    [[ "$signal_child_pid" =~ ^[1-9][0-9]*$ ]] || signal_failure \
+        "signal command readiness omitted its PID; readiness=$signal_state" \
+        "$expected_status" '<not-waited>'
     holder_descendant_pid="$signal_child_pid"
     if [[ "${FINCH_CARGO_SLOT_ALLOW_BLOCKED_HANDLED:-0}" != 1 ]]; then
-        [[ "$signal_state" == *"handled_blocked=0"* ]] || fail \
-            "handled signal remained blocked in command: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid child_pid=$signal_child_pid"
+        [[ "$signal_state" == *"handled_blocked=0"* ]] || signal_failure \
+            "handled signal remained blocked in command; readiness=$signal_state" \
+            "$expected_status" '<not-waited>'
     fi
-    [[ "$signal_state" == *"usr1_blocked=1"* ]] || fail \
-        "non-handled SIGUSR1 mask was not preserved in command: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid child_pid=$signal_child_pid"
+    [[ "$signal_state" == *"usr1_blocked=1"* ]] || signal_failure \
+        "non-handled SIGUSR1 mask was not preserved in command; readiness=$signal_state" \
+        "$expected_status" '<not-waited>'
     kill -USR1 "$holder_pid"
     sleep 0.1
     background_job_is_running "$holder_pid" || {
         kill -TERM "$signal_child_pid" 2>/dev/null || true
-        wait "$holder_pid" 2>/dev/null || true
-        holder_pid=''
-        holder_descendant_pid=''
-        fail "non-handled SIGUSR1 was unblocked in proxy: signal=$signal_name child_pid=$signal_child_pid"
+        signal_failure "non-handled SIGUSR1 was unblocked in proxy" \
+            "$expected_status" '<proxy-terminated-before-wait>'
     }
     kill -s "$signal_name" "$holder_pid"
     echo "signal phase emitted: signal=$signal_name wrapper_pid=$holder_pid child_pid=$signal_child_pid" >&2
     signal_deadline="$(monotonic_deadline 5)"
     while background_job_is_running "$holder_pid"; do
         if monotonic_deadline_passed "$signal_deadline"; then
-            process_diagnostics wrapper "$holder_pid"
-            process_diagnostics child "$signal_child_pid"
-            kill -TERM "$holder_pid" "$signal_child_pid" 2>/dev/null || true
-            wait "$holder_pid" 2>/dev/null || true
-            holder_pid=''
-            holder_descendant_pid=''
-            fail "signal proxy and direct child exceeded a real five-second deadline after emission: signal=$signal_name"
+            signal_failure "signal proxy and direct child exceeded a real five-second deadline after emission" \
+                "$expected_status" '<still-running>'
         fi
         sleep 0.02
     done
@@ -316,17 +388,19 @@ for signal_case in $signal_cases; do
     wait "$holder_pid"
     status=$?
     set -e
+    [[ "$status" -eq "$expected_status" ]] || signal_failure \
+        "signal proxy changed child status" "$expected_status" "$status"
+    if [[ ! -f "$signal_observed" ]] || ! grep -F -- "$signal_name" "$signal_observed" >/dev/null; then
+        [[ ! -f "$signal_observed" ]] || sed 's/^/  /' "$signal_observed" >&2
+        signal_failure "signal proxy did not forward the handled signal to its foreground child" \
+            "$expected_status" "$status"
+    fi
+    ! kill -0 "$signal_child_pid" 2>/dev/null || signal_failure \
+        "signal proxy returned before its direct child was reaped" "$expected_status" "$status"
+    (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) || signal_failure \
+        "slot remained held after signal proxy reaped child" "$expected_status" "$status"
     holder_pid=''
     holder_descendant_pid=''
-    expected_status=$((128 + signal_number))
-    [[ "$status" -eq "$expected_status" ]] || fail \
-        "signal proxy changed child status: signal=$signal_name expected=$expected_status actual=$status"
-    assert_contains "$signal_observed" "$signal_name" \
-        "signal proxy did not forward $signal_name to its foreground child"
-    ! kill -0 "$signal_child_pid" 2>/dev/null || fail \
-        "signal proxy returned before its direct child was reaped: signal=$signal_name child_pid=$signal_child_pid"
-    (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
-        fail "slot remained held after signal proxy reaped child: signal=$signal_name lock=$common_dir/finch-cargo-slot.lock"
 done
 
 # Force a signal into the fork window: the child publishes its PID from a
