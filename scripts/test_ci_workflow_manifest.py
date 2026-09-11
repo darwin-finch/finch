@@ -154,6 +154,17 @@ class WorkflowContractTests(unittest.TestCase):
             "Focused spawn tests (windows-2022)",
         )
 
+    def test_cargo_slot_runs_on_exact_supported_linux_and_macos_images(self) -> None:
+        self.repository.replace(
+            "issue-245-cargo-slot.yml", "os: [ubuntu-24.04, macos-14]",
+            "os: [ubuntu-latest, macos-latest]",
+        )
+        self.assert_fails(
+            "issue-245-cargo-slot.yml: expanded check allocation changed",
+            "macos-14 repository-wide lock", "macos-latest repository-wide lock",
+            "ubuntu-24.04 repository-wide lock", "ubuntu-latest repository-wide lock",
+        )
+
     def test_duplicate_expanded_check_names_fail_actionably(self) -> None:
         self.repository.replace(
             "issue-46-atomic-conversation.yml", "os: [ubuntu-24.04, macos-14]",

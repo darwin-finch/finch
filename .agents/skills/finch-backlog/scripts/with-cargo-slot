@@ -102,7 +102,7 @@ esac
 # Acquire nonblocking in a bounded loop, then retain the lock in a supervising
 # parent. The command child closes the lock descriptor before exec so a
 # compiler cache or other daemon cannot keep the slot after Cargo exits.
-exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -MPOSIX=SIG_BLOCK,SIG_SETMASK,SIGHUP,SIGINT,SIGQUIT,SIGTERM -e '
+exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -MPOSIX=SIG_BLOCK,SIG_SETMASK,SIG_UNBLOCK,SIGHUP,SIGINT,SIGQUIT,SIGTERM -e '
     use strict;
     use warnings;
     my ($timeout, $path, @command) = @ARGV;
@@ -137,12 +137,19 @@ exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -MPOSIX=SIG_BLOCK,SIG_SETMASK,
         $SIG{$_} = "DEFAULT" for qw(HUP INT QUIT TERM);
         POSIX::sigprocmask(SIG_SETMASK, $previous)
             or die "with-cargo-slot: could not restore child signal mask: $!\n";
+        # The proxy promises to handle these signals even when its caller had
+        # one blocked. Restoring the caller mask and then removing only the
+        # handled set preserves every unrelated inherited mask bit.
+        POSIX::sigprocmask(SIG_UNBLOCK, $blocked)
+            or die "with-cargo-slot: could not unblock child proxy signals: $!\n";
         exec {$command[0]} @command
             or die "with-cargo-slot: could not execute $command[0]: $!\n";
     }
     $child = $pid;
     POSIX::sigprocmask(SIG_SETMASK, $previous)
         or die "with-cargo-slot: could not restore parent signal mask: $!\n";
+    POSIX::sigprocmask(SIG_UNBLOCK, $blocked)
+        or die "with-cargo-slot: could not unblock parent proxy signals: $!\n";
     kill $_, $child for @pending;
     my $waited;
     do {

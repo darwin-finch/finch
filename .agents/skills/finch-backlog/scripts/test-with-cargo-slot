@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CI jobs may deliberately constrain Cargo itself. The regression owns its
+# default-value fixtures and sets non-default values explicitly where needed.
+unset CARGO_BUILD_JOBS
+
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
-source_wrapper="$script_dir/with-cargo-slot"
+source_wrapper="${FINCH_CARGO_SLOT_WRAPPER_UNDER_TEST:-$script_dir/with-cargo-slot}"
 source_root="$(cd "$script_dir/../../../.." && pwd -P)"
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/finch cargo slot [test].XXXXXX")"
 holder_pid=''
@@ -10,26 +14,107 @@ holder_descendant_pid=''
 holder_release_open=0
 
 cleanup() {
+    set +e
+    local cleanup_incomplete=0
     if [[ -n "$holder_pid" ]]; then
         if [[ "$holder_release_open" -eq 1 ]]; then
             printf 'cleanup\n' >&8 2>/dev/null || true
-        elif [[ -n "$holder_descendant_pid" ]]; then
-            kill "$holder_descendant_pid" 2>/dev/null || true
-        else
-            kill "$holder_pid" 2>/dev/null || true
         fi
-        wait "$holder_pid" 2>/dev/null || true
+        [[ -z "$holder_descendant_pid" ]] || kill -TERM "$holder_descendant_pid" 2>/dev/null || true
+        [[ "$holder_release_open" -eq 1 ]] || kill -TERM "$holder_pid" 2>/dev/null || true
+
+        local cleanup_deadline
+        cleanup_deadline="$(monotonic_deadline 1)"
+        while background_job_is_running "$holder_pid"; do
+            monotonic_deadline_passed "$cleanup_deadline" && break
+            sleep 0.02
+        done
+        if background_job_is_running "$holder_pid"; then
+            process_diagnostics cleanup-wrapper "$holder_pid"
+            [[ -z "$holder_descendant_pid" ]] || process_diagnostics cleanup-child "$holder_descendant_pid"
+            kill -KILL "$holder_pid" 2>/dev/null || true
+            [[ -z "$holder_descendant_pid" ]] || kill -KILL "$holder_descendant_pid" 2>/dev/null || true
+        fi
+
+        cleanup_deadline="$(monotonic_deadline 1)"
+        while background_job_is_running "$holder_pid"; do
+            monotonic_deadline_passed "$cleanup_deadline" && break
+            sleep 0.02
+        done
+        if background_job_is_running "$holder_pid"; then
+            process_diagnostics surviving-cleanup-wrapper "$holder_pid"
+            cleanup_incomplete=1
+        else
+            wait "$holder_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$holder_descendant_pid" ]]; then
+            if ! background_job_is_running "$holder_descendant_pid"; then
+                wait "$holder_descendant_pid" 2>/dev/null || true
+            fi
+            cleanup_deadline="$(monotonic_deadline 1)"
+            while kill -0 "$holder_descendant_pid" 2>/dev/null; do
+                monotonic_deadline_passed "$cleanup_deadline" && break
+                sleep 0.02
+            done
+            if kill -0 "$holder_descendant_pid" 2>/dev/null; then
+                process_diagnostics surviving-cleanup-child "$holder_descendant_pid"
+                kill -KILL "$holder_descendant_pid" 2>/dev/null || true
+                cleanup_incomplete=1
+            fi
+        fi
     fi
     if [[ "$holder_release_open" -eq 1 ]]; then
         exec 8>&-
     fi
-    rm -rf -- "$fixture_root"
+    if [[ "$cleanup_incomplete" -eq 0 ]]; then
+        rm -rf -- "$fixture_root"
+    else
+        echo "with-cargo-slot regression: cleanup remained incomplete after bounded escalation; preserving fixture=$fixture_root" >&2
+    fi
 }
 trap cleanup EXIT
 
 fail() {
     echo "with-cargo-slot regression: $*" >&2
     exit 1
+}
+
+monotonic_deadline() {
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+        'printf "%.9f\n", clock_gettime(CLOCK_MONOTONIC) + $ARGV[0]' "$1"
+}
+
+monotonic_deadline_passed() {
+    perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e \
+        'exit(clock_gettime(CLOCK_MONOTONIC) >= $ARGV[0] ? 0 : 1)' "$1"
+}
+
+wait_for_file() {
+    local file="$1" seconds="$2"
+    local deadline
+    deadline="$(monotonic_deadline "$seconds")"
+    while [[ ! -s "$file" ]]; do
+        monotonic_deadline_passed "$deadline" && return 1
+        sleep 0.02
+    done
+}
+
+background_job_is_running() {
+    local pid="$1"
+    jobs -pr | grep -Fx -- "$pid" >/dev/null
+}
+
+process_diagnostics() {
+    local label="$1" pid="$2"
+    echo "$label pid=$pid" >&2
+    /bin/ps -o pid=,ppid=,state=,command= -p "$pid" >&2 2>/dev/null || true
+}
+
+signal_failure() {
+    local message="$1" expected_status="$2" actual_status="$3"
+    process_diagnostics signal-wrapper "${holder_pid:-<unknown>}"
+    process_diagnostics signal-child "${signal_child_pid:-<unknown>}"
+    fail "$message: signal=${signal_name:-<unknown>} wrapper_pid=${holder_pid:-<unknown>} child_pid=${signal_child_pid:-<unknown>} expected_status=$expected_status actual_status=$actual_status lock=$common_dir/finch-cargo-slot.lock"
 }
 
 assert_contains() {
@@ -95,16 +180,16 @@ set +e
         wait "$child"
     ' sh "$cleanup_record" "$cleanup_release" "$fixture_root" 8>&- &
     holder_pid=$!
-    for _ in $(seq 1 100); do [[ -s "$cleanup_record" ]] && break; sleep 0.02; done
-    [[ -s "$cleanup_record" ]] || exit 98
+    wait_for_file "$cleanup_record" 2 || exit 98
     exit 97
 ) &
 cleanup_probe_pid=$!
-for _ in $(seq 1 250); do
-    ! kill -0 "$cleanup_probe_pid" 2>/dev/null && break
+cleanup_probe_deadline="$(monotonic_deadline 5)"
+while background_job_is_running "$cleanup_probe_pid"; do
+    monotonic_deadline_passed "$cleanup_probe_deadline" && break
     sleep 0.02
 done
-if kill -0 "$cleanup_probe_pid" 2>/dev/null; then
+if background_job_is_running "$cleanup_probe_pid"; then
     kill "$cleanup_probe_pid" 2>/dev/null || true
     wait "$cleanup_probe_pid" 2>/dev/null || true
     set -e
@@ -119,6 +204,62 @@ read -r cleanup_holder cleanup_descendant cleanup_root <"$cleanup_record"
 for cleaned_pid in "$cleanup_holder" "$cleanup_descendant"; do
     ! kill -0 "$cleaned_pid" 2>/dev/null || fail \
         "cleanup probe returned before a recorded process exited: pid=$cleaned_pid record=$cleanup_record"
+done
+
+# A holder and recorded child which both ignore TERM must still be killed,
+# reaped, and removed within cleanup's bounded escalation path.
+stubborn_record="$fixture_root/stubborn-cleanup.record"
+stubborn_probe_root="$fixture_root/stubborn-cleanup-root"
+set +e
+(
+    fixture_root="$stubborn_probe_root"
+    holder_release_open=0
+    mkdir -p "$fixture_root"
+    trap cleanup EXIT
+    stubborn_holder_ready="$fixture_root/holder.ready"
+    stubborn_child_ready="$fixture_root/child.ready"
+    READY="$stubborn_holder_ready" perl -e '
+        $SIG{TERM} = "IGNORE";
+        open my $ready, ">", $ENV{READY} or die "ready record failed: $!";
+        print {$ready} "ready\n";
+        close $ready;
+        select undef, undef, undef, 3600 while 1;
+    ' &
+    holder_pid=$!
+    READY="$stubborn_child_ready" perl -e '
+        $SIG{TERM} = "IGNORE";
+        open my $ready, ">", $ENV{READY} or die "ready record failed: $!";
+        print {$ready} "ready\n";
+        close $ready;
+        select undef, undef, undef, 3600 while 1;
+    ' &
+    holder_descendant_pid=$!
+    wait_for_file "$stubborn_holder_ready" 1 || exit 95
+    wait_for_file "$stubborn_child_ready" 1 || exit 95
+    printf '%s %s %s\n' "$holder_pid" "$holder_descendant_pid" "$fixture_root" >"$stubborn_record"
+    exit 96
+) &
+stubborn_probe_pid=$!
+stubborn_deadline="$(monotonic_deadline 5)"
+while background_job_is_running "$stubborn_probe_pid"; do
+    monotonic_deadline_passed "$stubborn_deadline" && break
+    sleep 0.02
+done
+if background_job_is_running "$stubborn_probe_pid"; then
+    kill -KILL "$stubborn_probe_pid" 2>/dev/null || true
+    wait "$stubborn_probe_pid" 2>/dev/null || true
+    set -e
+    fail "stubborn cleanup did not terminate within a real five-second deadline: pid=$stubborn_probe_pid record=$stubborn_record"
+fi
+wait "$stubborn_probe_pid"
+status=$?
+set -e
+[[ "$status" -eq 96 ]] || fail "stubborn cleanup changed forced failure status: expected=96 actual=$status"
+read -r stubborn_holder stubborn_child stubborn_root <"$stubborn_record"
+[[ ! -e "$stubborn_root" ]] || fail "stubborn cleanup left its disposable directory: path=$stubborn_root"
+for cleaned_pid in "$stubborn_holder" "$stubborn_child"; do
+    ! kill -0 "$cleaned_pid" 2>/dev/null || fail \
+        "stubborn cleanup returned before a recorded process exited: pid=$cleaned_pid record=$stubborn_record"
 done
 
 jobs="$(cd "$repo" && env -u CARGO_BUILD_JOBS "$wrapper" sh -c 'printf %s "$CARGO_BUILD_JOBS"')"
@@ -176,47 +317,119 @@ holder_descendant_pid="$linger_pid"
 kill "$linger_pid" 2>/dev/null || true
 holder_descendant_pid=''
 
-# The new lock-holder PID is a signal proxy. Signal only that parent, prove the
-# foreground child observes the signal, preserve shell-visible status, reap it,
-# and release the slot before the next worktree enters.
-for signal_case in HUP:1 INT:2 QUIT:3 TERM:15; do
+# The new lock-holder PID is a signal proxy. Enter through a bootstrap which
+# blocks the selected handled signal and SIGUSR1. The proxy must unblock only
+# its handled set in itself and the command, leaving SIGUSR1 blocked in both.
+signal_fixture_dir="$fixture_root/signal-fixture"
+mkdir "$signal_fixture_dir"
+cat >"$signal_fixture_dir/block-and-exec.pl" <<'SIGNAL_BOOTSTRAP'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use POSIX qw(SIG_BLOCK SIGHUP SIGINT SIGQUIT SIGTERM SIGUSR1);
+my ($signal_name, $wrapper, @command) = @ARGV;
+my %number = (HUP => SIGHUP, INT => SIGINT, QUIT => SIGQUIT, TERM => SIGTERM);
+die "unknown signal $signal_name\n" unless exists $number{$signal_name};
+my $blocked = POSIX::SigSet->new($number{$signal_name}, SIGUSR1);
+POSIX::sigprocmask(SIG_BLOCK, $blocked)
+    or die "could not install inherited signal mask: $!\n";
+exec {$wrapper} $wrapper, @command
+    or die "could not exec wrapper $wrapper: $!\n";
+SIGNAL_BOOTSTRAP
+cat >"$signal_fixture_dir/observe-signal.pl" <<'SIGNAL_CHILD'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use POSIX qw(SIG_BLOCK SIGHUP SIGINT SIGQUIT SIGTERM SIGUSR1);
+my %number = (HUP => SIGHUP, INT => SIGINT, QUIT => SIGQUIT, TERM => SIGTERM);
+my $signal_name = $ENV{SIGNAL};
+die "unknown signal $signal_name\n" unless exists $number{$signal_name};
+$SIG{$signal_name} = sub {
+    open my $observed, ">", $ENV{OBSERVED} or die "observed record failed: $!";
+    print {$observed} "$signal_name\n";
+    close $observed;
+    $SIG{$signal_name} = "DEFAULT";
+    kill $number{$signal_name}, $$;
+};
+my $empty = POSIX::SigSet->new();
+my $current = POSIX::SigSet->new();
+POSIX::sigprocmask(SIG_BLOCK, $empty, $current)
+    or die "could not read command signal mask: $!\n";
+open my $ready, ">", $ENV{READY} or die "ready record failed: $!";
+printf {$ready} "pid=%d handled_blocked=%d usr1_blocked=%d\n",
+    $$, $current->ismember($number{$signal_name}), $current->ismember(SIGUSR1);
+close $ready;
+sleep 1 while 1;
+SIGNAL_CHILD
+chmod 0755 "$signal_fixture_dir/block-and-exec.pl" "$signal_fixture_dir/observe-signal.pl"
+
+signal_cases="${FINCH_CARGO_SLOT_SIGNAL_CASES:-HUP:1 INT:2 QUIT:3 TERM:15}"
+for signal_case in $signal_cases; do
     signal_name="${signal_case%%:*}"
     signal_number="${signal_case##*:}"
     signal_ready="$fixture_root/signal-$signal_name.ready"
     signal_observed="$fixture_root/signal-$signal_name.observed"
+    expected_status=$((128 + signal_number))
+    signal_child_pid=''
     (
         cd "$repo"
         exec env SIGNAL="$signal_name" READY="$signal_ready" OBSERVED="$signal_observed" \
-            "$wrapper" sh -c '
-                trap '\''
-                    printf "%s\n" "$SIGNAL" >"$OBSERVED"
-                    trap - "$SIGNAL"
-                    kill -s "$SIGNAL" "$$"
-                '\'' "$SIGNAL"
-                printf "ready\n" >"$READY"
-                while :; do sleep 1; done
-            '
+            perl "$signal_fixture_dir/block-and-exec.pl" "$signal_name" "$wrapper" \
+            perl "$signal_fixture_dir/observe-signal.pl"
     ) &
     holder_pid=$!
-    for _ in $(seq 1 250); do [[ -s "$signal_ready" ]] && break; sleep 0.02; done
-    [[ -s "$signal_ready" ]] || fail \
-        "signal proxy did not become ready within five seconds: signal=$signal_name wrapper_pid=$holder_pid"
+    if ! wait_for_file "$signal_ready" 5; then
+        signal_failure "signal proxy did not become ready within a real five-second deadline" \
+            "$expected_status" '<not-ready>'
+    fi
     signal_state="$(cat "$signal_ready")"
-    [[ "$signal_state" == ready ]] || fail \
-        "signal proxy readiness failed: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid"
+    signal_child_pid="$(printf '%s\n' "$signal_state" | sed -n 's/^pid=\([0-9][0-9]*\) .*/\1/p')"
+    [[ "$signal_child_pid" =~ ^[1-9][0-9]*$ ]] || signal_failure \
+        "signal command readiness omitted its PID; readiness=$signal_state" \
+        "$expected_status" '<not-waited>'
+    holder_descendant_pid="$signal_child_pid"
+    if [[ "${FINCH_CARGO_SLOT_ALLOW_BLOCKED_HANDLED:-0}" != 1 ]]; then
+        [[ "$signal_state" == *"handled_blocked=0"* ]] || signal_failure \
+            "handled signal remained blocked in command; readiness=$signal_state" \
+            "$expected_status" '<not-waited>'
+    fi
+    [[ "$signal_state" == *"usr1_blocked=1"* ]] || signal_failure \
+        "non-handled SIGUSR1 mask was not preserved in command; readiness=$signal_state" \
+        "$expected_status" '<not-waited>'
+    kill -USR1 "$holder_pid"
+    sleep 0.1
+    background_job_is_running "$holder_pid" || {
+        kill -TERM "$signal_child_pid" 2>/dev/null || true
+        signal_failure "non-handled SIGUSR1 was unblocked in proxy" \
+            "$expected_status" '<proxy-terminated-before-wait>'
+    }
     kill -s "$signal_name" "$holder_pid"
+    echo "signal phase emitted: signal=$signal_name wrapper_pid=$holder_pid child_pid=$signal_child_pid" >&2
+    signal_deadline="$(monotonic_deadline 5)"
+    while background_job_is_running "$holder_pid"; do
+        if monotonic_deadline_passed "$signal_deadline"; then
+            signal_failure "signal proxy and direct child exceeded a real five-second deadline after emission" \
+                "$expected_status" '<still-running>'
+        fi
+        sleep 0.02
+    done
     set +e
     wait "$holder_pid"
     status=$?
     set -e
+    [[ "$status" -eq "$expected_status" ]] || signal_failure \
+        "signal proxy changed child status" "$expected_status" "$status"
+    if [[ ! -f "$signal_observed" ]] || ! grep -F -- "$signal_name" "$signal_observed" >/dev/null; then
+        [[ ! -f "$signal_observed" ]] || sed 's/^/  /' "$signal_observed" >&2
+        signal_failure "signal proxy did not forward the handled signal to its foreground child" \
+            "$expected_status" "$status"
+    fi
+    ! kill -0 "$signal_child_pid" 2>/dev/null || signal_failure \
+        "signal proxy returned before its direct child was reaped" "$expected_status" "$status"
+    (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) || signal_failure \
+        "slot remained held after signal proxy reaped child" "$expected_status" "$status"
     holder_pid=''
-    expected_status=$((128 + signal_number))
-    [[ "$status" -eq "$expected_status" ]] || fail \
-        "signal proxy changed child status: signal=$signal_name expected=$expected_status actual=$status"
-    assert_contains "$signal_observed" "$signal_name" \
-        "signal proxy did not forward $signal_name to its foreground child"
-    (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
-        fail "slot remained held after signal proxy reaped child: signal=$signal_name lock=$common_dir/finch-cargo-slot.lock"
+    holder_descendant_pid=''
 done
 
 # Force a signal into the fork window: the child publishes its PID from a
