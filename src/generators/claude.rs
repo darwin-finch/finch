@@ -2,11 +2,12 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::claude::{ClaudeClient, ContentBlock, Message, MessageRequest};
-use crate::context::collect_claude_md_context;
+use crate::context::{collect_instructions, InstructionSources};
 use crate::tools::types::ToolDefinition;
 
 use super::{
@@ -104,14 +105,22 @@ pub struct ClaudeGenerator {
     capabilities: GeneratorCapabilities,
     /// Working directory context injected into the system prompt.
     cwd: Option<String>,
-    /// Concatenated contents of any CLAUDE.md / FINCH.md files found at startup.
-    claude_md_context: Option<String>,
+    /// Project instructions found at construction, with where each came from.
+    instructions: InstructionSources,
 }
 
 impl ClaudeGenerator {
     pub fn new(client: Arc<ClaudeClient>) -> Self {
-        let cwd = std::env::current_dir().ok();
-        let claude_md_context = cwd.as_deref().and_then(collect_claude_md_context);
+        Self::new_in(client, std::env::current_dir().ok(), dirs::home_dir())
+    }
+
+    /// Build a generator whose instructions are collected from `cwd`, reading user-level files
+    /// under `home`. [`ClaudeGenerator::new`] passes the process working and home directories.
+    pub fn new_in(client: Arc<ClaudeClient>, cwd: Option<PathBuf>, home: Option<PathBuf>) -> Self {
+        let instructions = cwd
+            .as_deref()
+            .map(|cwd| collect_instructions(cwd, home.as_deref()))
+            .unwrap_or_default();
         let cwd_str = cwd.map(|p| p.display().to_string());
         Self {
             client,
@@ -122,12 +131,17 @@ impl ClaudeGenerator {
                 max_context_messages: Some(50),
             },
             cwd: cwd_str,
-            claude_md_context,
+            instructions,
         }
     }
 
+    /// The instruction files found at construction and what happened to each.
+    pub fn instruction_sources(&self) -> &InstructionSources {
+        &self.instructions
+    }
+
     fn system_prompt(&self) -> String {
-        build_system_prompt(self.cwd.as_deref(), self.claude_md_context.as_deref())
+        build_system_prompt(self.cwd.as_deref(), self.instructions.text())
     }
 
     /// Convert Claude MessageResponse to unified GeneratorResponse
@@ -300,5 +314,113 @@ mod tests {
         for supported in ["/say <text>", "@finch <prompt>", "/who", "/whois <subject>"] {
             assert!(COMMAND_REFERENCE.contains(supported));
         }
+    }
+
+    /// Records the exact provider request `ClaudeGenerator` sends.
+    #[cfg(unix)]
+    struct RecordingProvider {
+        requests: std::sync::Mutex<Vec<crate::providers::ProviderRequest>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for RecordingProvider {
+        async fn send_message_validated(
+            &self,
+            request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<crate::providers::ProviderResponse> {
+            let request = request.into_request_for(self)?;
+            let model = request.model.clone();
+            self.requests.lock().unwrap().push(request);
+            Ok(crate::providers::ProviderResponse {
+                id: "recorded".into(),
+                model,
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                stop_reason: Some("end_turn".into()),
+                role: "assistant".into(),
+                provider: "recording".into(),
+                usage: None,
+                allowance: None,
+            })
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            _request: crate::providers::ValidatedProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
+            anyhow::bail!("recording provider does not stream")
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn default_model(&self) -> &str {
+            "recording-model"
+        }
+
+        fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
+            use crate::providers::{CapabilitySupport, ModelCapabilities, ReasoningCapability};
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-09-11",
+                "test fixture",
+                CapabilitySupport::Unsupported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-09-11", "test fixture"),
+                Some(100_000),
+                Some(10_000),
+                None,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_request_carries_symlinked_agents_md_once_and_nested_rules_last() {
+        let project = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let nested = project.path().join("src/vm");
+        std::fs::create_dir_all(&nested).unwrap();
+        // Finch's own layout: AGENTS.md is a symlink to CLAUDE.md, plus a nested capsule.
+        std::fs::write(project.path().join("CLAUDE.md"), "ROOT-INVARIANT-7f3a").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", project.path().join("AGENTS.md")).unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "VM-CAPSULE-19c2").unwrap();
+
+        let provider = Arc::new(RecordingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let client = Arc::new(ClaudeClient::with_shared_provider(provider.clone()));
+        let generator = ClaudeGenerator::new_in(
+            client,
+            Some(nested.clone()),
+            Some(home.path().to_path_buf()),
+        );
+        generator
+            .generate(vec![Message::user("hello")], None)
+            .await
+            .expect("recording provider accepts the request");
+
+        let requests = provider.requests.lock().unwrap();
+        let system = requests
+            .first()
+            .and_then(|request| request.system.clone())
+            .expect("the provider request must carry a system prompt");
+        assert_eq!(
+            system.matches("ROOT-INVARIANT-7f3a").count(),
+            1,
+            "a symlinked AGENTS.md must reach the provider exactly once; sources={:?}\n{system}",
+            generator.instruction_sources().sources
+        );
+        let root = system.find("ROOT-INVARIANT-7f3a").unwrap();
+        let capsule = system.find("VM-CAPSULE-19c2").unwrap_or_else(|| {
+            panic!("nested AGENTS.md capsule missing from the request:\n{system}")
+        });
+        assert!(
+            root < capsule,
+            "the nested capsule must follow (and so refine) the root instructions:\n{system}"
+        );
     }
 }

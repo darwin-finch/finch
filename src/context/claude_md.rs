@@ -1,229 +1,545 @@
-// Auto-loading of CLAUDE.md / FINCH.md / CONTEXT.md / README.md files into the system prompt
+// Loading of project instruction files (AGENTS.md / CLAUDE.md / FINCH.md / CONTEXT.md /
+// README.md) into the system prompt. See ASSEMBLY.md for the full contract.
 //
-// Matches Claude Code behavior: load ~/.claude/CLAUDE.md (user-level) first,
-// then walk upward from cwd to root collecting any CLAUDE.md, FINCH.md,
-// CONTEXT.md, or README.md found, and concatenate them outermost-first so
-// project-specific instructions win.
+// Precedence, lowest first (later sections win): `~/.claude/CLAUDE.md`, `~/.finch/FINCH.md`,
+// then each directory from the filesystem root down to the working directory, and within one
+// directory AGENTS.md → CLAUDE.md → FINCH.md → CONTEXT.md → README.md. AGENTS.md is the
+// cross-tool convention, so Finch/Claude-specific files refine it; README.md is overview
+// context and keeps its last position only for compatibility.
 //
-// FINCH.md is supported as an open, tool-agnostic alternative to CLAUDE.md.
-// CONTEXT.md is a neutral name that works across any AI assistant.
-// README.md is loaded last as general project overview context.
-// When multiple files exist in the same directory, all are loaded in order.
+// A file reached more than once (a symlink, a hardlink, or a user-level file that points into
+// the project) is included once, at its last and therefore highest-precedence position.
+// Distinct files with identical text are both included. Files over
+// `MAX_INSTRUCTION_FILE_BYTES` are skipped rather than truncated mid-rule. Every file found
+// is reported in `InstructionSources` with what happened to it.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Filenames we look for, in the order they are loaded within a single directory.
-const CONTEXT_FILENAMES: &[&str] = &["CLAUDE.md", "FINCH.md", "CONTEXT.md", "README.md"];
+const CONTEXT_FILENAMES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "FINCH.md",
+    "CONTEXT.md",
+    "README.md",
+];
 
-/// Collect all CLAUDE.md / FINCH.md / CONTEXT.md / README.md context visible from `cwd`.
-///
-/// Load order (lowest → highest priority):
-/// 1. `~/.claude/CLAUDE.md` — user-level defaults (Claude Code convention)
-/// 2. `~/.finch/FINCH.md`   — user-level defaults (Finch-specific)
-/// 3. Each `CLAUDE.md` / `FINCH.md` / `CONTEXT.md` / `README.md` found walking
-///    from root down to `cwd` (outermost first, in filename order within same dir)
+/// Largest instruction file that is loaded; larger files are skipped and reported.
+pub const MAX_INSTRUCTION_FILE_BYTES: u64 = 256 * 1024;
+
+/// What happened to one instruction file that exists on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceStatus {
+    /// Included in the system prompt.
+    Loaded,
+    /// Present but blank.
+    Empty,
+    /// The same file is reached again later, at a higher-precedence path.
+    SupersededBy(PathBuf),
+    /// Larger than [`MAX_INSTRUCTION_FILE_BYTES`].
+    TooLarge { bytes: u64 },
+    /// Not a regular file, or could not be read.
+    Unreadable(String),
+}
+
+/// One instruction file found while collecting, in precedence order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionSource {
+    pub path: PathBuf,
+    pub status: SourceStatus,
+}
+
+/// The instruction files found for a working directory and the text assembled from them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstructionSources {
+    /// Every existing candidate, lowest precedence first.
+    pub sources: Vec<InstructionSource>,
+    text: Option<String>,
+}
+
+impl InstructionSources {
+    /// The assembled instructions, or `None` when nothing was loaded.
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    /// Paths whose contents were included, in prompt order.
+    pub fn loaded(&self) -> impl Iterator<Item = &Path> {
+        self.sources
+            .iter()
+            .filter(|source| source.status == SourceStatus::Loaded)
+            .map(|source| source.path.as_path())
+    }
+}
+
+/// Collect the instructions visible from `cwd` using the real home directory.
 ///
 /// Returns `None` if no files were found or all were empty.
 pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
-    let mut sections: Vec<String> = Vec::new();
-
-    // 1. User-level: ~/.claude/CLAUDE.md  (Claude Code convention)
-    if let Some(home) = dirs::home_dir() {
-        let user_claude_md = home.join(".claude").join("CLAUDE.md");
-        if let Some(content) = read_non_empty(&user_claude_md) {
-            debug!("Loaded user CLAUDE.md: {}", user_claude_md.display());
-            sections.push(content);
-        }
-
-        // 2. User-level: ~/.finch/FINCH.md  (Finch convention)
-        let user_finch_md = home.join(".finch").join("FINCH.md");
-        if let Some(content) = read_non_empty(&user_finch_md) {
-            debug!("Loaded user FINCH.md: {}", user_finch_md.display());
-            sections.push(content);
-        }
-    }
-
-    // 3. Walk upward from cwd to root, collecting paths.
-    //    Build a list of (dir, filename) pairs sorted outermost-first.
-    let ancestor_dirs: Vec<std::path::PathBuf> = {
-        let mut dirs: Vec<_> = cwd.ancestors().map(|p| p.to_path_buf()).collect();
-        dirs.reverse(); // root first, cwd last
-        dirs
-    };
-
-    for dir in &ancestor_dirs {
-        for &filename in CONTEXT_FILENAMES {
-            let path = dir.join(filename);
-            if let Some(content) = read_non_empty(&path) {
-                debug!("Loaded project {}: {}", filename, path.display());
-                sections.push(content);
-            }
-        }
-    }
-
-    if sections.is_empty() {
-        debug!("No context files found from {}", cwd.display());
-        return None;
-    }
-
-    debug!(
-        "Loaded {} context file(s) into system prompt",
-        sections.len()
-    );
-
-    Some(sections.join("\n\n---\n\n"))
+    collect_instructions(cwd, dirs::home_dir().as_deref())
+        .text()
+        .map(str::to_owned)
 }
 
-/// Read a file and return its contents if non-empty, otherwise `None`.
-fn read_non_empty(path: &Path) -> Option<String> {
-    if !path.exists() {
-        return None;
+/// Collect the instructions visible from `cwd`, reading user-level files under `home`.
+pub fn collect_instructions(cwd: &Path, home: Option<&Path>) -> InstructionSources {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        candidates.push(home.join(".claude").join("CLAUDE.md"));
+        candidates.push(home.join(".finch").join("FINCH.md"));
     }
-    match std::fs::read_to_string(path) {
-        Ok(content) if !content.trim().is_empty() => Some(content),
-        Ok(_) => None,
-        Err(e) => {
-            debug!("Failed to read {}: {}", path.display(), e);
-            None
+    let mut ancestors: Vec<&Path> = cwd.ancestors().collect();
+    ancestors.reverse(); // root first, cwd last
+    for dir in ancestors {
+        for filename in CONTEXT_FILENAMES {
+            candidates.push(dir.join(filename));
         }
+    }
+
+    let mut entries: Vec<(InstructionSource, Option<(FileIdentity, String)>)> = Vec::new();
+    for path in candidates {
+        let Some(entry) = inspect(path) else { continue };
+        entries.push(entry);
+    }
+
+    // Keep each file only at its last (highest-precedence) position.
+    let mut last_position: HashMap<FileIdentity, usize> = HashMap::new();
+    for (index, (_, loaded)) in entries.iter().enumerate() {
+        if let Some((identity, _)) = loaded {
+            last_position.insert(identity.clone(), index);
+        }
+    }
+    let paths: Vec<PathBuf> = entries
+        .iter()
+        .map(|(source, _)| source.path.clone())
+        .collect();
+    let mut sections: Vec<String> = Vec::new();
+    let mut sources: Vec<InstructionSource> = Vec::with_capacity(entries.len());
+    for (index, (mut source, loaded)) in entries.into_iter().enumerate() {
+        if let Some((identity, content)) = loaded {
+            let last = last_position[&identity];
+            if last == index {
+                sections.push(format!(
+                    "From `{}`:\n\n{}",
+                    source.path.display(),
+                    content.trim_end()
+                ));
+            } else {
+                source.status = SourceStatus::SupersededBy(paths[last].clone());
+            }
+        }
+        debug!(path = %source.path.display(), status = ?source.status, "instruction source");
+        sources.push(source);
+    }
+
+    let text = (!sections.is_empty()).then(|| sections.join("\n\n---\n\n"));
+    if text.is_none() {
+        debug!("No instruction files loaded from {}", cwd.display());
+    }
+    InstructionSources { sources, text }
+}
+
+/// Identity of the file a path resolves to, so every route to one file counts once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Inode { device: u64, inode: u64 },
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata, _path: &Path) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity::Inode {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata, path: &Path) -> FileIdentity {
+    FileIdentity::Canonical(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// Inspect one candidate; `None` when it does not exist. Loadable files carry their content.
+fn inspect(path: PathBuf) -> Option<(InstructionSource, Option<(FileIdentity, String)>)> {
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A symlink whose target is gone still exists; report it rather than vanish.
+            let dangling = fs::symlink_metadata(&path).is_ok();
+            let status = SourceStatus::Unreadable("dangling symlink".into());
+            return dangling.then(|| (InstructionSource { path, status }, None));
+        }
+        Err(error) => {
+            let status = SourceStatus::Unreadable(error.to_string());
+            return Some((InstructionSource { path, status }, None));
+        }
+    };
+    let status = |status| InstructionSource {
+        path: path.clone(),
+        status,
+    };
+    if !metadata.is_file() {
+        return Some((
+            status(SourceStatus::Unreadable("not a regular file".into())),
+            None,
+        ));
+    }
+    if metadata.len() > MAX_INSTRUCTION_FILE_BYTES {
+        let bytes = metadata.len();
+        return Some((status(SourceStatus::TooLarge { bytes }), None));
+    }
+    // Read at most one byte past the cap so a file that grows after `metadata` stays bounded.
+    let read = fs::File::open(&path).and_then(|file| {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_INSTRUCTION_FILE_BYTES + 1),
+            &mut bytes,
+        )?;
+        Ok(bytes)
+    });
+    let read = match read {
+        Ok(bytes) if bytes.len() as u64 > MAX_INSTRUCTION_FILE_BYTES => {
+            let bytes = bytes.len() as u64;
+            return Some((status(SourceStatus::TooLarge { bytes }), None));
+        }
+        Ok(bytes) => String::from_utf8(bytes).map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match read {
+        Ok(content) if content.trim().is_empty() => Some((status(SourceStatus::Empty), None)),
+        Ok(content) => {
+            let identity = file_identity(&metadata, &path);
+            Some((status(SourceStatus::Loaded), Some((identity, content))))
+        }
+        Err(error) => Some((status(SourceStatus::Unreadable(error)), None)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
-    fn write(dir: &std::path::Path, name: &str, content: &str) {
-        fs::write(dir.join(name), content).unwrap();
+    /// A project tree and an isolated home, so the developer's own files never leak in.
+    struct Tree {
+        root: TempDir,
+        home: TempDir,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            Self {
+                root: TempDir::new().unwrap(),
+                home: TempDir::new().unwrap(),
+            }
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.root.path().join(relative)
+        }
+
+        fn write(&self, relative: &str, content: &str) -> PathBuf {
+            let path = self.path(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, content).unwrap();
+            path
+        }
+
+        fn collect(&self, cwd: &str) -> InstructionSources {
+            collect_instructions(&self.path(cwd), Some(self.home.path()))
+        }
+
+        /// Statuses for sources inside this tree or its home, ignoring anything above /tmp.
+        fn statuses(&self, sources: &InstructionSources) -> Vec<(PathBuf, SourceStatus)> {
+            sources
+                .sources
+                .iter()
+                .filter(|s| {
+                    s.path.starts_with(self.root.path()) || s.path.starts_with(self.home.path())
+                })
+                .map(|s| (s.path.clone(), s.status.clone()))
+                .collect()
+        }
+    }
+
+    fn text(sources: &InstructionSources) -> &str {
+        sources.text().expect("expected instructions to be loaded")
+    }
+
+    fn position(text: &str, marker: &str) -> usize {
+        text.find(marker).unwrap_or_else(|| {
+            panic!("marker {marker:?} missing from assembled instructions:\n{text}")
+        })
     }
 
     #[test]
-    fn returns_none_when_no_context_files() {
-        let tmp = TempDir::new().unwrap();
-        // No context files in tmp or any ancestor (the user-level ones may
-        // exist, but we can't control that in tests — just check no panic).
-        let _ = collect_claude_md_context(tmp.path());
-    }
-
-    #[test]
-    fn loads_claude_md_from_cwd() {
-        let tmp = TempDir::new().unwrap();
-        write(
-            tmp.path(),
-            "CLAUDE.md",
-            "# Project Instructions\nDo the thing.",
+    fn returns_no_tree_sources_when_no_context_files() {
+        let tree = Tree::new();
+        let sources = tree.collect("");
+        assert!(
+            tree.statuses(&sources).is_empty(),
+            "an empty tree and home must contribute no sources: {:?}",
+            sources.sources
         );
-
-        let result = collect_claude_md_context(tmp.path());
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("Do the thing."));
     }
 
     #[test]
-    fn loads_finch_md_from_cwd() {
-        let tmp = TempDir::new().unwrap();
-        write(
-            tmp.path(),
-            "FINCH.md",
-            "# Finch Instructions\nUse iterators.",
+    fn loads_agents_md_from_cwd() {
+        let tree = Tree::new();
+        let agents = tree.write("AGENTS.md", "shared agent rules");
+        let sources = tree.collect("");
+        assert!(
+            text(&sources).contains("shared agent rules"),
+            "AGENTS.md must be loaded"
         );
-
-        let result = collect_claude_md_context(tmp.path());
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("Use iterators."));
-    }
-
-    #[test]
-    fn loads_context_md_from_cwd() {
-        let tmp = TempDir::new().unwrap();
-        write(
-            tmp.path(),
-            "CONTEXT.md",
-            "# Context\nPrefer functional style.",
+        assert_eq!(
+            tree.statuses(&sources),
+            vec![(agents, SourceStatus::Loaded)],
+            "provenance must report AGENTS.md as loaded"
         );
-
-        let result = collect_claude_md_context(tmp.path());
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("Prefer functional style."));
-    }
-
-    #[test]
-    fn loads_readme_md_from_cwd() {
-        let tmp = TempDir::new().unwrap();
-        write(tmp.path(), "README.md", "# My Project\nDoes cool things.");
-
-        let result = collect_claude_md_context(tmp.path());
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("Does cool things."));
     }
 
     #[test]
     fn loads_all_names_in_same_directory() {
-        let tmp = TempDir::new().unwrap();
-        write(tmp.path(), "CLAUDE.md", "claude instructions");
-        write(tmp.path(), "FINCH.md", "finch instructions");
-        write(tmp.path(), "CONTEXT.md", "context instructions");
-        write(tmp.path(), "README.md", "readme instructions");
-
-        let result = collect_claude_md_context(tmp.path());
-        assert!(result.is_some());
-        let text = result.unwrap();
-        assert!(text.contains("claude instructions"));
-        assert!(text.contains("finch instructions"));
-        assert!(text.contains("context instructions"));
-        assert!(text.contains("readme instructions"));
-        // Load order: CLAUDE.md → FINCH.md → CONTEXT.md → README.md
-        let claude_pos = text.find("claude instructions").unwrap();
-        let finch_pos = text.find("finch instructions").unwrap();
-        let context_pos = text.find("context instructions").unwrap();
-        let readme_pos = text.find("readme instructions").unwrap();
-        assert!(
-            claude_pos < finch_pos,
-            "CLAUDE.md should appear before FINCH.md"
-        );
-        assert!(
-            finch_pos < context_pos,
-            "FINCH.md should appear before CONTEXT.md"
-        );
-        assert!(
-            context_pos < readme_pos,
-            "CONTEXT.md should appear before README.md"
-        );
-    }
-
-    #[test]
-    fn skips_empty_files() {
-        let tmp = TempDir::new().unwrap();
-        write(tmp.path(), "CLAUDE.md", "   \n   ");
-        write(tmp.path(), "FINCH.md", "   \n   ");
-
-        // All-whitespace files should be ignored.
-        if let Some(text) = collect_claude_md_context(tmp.path()) {
-            assert!(!text.trim().is_empty());
+        let tree = Tree::new();
+        for (name, marker) in [
+            ("AGENTS.md", "agents-marker"),
+            ("CLAUDE.md", "claude-marker"),
+            ("FINCH.md", "finch-marker"),
+            ("CONTEXT.md", "context-marker"),
+            ("README.md", "readme-marker"),
+        ] {
+            tree.write(name, marker);
         }
+        let sources = tree.collect("");
+        let text = text(&sources);
+        let order: Vec<usize> = [
+            "agents-marker",
+            "claude-marker",
+            "finch-marker",
+            "context-marker",
+            "readme-marker",
+        ]
+        .iter()
+        .map(|marker| position(text, marker))
+        .collect();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "within one directory the order must be AGENTS → CLAUDE → FINCH → CONTEXT → README; positions={order:?}\n{text}"
+        );
     }
 
     #[test]
     fn joins_multiple_sections_with_separator() {
-        let outer = TempDir::new().unwrap();
-        let inner = outer.path().join("subdir");
-        fs::create_dir_all(&inner).unwrap();
+        let tree = Tree::new();
+        tree.write("CLAUDE.md", "outer instructions");
+        tree.write("subdir/AGENTS.md", "inner instructions");
+        let sources = tree.collect("subdir");
+        let text = text(&sources);
+        assert!(
+            position(text, "outer instructions") < position(text, "inner instructions"),
+            "the working directory must come after (and so win over) its ancestors:\n{text}"
+        );
+        assert!(
+            text.contains("\n\n---\n\n"),
+            "sections must be separated:\n{text}"
+        );
+    }
 
-        write(outer.path(), "CLAUDE.md", "outer instructions");
-        write(&inner, "FINCH.md", "inner instructions");
+    #[test]
+    fn each_section_names_its_source_path() {
+        let tree = Tree::new();
+        let agents = tree.write("AGENTS.md", "rules");
+        let sources = tree.collect("");
+        let expected = format!("From `{}`:\n\nrules", agents.display());
+        assert!(
+            text(&sources).contains(&expected),
+            "section must be introduced by its path; expected {expected:?} in:\n{}",
+            text(&sources)
+        );
+    }
 
-        let result = collect_claude_md_context(&inner);
-        assert!(result.is_some());
-        let text = result.unwrap();
-        assert!(text.contains("outer instructions"));
-        assert!(text.contains("inner instructions"));
-        // Outer comes before inner (outermost-first)
-        let outer_pos = text.find("outer instructions").unwrap();
-        let inner_pos = text.find("inner instructions").unwrap();
-        assert!(outer_pos < inner_pos, "outer should appear before inner");
-        assert!(text.contains("---"));
+    #[test]
+    fn user_level_files_precede_project_files() {
+        let tree = Tree::new();
+        fs::create_dir_all(tree.home.path().join(".claude")).unwrap();
+        fs::create_dir_all(tree.home.path().join(".finch")).unwrap();
+        fs::write(tree.home.path().join(".claude/CLAUDE.md"), "user-claude").unwrap();
+        fs::write(tree.home.path().join(".finch/FINCH.md"), "user-finch").unwrap();
+        tree.write("AGENTS.md", "project-agents");
+        let sources = tree.collect("");
+        let text = text(&sources);
+        assert!(
+            position(text, "user-claude") < position(text, "user-finch")
+                && position(text, "user-finch") < position(text, "project-agents"),
+            "user-level files must precede project files:\n{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_agents_md_loads_once_at_the_later_position() {
+        let tree = Tree::new();
+        let claude = tree.write("CLAUDE.md", "shared-rules");
+        let agents = tree.path("AGENTS.md");
+        std::os::unix::fs::symlink("CLAUDE.md", &agents).unwrap();
+        let sources = tree.collect("");
+        let text = text(&sources);
+        assert_eq!(
+            text.matches("shared-rules").count(),
+            1,
+            "a symlinked AGENTS.md must not inject the same rules twice:\n{text}"
+        );
+        assert_eq!(
+            tree.statuses(&sources),
+            vec![
+                (agents, SourceStatus::SupersededBy(claude.clone())),
+                (claude, SourceStatus::Loaded),
+            ],
+            "provenance must show AGENTS.md superseded by the CLAUDE.md it points to"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_file_loads_once() {
+        let tree = Tree::new();
+        let agents = tree.write("AGENTS.md", "linked-rules");
+        let finch = tree.path("FINCH.md");
+        fs::hard_link(&agents, &finch).unwrap();
+        let sources = tree.collect("");
+        assert_eq!(
+            text(&sources).matches("linked-rules").count(),
+            1,
+            "a hardlink is the same file and must load once: {:?}",
+            sources.sources
+        );
+        assert_eq!(
+            tree.statuses(&sources),
+            vec![
+                (agents, SourceStatus::SupersededBy(finch.clone())),
+                (finch, SourceStatus::Loaded),
+            ],
+            "provenance must report the earlier hardlink superseded by the later one: {:?}",
+            sources.sources
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_level_file_linked_into_the_project_appears_at_the_project_position() {
+        let tree = Tree::new();
+        let project = tree.write("CLAUDE.md", "one-copy");
+        fs::create_dir_all(tree.home.path().join(".claude")).unwrap();
+        fs::create_dir_all(tree.home.path().join(".finch")).unwrap();
+        let user = tree.home.path().join(".claude/CLAUDE.md");
+        std::os::unix::fs::symlink(&project, &user).unwrap();
+        fs::write(tree.home.path().join(".finch/FINCH.md"), "user-finch").unwrap();
+        let sources = tree.collect("");
+        let text = text(&sources);
+        assert_eq!(
+            text.matches("one-copy").count(),
+            1,
+            "linked file must load once:\n{text}"
+        );
+        assert!(
+            position(text, "user-finch") < position(text, "one-copy"),
+            "the linked file must sit at its project position, after later user-level files:\n{text}"
+        );
+        assert_eq!(
+            tree.statuses(&sources)[0],
+            (user, SourceStatus::SupersededBy(project)),
+            "the user-level route must be reported as superseded by the project path: {:?}",
+            sources.sources
+        );
+    }
+
+    #[test]
+    fn distinct_files_with_identical_text_both_load() {
+        let tree = Tree::new();
+        tree.write("AGENTS.md", "repeated-rule");
+        tree.write("CLAUDE.md", "repeated-rule");
+        let sources = tree.collect("");
+        assert_eq!(
+            text(&sources).matches("repeated-rule").count(),
+            2,
+            "identical text in two distinct files is the author repeating themselves: {:?}",
+            sources.sources
+        );
+    }
+
+    #[test]
+    fn oversized_file_is_skipped_and_reported() {
+        let tree = Tree::new();
+        let big = tree.write(
+            "AGENTS.md",
+            &"x".repeat(MAX_INSTRUCTION_FILE_BYTES as usize + 1),
+        );
+        tree.write("CLAUDE.md", "small-rules");
+        let sources = tree.collect("");
+        assert!(
+            !text(&sources).contains("xxxx"),
+            "oversized file must not be loaded"
+        );
+        assert_eq!(
+            tree.statuses(&sources)[0],
+            (
+                big,
+                SourceStatus::TooLarge {
+                    bytes: MAX_INSTRUCTION_FILE_BYTES + 1
+                }
+            ),
+            "an oversized file must be reported as too large, not loaded or truncated: {:?}",
+            sources.sources
+        );
+    }
+
+    #[test]
+    fn empty_and_unreadable_candidates_are_reported_not_loaded() {
+        let tree = Tree::new();
+        let empty = tree.write("CLAUDE.md", "   \n   ");
+        let directory = tree.path("AGENTS.md");
+        fs::create_dir_all(&directory).unwrap();
+        let sources = tree.collect("");
+        assert!(
+            tree.statuses(&sources)
+                .iter()
+                .all(|(_, status)| *status != SourceStatus::Loaded),
+            "nothing in the tree is loadable, so nothing in it may be loaded: {:?}",
+            sources.sources
+        );
+        assert_eq!(
+            tree.statuses(&sources),
+            vec![
+                (
+                    directory,
+                    SourceStatus::Unreadable("not a regular file".into())
+                ),
+                (empty, SourceStatus::Empty),
+            ],
+            "empty and non-file candidates must be reported with their reason: {:?}",
+            sources.sources
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_reported_not_skipped() {
+        let tree = Tree::new();
+        let agents = tree.path("AGENTS.md");
+        std::os::unix::fs::symlink("CLAUDE.md", &agents).unwrap();
+        let sources = tree.collect("");
+        assert_eq!(
+            tree.statuses(&sources),
+            vec![(agents, SourceStatus::Unreadable("dangling symlink".into()))],
+            "an AGENTS.md pointing at a missing CLAUDE.md must be visible in provenance: {:?}",
+            sources.sources
+        );
     }
 }

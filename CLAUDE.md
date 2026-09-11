@@ -67,7 +67,7 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 ### Context
 
-- **Load order: `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`; cwd wins over parent** — `loads_all_names_in_same_directory`, `joins_multiple_sections_with_separator` in `src/context/claude_md.rs`
+- **Load order: `AGENTS.md` → `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`; cwd wins over parent; a file reached by several names (symlink, hardlink) loads once** — `loads_all_names_in_same_directory`, `joins_multiple_sections_with_separator`, `symlinked_agents_md_loads_once_at_the_later_position` in `src/context/claude_md.rs`; `provider_request_carries_symlinked_agents_md_once_and_nested_rules_last` in `src/generators/claude.rs`
 
 ### GUI Accessibility
 
