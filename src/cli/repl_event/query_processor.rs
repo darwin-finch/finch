@@ -1235,7 +1235,10 @@ pub(crate) async fn process_query_with_tools(
                             // Every text-only response is candidate VM source.
                             // Project its exact bytes immediately; parsing and
                             // verification still wait for the complete source.
-                            if !reusing_tool_unit && has_streamed_wire_source(&text) {
+                            let initial_named_brain_turn = named_brain_turn && !query.is_empty();
+                            if (!reusing_tool_unit || initial_named_brain_turn)
+                                && has_streamed_wire_source(&text)
+                            {
                                 let language =
                                     crate::programs::ProgramLanguage::infer_source(&text);
                                 work_unit.set_program_source(language.as_str());
@@ -2022,7 +2025,414 @@ pub(crate) fn apply_sliding_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::messages::{Message, MessageStatus, TranscriptRowKind, WorkUnit};
+    use crate::generators::GeneratorCapabilities;
+    use crate::tools::executor::ToolExecutor;
+    use crate::tools::permissions::PermissionManager;
+    use crate::tools::registry::ToolRegistry;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PacedStreamGenerator {
+        receiver:
+            std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>,
+    }
+
+    impl PacedStreamGenerator {
+        fn new() -> (
+            Arc<Self>,
+            tokio::sync::mpsc::Sender<anyhow::Result<StreamChunk>>,
+        ) {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            (
+                Arc::new(Self {
+                    receiver: std::sync::Mutex::new(Some(receiver)),
+                }),
+                sender,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for PacedStreamGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            anyhow::bail!("paced streaming fixture must not use non-streaming generation")
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(self
+                .receiver
+                .lock()
+                .expect("paced stream receiver lock poisoned")
+                .take())
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: true,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(8),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "paced-stream"
+        }
+    }
+
+    struct StreamingQueryHarness {
+        stream_tx: Option<tokio::sync::mpsc::Sender<anyhow::Result<StreamChunk>>>,
+        output: Arc<OutputManager>,
+        canonical: Arc<WorkUnit>,
+        canonical_id: crate::cli::messages::MessageId,
+        query_states: Arc<QueryStateManager>,
+        query_id: Uuid,
+        runtime: Arc<crate::runtime::ProgramRuntime>,
+        events: mpsc::UnboundedReceiver<ReplEvent>,
+        task: tokio::task::JoinHandle<()>,
+        colors: crate::config::ColorScheme,
+        _tempdir: tempfile::TempDir,
+    }
+
+    impl StreamingQueryHarness {
+        async fn spawn(query: &str) -> Self {
+            let colors = crate::config::ColorScheme::default();
+            let output = Arc::new(OutputManager::new(colors.clone()));
+            output.disable_stdout();
+            let status = Arc::new(StatusBar::new());
+            let tui_renderer = Arc::new(tokio::sync::Mutex::new(TuiRenderer::new_headless(
+                Arc::clone(&output),
+                Arc::clone(&status),
+                colors.clone(),
+            )));
+            let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+            conversation
+                .write()
+                .await
+                .add_user_message(if query.is_empty() {
+                    "original named-Brain prompt".to_string()
+                } else {
+                    query.to_string()
+                });
+
+            let query_states = Arc::new(QueryStateManager::new());
+            let query_id = query_states
+                .create_query(conversation.read().await.get_messages())
+                .await;
+            let run_id = crate::brain::store::RunId(Uuid::new_v4());
+            query_states
+                .bind_brain_turn_provenance(
+                    query_id,
+                    super::super::query_state::BrainTurnProvenance {
+                        brain_id: crate::brain::store::BrainId(Uuid::new_v4()),
+                        run_id,
+                        request_seq: 1,
+                    },
+                )
+                .await;
+
+            let label = format!("Brain run {}", run_id.0);
+            let canonical = output.start_work_unit(&label);
+            canonical.set_activity_presentation(&label);
+            let status_row = canonical.add_activity_row(format!("{label} · status"));
+            canonical.complete_row(status_row, "running");
+            let canonical_id = canonical.id();
+            query_states
+                .set_tool_work_unit(query_id, Some(Arc::clone(&canonical)))
+                .await;
+
+            let tempdir = tempfile::tempdir().expect("create isolated tool-pattern directory");
+            let executor = ToolExecutor::new(
+                ToolRegistry::new(),
+                PermissionManager::new(),
+                tempdir.path().join("patterns.json"),
+            )
+            .expect("construct inert tool executor");
+            let (event_tx, events) = mpsc::unbounded_channel();
+            let tool_coordinator = ToolExecutionCoordinator::new(
+                event_tx.clone(),
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&output),
+                Arc::clone(&conversation),
+                Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+                Arc::new(crate::models::TextTokenizer::stub().expect("construct stub tokenizer")),
+                Arc::new(RwLock::new(ReplMode::Normal)),
+                Arc::new(RwLock::new(None)),
+            );
+            let (generator, stream_tx) = PacedStreamGenerator::new();
+            let selected: Arc<dyn Generator> = generator.clone();
+            let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+            let task = tokio::spawn(process_query_with_tools(
+                query_id,
+                query.to_string(),
+                event_tx,
+                Arc::clone(&selected),
+                Arc::clone(&selected),
+                Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+                Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+                Arc::new(Vec::new()),
+                conversation,
+                Arc::clone(&query_states),
+                tool_coordinator,
+                Arc::clone(&runtime),
+                tui_renderer,
+                Arc::new(RwLock::new(ReplMode::Normal)),
+                Arc::clone(&output),
+                status,
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                "test-brain".to_string(),
+                "/test/workspace".to_string(),
+                4,
+                20,
+                0,
+                true,
+                false,
+                false,
+                selected,
+                Arc::new(RwLock::new(HashMap::new())),
+                None,
+                "test persona".to_string(),
+            ));
+
+            Self {
+                stream_tx: Some(stream_tx),
+                output,
+                canonical,
+                canonical_id,
+                query_states,
+                query_id,
+                runtime,
+                events,
+                task,
+                colors,
+                _tempdir: tempdir,
+            }
+        }
+
+        async fn send(&self, chunk: anyhow::Result<StreamChunk>) {
+            self.stream_tx
+                .as_ref()
+                .expect("paced stream sender already closed")
+                .send(chunk)
+                .await
+                .expect("query processor dropped paced stream early");
+        }
+
+        fn close_stream(&mut self) {
+            self.stream_tx.take();
+        }
+
+        async fn wait_for_content(&self, expected: &str) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if self.canonical.content() == expected {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "named-Brain stream never projected {expected:?}; status={:?}, content={:?}",
+                    self.canonical.status(),
+                    self.canonical.content()
+                )
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn named_brain_initial_turn_projects_partial_source_into_canonical_unit() {
+        let mut harness = StreamingQueryHarness::spawn("say hello").await;
+        harness
+            .send(Ok(StreamChunk::TextDelta("(say \"".to_string())))
+            .await;
+        harness.wait_for_content("(say \"").await;
+
+        assert_eq!(
+            harness.output.len(),
+            1,
+            "partial named-Brain source created a duplicate WorkUnit: {:?}",
+            harness
+                .output
+                .get_messages()
+                .iter()
+                .map(|message| (message.id(), message.status(), message.content()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(harness.canonical.id(), harness.canonical_id);
+        assert_eq!(harness.canonical.status(), MessageStatus::InProgress);
+        let partial = harness
+            .canonical
+            .transcript_row(&harness.colors)
+            .expect("canonical Brain unit must remain a transcript row while streaming");
+        assert_eq!(partial.kind, TranscriptRowKind::Program);
+        assert_eq!(partial.body, vec!["(say \"".to_string()]);
+        assert!(
+            partial
+                .children
+                .iter()
+                .any(|child| child.label.contains("status")),
+            "partial Program source lost the canonical Brain status child: {partial:?}"
+        );
+
+        harness
+            .send(Ok(StreamChunk::TextDelta("hello\")".to_string())))
+            .await;
+        harness.wait_for_content("(say \"hello\")").await;
+        harness.close_stream();
+        harness.task.await.expect("named-Brain query task panicked");
+
+        assert_eq!(harness.canonical.id(), harness.canonical_id);
+        assert_eq!(harness.canonical.status(), MessageStatus::Complete);
+        assert_eq!(
+            harness.runtime.revision(),
+            1,
+            "complete named-Brain wire source did not execute exactly once"
+        );
+        let mut saw_vm_effect = false;
+        let mut saw_output_complete = false;
+        let mut completed_response = None;
+        while let Ok(event) = harness.events.try_recv() {
+            match event {
+                ReplEvent::VmEffect { .. } => saw_vm_effect = true,
+                ReplEvent::VmOutputComplete { .. } => saw_output_complete = true,
+                ReplEvent::StreamingComplete { full_response, .. } => {
+                    completed_response = Some(full_response)
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_vm_effect,
+            "completed named-Brain program emitted no VM effect"
+        );
+        assert!(
+            saw_output_complete,
+            "completed named-Brain program emitted no output completion"
+        );
+        assert_eq!(completed_response.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn named_brain_empty_query_continuation_keeps_scratch_text_buffered() {
+        let harness = StreamingQueryHarness::spawn("").await;
+        harness
+            .send(Ok(StreamChunk::TextDelta(
+                "I will inspect the result".to_string(),
+            )))
+            .await;
+        harness
+            .send(Err(anyhow::anyhow!("end continuation fixture")))
+            .await;
+        harness
+            .task
+            .await
+            .expect("continuation query task panicked");
+
+        assert_eq!(harness.canonical.id(), harness.canonical_id);
+        assert_eq!(
+            harness.canonical.content(),
+            "",
+            "named-Brain tool continuation exposed provider scratch narration"
+        );
+        assert_eq!(
+            harness.output.len(),
+            1,
+            "named-Brain continuation created a duplicate activity unit"
+        );
+        let row = harness
+            .canonical
+            .transcript_row(&harness.colors)
+            .expect("canonical Brain activity row disappeared");
+        assert_eq!(row.kind, TranscriptRowKind::Activity);
+        assert!(
+            row.children
+                .iter()
+                .any(|child| child.label.contains("status")),
+            "named-Brain continuation lost the canonical status child: {row:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_brain_stream_error_retains_partial_source_without_executing_it() {
+        let mut harness = StreamingQueryHarness::spawn("say nothing yet").await;
+        let partial_source = "(say \"must not run\")";
+        harness
+            .send(Ok(StreamChunk::TextDelta(partial_source.to_string())))
+            .await;
+        harness.wait_for_content(partial_source).await;
+        harness
+            .send(Err(anyhow::anyhow!("paced stream failed")))
+            .await;
+        harness
+            .task
+            .await
+            .expect("failed stream query task panicked");
+
+        assert_eq!(harness.canonical.id(), harness.canonical_id);
+        assert_eq!(harness.canonical.status(), MessageStatus::Failed);
+        assert_eq!(harness.canonical.content(), partial_source);
+        assert_eq!(
+            harness.output.len(),
+            1,
+            "failed partial stream produced another WorkUnit instead of retaining the canonical one"
+        );
+        let failed = harness
+            .canonical
+            .transcript_row(&harness.colors)
+            .expect("failed canonical Brain unit disappeared");
+        assert!(
+            failed
+                .children
+                .iter()
+                .any(|child| child.label.contains("status")),
+            "failed partial stream lost the canonical Brain status child: {failed:?}"
+        );
+        assert_eq!(
+            harness.runtime.revision(),
+            0,
+            "a complete-looking partial delta executed before stream completion"
+        );
+        assert!(
+            harness
+                .query_states
+                .brain_output_work_unit(harness.query_id)
+                .await
+                .is_none(),
+            "failed partial stream installed a VM output unit"
+        );
+        let events = std::iter::from_fn(|| harness.events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ReplEvent::QueryFailed { error, .. } if error == "paced stream failed"
+            )),
+            "failed stream did not emit its actionable QueryFailed event: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                ReplEvent::VmEffect { .. }
+                    | ReplEvent::VmOutputComplete { .. }
+                    | ReplEvent::StreamingComplete { .. }
+            )),
+            "failed partial stream emitted execution/completion events: {events:?}"
+        );
+    }
 
     #[test]
     fn streaming_requires_both_user_opt_in_and_provider_support() {
