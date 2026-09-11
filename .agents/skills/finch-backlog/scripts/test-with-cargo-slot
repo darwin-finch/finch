@@ -150,6 +150,145 @@ status=$?
 set -e
 [[ "$status" -eq 23 ]] || fail "wrapped exit status changed: expected=23 actual=$status"
 
+# A daemon intentionally outliving the foreground command must not inherit the
+# lock descriptor. The unfixed exec-based wrapper leaves this descendant
+# holding the slot and makes the zero-timeout contender exit 75.
+linger_pid_file="$fixture_root/outliving-descendant.pid"
+(cd "$repo" && LINGER_PID_FILE="$linger_pid_file" "$wrapper" perl -e '
+    my $pid = fork();
+    die "fork failed: $!" unless defined $pid;
+    if ($pid == 0) {
+        open my $record, ">", $ENV{LINGER_PID_FILE} or die "record failed: $!";
+        print {$record} "$$\n";
+        close $record;
+        sleep 30;
+        exit 0;
+    }
+    exit 0;
+')
+for _ in $(seq 1 100); do [[ -s "$linger_pid_file" ]] && break; sleep 0.02; done
+[[ -s "$linger_pid_file" ]] || fail "outliving descendant did not publish its pid"
+linger_pid="$(cat "$linger_pid_file")"
+kill -0 "$linger_pid" 2>/dev/null || fail "outliving descendant exited before lock probe: pid=$linger_pid"
+holder_descendant_pid="$linger_pid"
+(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
+    fail "outliving descendant inherited the Cargo slot: pid=$linger_pid lock=$common_dir/finch-cargo-slot.lock"
+kill "$linger_pid" 2>/dev/null || true
+holder_descendant_pid=''
+
+# The new lock-holder PID is a signal proxy. Signal only that parent, prove the
+# foreground child observes the signal, preserve shell-visible status, reap it,
+# and release the slot before the next worktree enters.
+for signal_case in HUP:1 INT:2 QUIT:3 TERM:15; do
+    signal_name="${signal_case%%:*}"
+    signal_number="${signal_case##*:}"
+    signal_ready="$fixture_root/signal-$signal_name.ready"
+    signal_observed="$fixture_root/signal-$signal_name.observed"
+    (
+        cd "$repo"
+        exec env SIGNAL="$signal_name" READY="$signal_ready" OBSERVED="$signal_observed" \
+            "$wrapper" sh -c '
+                trap '\''
+                    printf "%s\n" "$SIGNAL" >"$OBSERVED"
+                    trap - "$SIGNAL"
+                    kill -s "$SIGNAL" "$$"
+                '\'' "$SIGNAL"
+                printf "ready\n" >"$READY"
+                while :; do sleep 1; done
+            '
+    ) &
+    holder_pid=$!
+    for _ in $(seq 1 250); do [[ -s "$signal_ready" ]] && break; sleep 0.02; done
+    [[ -s "$signal_ready" ]] || fail \
+        "signal proxy did not become ready within five seconds: signal=$signal_name wrapper_pid=$holder_pid"
+    signal_state="$(cat "$signal_ready")"
+    [[ "$signal_state" == ready ]] || fail \
+        "signal proxy readiness failed: signal=$signal_name actual=$signal_state wrapper_pid=$holder_pid"
+    kill -s "$signal_name" "$holder_pid"
+    set +e
+    wait "$holder_pid"
+    status=$?
+    set -e
+    holder_pid=''
+    expected_status=$((128 + signal_number))
+    [[ "$status" -eq "$expected_status" ]] || fail \
+        "signal proxy changed child status: signal=$signal_name expected=$expected_status actual=$status"
+    assert_contains "$signal_observed" "$signal_name" \
+        "signal proxy did not forward $signal_name to its foreground child"
+    (cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
+        fail "slot remained held after signal proxy reaped child: signal=$signal_name lock=$common_dir/finch-cargo-slot.lock"
+done
+
+# Force a signal into the fork window: the child publishes its PID from a
+# CORE::GLOBAL::fork override before returning from fork, while the parent has
+# already returned and begun waiting. The parent receives TERM first and must
+# forward it; the child must keep TERM blocked until its default handler is
+# installed, then die before executing the command.
+fork_probe_dir="$fixture_root/fork-probe"
+mkdir "$fork_probe_dir"
+cat >"$fork_probe_dir/FinchForkDelay.pm" <<'FORK_PROBE'
+package FinchForkDelay;
+use strict;
+use warnings;
+BEGIN {
+    *CORE::GLOBAL::fork = sub {
+        my $pid = CORE::fork();
+        if (defined $pid && $pid == 0) {
+            open my $pid_file, ">", $ENV{FORK_CHILD_PID} or die "pid record failed: $!";
+            print {$pid_file} "$$\n";
+            close $pid_file;
+            open my $ready, ">", $ENV{FORK_READY} or die "ready record failed: $!";
+            print {$ready} "ready\n";
+            close $ready;
+            while (!-e $ENV{FORK_RELEASE}) {
+                select undef, undef, undef, 0.01;
+            }
+        }
+        return $pid;
+    };
+}
+1;
+FORK_PROBE
+fork_ready="$fixture_root/fork-window.ready"
+fork_release="$fixture_root/fork-window.release"
+fork_child_pid_file="$fixture_root/fork-window.child-pid"
+fork_executed="$fixture_root/fork-window.executed"
+(
+    cd "$repo"
+    exec env \
+        PERL5LIB="$fork_probe_dir" \
+        PERL5OPT=-MFinchForkDelay \
+        FORK_READY="$fork_ready" \
+        FORK_RELEASE="$fork_release" \
+        FORK_CHILD_PID="$fork_child_pid_file" \
+        EXECUTED="$fork_executed" \
+        "$wrapper" sh -c 'printf "executed\n" >"$EXECUTED"'
+) &
+holder_pid=$!
+for _ in $(seq 1 250); do
+    [[ -s "$fork_ready" && -s "$fork_child_pid_file" ]] && break
+    sleep 0.02
+done
+if [[ ! -s "$fork_ready" || ! -s "$fork_child_pid_file" ]]; then
+    : >"$fork_release"
+    fail "fork-window child did not become ready within five seconds: wrapper_pid=$holder_pid"
+fi
+holder_descendant_pid="$(cat "$fork_child_pid_file")"
+kill -TERM "$holder_pid"
+: >"$fork_release"
+set +e
+wait "$holder_pid"
+status=$?
+set -e
+holder_pid=''
+holder_descendant_pid=''
+[[ "$status" -eq 143 ]] || fail \
+    "fork-window TERM was lost: expected=143 actual=$status child_pid=$(cat "$fork_child_pid_file")"
+assert_no_file "$fork_executed" \
+    "fork-window child executed the command after TERM was forwarded before its fork return"
+(cd "$worktree" && FINCH_CARGO_SLOT_TIMEOUT_SECONDS=0 "$wrapper" true) ||
+    fail "slot remained held after fork-window signal repair: lock=$common_dir/finch-cargo-slot.lock"
+
 # Killing a wrapped command releases the kernel-owned slot; the persistent
 # lock pathname must not exclude later work.
 crash_ready="$fixture_root/crash-ready.fifo"
