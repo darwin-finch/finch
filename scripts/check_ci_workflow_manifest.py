@@ -707,7 +707,7 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors.extend(required_step_errors(
         documents, "ci.yml", "security", "Verify cargo-audit 0.22.2",
         None, None,
-        ('test "$(cargo audit --version)" = "cargo-audit 0.22.2"',),
+        ('test "$(cargo-audit --version)" = "cargo-audit 0.22.2"',),
     ))
     return errors
 

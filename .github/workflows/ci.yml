@@ -365,7 +365,7 @@ jobs:
       run: cargo install cargo-audit --version 0.22.2 --locked
 
     - name: Verify cargo-audit 0.22.2
-      run: test "$(cargo audit --version)" = "cargo-audit 0.22.2"
+      run: test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
 
     - name: Verify resolved dependency security contract
       run: |

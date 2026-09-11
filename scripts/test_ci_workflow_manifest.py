@@ -454,6 +454,14 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assert_fails("Install cargo-audit 0.22.2 on cache miss", "commands changed")
 
+    def test_cargo_audit_version_check_uses_direct_binary(self) -> None:
+        self.repository.replace(
+            "ci.yml",
+            'test "$(cargo-audit --version)" = "cargo-audit 0.22.2"',
+            'test "$(cargo audit --version)" = "cargo-audit 0.22.2"',
+        )
+        self.assert_fails("Verify cargo-audit 0.22.2", "commands changed")
+
     def test_malformed_yaml_fails_actionably(self) -> None:
         self.repository.workflow("docs.yml").write_text("jobs: [\n")
         self.assert_fails("docs.yml: invalid workflow YAML")
