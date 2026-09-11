@@ -15,6 +15,7 @@ holder_release_open=0
 
 cleanup() {
     set +e
+    local cleanup_incomplete=0
     if [[ -n "$holder_pid" ]]; then
         if [[ "$holder_release_open" -eq 1 ]]; then
             printf 'cleanup\n' >&8 2>/dev/null || true
@@ -40,19 +41,36 @@ cleanup() {
             monotonic_deadline_passed "$cleanup_deadline" && break
             sleep 0.02
         done
-        wait "$holder_pid" 2>/dev/null || true
+        if background_job_is_running "$holder_pid"; then
+            process_diagnostics surviving-cleanup-wrapper "$holder_pid"
+            cleanup_incomplete=1
+        else
+            wait "$holder_pid" 2>/dev/null || true
+        fi
         if [[ -n "$holder_descendant_pid" ]]; then
-            wait "$holder_descendant_pid" 2>/dev/null || true
+            if ! background_job_is_running "$holder_descendant_pid"; then
+                wait "$holder_descendant_pid" 2>/dev/null || true
+            fi
+            cleanup_deadline="$(monotonic_deadline 1)"
+            while kill -0 "$holder_descendant_pid" 2>/dev/null; do
+                monotonic_deadline_passed "$cleanup_deadline" && break
+                sleep 0.02
+            done
             if kill -0 "$holder_descendant_pid" 2>/dev/null; then
                 process_diagnostics surviving-cleanup-child "$holder_descendant_pid"
                 kill -KILL "$holder_descendant_pid" 2>/dev/null || true
+                cleanup_incomplete=1
             fi
         fi
     fi
     if [[ "$holder_release_open" -eq 1 ]]; then
         exec 8>&-
     fi
-    rm -rf -- "$fixture_root"
+    if [[ "$cleanup_incomplete" -eq 0 ]]; then
+        rm -rf -- "$fixture_root"
+    else
+        echo "with-cargo-slot regression: cleanup remained incomplete after bounded escalation; preserving fixture=$fixture_root" >&2
+    fi
 }
 trap cleanup EXIT
 
@@ -162,8 +180,7 @@ set +e
         wait "$child"
     ' sh "$cleanup_record" "$cleanup_release" "$fixture_root" 8>&- &
     holder_pid=$!
-    for _ in $(seq 1 100); do [[ -s "$cleanup_record" ]] && break; sleep 0.02; done
-    [[ -s "$cleanup_record" ]] || exit 98
+    wait_for_file "$cleanup_record" 2 || exit 98
     exit 97
 ) &
 cleanup_probe_pid=$!
@@ -201,9 +218,21 @@ set +e
     trap cleanup EXIT
     stubborn_holder_ready="$fixture_root/holder.ready"
     stubborn_child_ready="$fixture_root/child.ready"
-    sh -c 'trap "" TERM; printf "ready\n" >"$1"; while :; do sleep 1; done' sh "$stubborn_holder_ready" &
+    READY="$stubborn_holder_ready" perl -e '
+        $SIG{TERM} = "IGNORE";
+        open my $ready, ">", $ENV{READY} or die "ready record failed: $!";
+        print {$ready} "ready\n";
+        close $ready;
+        select undef, undef, undef, 3600 while 1;
+    ' &
     holder_pid=$!
-    sh -c 'trap "" TERM; printf "ready\n" >"$1"; while :; do sleep 1; done' sh "$stubborn_child_ready" &
+    READY="$stubborn_child_ready" perl -e '
+        $SIG{TERM} = "IGNORE";
+        open my $ready, ">", $ENV{READY} or die "ready record failed: $!";
+        print {$ready} "ready\n";
+        close $ready;
+        select undef, undef, undef, 3600 while 1;
+    ' &
     holder_descendant_pid=$!
     wait_for_file "$stubborn_holder_ready" 1 || exit 95
     wait_for_file "$stubborn_child_ready" 1 || exit 95
