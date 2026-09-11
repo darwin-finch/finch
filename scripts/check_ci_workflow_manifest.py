@@ -16,12 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = Path(".github/workflows")
 
 EXPECTED_WORKFLOWS = (
-    "ci.yml", "docs.yml", "issue-104-chooser-catalog.yml", "issue-105-oauth.yml",
-    "issue-163-effect-audit.yml", "issue-187-subagent-fanout.yml",
-    "issue-201-chatgpt-auth.yml", "issue-227-setup-preservation.yml",
-    "issue-245-cargo-slot.yml", "issue-46-atomic-conversation.yml",
-    "issue-56-brain-isolation.yml", "issue-72-capability-contract.yml", "release.yml",
-    "repository-hygiene.yml",
+    "ci.yml", "docs.yml", "issue-201-chatgpt-auth.yml",
+    "issue-56-brain-isolation.yml", "release.yml", "repository-hygiene.yml",
 )
 
 # Exact triggers are reviewed separately from fixture activation so a path change cannot hide
@@ -33,43 +29,13 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
         ".agents/skills/finch-backlog/scripts/test-review-protocol",
         ".github/workflows/docs.yml",
     ),
-    "issue-105-oauth.yml": (
-        "Cargo.toml", "src/lib.rs", "src/oauth/**", "src/providers/chatgpt_oauth.rs",
-        "src/providers/mod.rs", ".github/issue-105-windows-probe/**",
-        ".github/workflows/issue-105-oauth.yml",
-    ),
-    "issue-163-effect-audit.yml": (
-        ".github/workflows/issue-163-effect-audit.yml", "schema/finch_ipc.capnp",
-        "src/brain/effect_audit_archive.rs", "src/brain/mod.rs", "src/brain/remote.rs",
-        "src/brain/store.rs", "src/cli/repl_event/**", "src/ipc/**",
-        "src/runtime/effect_log.rs", "src/runtime/mod.rs", "src/server/brain_runner.rs",
-        "src/server/brain_service.rs", "src/server/handlers.rs", "src/server/mod.rs",
-        "src/tools/executor.rs", "src/tools/types.rs",
-        "src/tools/implementations/program.rs",
-    ),
-    "issue-187-subagent-fanout.yml": (
-        "src/tools/implementations/spawn.rs",
-        ".github/workflows/issue-187-subagent-fanout.yml",
-    ),
     "issue-201-chatgpt-auth.yml": (
-        "Cargo.toml", "src/oauth/**", "src/config/**", "src/providers/chatgpt_oauth.rs",
-        "src/providers/model_catalog.rs", "src/providers/openai_jwks.rs",
-        "src/cli/chatgpt_auth.rs", "src/cli/setup_wizard.rs", "src/main.rs", "docs/OAUTH.md",
-        ".github/issue-201-windows-probe/**",
+        "Cargo.toml", "src/lib.rs", "src/oauth/**", "src/config/**",
+        "src/providers/chatgpt_oauth.rs", "src/providers/openai_jwks.rs",
+        "src/providers/model_catalog.rs", "src/providers/mod.rs", "src/cli/chatgpt_auth.rs",
+        "src/cli/setup_wizard.rs", "src/main.rs", "docs/OAUTH.md",
+        ".github/issue-105-windows-probe/**", ".github/issue-201-windows-probe/**",
         ".github/workflows/issue-201-chatgpt-auth.yml",
-    ),
-    "issue-227-setup-preservation.yml": (
-        "src/config/**", "src/cli/setup_wizard.rs", "src/main.rs",
-        ".github/workflows/issue-227-setup-preservation.yml",
-    ),
-    "issue-245-cargo-slot.yml": (
-        ".agents/skills/finch-backlog/**", ".claude/skills/finch-backlog",
-        ".github/workflows/issue-245-cargo-slot.yml",
-    ),
-    "issue-46-atomic-conversation.yml": (
-        ".github/workflows/issue-46-atomic-conversation.yml", "src/cli/conversation.rs",
-        "src/cli/memtree_console/event_handler.rs", "src/cli/repl_event/**",
-        "src/providers/claude.rs",
     ),
     "issue-56-brain-isolation.yml": (
         ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
@@ -80,8 +46,7 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
 
 EXPECTED_PULL_REQUEST_OPTIONS = {
     name: ({"branches": ("main",)} if name in {
-        "ci.yml", "issue-105-oauth.yml", "issue-187-subagent-fanout.yml",
-        "issue-201-chatgpt-auth.yml", "issue-227-setup-preservation.yml",
+        "ci.yml", "issue-201-chatgpt-auth.yml",
     } else {})
     for name in EXPECTED_PATHS
 }
@@ -94,25 +59,7 @@ EXPECTED_CHECKS = {
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
     ),
     "docs.yml": ("Current docs links, claims, and shell syntax",),
-    "issue-105-oauth.yml": ("macos-oauth", "oauth", "windows-compile"),
-    "issue-163-effect-audit.yml": ("effect-audit",),
-    "issue-187-subagent-fanout.yml": (
-        "Focused spawn tests (macos-14)", "Focused spawn tests (ubuntu-24.04)",
-    ),
-    "issue-201-chatgpt-auth.yml": (
-        "focused-auth (macos-14)", "focused-auth (ubuntu-24.04)",
-        "windows-verifier-compile",
-    ),
-    "issue-227-setup-preservation.yml": (
-        "setup-preservation (macos-14)", "setup-preservation (ubuntu-24.04)",
-        "windows-auth-contract",
-    ),
-    "issue-245-cargo-slot.yml": (
-        "macos-14 repository-wide lock", "ubuntu-24.04 repository-wide lock",
-    ),
-    "issue-46-atomic-conversation.yml": (
-        "atomic-rounds (macos-14)", "atomic-rounds (ubuntu-24.04)",
-    ),
+    "issue-201-chatgpt-auth.yml": ("windows-verifier-compile",),
     "issue-56-brain-isolation.yml": ("Isolation boundaries (ubuntu-24.04)",),
     "repository-hygiene.yml": ("Tracked tree (ubuntu-24.04)",),
 }
@@ -137,23 +84,21 @@ EXPECTED_FIXTURES = {
         "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)", "effect-audit",
+        "Tracked tree (ubuntu-24.04)",
     )),
     "manifest_dependency": (("Cargo.toml", "Cargo.lock"), (
         "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
         "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)", "focused-auth (macos-14)",
-        "focused-auth (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile",
-        "windows-verifier-compile",
+        "Tracked tree (ubuntu-24.04)", "windows-verifier-compile",
     )),
     "public_api": (("src/lib.rs",), (
         "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
         "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
         "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
         "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)", "macos-oauth", "oauth", "windows-compile",
+        "Tracked tree (ubuntu-24.04)", "windows-verifier-compile",
     )),
 }
 
@@ -216,32 +161,40 @@ end
     return document
 
 
-def pull_request_contract(document: dict[str, Any], display: str) -> dict[str, tuple[str, ...]] | bool:
+def event_contract(
+    document: dict[str, Any], display: str, event: str,
+) -> dict[str, tuple[str, ...]] | bool:
     triggers = document["on"]
     if not isinstance(triggers, dict):
         raise ContractError(f"{display}: on must be a mapping")
     if "pull_request_target" in triggers:
         raise ContractError(f"{display}: on.pull_request_target is unsupported by the reviewed PR allocation")
-    if "pull_request" not in triggers:
+    if event not in triggers:
         return False
-    pull_request = triggers["pull_request"]
-    if pull_request is None:
+    options = triggers[event]
+    if options is None:
         return {}
-    if not isinstance(pull_request, dict):
-        raise ContractError(f"{display}: on.pull_request must be a mapping or null")
+    if not isinstance(options, dict):
+        raise ContractError(f"{display}: on.{event} must be a mapping or null")
     supported = {"branches", "branches-ignore", "types", "paths", "paths-ignore"}
-    unsupported = set(pull_request) - supported
+    unsupported = set(options) - supported
     if unsupported:
-        raise ContractError(f"{display}: unsupported pull_request keys affecting activation: {sorted(unsupported)}")
+        raise ContractError(f"{display}: unsupported {event} keys affecting activation: {sorted(unsupported)}")
     for alternatives in (("branches", "branches-ignore"), ("paths", "paths-ignore")):
-        if set(alternatives) <= set(pull_request):
-            raise ContractError(f"{display}: on.pull_request cannot combine {alternatives[0]} and {alternatives[1]}")
+        if set(alternatives) <= set(options):
+            raise ContractError(f"{display}: on.{event} cannot combine {alternatives[0]} and {alternatives[1]}")
     contract: dict[str, tuple[str, ...]] = {}
-    for key, values in pull_request.items():
+    for key, values in options.items():
         if not isinstance(values, list) or not values or not all(isinstance(item, str) for item in values):
-            raise ContractError(f"{display}: on.pull_request.{key} must be a nonempty string list")
+            raise ContractError(f"{display}: on.{event}.{key} must be a nonempty string list")
+        if len(values) != len(set(values)):
+            raise ContractError(f"{display}: on.{event}.{key} contains duplicates")
         contract[key] = tuple(values)
     return contract
+
+
+def pull_request_contract(document: dict[str, Any], display: str) -> dict[str, tuple[str, ...]] | bool:
+    return event_contract(document, display, "pull_request")
 
 
 MATRIX_REFERENCE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}")
@@ -345,6 +298,175 @@ def workflow_activates(contract: dict[str, tuple[str, ...]], changed: tuple[str,
     return any(path_matches(path) for path in changed)
 
 
+def shell_commands(run: Any) -> tuple[str, ...]:
+    if not isinstance(run, str):
+        return ()
+    joined = run.replace("\\\n", " ")
+    return tuple(" ".join(line.split()) for line in joined.splitlines() if line.strip())
+
+
+def active_owner_job_errors(
+    documents: dict[str, dict[str, Any]], workflow: str, job_id: str, expected_runner: str,
+) -> list[str]:
+    job = documents.get(workflow, {}).get("jobs", {}).get(job_id)
+    if not isinstance(job, dict):
+        return [f"{workflow}: required owner job {job_id!r} is missing"]
+    errors: list[str] = []
+    if job.get("runs-on") != expected_runner or job.get("if") is not None:
+        errors.append(
+            f"{workflow}: owner job {job_id!r} must run actively on {expected_runner}"
+        )
+    if job.get("continue-on-error") not in (None, False):
+        errors.append(f"{workflow}: owner job {job_id!r} must gate failure")
+    return errors
+
+
+def required_step_errors(
+    documents: dict[str, dict[str, Any]], workflow: str, job_id: str, name: str,
+    expected_if: str | None, expected_shell: str | None, commands: tuple[str, ...],
+) -> list[str]:
+    errors: list[str] = []
+    matches: list[tuple[str, str, dict[str, Any]]] = []
+    for owner_workflow, document in documents.items():
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for owner_job, job in jobs.items():
+            if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+                continue
+            for step in job["steps"]:
+                if isinstance(step, dict) and step.get("name") == name:
+                    matches.append((owner_workflow, owner_job, step))
+    owners = tuple((owner_workflow, owner_job) for owner_workflow, owner_job, _ in matches)
+    if len(matches) != 1 or owners != ((workflow, job_id),):
+        return [
+            f"required step {name!r} must occur exactly once in {workflow}:{job_id}; "
+            f"actual={owners!r}"
+        ]
+    step = matches[0][2]
+    if step.get("if") != expected_if:
+        errors.append(
+            f"{workflow}: step {name!r} condition changed; "
+            f"expected={expected_if!r} actual={step.get('if')!r}"
+        )
+    if step.get("shell") != expected_shell:
+        errors.append(
+            f"{workflow}: step {name!r} shell changed; "
+            f"expected={expected_shell!r} actual={step.get('shell')!r}"
+        )
+    if step.get("continue-on-error") not in (None, False):
+        errors.append(f"{workflow}: step {name!r} must gate failure")
+    actual_commands = shell_commands(step.get("run"))
+    if actual_commands != commands:
+        errors.append(
+            f"{workflow}: step {name!r} commands changed; "
+            f"expected={commands!r} actual={actual_commands!r}"
+        )
+    return errors
+
+
+def step_order_errors(
+    documents: dict[str, dict[str, Any]], workflow: str, job_id: str,
+    earlier_names: tuple[str, ...], before_name: str,
+) -> list[str]:
+    """Require unique preflight steps to precede the named expensive setup boundary."""
+    job = documents.get(workflow, {}).get("jobs", {}).get(job_id)
+    if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+        return []
+    positions: dict[str, list[int]] = {}
+    for index, step in enumerate(job["steps"]):
+        if isinstance(step, dict) and isinstance(step.get("name"), str):
+            positions.setdefault(step["name"], []).append(index)
+    required = (*earlier_names, before_name)
+    if any(len(positions.get(name, ())) != 1 for name in required):
+        return []  # Missing/duplicate steps already have more specific diagnostics.
+    boundary = positions[before_name][0]
+    late = tuple(name for name in earlier_names if positions[name][0] >= boundary)
+    if not late:
+        return []
+    return [
+        f"{workflow}: job {job_id!r} preflight steps must precede {before_name!r}; "
+        f"late={late!r}"
+    ]
+
+
+def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "${{ matrix.os }}"))
+
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "test", "Prove validated request tokens cannot be forged",
+        "runner.os == 'Linux' && matrix.feature_name == 'default'", None,
+        ("cargo test --doc -- ValidatedProviderRequest",),
+    ))
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "test", "Run release-mode atomic history regression",
+        "runner.os == 'Linux' && matrix.feature_name == 'default'", None,
+        ("cargo test --release --lib cli::conversation::tests -- --nocapture",),
+    ))
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "test", "Verify shared skill discovery",
+        "matrix.feature_name == 'default'", "bash", (
+            "test -L .claude/skills/finch-backlog",
+            'test "$(cd .agents/skills/finch-backlog && pwd -P)" = "$(cd .claude/skills/finch-backlog && pwd -P)"',
+        ),
+    ))
+    errors.extend(required_step_errors(
+        documents, "ci.yml", "test", "Check and exercise the Cargo slot",
+        "matrix.feature_name == 'default'", "bash", (
+            "bash -n .agents/skills/finch-backlog/scripts/with-cargo-slot .agents/skills/finch-backlog/scripts/test-with-cargo-slot",
+            ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
+        ),
+    ))
+    errors.extend(step_order_errors(
+        documents, "ci.yml", "test", (
+            "Verify shared skill discovery", "Check and exercise the Cargo slot",
+        ), "Install repository Rust toolchain",
+    ))
+
+    auth = documents.get("issue-201-chatgpt-auth.yml", {})
+    jobs = auth.get("jobs")
+    if not isinstance(jobs, dict) or tuple(jobs) != ("windows-verifier-compile",):
+        errors.append("issue-201-chatgpt-auth.yml: exactly one Windows verifier job is required")
+    else:
+        job = jobs["windows-verifier-compile"]
+        if not isinstance(job, dict):
+            errors.append("issue-201-chatgpt-auth.yml: Windows verifier job must be a mapping")
+    errors.extend(active_owner_job_errors(
+        documents, "issue-201-chatgpt-auth.yml", "windows-verifier-compile", "windows-2022",
+    ))
+    errors.extend(required_step_errors(
+        documents, "issue-201-chatgpt-auth.yml", "windows-verifier-compile",
+        "Compile exact authentication sources on Windows", None, None, (
+            "cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml",
+            "cargo check --manifest-path .github/issue-201-windows-probe/Cargo.toml",
+        ),
+    ))
+
+    try:
+        push = event_contract(auth, ".github/workflows/issue-201-chatgpt-auth.yml", "push")
+    except ContractError as error:
+        errors.append(str(error))
+    else:
+        expected = {"branches": ("main",), "paths": EXPECTED_PATHS["issue-201-chatgpt-auth.yml"]}
+        if push is False:
+            errors.append("issue-201-chatgpt-auth.yml: path-filtered push to main is required")
+        else:
+            for key in sorted(set(push) | set(expected)):
+                actual_value = push.get(key)
+                expected_value = expected.get(key)
+                equal = (
+                    set(actual_value or ()) == set(expected_value or ())
+                    if key == "paths" else actual_value == expected_value
+                )
+                if not equal:
+                    errors.append(
+                        f"issue-201-chatgpt-auth.yml: push.{key} changed; "
+                        f"expected={expected_value!r} actual={actual_value!r}"
+                    )
+    return errors
+
+
 def compare_contract(root: Path) -> list[str]:
     directory = root / WORKFLOWS
     actual_files = tuple(sorted(path.name for path in directory.glob("*.y*ml")))
@@ -352,10 +474,12 @@ def compare_contract(root: Path) -> list[str]:
     if actual_files != EXPECTED_WORKFLOWS:
         errors.append(f"workflow inventory changed; expected={EXPECTED_WORKFLOWS!r} actual={actual_files!r}")
     parsed: dict[str, tuple[dict[str, tuple[str, ...]], tuple[str, ...]]] = {}
+    documents: dict[str, dict[str, Any]] = {}
     for name in sorted(set(actual_files) & set(EXPECTED_WORKFLOWS)):
         display = (WORKFLOWS / name).as_posix()
         try:
             document = load_yaml(directory / name)
+            documents[name] = document
             contract = pull_request_contract(document, display)
             if contract is False:
                 continue
@@ -373,10 +497,16 @@ def compare_contract(root: Path) -> list[str]:
         if EXPECTED_PATHS[name] is not None:
             expected_contract["paths"] = EXPECTED_PATHS[name]
         for key in sorted(set(contract) | set(expected_contract)):
-            if contract.get(key) != expected_contract.get(key):
+            actual_value = contract.get(key)
+            expected_value = expected_contract.get(key)
+            equal = (
+                set(actual_value or ()) == set(expected_value or ())
+                if key == "paths" else actual_value == expected_value
+            )
+            if not equal:
                 errors.append(
                     f"{WORKFLOWS / name}: pull_request.{key} changed; "
-                    f"expected={expected_contract.get(key)!r} actual={contract.get(key)!r}"
+                    f"expected={expected_value!r} actual={actual_value!r}"
                 )
         expected = tuple(sorted(EXPECTED_CHECKS[name]))
         if checks != expected:
@@ -405,6 +535,7 @@ def compare_contract(root: Path) -> list[str]:
                 f"missing={sorted(set(wanted) - set(actual))!r} "
                 f"unexpected={sorted(set(actual) - set(wanted))!r}"
             )
+    errors.extend(migrated_boundary_errors(documents))
     return errors
 
 
