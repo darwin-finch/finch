@@ -12,14 +12,36 @@ source "$repo_root/scripts/lib/brain_test_isolation.sh"
 # fixed `-pinned` file can survive a cache restore from an older checkout and
 # is not evidence that its bytes implement the current proof contract. Use a
 # short supervised probe to report the freshly selected content-addressed
-# executable, then retain this harness's original unnested process topology.
+# executable and its matching Cargo target, then retain this harness's original
+# unnested process topology. Command-substitution environment changes do not
+# propagate to this parent shell, so the authority pair must be returned
+# explicitly.
+selected_cargo_target=''
 if [[ -z "${FINCH_TEST_SUPERVISOR_BIN:-}" ]]; then
-  supervisor="$("$repo_root/scripts/test_brains.sh" bash -c \
-    'printf "%s\n" "$FINCH_TEST_SUPERVISOR_BIN"')"
+  supervisor_selection="$("$repo_root/scripts/test_brains.sh" bash -c \
+    'printf "%s\n%s\n" "$FINCH_TEST_SUPERVISOR_BIN" "$CARGO_TARGET_DIR"')"
+  if [[ "$supervisor_selection" != *$'\n'* ]]; then
+    echo "Brain isolation freshness probe omitted its Cargo target: supervisor=${supervisor_selection:-<unset>} target=<unset>" >&2
+    exit 69
+  fi
+  supervisor="${supervisor_selection%%$'\n'*}"
+  selected_cargo_target="${supervisor_selection#*$'\n'}"
 else
   supervisor="$FINCH_TEST_SUPERVISOR_BIN"
+  selected_cargo_target="${CARGO_TARGET_DIR:-}"
 fi
 [[ -x "$supervisor" ]] || { echo 'inherited test supervisor is not executable' >&2; exit 69; }
+if [[ -z "$selected_cargo_target" || "$selected_cargo_target" != /* ||
+  ! -d "$selected_cargo_target" ]]; then
+  echo "Brain isolation supervisor has no usable absolute Cargo target: supervisor=$supervisor target=${selected_cargo_target:-<unset>}" >&2
+  exit 69
+fi
+selected_cargo_target="$(cd "$selected_cargo_target" && pwd -P)"
+export CARGO_TARGET_DIR="$selected_cargo_target"
+if ! brain_isolation_supervisor_digest_for_profile "$repo_root" "$supervisor" >/dev/null; then
+  echo "Brain isolation supervisor does not belong to its selected Cargo target/profile: supervisor=$supervisor target=$CARGO_TARGET_DIR" >&2
+  exit 69
+fi
 
 scratch="$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/finch-brain-isolation-regression.XXXXXX")"
 sentinel_pid=''
@@ -278,7 +300,7 @@ if ! grep -q 'does not contain the image named by its path' "$rust_wrong_digest_
   exit 1
 fi
 phase=shell-rejects-wrong-content-addressed-supervisor-name
-shell_wrong_digest_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
+shell_wrong_digest_supervisor="$CARGO_TARGET_DIR/debug/finch-test-supervisor-pinned-sha256-$false_supervisor_digest"
 shell_wrong_digest_diagnostic="$scratch/shell-wrong-digest-diagnostic"
 install -m 0555 "$observed_supervisor" "$shell_wrong_digest_supervisor"
 shell_wrong_digest_status=0
@@ -911,7 +933,13 @@ for launcher in "${launchers[@]}"; do
   FINCH_TEST_PROOF_DIAGNOSTICS=1 FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" \
     FINCH_TEST_LAUNCHER_PROBE_ONLY=1 \
     run_isolated "$repo_root/scripts/$launcher"
-  [[ "$(cat "$launcher_probe")" == "$temp_parent"/finch-brain-test-home.* ]]
+  launcher_probe_lines="$(wc -l <"$launcher_probe" | tr -d '[:space:]')"
+  launcher_probe_home="$(cat "$launcher_probe")"
+  if [[ "$launcher_probe_lines" != 1 ||
+    "$launcher_probe_home" != "$temp_parent"/finch-brain-test-home.* ]]; then
+    echo "launcher probe did not execute exactly once inside the selected isolated HOME: launcher=$launcher lines=$launcher_probe_lines expected=$temp_parent/finch-brain-test-home.* actual=$launcher_probe_home" >&2
+    exit 1
+  fi
 done
 
 # Keep the executable/integration inventory closed. Any newly added script or
