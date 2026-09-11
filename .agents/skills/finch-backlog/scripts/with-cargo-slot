@@ -102,7 +102,7 @@ esac
 # Acquire nonblocking in a bounded loop, then retain the lock in a supervising
 # parent. The command child closes the lock descriptor before exec so a
 # compiler cache or other daemon cannot keep the slot after Cargo exits.
-exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -e '
+exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -MPOSIX=SIG_BLOCK,SIG_SETMASK,SIGHUP,SIGINT,SIGQUIT,SIGTERM -e '
     use strict;
     use warnings;
     my ($timeout, $path, @command) = @ARGV;
@@ -117,6 +117,10 @@ exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -e '
     }
     my $child = 0;
     my @pending;
+    my $blocked = POSIX::SigSet->new(SIGHUP, SIGINT, SIGQUIT, SIGTERM);
+    my $previous = POSIX::SigSet->new();
+    POSIX::sigprocmask(SIG_BLOCK, $blocked, $previous)
+        or die "with-cargo-slot: could not block signals before fork: $!\n";
     for my $signal (qw(HUP INT QUIT TERM)) {
         $SIG{$signal} = sub {
             if ($child > 0) {
@@ -131,10 +135,14 @@ exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -e '
     if ($pid == 0) {
         close $lock;
         $SIG{$_} = "DEFAULT" for qw(HUP INT QUIT TERM);
+        POSIX::sigprocmask(SIG_SETMASK, $previous)
+            or die "with-cargo-slot: could not restore child signal mask: $!\n";
         exec {$command[0]} @command
             or die "with-cargo-slot: could not execute $command[0]: $!\n";
     }
     $child = $pid;
+    POSIX::sigprocmask(SIG_SETMASK, $previous)
+        or die "with-cargo-slot: could not restore parent signal mask: $!\n";
     kill $_, $child for @pending;
     my $waited;
     do {
