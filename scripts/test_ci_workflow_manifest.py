@@ -14,11 +14,17 @@ ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_ci_workflow_manifest.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 from check_ci_workflow_manifest import (  # noqa: E402
+    ESCAPE_API_ALLOWLIST,
     EXPECTED_PATHS,
+    ISOLATION_WORKFLOW,
+    MAIN_SAVE_IF,
+    escape_api_errors,
     event_contract,
     load_yaml,
     workflow_activates,
 )
+
+MACOS_JOB = "  isolation-boundaries-macos:\n"
 
 
 class Repository:
@@ -26,6 +32,14 @@ class Repository:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         shutil.copytree(ROOT / ".github/workflows", self.root / ".github/workflows")
+        # Minimal sources holding exactly the allowlisted escape-API uses; the real tree is
+        # covered by test_real_tree_escape_api_uses_match_the_allowlist.
+        for entry in ESCAPE_API_ALLOWLIST:
+            relative, line = entry.split(":", 1)
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as source:
+                source.write(f"    {line}\n")
 
     def close(self) -> None:
         self.temporary.cleanup()
@@ -33,12 +47,23 @@ class Repository:
     def workflow(self, name: str) -> Path:
         return self.root / ".github/workflows" / name
 
-    def replace(self, name: str, old: str, new: str) -> None:
+    def replace(self, name: str, old: str, new: str, after: str | None = None) -> None:
+        """Replace the first occurrence of old, or the first one following the after anchor."""
         path = self.workflow(name)
         contents = path.read_text()
-        if old not in contents:
+        start = 0
+        if after is not None:
+            if after not in contents:
+                raise AssertionError(f"fixture anchor missing from {name}: {after!r}")
+            start = contents.index(after)
+        if old not in contents[start:]:
             raise AssertionError(f"fixture mutation target missing from {name}: {old!r}")
-        path.write_text(contents.replace(old, new, 1))
+        path.write_text(contents[:start] + contents[start:].replace(old, new, 1))
+
+    def write_source(self, relative: str, text: str) -> None:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
 
     def check(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -109,20 +134,214 @@ class WorkflowContractTests(unittest.TestCase):
             "one excluded file must not hide a different included changed path",
         )
 
-    def test_every_auth_path_activates_pull_request_and_push(self) -> None:
-        document = load_yaml(ROOT / ".github/workflows/issue-201-chatgpt-auth.yml")
-        for event in ("pull_request", "push"):
-            contract = event_contract(document, "issue-201-chatgpt-auth.yml", event)
-            self.assertIsInstance(contract, dict, f"{event} contract must be path-filtered")
-            for path in EXPECTED_PATHS["issue-201-chatgpt-auth.yml"] or ():
-                self.assertTrue(
-                    workflow_activates(contract, (path.replace("**", "probe"),)),
-                    f"{event} must activate for contracted path {path}",
-                )
-            self.assertFalse(
-                workflow_activates(contract, ("src/models/mod.rs",)),
-                f"{event} must stay idle for an ordinary non-auth path",
-            )
+    def test_every_contracted_path_activates_pull_request_and_push(self) -> None:
+        ordinary = {
+            "issue-201-chatgpt-auth.yml": ("src/models/mod.rs",),
+            ISOLATION_WORKFLOW: (
+                "src/models/mod.rs", "src/cli/query.rs", "src/cli/tui/mod.rs",
+                "src/providers/anthropic.rs", "src/lib.rs", "README.md",
+            ),
+        }
+        for workflow, idle_paths in ordinary.items():
+            document = load_yaml(ROOT / ".github/workflows" / workflow)
+            for event in ("pull_request", "push"):
+                contract = event_contract(document, workflow, event)
+                self.assertIsInstance(contract, dict, f"{workflow} {event} contract must be path-filtered")
+                for path in EXPECTED_PATHS[workflow] or ():
+                    self.assertTrue(
+                        workflow_activates(contract, (path.replace("**", "probe"),)),
+                        f"{workflow} {event} must activate for contracted path {path}",
+                    )
+                for path in idle_paths:
+                    self.assertFalse(
+                        workflow_activates(contract, (path,)),
+                        f"{workflow} {event} must stay idle for ordinary path {path}",
+                    )
+
+    def test_isolation_triggers_are_bound(self) -> None:
+        mutations = (
+            # Only the second (push) occurrence changes, so PR and push paths diverge.
+            (
+                "      - 'docs/DEVELOPMENT.md'\n", "", "  push:\n",
+                "push.paths changed", "docs/DEVELOPMENT.md",
+            ),
+            ("      - 'tests/README.md'\n", "", None, "pull_request.paths changed", "tests/README.md"),
+            ("    - cron: '0 9 * * 1'\n", "    - cron: '0 9 * * *'\n", None, "weekly schedule changed"),
+            ("  schedule:\n    - cron: '0 9 * * 1'\n", "", None, "weekly schedule changed"),
+            ("  workflow_dispatch:\n", "", None, "manual workflow_dispatch trigger is required"),
+        )
+        for old, new, after, *diagnostics in mutations:
+            with self.subTest(diagnostics=diagnostics):
+                repository = Repository()
+                try:
+                    repository.replace(ISOLATION_WORKFLOW, old, new, after=after)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"isolation trigger mutant passed: {diagnostics}")
+                    for diagnostic in diagnostics:
+                        self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_both_isolation_platforms_run_the_complete_fatal_sequence(self) -> None:
+        harness = "    - name: Exercise the complete synthetic isolation harness\n"
+        mutations = (
+            ("    runs-on: macos-14\n", "    runs-on: ubuntu-24.04\n", MACOS_JOB,
+             "owner job 'isolation-boundaries-macos' must run actively on macos-14"),
+            ("    runs-on: macos-14\n", "    if: false\n    runs-on: macos-14\n", MACOS_JOB,
+             "owner job 'isolation-boundaries-macos' must run actively"),
+            ("    runs-on: macos-14\n", "    continue-on-error: true\n    runs-on: macos-14\n", MACOS_JOB,
+             "owner job 'isolation-boundaries-macos' must gate failure"),
+            (harness + "      timeout-minutes: 15\n      run: ./scripts/test_brain_isolation.sh\n", "",
+             MACOS_JOB, "'isolation-boundaries-macos' (macos-14) fatal step "
+             "'Exercise the complete synthetic isolation harness' must occur exactly once"),
+            (harness, harness + "      if: false\n", MACOS_JOB, "must run unconditionally"),
+            (harness, harness + "      continue-on-error: true\n", MACOS_JOB, "must gate failure"),
+            ("tests/worker_node_isolation_contract.sh\n", "true\n", MACOS_JOB,
+             "'Keep worker node identity inside disposable state' commands changed"),
+            ("        ./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture\n", "", None,
+             "'isolation-boundaries' (ubuntu-24.04) fatal step", "commands changed"),
+            ("  isolation-boundaries-macos:\n", "  isolation-boundaries-mac:\n", None,
+             "isolation job inventory changed",
+             "required owner job 'isolation-boundaries-macos' is missing"),
+        )
+        for old, new, after, *diagnostics in mutations:
+            with self.subTest(diagnostics=diagnostics):
+                repository = Repository()
+                try:
+                    repository.replace(ISOLATION_WORKFLOW, old, new, after=after)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"isolation platform mutant passed: {diagnostics}")
+                    for diagnostic in diagnostics:
+                        self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_isolation_fatal_steps_must_keep_their_order(self) -> None:
+        path = self.repository.workflow(ISOLATION_WORKFLOW)
+        source = path.read_text()
+        macos = source.index(MACOS_JOB)
+        start = source.index("    - name: Exercise the complete synthetic isolation harness\n", macos)
+        harness = source[start:]
+        source = source[:start]
+        insertion = source.index("    - name: Check bins and tests\n", macos)
+        path.write_text(source[:insertion] + harness + "\n" + source[insertion:])
+        self.assert_fails("'isolation-boundaries-macos' (macos-14) fatal steps are out of order")
+
+    def test_macos_isolation_cache_is_a_restore_only_consumer_of_the_macos_family(self) -> None:
+        mutations = (
+            ("        save-if: false\n", f"        save-if: {MAIN_SAVE_IF}\n",
+             "'isolation-boundaries-macos' cache inputs changed"),
+            ("apple-release-default-${{", "apple-release-isolation-${{",
+             "'isolation-boundaries-macos' cache inputs changed",
+             "Cargo cache identity set changed; expected 6 identities across 7 locations",
+             "apple-release-isolation"),
+            ('      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"\n', "",
+             "'isolation-boundaries-macos' effective Cargo/Rust environment changed"),
+            ("      CARGO_PROFILE_RELEASE_LTO: \"false\"\n",
+             "      CARGO_PROFILE_RELEASE_LTO: \"false\"\n      CARGO_PROFILE_TEST_DEBUG: 0\n",
+             "'isolation-boundaries-macos' effective Cargo/Rust environment changed"),
+            ("      continue-on-error: true\n      with:\n",
+             "      continue-on-error: true\n      env:\n        CARGO_INCREMENTAL: 0\n      with:\n",
+             "'isolation-boundaries-macos' must not override action-hashed Rust/Cargo"),
+        )
+        for old, new, *diagnostics in mutations:
+            with self.subTest(diagnostics=diagnostics):
+                repository = Repository()
+                try:
+                    repository.replace(ISOLATION_WORKFLOW, old, new, after=MACOS_JOB)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"macOS isolation cache mutant passed: {diagnostics}")
+                    for diagnostic in diagnostics:
+                        self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_ubuntu_isolation_environment_stays_bound_to_its_family(self) -> None:
+        self.repository.replace(ISOLATION_WORKFLOW, "      CARGO_PROFILE_TEST_DEBUG: 0\n", "")
+        self.assert_fails("'isolation-boundaries' effective Cargo/Rust environment changed")
+
+    def test_supervised_commands_cannot_return_to_ordinary_ci(self) -> None:
+        moved = (
+            "    - name: Exercise the complete synthetic isolation harness on macOS\n"
+            "      if: runner.os == 'macOS'\n"
+            "      run: ./scripts/test_brain_isolation.sh\n\n"
+        )
+        self.repository.replace(
+            "ci.yml", "    - name: Warm macOS isolation supervisor cache on trusted main\n",
+            moved + "    - name: Warm macOS isolation supervisor cache on trusted main\n",
+        )
+        self.assert_fails(
+            "runs supervised isolation work in ordinary CI",
+            "Exercise the complete synthetic isolation harness on macOS",
+        )
+
+    def test_supervisor_cache_warm_stays_trusted_main_only(self) -> None:
+        mutations = (
+            ("      if: github.event_name == 'push' && runner.os == 'macOS'\n      run: |\n        cargo test --bin finch-test-supervisor",
+             "      if: runner.os == 'macOS'\n      run: |\n        cargo test --bin finch-test-supervisor",
+             "Warm macOS isolation supervisor cache on trusted main", "condition changed"),
+            ("        cargo build --release --bin finch-test-supervisor\n",
+             "        cargo build --release --bin finch-test-supervisor\n        ./scripts/test_brain_isolation.sh\n",
+             "Warm macOS isolation supervisor cache on trusted main", "commands changed"),
+        )
+        for old, new, *diagnostics in mutations:
+            with self.subTest(diagnostics=diagnostics):
+                repository = Repository()
+                try:
+                    repository.replace("ci.yml", old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"supervisor warm mutant passed: {diagnostics}")
+                    for diagnostic in diagnostics:
+                        self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_escape_api_in_ordinary_source_fails_without_activating_isolation(self) -> None:
+        ordinary = "src/cli/tui/mod.rs"
+        contract = event_contract(
+            load_yaml(ROOT / ".github/workflows" / ISOLATION_WORKFLOW), ISOLATION_WORKFLOW, "pull_request",
+        )
+        self.assertFalse(
+            workflow_activates(contract, (ordinary,)),
+            f"{ordinary} must not activate supervised isolation; the always-on scan must catch it",
+        )
+        self.repository.write_source(ordinary, "fn detach() {\n    unsafe { nix::libc::setsid() };\n}\n")
+        self.assert_fails("escape-API allowlist changed", "src/cli/tui/mod.rs:unsafe { nix::libc::setsid() };")
+
+    def test_escape_api_scan_covers_shell_job_control_and_every_root(self) -> None:
+        cases = (
+            ("scripts/new_launcher.sh", "set -m\n", "scripts/new_launcher.sh:set -m"),
+            ("tests/new_test.rs", "cmd.process_group(0);\n", "tests/new_test.rs:cmd.process_group(0);"),
+            ("src/node/spawn.rs", "libc::setpgid(0, 0);\n", "src/node/spawn.rs:libc::setpgid(0, 0);"),
+        )
+        for relative, text, diagnostic in cases:
+            with self.subTest(relative=relative):
+                repository = Repository()
+                try:
+                    repository.write_source(relative, text)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"unauthorized escape API passed in {relative}")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
+    def test_escape_api_allowlist_rejects_missing_or_changed_uses(self) -> None:
+        self.repository.write_source("src/daemon/spawn.rs", "fn spawn() {}\n")
+        self.assert_fails("missing_allowlisted=", "src/daemon/spawn.rs:if nix::libc::setsid() == -1 {")
+        self.repository.write_source("src/daemon/spawn.rs", "    if nix::libc::setsid() != 0 {\n")
+        self.assert_fails(
+            "unauthorized=['src/daemon/spawn.rs:if nix::libc::setsid() != 0 {']",
+            "src/daemon/spawn.rs:if nix::libc::setsid() == -1 {",
+        )
+
+    def test_escape_api_scan_keeps_harness_self_exclusion_and_ignores_other_files(self) -> None:
+        self.repository.write_source("scripts/test_brain_isolation.sh", "rg 'setsid|setpgid'\nset -m\n")
+        self.repository.write_source("src/notes.md", "setsid\n")
+        self.repository.write_source("src/reset_id.rs", "let preset_idle = subset -mode;\n")
+        self.assert_passes()
+
+    def test_real_tree_escape_api_uses_match_the_allowlist(self) -> None:
+        self.assertEqual([], escape_api_errors(ROOT), "current tree escape-API uses diverge from the allowlist")
 
     def test_branch_filter_drift_fails_actionably(self) -> None:
         self.repository.replace(
