@@ -159,77 +159,14 @@ jobs:
       if: runner.os == 'Linux' && matrix.feature_name == 'default'
       run: cargo test --release --lib cli::conversation::tests -- --nocapture
 
-    - name: Check the current tracked tree on macOS
-      if: runner.os == 'macOS'
-      run: python3 scripts/check_repository_hygiene.py
-
-    - name: Run repository hygiene regressions on macOS
-      if: runner.os == 'macOS'
-      run: python3 scripts/test_repository_hygiene.py
-
-    - name: Reject restoration of the removed SSH surface on macOS
-      if: runner.os == 'macOS'
-      run: python3 scripts/check_no_ssh_surface.py
-
-    - name: Run removed SSH surface regressions on macOS
-      if: runner.os == 'macOS'
-      run: python3 scripts/test_no_ssh_surface.py
-
-    - name: Build macOS isolation supervisor profiles
-      if: runner.os == 'macOS'
+    - name: Warm macOS isolation supervisor cache on trusted main
+      # Keeps the macOS cache family's workload union for the restore-only
+      # isolation job in issue-56-brain-isolation.yml; it proves nothing itself.
+      if: github.event_name == 'push' && runner.os == 'macOS'
       run: |
-        cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact
+        cargo test --bin finch-test-supervisor --no-run
         cargo build --bin finch-test-supervisor
         cargo build --release --bin finch-test-supervisor
-        install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
-        install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
-
-    - name: Reject self-issued proof authority on macOS
-      if: runner.os == 'macOS'
-      run: >-
-        ./scripts/test_brains.sh cargo test --lib
-        brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority
-        -- --nocapture
-
-    - name: Validate concurrent proof reads on macOS
-      if: runner.os == 'macOS'
-      run: >-
-        ./scripts/test_brains.sh cargo test --lib
-        brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
-        -- --nocapture
-
-    - name: Reject rewritten proof at the production constructor on macOS
-      if: runner.os == 'macOS'
-      run: >-
-        ./scripts/test_brains.sh cargo test --lib
-        server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
-        -- --nocapture
-
-    - name: Reject fixture traversal before external mutation on macOS
-      if: runner.os == 'macOS'
-      run: |
-        ./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture
-        ./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture
-        ./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture
-
-    - name: Exercise real Brain and server paths on macOS
-      if: runner.os == 'macOS'
-      run: |
-        ./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture
-        ./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture
-        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture
-        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture
-        ./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored --nocapture
-
-    - name: Keep worker node identity inside disposable state on macOS
-      if: runner.os == 'macOS'
-      run: |
-        tests/worker_node_isolation_contract.sh
-        ./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture
-
-    - name: Exercise the complete synthetic isolation harness on macOS
-      if: runner.os == 'macOS'
-      run: ./scripts/test_brain_isolation.sh
 
     - name: Build Apple Silicon release preflight on trusted main
       if: github.event_name == 'push' && runner.os == 'macOS'

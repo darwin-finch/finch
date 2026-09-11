@@ -37,12 +37,89 @@ EXPECTED_PATHS: dict[str, tuple[str, ...] | None] = {
         ".github/issue-105-windows-probe/**", ".github/issue-201-windows-probe/**",
         ".github/workflows/issue-201-chatgpt-auth.yml",
     ),
+    # Isolation-owned paths plus the three documents scripts/test_brain_isolation.sh scans
+    # directly. Ordinary query/TUI/provider files stay out; the escape-API scan below still
+    # covers them on every PR.
     "issue-56-brain-isolation.yml": (
         ".github/workflows/issue-56-brain-isolation.yml", "Cargo.toml", "Cargo.lock",
-        "build.rs", "schema/**", "src/**", "scripts/**", "tests/**",
+        "build.rs", "schema/**", "src/bin/finch-test-supervisor.rs", "src/brain/**",
+        "src/daemon/**", "src/ipc/**", "src/node/**", "src/server/**",
+        "src/client/daemon_client.rs", "src/cli/repl_event/brain_handler.rs",
+        "scripts/**", "tests/**", "docs/AUTOMATIC_TRAINING.md", "docs/DEVELOPMENT.md",
+        "tests/README.md",
     ),
     "repository-hygiene.yml": None,
 }
+
+ISOLATION_WORKFLOW = "issue-56-brain-isolation.yml"
+ISOLATION_SCHEDULE = [{"cron": "0 9 * * 1"}]
+ISOLATION_JOBS = {"isolation-boundaries": "ubuntu-24.04", "isolation-boundaries-macos": "macos-14"}
+
+# The complete fatal sequence each isolation platform must run, in order.
+ISOLATION_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Check bins and tests", ("cargo check --lib --bins --tests",)),
+    ("Reject external provider binaries", (
+        "cargo test --test no_external_provider_binary_test -- --nocapture",
+    )),
+    ("Build isolation supervisor", (
+        "cargo test --bin finch-test-supervisor signed_device_bits_serialize_as_parseable_u64_identity -- --exact",
+        "cargo build --bin finch-test-supervisor",
+        "cargo build --release --bin finch-test-supervisor",
+        "install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned",
+        "install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned",
+    )),
+    ("Reject self-issued proof authority", (
+        "./scripts/test_brains.sh cargo test --lib brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority -- --nocapture",
+    )),
+    ("Validate offset-independent concurrent proof reads", (
+        "./scripts/test_brains.sh cargo test --lib brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency -- --nocapture",
+    )),
+    ("Reject rewritten proof at the production constructor", (
+        "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore -- --nocapture",
+    )),
+    ("Reject fixture traversal before external mutation", (
+        "./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture",
+        "./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture",
+        "./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture",
+    )),
+    ("Exercise real Brain and server paths behind the guard", (
+        "./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture",
+        "./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture",
+        "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture",
+        "./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture",
+        "./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored --nocapture",
+    )),
+    ("Keep worker node identity inside disposable state", (
+        "tests/worker_node_isolation_contract.sh",
+        "./scripts/test_brains.sh cargo test --test worker_integration_test -- --nocapture",
+    )),
+    ("Exercise the complete synthetic isolation harness", ("./scripts/test_brain_isolation.sh",)),
+)
+
+# Ordinary CI may touch the supervisor only to warm the macOS cache family on trusted main.
+SUPERVISED_MARKERS = (
+    "scripts/test_brains.sh", "scripts/test_brain_isolation.sh",
+    "worker_node_isolation_contract.sh", "finch-test-supervisor",
+)
+SUPERVISOR_WARM_STEP = "Warm macOS isolation supervisor cache on trusted main"
+SUPERVISOR_WARM_COMMANDS = (
+    "cargo test --bin finch-test-supervisor --no-run",
+    "cargo build --bin finch-test-supervisor",
+    "cargo build --release --bin finch-test-supervisor",
+)
+
+# Mirrors the escape-API allowlist in scripts/test_brain_isolation.sh so ordinary source PRs,
+# which no longer run that harness, still reject unauthorized process-group/session escapes.
+ESCAPE_API_ROOTS = ("scripts", "src", "tests")
+ESCAPE_API_SELF = "scripts/test_brain_isolation.sh"
+ESCAPE_API = re.compile(r"(?:^|[^A-Za-z0-9_])(?:setsid|setpgid|process_group\(|set[ \t\n\v\f\r]+-m)")
+ESCAPE_API_ALLOWLIST = (
+    "src/bin/finch-test-supervisor.rs:if libc::setpgid(0, 0) == -1 {",
+    "src/brain/mod.rs:.process_group(0)",
+    "src/brain/mod.rs:if nix::libc::setpgid(0, 0) == -1 {",
+    "src/daemon/spawn.rs:if nix::libc::setsid() == -1 {",
+    "tests/no_external_provider_binary_test.rs:.process_group(0);",
+)
 
 EXPECTED_PULL_REQUEST_OPTIONS = {
     name: ({"branches": ("main",)} if name in {
@@ -60,46 +137,38 @@ EXPECTED_CHECKS = {
     ),
     "docs.yml": ("Current docs links, claims, and shell syntax",),
     "issue-201-chatgpt-auth.yml": ("windows-verifier-compile",),
-    "issue-56-brain-isolation.yml": ("Isolation boundaries (ubuntu-24.04)",),
+    ISOLATION_WORKFLOW: ("Isolation boundaries (macos-14)", "Isolation boundaries (ubuntu-24.04)"),
     "repository-hygiene.yml": ("Tracked tree (ubuntu-24.04)",),
 }
 
+# Checks every PR runs: all of ci.yml plus the tracked-tree hygiene job.
+ALWAYS_CHECKS = (*EXPECTED_CHECKS["ci.yml"], *EXPECTED_CHECKS["repository-hygiene.yml"])
+ISOLATION_CHECKS = EXPECTED_CHECKS[ISOLATION_WORKFLOW]
+
 EXPECTED_FIXTURES = {
     "readme_only": (("README.md",), (
-        "Build Release (x86_64-unknown-linux-gnu)",
-        "Current docs links, claims, and shell syntax", "Runtime Authority (Ubuntu)",
-        "Security Audit", "Test (macos-14, default)", "Test (ubuntu-24.04, default)",
-        "Test (ubuntu-24.04, no-default-features)", "Toolchain and formatting contract",
-        "Toolchain and formatting contract (Windows)", "Tracked tree (ubuntu-24.04)",
+        *ALWAYS_CHECKS, "Current docs links, claims, and shell syntax",
     )),
-    "ordinary_source": (("src/models/mod.rs",), (
-        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
-        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
-        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
-        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)",
-    )),
+    "ordinary_source": (("src/models/mod.rs",), ALWAYS_CHECKS),
+    "ordinary_query_tui_provider": (
+        ("src/cli/query.rs", "src/cli/tui/mod.rs", "src/providers/anthropic.rs"), ALWAYS_CHECKS,
+    ),
     "brain_effect": (("src/brain/store.rs", "src/server/handlers.rs"), (
-        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
-        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
-        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
-        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)",
+        *ALWAYS_CHECKS, *ISOLATION_CHECKS,
+    )),
+    "isolation_harness": (("scripts/test_brain_isolation.sh",), (
+        *ALWAYS_CHECKS, *ISOLATION_CHECKS,
+    )),
+    "isolation_integration_test": (("tests/daemon_integration_test.rs",), (
+        *ALWAYS_CHECKS, *ISOLATION_CHECKS,
+    )),
+    "supervisor_binary": (("src/bin/finch-test-supervisor.rs",), (
+        *ALWAYS_CHECKS, *ISOLATION_CHECKS,
     )),
     "manifest_dependency": (("Cargo.toml", "Cargo.lock"), (
-        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
-        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
-        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
-        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)", "windows-verifier-compile",
+        *ALWAYS_CHECKS, *ISOLATION_CHECKS, "windows-verifier-compile",
     )),
-    "public_api": (("src/lib.rs",), (
-        "Build Release (x86_64-unknown-linux-gnu)", "Isolation boundaries (ubuntu-24.04)",
-        "Runtime Authority (Ubuntu)", "Security Audit", "Test (macos-14, default)",
-        "Test (ubuntu-24.04, default)", "Test (ubuntu-24.04, no-default-features)",
-        "Toolchain and formatting contract", "Toolchain and formatting contract (Windows)",
-        "Tracked tree (ubuntu-24.04)", "windows-verifier-compile",
-    )),
+    "public_api": (("src/lib.rs",), (*ALWAYS_CHECKS, "windows-verifier-compile")),
 }
 
 RUST_CACHE_ACTION = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
@@ -119,11 +188,34 @@ COMMON_CACHE_INPUTS = {
 }
 
 
+CI_SHARED_ENV = {
+    "CARGO_TERM_COLOR": "always",
+    "RUST_BACKTRACE": 1,
+    "CARGO_BUILD_JOBS": 1,
+    "CARGO_PROFILE_RELEASE_LTO": "false",
+    "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
+}
+MACOS_FAMILY = "debug-default_supervisor-release_apple-release-default"
+
+
 def literal_cache_key(platform: str, target: str, family: str) -> str:
     return (
         f"finch-cargo-v5-{platform}-${{{{ runner.arch }}}}-{target}-"
         f"rust-1.98.0-{family}-{GRAPH_HASH}"
     )
+
+
+# The six approved cache identities (#384). Locations may share one; none may add another.
+EXPECTED_CACHE_IDENTITIES = frozenset(
+    literal_cache_key(platform, target, family) for platform, target, family in (
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "debug-default_all-features-clippy_release-default"),
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "debug-no-default-features"),
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "release-default-lto-false-codegen-units-16"),
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "cargo-audit-0.22.2"),
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu", "debug-default-test-debug-0_supervisor-release"),
+        ("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
+    )
+)
 
 
 CACHE_SPECS = {
@@ -162,7 +254,7 @@ CACHE_SPECS = {
         "cache-bin": True,
         "id": "cargo-audit-cache",
     },
-    ("issue-56-brain-isolation.yml", "isolation-boundaries"): {
+    (ISOLATION_WORKFLOW, "isolation-boundaries"): {
         "name": "Restore compatible isolation Cargo state",
         "shared-key": literal_cache_key(
             "ubuntu-24.04", "x86_64-unknown-linux-gnu",
@@ -170,6 +262,19 @@ CACHE_SPECS = {
         ),
         "save-if": MAIN_SAVE_IF,
         "before": "Check bins and tests",
+        "env": {
+            "CARGO_BUILD_JOBS": 1, "CARGO_PROFILE_TEST_DEBUG": 0,
+            "CARGO_TERM_COLOR": "always", "RUST_BACKTRACE": 1,
+        },
+    },
+    # A restore-only consumer of the ci.yml macOS family: same key and effective environment,
+    # never a writer, so it adds a cache location without adding a cache identity.
+    (ISOLATION_WORKFLOW, "isolation-boundaries-macos"): {
+        "name": "Restore the macOS default Cargo family",
+        "shared-key": literal_cache_key("macos-14", "aarch64-apple-darwin", MACOS_FAMILY),
+        "save-if": False,
+        "before": "Check bins and tests",
+        "env": CI_SHARED_ENV,
     },
     ("release.yml", "build-release"): {
         "name": "Restore compatible Cargo dependencies and build artifacts",
@@ -577,11 +682,41 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                 f"{workflow}: job {job_id!r} cache must run after the pinned toolchain "
                 f"and before {spec['before']!r}"
             )
-        if relevant_rust_env(job.get("env")) or relevant_rust_env(step.get("env")):
+        job_env = relevant_rust_env(job.get("env"))
+        if relevant_rust_env(step.get("env")) or (job_env and "env" not in spec):
             errors.append(
                 f"{workflow}: job {job_id!r} must not override action-hashed Rust/Cargo "
                 "environment at the cache boundary"
             )
+        if "env" in spec:
+            effective = {**relevant_rust_env(documents[workflow].get("env")), **job_env}
+            if effective != spec["env"]:
+                errors.append(
+                    f"{workflow}: job {job_id!r} effective Cargo/Rust environment changed; "
+                    f"expected={spec['env']!r} actual={effective!r}"
+                )
+
+    identities: set[str] = set()
+    for (workflow, job_id), matches in found.items():
+        strategy = documents[workflow]["jobs"][job_id].get("strategy")
+        matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
+        include = matrix.get("include") if isinstance(matrix, dict) else None
+        rows = [row for row in include if isinstance(row, dict)] if isinstance(include, list) else []
+        for _, step in matches:
+            key = (step.get("with") or {}).get("shared-key")
+            if not isinstance(key, str):
+                continue
+            for row in rows or [{}]:
+                identities.add(MATRIX_REFERENCE.sub(
+                    lambda match: str(row.get(match.group(1), match.group(0))), key,
+                ))
+    if identities != EXPECTED_CACHE_IDENTITIES:
+        errors.append(
+            f"Cargo cache identity set changed; expected {len(EXPECTED_CACHE_IDENTITIES)} "
+            f"identities across {len(CACHE_SPECS)} locations; "
+            f"missing={sorted(EXPECTED_CACHE_IDENTITIES - identities)!r} "
+            f"unexpected={sorted(identities - EXPECTED_CACHE_IDENTITIES)!r}"
+        )
 
     expected_modes = {
         ("ci.yml", "runtime-authority"): "read",
@@ -605,31 +740,10 @@ def cache_contract_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
 
     ci_env = relevant_rust_env(documents.get("ci.yml", {}).get("env"))
     release_env = relevant_rust_env(documents.get("release.yml", {}).get("env"))
-    expected_shared_env = {
-        "CARGO_TERM_COLOR": "always",
-        "RUST_BACKTRACE": 1,
-        "CARGO_BUILD_JOBS": 1,
-        "CARGO_PROFILE_RELEASE_LTO": "false",
-        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
-    }
-    if ci_env != expected_shared_env or release_env != expected_shared_env:
+    if ci_env != CI_SHARED_ENV or release_env != CI_SHARED_ENV:
         errors.append(
             "ci.yml and release.yml must retain identical action-hashed Cargo/Rust "
-            f"environment; expected={expected_shared_env!r} ci={ci_env!r} release={release_env!r}"
-        )
-    expected_isolation_env = {
-        "CARGO_BUILD_JOBS": 1,
-        "CARGO_PROFILE_TEST_DEBUG": 0,
-        "CARGO_TERM_COLOR": "always",
-        "RUST_BACKTRACE": 1,
-    }
-    isolation_env = relevant_rust_env(
-        documents.get("issue-56-brain-isolation.yml", {}).get("env")
-    )
-    if isolation_env != expected_isolation_env:
-        errors.append(
-            "issue-56-brain-isolation.yml cache family environment changed; "
-            f"expected={expected_isolation_env!r} actual={isolation_env!r}"
+            f"environment; expected={CI_SHARED_ENV!r} ci={ci_env!r} release={release_env!r}"
         )
 
     expected_test_matrix = [
@@ -765,28 +879,141 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
         ),
     ))
 
+    errors.extend(push_contract_errors(documents, "issue-201-chatgpt-auth.yml"))
+    return errors
+
+
+def push_contract_errors(documents: dict[str, dict[str, Any]], workflow: str) -> list[str]:
+    """Require a main-branch push trigger whose paths equal the reviewed PR paths."""
+    document = documents.get(workflow)
+    if document is None:
+        return []
     try:
-        push = event_contract(auth, ".github/workflows/issue-201-chatgpt-auth.yml", "push")
+        push = event_contract(document, (WORKFLOWS / workflow).as_posix(), "push")
     except ContractError as error:
-        errors.append(str(error))
-    else:
-        expected = {"branches": ("main",), "paths": EXPECTED_PATHS["issue-201-chatgpt-auth.yml"]}
-        if push is False:
-            errors.append("issue-201-chatgpt-auth.yml: path-filtered push to main is required")
-        else:
-            for key in sorted(set(push) | set(expected)):
-                actual_value = push.get(key)
-                expected_value = expected.get(key)
-                equal = (
-                    set(actual_value or ()) == set(expected_value or ())
-                    if key == "paths" else actual_value == expected_value
+        return [str(error)]
+    if push is False:
+        return [f"{workflow}: path-filtered push to main is required"]
+    errors: list[str] = []
+    expected = {"branches": ("main",), "paths": EXPECTED_PATHS[workflow]}
+    for key in sorted(set(push) | set(expected)):
+        actual_value = push.get(key)
+        expected_value = expected.get(key)
+        equal = (
+            set(actual_value or ()) == set(expected_value or ())
+            if key == "paths" else actual_value == expected_value
+        )
+        if not equal:
+            errors.append(
+                f"{workflow}: push.{key} changed; "
+                f"expected={expected_value!r} actual={actual_value!r}"
+            )
+    return errors
+
+
+def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Both platforms run the full fatal sequence on owned paths, weekly, and on demand."""
+    document = documents.get(ISOLATION_WORKFLOW)
+    if document is None:
+        return []
+    errors = push_contract_errors(documents, ISOLATION_WORKFLOW)
+    triggers = document.get("on")
+    if not isinstance(triggers, dict) or triggers.get("schedule") != ISOLATION_SCHEDULE:
+        actual = triggers.get("schedule") if isinstance(triggers, dict) else None
+        errors.append(
+            f"{ISOLATION_WORKFLOW}: weekly schedule changed; "
+            f"expected={ISOLATION_SCHEDULE!r} actual={actual!r}"
+        )
+    if not isinstance(triggers, dict) or "workflow_dispatch" not in triggers:
+        errors.append(f"{ISOLATION_WORKFLOW}: manual workflow_dispatch trigger is required")
+
+    jobs = document.get("jobs")
+    jobs = jobs if isinstance(jobs, dict) else {}
+    if set(jobs) != set(ISOLATION_JOBS):
+        errors.append(
+            f"{ISOLATION_WORKFLOW}: isolation job inventory changed; "
+            f"expected={sorted(ISOLATION_JOBS)!r} actual={sorted(jobs)!r}"
+        )
+    for job_id, runner in ISOLATION_JOBS.items():
+        errors.extend(active_owner_job_errors(documents, ISOLATION_WORKFLOW, job_id, runner))
+        job = jobs.get(job_id)
+        steps = job.get("steps") if isinstance(job, dict) else None
+        if not isinstance(steps, list):
+            continue
+        positions: list[int] = []
+        for name, commands in ISOLATION_STEPS:
+            matches = [
+                (index, step) for index, step in enumerate(steps)
+                if isinstance(step, dict) and step.get("name") == name
+            ]
+            where = f"{ISOLATION_WORKFLOW}: job {job_id!r} ({runner}) fatal step {name!r}"
+            if len(matches) != 1:
+                errors.append(f"{where} must occur exactly once; actual={len(matches)}")
+                continue
+            index, step = matches[0]
+            positions.append(index)
+            if step.get("if") is not None:
+                errors.append(f"{where} must run unconditionally; actual if={step.get('if')!r}")
+            if step.get("continue-on-error") not in (None, False):
+                errors.append(f"{where} must gate failure")
+            actual_commands = shell_commands(step.get("run"))
+            if actual_commands != commands:
+                errors.append(
+                    f"{where} commands changed; expected={commands!r} actual={actual_commands!r}"
                 )
-                if not equal:
+        if positions != sorted(positions):
+            errors.append(f"{ISOLATION_WORKFLOW}: job {job_id!r} ({runner}) fatal steps are out of order")
+    return errors
+
+
+def ordinary_ci_supervision_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
+    """Keep supervised isolation out of ordinary CI except the trusted-main cache warm."""
+    errors = required_step_errors(
+        documents, "ci.yml", "test", SUPERVISOR_WARM_STEP,
+        "github.event_name == 'push' && runner.os == 'macOS'", None, SUPERVISOR_WARM_COMMANDS,
+    )
+    jobs = documents.get("ci.yml", {}).get("jobs")
+    for job_id, job in (jobs.items() if isinstance(jobs, dict) else ()):
+        steps = job.get("steps") if isinstance(job, dict) else None
+        for step in steps if isinstance(steps, list) else ():
+            if not isinstance(step, dict) or step.get("name") == SUPERVISOR_WARM_STEP:
+                continue
+            for command in shell_commands(step.get("run")):
+                if any(marker in command for marker in SUPERVISED_MARKERS):
                     errors.append(
-                        f"issue-201-chatgpt-auth.yml: push.{key} changed; "
-                        f"expected={expected_value!r} actual={actual_value!r}"
+                        f"ci.yml: job {job_id!r} step {step.get('name')!r} runs supervised "
+                        f"isolation work in ordinary CI; move it to {ISOLATION_WORKFLOW}: {command!r}"
                     )
     return errors
+
+
+def escape_api_errors(root: Path) -> list[str]:
+    """Scan every Rust and shell source for process-group/session escapes outside the allowlist."""
+    actual: list[str] = []
+    for top in ESCAPE_API_ROOTS:
+        base = root / top
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            if path.suffix not in (".rs", ".sh") or not path.is_file() or relative == ESCAPE_API_SELF:
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").split("\n"):
+                if ESCAPE_API.search(line):
+                    actual.append(f"{relative}:{line.lstrip()}")
+    remaining = list(actual)
+    missing = []
+    for entry in ESCAPE_API_ALLOWLIST:
+        if entry in remaining:
+            remaining.remove(entry)
+        else:
+            missing.append(entry)
+    if not remaining and not missing:
+        return []
+    return [
+        "escape-API allowlist changed (setsid/setpgid/process_group/set -m); "
+        f"unauthorized={remaining!r} missing_allowlisted={missing!r}"
+    ]
 
 
 def compare_contract(root: Path) -> list[str]:
@@ -858,7 +1085,10 @@ def compare_contract(root: Path) -> list[str]:
                 f"unexpected={sorted(set(actual) - set(wanted))!r}"
             )
     errors.extend(migrated_boundary_errors(documents))
+    errors.extend(isolation_errors(documents))
+    errors.extend(ordinary_ci_supervision_errors(documents))
     errors.extend(cache_contract_errors(documents))
+    errors.extend(escape_api_errors(root))
     return errors
 
 
