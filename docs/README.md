@@ -26,6 +26,8 @@ These are implementation-oriented references. Co-located module documents genera
 scope and are more reliable than the older project-wide guides, but source and tests remain
 authoritative.
 
+- [Root design index](../DESIGN.md): subsystem map, current dependency cycles, and intended
+  direction
 - [Configuration types](../src/config/settings.rs),
   [provider profiles](../src/config/provider.rs), and
   [configuration notes](../src/config/CONFIGURATION.md)

@@ -7,6 +7,7 @@ Archived and design documents preserve historical claims and are outside this ga
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +21,7 @@ CURRENT_DOCS = (
     Path("README.md"),
     Path("CONTRIBUTING.md"),
     Path("CLAUDE.md"),
+    Path("DESIGN.md"),
     Path("docs/README.md"),
     Path("docs/AUTOMATIC_TRAINING.md"),
     Path("docs/MCP_USER_GUIDE.md"),
@@ -125,6 +127,15 @@ REVISION_RULES = (
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 FENCE_RE = re.compile(r"^```(bash|sh)\s*$\n(.*?)^```\s*$", re.MULTILINE | re.DOTALL)
 HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+
+# The root design index must be reachable from the agent entry point, link every module document
+# the instructions name, and never present historical or planning documents as current authority.
+DESIGN_DOCUMENT = Path("DESIGN.md")
+AGENTS_DOCUMENT = Path("AGENTS.md")
+INSTRUCTIONS_DOCUMENT = Path("CLAUDE.md")
+DOCS_MAP = Path("docs/README.md")
+DESIGN_PLAN_SECTIONS = ("Intended direction", "Open questions")
 
 
 def github_anchor(heading: str) -> str:
@@ -290,9 +301,138 @@ def check_stale_claims(text: str) -> list[str]:
     return errors
 
 
+def local_links(document: Path, text: str) -> list[tuple[str, str]]:
+    """Return repository-relative local link targets with the `##` section each appears under."""
+    headings = [(match.start(), match.group(1)) for match in SECTION_RE.finditer(text)]
+    links: list[tuple[str, str]] = []
+    for match in LINK_RE.finditer(text):
+        path, _ = split_link(match.group(1))
+        if not path or path.startswith(("http://", "https://", "mailto:")):
+            continue
+        section = next(
+            (title for start, title in reversed(headings) if start < match.start()), ""
+        )
+        links.append((os.path.normpath((document.parent / path).as_posix()), section))
+    return links
+
+
+def module_doc_paths(instructions: str) -> list[str]:
+    """Paths written as code spans in the instructions' Module Docs table."""
+    section = re.search(r"^### Module Docs\s*$(.*?)(?=^#{1,3} )", instructions, re.M | re.S)
+    if section is None:
+        return []
+    return [
+        span for span in re.findall(r"`([^`\s]+)`", section.group(1))
+        if "/" in span and "." in span.rsplit("/", 1)[-1]
+    ]
+
+
+def check_design_index(
+    agents: str, instructions: str, design: str, docs_map: str, exists=None,
+) -> list[str]:
+    """Bind the root design index to the agent entry point and the documentation roles."""
+    exists = exists or (lambda path: (ROOT / path).exists())
+    errors: list[str] = []
+    if DESIGN_DOCUMENT.as_posix() not in {target for target, _ in local_links(AGENTS_DOCUMENT, agents)}:
+        errors.append(f"{AGENTS_DOCUMENT}: must link the root design index {DESIGN_DOCUMENT}")
+
+    design_links = local_links(DESIGN_DOCUMENT, design)
+    linked = {target for target, _ in design_links}
+    paths = module_doc_paths(instructions)
+    if not paths:
+        errors.append(f"{INSTRUCTIONS_DOCUMENT}: Module Docs table not found or lists no paths")
+    for path in paths:
+        if not exists(path):
+            errors.append(f"{INSTRUCTIONS_DOCUMENT}: Module Docs path does not exist: {path}")
+        if path not in linked:
+            errors.append(f"{DESIGN_DOCUMENT}: does not link module doc named in {AGENTS_DOCUMENT}: {path}")
+
+    roles = local_links(DOCS_MAP, docs_map)
+    historical = {target for target, section in roles if "historical" in section.casefold()}
+    plans = {target for target, section in roles if section.casefold().startswith("design and planning")}
+    if not historical or not plans:
+        errors.append(f"{DOCS_MAP}: historical or design-and-planning section not found")
+    for target, section in design_links:
+        if target == "docs/archive" or target.startswith("docs/archive/") or target in historical:
+            errors.append(
+                f"{DESIGN_DOCUMENT}: cites historical or archived document {target} under "
+                f"{section!r}; reach history through {DOCS_MAP} instead"
+            )
+        elif target in plans and section not in DESIGN_PLAN_SECTIONS:
+            errors.append(
+                f"{DESIGN_DOCUMENT}: design document {target} cited under {section!r}; "
+                f"plans belong only under {DESIGN_PLAN_SECTIONS!r}"
+            )
+    return errors
+
+
+def design_index_texts() -> tuple[str, str, str, str]:
+    """Missing files read as empty so every rule reports what is absent instead of crashing."""
+    def read(path: Path) -> str:
+        return path.read_text() if path.is_file() else ""
+
+    return (
+        read(ROOT / AGENTS_DOCUMENT),
+        read(ROOT / INSTRUCTIONS_DOCUMENT),
+        read(ROOT / DESIGN_DOCUMENT),
+        read(ROOT / DOCS_MAP),
+    )
+
+
+def design_index_self_test() -> list[str]:
+    errors: list[str] = []
+    if DESIGN_DOCUMENT not in CURRENT_DOCS:
+        errors.append("root design index is not enrolled in CURRENT_DOCS")
+    agents, instructions, design, docs_map = design_index_texts()
+    if check_design_index(agents, instructions, design, docs_map):
+        errors.append("current design index was rejected")
+    table = module_doc_paths(instructions)
+    if not table:
+        return errors + ["Module Docs table is empty; design index probes cannot run"]
+
+    # AGENTS.md is what agents read; if it stops carrying the pointer (for example a real file
+    # replacing the symlink), the gate must fail even though CLAUDE.md still links DESIGN.md.
+    unlinked = check_design_index(agents.replace("(DESIGN.md)", "(README.md)"), instructions, design, docs_map)
+    if not any("must link the root design index" in error for error in unlinked):
+        errors.append("AGENTS.md without the DESIGN.md pointer escaped")
+
+    first_path = table[0]
+    probes = (
+        ("missing module doc path",
+         (agents, instructions.replace(f"`{first_path}`", "`src/missing/GONE.md`", 1), design, docs_map),
+         "Module Docs path does not exist: src/missing/GONE.md"),
+        ("module doc not linked from DESIGN.md",
+         (agents, instructions, design.replace(f"({first_path})", "(README.md)"), docs_map),
+         f"does not link module doc named in AGENTS.md: {first_path}"),
+        ("renamed Module Docs heading",
+         (agents, instructions.replace("### Module Docs", "### Module Documents", 1), design, docs_map),
+         "Module Docs table not found"),
+        ("historical target",
+         (agents, instructions, design.replace("## Composition\n", "## Composition\n\n[old](docs/ARCHITECTURE.md)\n", 1), docs_map),
+         "cites historical or archived document docs/ARCHITECTURE.md"),
+        ("archived target",
+         (agents, instructions, design.replace("## Composition\n", "## Composition\n\n[old](docs/archive/x.md)\n", 1), docs_map),
+         "cites historical or archived document docs/archive/x.md"),
+        ("design document outside permitted sections",
+         (agents, instructions, design.replace("## Subsystems\n", "## Subsystems\n\n[plan](docs/ROADMAP.md)\n", 1), docs_map),
+         "design document docs/ROADMAP.md cited under 'Subsystems'"),
+    )
+    for label, texts, diagnostic in probes:
+        found = check_design_index(*texts)
+        if not any(diagnostic in error for error in found):
+            errors.append(f"design index probe escaped ({label}); errors={found!r}")
+
+    allowed = design.replace("## Open questions\n", "## Open questions\n\n[plan](docs/ROADMAP.md)\n", 1)
+    if check_design_index(agents, instructions, allowed, docs_map):
+        errors.append("a design document under Open questions was rejected")
+    if not check_links(DESIGN_DOCUMENT, "[gone](docs/definitely-missing.md)"):
+        errors.append("dead-link probe escaped the design index link gate")
+    return errors
+
+
 def self_test() -> int:
     """Exercise the important positive and negative controls for this gate."""
-    errors: list[str] = []
+    errors: list[str] = design_index_self_test()
     if TRANSPORT_DOCUMENT not in CURRENT_DOCS:
         errors.append("native ChatGPT transport guide is not enrolled in CURRENT_DOCS")
 
@@ -400,6 +540,7 @@ def main() -> int:
         errors.extend(check_links(document, text))
         errors.extend(check_shell_fences(document, text))
         errors.extend(check_truth_claims(document, text))
+    errors.extend(check_design_index(*design_index_texts()))
 
     # The package description is published to package indexes and mirrored far
     # more widely than any document here, so it is held to the same standard.
