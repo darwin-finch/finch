@@ -1,0 +1,201 @@
+# Finch subsystem manifest. Checked by scripts/check_subsystems.py on every PR.
+#
+# Ownership: every tracked file resolves to exactly one subsystem, the global set, or an
+# explicit exclusion. A path ending in "/" is a prefix; anything else is an exact file. The
+# longest matching entry wins; two matches of equal length are an error.
+#
+# Dependencies: every production `crate::<module>` reference from one subsystem into another
+# must be declared exactly once, either in `depends_on` or as `debt`, and every declared edge
+# must still have a reference. `depends_on` edges point strictly to a lower `layer`, so the
+# allowed graph is acyclic; `debt` records an edge that breaks the intended direction in
+# DESIGN.md. Every debt edge cites #541 as a placeholder until a facade issue takes it over.
+#
+# Layers are the intended direction from #541, lower is more foundational. Changing one is a
+# reviewed manifest edit. `tools` at layer 1 reads all of src/tools as the future tools-api;
+# its debt clears only when the API is split from the implementations.
+
+version = 1
+
+# Cross-cutting files: a change here always selects the full gates.
+[global]
+paths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "build.rs",
+  "rust-toolchain.toml",
+  "src/lib.rs",
+  "src/main.rs",
+  "src/bin/",
+  "AGENTS.md",
+  "CLAUDE.md",
+  ".gitignore",
+  "subsystems.toml",
+  ".github/workflows/",
+  "scripts/test_brains.sh",
+  "scripts/lib/brain_test_isolation.sh",
+  "scripts/test_brain_isolation.sh",
+  ".agents/skills/finch-backlog/scripts/with-cargo-slot",
+  "tests/worker_node_isolation_contract.sh",
+]
+
+[[excluded]]
+path = "docs/archive/"
+reason = "Preserved project history; never current authority"
+
+[[excluded]]
+path = "src/evolution/"
+reason = "Tracked but never compiled; deletion is #471, which must remove this entry"
+
+[[subsystem]]
+id = "config"
+name = "Config, context, license, metrics"
+layer = 0
+paths = ["src/config/", "src/context/", "src/license/", "src/metrics/", "src/monitoring/", "src/errors.rs", "data/"]
+docs = ["src/config/CONFIGURATION.md", "src/context/ASSEMBLY.md", "src/license/LICENSING.md"]
+depends_on = []
+debt = [
+  { to = "memory", issue = 541 },
+  { to = "models", issue = 541 },
+  { to = "tools", issue = 541 },
+]
+
+[[subsystem]]
+id = "vm"
+name = "Typed VM, CoForth, CoLisp"
+layer = 0
+paths = ["src/vm/", "src/lisp/", "vocabulary/", "examples/finch/"]
+docs = ["vocabulary/language/FINCH_VM.md", "vocabulary/language/FINCH_FORTH.md", "vocabulary/language/FINCH_LISP.md", "docs/TYPED_VM_MIGRATION_AUDIT.md"]
+depends_on = []
+debt = [
+  { to = "programs", issue = 541 },
+  { to = "runtime", issue = 541 },
+]
+
+[[subsystem]]
+id = "programs"
+name = "Program definitions, catalog, and corpus"
+layer = 1
+paths = ["src/programs/"]
+depends_on = ["vm"]
+debt = [
+  { to = "config", issue = 541 },
+  { to = "runtime", issue = 541 },
+]
+
+[[subsystem]]
+id = "memory"
+name = "MemTree memory and retrieval"
+layer = 1
+paths = ["src/memory/", "src/memory_status.rs", "src/workbook.rs"]
+depends_on = []
+debt = [
+  { to = "programs", issue = 541 },
+]
+
+[[subsystem]]
+id = "tools"
+name = "Tool execution and authority"
+layer = 1
+paths = ["src/tools/"]
+docs = ["src/tools/EXECUTION.md", "docs/MCP_USER_GUIDE.md", "docs/MACOS_GUI_AUTOMATION.md"]
+depends_on = ["config", "vm"]
+debt = [
+  { to = "brain", issue = 541 },
+  { to = "frontend", issue = 541 },
+  { to = "memory", issue = 541 },
+  { to = "models", issue = 541 },
+  { to = "programs", issue = 541 },
+  { to = "providers", issue = 541 },
+  { to = "runtime", issue = 541 },
+]
+
+[[subsystem]]
+id = "runtime"
+name = "Program runtime and task-graph execution"
+layer = 2
+paths = ["src/runtime/", "src/poset/"]
+depends_on = ["config", "memory", "programs", "tools", "vm"]
+debt = [
+  { to = "brain", issue = 541 },
+  { to = "models", issue = 541 },
+  { to = "providers", issue = 541 },
+]
+
+[[subsystem]]
+id = "models"
+name = "Local models, routing, training, feedback"
+layer = 2
+paths = ["src/models/", "src/local/", "src/generators/", "src/training/", "src/feedback/", "src/router/", "src/logging/"]
+docs = ["src/models/unified_loader.rs", "src/models/ONNX.md", "src/models/BOOTSTRAP.md", "src/models/LORA.md", "src/router/ROUTING.md", "docs/AUTOMATIC_TRAINING.md"]
+depends_on = ["config", "tools"]
+debt = [
+  { to = "brain", issue = 541 },
+  { to = "frontend", issue = 541 },
+  { to = "providers", issue = 541 },
+]
+
+[[subsystem]]
+id = "providers"
+name = "Providers, transports, OAuth, planning prompts"
+layer = 3
+paths = ["src/providers/", "src/claude/", "src/oauth/", "src/llms/", "src/planning/"]
+docs = ["src/claude/CLIENT.md", "docs/OAUTH.md", "docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md", "docs/OPENAI_TRANSPORT.md"]
+depends_on = ["config", "models", "tools"]
+debt = [
+  { to = "frontend", issue = 541 },
+]
+
+[[subsystem]]
+id = "transport"
+name = "IPC, node identity, service discovery"
+layer = 3
+paths = ["src/ipc/", "src/node/", "src/network/", "src/service/", "src/node_name.rs", "schema/"]
+docs = ["schema/finch_ipc.capnp"]
+depends_on = ["models", "programs", "runtime", "tools", "vm"]
+debt = [
+  { to = "brain", issue = 541 },
+  { to = "frontend", issue = 541 },
+  { to = "providers", issue = 541 },
+]
+
+[[subsystem]]
+id = "brain"
+name = "Brains, server, daemon"
+layer = 4
+paths = ["src/brain/", "src/server/", "src/daemon/", "src/client/", "src/agent/", "src/review/", "src/registry/", "src/graph/"]
+docs = ["tests/BRAIN_TEST_INVENTORY.md"]
+depends_on = ["config", "models", "providers", "runtime", "tools", "transport", "vm"]
+debt = [
+  { to = "frontend", issue = 541 },
+]
+
+[[subsystem]]
+id = "frontend"
+name = "CLI and TUI"
+layer = 5
+paths = ["src/cli/", "src/startup.rs", "src/samples.rs"]
+docs = ["src/cli/tui/ARCHITECTURE.md", "src/cli/repl_event/ATOMIC_HISTORY.md"]
+depends_on = ["brain", "config", "memory", "models", "programs", "providers", "runtime", "tools", "transport", "vm"]
+
+[[subsystem]]
+id = "tests"
+name = "Integration tests"
+paths = ["tests/"]
+docs = ["tests/README.md", "tests/BRAIN_TEST_INVENTORY.md"]
+
+[[subsystem]]
+id = "ci"
+name = "CI, repository checks, agent skills"
+paths = [".github/", "scripts/", ".agents/", ".claude/", "install.sh"]
+docs = ["docs/REPOSITORY_HYGIENE.md", "docs/RUST_TOOLCHAIN.md"]
+
+[[subsystem]]
+id = "docs"
+name = "Project documentation"
+paths = ["docs/", "README.md", "CONTRIBUTING.md", "CHANGELOG.md", "TODO.md", "BLOG.md", "LICENSE", "DESIGN.md"]
+docs = ["docs/README.md", "DESIGN.md"]
+
+[[subsystem]]
+id = "website"
+name = "Website and license checkout"
+paths = ["web/"]
