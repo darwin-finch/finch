@@ -35,8 +35,6 @@ pub use effects::{
 };
 pub use frontend::forth::{compile_forth, compile_forth_with_functions};
 pub use frontend::lisp::{compile_lisp, compile_lisp_with_functions};
-/// Instantiate a capability requirement from a selector template. Public because the program
-/// runtime service builds requirements outside this subsystem.
 pub use interpreter::instantiate_requirement;
 pub use interpreter::{
     CapabilityHandler, HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame,

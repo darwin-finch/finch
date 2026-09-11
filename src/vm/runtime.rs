@@ -636,8 +636,8 @@ impl TypedRuntime {
     /// the application has independently authorized its concrete request.
     /// The authorization applies only to that pending boundary: subsequent
     /// calls continue under this runtime's ordinary grant set.
-    /// Resume a suspended execution after its host call was authorized. Public because the
-    /// program runtime service drives resumption from outside this subsystem.
+    /// Public because the program runtime service drives resumption from outside this
+    /// subsystem.
     pub fn resume_authorized_host_call_with_handler<H: CapabilityHandler>(
         &mut self,
         suspension: TypedSuspension,
