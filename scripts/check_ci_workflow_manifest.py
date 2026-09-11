@@ -310,11 +310,36 @@ def condition_identity(value: Any) -> tuple[tuple[str, str], ...] | None:
     """Return the bounded semantic identity of a supported job/step condition."""
     if value is None:
         return None
+    if isinstance(value, bool):
+        return (("literal", str(value).lower()),)
     if not isinstance(value, str):
         return (("unsupported", repr(value)),)
     expression = value.strip()
     if expression.startswith("${{") and expression.endswith("}}"):
         expression = expression[3:-2].strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        depth = 0
+        closing = -1
+        quote: str | None = None
+        for index, character in enumerate(expression):
+            if quote is not None:
+                if character == quote:
+                    quote = None
+                continue
+            if character in "'\"":
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    closing = index
+                    break
+        if closing != len(expression) - 1:
+            break
+        expression = expression[1:-1].strip()
+    if expression.lower() in {"true", "false"}:
+        return (("literal", expression.lower()),)
     terms: list[tuple[str, str]] = []
     for term in expression.split("&&"):
         term = term.strip()
@@ -330,18 +355,36 @@ def condition_identity(value: Any) -> tuple[tuple[str, str], ...] | None:
     return tuple(sorted(terms))
 
 
-def migrated_command_identity(command: str) -> str | None:
-    """Identify the bounded operation owned by a migrated workflow boundary."""
+def shell_segments(command: str) -> tuple[tuple[str, ...], ...]:
+    """Split one bounded shell line into simple commands without splitting quoted substitutions."""
     try:
-        tokens = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
-        return None
-    if tokens[:2] == ["cargo", "test"]:
+        return ()
+    segments: list[tuple[str, ...]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in {";", "&", "&&", "||"}:
+            if current:
+                segments.append(tuple(current))
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(tuple(current))
+    return tuple(segments)
+
+
+def migrated_segment_identity(tokens: tuple[str, ...]) -> str | None:
+    """Identify one simple command owned by a migrated workflow boundary."""
+    if tokens[:2] == ("cargo", "test"):
         if "--doc" in tokens and "ValidatedProviderRequest" in tokens:
             return "provider-token-doctest"
         if {"--release", "--lib", "cli::conversation::tests"}.issubset(tokens):
             return "release-atomic-history"
-    if tokens[:2] == ["cargo", "check"]:
+    if tokens[:2] == ("cargo", "check"):
         manifest: str | None = None
         for index, token in enumerate(tokens):
             if token.startswith("--manifest-path="):
@@ -355,22 +398,33 @@ def migrated_command_identity(command: str) -> str | None:
             ".github/issue-201-windows-probe/Cargo.toml",
         }:
             return f"windows-probe:{manifest}"
-    if tokens[:2] == ["test", "-L"] and ".claude/skills/finch-backlog" in tokens:
+    if tokens[:2] == ("test", "-L") and ".claude/skills/finch-backlog" in tokens:
         return "skill-symlink-exists"
     if (
-        "cd .agents/skills/finch-backlog && pwd -P" in command
-        and "cd .claude/skills/finch-backlog && pwd -P" in command
+        len(tokens) == 4
+        and tokens[0] == "test"
+        and tokens[2] == "="
+        and tokens[1] == "$(cd .agents/skills/finch-backlog && pwd -P)"
+        and tokens[3] == "$(cd .claude/skills/finch-backlog && pwd -P)"
     ):
         return "skill-symlink-target"
     slot_scripts = {
         ".agents/skills/finch-backlog/scripts/with-cargo-slot",
         ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
     }
-    if tokens[:2] == ["bash", "-n"] and slot_scripts.issubset(tokens):
+    if tokens[:2] == ("bash", "-n") and slot_scripts.issubset(tokens):
         return "cargo-slot-syntax"
     if tokens and tokens[0] == ".agents/skills/finch-backlog/scripts/test-with-cargo-slot":
         return "cargo-slot-regression"
     return None
+
+
+def migrated_command_identities(command: str) -> tuple[str, ...]:
+    return tuple(
+        identity
+        for segment in shell_segments(command)
+        if (identity := migrated_segment_identity(segment)) is not None
+    )
 
 
 def active_owner_job_errors(
@@ -380,7 +434,10 @@ def active_owner_job_errors(
     if not isinstance(job, dict):
         return [f"{workflow}: required owner job {job_id!r} is missing"]
     errors: list[str] = []
-    if job.get("runs-on") != expected_runner or job.get("if") is not None:
+    active_condition = condition_identity(job.get("if"))
+    if job.get("runs-on") != expected_runner or active_condition not in {
+        None, (("literal", "true"),),
+    }:
         errors.append(
             f"{workflow}: owner job {job_id!r} must run actively on {expected_runner}"
         )
@@ -481,8 +538,7 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                     all_commands.extend(shell_commands(step.get("run")))
     operation_counts: dict[str, int] = {}
     for command in all_commands:
-        identity = migrated_command_identity(command)
-        if identity is not None:
+        for identity in migrated_command_identities(command):
             operation_counts[identity] = operation_counts.get(identity, 0) + 1
     for operation in owned_operations:
         count = operation_counts.get(operation, 0)

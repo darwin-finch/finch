@@ -255,6 +255,16 @@ class WorkflowContractTests(unittest.TestCase):
             "if: matrix.feature_name == 'default'",
             "if: ${{ matrix.feature_name == 'default' }}",
         )
+        self.repository.replace(
+            "ci.yml",
+            "if: runner.os == 'Linux' && matrix.feature_name == 'default'",
+            "if: ${{ (runner.os == 'Linux' && matrix.feature_name == 'default') }}",
+        )
+        self.repository.replace(
+            "issue-201-chatgpt-auth.yml",
+            "  windows-verifier-compile:\n    runs-on:",
+            "  windows-verifier-compile:\n    if: ${{ true }}\n    runs-on:",
+        )
         self.assert_passes()
 
     def test_migrated_owner_jobs_must_be_active_and_gating(self) -> None:
@@ -360,6 +370,45 @@ class WorkflowContractTests(unittest.TestCase):
             )
         finally:
             repository.close()
+
+    def test_migrated_duplicates_after_shell_separators_are_rejected(self) -> None:
+        duplicate_doctest = """\n    - name: Duplicate doctest after shell prefix
+      run: echo starting && cargo test --doc -- ValidatedProviderRequest
+"""
+        self.repository.replace(
+            "ci.yml", "\n  runtime-authority:\n", duplicate_doctest + "\n  runtime-authority:\n",
+        )
+        self.assert_fails(
+            "migrated operation ownership count expected=1 actual=2: provider-token-doctest"
+        )
+
+        repository = Repository()
+        try:
+            duplicate_probe = """\n      - name: Duplicate probe after PowerShell prefix
+        run: Write-Output starting; cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml
+"""
+            repository.replace(
+                "issue-201-chatgpt-auth.yml",
+                "      - name: Compile exact authentication sources on Windows\n",
+                duplicate_probe + "      - name: Compile exact authentication sources on Windows\n",
+            )
+            result = repository.check()
+            self.assertNotEqual(0, result.returncode, "separator-prefixed Windows duplicate passed")
+            self.assertIn(
+                "migrated operation ownership count expected=1 actual=2: "
+                "windows-probe:.github/issue-105-windows-probe/Cargo.toml",
+                result.stderr,
+                result.stderr,
+            )
+        finally:
+            repository.close()
+
+    def test_quoted_skill_paths_are_not_mistaken_for_an_executed_check(self) -> None:
+        prose = """\n    - name: Explain the symlink check
+      run: echo 'cd .agents/skills/finch-backlog && pwd -P; cd .claude/skills/finch-backlog && pwd -P'
+"""
+        self.repository.replace("ci.yml", "\n  runtime-authority:\n", prose + "\n  runtime-authority:\n")
+        self.assert_passes()
 
     def test_windows_push_trigger_and_both_probe_paths_are_required(self) -> None:
         self.repository.replace("issue-201-chatgpt-auth.yml", "  push:\n", "  deleted_push:\n")
