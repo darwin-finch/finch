@@ -119,6 +119,9 @@ risk-proportional review, then squash merge. Check current main for conflicts an
 do not require ritual rebases or review restarts merely to reproduce a SHA when GitHub can cleanly
 squash. If main later exposes a regression, fix it forward with a focused test and review.
 
+Squash each feature or fix into its own commit on `main`. Never combine separate features or fixes
+into one squash, and never integrate with a merge commit instead of squashing.
+
 Match proof to the accepted outcome: user-facing changes need user-visible proof; refactors need
 equivalence, integration, and dependency-boundary proof; deletion needs reference/reachability
 evidence plus affected tests; enabling work needs a usable downstream seam. Completion requires a
