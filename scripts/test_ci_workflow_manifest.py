@@ -184,15 +184,19 @@ class WorkflowContractTests(unittest.TestCase):
         )
         self.assert_fails("ci.yml: expanded check allocation changed", "Test (windows-2025, default)")
 
-    def test_cargo_slot_runs_on_exact_supported_linux_and_macos_images(self) -> None:
-        self.repository.replace(
-            "issue-245-cargo-slot.yml", "os: [ubuntu-24.04, macos-14]",
-            "os: [ubuntu-latest, macos-latest]",
-        )
+    def test_migrated_preflights_must_run_before_cargo_setup(self) -> None:
+        path = self.repository.workflow("ci.yml")
+        source = path.read_text()
+        start = source.index("    - name: Verify shared skill discovery\n")
+        end = source.index("    - name: Install capnproto (Ubuntu)\n", start)
+        preflights = source[start:end]
+        source = source[:start] + source[end:]
+        insertion = source.index("    - name: Cache Cargo registry and build\n")
+        path.write_text(source[:insertion] + preflights + source[insertion:])
         self.assert_fails(
-            "issue-245-cargo-slot.yml: expanded check allocation changed",
-            "macos-14 repository-wide lock", "macos-latest repository-wide lock",
-            "ubuntu-24.04 repository-wide lock", "ubuntu-latest repository-wide lock",
+            "ci.yml: job 'test' preflight steps must precede "
+            "'Install repository Rust toolchain'",
+            "Verify shared skill discovery", "Check and exercise the Cargo slot",
         )
 
     def test_duplicate_expanded_check_names_fail_actionably(self) -> None:

@@ -486,6 +486,31 @@ def required_step_errors(
     return errors
 
 
+def step_order_errors(
+    documents: dict[str, dict[str, Any]], workflow: str, job_id: str,
+    earlier_names: tuple[str, ...], before_name: str,
+) -> list[str]:
+    """Require unique preflight steps to precede the named expensive setup boundary."""
+    job = documents.get(workflow, {}).get("jobs", {}).get(job_id)
+    if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+        return []
+    positions: dict[str, list[int]] = {}
+    for index, step in enumerate(job["steps"]):
+        if isinstance(step, dict) and isinstance(step.get("name"), str):
+            positions.setdefault(step["name"], []).append(index)
+    required = (*earlier_names, before_name)
+    if any(len(positions.get(name, ())) != 1 for name in required):
+        return []  # Missing/duplicate steps already have more specific diagnostics.
+    boundary = positions[before_name][0]
+    late = tuple(name for name in earlier_names if positions[name][0] >= boundary)
+    if not late:
+        return []
+    return [
+        f"{workflow}: job {job_id!r} preflight steps must precede {before_name!r}; "
+        f"late={late!r}"
+    ]
+
+
 def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     errors: list[str] = []
     errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "${{ matrix.os }}"))
@@ -513,6 +538,11 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             "bash -n .agents/skills/finch-backlog/scripts/with-cargo-slot .agents/skills/finch-backlog/scripts/test-with-cargo-slot",
             ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
         ),
+    ))
+    errors.extend(step_order_errors(
+        documents, "ci.yml", "test", (
+            "Verify shared skill discovery", "Check and exercise the Cargo slot",
+        ), "Install repository Rust toolchain",
     ))
 
     owned_operations = (
