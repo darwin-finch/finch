@@ -301,5 +301,5 @@ Measured at commit `cb39ea0f`; re-derive before relying on these numbers.
   removed. A different test-exclusion heuristic gives 25; treat the size as approximate.
 - Subsystem level, at commit `74866238`: 61 cross-subsystem edges, 35 allowed (`depends_on`)
   and 26 recorded as debt in [`subsystems.toml`](subsystems.toml).
-- After [#584](https://github.com/darwin-finch/finch/issues/584): `vm` has no outgoing edge (59 edges, 35
-  allowed, 24 debt), and the module-level component drops to 22 modules without `vm` and `lisp`.
+- After [#584](https://github.com/darwin-finch/finch/issues/584): `vm` has no outgoing edge (59 edges,
+  35 allowed, 24 debt) and is no longer part of the module-level component.
