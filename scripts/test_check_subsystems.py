@@ -294,7 +294,7 @@ class SubsystemManifestTests(unittest.TestCase):
         self.fixture.edit("src/vm/mod.rs", "pub struct Value;", "mod ir;\n// pub mod commented;\nconst S: &str = \"pub mod quoted;\";\npub struct Value;")
         self.fixture.write("src/vm/ir.rs", "pub struct Ir;\n")
         self.assert_clean()
-        for declaration in ("pub mod ir;", "pub(crate) mod ir;", "pub(super) mod ir;"):
+        for declaration in ("pub mod ir;", "pub(crate) mod ir;", "pub(super) mod ir;", "#[cfg(test)] pub mod ir;", "pub\n    mod ir;"):
             with self.subTest(declaration=declaration):
                 self.fixture.write("src/vm/mod.rs", f"use crate::app::Hook;\n{declaration}\npub struct Value;\n")
                 self.assert_error(f"src/vm/mod.rs:2: public module `ir` in the 'vm' facade")

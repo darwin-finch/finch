@@ -35,7 +35,7 @@ UNIVERSAL_HEADINGS = (
     "## Invariants", "## Development Guidelines", "### Testing (mandatory)",
     "### Reporting status to a human", "## Key Principles",
 )
-PUBLIC_MODULE = re.compile(r"^[ \t]*pub(?:[ \t]*\([^)]*\))?[ \t]+mod[ \t]+(\w+)", re.M)
+PUBLIC_MODULE = re.compile(r"\bpub(?:\s*\([^)]*\))?\s+mod\s+(\w+)")
 TEST_MODULE_BLOCK = re.compile(
     r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"
 )
