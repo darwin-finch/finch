@@ -5,9 +5,11 @@
 
 pub mod diagnostic;
 pub mod effects;
+pub mod fiber;
 pub mod frontend;
 pub mod interpreter;
 pub mod ir;
+mod language;
 pub mod migration;
 pub mod runtime;
 pub mod signature;
@@ -33,6 +35,7 @@ pub use interpreter::{
     HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect, VmStep,
     VmTrampoline,
 };
+pub use language::ProgramLanguage;
 pub use runtime::{
     EffectJournalEntry, EffectJournalState, PendingHostCall, ProducerFiberRecord,
     ProducerFiberState, TypedExecution, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,

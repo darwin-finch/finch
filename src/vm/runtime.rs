@@ -1,5 +1,6 @@
 use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
 use super::effects::{CapabilityKind, CapabilityRequirement, EffectSet};
+use super::fiber::CpuFiberScheduler;
 use super::frontend::{forth::compile_forth_with_functions, lisp::compile_lisp_with_functions};
 use super::interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, VmContinuation, VmSideEffect, VmStep,
@@ -7,9 +8,8 @@ use super::interpreter::{
 };
 use super::ir::{Function, Module};
 use super::types::{Type, TypedValue};
+use super::ProgramLanguage;
 use super::{core_vocabulary, VerifiedModule, Verifier, Vocabulary, VM_TYPE_SYSTEM_VERSION};
-use crate::programs::ProgramLanguage;
-use crate::runtime::fiber::CpuFiberScheduler;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -1898,8 +1898,8 @@ impl TypedRuntime {
             )
         })?;
         match snapshot.status {
-            crate::runtime::fiber::CpuFiberStatus::Running => Ok(None),
-            crate::runtime::fiber::CpuFiberStatus::Completed => {
+            crate::vm::fiber::CpuFiberStatus::Running => Ok(None),
+            crate::vm::fiber::CpuFiberStatus::Completed => {
                 let values = snapshot.result.ok_or_else(|| {
                     VmDiagnostic::error(
                         "E-FIBER-014",
@@ -1925,7 +1925,7 @@ impl TypedRuntime {
                 }
                 Ok(Some(values))
             }
-            crate::runtime::fiber::CpuFiberStatus::Failed => {
+            crate::vm::fiber::CpuFiberStatus::Failed => {
                 Err(snapshot.diagnostic.unwrap_or_else(|| {
                     VmDiagnostic::error(
                         "E-FIBER-016",
@@ -1935,7 +1935,7 @@ impl TypedRuntime {
                     )
                 }))
             }
-            crate::runtime::fiber::CpuFiberStatus::Cancelled => Err(VmDiagnostic::error(
+            crate::vm::fiber::CpuFiberStatus::Cancelled => Err(VmDiagnostic::error(
                 "E-FIBER-017",
                 DiagnosticPhase::Cancellation,
                 "CPU task was cancelled",
@@ -3177,10 +3177,7 @@ mod tests {
         assert_eq!(*kind, crate::vm::types::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).expect("CPU task id must be a UUID");
         let result = runtime.cpu_fibers.scheduler.join(id).unwrap();
-        assert_eq!(
-            result.status,
-            crate::runtime::fiber::CpuFiberStatus::Completed
-        );
+        assert_eq!(result.status, crate::vm::fiber::CpuFiberStatus::Completed);
         assert_eq!(result.result, Some(vec![TypedValue::Int(42)]));
     }
 
