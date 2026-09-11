@@ -16,7 +16,7 @@ arrive, hold intent only; this root index is the deliberate exception that maps 
 intended structure side by side.
 
 `scripts/check_docs.py` checks this file's links, anchors, shell fences, and known stale claims,
-that it links every module document named in `AGENTS.md`, that it cites no historical or archived
+that it links every `docs` entry in `subsystems.toml`, that it cites no historical or archived
 document, and that design documents appear only under intended direction or open questions. It does
 not verify the prose or the cited symbols.
 
@@ -71,7 +71,7 @@ Documents with known stale claims are flagged in [documentation status](#documen
 **Global** files select the full gates whenever they change: the Cargo manifests and toolchain,
 `src/lib.rs`, [`src/main.rs`](src/main.rs), `src/bin/` (the test supervisor), the root instruction
 files, every workflow under `.github/workflows/` (including [`release.yml`](.github/workflows/release.yml);
-see the [release process](CLAUDE.md#release-process) and open work on signed packages and rollback,
+see the [release process](CONTRIBUTING.md#release-process) and open work on signed packages and rollback,
 [#119](https://github.com/darwin-finch/finch/issues/119), and newer-release notification,
 [#144](https://github.com/darwin-finch/finch/issues/144)), the Brain test launchers and isolation
 harness, and the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot).

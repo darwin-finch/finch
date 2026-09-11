@@ -271,6 +271,8 @@ class SubsystemManifestTests(unittest.TestCase):
         self.fixture.write("CLAUDE.md", "# Instructions\n\n### Subsystem capsules\n\n`src/vm/AGENTS.md`\n")
         self.add_vm_capsule("# vm capsule\n\n### Testing (mandatory)\n\nA forked copy.\n")
         self.assert_error("src/vm/AGENTS.md: capsule restates the root's universal section '### Testing (mandatory)'")
+        self.fixture.write("src/vm/CLAUDE.md", "# vm capsule\n\n#### invariants for the vm\n")
+        self.assert_error("src/vm/AGENTS.md: capsule restates the root's universal section '## Invariants'")
 
     def test_nested_instruction_files_need_the_alias(self) -> None:
         self.fixture.write("src/app/CLAUDE.md", "# app notes\n")

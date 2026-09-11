@@ -11,8 +11,9 @@ catalog is `src/programs/`.
 `src/vm/mod.rs` and `src/lisp/mod.rs`.
 
 **Dependencies:** layer 0 in [`subsystems.toml`](../../subsystems.toml), no allowed edges. Debt:
-`vm → programs` and `vm → runtime`, both in `src/vm/runtime.rs`. Any new `crate::` import from
-here fails `scripts/check_subsystems.py`.
+`vm → programs` and `vm → runtime`, both in `src/vm/runtime.rs`. Importing any other subsystem
+fails `scripts/check_subsystems.py`. The debt record allows `programs` and `runtime` imports
+anywhere in this subsystem, so the check will not stop a new one; add none.
 
 **Effects** go through the capability broker, never around it
 ([capability boundaries](../../CLAUDE.md#key-principles)).

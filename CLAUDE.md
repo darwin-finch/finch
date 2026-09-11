@@ -200,7 +200,8 @@ Two related habits, for the same reason:
 Follow the steps in [`CONTRIBUTING.md`](CONTRIBUTING.md#release-process). Do not describe a release
 as ready merely because artifacts exist; release reliability is tracked in #119 (signed packages and
 verified rollback) and #144 (newer-release notification). macOS-only dependencies belong **after**
-the `[target.'cfg(target_os = "macos")'.dependencies]` header so they remain target-scoped.
+the `[target.'cfg(target_os = "macos")'.dependencies]` header so they remain target-scoped. The Linux
+release runner must stay on `ubuntu-24.04` or newer (glibc 2.38+), and Intel macOS is unsupported.
 
 ## Current Project Status
 

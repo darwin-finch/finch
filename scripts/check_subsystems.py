@@ -398,7 +398,9 @@ def capsule_errors(manifest: dict, root: Path) -> list[str]:
         capsule = root / path
         body = capsule.read_text() if capsule.is_file() else ""
         for heading in UNIVERSAL_HEADINGS:
-            if re.search(rf"^{re.escape(heading)}\s*$", body, re.M):
+            # Match the heading text at any level and case, so `### invariants (vm)` also counts.
+            title = re.escape(heading.lstrip("#").strip())
+            if re.search(rf"^#+\s*{title}(?!\w)", body, re.M | re.I):
                 errors.append(
                     f"{path}: capsule restates the root's universal section {heading!r}; link to it instead"
                 )
