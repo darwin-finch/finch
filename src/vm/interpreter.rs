@@ -1691,7 +1691,7 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
     }
 }
 
-pub(crate) fn instantiate_requirement(
+pub fn instantiate_requirement(
     requirement: &CapabilityRequirement,
     arguments: &[TypedValue],
 ) -> Result<CapabilityRequirement, String> {

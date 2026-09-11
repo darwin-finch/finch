@@ -1007,6 +1007,23 @@ fn leading_documentation(source: &str, language: ProgramLanguage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::{TypedExecutionStatus, TypedRuntime};
+
+    #[test]
+    fn executable_lisp_script_envelope_enters_the_shared_typed_runtime() {
+        let script = parse_finch_script(
+            std::path::Path::new("reply.lisp"),
+            "#!/usr/local/finch --exec --language=lisp\n; a script comment\n(begin (say \"hello from script\"))\n",
+        )
+        .unwrap();
+        assert_eq!(script.language, ProgramLanguage::Lisp);
+
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute(script.language, "reply.lisp", &script.source, 1_000);
+        assert_eq!(result.status, TypedExecutionStatus::Completed);
+        assert_eq!(result.output, "hello from script");
+        assert!(result.values.is_empty());
+    }
 
     #[test]
     fn omitted_language_uses_compact_wire_inference() {
