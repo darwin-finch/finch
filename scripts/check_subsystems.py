@@ -35,6 +35,7 @@ UNIVERSAL_HEADINGS = (
     "## Invariants", "## Development Guidelines", "### Testing (mandatory)",
     "### Reporting status to a human", "## Key Principles",
 )
+PUBLIC_MODULE = re.compile(r"^[ \t]*pub(?:[ \t]*\([^)]*\))?[ \t]+mod[ \t]+(\w+)", re.M)
 TEST_MODULE_BLOCK = re.compile(
     r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"
 )
@@ -429,6 +430,31 @@ def capsule_errors(manifest: dict, root: Path) -> list[str]:
     return errors
 
 
+def facade_errors(manifest: dict, files: list[str], root: Path) -> list[str]:
+    """A facade file exposes its subsystem only through `pub use`; no child module is public.
+
+    Private modules already make reaching past the facade a compile error; this guards the one
+    thing the compiler cannot: someone re-adding `pub mod` to the facade file.
+    """
+    errors: list[str] = []
+    for record in valid_records(manifest):
+        facade = record.get("facade")
+        if facade is None:
+            continue
+        owner = record["id"]
+        if not isinstance(facade, str) or facade not in files:
+            errors.append(f"subsystem {owner!r}: facade must name a tracked file; actual={facade!r}")
+            continue
+        text = blank_comments_and_literals((root / facade).read_text(errors="replace"))
+        for match in PUBLIC_MODULE.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"{facade}:{line}: public module `{match.group(1)}` in the {owner!r} facade; "
+                "make it private and re-export the items callers need with `pub use`"
+            )
+    return errors
+
+
 def check(root: Path) -> list[str]:
     try:
         manifest = load_manifest(root)
@@ -441,6 +467,7 @@ def check(root: Path) -> list[str]:
     errors += dependency_errors(manifest, edges)
     errors += alias_errors(root, files)
     errors += capsule_errors(manifest, root)
+    errors += facade_errors(manifest, files, root)
     return errors
 
 

@@ -2696,7 +2696,7 @@ mod tests {
         assert!(matches!(
             snapshot.typed_stack.last().map(|cell| &cell.value_type),
             Some(crate::vm::Type::Task(result))
-                if **result == crate::vm::vocabulary::agent_task_result_type()
+                if **result == crate::vm::agent_task_result_type()
         ));
         let poll = runtime
             .submit(crate::runtime::ProgramSubmission {

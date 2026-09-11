@@ -1,7 +1,7 @@
 use crate::programs::{ExecutionEffect, ProgramValue};
 use crate::vm::{
-    interpreter::{HostSideEffect, VmSideEffect},
-    ApprovalPrompt, CapabilityRequirement, EffectJournalEntry, VmDiagnostic,
+    ApprovalPrompt, CapabilityRequirement, EffectJournalEntry, HostSideEffect, VmDiagnostic,
+    VmSideEffect,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

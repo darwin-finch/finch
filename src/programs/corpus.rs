@@ -16,8 +16,8 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::vm::frontend::forth::compile_forth_with_functions;
-use crate::vm::frontend::lisp::compile_lisp_with_functions;
+use crate::vm::compile_forth_with_functions;
+use crate::vm::compile_lisp_with_functions;
 
 pub const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
 pub const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";

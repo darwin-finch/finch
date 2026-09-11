@@ -7,8 +7,10 @@ frontends), `src/lisp/` (reader only; Lisp semantics live in `vm::frontend::lisp
 `vocabulary/`, and `examples/finch/`. The program runtime service is `src/runtime/`; the program
 catalog is `src/programs/`.
 
-**Interface:** no facade is enforced yet (#541 phase 3); use the `pub use` re-exports in
-`src/vm/mod.rs` and `src/lisp/mod.rs`.
+**Interface:** the `pub use` list in `src/vm/mod.rs` is the whole public surface. Child modules are
+private, so reaching past it is a compile error, and `scripts/check_subsystems.py` rejects any
+`pub mod` there. To expose something new, re-export it deliberately. `src/lisp/mod.rs` has no
+facade yet.
 
 **Dependencies:** layer 0 in [`subsystems.toml`](../../subsystems.toml): `vm` depends on no other
 subsystem, and any `crate::` import of one fails `scripts/check_subsystems.py`. The pure CPU fiber

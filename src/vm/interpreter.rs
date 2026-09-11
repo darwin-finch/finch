@@ -274,6 +274,7 @@ impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
 pub struct DenyCapabilities;
 
 impl CapabilityHandler for DenyCapabilities {
@@ -1552,12 +1553,14 @@ impl<'a> VmTrampoline<'a> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
 pub struct Interpreter<'a, H> {
     module: &'a VerifiedModule,
     handler: H,
     config: InterpreterConfig,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
 impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
     pub fn new(module: &'a VerifiedModule, handler: H, config: InterpreterConfig) -> Self {
         Self {

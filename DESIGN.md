@@ -245,7 +245,8 @@ Known stale or unsupported claims in current-looking documents, awaiting repair 
 Design intent, not current fact. The program, its phases, and its measurable gates are in
 [#541](https://github.com/darwin-finch/finch/issues/541).
 
-- **Facades before crates.** Each subsystem gets a narrow public interface with private
+- **Facades before crates.** Done for `vm` ([#586](https://github.com/darwin-finch/finch/issues/586)): its
+  child modules are private behind `pub use` re-exports. Each subsystem gets a narrow public interface with private
   implementation children, co-located instructions and documentation, and boundary tests.
   Reverse and cross-subsystem implementation imports are removed before code moves between
   crates.

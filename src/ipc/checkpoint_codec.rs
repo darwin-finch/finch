@@ -6,25 +6,23 @@
 //! host-width integer overflow.
 
 use crate::ipc::schema::finch_ipc_capnp as wire;
-use crate::vm::diagnostic::{
-    DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
-};
-use crate::vm::effects::{
+use crate::vm::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
+use crate::vm::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileSelector, FileSelectorTemplate,
     FileSelectorTemplatePart, McpSelectorTemplate, NetworkSelectorTemplate,
     ProcessSelectorTemplate, ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
-use crate::vm::interpreter::{
-    HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect,
+use crate::vm::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
+use crate::vm::{
+    DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
 };
-use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::runtime::{
+use crate::vm::{
     EffectJournalEntry, EffectJournalState, ProducerFiberRecord, ProducerFiberState,
     TypedRuntimeCheckpoint,
 };
-use crate::vm::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
-use crate::vm::types::{TaskKind, Type, TypedValue};
-use crate::vm::verifier::{VerifiedFunction, VerifiedModule};
+use crate::vm::{HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect};
+use crate::vm::{TaskKind, Type, TypedValue};
+use crate::vm::{VerifiedFunction, VerifiedModule};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 

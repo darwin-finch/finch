@@ -289,6 +289,20 @@ class SubsystemManifestTests(unittest.TestCase):
         (self.fixture.root / "src/app/AGENTS.md").symlink_to("CLAUDE.md")
         self.assert_error("src/app/AGENTS.md must not be a symlink: Finch's tree-list rejects symlinks")
 
+    def test_facade_file_may_not_declare_public_modules(self) -> None:
+        self.fixture.edit("subsystems.toml", 'docs = ["src/vm/VM.md"]', 'docs = ["src/vm/VM.md"]\nfacade = "src/vm/mod.rs"')
+        self.fixture.edit("src/vm/mod.rs", "pub struct Value;", "mod ir;\n// pub mod commented;\nconst S: &str = \"pub mod quoted;\";\npub struct Value;")
+        self.fixture.write("src/vm/ir.rs", "pub struct Ir;\n")
+        self.assert_clean()
+        for declaration in ("pub mod ir;", "pub(crate) mod ir;", "pub(super) mod ir;"):
+            with self.subTest(declaration=declaration):
+                self.fixture.write("src/vm/mod.rs", f"use crate::app::Hook;\n{declaration}\npub struct Value;\n")
+                self.assert_error(f"src/vm/mod.rs:2: public module `ir` in the 'vm' facade")
+
+    def test_facade_must_name_a_tracked_file(self) -> None:
+        self.fixture.edit("subsystems.toml", 'docs = ["src/vm/VM.md"]', 'docs = ["src/vm/VM.md"]\nfacade = "src/vm/lib.rs"')
+        self.assert_error("subsystem 'vm': facade must name a tracked file; actual='src/vm/lib.rs'")
+
     def test_excluded_entries_need_a_reason(self) -> None:
         self.fixture.edit("subsystems.toml", 'reason = "history"', 'reason = ""')
         self.assert_error("excluded path 'old/' needs a reason")

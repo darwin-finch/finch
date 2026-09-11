@@ -10,7 +10,7 @@ pub mod outcome;
 pub mod scheduler;
 
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
-use crate::vm::vocabulary::{
+use crate::vm::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
     capability_grant_entry_type, core_word_spec, tree_entry_type, tree_listing_type,
     CoreHostBinding, CoreWordImplementation,
@@ -230,7 +230,7 @@ pub struct VmStateSnapshot {
 pub struct ProgramCompilerContext {
     pub manifest_generation: u64,
     pub revision: u64,
-    pub functions: std::collections::BTreeMap<String, crate::vm::ir::Function>,
+    pub functions: std::collections::BTreeMap<String, crate::vm::Function>,
 }
 
 /// An immutable in-memory checkpoint at a successful VM commit boundary.
@@ -443,7 +443,7 @@ struct PendingTypedExecution {
     caller: Option<scheduler::AgentIdentity>,
     output: String,
     output_chunks: Vec<String>,
-    side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
+    side_effects: Vec<crate::vm::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
     effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     deferred_host_effects: DeferredHostEffects,
@@ -3410,7 +3410,7 @@ struct TypedHostHandler {
     resource_roots: Arc<RwLock<ResourceRootState>>,
     output: String,
     output_chunks: Vec<String>,
-    side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
+    side_effects: Vec<crate::vm::HostSideEffect>,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
     mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
@@ -4050,13 +4050,13 @@ fn typed_agent_task_snapshot(
     Ok(value)
 }
 
-impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
+impl crate::vm::CapabilityHandler for TypedHostHandler {
     fn prepare_awaited_effect(
         &mut self,
         effect: &mut VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
         let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
-        let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+        let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
             return Err(host_binding_error(
                 &effect.origin,
                 "typed host operation requires a typed host request",
@@ -4179,7 +4179,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             return Ok(());
         }
         let arguments = match &effect.event {
-            crate::vm::interpreter::HostSideEffect::Request { arguments } => arguments.clone(),
+            crate::vm::HostSideEffect::Request { arguments } => arguments.clone(),
             _ => {
                 return Err(VmDiagnostic::error(
                     "E-HOST-002",
@@ -4391,7 +4391,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         &mut self,
         effect: &VmSideEffect,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
-        let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+        let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
             return Err(VmDiagnostic::error(
                 "E-HOST-002",
                 crate::vm::DiagnosticPhase::HostCall,
@@ -4457,9 +4457,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         if effect.origin.word.as_deref() == Some("output-open") {
             let (Some(TypedValue::String(title)), Some(target)) = (
                 match &effect.event {
-                    crate::vm::interpreter::HostSideEffect::Request { arguments } => {
-                        arguments.first()
-                    }
+                    crate::vm::HostSideEffect::Request { arguments } => arguments.first(),
                     _ => None,
                 },
                 values.first(),
@@ -4471,8 +4469,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             };
             if let Some(sink) = &self.typed_effect_sink {
                 let mut create = effect.clone();
-                create.event = crate::vm::interpreter::HostSideEffect::Ui {
-                    operation: crate::vm::interpreter::UiOperation::Create,
+                create.event = crate::vm::HostSideEffect::Ui {
+                    operation: crate::vm::UiOperation::Create,
                     target: Some(target.clone()),
                     text: Some(title.clone()),
                     progress: None,
@@ -5566,20 +5564,20 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         self.output_chunks.clone()
     }
 
-    fn side_effects(&self) -> Vec<crate::vm::interpreter::HostSideEffect> {
+    fn side_effects(&self) -> Vec<crate::vm::HostSideEffect> {
         self.side_effects.clone()
     }
 
     fn side_effect(
         &mut self,
-        effect: &crate::vm::interpreter::VmSideEffect,
+        effect: &crate::vm::VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
         match &effect.event {
-            crate::vm::interpreter::HostSideEffect::Emit { text } => {
+            crate::vm::HostSideEffect::Emit { text } => {
                 self.output.push_str(text);
                 self.output_chunks.push(text.clone());
             }
-            crate::vm::interpreter::HostSideEffect::Ui {
+            crate::vm::HostSideEffect::Ui {
                 target, operation, ..
             } => {
                 let Some(TypedValue::Resource {
@@ -5622,8 +5620,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 }
                 if matches!(
                     operation,
-                    crate::vm::interpreter::UiOperation::Complete
-                        | crate::vm::interpreter::UiOperation::Fail
+                    crate::vm::UiOperation::Complete | crate::vm::UiOperation::Fail
                 ) {
                     self.output_handles
                         .lock()
@@ -5638,7 +5635,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         .remove(handle);
                 }
             }
-            crate::vm::interpreter::HostSideEffect::Request { .. } => {
+            crate::vm::HostSideEffect::Request { .. } => {
                 return Err(VmDiagnostic::error(
                     "E-HOST-003",
                     crate::vm::DiagnosticPhase::HostCall,
@@ -5780,7 +5777,7 @@ fn validate_core_host_request(
                 .ok_or_else(|| {
                     host_binding_error(origin, "core binding does not declare this capability")
                 })?;
-            let expected = crate::vm::interpreter::instantiate_requirement(declared, arguments)
+            let expected = crate::vm::instantiate_requirement(declared, arguments)
                 .map_err(|message| host_binding_error(origin, message))?;
             let dynamically_bound = matches!(
                 binding,
@@ -6717,7 +6714,7 @@ fn normalize_process_grant(
 
 fn validate_process_effect(effect: &VmSideEffect) -> std::result::Result<(), VmDiagnostic> {
     let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
-    let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+    let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
         return Err(host_binding_error(
             &effect.origin,
             "process-run requires a typed host request",
@@ -8790,7 +8787,7 @@ mod tests {
         .is_err());
 
         let mut checked = 0_usize;
-        for (name, spec) in crate::vm::vocabulary::core_word_registry() {
+        for (name, spec) in crate::vm::core_word_registry() {
             let CoreWordImplementation::HostEffect(binding) = spec.implementation else {
                 continue;
             };
@@ -8814,7 +8811,7 @@ mod tests {
 
         let runtime = ProgramRuntime::new();
         let mut host = production_host_handler(&runtime);
-        let error = crate::vm::interpreter::CapabilityHandler::request(
+        let error = crate::vm::CapabilityHandler::request(
             &mut host,
             &requirement,
             vec![TypedValue::String("hostile".into()), TypedValue::Int(0)],
@@ -8823,7 +8820,7 @@ mod tests {
         .expect_err("the production host boundary must reject automation ABI substitution");
         assert_eq!(error.code, "E-HOST-002");
 
-        let error = crate::vm::interpreter::CapabilityHandler::request(
+        let error = crate::vm::CapabilityHandler::request(
             &mut host,
             &file_requirement,
             vec![TypedValue::Path {
@@ -8867,7 +8864,7 @@ mod tests {
             },
         };
         let stale_generation = host.resource_generation + 1;
-        let error = crate::vm::interpreter::CapabilityHandler::request(
+        let error = crate::vm::CapabilityHandler::request(
             &mut host,
             &requirement,
             vec![
@@ -13532,7 +13529,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         assert!(matches!(
             event.effect.event,
-            crate::vm::interpreter::HostSideEffect::Request { ref arguments }
+            crate::vm::HostSideEffect::Request { ref arguments }
                 if matches!(arguments.as_slice(), [TypedValue::String(language), ..] if language == "python")
         ));
         let info = runtime
@@ -14159,7 +14156,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             events
                 .iter()
                 .map(|event| match &event.effect.event {
-                    crate::vm::interpreter::HostSideEffect::Emit { text } => text.as_str(),
+                    crate::vm::HostSideEffect::Emit { text } => text.as_str(),
                     other => panic!("expected emit event, found {other:?}"),
                 })
                 .collect::<Vec<_>>(),
@@ -14169,10 +14166,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(
             outcome.side_effects,
             vec![
-                crate::vm::interpreter::HostSideEffect::Emit {
+                crate::vm::HostSideEffect::Emit {
                     text: "first".into()
                 },
-                crate::vm::interpreter::HostSideEffect::Emit {
+                crate::vm::HostSideEffect::Emit {
                     text: "second".into()
                 }
             ]
@@ -14196,7 +14193,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(outcome.output, "hello from standard Forth");
         assert_eq!(
             outcome.side_effects,
-            vec![crate::vm::interpreter::HostSideEffect::Emit {
+            vec![crate::vm::HostSideEffect::Emit {
                 text: "hello from standard Forth".into(),
             }]
         );
@@ -14335,12 +14332,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         assert!(events.iter().all(|effect| !matches!(
             effect.effect.event,
-            crate::vm::interpreter::HostSideEffect::Request { .. }
+            crate::vm::HostSideEffect::Request { .. }
         )));
         assert!(matches!(
             events.first().map(|effect| &effect.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Create,
+            Some(crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Create,
                 text: Some(title),
                 target: Some(TypedValue::Resource { kind, .. }),
                 ..
@@ -14348,8 +14345,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         ));
         assert!(matches!(
             events.last().map(|effect| &effect.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Complete,
+            Some(crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Complete,
                 ..
             })
         ));
@@ -14396,32 +14393,32 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let events = events.lock().unwrap();
         assert!(matches!(
             events.first().map(|effect| &effect.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Create,
+            Some(crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Create,
                 ..
             })
         ));
         assert!(events.iter().any(|effect| matches!(
             &effect.effect.event,
-            crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Create,
+            crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Create,
                 text: Some(title),
                 ..
             } if title == "download"
         )));
         assert!(events.iter().any(|effect| matches!(
             &effect.effect.event,
-            crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Status,
+            crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Status,
                 text: Some(text),
                 ..
             } if text == "starting"
         )));
         assert!(events.iter().any(|effect| matches!(
             &effect.effect.event,
-            crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Progress,
-                progress: Some(crate::vm::interpreter::UiProgress {
+            crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Progress,
+                progress: Some(crate::vm::UiProgress {
                     completed: 2,
                     total: Some(5),
                 }),
@@ -14430,8 +14427,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         )));
         assert!(matches!(
             events.last().map(|effect| &effect.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Complete,
+            Some(crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Complete,
                 ..
             })
         ));
@@ -14462,7 +14459,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(open.execution_id, pending.execution_id);
         assert!(matches!(
             &open.effect.event,
-            crate::vm::interpreter::HostSideEffect::Request { arguments }
+            crate::vm::HostSideEffect::Request { arguments }
                 if matches!(arguments.as_slice(), [TypedValue::String(title)] if title == "download")
         ));
 
@@ -14493,8 +14490,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         assert!(matches!(
             updates.first().map(|envelope| &envelope.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Status,
+            Some(crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Status,
                 text: Some(text),
                 target: Some(TypedValue::Resource { handle, generation, .. }),
                 ..
@@ -14502,8 +14499,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         ));
         assert!(matches!(
             updates.last().map(|envelope| &envelope.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Ui {
-                operation: crate::vm::interpreter::UiOperation::Complete,
+            Some(crate::vm::HostSideEffect::Ui {
+                operation: crate::vm::UiOperation::Complete,
                 ..
             })
         ));

@@ -24,6 +24,7 @@ pub enum CpuFiberStatus {
 
 #[derive(Debug, Clone)]
 pub struct CpuFiberSnapshot {
+    #[allow(dead_code)] // never read, even by tests; decision tracked in #587
     pub id: Uuid,
     pub status: CpuFiberStatus,
     pub result: Option<Vec<TypedValue>>,
@@ -58,6 +59,7 @@ impl CpuFiberScheduler {
     /// Spawn a pure function with only explicit input values and captures.
     /// Effects are rejected before a native worker exists, so a CPU fiber
     /// cannot reach files, processes, UI output, memory, or agent operations.
+    #[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
     pub fn spawn(
         self: &Arc<Self>,
         module: VerifiedModule,
@@ -133,6 +135,7 @@ impl CpuFiberScheduler {
     /// data-stack reference crosses the worker boundary. The language-level
     /// `defer :cpu` form lowers to this operation after checking that the
     /// closure has no remaining positional arguments.
+    #[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
     pub fn spawn_closure(
         self: &Arc<Self>,
         module: VerifiedModule,
@@ -248,6 +251,7 @@ impl CpuFiberScheduler {
     /// Wait for terminal state. This blocks only a worker calling `join`, not
     /// Finch's UI/event-loop thread; the language-level join will instead
     /// suspend its VM continuation before calling this operation.
+    #[cfg_attr(not(test), allow(dead_code))] // test-only today; decision tracked in #587
     pub fn join(&self, id: Uuid) -> Result<CpuFiberSnapshot> {
         let record = self.record(id)?;
         let mut state = record

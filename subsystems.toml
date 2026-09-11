@@ -66,6 +66,7 @@ layer = 0
 paths = ["src/vm/", "src/lisp/", "vocabulary/", "examples/finch/"]
 docs = ["vocabulary/language/FINCH_VM.md", "vocabulary/language/FINCH_FORTH.md", "vocabulary/language/FINCH_LISP.md", "docs/TYPED_VM_MIGRATION_AUDIT.md"]
 instructions = ["src/vm/AGENTS.md"]
+facade = "src/vm/mod.rs"
 depends_on = []
 
 [[subsystem]]
