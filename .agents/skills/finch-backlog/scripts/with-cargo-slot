@@ -85,7 +85,7 @@ locked_exec='
     exec 107<"$proof_path" || exit 69
     rm -f -- "$proof_path" || exit 69
     export FINCH_CARGO_SLOT_HELD="$1"
-    export FINCH_CARGO_SLOT_OWNER_PID="$$"
+    export FINCH_CARGO_SLOT_OWNER_PID="$PPID"
     export FINCH_CARGO_SLOT_PROOF_FD=107
     shift
     exec "$@"
@@ -99,11 +99,10 @@ case "$(uname -s)" in
         ;;
 esac
 
-# Acquire nonblocking in a bounded loop, clear close-on-exec only for the lock
-# descriptor, then replace this process with the caller. The inherited open
-# file description retains the kernel lock throughout the complete command
-# tree and releases it automatically on exit or crash.
-exec perl -MFcntl=:flock,F_SETFD -MTime::HiRes=time,sleep -e '
+# Acquire nonblocking in a bounded loop, then retain the lock in a supervising
+# parent. The command child closes the lock descriptor before exec so a
+# compiler cache or other daemon cannot keep the slot after Cargo exits.
+exec perl -MFcntl=:flock -MTime::HiRes=time,sleep -e '
     use strict;
     use warnings;
     my ($timeout, $path, @command) = @ARGV;
@@ -116,9 +115,40 @@ exec perl -MFcntl=:flock,F_SETFD -MTime::HiRes=time,sleep -e '
         exit 75 if time() >= $deadline;
         sleep 0.05;
     }
-    fcntl($lock, F_SETFD, 0)
-        or die "with-cargo-slot: could not preserve lock descriptor for $path: $!\n";
-    exec {$command[0]} @command
-        or die "with-cargo-slot: could not execute $command[0]: $!\n";
+    my $child = 0;
+    my @pending;
+    for my $signal (qw(HUP INT QUIT TERM)) {
+        $SIG{$signal} = sub {
+            if ($child > 0) {
+                kill $signal, $child;
+            } else {
+                push @pending, $signal;
+            }
+        };
+    }
+    my $pid = fork();
+    die "with-cargo-slot: could not fork command: $!\n" unless defined $pid;
+    if ($pid == 0) {
+        close $lock;
+        $SIG{$_} = "DEFAULT" for qw(HUP INT QUIT TERM);
+        exec {$command[0]} @command
+            or die "with-cargo-slot: could not execute $command[0]: $!\n";
+    }
+    $child = $pid;
+    kill $_, $child for @pending;
+    my $waited;
+    do {
+        $waited = waitpid($child, 0);
+    } while ($waited < 0 && $!{EINTR});
+    die "with-cargo-slot: could not reap command $child: $!\n" if $waited < 0;
+    my $status = $?;
+    if ($status & 127) {
+        my $signal = $status & 127;
+        my %signal_name = (1 => "HUP", 2 => "INT", 3 => "QUIT", 15 => "TERM");
+        $SIG{$signal_name{$signal}} = "DEFAULT" if exists $signal_name{$signal};
+        kill $signal, $$;
+        exit 128 + $signal;
+    }
+    exit($status >> 8);
 ' "$timeout_seconds" "$lock_path" \
     /bin/bash -c "$locked_exec" finch-cargo-slot "$git_common_dir" "$@"
