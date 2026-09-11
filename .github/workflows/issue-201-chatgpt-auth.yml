@@ -1,5 +1,8 @@
 name: Issue 201 ChatGPT Auth
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch: {}
   push:
@@ -46,7 +49,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
       - name: Compile exact authentication sources on Windows
         run: |
           cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml
