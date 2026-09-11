@@ -216,6 +216,31 @@ class WorkflowContractTests(unittest.TestCase):
                 finally:
                     repository.close()
 
+    def test_isolation_fatal_steps_cannot_be_rewritten_by_shell_directory_or_defaults(self) -> None:
+        harness = "    - name: Exercise the complete synthetic isolation harness\n"
+        mutations = (
+            (harness, harness + "      shell: true {0}\n", MACOS_JOB,
+             "'isolation-boundaries-macos' (macos-14) fatal step 'Exercise the complete synthetic isolation harness' must use the default shell"),
+            (harness, harness + "      working-directory: /tmp\n", None,
+             "'isolation-boundaries' (ubuntu-24.04) fatal step 'Exercise the complete synthetic isolation harness' must use the default working-directory"),
+            ("    runs-on: macos-14\n", "    runs-on: macos-14\n    defaults:\n      run:\n        shell: true {0}\n", MACOS_JOB,
+             "job 'isolation-boundaries-macos' (macos-14) defaults would rewrite its fatal steps"),
+            ("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    defaults:\n      run:\n        working-directory: /tmp\n", None,
+             "job 'isolation-boundaries' (ubuntu-24.04) defaults would rewrite its fatal steps"),
+            ("permissions:\n", "defaults:\n  run:\n    shell: true {0}\n\npermissions:\n", None,
+             "workflow-level defaults would rewrite every fatal step"),
+        )
+        for old, new, after, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                repository = Repository()
+                try:
+                    repository.replace(ISOLATION_WORKFLOW, old, new, after=after)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, f"isolation rewrite mutant passed: {diagnostic}")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
     def test_isolation_fatal_steps_must_keep_their_order(self) -> None:
         path = self.repository.workflow(ISOLATION_WORKFLOW)
         source = path.read_text()

@@ -927,6 +927,9 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     if not isinstance(triggers, dict) or "workflow_dispatch" not in triggers:
         errors.append(f"{ISOLATION_WORKFLOW}: manual workflow_dispatch trigger is required")
 
+    # A `defaults.run` shell or directory silently rewrites every fatal step below it.
+    if "defaults" in document:
+        errors.append(f"{ISOLATION_WORKFLOW}: workflow-level defaults would rewrite every fatal step; remove them")
     jobs = document.get("jobs")
     jobs = jobs if isinstance(jobs, dict) else {}
     if set(jobs) != set(ISOLATION_JOBS):
@@ -940,6 +943,10 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
         steps = job.get("steps") if isinstance(job, dict) else None
         if not isinstance(steps, list):
             continue
+        if "defaults" in job:
+            errors.append(
+                f"{ISOLATION_WORKFLOW}: job {job_id!r} ({runner}) defaults would rewrite its fatal steps; remove them"
+            )
         positions: list[int] = []
         for name, commands in ISOLATION_STEPS:
             matches = [
@@ -956,6 +963,9 @@ def isolation_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
                 errors.append(f"{where} must run unconditionally; actual if={step.get('if')!r}")
             if step.get("continue-on-error") not in (None, False):
                 errors.append(f"{where} must gate failure")
+            for key in ("shell", "working-directory"):
+                if key in step:
+                    errors.append(f"{where} must use the default {key}; actual {key}={step[key]!r}")
             actual_commands = shell_commands(step.get("run"))
             if actual_commands != commands:
                 errors.append(
