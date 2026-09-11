@@ -244,6 +244,51 @@ class WorkflowContractTests(unittest.TestCase):
                 finally:
                     repository.close()
 
+    def test_equivalent_migrated_conditions_pass(self) -> None:
+        self.repository.replace(
+            "ci.yml",
+            "if: runner.os == 'Linux' && matrix.feature_name == 'default'",
+            "if: ${{ matrix.feature_name == 'default' && runner.os == 'Linux' }}",
+        )
+        self.repository.replace(
+            "ci.yml",
+            "if: matrix.feature_name == 'default'",
+            "if: ${{ matrix.feature_name == 'default' }}",
+        )
+        self.assert_passes()
+
+    def test_migrated_owner_jobs_must_be_active_and_gating(self) -> None:
+        mutations = (
+            (
+                "ci.yml",
+                "  test:\n    name: Test",
+                "  test:\n    if: false\n    name: Test",
+                "owner job 'test' must run actively",
+            ),
+            (
+                "ci.yml",
+                "  test:\n    name: Test",
+                "  test:\n    continue-on-error: true\n    name: Test",
+                "owner job 'test' must gate failure",
+            ),
+            (
+                "issue-201-chatgpt-auth.yml",
+                "  windows-verifier-compile:\n    runs-on:",
+                "  windows-verifier-compile:\n    continue-on-error: true\n    runs-on:",
+                "owner job 'windows-verifier-compile' must gate failure",
+            ),
+        )
+        for name, old, new, diagnostic in mutations:
+            with self.subTest(name=name, diagnostic=diagnostic):
+                repository = Repository()
+                try:
+                    repository.replace(name, old, new)
+                    result = repository.check()
+                    self.assertNotEqual(0, result.returncode, "inactive/non-gating owner job passed")
+                    self.assertIn(diagnostic, result.stderr, result.stderr)
+                finally:
+                    repository.close()
+
     def test_windows_boundary_rejects_wrong_owner_os_inertness_and_manifest(self) -> None:
         mutations = (
             ("runs-on: windows-2022", "runs-on: ubuntu-24.04", "must run actively on windows-2022"),
@@ -270,7 +315,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.repository.replace(
             "ci.yml", "\n  runtime-authority:\n", duplicate + "\n  runtime-authority:\n",
         )
-        self.assert_fails("migrated command ownership count expected=1 actual=2")
+        self.assert_fails("migrated operation ownership count expected=1 actual=2")
 
         repository = Repository()
         try:
@@ -281,6 +326,38 @@ class WorkflowContractTests(unittest.TestCase):
             result = repository.check()
             self.assertNotEqual(0, result.returncode, "non-gating migrated step passed")
             self.assertIn("must gate failure", result.stderr, result.stderr)
+        finally:
+            repository.close()
+
+    def test_equivalent_cargo_syntax_cannot_duplicate_migrated_ownership(self) -> None:
+        duplicate_doctest = """\n    - name: Duplicate equivalent doctest
+      run: cargo test --package finch --doc -- ValidatedProviderRequest
+"""
+        self.repository.replace(
+            "ci.yml", "\n  runtime-authority:\n", duplicate_doctest + "\n  runtime-authority:\n",
+        )
+        self.assert_fails(
+            "migrated operation ownership count expected=1 actual=2: provider-token-doctest"
+        )
+
+        repository = Repository()
+        try:
+            duplicate_probe = """\n      - name: Duplicate equivalent Windows probe
+        run: cargo check --manifest-path=.github/issue-105-windows-probe/Cargo.toml
+"""
+            repository.replace(
+                "issue-201-chatgpt-auth.yml",
+                "      - name: Compile exact authentication sources on Windows\n",
+                duplicate_probe + "      - name: Compile exact authentication sources on Windows\n",
+            )
+            result = repository.check()
+            self.assertNotEqual(0, result.returncode, "equivalent Windows probe duplicate passed")
+            self.assertIn(
+                "migrated operation ownership count expected=1 actual=2: "
+                "windows-probe:.github/issue-105-windows-probe/Cargo.toml",
+                result.stderr,
+                result.stderr,
+            )
         finally:
             repository.close()
 

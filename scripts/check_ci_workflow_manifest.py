@@ -7,6 +7,7 @@ import argparse
 import itertools
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -305,6 +306,89 @@ def shell_commands(run: Any) -> tuple[str, ...]:
     return tuple(" ".join(line.split()) for line in joined.splitlines() if line.strip())
 
 
+def condition_identity(value: Any) -> tuple[tuple[str, str], ...] | None:
+    """Return the bounded semantic identity of a supported job/step condition."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return (("unsupported", repr(value)),)
+    expression = value.strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    terms: list[tuple[str, str]] = []
+    for term in expression.split("&&"):
+        term = term.strip()
+        while term.startswith("(") and term.endswith(")"):
+            term = term[1:-1].strip()
+        match = re.fullmatch(
+            r"(runner\.os|matrix\.feature_name)\s*==\s*(['\"])([^'\"]+)\2",
+            term,
+        )
+        if match is None:
+            return (("unsupported", expression),)
+        terms.append((match.group(1), match.group(3)))
+    return tuple(sorted(terms))
+
+
+def migrated_command_identity(command: str) -> str | None:
+    """Identify the bounded operation owned by a migrated workflow boundary."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    if tokens[:2] == ["cargo", "test"]:
+        if "--doc" in tokens and "ValidatedProviderRequest" in tokens:
+            return "provider-token-doctest"
+        if {"--release", "--lib", "cli::conversation::tests"}.issubset(tokens):
+            return "release-atomic-history"
+    if tokens[:2] == ["cargo", "check"]:
+        manifest: str | None = None
+        for index, token in enumerate(tokens):
+            if token.startswith("--manifest-path="):
+                manifest = token.split("=", 1)[1]
+                break
+            if token == "--manifest-path" and index + 1 < len(tokens):
+                manifest = tokens[index + 1]
+                break
+        if manifest in {
+            ".github/issue-105-windows-probe/Cargo.toml",
+            ".github/issue-201-windows-probe/Cargo.toml",
+        }:
+            return f"windows-probe:{manifest}"
+    if tokens[:2] == ["test", "-L"] and ".claude/skills/finch-backlog" in tokens:
+        return "skill-symlink-exists"
+    if (
+        "cd .agents/skills/finch-backlog && pwd -P" in command
+        and "cd .claude/skills/finch-backlog && pwd -P" in command
+    ):
+        return "skill-symlink-target"
+    slot_scripts = {
+        ".agents/skills/finch-backlog/scripts/with-cargo-slot",
+        ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
+    }
+    if tokens[:2] == ["bash", "-n"] and slot_scripts.issubset(tokens):
+        return "cargo-slot-syntax"
+    if tokens and tokens[0] == ".agents/skills/finch-backlog/scripts/test-with-cargo-slot":
+        return "cargo-slot-regression"
+    return None
+
+
+def active_owner_job_errors(
+    documents: dict[str, dict[str, Any]], workflow: str, job_id: str, expected_runner: str,
+) -> list[str]:
+    job = documents.get(workflow, {}).get("jobs", {}).get(job_id)
+    if not isinstance(job, dict):
+        return [f"{workflow}: required owner job {job_id!r} is missing"]
+    errors: list[str] = []
+    if job.get("runs-on") != expected_runner or job.get("if") is not None:
+        errors.append(
+            f"{workflow}: owner job {job_id!r} must run actively on {expected_runner}"
+        )
+    if job.get("continue-on-error") not in (None, False):
+        errors.append(f"{workflow}: owner job {job_id!r} must gate failure")
+    return errors
+
+
 def required_step_errors(
     documents: dict[str, dict[str, Any]], workflow: str, job_id: str, name: str,
     expected_if: str | None, expected_shell: str | None, commands: tuple[str, ...],
@@ -320,7 +404,7 @@ def required_step_errors(
     if len(matches) != 1:
         return [f"{workflow}: required step {name!r} count expected=1 actual={len(matches)}"]
     step = matches[0]
-    if step.get("if") != expected_if:
+    if condition_identity(step.get("if")) != condition_identity(expected_if):
         errors.append(
             f"{workflow}: step {name!r} condition changed; "
             f"expected={expected_if!r} actual={step.get('if')!r}"
@@ -347,6 +431,7 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
     test_job = ci.get("jobs", {}).get("test") if isinstance(ci.get("jobs"), dict) else None
     if not isinstance(test_job, dict) or test_job.get("runs-on") != "${{ matrix.os }}":
         errors.append("ci.yml: migrated boundaries require the canonical matrix test job")
+    errors.extend(active_owner_job_errors(documents, "ci.yml", "test", "${{ matrix.os }}"))
 
     errors.extend(required_step_errors(
         documents, "ci.yml", "test", "Prove validated request tokens cannot be forged",
@@ -373,15 +458,15 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
         ),
     ))
 
-    owned_commands = (
-        "cargo test --doc -- ValidatedProviderRequest",
-        "cargo test --release --lib cli::conversation::tests -- --nocapture",
-        "test -L .claude/skills/finch-backlog",
-        'test "$(cd .agents/skills/finch-backlog && pwd -P)" = "$(cd .claude/skills/finch-backlog && pwd -P)"',
-        "bash -n .agents/skills/finch-backlog/scripts/with-cargo-slot .agents/skills/finch-backlog/scripts/test-with-cargo-slot",
-        ".agents/skills/finch-backlog/scripts/test-with-cargo-slot",
-        "cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml",
-        "cargo check --manifest-path .github/issue-201-windows-probe/Cargo.toml",
+    owned_operations = (
+        "provider-token-doctest",
+        "release-atomic-history",
+        "skill-symlink-exists",
+        "skill-symlink-target",
+        "cargo-slot-syntax",
+        "cargo-slot-regression",
+        "windows-probe:.github/issue-105-windows-probe/Cargo.toml",
+        "windows-probe:.github/issue-201-windows-probe/Cargo.toml",
     )
     all_commands: list[str] = []
     for document in documents.values():
@@ -394,10 +479,17 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
             for step in job["steps"]:
                 if isinstance(step, dict):
                     all_commands.extend(shell_commands(step.get("run")))
-    for command in owned_commands:
-        count = all_commands.count(command)
+    operation_counts: dict[str, int] = {}
+    for command in all_commands:
+        identity = migrated_command_identity(command)
+        if identity is not None:
+            operation_counts[identity] = operation_counts.get(identity, 0) + 1
+    for operation in owned_operations:
+        count = operation_counts.get(operation, 0)
         if count != 1:
-            errors.append(f"migrated command ownership count expected=1 actual={count}: {command}")
+            errors.append(
+                f"migrated operation ownership count expected=1 actual={count}: {operation}"
+            )
 
     auth = documents.get("issue-201-chatgpt-auth.yml", {})
     jobs = auth.get("jobs")
@@ -405,8 +497,11 @@ def migrated_boundary_errors(documents: dict[str, dict[str, Any]]) -> list[str]:
         errors.append("issue-201-chatgpt-auth.yml: exactly one Windows verifier job is required")
     else:
         job = jobs["windows-verifier-compile"]
-        if not isinstance(job, dict) or job.get("runs-on") != "windows-2022" or job.get("if") is not None:
-            errors.append("issue-201-chatgpt-auth.yml: Windows verifier must run actively on windows-2022")
+        if not isinstance(job, dict):
+            errors.append("issue-201-chatgpt-auth.yml: Windows verifier job must be a mapping")
+    errors.extend(active_owner_job_errors(
+        documents, "issue-201-chatgpt-auth.yml", "windows-verifier-compile", "windows-2022",
+    ))
     errors.extend(required_step_errors(
         documents, "issue-201-chatgpt-auth.yml", "windows-verifier-compile",
         "Compile exact authentication sources on Windows", None, None, (
