@@ -43,34 +43,51 @@ Named Brains run on per-Brain runtimes from `BrainStore::program_runtime`
 
 ## Subsystems
 
-Each row names the top-level modules a subsystem owns and its authoritative local documentation.
-"None yet" marks a subsystem without local documentation; the subsystem program adds one before
-code moves. Documents with known stale claims are flagged in
-[documentation status](#documentation-status).
+[`subsystems.toml`](subsystems.toml) is the authoritative ownership record: every tracked file
+belongs to exactly one subsystem, the global set, or an explicit exclusion, and
+`scripts/check_subsystems.py` enforces that on every PR. This table summarizes it. Layers are the
+intended direction (lower is more foundational); see [dependencies](#dependencies). "None yet"
+marks a subsystem without local documentation; the subsystem program adds one before code moves.
+Documents with known stale claims are flagged in [documentation status](#documentation-status).
 
-| Subsystem and responsibility | Modules under `src/` | Local documentation |
-|------------------------------|----------------------|---------------------|
-| **Typed runtime** (VM, CoForth, CoLisp): parse, verify, and run typed programs under capability authority | `vm`, `lisp`, `runtime` | Language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
-| **Programs**: durable program identity, catalog, and corpus; task-graph planning | `programs`, `poset` | None yet |
-| **Memory and local models**: MemTree storage and retrieval, local model loading, routing, feedback | `memory`, `models`, `local`, `generators`, `training`, `feedback`, `router`, `logging`, `memory_status.rs`, `workbook.rs` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
-| **Frontend** (CLI and TUI): commands, the interactive REPL, rendering, setup | `cli`, `main.rs`, `startup.rs`, `samples.rs` | [TUI renderer](src/cli/tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
-| **Brain and backend**: durable named Brains, the HTTP server and runner, daemon lifecycle | `brain`, `server`, `daemon`, `client`, `agent`, `review`, `registry` (migration only), `graph` | None yet; see the [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
-| **Tools and authority**: tool execution, permissions, MCP client, GUI automation | `tools` (including `tools/mcp`) | [Tool execution and permissions](src/tools/EXECUTION.md), [MCP client guide](docs/MCP_USER_GUIDE.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
-| **Providers**: provider graph and wire transports, OAuth, planning prompts | `providers`, `claude`, `oauth`, `llms`, `planning` | [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
-| **IPC, transport, node**: Cap'n Proto IPC, node identity, service discovery | `ipc`, `node`, `network`, `service` (mDNS), `node_name.rs` | None yet; wire schema in [`schema/finch_ipc.capnp`](schema/finch_ipc.capnp) |
-| **Config, context, license, metrics**: configuration, instruction loading, licensing, metrics | `config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs` | [Configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
-| **Tests**: integration tests and the isolation supervisor | `tests/`, `src/bin/finch-test-supervisor.rs` | [Test guide](tests/README.md), [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
-| **CI and scripts**: workflows, repository checks, the shared Cargo slot | `.github/workflows/`, `scripts/`, the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot) | [Repository hygiene](docs/REPOSITORY_HYGIENE.md), [Rust toolchain](docs/RUST_TOOLCHAIN.md) |
-| **Release**: tagged binary builds | [`release.yml`](.github/workflows/release.yml) | [Release process](CLAUDE.md#release-process); open work: signed packages and verified rollback ([#119](https://github.com/darwin-finch/finch/issues/119)), newer-release notification ([#144](https://github.com/darwin-finch/finch/issues/144)) |
+| Subsystem (layer): responsibility | Owns | Local documentation |
+|-----------------------------------|------|---------------------|
+| **`config`** (0): configuration, instruction loading, licensing, metrics | `src/config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs`; `data/` personas | [Configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
+| **`vm`** (0): parse, verify, and run CoForth and CoLisp under capability authority | `src/vm`, `lisp`; `vocabulary/`, `examples/finch/` | Language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
+| **`programs`** (1): durable program identity, catalog, and corpus | `src/programs` | None yet |
+| **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | None yet |
+| **`tools`** (1): tool execution, permissions, MCP client, GUI automation | `src/tools` | [Tool execution and permissions](src/tools/EXECUTION.md), [MCP client guide](docs/MCP_USER_GUIDE.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
+| **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset` | None yet |
+| **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
+| **`providers`** (3): provider graph and wire transports, OAuth, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
+| **`transport`** (3): Cap'n Proto IPC, node identity, service discovery | `src/ipc`, `node`, `network`, `service`, `node_name.rs`; `schema/` | None yet; wire schema in [`schema/finch_ipc.capnp`](schema/finch_ipc.capnp) |
+| **`brain`** (4): durable named Brains, the HTTP server and runner, daemon lifecycle | `src/brain`, `server`, `daemon`, `client`, `agent`, `review`, `registry` (migration only), `graph` | None yet; see the [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
+| **`frontend`** (5): commands, the interactive REPL, rendering, setup | `src/cli`, `startup.rs`, `samples.rs` | [TUI renderer](src/cli/tui/ARCHITECTURE.md), [atomic history](src/cli/repl_event/ATOMIC_HISTORY.md) |
+| **`tests`**: integration tests | `tests/` | [Test guide](tests/README.md), [Brain test inventory](tests/BRAIN_TEST_INVENTORY.md) |
+| **`ci`**: repository checks, agent skills, installer | `.github/` (except workflows), `scripts/`, `.agents/`, `.claude/`, `install.sh` | [Repository hygiene](docs/REPOSITORY_HYGIENE.md), [Rust toolchain](docs/RUST_TOOLCHAIN.md) |
+| **`docs`**: project documentation | `docs/` (except the archive), root narrative files | [Documentation map](docs/README.md) |
+| **`website`**: website and license checkout | `web/` | None yet |
 
-`src/evolution/mod.rs` is tracked but not compiled
-([#573](https://github.com/darwin-finch/finch/issues/573)).
+**Global** files select the full gates whenever they change: the Cargo manifests and toolchain,
+`src/lib.rs`, [`src/main.rs`](src/main.rs), `src/bin/` (the test supervisor), the root instruction
+files, every workflow under `.github/workflows/` (including [`release.yml`](.github/workflows/release.yml);
+see the [release process](CLAUDE.md#release-process) and open work on signed packages and rollback,
+[#119](https://github.com/darwin-finch/finch/issues/119), and newer-release notification,
+[#144](https://github.com/darwin-finch/finch/issues/144)), the Brain test launchers and isolation
+harness, and the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-cargo-slot).
+
+**Excluded**: `docs/archive/` (history) and `src/evolution/`, which is tracked but never compiled
+([#471](https://github.com/darwin-finch/finch/issues/471)).
 
 ## Dependencies
 
-Module boundaries are not enforced today. Nearly every top-level module belongs to one strongly
-connected component of production `crate::` imports (see the [snapshot](#snapshot)), so any of them
-can reach any other.
+Module visibility is not enforced yet, but the dependency record is. `subsystems.toml` declares
+every cross-subsystem edge found in production `crate::` paths, either as an allowed
+`depends_on` edge, which must point to a lower layer, or as `debt` against the intended
+direction. `scripts/check_subsystems.py` fails on an undeclared edge and on a declared edge that
+no longer exists, so the record only shrinks as facade work lands. At the module level, nearly
+every top-level module still belongs to one strongly connected component (see the
+[snapshot](#snapshot)).
 
 Two-way edges that block the first extractions, one import each way:
 
@@ -83,8 +100,8 @@ Two-way edges that block the first extractions, one import each way:
 | `models` ↔ `cli` | `src/models/bootstrap.rs` imports `cli::OutputManager`; `src/cli/setup_wizard.rs` imports `models` |
 
 Memory has no two-way edge. Its only production import is `crate::programs`
-(`memory::program_registry` and `MemorySystem::save_lisp_define`), so it joins the component through memory → programs → runtime and
-vm. Its separate extraction blocker is heavy dependencies: `memory::neural_embedding` uses ONNX
+(`memory::program_registry` and `MemorySystem::save_lisp_define`), so it joins the component
+through memory → programs → runtime and vm. Its separate extraction blocker is heavy dependencies: `memory::neural_embedding` uses ONNX
 Runtime (`ort`), `tokenizers`, and `hf_hub` directly.
 
 The application layer is knotted mostly through `tools`: `src/tools/types.rs` imports `cli`,
@@ -200,3 +217,5 @@ Measured at commit `cb39ea0f`; re-derive before relying on these numbers.
   `programs`, `providers`, `router`, `runtime`, `server`, `tools`, `training`, `vm`). Method:
   top-level-module edges from production `crate::` paths, with `#[cfg(test)] mod tests` blocks
   removed. A different test-exclusion heuristic gives 25; treat the size as approximate.
+- Subsystem level, at commit `74866238`: 61 cross-subsystem edges, 35 allowed (`depends_on`)
+  and 26 recorded as debt in [`subsystems.toml`](subsystems.toml).
