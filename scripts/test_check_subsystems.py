@@ -137,7 +137,7 @@ class SubsystemManifestTests(unittest.TestCase):
 
     def test_missing_doc_target_fails(self) -> None:
         (self.fixture.root / "src/vm/VM.md").unlink()
-        self.assert_error("subsystem 'vm': docs target does not exist: src/vm/VM.md")
+        self.assert_error("subsystem 'vm': docs target is not a tracked file: src/vm/VM.md")
 
     def test_new_cross_subsystem_import_fails(self) -> None:
         self.fixture.write("src/cli/mod.rs", "pub struct Cli;\n")
@@ -188,18 +188,59 @@ class SubsystemManifestTests(unittest.TestCase):
         )
         self.assert_clean()
 
-    def test_comments_and_literals_do_not_create_or_hide_edges(self) -> None:
+    def test_comments_and_literals_do_not_create_edges(self) -> None:
+        # A real `cli` subsystem makes any `crate::cli` that escapes blanking a failing edge.
+        # Each line defeats a specific lexer shortcut: a flat comment regex ends the nested
+        # comment early, and a lexer without raw strings leaves `crate::cli` between quotes.
+        self.fixture.write("src/cli/mod.rs", "pub struct Cli;\n")
+        self.fixture.edit(
+            "subsystems.toml", '[[subsystem]]\nid = "docs"',
+            '[[subsystem]]\nid = "cli"\nlayer = 2\npaths = ["src/cli/"]\n\n[[subsystem]]\nid = "docs"',
+        )
         self.fixture.edit(
             "src/app/mod.rs", "pub struct Hook;",
-            'pub struct Hook;\n// crate::cli::Nope\nconst GLOB: &str = "**/*.rs";\n'
-            'const RAW: &str = r#"crate::cli "quoted""#;\n/* nested /* crate::cli */ */\n'
+            "pub struct Hook;\n// crate::cli::Nope\n/* outer /* inner */ crate::cli */\n"
+            'const RAW: &str = r#"a " crate::cli " b"#;\n'
             "fn keep<'a>(value: &'a str) -> &'a str { value }\n",
         )
         self.assert_clean()
-        # The glob string must not swallow a real import that follows it.
-        self.fixture.edit("src/app/mod.rs", "fn keep<'a>", "use crate::vm::Value as Again;\nfn keep<'a>")
+
+    def test_glob_literals_do_not_hide_later_imports(self) -> None:
+        # A regex `/* ... */` strip would blank from the glob's `/*` to the next `*/`,
+        # swallowing the only app -> vm import and making that declared edge stale.
         self.fixture.edit("src/app/mod.rs", "use crate::vm::Value;\n", "")
+        self.fixture.edit(
+            "src/app/mod.rs", "pub struct Hook;",
+            'pub struct Hook;\nconst GLOB: &str = "**/*.rs";\nuse crate::vm::Value;\nconst DIR: &str = "src/**/";\n',
+        )
         self.assert_clean()
+
+    def test_grouped_crate_imports_are_scanned(self) -> None:
+        self.fixture.write("src/cli/mod.rs", "pub struct Cli;\n")
+        self.fixture.edit(
+            "subsystems.toml", '[[subsystem]]\nid = "docs"',
+            '[[subsystem]]\nid = "cli"\nlayer = 2\npaths = ["src/cli/"]\n\n[[subsystem]]\nid = "docs"',
+        )
+        self.fixture.edit("src/vm/mod.rs", "pub struct Value;", "pub struct Value;\nuse crate::{\n    cli::Cli,\n};")
+        self.assert_error("undeclared dependency vm (layer 0) -> cli (layer 2)", "src/vm/mod.rs:4 crate::cli")
+
+    def test_module_split_across_owners_fails(self) -> None:
+        self.fixture.write("src/app/split.rs", "pub fn split() {}\n")
+        self.fixture.edit("subsystems.toml", 'paths = ["README.md"]', 'paths = ["README.md", "src/app/split.rs"]')
+        self.fixture.edit("subsystems.toml", '[[subsystem]]\nid = "docs"', '[[subsystem]]\nid = "docs"\nlayer = 3')
+        self.assert_error("src/app: top-level module is split across owners ['app', 'docs']")
+
+    def test_global_entry_beats_a_shorter_subsystem_prefix(self) -> None:
+        # Non-Rust files may be carved out of a subsystem; Rust modules may not (split rule).
+        self.fixture.write("src/vm/shared/schema.capnp", "@0xdeadbeef;\n")
+        self.fixture.edit("subsystems.toml", 'paths = ["src/lib.rs",', 'paths = ["src/vm/shared/", "src/lib.rs",')
+        self.assert_clean()
+        self.fixture.write("src/vm/shared/codec.rs", "pub fn codec() {}\n")
+        self.assert_error("src/vm: top-level module is split across owners ['global', 'vm']")
+
+    def test_record_without_an_id_is_reported_not_raised(self) -> None:
+        self.fixture.edit("subsystems.toml", 'id = "docs"\n', "")
+        self.assert_error("subsystem record 3 needs a string id")
 
     def test_production_rust_in_a_layerless_record_fails(self) -> None:
         self.fixture.write("src/notes/mod.rs", "use crate::vm::Value;\n")

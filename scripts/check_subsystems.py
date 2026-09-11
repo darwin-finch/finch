@@ -25,6 +25,10 @@ GLOBAL = "global"
 EXCLUDED = "excluded"
 
 CRATE_PATH = re.compile(r"\bcrate::([a-z_][a-z0-9_]*)")
+CRATE_GROUP = re.compile(r"\bcrate::\s*\{")
+GROUP_ITEM = re.compile(r"\s*([a-z_][a-z0-9_]*)")
+RAW_STRING = re.compile(r'[bc]?r(#*)"')
+CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
 TEST_MODULE_BLOCK = re.compile(
     r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"
 )
@@ -56,10 +60,18 @@ def load_manifest(root: Path) -> dict:
         raise ManifestError(f"{MANIFEST} is not valid TOML: {error}") from error
 
 
+def valid_records(manifest: dict) -> list[dict]:
+    """Subsystem records with a usable id; the rest are reported by manifest_shape_errors."""
+    return [
+        record for record in manifest.get("subsystem", [])
+        if isinstance(record, dict) and isinstance(record.get("id"), str) and record["id"]
+    ]
+
+
 def owner_entries(manifest: dict) -> list[tuple[str, str]]:
     """(path, owner) pairs; a path ending in '/' is a prefix, anything else an exact file."""
     entries = [
-        (path, record["id"]) for record in manifest.get("subsystem", [])
+        (path, record["id"]) for record in valid_records(manifest)
         for path in record.get("paths", [])
     ]
     entries += [(path, GLOBAL) for path in manifest.get("global", {}).get("paths", [])]
@@ -86,6 +98,10 @@ def manifest_shape_errors(manifest: dict, files: list[str], root: Path) -> list[
     if manifest.get("version") != SUPPORTED_VERSION:
         errors.append(f"version must be {SUPPORTED_VERSION}; actual={manifest.get('version')!r}")
     records = manifest.get("subsystem", [])
+    for position, record in enumerate(records, start=1):
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not record["id"]:
+            errors.append(f"subsystem record {position} needs a string id")
+    records = valid_records(manifest)
     ids = [record.get("id") for record in records]
     duplicates = sorted({i for i in ids if ids.count(i) > 1})
     if duplicates:
@@ -97,13 +113,14 @@ def manifest_shape_errors(manifest: dict, files: list[str], root: Path) -> list[
             errors.append(f"excluded path {item.get('path')!r} needs a reason")
 
     known = set(ids)
+    tracked = set(files)
     layers = {record.get("id"): record.get("layer") for record in records}
     for record in records:
         rid = record.get("id")
         for field in ("docs", "instructions"):
             for target in record.get(field, []):
-                if not (root / target).exists():
-                    errors.append(f"subsystem {rid!r}: {field} target does not exist: {target}")
+                if target not in tracked:
+                    errors.append(f"subsystem {rid!r}: {field} target is not a tracked file: {target}")
         declared: set[str] = set()
         for target in record.get("depends_on", []):
             if target not in known:
@@ -179,15 +196,15 @@ def blank_comments_and_literals(text: str) -> str:
                     end += 1
             blank(index, end)
             index = end
-        elif char in "rb" and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
-            raw = re.match(r'b?r(#*)"', text[index:])
+        elif char in "rbc" and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
+            raw = RAW_STRING.match(text, index)
             if raw is None:
                 index += 1
                 continue
             closing = '"' + raw.group(1)
-            end = text.find(closing, index + raw.end())
+            end = text.find(closing, raw.end())
             end = length if end < 0 else end + len(closing)
-            blank(index + raw.end(), end - len(closing))
+            blank(raw.end(), end - len(closing))
             index = end
         elif char == '"':
             end = index + 1
@@ -196,12 +213,12 @@ def blank_comments_and_literals(text: str) -> str:
             blank(index + 1, end)
             index = end + 1
         elif char == "'":
-            literal = re.match(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'", text[index:])
+            literal = CHAR_LITERAL.match(text, index)
             if literal is None:  # a lifetime or label
                 index += 1
                 continue
-            blank(index + 1, index + literal.end() - 1)
-            index += literal.end()
+            blank(index + 1, literal.end() - 1)
+            index = literal.end()
         else:
             index += 1
     return "".join(out)
@@ -226,6 +243,26 @@ def strip_comments_and_tests(text: str) -> str:
     return "".join(pieces)
 
 
+def crate_references(text: str) -> list[tuple[int, str]]:
+    """(offset, top-level module) for `crate::m` paths and each item of `crate::{a::x, b}`."""
+    found = [(match.start(), match.group(1)) for match in CRATE_PATH.finditer(text)]
+    for group in CRATE_GROUP.finditer(text):
+        depth, index, item_start = 1, group.end(), group.end()
+        while index < len(text) and depth:
+            char = text[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            if depth == 1 and char == "," or depth == 0:
+                item = GROUP_ITEM.match(text, item_start, index)
+                if item:
+                    found.append((item.start(1), item.group(1)))
+                item_start = index + 1
+            index += 1
+    return found
+
+
 def test_module_files(sources: dict[str, str]) -> set[str]:
     """Files declared by `#[cfg(test)] mod name;` are test code."""
     found: set[str] = set()
@@ -243,20 +280,26 @@ def observed_edges(
     manifest: dict, files: list[str], root: Path,
 ) -> tuple[dict[tuple[str, str], list[str]], list[str]]:
     entries = owner_entries(manifest)
-    graph_ids = {record["id"] for record in manifest.get("subsystem", []) if "layer" in record}
+    graph_ids = {record["id"] for record in valid_records(manifest) if "layer" in record}
     errors: list[str] = []
     rust = [path for path in files if path.startswith("src/") and path.endswith(".rs")]
     sources = {path: (root / path).read_text(errors="replace") for path in rust}
     test_files = test_module_files(sources)
 
-    module_owner: dict[str, str] = {}
+    # Edge targets are attributed by top-level module, so a module split across owners would
+    # misattribute edges; refuse that until the scan resolves deeper paths.
+    owners_by_module: dict[str, set[str]] = defaultdict(set)
     for path in rust:
         parts = path.split("/")
         module = parts[1][:-3] if len(parts) == 2 else parts[1]
-        root_file = len(parts) == 2 or (len(parts) == 3 and parts[2] == "mod.rs")
         owner, _ = resolve(path, entries)
-        if owner and (root_file or module not in module_owner):
-            module_owner[module] = owner
+        if owner:
+            owners_by_module[module].add(owner)
+    module_owner: dict[str, str] = {}
+    for module, owners in sorted(owners_by_module.items()):
+        if len(owners) > 1 and module != "bin":
+            errors.append(f"src/{module}: top-level module is split across owners {sorted(owners)}")
+        module_owner[module] = sorted(owners)[0]
 
     edges: dict[tuple[str, str], list[str]] = defaultdict(list)
     for path in rust:
@@ -267,19 +310,19 @@ def observed_edges(
             errors.append(f"{path}: production Rust owned by {owner!r}, which has no layer")
             continue
         text = strip_comments_and_tests(sources[path])
-        for match in CRATE_PATH.finditer(text):
-            target = module_owner.get(match.group(1))
+        for offset, module in crate_references(text):
+            target = module_owner.get(module)
             if target in (None, GLOBAL, EXCLUDED, owner):
                 continue
-            line = text.count("\n", 0, match.start()) + 1
-            edges[(owner, target)].append(f"{path}:{line} crate::{match.group(1)}")
+            line = text.count("\n", 0, offset) + 1
+            edges[(owner, target)].append(f"{path}:{line} crate::{module}")
     return edges, errors
 
 
 def dependency_errors(manifest: dict, edges: dict[tuple[str, str], list[str]]) -> list[str]:
-    layers = {record["id"]: record.get("layer") for record in manifest.get("subsystem", [])}
+    layers = {record["id"]: record.get("layer") for record in valid_records(manifest)}
     declared: dict[tuple[str, str], str] = {}
-    for record in manifest.get("subsystem", []):
+    for record in valid_records(manifest):
         for target in record.get("depends_on", []):
             declared[(record["id"], target)] = "depends_on"
         for debt in record.get("debt", []):
