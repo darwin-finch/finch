@@ -13,30 +13,57 @@ Everything below is what callers outside this subsystem can reach. Implementatio
 ```rust
 /// Upper bound on what executing a program may affect.
 pub enum ExecutionEffect { Pure, VmRead, VmWrite, WorkspaceRead, ExternalRead, WorkspaceWrite, ExternalWrite, Destructive, Unclassified }
+impl ExecutionEffect {
+    pub fn as_str(self) -> &'static str;
+    pub fn runs_autonomously(self) -> bool;
+}
 /// A self-executing Finch source file after its shebang has been removed.
 pub struct FinchScript { … }
 /// Incremental lexical receiver for the compact Co-Forth wire form.
 pub struct ForthWireBuffer { … }
+impl ForthWireBuffer {
+    pub fn finish(&mut self) -> Result<Vec<ForthWireToken>>;
+    pub fn push(&mut self, fragment: &str) -> Result<Vec<ForthWireToken>>;
+    pub fn source(&self) -> &str;
+}
 /// One complete Co-Forth lexical token observed while a provider response is still streaming.
 pub struct ForthWireToken { … }
 /// Identity of one normative artifact handed to a provider.
 pub struct LanguagePackageIdentity { … }
 /// Canonical definition and review metadata for one program version.
 pub struct ProgramDefinition { … }
+impl ProgramDefinition {
+    /// Create a new session candidate.
+    pub fn candidate(name: impl Into<String>, language: ProgramLanguage, source: impl Into<String>) -> Self;
+    /// Project a persisted top-level Lisp `define` expression into the registry.
+    pub fn from_lisp_define(source: &str, scope_key: Option<String>) -> Option<Self>;
+    /// Load one plain-text `.forth` or `.lisp` file as a canonical definition.
+    pub fn from_source_file(path: &Path, root: &Path, scope: ProgramScope) -> Result<Self>;
+}
 /// Language in which a stored program's canonical source is written. Re-exported from `vm`.
 pub enum ProgramLanguage { Forth, Lisp }
 /// Immutable address of a stored program version.
 pub struct ProgramRef { … }
 /// Persistence and visibility boundary for a definition.
 pub enum ProgramScope { Builtin, Task, Session, Project, Personal, User, Published, Imported }
+impl ProgramScope {
+    pub fn as_str(self) -> &'static str;
+}
 /// Compact definition supplied to an LLM during the VM handshake.
 pub struct ProgramSummary { … }
 /// Portable values accepted by the initial pure cross-language ABI.
 pub enum ProgramValue { Nil, Bool, Int, Float, Symbol, String, Bytes, Json, List, Map, Option, Result, Record, Variant, Task, Fiber, Resource }
 /// Review state for executable vocabulary.
 pub enum TrustState { Candidate, Tested, Approved, Quarantined, Deprecated }
+impl TrustState {
+    pub fn as_str(self) -> &'static str;
+}
 /// Compact runtime discovery document refreshed across model/session changes.
 pub struct VmManifest { … }
+impl VmManifest {
+    /// Format a deliberately compact block suitable for prompt injection.
+    pub fn prompt_block(&self) -> String;
+}
 pub enum WireCorpusAttempt { FirstPass, Repair }
 pub struct WireCorpusAudit { … }
 pub struct WireCorpusCounts { … }

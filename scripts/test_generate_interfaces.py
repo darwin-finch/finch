@@ -44,6 +44,18 @@ pub use ir::{Detail as Reason, Module, Phase};
 
 /// The IR family this VM accepts.
 pub const VERSION: u32 = 5;
+
+/// A handle the facade defines rather than re-exports.
+pub struct Session {
+    depth: usize,
+}
+
+impl Session {
+    /// Open a session at the root.
+    pub fn open() -> Self {
+        Self { depth: 0 }
+    }
+}
 """
 
 IR = """\
@@ -301,6 +313,13 @@ class InterfaceGeneratorTests(unittest.TestCase):
     def test_a_changed_method_signature_makes_the_interface_stale(self) -> None:
         self.fixture.edit("src/vm/ir.rs", "pub fn parse(text: &str)", "pub fn parse(text: &[u8])")
         self.assert_stale("src/vm/INTERFACE.md is stale", "&[u8]")
+
+    def test_a_type_defined_in_the_facade_keeps_its_methods(self) -> None:
+        # Types reached two different ways — re-exported from a child, or defined in the facade
+        # itself — must render the same, or half the surface silently loses its methods.
+        interface = self.fixture.interface()
+        self.assertIn("impl Session {", interface, f"facade-local type lost its methods:\n{interface}")
+        self.assertIn("pub fn open() -> Self;", interface)
 
     def test_missing_interface_file_is_stale(self) -> None:
         (self.fixture.root / "src/vm/INTERFACE.md").unlink()

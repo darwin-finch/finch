@@ -95,12 +95,27 @@ def exported_names(facade: str, problems: list[str] | None = None) -> list[tuple
     return names
 
 
-def local_items(facade: str) -> list[tuple[str, str, str]]:
-    """(kind, name, rendered) for public items defined in the facade file itself."""
+def local_items(facade: str, sources: dict[str, str] | None = None) -> list[tuple[str, str, str]]:
+    """(kind, name, rendered) for public items defined in the facade file itself.
+
+    A type defined in the facade carries its methods like any other; `sources` is optional only so
+    the membership check below can call this without re-scanning for them.
+    """
     found = []
     for kind, name, signature, doc in scan_items(facade):
-        found.append((kind, name, render(signature, doc)))
+        found.append((kind, name, with_methods(kind, name, name, render(signature, doc), sources or {})))
     return found
+
+
+def with_methods(kind: str, defined: str, name: str, text: str, sources: dict[str, str]) -> str:
+    """Append the type's inherent `impl` block, if it has public methods."""
+    if kind not in ("struct", "enum", "union"):
+        return text
+    methods = inherent_methods(sources, defined)
+    if not methods:
+        return text
+    body = "\n".join(methods)
+    return f"{text}\nimpl {name} {{\n{body}\n}}"
 
 
 def scan_items(source: str) -> list[tuple[str, str, str, str]]:
@@ -393,14 +408,8 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict, p
             doc = f"{doc} Re-exported from `{owner}`." if doc else f"Re-exported from `{owner}`."
         if name != defined:
             doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
-        text = render(signature, doc)
-        if kind in ("struct", "enum", "union"):
-            methods = inherent_methods(sources, defined)
-            if methods:
-                body = "\n".join(methods)
-                text += f"\nimpl {name} {{\n{body}\n}}"
-        rendered.append((kind, name, text))
-    rendered.extend(local_items(facade))
+        rendered.append((kind, name, with_methods(kind, defined, name, render(signature, doc), sources)))
+    rendered.extend(local_items(facade, sources))
 
     # Both names count: a renamed export is reachable, under the name the facade publishes.
     exported = {

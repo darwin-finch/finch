@@ -69,6 +69,58 @@ pub struct MemorySourceMetadata { … }
 pub struct MemoryStats { … }
 /// Memory system with MemTree and SQLite storage
 pub struct MemorySystem { … }
+impl MemorySystem {
+    /// Derive a short topic summary without any LLM call.
+    pub async fn conversation_summary(&self, depth: usize) -> Result<ConversationSummaryLines>;
+    /// Derive context-summary lines from one Finch session only.
+    pub async fn conversation_summary_for_session(&self, session_id: &str, depth: usize) -> Result<ConversationSummaryLines>;
+    /// Wait until every persisted node is in memory.
+    pub async fn ensure_hydrated(&self) -> Result<()>;
+    /// Resolve the newest non-deprecated version of a scoped program name.
+    pub async fn get_program_by_name(&self, name: &str, language: Option<ProgramLanguage>) -> Result<Option<ProgramDefinition>>;
+    /// Look up one immutable program version.
+    pub async fn get_program_definition(&self, reference: &ProgramRef) -> Result<Option<ProgramDefinition>>;
+    /// Get recent conversations (for context window)
+    pub async fn get_recent_conversations(&self, limit: usize) -> Result<Vec<(String, String)>>;
+    /// Structural summary of the semantic index: (leaf count, max depth, widest fan-out below the root).
+    pub async fn index_shape(&self) -> (usize, usize, usize);
+    /// Insert one side of a successful named-Brain turn exactly once.
+    pub async fn insert_brain_conversation(&self, role: &str, content: &str, model: Option<&str>, session_id: Option<&str>, provenance: &BrainConversationProvenance) -> Result<bool>;
+    /// Insert a conversation turn into memory
+    pub async fn insert_conversation(&self, role: &str, content: &str, model: Option<&str>, session_id: Option<&str>) -> Result<()>;
+    /// Resolve the stable ID returned by `query_with_sources`.
+    pub async fn inspect_memory(&self, memory_id: &str) -> Result<Option<InspectedMemory>>;
+    /// Load legacy persisted Lisp definitions for explicit migration tooling.
+    pub async fn load_lisp_defines(&self) -> Result<Vec<String>>;
+    /// Create a new memory system, downloading the neural model if needed.
+    pub async fn new_async(config: MemoryConfig) -> Result<Self>;
+    /// Current monotonic registry generation used to invalidate stale model manifests.
+    pub async fn program_registry_generation(&self) -> Result<u64>;
+    /// Query memory for relevant context
+    pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>>;
+    /// Query semantic memory while retaining a stable reference to the canonical stored turn behind every new-format leaf.
+    pub async fn query_with_sources(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<MemorySearchResult>>;
+    /// Project every conversation that was stored but never indexed, and report how many were repaired.
+    pub async fn recover_pending_projections(&self) -> Result<usize>;
+    /// Write an authored definition to the browsable vocabulary first, then index it.
+    pub async fn save_authored_program(&self, definition: ProgramDefinition) -> Result<(ProgramRef, PathBuf)>;
+    /// Persist a successful Lisp `(define ...)` expression for session replay.
+    pub async fn save_lisp_define(&self, expr: &str) -> Result<()>;
+    /// Search current program versions using a compact lexical relevance score.
+    pub async fn search_program_definitions(&self, query: &str, limit: usize) -> Result<Vec<ProgramDefinition>>;
+    /// Get memory statistics
+    pub async fn stats(&self) -> Result<MemoryStats>;
+    /// Load canonical `.forth` and `.lisp` files and update the searchable index.
+    pub async fn sync_program_files(&self, root: &std::path::Path, scope: ProgramScope) -> Result<usize>;
+    /// Build a compact discovery manifest for a model and its current task.
+    pub async fn vm_manifest(&self, query: &str, limit: usize) -> Result<VmManifest>;
+    /// Progress of the background hydration, for status surfaces.
+    pub fn hydration_status(&self) -> HydrationStatus;
+    /// Create new memory system (synchronous).
+    pub fn new(config: MemoryConfig) -> Result<Self>;
+    /// Root containing user-readable program sources beside the memory database.
+    pub fn program_source_root(&self) -> PathBuf;
+}
 /// ONNX sentence transformer embedding engine.
 pub struct NeuralEmbeddingEngine { … }
 impl NeuralEmbeddingEngine {
