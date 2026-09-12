@@ -722,7 +722,7 @@ fn persisted_definition_contract(definition: crate::programs::ProgramDefinition)
 
 pub struct SubmitProgramTool {
     runtime: Arc<ProgramRuntime>,
-    caller: Option<crate::runtime::scheduler::AgentIdentity>,
+    caller: Option<crate::scheduler::AgentIdentity>,
 }
 
 impl SubmitProgramTool {
@@ -733,10 +733,7 @@ impl SubmitProgramTool {
         }
     }
 
-    pub fn child(
-        runtime: Arc<ProgramRuntime>,
-        caller: crate::runtime::scheduler::AgentIdentity,
-    ) -> Self {
+    pub fn child(runtime: Arc<ProgramRuntime>, caller: crate::scheduler::AgentIdentity) -> Self {
         Self {
             runtime,
             caller: Some(caller),

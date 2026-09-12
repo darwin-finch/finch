@@ -28,8 +28,7 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 pub struct BrainRunnerBootstrap {
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
-    pub subagent_control:
-        mpsc::UnboundedSender<crate::runtime::scheduler::AgentBrainControlRequest>,
+    pub subagent_control: mpsc::UnboundedSender<crate::scheduler::AgentBrainControlRequest>,
 }
 
 pub struct BrainSubmissionResult {
@@ -678,11 +677,11 @@ impl IpcClient {
         let response = reply.get()?;
         let control: brain_runner_control::Client = response.get_control()?;
         let (subagent_control, mut subagent_rx) =
-            mpsc::unbounded_channel::<crate::runtime::scheduler::AgentBrainControlRequest>();
+            mpsc::unbounded_channel::<crate::scheduler::AgentBrainControlRequest>();
         tokio::task::spawn_local(async move {
             while let Some(request) = subagent_rx.recv().await {
                 match request {
-                    crate::runtime::scheduler::AgentBrainControlRequest::Start {
+                    crate::scheduler::AgentBrainControlRequest::Start {
                         parent_run_id,
                         task_id,
                         detail,
@@ -704,7 +703,7 @@ impl IpcClient {
                         .map_err(|error| error.to_string());
                         let _ = response_tx.send(result);
                     }
-                    crate::runtime::scheduler::AgentBrainControlRequest::Finish {
+                    crate::scheduler::AgentBrainControlRequest::Finish {
                         run_id,
                         status,
                         detail,

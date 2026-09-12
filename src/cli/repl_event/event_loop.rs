@@ -266,9 +266,9 @@ pub struct EventLoop {
     /// verified portable effect; the daemon never acquires workspace authority
     /// through this field.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
-    agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
+    agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
     /// Revalidating provider resolver shared with child-agent model selection.
-    provider_resolver: crate::runtime::scheduler::ProviderResolver,
+    provider_resolver: crate::scheduler::ProviderResolver,
 
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
@@ -1692,8 +1692,8 @@ impl EventLoop {
         enable_summarization: bool,
         auto_compact_enabled: bool,
         daemon_base_url: Option<String>,
-        provider_resolver: crate::runtime::scheduler::ProviderResolver,
-        agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
+        provider_resolver: crate::scheduler::ProviderResolver,
+        agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         todo_journal_receiver.spawn();

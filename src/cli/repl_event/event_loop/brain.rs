@@ -18,9 +18,8 @@ impl EventLoop {
         ));
         let (_todo_writer, todo_target, todo_receiver) =
             crate::tools::todo::todo_journal(Arc::clone(&todo_list));
-        let provider_resolver =
-            crate::runtime::scheduler::ProviderResolver::new(Arc::clone(&generator));
-        let agent_scheduler = crate::runtime::scheduler::AgentScheduler::new(
+        let provider_resolver = crate::scheduler::ProviderResolver::new(Arc::clone(&generator));
+        let agent_scheduler = crate::scheduler::AgentScheduler::new(
             provider_resolver.clone(),
             Arc::clone(&program_runtime),
         );
@@ -87,7 +86,7 @@ impl EventLoop {
             .insert(run_id, cancel.clone());
         tokio::task::spawn_local(async move {
             agent_scheduler
-                .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
+                .set_active_brain_parent(Some(crate::scheduler::AgentBrainContext {
                     run_id,
                     request_seq,
                 }))
@@ -295,7 +294,7 @@ impl EventLoop {
             },
         );
         self.agent_scheduler
-            .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
+            .set_active_brain_parent(Some(crate::scheduler::AgentBrainContext {
                 run_id: request.run_id,
                 request_seq: request.request_seq,
             }))

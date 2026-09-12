@@ -4,11 +4,11 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
 // The boundary vocabulary lives below this module; re-exported so existing callers keep working.
-pub use super::agents::{
+pub use crate::runtime::agents::{
     AgentBudget, AgentContextReference, AgentEvent, AgentIdentity, AgentRole, AgentSpawning,
     AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
 };
-pub(crate) use super::agents::{
+pub(crate) use crate::runtime::agents::{
     MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
     MAX_CONTEXT_TOTAL_BYTES, MAX_DEPTH, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, MAX_TURNS,
 };

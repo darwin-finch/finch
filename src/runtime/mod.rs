@@ -9,7 +9,6 @@ pub mod effect_log;
 mod hostio;
 mod mcp;
 pub mod outcome;
-pub mod scheduler;
 
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 pub(crate) use hostio::workbook_cell_to_string;
