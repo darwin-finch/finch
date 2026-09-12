@@ -204,6 +204,65 @@ def trait_methods(source: str, brace: int) -> str:
     return "\n".join(methods)
 
 
+IMPL_HEAD = re.compile(r"^impl(?:\s*<.*?>)?\s+(?P<head>[^{;]+?)\s*\{", re.M | re.S)
+
+
+def block_end(source: str, brace: int) -> int:
+    """Offset of the `}` closing the block whose `{` is at `brace`."""
+    depth, index = 0, brace
+    while index < len(source):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return len(source)
+
+
+def inherent_methods(sources: dict[str, str], type_name: str) -> list[str]:
+    """Rendered `pub fn` signatures from `impl <type_name>` blocks across a subsystem's sources.
+
+    A type without its methods is not an interface: a caller can see `McpClient` exists and still
+    not know that `from_config` is how one is obtained. Trait implementations are skipped — the
+    trait states that contract, and repeating it per type buries the inherent surface.
+    """
+    found: list[tuple[str, str]] = []
+    for path in sorted(sources):
+        text = without_comments_keeping_docs(sources[path])
+        for match in IMPL_HEAD.finditer(text):
+            head = " ".join(match.group("head").split())
+            if " for " in f" {head} ":
+                continue
+            target = head.split(" where ")[0].strip()
+            if target.split("<")[0].strip() != type_name:
+                continue
+            brace = match.end() - 1
+            body = text[brace + 1:block_end(text, brace)]
+            for item in re.finditer(
+                r"^[ \t]+pub\s+(?:async\s+|unsafe\s+|const\s+|extern\s+\"[^\"]*\"\s+)*fn\s+",
+                body, re.M,
+            ):
+                signature = signature_at(body, item.start()).strip().removesuffix(" { … }").rstrip(";")
+                doc = doc_above(body, item.start())
+                found.append((signature, doc))
+    rendered = []
+    for signature, doc in sorted(set(found)):
+        if doc:
+            rendered.append(f"    /// {doc}")
+        rendered.append(f"    {signature};")
+    return rendered
+
+
+def without_comments_keeping_docs(source: str) -> str:
+    """Blank `//` comments and attributes but keep `///` docs, preserving offsets."""
+    blanked = re.sub(
+        r"(?<!/)//(?!/)[^\n]*", lambda match: " " * len(match.group(0)), source,
+    )
+    return blank_attributes(blanked)
+
+
 def signature_at(source: str, start: int) -> str:
     """The item's signature: everything up to its body or terminating semicolon."""
     depth = 0
@@ -310,7 +369,8 @@ def definitions_in(root: Path, sources: dict[str, str]) -> dict[str, list[tuple[
 def interface_text(root: Path, files: list[str], manifest: dict, record: dict, problems: list[str]) -> str:
     facade_path = record["facade"]
     facade = (root / facade_path).read_text()
-    definitions = definitions_in(root, subsystem_sources(root, files, record))
+    sources = subsystem_sources(root, files, record)
+    definitions = definitions_in(root, sources)
     # A facade may re-export another subsystem's type; resolve it and say where it comes from.
     elsewhere = definitions_in(
         root, {path: (root / path).read_text(errors="replace") for path in files
@@ -333,7 +393,13 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict, p
             doc = f"{doc} Re-exported from `{owner}`." if doc else f"Re-exported from `{owner}`."
         if name != defined:
             doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
-        rendered.append((kind, name, render(signature, doc)))
+        text = render(signature, doc)
+        if kind in ("struct", "enum", "union"):
+            methods = inherent_methods(sources, defined)
+            if methods:
+                body = "\n".join(methods)
+                text += f"\nimpl {name} {{\n{body}\n}}"
+        rendered.append((kind, name, text))
     rendered.extend(local_items(facade))
 
     # Both names count: a renamed export is reachable, under the name the facade publishes.

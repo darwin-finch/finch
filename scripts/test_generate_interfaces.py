@@ -67,6 +67,25 @@ pub struct Detail {
 }
 
 pub struct NotExported;
+
+impl Module {
+    /// Load a module from source.
+    pub fn parse(text: &str) -> Result<Self, Phase> {
+        todo!()
+    }
+
+    /// Private to the subsystem; never part of the interface.
+    fn rebuild(&mut self) {}
+
+    pub(crate) fn seal(&self) {}
+}
+
+impl std::fmt::Display for Module {
+    /// A trait method, stated by the trait and not repeated per type.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
 """
 
 INTERPRETER = """\
@@ -256,6 +275,32 @@ class InterfaceGeneratorTests(unittest.TestCase):
         self.fixture.edit("src/vm/interpreter.rs", "fn private_helper() -> u32 {\n    7\n}", "fn private_helper() -> u32 {\n    9\n}")
         self.fixture.edit("src/vm/ir.rs", "pub struct NotExported;", "pub struct NotExported {\n    pub added: bool,\n}")
         self.assertEqual(0, self.fixture.run().returncode, "changes behind the facade must not churn the interface")
+
+    def test_public_methods_reach_the_interface_with_their_docs(self) -> None:
+        # A type without its constructors is not an interface: a caller can see `Module` exists
+        # and still have no way to obtain one.
+        interface = self.fixture.interface()
+        self.assertIn("impl Module {", interface, f"the type's inherent block is missing:\n{interface}")
+        self.assertIn("pub fn parse(text: &str) -> Result<Self, Phase>;", interface)
+        self.assertIn("/// Load a module from source.", interface)
+
+    def test_methods_callers_cannot_reach_stay_out(self) -> None:
+        interface = self.fixture.interface()
+        self.assertNotIn("rebuild", interface, "a private method is not part of the interface")
+        self.assertNotIn("seal", interface, "a pub(crate) method is not reachable from outside")
+        self.assertNotIn("fmt", interface, "a trait implementation is stated by the trait")
+
+    def test_a_new_public_method_makes_the_interface_stale(self) -> None:
+        # The invariant that matters: adding to a subsystem's surface cannot merge silently.
+        self.fixture.edit(
+            "src/vm/ir.rs", "    pub(crate) fn seal(&self) {}",
+            "    pub(crate) fn seal(&self) {}\n\n    pub fn verify(&self) -> bool {\n        true\n    }",
+        )
+        self.assert_stale("src/vm/INTERFACE.md is stale", "verify")
+
+    def test_a_changed_method_signature_makes_the_interface_stale(self) -> None:
+        self.fixture.edit("src/vm/ir.rs", "pub fn parse(text: &str)", "pub fn parse(text: &[u8])")
+        self.assert_stale("src/vm/INTERFACE.md is stale", "&[u8]")
 
     def test_missing_interface_file_is_stale(self) -> None:
         (self.fixture.root / "src/vm/INTERFACE.md").unlink()
