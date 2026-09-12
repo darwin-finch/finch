@@ -8,9 +8,9 @@
 
 mod embeddings;
 mod memtree;
-pub mod neural_embedding;
+mod neural_embedding;
 mod program_registry;
-pub mod quality;
+mod quality;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memtree::{MemTree, NodeId, TreeNode};

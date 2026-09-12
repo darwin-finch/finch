@@ -6,8 +6,9 @@ Supplements the root [`AGENTS.md`](../../CLAUDE.md), which still applies in full
 the neural embedding engine, retrieval quality, the program registry), `src/memory_status.rs`,
 and `src/workbook.rs`. Local model loading is `src/models/`; Brain event logs are `src/brain/`.
 
-**Interface:** no facade is enforced yet (#541 phase 3); use `MemorySystem` and the `pub use`
-re-exports in `src/memory/mod.rs`.
+**Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. Child
+modules are private, so the `pub use` list in `src/memory/mod.rs` is the whole public surface, and
+`scripts/check_subsystems.py` rejects a `pub mod` there.
 
 **Dependencies:** layer 1 in [`subsystems.toml`](../../subsystems.toml), no allowed edges. Debt:
 `memory → programs` (`memory::program_registry`, `MemorySystem::save_lisp_define`); importing any
