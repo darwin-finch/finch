@@ -65,6 +65,10 @@ pub enum CoreWordImplementation { Interpreter, VmInstruction, HostEffect }
 /// One inspectable production core-word contract.
 pub struct CoreWordSpec { … }
 pub enum DiagnosticPhase { Reader, MacroExpansion, NameResolution, TypeInference, Verification, Linking, Authorization, Availability, Approval, Interpretation, HostCall, NativeExecution, TransactionCommit, ChildExecution, Cancellation, ResourceLimit }
+impl DiagnosticPhase {
+    /// The phase as a reader would name it, matching the serialised form.
+    pub fn label(&self) -> &'static str;
+}
 /// One durable, idempotently-addressable host-effect record.
 pub struct EffectJournalEntry { … }
 pub enum EffectJournalState { Proposed, AwaitingApproval, AwaitingHostResult, Acknowledged, Denied, Cancelled, Failed }
@@ -249,6 +253,8 @@ pub struct VmContinuation { … }
 pub struct VmDiagnostic { … }
 impl VmDiagnostic {
     pub fn error(code: impl Into<String>, phase: DiagnosticPhase, message: impl Into<String>, primary: Option<SourceOrigin>) -> Self;
+    /// A report that names the offending source, not just the failure.
+    pub fn render(&self, source: Option<&str>) -> String;
     pub fn type_mismatch(expected: Type, found: Type, primary: Option<SourceOrigin>) -> Self;
 }
 /// Serializable activation record for the VM's internal trampoline.
