@@ -147,6 +147,18 @@ pull request merge is progress, not automatically the completion of a broader ou
 At handoff, report the exact commit, tests, remaining risks, ownership, and next action. Do not
 claim provider, model, platform, or release conformance without direct evidence.
 
+## Rules that have already cost us something
+
+**No agent attribution trailers.** Never add `Co-Authored-By:` for a model, or a session URL, to a
+commit. `CONTRIBUTING.md` is the policy; the commit author is the human who takes responsibility,
+and attribution should not imply accountability an agent cannot hold. Say this explicitly when
+delegating: subagents imitate git history, and one session's trailers propagated into another
+tool's commits before anyone noticed.
+
+**Never stop a process by pattern.** No `pkill -f`, no `killall`: the pattern matches another
+session's server, another worktree's daemon, or the user's own editor. Kill a recorded PID or a
+named container, or let the supervisor in `scripts/test_brains.sh` reap its own process group.
+
 ## Workspace cleanup
 
 The coordinator owns cleanup; workers never remove another worker's workspace. Create workspaces
