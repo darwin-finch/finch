@@ -73,6 +73,14 @@ class SeamCostTests(unittest.TestCase):
         report = self.report("src/tools/mcp/")
         self.assertIn("outgoing: 1 subsystem(s)", report, report)
 
+    def test_a_single_file_candidate_counts_its_callers(self) -> None:
+        # A file names a module just as a directory does. Building its module path as if it were a
+        # directory yields `tools::mcp.rs`, which matches nothing, and the tool then reports a
+        # heavily-used file as having no callers at all.
+        report = self.report("src/tools/types.rs")
+        self.assertIn("incoming: 2 reference(s)", report, report)
+        self.assertIn("src/app/codec/mod.rs", report, report)
+
     def test_an_empty_path_says_so_rather_than_reporting_zeroes(self) -> None:
         report = self.report("src/nowhere/")
         self.assertIn("no tracked Rust files", report, report)

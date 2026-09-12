@@ -76,7 +76,11 @@ def report(root: Path, candidate: str, directories: list[str], files: list[str],
                 outgoing[owner] += 1
 
     incoming: dict[str, Counter[str]] = defaultdict(Counter)
-    prefix = module_path_of(candidate.rstrip("/") + "/mod.rs")
+    # A candidate may be a directory or a single file; both name a module, but only a directory
+    # reaches its module through a `mod.rs`.
+    prefix = module_path_of(
+        candidate if candidate.endswith(".rs") else candidate.rstrip("/") + "/mod.rs"
+    )
     for path, text in sources.items():
         if path.startswith(candidate):
             continue

@@ -1,6 +1,7 @@
 //! Provider-neutral execution service for Finch's Forth and Lisp VMs.
 
 pub mod agent_vm;
+pub mod agents;
 pub mod archive_store;
 pub mod automation;
 pub mod context;
