@@ -1,5 +1,8 @@
 # Finch subsystem manifest. Checked by scripts/check_subsystems.py on every PR.
 #
+# Purpose: bound how much an agent must read. Ownership and the dependency record below make
+# reachability a lookup; facades keep interfaces short. See "Why subsystems exist" in DESIGN.md.
+#
 # Ownership: every tracked file resolves to exactly one subsystem, the global set, or an
 # explicit exclusion. A path ending in "/" is a prefix; anything else is an exact file. The
 # longest matching entry wins; two matches of equal length are an error.

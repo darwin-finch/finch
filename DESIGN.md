@@ -20,6 +20,35 @@ that it links every `docs` entry in `subsystems.toml`, that it cites no historic
 document, and that design documents appear only under intended direction or open questions. It does
 not verify the prose or the cited symbols.
 
+## Why subsystems exist
+
+**The goal is to bound how much an agent must read.** Finch is worked on mostly by LLM agents, and
+the binding constraint is context, not compilation. An agent changing a subsystem should need that
+subsystem's code, its capsule, and the *interfaces* of the subsystems it depends on. It should
+never need their implementations, and it should never have to read the tree to find out what it is
+allowed to touch.
+
+Everything else in this section follows from that:
+
+- **A subsystem's interface is a short, enumerable list.** Implementation modules are private, so
+  what a caller can reach is what the facade re-exports. `vm` is the worked example: about 60
+  exported items stand in front of roughly 23,000 lines.
+- **Dependencies are recorded, not discovered.** [`subsystems.toml`](subsystems.toml) answers "what
+  may this touch, and what touches it" as a lookup rather than a search, and the checker keeps the
+  record true.
+- **Instructions are local.** A capsule beside the code states scope, limits, and focused tests, so
+  an agent starting there inherits the root rules plus one page, not the whole project narrative.
+- **Interfaces should be readable without the source.** A generated, signature-level digest of each
+  facade lets a caller read a few kilobytes instead of opening the subsystem.
+- **Crate extraction is optional.** A crate makes a boundary unforgeable and shrinks the dependency
+  surface a change pays for, but the facade is what delivers the context win. Extract only where
+  measurement justifies it.
+
+**Measure the goal, not its proxies.** The primary number is the context a representative task
+requires: the capsule, the files being edited, and the interface digests of what they depend on.
+Build and test latency are secondary evidence; they say how fast the loop runs, not how much an
+agent must understand to be correct.
+
 ## Composition
 
 Finch builds as one package that produces the `finch` binary ([`src/main.rs`](src/main.rs)) and a
