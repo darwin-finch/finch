@@ -70,7 +70,7 @@ depends_on = []
 debt = [
   { to = "memory", issue = 541 },
   { to = "models", issue = 541 },
-  { to = "tools", issue = 541 },
+  { to = "tools-mcp", issue = 599 },
 ]
 
 [[subsystem]]
@@ -112,12 +112,25 @@ debt = [
 ]
 
 [[subsystem]]
+id = "tools-mcp"
+name = "MCP client: external tool servers"
+layer = 0
+paths = ["src/tools/mcp/"]
+instructions = ["src/tools/mcp/AGENTS.md"]
+facade = "src/tools/mcp/mod.rs"
+interface = "src/tools/mcp/INTERFACE.md"
+depends_on = []
+debt = [
+  { to = "tools", issue = 599 },
+]
+
+[[subsystem]]
 id = "tools"
 name = "Tool execution and authority"
 layer = 1
 paths = ["src/tools/"]
 docs = ["src/tools/EXECUTION.md", "docs/MCP_USER_GUIDE.md", "docs/MACOS_GUI_AUTOMATION.md"]
-depends_on = ["config", "vm"]
+depends_on = ["config", "tools-mcp", "vm"]
 debt = [
   { to = "brain", issue = 541 },
   { to = "frontend", issue = 541 },
@@ -133,7 +146,7 @@ id = "runtime"
 name = "Program runtime and task-graph execution"
 layer = 2
 paths = ["src/runtime/", "src/poset/"]
-depends_on = ["config", "memory", "programs", "tools", "vm"]
+depends_on = ["config", "memory", "programs", "tools", "tools-mcp", "vm"]
 debt = [
   { to = "brain", issue = 541 },
   { to = "models", issue = 541 },
@@ -183,7 +196,7 @@ name = "Brains, server, daemon"
 layer = 4
 paths = ["src/brain/", "src/server/", "src/daemon/", "src/client/", "src/agent/", "src/review/", "src/registry/", "src/graph/"]
 docs = ["tests/BRAIN_TEST_INVENTORY.md"]
-depends_on = ["config", "models", "providers", "runtime", "tools", "transport", "vm"]
+depends_on = ["config", "models", "providers", "runtime", "tools", "tools-mcp", "transport", "vm"]
 debt = [
   { to = "frontend", issue = 541 },
 ]

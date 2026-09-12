@@ -18,10 +18,10 @@
 // let result = mcp_client.execute_tool("mcp_filesystem_read_file", params).await?;
 // ```
 
-pub mod client;
-pub mod config;
-pub mod connection;
-pub mod protocol;
+mod client;
+mod config;
+mod connection;
+mod protocol;
 
 pub use client::{McpClient, McpToolDescriptor};
 pub use config::{McpServerConfig, TransportType};

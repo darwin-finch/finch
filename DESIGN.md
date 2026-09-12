@@ -79,13 +79,20 @@ intended direction (lower is more foundational); see [dependencies](#dependencie
 marks a subsystem without local documentation; the subsystem program adds one before code moves.
 Documents with known stale claims are flagged in [documentation status](#documentation-status).
 
+A subsystem may be declared on a path inside another's — that is all a *sub-subsystem* is, and
+`tools-mcp` inside `tools` is the first. Ownership takes the longest matching path, a `crate::a::b`
+reference resolves to the deepest owner it names, and the layer ratchet governs the parent and
+child like any other pair. The point is the same one as for a top-level subsystem: an agent sent to
+the MCP client should not have to load tool execution and permissions to get there.
+
 | Subsystem (layer): responsibility | Owns | Local documentation |
 |-----------------------------------|------|---------------------|
 | **`config`** (0): configuration, instruction loading, licensing, metrics | `src/config`, `context`, `license`, `metrics`, `monitoring`, `errors.rs`; `data/` personas | Capsule [`src/config/AGENTS.md`](src/config/AGENTS.md), interface [`src/config/INTERFACE.md`](src/config/INTERFACE.md); [configuration](src/config/CONFIGURATION.md), [context assembly](src/context/ASSEMBLY.md), [licensing](src/license/LICENSING.md) |
 | **`vm`** (0): parse, verify, and run CoForth and CoLisp under capability authority | `src/vm`, `lisp`; `vocabulary/`, `examples/finch/` | Capsule [`src/vm/AGENTS.md`](src/vm/AGENTS.md), interface [`src/vm/INTERFACE.md`](src/vm/INTERFACE.md); language contracts compiled into the binary and given to the model: [`FINCH_VM.md`](vocabulary/language/FINCH_VM.md), [`FINCH_FORTH.md`](vocabulary/language/FINCH_FORTH.md), [`FINCH_LISP.md`](vocabulary/language/FINCH_LISP.md); reference: [typed VM migration audit](docs/TYPED_VM_MIGRATION_AUDIT.md) |
 | **`programs`** (1): durable program identity, catalog, and corpus | `src/programs` | Capsule [`src/programs/AGENTS.md`](src/programs/AGENTS.md), interface [`src/programs/INTERFACE.md`](src/programs/INTERFACE.md) |
 | **`memory`** (1): MemTree storage and retrieval | `src/memory`, `memory_status.rs`, `workbook.rs` | Capsule [`src/memory/AGENTS.md`](src/memory/AGENTS.md), interface [`src/memory/INTERFACE.md`](src/memory/INTERFACE.md) |
-| **`tools`** (1): tool execution, permissions, MCP client, GUI automation | `src/tools` | [Tool execution and permissions](src/tools/EXECUTION.md), [MCP client guide](docs/MCP_USER_GUIDE.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
+| **`tools-mcp`** (0): the client for external Model Context Protocol servers | `src/tools/mcp` | Capsule [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md), interface [`src/tools/mcp/INTERFACE.md`](src/tools/mcp/INTERFACE.md), [user guide](docs/MCP_USER_GUIDE.md) |
+| **`tools`** (1): tool execution, permissions, GUI automation | `src/tools` except `mcp` | [Tool execution and permissions](src/tools/EXECUTION.md), [macOS GUI automation](docs/MACOS_GUI_AUTOMATION.md) |
 | **`runtime`** (2): the program runtime service and task-graph execution | `src/runtime`, `poset` | None yet |
 | **`models`** (2): local model loading, routing, training, feedback | `src/models`, `local`, `generators`, `training`, `feedback`, `router`, `logging` | [Local model loader](src/models/unified_loader.rs), [ONNX loader](src/models/ONNX.md), [bootstrap loading](src/models/BOOTSTRAP.md), [deferred LoRA path](src/models/LORA.md), [router](src/router/ROUTING.md), [automatic-training status](docs/AUTOMATIC_TRAINING.md) |
 | **`providers`** (3): provider graph and wire transports, OAuth, planning prompts | `src/providers`, `claude`, `oauth`, `llms`, `planning` | [Claude client](src/claude/CLIENT.md), [OAuth boundary](docs/OAUTH.md), [ChatGPT subscription transport](docs/CHATGPT_SUBSCRIPTION_TRANSPORT.md), [OpenAI transport](docs/OPENAI_TRANSPORT.md) |
