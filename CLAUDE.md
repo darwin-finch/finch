@@ -56,6 +56,13 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 - **Load order: `AGENTS.md` → `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`; cwd wins over parent; a file reached by several names (symlink, hardlink) loads once** — `loads_all_names_in_same_directory`, `joins_multiple_sections_with_separator`, `symlinked_agents_md_loads_once_at_the_later_position` in `src/context/claude_md.rs`; `provider_request_carries_symlinked_agents_md_once_and_nested_rules_last` in `src/generators/claude.rs`
 
+### Subsystem interfaces
+
+- **Every subsystem's `INTERFACE.md` matches its facade** — an agent must be able to read what a
+  subsystem offers without opening its source, so the file is generated and checked, never hand-
+  edited. Change a public item, then run `python3 scripts/generate_interfaces.py --write` and commit
+  the result — `scripts/test_generate_interfaces.py`, and the check in `repository-hygiene.yml`
+
 ### GUI Accessibility
 
 - **Coordinate-based GUI ops are forbidden as the primary interface** — blind users cannot determine pixel positions; all GUI tools must accept semantic identifiers: element role + label, button name, or app-domain address (e.g. cell `B3` in Excel).
