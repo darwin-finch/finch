@@ -12,6 +12,29 @@ outcome need not be user-visible: deletion, refactoring, and enabling work are v
 Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost proportional to the change; otherwise remove it.
 Tooling is advisory mechanical lint, never an authority engine.
 
+## Pick the next item by cost and benefit
+
+Order ready work by `(value × certainty × (1 + unblocking)) / cost`, scored 1–5 per axis and
+recorded on the item. Cheap, certain, unblocking changes merge first; review attention is the
+scarce resource. See [picking the next item](references/queue.md) for the axes, the two guards that
+keep the score honest, what makes an item ready, and the five numbers to record per change.
+
+## Say the tier out loud, then run only that tier
+
+Proportionality fails by being thorough. Name the tier in the first message about a change, and run
+that tier's process and no more.
+
+| Tier | What it is | Process |
+|------|-----------|---------|
+| **1 — trivial** | prose, comments, a rename with no behaviour change, a one-line non-behavioural fix | no contract, no packet, no review round. Run the gate stage the change touches, then merge. |
+| **2 — ordinary** | a bounded code change with a clear approach and a test that fails before it | a short contract in the issue, one review round on the tip, gate stages the scope touches. |
+| **3 — risky** | authority, credentials, persistence, wire or checkpoint formats, process lifecycle, concurrency, release, or anything a user can lose data to | full contract with an independent contract review, a production-boundary regression, an independent review of the candidate that will merge, and the full gate matrix. |
+
+A tier is about blast radius, not diff size: a two-line change to a permission check is tier 3, and
+a five-hundred-line docs move is tier 1. When two tiers look defensible, pick the lower one and say
+why; the cost of the heavier process is real and is paid in review attention, which is the scarce
+resource.
+
 ## Two layers
 
 The generic engineering loop is: understand the accepted outcome; design and make a focused
@@ -37,6 +60,8 @@ bookkeeping, terminal events, and frontier tracking.
    Small, obvious changes should have small contracts. Add detail only for actual risk.
 4. Check current branches, worktrees, pull requests, and the procedural claim record for overlap.
    Preserve unrelated and unpushed work.
+5. Record the four queue scores and one sentence of justification before starting, and re-score
+   if actual cost passes double the estimate.
 
 Readiness, a candidate implementation, and a review finding answer different questions. A green
 check or severe finding does not redefine the issue. People remain accountable for readiness,
@@ -130,6 +155,25 @@ pull request merge is progress, not automatically the completion of a broader ou
 
 At handoff, report the exact commit, tests, remaining risks, ownership, and next action. Do not
 claim provider, model, platform, or release conformance without direct evidence.
+
+## Rules that have already cost us something
+
+**No agent attribution trailers.** Never add `Co-Authored-By:` for a model, or a session URL, to a
+commit. `CONTRIBUTING.md` is the policy; the commit author is the human who takes responsibility,
+and attribution should not imply accountability an agent cannot hold. Say this explicitly when
+delegating: subagents imitate git history, and one session's trailers propagated into another
+tool's commits before anyone noticed.
+
+**A macOS build does not prove an import is unused.** `cargo check` here compiles only the
+`cfg` branches this platform selects, so an import that looks dead on a Mac may be the one thing
+holding up the Linux, FreeBSD or Windows arm of the same file. Before deleting an import that the
+compiler calls unused, grep the file for its symbols; if they appear inside a `cfg` block this
+platform excludes, re-import under that same guard rather than unconditionally. Four Linux CI jobs
+failed on a move that was clean locally, and the fix was one `#[cfg(any(...))]` above a `use`.
+
+**Never stop a process by pattern.** No `pkill -f`, no `killall`: the pattern matches another
+session's server, another worktree's daemon, or the user's own editor. Kill a recorded PID or a
+named container, or let the supervisor in `scripts/test_brains.sh` reap its own process group.
 
 ## Workspace cleanup
 

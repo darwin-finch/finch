@@ -48,6 +48,10 @@ A useful finding contains:
 - the affected invariant; and
 - whether it belongs to the current contract.
 
+A finding is a hypothesis until someone else reproduces it. Confirmed means a **different**
+reviewer walked a concrete failure path: inputs, state, and the wrong result. A model's own
+confidence is not that evidence and must not be used as a filter; a second independent pass is.
+
 Track five independent axes:
 
 - confidence: confirmed or plausible;
@@ -75,16 +79,26 @@ If a repair approach repeatedly fails, diagnose the cause and change the approac
 fixed attempt count or round count that proves infeasibility, and agent failure is not evidence that
 the requested outcome cannot be built.
 
-## Converge once
+## Stop on a rule, not on fatigue
 
-Convergence is intentionally simple:
+A round **ends the change** when each of its confirmed findings is either a product defect now
+fixed, or a test-only gap recorded as a follow-up. Nothing else keeps the change open.
+
+Classify every confirmed finding as **product** or **test-only** before deciding whether to repair
+it here. A defect in the code users run is product. A gap in a test, a fixture, or a checker's own
+regressions is test-only: record it as a follow-up with an owner and merge. **Findings about the
+tests of the tests do not open a new round.** Four rounds on one sibling repository's candidate
+produced about thirty confirmed problems; three mattered, and the most expensive finding of the
+last round was a race in a test harness.
+
+Convergence is otherwise simple:
 
 1. Resolve every concrete in-scope blocker and required regression-debt item.
 2. Review the current candidate with perspectives appropriate to the final diff.
-3. Repair confirmed in-scope blockers, rerun affected tests, and start another round after any
-   material repair.
-4. Merge after the first complete round with zero confirmed in-scope blockers and relevant tests
-   passing. Stop then; do not add confidence rounds.
+3. Repair confirmed in-scope **product** blockers, rerun affected tests, and review the repaired
+   tip. A repair that touches only tests or fixtures does not start a fresh round.
+4. Merge after the first complete round whose confirmed findings are all fixed product defects or
+   recorded test-only follow-ups. Stop then; do not add confidence rounds.
 
 A small patch may need only one perspective; higher-risk changes may need several. Speculative or
 optional items are nonblocking follow-ups. Findings are bounded to behavior introduced, changed,
