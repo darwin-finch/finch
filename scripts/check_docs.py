@@ -25,6 +25,7 @@ CURRENT_DOCS = (
     Path("DESIGN.md"),
     Path("src/vm/AGENTS.md"),
     Path("src/memory/AGENTS.md"),
+    Path("src/programs/AGENTS.md"),
     Path("docs/README.md"),
     Path("docs/AUTOMATIC_TRAINING.md"),
     Path("docs/MCP_USER_GUIDE.md"),
