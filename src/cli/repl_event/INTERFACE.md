@@ -90,6 +90,7 @@ impl ToolExecutionCoordinator {
 ## Modules
 
 ```rust
+pub mod activity_view;
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
