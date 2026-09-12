@@ -6,7 +6,7 @@ use serde_json::Value;
 // Re-export tool types for convenience
 pub use crate::tools::types::ToolDefinition;
 
-use crate::config::constants::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
+use crate::config::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
 
 /// Content block - supports text, image, tool_use, and tool_result
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

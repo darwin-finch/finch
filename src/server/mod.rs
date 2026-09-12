@@ -85,7 +85,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: crate::config::constants::DEFAULT_HTTP_ADDR.to_string(),
+            bind_address: crate::config::DEFAULT_HTTP_ADDR.to_string(),
             brain_bind_address: None,
             auth_enabled: false,
             api_keys: vec![],

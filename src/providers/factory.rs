@@ -28,7 +28,7 @@ struct CredentialBoundProvider {
     inner: Box<dyn LlmProvider>,
     credential_name: String,
     expires_at: Option<DateTime<Utc>>,
-    revocation: crate::config::credential::LifecycleRevocation,
+    revocation: crate::config::LifecycleRevocation,
 }
 
 impl CredentialBoundProvider {
@@ -394,7 +394,7 @@ fn resolve_named_graph(
     resolver: &dyn CredentialResolver,
 ) -> Result<BTreeMap<String, ResolvedCredential>> {
     config.validate()?;
-    let credentials = crate::config::credential::credential_index(config.credentials())?;
+    let credentials = crate::config::credential_index(config.credentials())?;
     let mut resolved = BTreeMap::new();
     for entry in &config.providers {
         let Some(binding) = entry.credential_binding() else {
@@ -507,7 +507,7 @@ fn create_named_profiles_from_config_with_resolver(
         bail!("Injected credential resolvers cannot fabricate a refreshable ChatGPT subscription lease")
     }
     let resolved = resolve_named_graph(config, resolver)?;
-    let credentials = crate::config::credential::credential_index(config.credentials())?;
+    let credentials = crate::config::credential_index(config.credentials())?;
     let cloud: Vec<_> = config
         .providers
         .iter()
@@ -748,7 +748,7 @@ pub fn create_provider_profile_from_config_with_resolver(
         .find(|entry| !entry.is_local() && entry.profile_name() == profile_name)
         .with_context(|| format!("Provider profile '{profile_name}' was not found"))?;
     let provider = if let Some(binding) = entry.credential_binding() {
-        let credentials = crate::config::credential::credential_index(config.credentials())?;
+        let credentials = crate::config::credential_index(config.credentials())?;
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked the selected named credential reference");

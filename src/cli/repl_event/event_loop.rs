@@ -6212,7 +6212,7 @@ Rules:\n\
         let base = self
             .daemon_base_url
             .clone()
-            .unwrap_or_else(|| format!("http://{}", crate::config::constants::DEFAULT_HTTP_ADDR));
+            .unwrap_or_else(|| format!("http://{}", crate::config::DEFAULT_HTTP_ADDR));
         let http = reqwest::Client::new();
         match password {
             Some(password) => {

@@ -32,7 +32,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            bind_address: crate::config::constants::DEFAULT_DAEMON_ADDR.to_string(),
+            bind_address: crate::config::DEFAULT_DAEMON_ADDR.to_string(),
             auto_spawn: true,
             timeout_seconds: 120,
             api_key: None,

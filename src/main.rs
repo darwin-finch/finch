@@ -94,7 +94,7 @@ enum Command {
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
-        // constant: crate::config::constants::DEFAULT_HTTP_ADDR
+        // constant: crate::config::DEFAULT_HTTP_ADDR
         #[arg(long, default_value = "127.0.0.1:8000")]
         bind: String,
     },
@@ -127,7 +127,7 @@ enum Command {
     /// delegate work to this node. Shows node identity and capabilities.
     Worker {
         /// Bind address (default: 0.0.0.0:8000 — accepts external connections)
-        // constant: crate::config::constants::DEFAULT_WORKER_ADDR
+        // constant: crate::config::DEFAULT_WORKER_ADDR
         #[arg(long, default_value = "0.0.0.0:8000")]
         bind: String,
         /// Show node info and exit without starting server
@@ -1377,7 +1377,7 @@ async fn run_daemon_status() -> Result<()> {
     let client = reqwest::Client::new();
     let daemon_url = format!(
         "http://{}/health",
-        finch::config::constants::DEFAULT_DAEMON_ADDR
+        finch::config::DEFAULT_DAEMON_ADDR
     );
 
     let response = client
@@ -1414,7 +1414,7 @@ async fn run_daemon_status() -> Result<()> {
     println!("  Named Brains:    {}", health.named_brains);
     println!(
         "  Bind Address:    {}",
-        finch::config::constants::DEFAULT_DAEMON_ADDR
+        finch::config::DEFAULT_DAEMON_ADDR
     );
     println!();
 
@@ -1818,7 +1818,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     .split(':')
                     .next_back()
                     .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(finch::config::constants::DEFAULT_BRAIN_TLS_PORT);
+                    .unwrap_or(finch::config::DEFAULT_BRAIN_TLS_PORT);
 
                 match discovery.advertise(port) {
                     Ok(_) => {
@@ -2296,7 +2296,7 @@ async fn run_query_teacher_only(
         .cloud_providers()
         .first()
         .and_then(|provider| provider.model().map(str::to_string))
-        .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
+        .unwrap_or_else(|| finch::config::DEFAULT_CLAUDE_MODEL.to_string());
     let provider = config
         .cloud_providers()
         .first()
@@ -2317,7 +2317,7 @@ async fn run_query_teacher_only(
     for _ in 0..MAX_TURNS {
         let request = MessageRequest {
             model: model.clone(),
-            max_tokens: finch::config::constants::DEFAULT_MAX_TOKENS,
+            max_tokens: finch::config::DEFAULT_MAX_TOKENS,
             messages: messages.clone(),
             system: Some(system.clone()),
             tools: (!wire_repair_requested).then(|| tool_definitions.clone()),

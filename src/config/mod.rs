@@ -3,8 +3,8 @@
 
 mod backend;
 mod colors;
-pub mod constants;
-pub mod credential;
+mod constants;
+mod credential;
 mod loader;
 mod notice_state;
 
@@ -41,8 +41,8 @@ pub fn forget_notice_suppression() {
     }
 }
 
-pub mod persona;
-pub mod provider;
+mod persona;
+mod provider;
 mod settings;
 
 #[allow(deprecated)]
@@ -60,6 +60,12 @@ pub use credential::{
 pub use loader::{load_config, load_persisted_config};
 #[cfg(test)]
 pub(crate) use loader::{load_config_from_path, load_config_from_path_with_paths};
+pub use constants::{
+    DEFAULT_BRAIN_TLS_PORT, DEFAULT_CLAUDE_MODEL, DEFAULT_DAEMON_ADDR, DEFAULT_HTTP_ADDR,
+    DEFAULT_MAX_TOKENS, DEFAULT_WORKER_ADDR,
+};
+pub use credential::{credential_index, validate_binding};
+pub(crate) use credential::LifecycleRevocation;
 pub use persona::Persona;
 pub use provider::{ProviderEntry, ReasoningEffort};
 pub use settings::{

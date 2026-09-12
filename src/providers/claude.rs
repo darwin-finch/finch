@@ -17,7 +17,7 @@ use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProvider
 use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::streaming::StreamEvent;
 use crate::claude::types::{ContentBlock, MessageRequest};
-use crate::config::constants::DEFAULT_CLAUDE_MODEL;
+use crate::config::DEFAULT_CLAUDE_MODEL;
 
 const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";

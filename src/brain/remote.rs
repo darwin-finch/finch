@@ -16,7 +16,7 @@ use super::store::{
     BrainSnapshot, BrainWireMessage,
 };
 
-pub const DEFAULT_BRAIN_PORT: u16 = crate::config::constants::DEFAULT_BRAIN_TLS_PORT;
+pub const DEFAULT_BRAIN_PORT: u16 = crate::config::DEFAULT_BRAIN_TLS_PORT;
 const ATTACHMENT_IDENTITIES_VERSION: u32 = 1;
 
 /// Dynamic node information returned only after Brain-scoped authentication.
@@ -2304,7 +2304,7 @@ mod tests {
         assert_eq!(address, proof.daemon_addr);
         let socket: std::net::SocketAddr = address.parse().expect("invalid test daemon address");
         assert!(socket.ip().is_loopback() && socket.port() != 0);
-        assert_ne!(address, crate::config::constants::DEFAULT_DAEMON_ADDR);
+        assert_ne!(address, crate::config::DEFAULT_DAEMON_ADDR);
         address
     }
 

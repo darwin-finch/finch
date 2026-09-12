@@ -29,6 +29,7 @@ scope, dependency limits, and focused tests to everything in this file; it never
 | `src/vm/`, `src/lisp/`, `vocabulary/`, `examples/finch/` | [`src/vm/AGENTS.md`](src/vm/AGENTS.md) |
 | `src/memory/`, `src/memory_status.rs`, `src/workbook.rs` | [`src/memory/AGENTS.md`](src/memory/AGENTS.md) |
 | `src/programs/` | [`src/programs/AGENTS.md`](src/programs/AGENTS.md) |
+| `src/config/`, `src/context/`, `src/license/`, `src/metrics/` | [`src/config/AGENTS.md`](src/config/AGENTS.md) |
 
 ## Invariants
 
