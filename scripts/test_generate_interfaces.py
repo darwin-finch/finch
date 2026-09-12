@@ -34,8 +34,8 @@ FACADE = """\
 mod ir;
 mod interpreter;
 
-pub use interpreter::{run, Handler};
-pub use ir::{Module, Phase};
+pub use interpreter::{inspect, run, Handler};
+pub use ir::{Detail as Reason, Module, Phase};
 
 /// The IR family this VM accepts.
 pub const VERSION: u32 = 5;
@@ -49,8 +49,10 @@ pub struct Module {
 }
 
 /// Where a diagnostic was raised.
+#[derive(Debug, Clone)]
 pub enum Phase {
     /// Parsing, with commas, in prose.
+    #[serde(rename = "parse, really")]
     Parse,
     Verify(Detail),
 }
@@ -69,6 +71,11 @@ pub fn run(
     budget: u64,
 ) -> Result<Detail, Phase> {
     todo!()
+}
+
+/// Inspect private state that the facade does not export.
+pub fn inspect(state: &NotExported) -> u32 {
+    0
 }
 
 pub trait Handler {
@@ -156,7 +163,7 @@ class InterfaceGeneratorTests(unittest.TestCase):
         for expected in (
             "pub struct Module { … }",
             "/// One verified module.",  # the summary sentence only
-            "pub enum Phase { Parse, Verify }",
+            "pub enum Phase { Parse, Verify }",  # attributes must not masquerade as variants
             "pub fn run(module: &Module, budget: u64) -> Result<Detail, Phase> { … }",
             "fn handle(&mut self, phase: Phase) -> bool;",
             "fn finish(&self) -> String;",
@@ -166,20 +173,49 @@ class InterfaceGeneratorTests(unittest.TestCase):
         self.assertNotIn("A second doc line", text, "only the summary sentence belongs in the interface")
         self.assertNotIn("Bodies stay private", text, "the summary stops at the first sentence")
         self.assertNotIn("private_helper", text, "private items must not appear")
-        self.assertNotIn("NotExported", text, "unexported items must not appear")
         self.assertNotIn("pub name: String", text, "field bodies must not appear")
+
+    def test_renamed_export_uses_the_name_callers_write(self) -> None:
+        text = self.fixture.interface()
+        self.assertIn("pub struct Detail { … }", text, "the renamed item's signature must appear")
+        self.assertIn("Reason", text, "the interface must mention the exported name, not only the source name")
+
+    def test_attributes_do_not_become_variants(self) -> None:
+        text = self.fixture.interface()
+        self.assertNotIn("serde", text, "an attribute must never be rendered as an enum variant")
+        self.assertNotIn("rename", text, "attribute contents must not leak into the interface")
+
+    def test_nested_use_groups_are_expanded(self) -> None:
+        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Detail as Reason, Module, Phase};", "pub use ir::{{Detail as Reason, Module}, Phase as Phase2};")
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Phase2", self.fixture.interface(), "every name in a group must be expanded")
+
+    def test_glob_import_fails_loudly(self) -> None:
+        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Detail as Reason, Module, Phase};", "pub use ir::*;")
+        result = self.fixture.run("--write")
+        self.assertNotEqual(0, result.returncode, "a glob export must not be silently rendered")
+        self.assertIn("glob", result.stderr, result.stderr)
+        self.assertIn("refusing to write", result.stderr, result.stderr)
+
+    def test_unresolved_export_fails_loudly(self) -> None:
+        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Detail as Reason, Module, Phase};", "pub use ir::{Ghost, Module, Phase};")
+        result = self.fixture.run("--write")
+        self.assertNotEqual(0, result.returncode, "an export with no definition must fail, not be written")
+        self.assertIn("no definition found for exported `Ghost`", result.stderr, result.stderr)
 
     def test_referenced_but_unexported_types_are_reported(self) -> None:
         text = self.fixture.interface()
-        self.assertIn("Referenced but not exported", text)
-        self.assertIn("`Detail`", text, "run() returns Detail, which the facade does not export")
+        self.assertIn("Referenced but not exported", text, f"inspect() takes a type the facade omits:\n{text}")
+        self.assertIn("`NotExported`", text, "the unexported type must be named")
+        self.assertNotIn("`Detail`", text.split("Referenced but not exported")[1], "a renamed export is reachable, not missing")
 
     def test_new_export_makes_the_interface_stale(self) -> None:
-        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Module, Phase};", "pub use ir::{Detail, Module, Phase};")
-        self.assert_stale("src/vm/INTERFACE.md is stale", "Detail")
+        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Detail as Reason, Module, Phase};", "pub use ir::{Detail as Reason, Module, NotExported, Phase};")
+        self.assert_stale("src/vm/INTERFACE.md is stale", "NotExported")
 
     def test_removed_export_makes_the_interface_stale(self) -> None:
-        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Module, Phase};", "pub use ir::Module;")
+        self.fixture.edit("src/vm/mod.rs", "pub use ir::{Detail as Reason, Module, Phase};", "pub use ir::Module;")
         self.assert_stale("src/vm/INTERFACE.md is stale")
 
     def test_changed_signature_makes_the_interface_stale(self) -> None:
@@ -206,7 +242,9 @@ class InterfaceGeneratorTests(unittest.TestCase):
     def test_real_tree_interfaces_match_their_facades(self) -> None:
         result = subprocess.run([sys.executable, str(GENERATOR)], capture_output=True, text=True, check=False)
         self.assertEqual(0, result.returncode, f"repository interfaces drifted:\n{result.stderr}")
-        self.assertTrue(interfaces(ROOT), "the repository must generate at least one interface")
+        generated, problems = interfaces(ROOT)
+        self.assertEqual([], problems, "the repository's facades must parse cleanly")
+        self.assertTrue(generated, "the repository must generate at least one interface")
 
 
 if __name__ == "__main__":

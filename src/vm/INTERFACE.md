@@ -70,7 +70,7 @@ pub enum ProgramLanguage { Forth, Lisp }
 pub struct ProgramSelectorTemplate { … }
 pub enum ResourceRoot { Workspace, Project, TaskOutput, HostMachine, Named }
 pub enum ResourceSelector { None, File, FileTemplate, NetworkTemplate, Network, Automation, Agent, Process, ProcessTemplate, Program, ProgramTemplate, Mcp, McpTemplate, Memory, Schedule }
-pub enum SelectorError { error, error, error, error, error, error, error, error, error, error, error, error, error, error, error, error, error, error, error }
+pub enum SelectorError { Empty, AbsolutePath, ParentTraversal, UnknownRoot, InvalidRecursiveWildcard, DifferentRoots, IndeterminateIntersection, InvalidTemplateArgument, TemplateArgumentOutOfBounds, WildcardInRuntimePath, InvalidSeparator, InvalidNetworkTemplateArgument, NetworkTemplateArgumentOutOfBounds, InvalidProcessTemplateArgument, ProcessTemplateArgumentOutOfBounds, InvalidProgramTemplateArgument, ProgramTemplateArgumentOutOfBounds, InvalidMcpTemplateArgument, McpTemplateArgumentOutOfBounds }
 pub enum Severity { Note, Warning, Error }
 pub enum SourceLanguage { Forth, Lisp, FinchIr, Native, Provider }
 pub struct SourceOrigin { … }

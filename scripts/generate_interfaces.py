@@ -40,24 +40,58 @@ def tracked_files(root: Path) -> list[str]:
     return sorted(path for path in result.stdout.decode().split("\0") if path)
 
 
-def exported_names(facade: str) -> list[tuple[str, str]]:
-    """(module path, item name) for every name the facade re-exports."""
-    names: list[tuple[str, str]] = []
-    for match in REEXPORT.finditer(facade):
+def split_top_level(text: str) -> list[str]:
+    """Split on commas that are not inside a nested group."""
+    parts, depth, current = [], 0, ""
+    for char in text:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    parts.append(current)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def expand_use_tree(prefix: str, text: str, problems: list[str]) -> list[tuple[str, str, str]]:
+    """(module, defined name, exported name) for one `use` tree, recording what it cannot parse."""
+    text = text.strip()
+    if text.startswith("{"):
+        if not text.endswith("}"):
+            problems.append(f"unbalanced group in `use {prefix}{text}`")
+            return []
+        return [
+            pair for part in split_top_level(text[1:-1])
+            for pair in expand_use_tree(prefix, part, problems)
+        ]
+    head, brace, rest = text.partition("::{")
+    if brace:
+        return expand_use_tree(f"{prefix}{head}::", "{" + rest, problems)
+    source_text, _, exported = text.partition(" as ")
+    module, _, defined = (prefix + source_text.strip()).rpartition("::")
+    module, defined = module.strip(":"), defined.strip()
+    name = exported.strip() or defined
+    if defined in ("*", ""):
+        problems.append(f"glob or empty import in `use {prefix}{text}`; name each item instead")
+        return []
+    if defined == "self":
+        return []
+    return [(module, defined, name)]
+
+
+def exported_names(facade: str, problems: list[str] | None = None) -> list[tuple[str, str, str]]:
+    """(module, defined name, exported name) for every name the facade re-exports."""
+    problems = problems if problems is not None else []
+    names: list[tuple[str, str, str]] = []
+    for match in REEXPORT.finditer(without_comments(facade)):
         body = " ".join(match.group(1).split())
         if body.startswith("self::"):
             body = body[len("self::"):]
-        head, _, group = body.partition("{")
-        module = head.strip().rstrip(":").strip()
-        if group:
-            items = [item.strip() for item in group.rstrip("}").split(",")]
-        else:
-            module, _, last = body.rpartition("::")
-            items = [last.strip()]
-        for item in items:
-            item = item.split(" as ")[0].strip()
-            if item and item != "self":
-                names.append((module.strip(":"), item))
+        names.extend(expand_use_tree("", body, problems))
     return names
 
 
@@ -87,8 +121,34 @@ def scan_items(source: str) -> list[tuple[str, str, str, str]]:
 
 
 def without_comments(source: str) -> str:
-    """Blank `//` comments, keeping offsets, so commas in prose cannot look like syntax."""
-    return re.sub(r"//[^\n]*", lambda match: " " * len(match.group(0)), source)
+    """Blank comments and attributes, keeping offsets, so their text cannot look like syntax."""
+    blanked = re.sub(r"//[^\n]*", lambda match: " " * len(match.group(0)), source)
+    return blank_attributes(blanked)
+
+
+def blank_attributes(source: str) -> str:
+    """Blank `#[...]` spans, matching nested brackets, keeping offsets."""
+    out = list(source)
+    index = 0
+    while index < len(source):
+        if source.startswith("#[", index) or source.startswith("#![", index):
+            depth, end = 0, index + 1
+            while end < len(source):
+                if source[end] == "[":
+                    depth += 1
+                elif source[end] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end += 1
+                        break
+                end += 1
+            for position in range(index, min(end, len(source))):
+                if out[position] != "\n":
+                    out[position] = " "
+            index = end
+            continue
+        index += 1
+    return "".join(out)
 
 
 def enum_variants(source: str, brace: int) -> str:
@@ -208,7 +268,7 @@ def subsystem_sources(root: Path, files: list[str], record: dict) -> dict[str, s
     }
 
 
-def interface_text(root: Path, files: list[str], manifest: dict, record: dict) -> str:
+def interface_text(root: Path, files: list[str], manifest: dict, record: dict, problems: list[str]) -> str:
     facade_path = record["facade"]
     facade = (root / facade_path).read_text()
     sources = subsystem_sources(root, files, record)
@@ -219,16 +279,22 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict) -
 
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
-    for _, name in exported_names(facade):
-        candidates = definitions.get(name)
+    for _, defined, name in exported_names(facade, problems):
+        candidates = definitions.get(defined)
         if not candidates:
-            missing.append(name)
+            missing.append(defined)
             continue
         kind, signature, doc = candidates[0]
+        if name != defined:
+            doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
         rendered.append((kind, name, render(signature, doc)))
     rendered.extend(local_items(facade))
 
-    exported = {name for _, name in exported_names(facade)} | {name for _, name, _ in local_items(facade)}
+    # Both names count: a renamed export is reachable, under the name the facade publishes.
+    exported = {
+        item for _, defined, name in exported_names(facade) for item in (defined, name)
+    } | {name for _, name, _ in local_items(facade)}
+    problems.extend(f"{record['id']}: no definition found for exported `{name}`" for name in missing)
     referenced = {
         word for _, _, text in rendered
         for line in text.splitlines() if not line.lstrip().startswith("///")
@@ -273,21 +339,21 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict) -
             "caller can hold a value and never name its type. Export them or change the signature: "
             + ", ".join(f"`{name}`" for name in unnameable),
         ])
-    if missing:
-        lines.extend(["", "## Unresolved", "",
-                      "The generator could not find a definition for: " + ", ".join(f"`{n}`" for n in sorted(missing))])
     return "\n".join(lines) + "\n"
 
 
-def interfaces(root: Path) -> list[tuple[Path, str]]:
+def interfaces(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
+    """Generated (path, text) pairs, and anything the generator could not parse or resolve."""
     manifest = tomllib.loads((root / MANIFEST).read_text())
     files = tracked_files(root)
-    generated = []
+    generated, problems = [], []
     for record in manifest.get("subsystem", []):
         if "facade" not in record or "interface" not in record:
             continue
-        generated.append((root / record["interface"], interface_text(root, files, manifest, record)))
-    return generated
+        generated.append(
+            (root / record["interface"], interface_text(root, files, manifest, record, problems))
+        )
+    return generated, problems
 
 
 def main() -> int:
@@ -296,8 +362,18 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     arguments = parser.parse_args()
     root = arguments.root.resolve()
+    generated, problems = interfaces(root)
+    if problems:
+        for problem in problems:
+            print(f"interfaces: {problem}", file=sys.stderr)
+        print(
+            "interfaces: refusing to write an interface the generator cannot derive; "
+            "fix the facade or the generator",
+            file=sys.stderr,
+        )
+        return 1
     stale: list[str] = []
-    for path, text in interfaces(root):
+    for path, text in generated:
         if arguments.write:
             path.write_text(text)
             continue
@@ -318,7 +394,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"interfaces: {len(interfaces(root))} subsystem interface(s) match their facade")
+    print(f"interfaces: {len(generated)} subsystem interface(s) match their facade")
     return 0
 
 
