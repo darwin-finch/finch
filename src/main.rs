@@ -1375,10 +1375,7 @@ async fn run_daemon_status() -> Result<()> {
 
     // Query health endpoint
     let client = reqwest::Client::new();
-    let daemon_url = format!(
-        "http://{}/health",
-        finch::config::DEFAULT_DAEMON_ADDR
-    );
+    let daemon_url = format!("http://{}/health", finch::config::DEFAULT_DAEMON_ADDR);
 
     let response = client
         .get(&daemon_url)
@@ -1412,10 +1409,7 @@ async fn run_daemon_status() -> Result<()> {
     println!("  PID:             {}", pid);
     println!("  Uptime:          {}s", health.uptime_seconds);
     println!("  Named Brains:    {}", health.named_brains);
-    println!(
-        "  Bind Address:    {}",
-        finch::config::DEFAULT_DAEMON_ADDR
-    );
+    println!("  Bind Address:    {}", finch::config::DEFAULT_DAEMON_ADDR);
     println!();
 
     Ok(())

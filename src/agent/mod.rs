@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
-use crate::config::{Persona, Config};
+use crate::config::{Config, Persona};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
 use crate::tools::implementations::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,

@@ -870,8 +870,8 @@ impl WizardState {
         existing_config: Option<&crate::config::Config>,
         catalog_cache_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        use crate::config::Persona;
         use crate::config::ColorTheme;
+        use crate::config::Persona;
 
         let mut sections = HashMap::new();
 
