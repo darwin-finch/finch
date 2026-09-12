@@ -216,7 +216,8 @@ impl<'a> Verifier<'a> {
                 let start = stack.len() - count;
                 for found in &stack[start..] {
                     if !element_type.accepts(found) {
-                        return Err(VmDiagnostic::type_mismatch(
+                        return Err(type_mismatch_with_stack(
+                            stack,
                             element_type.clone(),
                             found.clone(),
                             Some(origin.clone()),
@@ -238,14 +239,16 @@ impl<'a> Verifier<'a> {
                 let start = stack.len() - value_count;
                 for pair in stack[start..].chunks_exact(2) {
                     if !key_type.accepts(&pair[0]) {
-                        return Err(VmDiagnostic::type_mismatch(
+                        return Err(type_mismatch_with_stack(
+                            stack,
                             key_type.clone(),
                             pair[0].clone(),
                             Some(origin.clone()),
                         ));
                     }
                     if !value_type.accepts(&pair[1]) {
-                        return Err(VmDiagnostic::type_mismatch(
+                        return Err(type_mismatch_with_stack(
+                            stack,
                             value_type.clone(),
                             pair[1].clone(),
                             Some(origin.clone()),
@@ -266,7 +269,8 @@ impl<'a> Verifier<'a> {
                 let start = stack.len() - count;
                 for ((_, expected), found) in fields.iter().zip(&stack[start..]) {
                     if !expected.accepts(found) {
-                        return Err(VmDiagnostic::type_mismatch(
+                        return Err(type_mismatch_with_stack(
+                            stack,
                             expected.clone(),
                             found.clone(),
                             Some(origin.clone()),
@@ -302,7 +306,8 @@ impl<'a> Verifier<'a> {
                 if let Some(expected) = payload_type {
                     let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                     if !expected.accepts(&found) {
-                        return Err(VmDiagnostic::type_mismatch(
+                        return Err(type_mismatch_with_stack(
+                            stack,
                             expected.clone(),
                             found,
                             Some(origin.clone()),
@@ -319,7 +324,8 @@ impl<'a> Verifier<'a> {
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 let expected = Type::Variant(variants.clone());
                 if found != expected {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         expected,
                         found,
                         Some(origin.clone()),
@@ -350,7 +356,8 @@ impl<'a> Verifier<'a> {
             Instruction::RecordGet { field, value_type } => {
                 let field_name = stack.pop().ok_or_else(|| underflow(origin, 2, 0))?;
                 if field_name != Type::String {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         Type::String,
                         field_name,
                         Some(origin.clone()),
@@ -390,7 +397,8 @@ impl<'a> Verifier<'a> {
             } => {
                 let field_name = stack.pop().ok_or_else(|| underflow(origin, 3, 0))?;
                 if field_name != Type::String {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         Type::String,
                         field_name,
                         Some(origin.clone()),
@@ -398,7 +406,8 @@ impl<'a> Verifier<'a> {
                 }
                 let value = stack.pop().ok_or_else(|| underflow(origin, 3, 1))?;
                 if !value_type.accepts(&value) {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         value_type.clone(),
                         value,
                         Some(origin.clone()),
@@ -486,7 +495,8 @@ impl<'a> Verifier<'a> {
                     })?;
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 if !expected.accepts(&found) {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         expected,
                         found,
                         Some(origin.clone()),
@@ -602,7 +612,8 @@ impl<'a> Verifier<'a> {
                     suspension: signature.suspension.clone(),
                 };
                 if closure != expected_closure && closure != Type::Dynamic {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         expected_closure,
                         closure,
                         Some(origin.clone()),
@@ -615,7 +626,8 @@ impl<'a> Verifier<'a> {
             Instruction::OutputOpen => {
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 if !Type::String.accepts(&found) {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         Type::String,
                         found,
                         Some(origin.clone()),
@@ -652,7 +664,8 @@ impl<'a> Verifier<'a> {
             Instruction::Yield { value_type } => {
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 if !value_type.accepts(&found) {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         value_type.clone(),
                         found,
                         Some(origin.clone()),
@@ -850,7 +863,8 @@ impl<'a> Verifier<'a> {
             } => {
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 if !Type::Bool.accepts(&found) {
-                    return Err(VmDiagnostic::type_mismatch(
+                    return Err(type_mismatch_with_stack(
+                        stack,
                         Type::Bool,
                         found,
                         Some(origin.clone()),
@@ -895,7 +909,12 @@ fn apply_signature(
         .iter()
         .zip(stack[prefix_len..].iter())
     {
-        unify(expected, found, &mut substitutions, origin)?;
+        // `unify` compares one expected type against one found type and has no view of the
+        // stack, so the stack is attached here, where it is known.
+        unify(expected, found, &mut substitutions, origin).map_err(|mut diagnostic| {
+            diagnostic.hints.push(describe_stack(stack));
+            diagnostic
+        })?;
     }
     stack.truncate(prefix_len);
     if signature.output.tail.is_none() {
@@ -954,7 +973,12 @@ pub(crate) fn instantiate_signature_types(
         .iter()
         .zip(stack[prefix_len..].iter())
     {
-        unify(expected, found, &mut substitutions, origin)?;
+        // `unify` compares one expected type against one found type and has no view of the
+        // stack, so the stack is attached here, where it is known.
+        unify(expected, found, &mut substitutions, origin).map_err(|mut diagnostic| {
+            diagnostic.hints.push(describe_stack(stack));
+            diagnostic
+        })?;
     }
     Ok(StackSignature {
         type_parameters: signature.type_parameters.clone(),
@@ -1301,6 +1325,37 @@ fn underflow(origin: &SourceOrigin, expected: usize, found: usize) -> VmDiagnost
         DiagnosticPhase::Verification,
         format!("stack underflow: instruction needs {expected} values, found {found}"),
         Some(origin.clone()),
+    )
+}
+
+/// A type mismatch, carrying the stack as the verifier saw it.
+///
+/// "expected int, found string" names the instruction that rejected the value, never the value's
+/// own origin. Showing the stack is what lets a reader — or a model asked to repair the program —
+/// work out which earlier word produced the wrong value.
+fn type_mismatch_with_stack(
+    stack: &[Type],
+    expected: Type,
+    found: Type,
+    origin: Option<SourceOrigin>,
+) -> VmDiagnostic {
+    let mut diagnostic = VmDiagnostic::type_mismatch(expected, found, origin);
+    diagnostic.hints.push(describe_stack(stack));
+    diagnostic
+}
+
+/// The stack bottom-first, the order the program pushed it in.
+fn describe_stack(stack: &[Type]) -> String {
+    if stack.is_empty() {
+        return "the stack is empty here".to_string();
+    }
+    format!(
+        "stack here, bottom first: {}",
+        stack
+            .iter()
+            .map(|ty| ty.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     )
 }
 

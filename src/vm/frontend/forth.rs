@@ -503,7 +503,8 @@ fn lower_forth_ast_body_with_locals(
             )]
         })?;
         if found != local.ty {
-            return Err(vec![VmDiagnostic::type_mismatch(
+            return Err(vec![type_mismatch_with_stack(
+                &stack,
                 local.ty.clone(),
                 found,
                 Some(local.origin.clone()),
@@ -809,7 +810,8 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     if !expected.accepts(&found) {
-                        return Err(vec![VmDiagnostic::type_mismatch(
+                        return Err(vec![type_mismatch_with_stack(
+                            &stack,
                             expected.clone(),
                             found,
                             Some(origin),
@@ -842,7 +844,8 @@ fn lower_forth_ast_body_with_locals(
                     )]
                 })?;
                 let Type::Variant(variants) = found else {
-                    return Err(vec![VmDiagnostic::type_mismatch(
+                    return Err(vec![type_mismatch_with_stack(
+                        &stack,
                         Type::Variant(Vec::new()),
                         found,
                         Some(origin),
@@ -1038,7 +1041,8 @@ fn lower_forth_ast_body_with_locals(
                 };
                 let replacement = &stack[stack.len() - 2];
                 if expected != replacement {
-                    return Err(vec![VmDiagnostic::type_mismatch(
+                    return Err(vec![type_mismatch_with_stack(
+                        &stack,
                         expected.clone(),
                         replacement.clone(),
                         Some(origin),
@@ -1217,7 +1221,8 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     if selector != Type::Int {
-                        return Err(vec![VmDiagnostic::type_mismatch(
+                        return Err(vec![type_mismatch_with_stack(
+                            &stack,
                             Type::Int,
                             selector,
                             Some(origin),
@@ -1460,7 +1465,8 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     if condition != Type::Bool {
-                        return Err(vec![VmDiagnostic::type_mismatch(
+                        return Err(vec![type_mismatch_with_stack(
+                            &stack,
                             Type::Bool,
                             condition,
                             Some(origin),
@@ -1860,7 +1866,8 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     if condition != Type::Bool {
-                        return Err(vec![VmDiagnostic::type_mismatch(
+                        return Err(vec![type_mismatch_with_stack(
+                            &stack,
                             Type::Bool,
                             condition,
                             Some(origin),
@@ -1978,7 +1985,8 @@ fn lower_forth_ast_body_with_locals(
                         )]
                     })?;
                     if condition != Type::Bool {
-                        return Err(vec![VmDiagnostic::type_mismatch(
+                        return Err(vec![type_mismatch_with_stack(
+                            &stack,
                             Type::Bool,
                             condition,
                             Some(origin),
@@ -2294,7 +2302,8 @@ fn lower_forth_ast_body_with_locals(
                         )]);
                     };
                     if !return_error_type.accepts(&error_type) {
-                        return Err(vec![VmDiagnostic::type_mismatch(
+                        return Err(vec![type_mismatch_with_stack(
+                            &stack,
                             (**return_error_type).clone(),
                             *error_type.clone(),
                             Some(origin),
@@ -2891,6 +2900,37 @@ fn definition_error(
         "E-FORTH-SIG-001",
         message,
         origin(source_id, source, token.start, token.end),
+    )
+}
+
+/// A type mismatch, carrying the stack as the verifier saw it.
+///
+/// "expected int, found string" names the word that rejected the value and not the value itself.
+/// A reader — or a model asked to repair the program — needs to know what was on the stack to find
+/// where the wrong value came from, and the verifier is the only place that still knows.
+fn type_mismatch_with_stack(
+    stack: &[Type],
+    expected: Type,
+    found: Type,
+    origin: Option<SourceOrigin>,
+) -> VmDiagnostic {
+    let mut diagnostic = VmDiagnostic::type_mismatch(expected, found, origin);
+    diagnostic.hints.push(describe_stack(stack));
+    diagnostic
+}
+
+/// The stack bottom-first, which is the order a Forth author writes and reads it in.
+fn describe_stack(stack: &[Type]) -> String {
+    if stack.is_empty() {
+        return "the stack is empty here".to_string();
+    }
+    format!(
+        "stack here, bottom first: {}",
+        stack
+            .iter()
+            .map(|ty| ty.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     )
 }
 

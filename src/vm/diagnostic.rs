@@ -32,6 +32,30 @@ pub enum DiagnosticPhase {
     ResourceLimit,
 }
 
+impl DiagnosticPhase {
+    /// The phase as a reader would name it, matching the serialised form.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::MacroExpansion => "macro expansion",
+            Self::NameResolution => "name resolution",
+            Self::TypeInference => "type inference",
+            Self::Verification => "verification",
+            Self::Linking => "linking",
+            Self::Authorization => "authorization",
+            Self::Availability => "availability",
+            Self::Approval => "approval",
+            Self::Interpretation => "interpretation",
+            Self::HostCall => "host call",
+            Self::NativeExecution => "native execution",
+            Self::TransactionCommit => "transaction commit",
+            Self::ChildExecution => "child execution",
+            Self::Cancellation => "cancellation",
+            Self::ResourceLimit => "resource limit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceLanguage {
@@ -180,7 +204,9 @@ impl VmDiagnostic {
 
     /// The annotations under a rendered diagnostic, in the order they help most.
     fn notes(&self) -> Vec<String> {
-        let mut notes = Vec::new();
+        // Which phase failed decides what a fix even looks like: a reader cannot tell a program
+        // that would not compile from one that ran and then broke without being told.
+        let mut notes = vec![format!("phase: {}", self.phase.label())];
         if !self.expected_types.is_empty() || !self.found_types.is_empty() {
             notes.push(format!(
                 "expected: {}",
@@ -376,7 +402,8 @@ error[E-LINK-002]: unknown Co-Forth word 'frobnicate'
  --> program.forth:2:7
   |
 2 | 3 4 frobnicate
-  |       ^^^^^^^^^^^";
+  |       ^^^^^^^^^^^
+  = phase: linking";
         assert_eq!(
             expected, rendered,
             "a rendered diagnostic must locate the failure in the source:\n{rendered}"
@@ -521,6 +548,16 @@ error[E-LINK-002]: unknown Co-Forth word 'frobnicate'
         assert!(nearest_names("dup", ["dup", "dip"].into_iter())
             .iter()
             .all(|name| name != "dup"));
+    }
+
+    #[test]
+    fn test_render_names_the_phase_that_failed() {
+        // A reader cannot tell a program that would not compile from one that ran and then broke
+        // unless the report says which.
+        let compile = VmDiagnostic::error("E-LINK-002", DiagnosticPhase::Linking, "x", None);
+        let run = VmDiagnostic::error("E-HOST-001", DiagnosticPhase::HostCall, "x", None);
+        assert!(compile.render(None).contains("phase: linking"));
+        assert!(run.render(None).contains("phase: host call"));
     }
 
     #[test]
