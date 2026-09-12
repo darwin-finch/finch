@@ -2448,10 +2448,13 @@ impl ProgramRuntime {
                 side_effects,
                 vm_side_effects,
                 effect_journal,
+                // Render rather than `to_string`: the span, the expected and found types, and the
+                // hints are what let a reader — or a model asked to repair this — find the part of
+                // the program that is wrong. `Display` drops all of it.
                 diagnostics: execution
                     .diagnostics
                     .iter()
-                    .map(ToString::to_string)
+                    .map(|diagnostic| diagnostic.render(Some(&pending.source)))
                     .collect(),
                 vm_diagnostics: execution.diagnostics,
                 inferred_capabilities,
@@ -3178,10 +3181,13 @@ impl ProgramRuntime {
                 side_effects: execution.side_effects,
                 vm_side_effects: execution.vm_side_effects,
                 effect_journal: execution.effect_journal,
+                // Render rather than `to_string`: the span, the expected and found types, and the
+                // hints are what let a reader — or a model asked to repair this — find the part of
+                // the program that is wrong. `Display` drops all of it.
                 diagnostics: execution
                     .diagnostics
                     .iter()
-                    .map(ToString::to_string)
+                    .map(|diagnostic| diagnostic.render(Some(&submission.source)))
                     .collect(),
                 vm_diagnostics: execution.diagnostics,
                 inferred_capabilities,

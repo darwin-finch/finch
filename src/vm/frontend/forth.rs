@@ -2313,12 +2313,27 @@ fn lower_forth_ast_body_with_locals(
                     Instruction::CaptureGet { index: *index }
                 } else {
                     let Some(signature) = vocabulary.get(&word) else {
-                        return Err(vec![VmDiagnostic::error(
+                        let mut diagnostic = VmDiagnostic::error(
                             "E-LINK-002",
                             DiagnosticPhase::NameResolution,
                             format!("unknown Co-Forth word '{word}'"),
                             Some(origin),
-                        )]);
+                        );
+                        let nearest = crate::vm::diagnostic::nearest_names(
+                            &word,
+                            vocabulary.keys().map(String::as_str),
+                        );
+                        if !nearest.is_empty() {
+                            diagnostic.hints.push(format!(
+                                "did you mean {}?",
+                                nearest
+                                    .iter()
+                                    .map(|name| format!("`{name}`"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        return Err(vec![diagnostic]);
                     };
                     let concrete_signature =
                         instantiate_signature_types(signature, &stack, &origin)

@@ -3617,12 +3617,27 @@ impl Compiler<'_> {
             return Ok(Type::Unit);
         }
         let Some(signature) = self.vocabulary.get(word).cloned() else {
-            return Err(vec![VmDiagnostic::error(
+            let mut diagnostic = VmDiagnostic::error(
                 "E-LINK-002",
                 DiagnosticPhase::Linking,
                 format!("unknown Lisp function '{operator}'"),
                 Some(origin),
-            )]);
+            );
+            let nearest = crate::vm::diagnostic::nearest_names(
+                word,
+                self.vocabulary.keys().map(String::as_str),
+            );
+            if !nearest.is_empty() {
+                diagnostic.hints.push(format!(
+                    "did you mean {}?",
+                    nearest
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            return Err(vec![diagnostic]);
         };
         if word == "str-cat" && arguments.len() > signature.input.values.len() {
             // Lisp knows the complete call arity at compile time. Lower its
