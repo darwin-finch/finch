@@ -36,6 +36,13 @@ use automation::AutomationRequest;
 use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
