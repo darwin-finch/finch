@@ -4,9 +4,8 @@ Generated from [`src/config/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`
 
 - **Facade:** `src/config/mod.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
-- **May depend on:** nothing. Debt: `memory`, `models`, `tools-mcp`.
 
-Everything below is what callers outside this subsystem can reach. Implementation modules are private; their contents are deliberately absent.
+Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
 
 ## Types
 

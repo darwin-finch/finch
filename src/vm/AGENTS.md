@@ -13,8 +13,8 @@ private, so reaching past it is a compile error, and `scripts/check_subsystems.p
 `pub mod` there. To expose something new, re-export it deliberately. `src/lisp/mod.rs` has no
 facade yet.
 
-**Dependencies:** layer 0 in [`subsystems.toml`](../../subsystems.toml): `vm` depends on no other
-subsystem, and any `crate::` import of one fails `scripts/check_subsystems.py`. The pure CPU fiber
+**Dependencies:** `vm` is the foundation and imports no other module of this crate. Keep it that
+way: a `crate::` import here is a design error, not a shortcut. The pure CPU fiber
 scheduler (`fiber.rs`) and `ProgramLanguage` (`language.rs`) live here for that reason; `programs`
 re-exports `ProgramLanguage`. One test in `src/vm/runtime.rs` still calls
 `programs::parse_finch_script` and must move before `finch-vm` becomes its own crate.

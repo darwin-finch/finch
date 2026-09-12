@@ -7,7 +7,7 @@
 # Usage: scripts/factory/gates <stage> [test-filter...]
 #
 #   docs      prose, links, and the process references          (seconds)
-#   arch      subsystem ownership, facades, interfaces          (seconds)
+#   arch      module facades and generated interfaces            (seconds)
 #   ci        workflow allocation and repository hygiene        (seconds)
 #   rust      formatting, then compile, then the named tests    (minutes)
 #   full      every stage above, plus the whole test suite      (long)
@@ -48,10 +48,9 @@ run_docs() {
 }
 
 run_arch() {
-  gate "subsystem ownership and dependencies" python3 scripts/check_subsystems.py
-  gate "subsystem checker tests" python3 scripts/test_check_subsystems.py
   gate "generated interfaces" python3 scripts/generate_interfaces.py
   gate "interface generator tests" python3 scripts/test_generate_interfaces.py
+  gate "seam measurement tests" python3 scripts/test_seam_cost.py
 }
 
 run_ci() {

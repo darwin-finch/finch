@@ -38,6 +38,7 @@ use super::{OutputManager, StatusBar, StatusLineType};
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
 // Sub-modules
 mod accordion;
+pub mod activity;
 mod async_input;
 mod autocomplete_widget;
 mod dialog;
@@ -1068,12 +1069,11 @@ pub struct TuiRenderer {
 
     // Rate limiting - removed in favor of event loop control
 
-    // Session task list (set after construction via set_todo_list)
-    todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
+    // Polled each frame for the session task list (set after construction).
+    task_rows: Option<activity::SharedActivityRows>,
 
-    // Live child-agent tree projected from scheduler lifecycle events.
-    agent_tasks: HashMap<uuid::Uuid, crate::runtime::scheduler::AgentTaskSnapshot>,
-    agent_active_tools: HashMap<uuid::Uuid, String>,
+    // Rows that arrive as a stream rather than by polling, keyed by identity.
+    tracked_rows: HashMap<uuid::Uuid, activity::ActivityRow>,
 
     // Output of the user-defined `check` word — shown in the corner if set.
     pub corner: Arc<std::sync::Mutex<Option<String>>>,
@@ -1145,9 +1145,8 @@ impl TuiRenderer {
             autocomplete_state: AutocompleteState::default(),
             pending_images: Vec::new(),
             image_counter: 0,
-            todo_list: None,
-            agent_tasks: HashMap::new(),
-            agent_active_tools: HashMap::new(),
+            task_rows: None,
+            tracked_rows: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
             poset: None,
@@ -1255,9 +1254,8 @@ impl TuiRenderer {
             pending_images: Vec::new(),
             image_counter: 0,
 
-            todo_list: None,
-            agent_tasks: HashMap::new(),
-            agent_active_tools: HashMap::new(),
+            task_rows: None,
+            tracked_rows: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
             poset: None,
@@ -1273,31 +1271,37 @@ impl TuiRenderer {
         })
     }
 
-    /// Attach the session task list so the live area can display it.
-    pub fn set_todo_list(
-        &mut self,
-        todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
-    ) {
-        self.todo_list = Some(todo_list);
+    /// Attach a source the live area polls for task rows each time it redraws.
+    pub fn set_task_rows(&mut self, rows: activity::SharedActivityRows) {
+        self.task_rows = Some(rows);
     }
 
     /// Fold a scheduler event into the live child-agent projection.
-    pub fn apply_agent_event(&mut self, event: &crate::runtime::scheduler::AgentEvent) {
-        use crate::runtime::scheduler::AgentEvent;
-        match event {
-            AgentEvent::TaskQueued { snapshot } | AgentEvent::TaskStarted { snapshot } => {
-                self.agent_tasks
-                    .insert(snapshot.identity.task_id, snapshot.clone());
+    pub fn apply_activity(&mut self, update: activity::ActivityUpdate) {
+        use activity::ActivityUpdate;
+        match update {
+            ActivityUpdate::Upsert { id, row } => {
+                // A row that reappears keeps the detail already shown against it, so a status
+                // change does not blank the tool a task is in the middle of running.
+                let detail = self
+                    .tracked_rows
+                    .get(&id)
+                    .and_then(|row| row.detail.clone());
+                self.tracked_rows.insert(
+                    id,
+                    activity::ActivityRow {
+                        detail: row.detail.or(detail),
+                        ..row
+                    },
+                );
             }
-            AgentEvent::ToolStarted { task_id, name } => {
-                self.agent_active_tools.insert(*task_id, name.clone());
+            ActivityUpdate::SetDetail { id, detail } => {
+                if let Some(row) = self.tracked_rows.get_mut(&id) {
+                    row.detail = detail;
+                }
             }
-            AgentEvent::ToolCompleted { task_id, .. } => {
-                self.agent_active_tools.remove(task_id);
-            }
-            AgentEvent::TaskFinished { result } => {
-                self.agent_tasks.remove(&result.identity.task_id);
-                self.agent_active_tools.remove(&result.identity.task_id);
+            ActivityUpdate::Remove { id } => {
+                self.tracked_rows.remove(&id);
             }
         }
         self.live_area_dirty = true;
@@ -1518,9 +1522,9 @@ impl TuiRenderer {
             return Ok(());
         }
         let todo_rows = self
-            .todo_list
+            .task_rows
             .as_ref()
-            .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
+            .map(|source| source.rows().len())
             .unwrap_or(0);
         let status_rows = 1 + effective_status
             .lines()
@@ -1544,7 +1548,7 @@ impl TuiRenderer {
                 + input_rows
                 + status_rows
                 + todo_rows
-                + self.agent_tasks.len()
+                + self.tracked_rows.len()
         };
         let live_messages = self.find_live_messages();
         let all_live_rendered = self.projected_lines(live_messages);
@@ -1577,81 +1581,62 @@ impl TuiRenderer {
 
         // ── 1b. Session task list (active items only) ─────────────────────────
         if !dialog_active {
-            if let Some(ref todo_arc) = self.todo_list {
-                if let Ok(todo) = todo_arc.try_read() {
-                    let active = todo.active_items();
-                    if !active.is_empty() {
-                        let term_w = term_width;
-                        for item in &active {
-                            let (symbol, color) = match item.status {
-                                crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
-                                crate::tools::todo::TodoStatus::Pending => ("○", DIM_GRAY),
-                                crate::tools::todo::TodoStatus::Completed => unreachable!(),
-                            };
-                            let priority_tag = match item.priority {
-                                crate::tools::todo::TodoPriority::High => " [!]",
-                                _ => "",
-                            };
-                            // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
-                            let max_content = term_w.saturating_sub(2 + priority_tag.len());
-                            let content: String = item.content.chars().take(max_content).collect();
-                            execute!(
-                                stdout,
-                                Print(format!(
-                                    "{}{} {}{}{}\r\n",
-                                    color, symbol, content, priority_tag, RESET
-                                ))
-                            )?;
-                            rows += shadow_buffer::physical_rows(&content, term_w);
-                        }
-                    }
+            if let Some(source) = self.task_rows.as_ref() {
+                for row in source.rows() {
+                    let (symbol, color) = match row.state {
+                        activity::ActivityState::Active => ("●", CYAN),
+                        activity::ActivityState::Pending => ("○", DIM_GRAY),
+                        activity::ActivityState::Done => continue,
+                    };
+                    let urgent_tag = if row.urgent { " [!]" } else { "" };
+                    // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
+                    let max_content = term_width.saturating_sub(2 + urgent_tag.len());
+                    let content: String = row.text.chars().take(max_content).collect();
+                    execute!(
+                        stdout,
+                        Print(format!(
+                            "{}{} {}{}{}\r\n",
+                            color, symbol, content, urgent_tag, RESET
+                        ))
+                    )?;
+                    rows += shadow_buffer::physical_rows(&content, term_width);
                 }
             }
         }
 
         // ── 1c. Child-agent task tree ─────────────────────────────────────────
-        let mut agent_tasks = if dialog_active {
+        let mut tracked = if dialog_active {
             Vec::new()
         } else {
-            self.agent_tasks.values().collect::<Vec<_>>()
+            self.tracked_rows.iter().collect::<Vec<_>>()
         };
-        agent_tasks.sort_by_key(|task| (task.identity.depth, task.identity.task_id));
-        for task in agent_tasks {
-            let indent = "  ".repeat(task.identity.depth);
-            let symbol = match task.status {
-                crate::runtime::scheduler::AgentTaskStatus::Queued => "○",
-                crate::runtime::scheduler::AgentTaskStatus::Running => "●",
-                _ => "✓",
+        // Depth first, then identity, so sibling rows keep a stable order between frames.
+        tracked.sort_by_key(|(id, row)| (row.depth, **id));
+        for (_, row) in tracked {
+            let indent = "  ".repeat(row.depth);
+            let symbol = match row.state {
+                activity::ActivityState::Pending => "○",
+                activity::ActivityState::Active => "●",
+                activity::ActivityState::Done => "✓",
             };
-            let model = &task.identity.provider_model;
-            let tool = self
-                .agent_active_tools
-                .get(&task.identity.task_id)
-                .map(|name| format!(" · {name}"))
-                .unwrap_or_default();
+            let detail = row.detail.clone().unwrap_or_default();
             let prefix_width = indent.chars().count() + 2;
-            let available = term_width
-                .saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
-            let task_text = task.task.chars().take(available).collect::<String>();
+            let available = term_width.saturating_sub(prefix_width + detail.chars().count() + 3);
+            let task_text = row.text.chars().take(available).collect::<String>();
             execute!(
                 stdout,
-                SetForegroundColor(
-                    if matches!(
-                        task.status,
-                        crate::runtime::scheduler::AgentTaskStatus::Running
-                    ) {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGrey
-                    }
-                ),
+                SetForegroundColor(if row.state == activity::ActivityState::Active {
+                    Color::Cyan
+                } else {
+                    Color::DarkGrey
+                }),
                 Print(&indent),
                 Print(symbol),
                 ResetColor,
                 Print(" "),
                 Print(task_text),
                 SetForegroundColor(Color::DarkGrey),
-                Print(format!(" · {model}{tool}")),
+                Print(detail),
                 ResetColor,
                 Print("\r\n")
             )?;
@@ -2588,9 +2573,9 @@ impl TuiRenderer {
             return Some((frame.lines.len(), frame.cursor_row));
         }
         let todo_rows = self
-            .todo_list
+            .task_rows
             .as_ref()
-            .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
+            .map(|source| source.rows().len())
             .unwrap_or(0);
         let drawn_status_rows = 1 + effective_status
             .lines()
@@ -2604,7 +2589,7 @@ impl TuiRenderer {
         .into_iter()
         .sum::<usize>();
         let base_reserved_rows =
-            1 + drawn_input_rows + drawn_status_rows + todo_rows + self.agent_tasks.len();
+            1 + drawn_input_rows + drawn_status_rows + todo_rows + self.tracked_rows.len();
         let all_live_rendered = self.projected_lines(self.find_live_messages());
         let all_live_lines = all_live_rendered
             .iter()
@@ -2628,33 +2613,22 @@ impl TuiRenderer {
             .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
             .sum::<usize>();
 
-        if let Some(ref todo_arc) = self.todo_list {
-            if let Ok(todo) = todo_arc.try_read() {
-                for item in todo.active_items() {
-                    let priority_tag = match item.priority {
-                        crate::tools::todo::TodoPriority::High => " [!]",
-                        _ => "",
-                    };
-                    let max_content = draw_width.saturating_sub(2 + priority_tag.len());
-                    let content = item.content.chars().take(max_content).collect::<String>();
-                    let line = format!("● {content}{priority_tag}");
-                    rows += shadow_buffer::physical_rows(&line, term_width);
-                }
+        if let Some(source) = self.task_rows.as_ref() {
+            for row in source.rows() {
+                let urgent_tag = if row.urgent { " [!]" } else { "" };
+                let max_content = draw_width.saturating_sub(2 + urgent_tag.len());
+                let content = row.text.chars().take(max_content).collect::<String>();
+                let line = format!("● {content}{urgent_tag}");
+                rows += shadow_buffer::physical_rows(&line, term_width);
             }
         }
-        for task in self.agent_tasks.values() {
-            let indent = "  ".repeat(task.identity.depth);
-            let model = &task.identity.provider_model;
-            let tool = self
-                .agent_active_tools
-                .get(&task.identity.task_id)
-                .map(|name| format!(" · {name}"))
-                .unwrap_or_default();
+        for row in self.tracked_rows.values() {
+            let indent = "  ".repeat(row.depth);
+            let detail = row.detail.clone().unwrap_or_default();
             let prefix_width = indent.chars().count() + 2;
-            let available = draw_width
-                .saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
-            let task_text = task.task.chars().take(available).collect::<String>();
-            let line = format!("{indent}● {task_text} · {model}{tool}");
+            let available = draw_width.saturating_sub(prefix_width + detail.chars().count() + 3);
+            let task_text = row.text.chars().take(available).collect::<String>();
+            let line = format!("{indent}● {task_text}{detail}");
             rows += shadow_buffer::physical_rows(&line, term_width);
         }
         let session_label = self

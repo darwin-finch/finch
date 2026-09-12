@@ -20,17 +20,14 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-import tomllib
 from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check_subsystems import (  # noqa: E402
-    crate_references, owner_entries, resolve, strip_comments_and_tests, tracked_files,
-)
+from generate_interfaces import module_directories, owning_module  # noqa: E402
+from rust_scan import crate_references, strip_comments_and_tests, tracked_files  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = "subsystems.toml"
 
 
 def rust_sources(root: Path, files: list[str]) -> dict[str, str]:
@@ -49,14 +46,16 @@ def module_path_of(path: str) -> str:
     return "::".join(parts)
 
 
-def report(root: Path, candidate: str, manifest: dict, files: list[str], sources: dict[str, str]) -> None:
-    entries = owner_entries(manifest)
+def report(root: Path, candidate: str, directories: list[str], files: list[str], sources: dict[str, str]) -> None:
+    def owner_of(path: str) -> str:
+        return owning_module(directories, path) or "?"
+
     inside = sorted(path for path in sources if path.startswith(candidate))
     if not inside:
         print(f"{candidate}: no tracked Rust files under this path")
         return
     lines = sum(sources[path].count("\n") for path in inside)
-    owners = {resolve(path, entries)[0] for path in inside}
+    owners = {owner_of(path) for path in inside}
 
     file_by_module = {module_path_of(path): path for path in sources}
 
@@ -66,7 +65,7 @@ def report(root: Path, candidate: str, manifest: dict, files: list[str], sources
             prefix = "::".join(parts[:depth])
             path = file_by_module.get(prefix)
             if path:
-                return resolve(path, entries)[0], path
+                return owner_of(path), path
         return None, None
 
     outgoing: Counter[str] = Counter()
@@ -77,13 +76,17 @@ def report(root: Path, candidate: str, manifest: dict, files: list[str], sources
                 outgoing[owner] += 1
 
     incoming: dict[str, Counter[str]] = defaultdict(Counter)
-    prefix = module_path_of(candidate.rstrip("/") + "/mod.rs")
+    # A candidate may be a directory or a single file; both name a module, but only a directory
+    # reaches its module through a `mod.rs`.
+    prefix = module_path_of(
+        candidate if candidate.endswith(".rs") else candidate.rstrip("/") + "/mod.rs"
+    )
     for path, text in sources.items():
         if path.startswith(candidate):
             continue
         for _, module in crate_references(strip_comments_and_tests(text)):
             if module == prefix or module.startswith(f"{prefix}::"):
-                incoming[resolve(path, entries)[0] or "?"][path] += 1
+                incoming[owner_of(path)][path] += 1
 
     print(f"\n{candidate}  —  {len(inside)} files, {lines} lines, currently owned by {sorted(owners)}")
     print(f"  outgoing: {len(outgoing)} subsystem(s)" + ("  ← above two is not a cheap cut" if len(outgoing) > 2 else ""))
@@ -104,12 +107,12 @@ def main() -> int:
     parser.add_argument("--root", default=str(ROOT))
     arguments = parser.parse_args()
     root = Path(arguments.root).resolve()
-    manifest = tomllib.loads((root / MANIFEST).read_text())
     files = tracked_files(root)
+    directories = module_directories(files)
     sources = rust_sources(root, files)
     for candidate in arguments.paths:
         report(root, candidate.rstrip("/") + "/" if not candidate.endswith(".rs") else candidate,
-               manifest, files, sources)
+               directories, files, sources)
     return 0
 
 

@@ -11,10 +11,8 @@ is `src/runtime/`.
 modules are private, so the `pub use` list in `src/programs/mod.rs` is the whole public surface,
 and `scripts/check_subsystems.py` rejects a `pub mod` there.
 
-**Dependencies:** layer 1 in [`subsystems.toml`](../../subsystems.toml), may depend on `vm` only.
-Debt: `config` (via `crate::metrics`) and `runtime`. Importing any other subsystem fails
-`scripts/check_subsystems.py`, and the check will not stop a new `config` or `runtime` import, so
-add none.
+**Dependencies:** `vm`, and nothing else by design. Two unwanted edges remain — `config` (via
+`crate::metrics`) and `runtime` — which are to be removed rather than joined. Add no new ones.
 
 **Language is not decided here.** `ProgramLanguage` lives in `vm` and is re-exported for
 compatibility; a program's meaning belongs to the VM frontends, never to a second evaluator here.

@@ -12,29 +12,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/seam_cost.py"
 
-MANIFEST = """\
-version = 1
-
-[global]
-paths = ["subsystems.toml"]
-
-[[subsystem]]
-id = "vm"
-layer = 0
-paths = ["src/vm/"]
-
-[[subsystem]]
-id = "tools"
-layer = 1
-paths = ["src/tools/"]
-
-[[subsystem]]
-id = "app"
-layer = 2
-paths = ["src/app/"]
-"""
-
 SOURCES = {
+    # A directory is a module when it carries a capsule beside a facade; nothing else declares it.
+    "src/tools/mcp/AGENTS.md": "# mcp capsule\n",
+    "src/tools/AGENTS.md": "# tools capsule\n",
+    "src/vm/AGENTS.md": "# vm capsule\n",
+    "src/app/AGENTS.md": "# app capsule\n",
     # A clean candidate: one outgoing reference, several incoming.
     "src/tools/mcp/mod.rs": "pub use client::Client;\nmod client;\n",
     "src/tools/mcp/client.rs": "use crate::tools::types::Definition;\npub struct Client;\n",
@@ -54,7 +37,6 @@ class SeamCostTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        (self.root / "subsystems.toml").write_text(MANIFEST)
         for path, text in SOURCES.items():
             target = self.root / path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -83,13 +65,21 @@ class SeamCostTests(unittest.TestCase):
     def test_a_candidate_that_reaches_out_is_flagged(self) -> None:
         # The mistake this script exists to prevent: reading a directory name as a boundary.
         report = self.report("src/app/codec/")
-        self.assertIn("outgoing: 3 subsystem(s)", report, report)
+        self.assertIn("outgoing: 4 subsystem(s)", report, report)
         self.assertIn("above two is not a cheap cut", report, report)
 
     def test_references_inside_the_candidate_are_not_counted_as_edges(self) -> None:
         # `mcp/mod.rs` -> `mcp/client.rs` is internal; counting it would make every seam look costly.
         report = self.report("src/tools/mcp/")
         self.assertIn("outgoing: 1 subsystem(s)", report, report)
+
+    def test_a_single_file_candidate_counts_its_callers(self) -> None:
+        # A file names a module just as a directory does. Building its module path as if it were a
+        # directory yields `tools::mcp.rs`, which matches nothing, and the tool then reports a
+        # heavily-used file as having no callers at all.
+        report = self.report("src/tools/types.rs")
+        self.assertIn("incoming: 2 reference(s)", report, report)
+        self.assertIn("src/app/codec/mod.rs", report, report)
 
     def test_an_empty_path_says_so_rather_than_reporting_zeroes(self) -> None:
         report = self.report("src/nowhere/")

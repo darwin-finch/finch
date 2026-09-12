@@ -15,22 +15,33 @@ or release-readiness claims without dated evidence; see Issues #74, #98, #120, a
 
 ## Architecture and subsystem capsules
 
-[`DESIGN.md`](DESIGN.md) describes how Finch is composed: subsystem ownership, dependencies,
-module documentation, operating modes, storage layout, and the technology stack.
-[`subsystems.toml`](subsystems.toml) is the authoritative ownership and dependency record.
+[`DESIGN.md`](DESIGN.md) describes how Finch is composed: what the modules are, how they depend on
+each other, operating modes, storage layout, and the technology stack. The tree itself is the
+record — a directory's `AGENTS.md` says what that directory is, and its `INTERFACE.md` says what it
+exposes.
 
-### Subsystem capsules
+### Every source directory has an AGENTS.md; read it first
 
-Before editing under a path listed here, read its capsule. A capsule adds subsystem-specific
-scope, dependency limits, and focused tests to everything in this file; it never replaces it.
+A source directory's `AGENTS.md` states what that subtree is for, what it exposes, what it may
+depend on, and how to test it. **Read it, and the `INTERFACE.md` beside it, before you decide
+anything about that subtree** — before grepping, before opening files, and certainly before
+changing code. It exists so you do not have to read the subtree to find out what the subtree does.
+It supplements this file; it never replaces it.
 
-| Paths | Capsule |
-|-------|---------|
-| `src/vm/`, `src/lisp/`, `vocabulary/`, `examples/finch/` | [`src/vm/AGENTS.md`](src/vm/AGENTS.md) |
-| `src/memory/`, `src/memory_status.rs`, `src/workbook.rs` | [`src/memory/AGENTS.md`](src/memory/AGENTS.md) |
-| `src/programs/` | [`src/programs/AGENTS.md`](src/programs/AGENTS.md) |
-| `src/config/`, `src/context/`, `src/license/`, `src/metrics/` | [`src/config/AGENTS.md`](src/config/AGENTS.md) |
-| `src/tools/mcp/` | [`src/tools/mcp/AGENTS.md`](src/tools/mcp/AGENTS.md) |
+The same document is how you *use* a module from outside it. To call into `src/memory`, read
+`src/memory/INTERFACE.md` — not `src/memory/*.rs`. Reading another module's implementation to
+learn its surface means the surface was not stated well enough; fix the document rather than
+working around it.
+
+**Keeping it true is part of the change, not follow-up work.** If you alter what a module exposes,
+what it depends on, or what it is for, you update its `AGENTS.md` in the same commit. A capsule
+that describes the module as it was is worse than no capsule, because it is trusted. `INTERFACE.md`
+is generated from the facade, so you regenerate rather than edit it:
+`python3 scripts/generate_interfaces.py --write`.
+
+A module directory earns a capsule when something outside it depends on it. The `mod.rs` is the
+interface: child modules stay private and the `pub use` list is the whole public surface, so a
+reader learns the module from one screen instead of from every file in it.
 
 ## Invariants
 
@@ -53,7 +64,7 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 - **Scrollback deduplication: each message written via `insert_before()` exactly once** — check `scrollback.get_message(msg_id).is_none()` before calling (tests in `src/cli/tui/scrollback.rs`)
 - **Dialog virtual rows stable after Other-row activation** — `test_multiselect_submit_button_emits_selection`, `test_o_key_moves_cursor_to_other_row` in `src/cli/tui/dialog.rs`
-- **Contractions and sentence-ending periods must never be taken as Forth** — currently unenforced: the REPL takes its language from the explicit `--forth`, `--lisp` and `--exec` modes, there is no detector to test, and the two tests this line used to cite no longer exist. Whether the invariant is obsolete or merely untested is #571.
+- **Prose must never be executed as a typed program** — `is_clearly_forth` in `src/main.rs` decides this for `finch query`; question marks, commas and a leading capital disqualify a line — `prose_about_a_forth_string_opener_is_not_executed_as_forth` in `src/main.rs`. Contractions are covered only by falling through, so `don't!` is still executed as Forth (#571)
 
 ### Context
 

@@ -1,12 +1,11 @@
-# tools-mcp — public interface
+# tools::mcp — public interface
 
 Generated from [`src/tools/mcp/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`; CI fails if it drifts. Edit the code, then regenerate.
 
 - **Facade:** `src/tools/mcp/mod.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
-- **May depend on:** nothing. Debt: `tools`.
 
-Everything below is what callers outside this subsystem can reach. Implementation modules are private; their contents are deliberately absent.
+Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
 
 ## Types
 

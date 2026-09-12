@@ -3,6 +3,15 @@
 use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
+// The boundary vocabulary lives below this module; re-exported so existing callers keep working.
+pub use super::agents::{
+    AgentBudget, AgentContextReference, AgentEvent, AgentIdentity, AgentRole, AgentSpawning,
+    AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec, AgentTaskStatus,
+};
+pub(crate) use super::agents::{
+    MAX_CONTEXT_ARTIFACT_BYTES, MAX_CONTEXT_FIELD_BYTES, MAX_CONTEXT_REFERENCES,
+    MAX_CONTEXT_TOTAL_BYTES, MAX_DEPTH, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, MAX_TURNS,
+};
 use crate::tools::implementations::{
     GetLanguageDefinitionTool, GetVmStateTool, InspectWordTool, SearchWordTool, SubmitProgramTool,
 };
@@ -20,15 +29,6 @@ use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-const MAX_DEPTH: usize = 4;
-const MAX_TURNS: usize = 10;
-const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
-const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CONTEXT_REFERENCES: usize = 64;
-const MAX_CONTEXT_FIELD_BYTES: usize = 1024;
-const MAX_CONTEXT_ARTIFACT_BYTES: usize = 64 * 1024;
-const MAX_CONTEXT_TOTAL_BYTES: usize = 256 * 1024;
 
 #[derive(Default)]
 pub struct AgentContextStore {
@@ -286,182 +286,6 @@ impl ProviderResolver {
             inner,
         )))
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentRole {
-    General,
-    Explore,
-    Research,
-    Code,
-}
-
-impl Default for AgentRole {
-    fn default() -> Self {
-        Self::General
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentBudget {
-    pub max_turns: usize,
-    pub timeout_ms: u64,
-    pub max_output_bytes: usize,
-}
-
-impl Default for AgentBudget {
-    fn default() -> Self {
-        Self {
-            max_turns: MAX_TURNS,
-            timeout_ms: 120_000,
-            max_output_bytes: 256 * 1024,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentContextReference {
-    pub kind: String,
-    pub id: String,
-    pub sha256: String,
-}
-
-impl AgentContextReference {
-    fn validate(&self) -> Result<()> {
-        for (name, value) in [("kind", &self.kind), ("id", &self.id)] {
-            if value.trim().is_empty() {
-                bail!("agent context reference {name} cannot be empty");
-            }
-            if value.len() > MAX_CONTEXT_FIELD_BYTES {
-                bail!("agent context reference {name} exceeds {MAX_CONTEXT_FIELD_BYTES} bytes");
-            }
-        }
-        if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("agent context reference sha256 must be exactly 64 hexadecimal digits");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTaskSpec {
-    pub task: String,
-    #[serde(default)]
-    pub role: AgentRole,
-    #[serde(default)]
-    pub background: Option<String>,
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub context: Vec<AgentContextReference>,
-    /// `None` inherits the caller's full creation-time ceiling (the compact
-    /// `agent-spawn` convenience). `Some`, including an empty set, is an
-    /// explicit selection of live opaque grant references.
-    #[serde(default)]
-    pub capability_grant_ids: Option<Vec<Uuid>>,
-    #[serde(default)]
-    pub budget: AgentBudget,
-}
-
-impl AgentTaskSpec {
-    fn validate(&self) -> Result<()> {
-        if self.task.trim().is_empty() {
-            bail!("agent task cannot be empty");
-        }
-        if self.context.len() > MAX_CONTEXT_REFERENCES {
-            bail!("agent context has more than {MAX_CONTEXT_REFERENCES} references");
-        }
-        for reference in &self.context {
-            reference.validate()?;
-        }
-        if !(1..=MAX_TURNS).contains(&self.budget.max_turns) {
-            bail!("agent max_turns must be between 1 and {MAX_TURNS}");
-        }
-        if !(1..=MAX_TIMEOUT_MS).contains(&self.budget.timeout_ms) {
-            bail!("agent timeout_ms must be between 1 and {MAX_TIMEOUT_MS}");
-        }
-        if !(1..=MAX_OUTPUT_BYTES).contains(&self.budget.max_output_bytes) {
-            bail!("agent max_output_bytes must be between 1 and {MAX_OUTPUT_BYTES}");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentIdentity {
-    pub agent_id: Uuid,
-    pub task_id: Uuid,
-    pub parent_agent_id: Option<Uuid>,
-    pub root_agent_id: Uuid,
-    pub depth: usize,
-    pub provider_model: String,
-    pub vm_revision: u64,
-    pub manifest_generation: u64,
-    pub starting_context_hash: String,
-    /// Inherited authority fixed when this child is created. Later
-    /// session/project/global grants cannot silently widen a live child;
-    /// an exact task-scoped user approval remains an explicit escalation.
-    #[serde(default)]
-    pub grant_ceiling: EffectSet,
-    /// Canonical durable run for this child when it was spawned from a named
-    /// Brain turn/program. Absent for legacy local-only agent tasks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brain_run_id: Option<crate::brain::store::RunId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentTaskStatus {
-    Queued,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTaskResult {
-    pub identity: AgentIdentity,
-    pub status: AgentTaskStatus,
-    pub final_message: String,
-    pub diagnostics: Vec<String>,
-    pub turns: usize,
-    pub elapsed_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTaskSnapshot {
-    pub identity: AgentIdentity,
-    pub task: String,
-    pub role: AgentRole,
-    pub status: AgentTaskStatus,
-    pub result: Option<AgentTaskResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    TaskQueued {
-        snapshot: AgentTaskSnapshot,
-    },
-    TaskStarted {
-        snapshot: AgentTaskSnapshot,
-    },
-    ToolStarted {
-        task_id: Uuid,
-        name: String,
-    },
-    ToolCompleted {
-        task_id: Uuid,
-        name: String,
-        is_error: bool,
-    },
-    TaskFinished {
-        result: AgentTaskResult,
-    },
 }
 
 /// Transport-neutral lifecycle requests from the child-agent scheduler to the
