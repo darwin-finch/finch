@@ -217,3 +217,36 @@ pub trait AgentSpawning: Send + Sync {
     async fn wait(&self, task_id: Uuid) -> Result<AgentTaskResult>;
     async fn cancel(&self, task_id: Uuid) -> Result<()>;
 }
+
+/// The spawner a runtime has before a host attaches one.
+///
+/// `Weak::new()` needs a concrete type even when the slot is empty, and this says plainly what an
+/// unattached runtime does with a request for a child agent: refuses it.
+pub struct NoAgentSpawning;
+
+#[async_trait::async_trait]
+impl AgentSpawning for NoAgentSpawning {
+    async fn spawn(
+        &self,
+        _spec: AgentTaskSpec,
+        _parent: Option<&AgentIdentity>,
+    ) -> Result<AgentIdentity> {
+        bail!("no agent scheduler is attached to this runtime")
+    }
+
+    async fn authorize(&self, _task_id: Uuid, _parent: Option<&AgentIdentity>) -> Result<()> {
+        bail!("no agent scheduler is attached to this runtime")
+    }
+
+    async fn poll(&self, _task_id: Uuid) -> Result<AgentTaskSnapshot> {
+        bail!("no agent scheduler is attached to this runtime")
+    }
+
+    async fn wait(&self, _task_id: Uuid) -> Result<AgentTaskResult> {
+        bail!("no agent scheduler is attached to this runtime")
+    }
+
+    async fn cancel(&self, _task_id: Uuid) -> Result<()> {
+        bail!("no agent scheduler is attached to this runtime")
+    }
+}

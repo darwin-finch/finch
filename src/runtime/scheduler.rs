@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -320,6 +320,10 @@ struct TaskRecord {
 }
 
 pub struct AgentScheduler {
+    /// A handle to itself, so `spawn` can hand a clone to the task it starts without demanding an
+    /// `Arc` receiver. An `Arc` receiver cannot be reached from a trait method, and this scheduler
+    /// has to be usable through `AgentSpawning` for the runtime to stop naming it.
+    self_ref: Weak<Self>,
     resolver: ProviderResolver,
     runtime: Arc<ProgramRuntime>,
     tasks: RwLock<HashMap<Uuid, TaskRecord>>,
@@ -338,6 +342,33 @@ pub struct AgentScheduler {
     wait_before_provider_poll: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
+#[async_trait::async_trait]
+impl AgentSpawning for AgentScheduler {
+    async fn spawn(
+        &self,
+        spec: AgentTaskSpec,
+        parent: Option<&AgentIdentity>,
+    ) -> Result<AgentIdentity> {
+        AgentScheduler::spawn(self, spec, parent).await
+    }
+
+    async fn authorize(&self, task_id: Uuid, parent: Option<&AgentIdentity>) -> Result<()> {
+        AgentScheduler::authorize(self, task_id, parent).await
+    }
+
+    async fn poll(&self, task_id: Uuid) -> Result<AgentTaskSnapshot> {
+        AgentScheduler::poll(self, task_id).await
+    }
+
+    async fn wait(&self, task_id: Uuid) -> Result<AgentTaskResult> {
+        AgentScheduler::wait(self, task_id).await
+    }
+
+    async fn cancel(&self, task_id: Uuid) -> Result<()> {
+        AgentScheduler::cancel(self, task_id).await
+    }
+}
+
 impl AgentScheduler {
     pub fn new(resolver: ProviderResolver, runtime: Arc<ProgramRuntime>) -> Arc<Self> {
         Self::with_context_store(resolver, runtime, Arc::new(AgentContextStore::default()))
@@ -349,7 +380,8 @@ impl AgentScheduler {
         context_store: Arc<AgentContextStore>,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(256);
-        let scheduler = Arc::new(Self {
+        let scheduler = Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
             resolver,
             runtime: Arc::clone(&runtime),
             tasks: RwLock::new(HashMap::new()),
@@ -392,7 +424,7 @@ impl AgentScheduler {
     }
 
     pub async fn spawn(
-        self: &Arc<Self>,
+        &self,
         spec: AgentTaskSpec,
         parent: Option<&AgentIdentity>,
     ) -> Result<AgentIdentity> {
@@ -495,7 +527,10 @@ impl AgentScheduler {
         if let Ok(snapshot) = self.poll(task_id).await {
             let _ = self.events.send(AgentEvent::TaskQueued { snapshot });
         }
-        let scheduler = Arc::clone(self);
+        let scheduler = self
+            .self_ref
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("agent scheduler is shutting down"))?;
         let child_identity = identity.clone();
         tokio::spawn(async move {
             scheduler

@@ -1,7 +1,7 @@
 //! VM-facing binding for the structured child-agent scheduler.
 
-use crate::runtime::scheduler::{
-    AgentIdentity, AgentScheduler, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec,
+use crate::runtime::agents::{
+    AgentIdentity, AgentSpawning, AgentTaskResult, AgentTaskSnapshot, AgentTaskSpec,
 };
 use anyhow::Result;
 use std::sync::{Arc, Weak};
@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AgentVmBinding {
-    scheduler: Weak<AgentScheduler>,
+    scheduler: Weak<dyn AgentSpawning>,
     parent: Option<AgentIdentity>,
 }
 
@@ -25,14 +25,14 @@ impl AgentVmBinding {
     /// interpreter, so that particular third leg is gone; the constructor stays
     /// `pub(crate)` because the claim should hold on its own terms and not on
     /// which consumers happen to exist.
-    pub(crate) fn new(scheduler: &Arc<AgentScheduler>, parent: Option<AgentIdentity>) -> Self {
+    pub(crate) fn new(scheduler: &Arc<dyn AgentSpawning>, parent: Option<AgentIdentity>) -> Self {
         Self {
             scheduler: Arc::downgrade(scheduler),
             parent,
         }
     }
 
-    fn scheduler(&self) -> Result<Arc<AgentScheduler>> {
+    fn scheduler(&self) -> Result<Arc<dyn AgentSpawning>> {
         self.scheduler
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))
