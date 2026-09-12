@@ -4,7 +4,7 @@
 //! definitions a shared identity, metadata model, and discovery manifest; it
 //! must never select a legacy evaluator as an alternate invocation ABI.
 
-pub mod forth_tokens;
+mod forth_tokens;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,11 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub mod corpus;
+mod corpus;
+pub use corpus::{
+    audit, capture_from_env, capture_with_runtime_from_env, WireCorpusAttempt, WireCorpusAudit,
+    WireCorpusCounts, WireCorpusEntry, WireCorpusLogger,
+};
 
 /// Version of the model/runtime vocabulary handshake.
 pub const MANIFEST_PROTOCOL_VERSION: u32 = 1;

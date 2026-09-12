@@ -78,6 +78,9 @@ id = "programs"
 name = "Program definitions, catalog, and corpus"
 layer = 1
 paths = ["src/programs/"]
+instructions = ["src/programs/AGENTS.md"]
+facade = "src/programs/mod.rs"
+interface = "src/programs/INTERFACE.md"
 depends_on = ["vm"]
 debt = [
   { to = "config", issue = 541 },
