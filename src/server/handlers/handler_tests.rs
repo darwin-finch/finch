@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::brain::store::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
