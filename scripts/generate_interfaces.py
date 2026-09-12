@@ -98,8 +98,8 @@ def exported_names(facade: str, problems: list[str] | None = None) -> list[tuple
 def local_items(facade: str) -> list[tuple[str, str, str]]:
     """(kind, name, rendered) for public items defined in the facade file itself."""
     found = []
-    for kind, name, rendered, doc in scan_items(facade):
-        found.append((kind, name, render(rendered, doc)))
+    for kind, name, signature, doc in scan_items(facade):
+        found.append((kind, name, render(signature, doc)))
     return found
 
 
@@ -268,23 +268,69 @@ def subsystem_sources(root: Path, files: list[str], record: dict) -> dict[str, s
     }
 
 
+def resolve_definition(
+    module: str, defined: str, candidates: list[tuple[str, str, str, str]], problems: list[str],
+) -> tuple[str, str, str, str] | None:
+    """Pick the definition the `use` path names; ambiguity is an error, not a guess."""
+    if len(candidates) == 1:
+        return candidates[0]
+    hint = module.rstrip(":").rsplit("::", 1)[-1]
+    matched = [
+        candidate for candidate in candidates
+        if hint and (f"/{hint}/" in candidate[3] or candidate[3].endswith(f"/{hint}.rs"))
+    ]
+    if len(matched) == 1:
+        return matched[0]
+    problems.append(
+        f"`{defined}` is defined in more than one place and `use {module}` does not disambiguate: "
+        + ", ".join(sorted(candidate[3] for candidate in candidates))
+    )
+    return None
+
+
+def owning_subsystem(manifest: dict, path: str) -> str | None:
+    """Which record owns a path, by longest matching prefix."""
+    best: tuple[int, str | None] = (0, None)
+    for record in manifest.get("subsystem", []):
+        for prefix in record.get("paths", []):
+            if path.startswith(prefix) and len(prefix) > best[0]:
+                best = (len(prefix), record.get("id"))
+    return best[1]
+
+
+def definitions_in(root: Path, sources: dict[str, str]) -> dict[str, list[tuple[str, str, str, str]]]:
+    """name -> [(kind, signature, doc, path)] for every public item in these sources."""
+    found: dict[str, list[tuple[str, str, str, str]]] = {}
+    for path, text in sources.items():
+        for kind, name, signature, doc in scan_items(text):
+            found.setdefault(name, []).append((kind, signature, doc, path))
+    return found
+
+
 def interface_text(root: Path, files: list[str], manifest: dict, record: dict, problems: list[str]) -> str:
     facade_path = record["facade"]
     facade = (root / facade_path).read_text()
-    sources = subsystem_sources(root, files, record)
-    definitions: dict[str, list[tuple[str, str, str]]] = {}
-    for path, text in sources.items():
-        for kind, name, signature, doc in scan_items(text):
-            definitions.setdefault(name, []).append((kind, signature, doc))
+    definitions = definitions_in(root, subsystem_sources(root, files, record))
+    # A facade may re-export another subsystem's type; resolve it and say where it comes from.
+    elsewhere = definitions_in(
+        root, {path: (root / path).read_text(errors="replace") for path in files
+               if path.endswith(".rs") and path.startswith("src/")}
+    )
 
     rendered: list[tuple[str, str, str]] = []
     missing: list[str] = []
-    for _, defined, name in exported_names(facade, problems):
-        candidates = definitions.get(defined)
+    for module, defined, name in exported_names(facade, problems):
+        candidates = definitions.get(defined) or elsewhere.get(defined)
         if not candidates:
             missing.append(defined)
             continue
-        kind, signature, doc = candidates[0]
+        resolved = resolve_definition(module, defined, candidates, problems)
+        if resolved is None:
+            continue
+        kind, signature, doc, path = resolved
+        owner = owning_subsystem(manifest, path)
+        if owner and owner != record["id"]:
+            doc = f"{doc} Re-exported from `{owner}`." if doc else f"Re-exported from `{owner}`."
         if name != defined:
             doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
         rendered.append((kind, name, render(signature, doc)))

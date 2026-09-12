@@ -21,6 +21,11 @@ version = 1
 paths = ["subsystems.toml"]
 
 [[subsystem]]
+id = "app"
+layer = 1
+paths = ["src/app/"]
+
+[[subsystem]]
 id = "vm"
 layer = 0
 paths = ["src/vm/"]
@@ -101,6 +106,7 @@ class Fixture:
         self.write("src/vm/ir.rs", IR)
         self.write("src/vm/interpreter.rs", INTERPRETER)
         self.write("src/vm/AGENTS.md", "# vm capsule\n")
+        self.write("src/app/mod.rs", "/// A type another subsystem re-exports.\npub struct Shared;\n")
         subprocess.run(["git", "-C", str(self.root), "init", "-q"], check=True)
         self.stage()
         self.generate()
@@ -190,6 +196,22 @@ class InterfaceGeneratorTests(unittest.TestCase):
         result = self.fixture.run("--write")
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("Phase2", self.fixture.interface(), "every name in a group must be expanded")
+
+    def test_cross_subsystem_reexport_says_where_it_comes_from(self) -> None:
+        self.fixture.edit("src/vm/mod.rs", "pub use interpreter::{inspect, run, Handler};", "pub use crate::app::Shared;\npub use interpreter::{inspect, run, Handler};")
+        result = self.fixture.run("--write")
+        self.assertEqual(0, result.returncode, result.stderr)
+        text = self.fixture.interface()
+        self.assertIn("pub struct Shared;", text, "a re-export from another subsystem must be listed")
+        self.assertIn("Re-exported from `app`", text, "and must say which subsystem owns it")
+
+    def test_ambiguous_definition_fails_rather_than_guessing(self) -> None:
+        self.fixture.write("src/app/other.rs", "/// A second definition of the same name.\npub struct Shared;\n")
+        self.fixture.edit("src/vm/mod.rs", "pub use interpreter::{inspect, run, Handler};", "pub use crate::app::Shared;\npub use interpreter::{inspect, run, Handler};")
+        result = self.fixture.run("--write")
+        self.assertNotEqual(0, result.returncode, "two definitions of one name must not be guessed between")
+        self.assertIn("defined in more than one place", result.stderr, result.stderr)
+        self.assertIn("src/app/other.rs", result.stderr, "the diagnostic must name the candidates")
 
     def test_glob_import_fails_loudly(self) -> None:
         self.fixture.edit("src/vm/mod.rs", "pub use ir::{Detail as Reason, Module, Phase};", "pub use ir::*;")

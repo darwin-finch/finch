@@ -2154,12 +2154,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             &guard,
         )
         .await?;
-    finch::programs::corpus::capture_with_runtime_from_env(
+    finch::programs::capture_with_runtime_from_env(
         &program_runtime,
         "daemon",
         "daemon-selected",
         "one_shot",
-        finch::programs::corpus::WireCorpusAttempt::FirstPass,
+        finch::programs::WireCorpusAttempt::FirstPass,
         &response,
     );
     if show_program {
@@ -2203,12 +2203,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::corpus::capture_with_runtime_from_env(
+            finch::programs::capture_with_runtime_from_env(
                 &program_runtime,
                 "daemon",
                 "daemon-selected",
                 "one_shot",
-                finch::programs::corpus::WireCorpusAttempt::Repair,
+                finch::programs::WireCorpusAttempt::Repair,
                 &repair,
             );
             if show_program {
@@ -2231,12 +2231,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::corpus::capture_with_runtime_from_env(
+            finch::programs::capture_with_runtime_from_env(
                 &program_runtime,
                 "daemon",
                 "daemon-selected",
                 "one_shot",
-                finch::programs::corpus::WireCorpusAttempt::Repair,
+                finch::programs::WireCorpusAttempt::Repair,
                 &repair,
             );
             if show_program {
@@ -2330,15 +2330,15 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
-            finch::programs::corpus::capture_with_runtime_from_env(
+            finch::programs::capture_with_runtime_from_env(
                 &program_runtime,
                 &provider,
                 &model,
                 "one_shot",
                 if wire_repair_requested {
-                    finch::programs::corpus::WireCorpusAttempt::Repair
+                    finch::programs::WireCorpusAttempt::Repair
                 } else {
-                    finch::programs::corpus::WireCorpusAttempt::FirstPass
+                    finch::programs::WireCorpusAttempt::FirstPass
                 },
                 &source,
             );
@@ -2713,7 +2713,7 @@ async fn run_node_info() -> Result<()> {
 fn run_wire_corpus_command(cmd: WireCorpusCommand) -> Result<()> {
     match cmd {
         WireCorpusCommand::Audit { corpus, json } => {
-            let report = finch::programs::corpus::audit(&corpus)?;
+            let report = finch::programs::audit(&corpus)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 return Ok(());
