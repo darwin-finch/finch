@@ -224,19 +224,32 @@ class SubsystemManifestTests(unittest.TestCase):
         self.fixture.edit("src/vm/mod.rs", "pub struct Value;", "pub struct Value;\nuse crate::{\n    cli::Cli,\n};")
         self.assert_error("undeclared dependency vm (layer 0) -> cli (layer 2)", "src/vm/mod.rs:4 crate::cli")
 
-    def test_module_split_across_owners_fails(self) -> None:
+    def test_a_nested_owner_is_attributed_separately_from_its_parent(self) -> None:
+        # The point of a sub-subsystem: `crate::app::split` must reach the owner declared on the
+        # nested path, not the owner of `src/app/`, or the nested declaration buys nothing.
         self.fixture.write("src/app/split.rs", "pub fn split() {}\n")
         self.fixture.edit("subsystems.toml", 'paths = ["README.md"]', 'paths = ["README.md", "src/app/split.rs"]')
         self.fixture.edit("subsystems.toml", '[[subsystem]]\nid = "docs"', '[[subsystem]]\nid = "docs"\nlayer = 3')
-        self.assert_error("src/app: top-level module is split across owners ['app', 'docs']")
+        self.fixture.edit("src/vm/mod.rs", "pub struct Value;", "pub struct Value;\nuse crate::app::split::split;")
+        self.assert_error("undeclared dependency vm (layer 0) -> docs (layer 3)", "crate::app::split")
+
+    def test_a_parent_reference_still_reaches_the_parent(self) -> None:
+        # The sibling of the rule above: a path that stops short of the nested module keeps its
+        # existing owner, so declaring a sub-subsystem does not silently re-route the parent's edges.
+        self.fixture.write("src/app/split.rs", "pub fn split() {}\n")
+        self.fixture.edit("subsystems.toml", 'paths = ["README.md"]', 'paths = ["README.md", "src/app/split.rs"]')
+        self.fixture.edit("subsystems.toml", '[[subsystem]]\nid = "docs"', '[[subsystem]]\nid = "docs"\nlayer = 3')
+        self.assert_clean()
 
     def test_global_entry_beats_a_shorter_subsystem_prefix(self) -> None:
-        # Non-Rust files may be carved out of a subsystem; Rust modules may not (split rule).
+        # A cross-cutting carve-out inside a subsystem's directory keeps its own owner, and a
+        # reference into it is attributed there rather than to the surrounding subsystem.
         self.fixture.write("src/vm/shared/schema.capnp", "@0xdeadbeef;\n")
         self.fixture.edit("subsystems.toml", 'paths = ["src/lib.rs",', 'paths = ["src/vm/shared/", "src/lib.rs",')
         self.assert_clean()
         self.fixture.write("src/vm/shared/codec.rs", "pub fn codec() {}\n")
-        self.assert_error("src/vm: top-level module is split across owners ['global', 'vm']")
+        self.fixture.edit("src/app/mod.rs", "pub struct Hook;", "pub struct Hook;\nuse crate::vm::shared::codec;")
+        self.assert_clean()
 
     def test_record_without_an_id_is_reported_not_raised(self) -> None:
         self.fixture.edit("subsystems.toml", 'id = "docs"\n', "")

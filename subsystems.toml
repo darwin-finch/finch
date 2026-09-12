@@ -7,6 +7,14 @@
 # explicit exclusion. A path ending in "/" is a prefix; anything else is an exact file. The
 # longest matching entry wins; two matches of equal length are an error.
 #
+# Nesting: a subsystem may be declared on a path inside another subsystem's path, which is how a
+# sub-subsystem is spelled — there is no separate kind of record. Ownership follows the longest
+# match, and a `crate::a::b` reference is attributed to the owner of the deepest module file the
+# path names, so `crate::tools::mcp::McpClient` reaches a subsystem declared on `src/tools/mcp/`
+# while `crate::tools::ToolRegistry` still reaches its parent. The dependency ratchet then applies
+# unchanged: a child that the parent uses sits at a lower layer, and any edge back up to the parent
+# is debt like any other.
+#
 # Dependencies: every production `crate::<module>` reference from one subsystem into another
 # must be declared exactly once, either in `depends_on` or as `debt`, and every declared edge
 # must still have a reference. `depends_on` edges point strictly to a lower `layer`, so the
