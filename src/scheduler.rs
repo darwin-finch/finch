@@ -451,7 +451,10 @@ impl AgentScheduler {
         };
         let vm_revision = self.runtime.revision();
         let manifest_generation = self.runtime.manifest_generation();
-        let parent_brain_run_id = match parent.and_then(|identity| identity.brain_run_id) {
+        let parent_brain_run_id = match parent
+            .and_then(|identity| identity.brain_run_id)
+            .map(crate::brain::store::RunId)
+        {
             Some(run_id) => Some(run_id),
             None => self
                 .active_brain_parent
@@ -506,7 +509,7 @@ impl AgentScheduler {
             manifest_generation,
             starting_context_hash,
             grant_ceiling,
-            brain_run_id,
+            brain_run_id: brain_run_id.map(|run_id| run_id.0),
         };
         let snapshot = AgentTaskSnapshot {
             identity: identity.clone(),
@@ -738,7 +741,7 @@ impl AgentScheduler {
                 let (response_tx, response_rx) = oneshot::channel();
                 control
                     .send(AgentBrainControlRequest::Finish {
-                        run_id,
+                        run_id: crate::brain::store::RunId(run_id),
                         status,
                         detail,
                         response_tx,
@@ -1609,10 +1612,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            identity.brain_run_id,
-            Some(crate::brain::store::RunId(identity.task_id))
-        );
+        assert_eq!(identity.brain_run_id, Some(identity.task_id));
         let result = scheduler.wait(identity.task_id).await.unwrap();
         assert_eq!(result.status, AgentTaskStatus::Completed);
         assert_eq!(
@@ -1761,10 +1761,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            nested.brain_run_id,
-            Some(crate::brain::store::RunId(nested.task_id))
-        );
+        assert_eq!(nested.brain_run_id, Some(nested.task_id));
         started.notified().await;
         scheduler.cancel(identity.task_id).await.unwrap();
         scheduler.cancel(nested.task_id).await.unwrap();
