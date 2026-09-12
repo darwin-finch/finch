@@ -7,15 +7,14 @@ they advertise, and calling one. `McpClient` holds the connections; `McpConnecti
 server; `McpServerConfig` and `TransportType` are the user-facing configuration shape.
 
 This is a sub-subsystem of `tools` — a subsystem declared on a path inside another's, which is all
-nesting means in [`subsystems.toml`](../../../subsystems.toml). Executing a *local* tool is the
+nesting means: a directory with its own capsule inside another's. Executing a *local* tool is the
 parent's job; nothing here decides permissions or authority.
 
 **Interface:** [`INTERFACE.md`](INTERFACE.md) lists every exported item with its signature. The
 child modules are private, so the `pub use` list in `src/tools/mcp/mod.rs` is the whole public
 surface, and `scripts/check_subsystems.py` rejects a `pub mod` there.
 
-**Dependencies:** layer 0, below its parent at layer 1, so `tools` may depend on it and it may
-depend on nothing. It carries one debt edge back up to `tools` — `client.rs` uses the tool
+**Dependencies:** none downward, and one unwanted edge back up to its parent — `client.rs` uses the tool
 vocabulary `ToolDefinition` and `ToolInputSchema` — which clears when `tools` splits its API from
 its implementations (that is the tools facade work). Add no other import.
 

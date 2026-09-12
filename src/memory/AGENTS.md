@@ -10,10 +10,9 @@ and `src/workbook.rs`. Local model loading is `src/models/`; Brain event logs ar
 modules are private, so the `pub use` list in `src/memory/mod.rs` is the whole public surface, and
 `scripts/check_subsystems.py` rejects a `pub mod` there.
 
-**Dependencies:** layer 1 in [`subsystems.toml`](../../subsystems.toml), no allowed edges. Debt:
-`memory → programs` (`memory::program_registry`, `MemorySystem::save_lisp_define`); importing any
-other subsystem fails `scripts/check_subsystems.py`, and the check will not stop a new `programs`
-import, so add none. The planned
+**Dependencies:** one, and it is unwanted: `memory → programs` (`memory::program_registry`,
+`MemorySystem::save_lisp_define`). Add no others, and prefer removing that one to matching it. The
+planned
 `finch-memory` crate must exclude ONNX, Candle, tokenizers, and Hugging Face; only
 `neural_embedding.rs` uses them today, so add no new uses.
 

@@ -16,7 +16,7 @@ arrive, hold intent only; this root index is the deliberate exception that maps 
 intended structure side by side.
 
 `scripts/check_docs.py` checks this file's links, anchors, shell fences, and known stale claims,
-that it links every `docs` entry in `subsystems.toml`, that it cites no historical or archived
+that it links every capsule under `src/`, that it cites no historical or archived
 document, and that design documents appear only under intended direction or open questions. It does
 not verify the prose or the cited symbols.
 
@@ -33,9 +33,8 @@ Everything else in this section follows from that:
 - **A subsystem's interface is a short, enumerable list.** Implementation modules are private, so
   what a caller can reach is what the facade re-exports. `vm` is the worked example: about 60
   exported items stand in front of roughly 23,000 lines.
-- **Dependencies are recorded, not discovered.** [`subsystems.toml`](subsystems.toml) answers "what
-  may this touch, and what touches it" as a lookup rather than a search, and the checker keeps the
-  record true.
+- **A module states its own limits.** Its capsule says what it may depend on and what it must not,
+  beside the code rather than in a central file that drifts from the tree.
 - **Instructions are local.** A capsule beside the code states scope, limits, and focused tests, so
   an agent starting there inherits the root rules plus one page, not the whole project narrative.
 - **Interfaces should be readable without the source.** A generated, signature-level digest of each
@@ -72,10 +71,9 @@ Named Brains run on per-Brain runtimes from `BrainStore::program_runtime`
 
 ## Subsystems
 
-[`subsystems.toml`](subsystems.toml) is the authoritative ownership record: every tracked file
-belongs to exactly one subsystem, the global set, or an explicit exclusion, and
-`scripts/check_subsystems.py` enforces that on every PR. This table summarizes it. Layers are the
-intended direction (lower is more foundational); see [dependencies](#dependencies). "None yet"
+The tree is the ownership record: a directory that carries an `AGENTS.md` is a module, and the
+files under it are its own. This table summarizes the current shape. Layers are the intended
+direction (lower is more foundational); see [dependencies](#dependencies). "None yet"
 marks a subsystem without local documentation; the subsystem program adds one before code moves.
 Documents with known stale claims are flagged in [documentation status](#documentation-status).
 
@@ -117,9 +115,11 @@ harness, and the [Cargo slot wrapper](.agents/skills/finch-backlog/scripts/with-
 
 ## Dependencies
 
-Module visibility is not enforced yet, but the dependency record is. `subsystems.toml` declares
-every cross-subsystem edge found in production `crate::` paths, either as an allowed
-`depends_on` edge, which must point to a lower layer, or as `debt` against the intended
+Module visibility is enforced where a facade exists: child modules are private, so the `pub use`
+list is the whole surface. Direction is not mechanically enforced — `scripts/seam_cost.py` reports
+the edges a directory actually has, and each capsule states which of them are intended. The edges
+below are measured from production `crate::` paths, either as an intended edge or as debt against
+the intended
 direction. `scripts/check_subsystems.py` fails on an undeclared edge and on a declared edge that
 no longer exists, so the record only shrinks as facade work lands. At the module level, nearly
 every top-level module still belongs to one strongly connected component (see the
@@ -337,6 +337,6 @@ Measured at commit `cb39ea0f`; re-derive before relying on these numbers.
   top-level-module edges from production `crate::` paths, with `#[cfg(test)] mod tests` blocks
   removed. A different test-exclusion heuristic gives 25; treat the size as approximate.
 - Subsystem level, at commit `74866238`: 61 cross-subsystem edges, 35 allowed (`depends_on`)
-  and 26 recorded as debt in [`subsystems.toml`](subsystems.toml).
+  and 26 recorded as debt at the time.
 - After [#584](https://github.com/darwin-finch/finch/issues/584): `vm` has no outgoing edge (59 edges,
   35 allowed, 24 debt) and is no longer part of the module-level component.

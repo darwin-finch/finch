@@ -14,11 +14,11 @@ import argparse
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = "subsystems.toml"
+CAPSULE = "AGENTS.md"
+FACADE = "mod.rs"
 GENERATED_BY = "scripts/generate_interfaces.py"
 
 # `pub use path::{A, B};` or `pub use path::Name;`, possibly spanning lines.
@@ -362,14 +362,33 @@ def resolve_definition(
     return None
 
 
-def owning_subsystem(manifest: dict, path: str) -> str | None:
-    """Which record owns a path, by longest matching prefix."""
-    best: tuple[int, str | None] = (0, None)
-    for record in manifest.get("subsystem", []):
-        for prefix in record.get("paths", []):
-            if path.startswith(prefix) and len(prefix) > best[0]:
-                best = (len(prefix), record.get("id"))
-    return best[1]
+def module_directories(files: list[str]) -> list[str]:
+    """Directories that are modules with a stated interface: an AGENTS.md beside a mod.rs.
+
+    The tree is the record. A directory says it is a module by carrying a capsule, so there is
+    nothing to keep in sync with a manifest and no way for the two to disagree.
+    """
+    tracked = set(files)
+    return sorted(
+        f"{Path(path).parent.as_posix()}/"
+        for path in files
+        if Path(path).name == CAPSULE
+        and Path(path).parent != Path(".")
+        and (Path(path).parent / FACADE).as_posix() in tracked
+    )
+
+
+def owning_module(directories: list[str], path: str) -> str | None:
+    """The innermost module directory containing a path, named as a caller would say it.
+
+    A path under no capsule still belongs somewhere, so it falls back to its top-level directory:
+    a re-export should always be able to say where it came from.
+    """
+    best = max((d for d in directories if path.startswith(d)), key=len, default=None)
+    if best:
+        return best.removeprefix("src/").rstrip("/").replace("/", "::")
+    parts = path.split("/")
+    return parts[1].removesuffix(".rs") if len(parts) > 1 and parts[0] == "src" else None
 
 
 def definitions_in(root: Path, sources: dict[str, str]) -> dict[str, list[tuple[str, str, str, str]]]:
@@ -381,10 +400,21 @@ def definitions_in(root: Path, sources: dict[str, str]) -> dict[str, list[tuple[
     return found
 
 
-def interface_text(root: Path, files: list[str], manifest: dict, record: dict, problems: list[str]) -> str:
-    facade_path = record["facade"]
+def interface_text(
+    root: Path, files: list[str], directories: list[str], directory: str, problems: list[str],
+) -> str:
+    identifier = directory.removeprefix("src/").rstrip("/").replace("/", "::")
+    facade_path = f"{directory}{FACADE}"
     facade = (root / facade_path).read_text()
-    sources = subsystem_sources(root, files, record)
+    # A nested module states its own interface, so its files belong to it, not to its parent.
+    nested = [other for other in directories if other != directory and other.startswith(directory)]
+    sources = {
+        path: (root / path).read_text(errors="replace")
+        for path in files
+        if path.startswith(directory)
+        and path.endswith(".rs")
+        and not any(path.startswith(child) for child in nested)
+    }
     definitions = definitions_in(root, sources)
     # A facade may re-export another subsystem's type; resolve it and say where it comes from.
     elsewhere = definitions_in(
@@ -403,8 +433,8 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict, p
         if resolved is None:
             continue
         kind, signature, doc, path = resolved
-        owner = owning_subsystem(manifest, path)
-        if owner and owner != record["id"]:
+        owner = owning_module(directories, path)
+        if owner and owner != identifier:
             doc = f"{doc} Re-exported from `{owner}`." if doc else f"Re-exported from `{owner}`."
         if name != defined:
             doc = f"{doc} Exported as `{name}`." if doc else f"Exported as `{name}`."
@@ -415,7 +445,7 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict, p
     exported = {
         item for _, defined, name in exported_names(facade) for item in (defined, name)
     } | {name for _, name, _ in local_items(facade)}
-    problems.extend(f"{record['id']}: no definition found for exported `{name}`" for name in missing)
+    problems.extend(f"{identifier}: no definition found for exported `{name}`" for name in missing)
     referenced = {
         word for _, _, text in rendered
         for line in text.splitlines() if not line.lstrip().startswith("///")
@@ -424,26 +454,18 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict, p
     }
     unnameable = sorted((referenced & set(definitions)) - exported)
 
-    depends = record.get("depends_on", []) or []
-    debt = [entry.get("to") for entry in record.get("debt", [])]
-    allowed = ", ".join(f"`{name}`" for name in sorted(depends)) or "nothing"
-    debt_text = f" Debt: {', '.join(f'`{name}`' for name in sorted(debt))}." if debt else ""
-    capsule = next(iter(record.get("instructions", [])), None)
-
     lines = [
-        f"# {record['id']} — public interface",
+        f"# {identifier} — public interface",
         "",
         f"Generated from [`{facade_path}`]({Path(facade_path).name}) by `{GENERATED_BY}`; "
         "CI fails if it drifts. Edit the code, then regenerate.",
         "",
         f"- **Facade:** `{facade_path}`",
     ]
-    if capsule:
-        lines.append(f"- **Capsule:** [`{Path(capsule).name}`]({Path(capsule).name})")
-    lines.append(f"- **May depend on:** {allowed}.{debt_text}")
+    lines.append(f"- **Capsule:** [`{CAPSULE}`]({CAPSULE})")
     lines.append("")
     lines.append(
-        "Everything below is what callers outside this subsystem can reach. Implementation "
+        "Everything below is what callers outside this module can reach. Implementation "
         "modules are private; their contents are deliberately absent."
     )
     for title, kinds in SECTIONS:
@@ -465,15 +487,14 @@ def interface_text(root: Path, files: list[str], manifest: dict, record: dict, p
 
 def interfaces(root: Path) -> tuple[list[tuple[Path, str]], list[str]]:
     """Generated (path, text) pairs, and anything the generator could not parse or resolve."""
-    manifest = tomllib.loads((root / MANIFEST).read_text())
     files = tracked_files(root)
+    directories = module_directories(files)
     generated, problems = [], []
-    for record in manifest.get("subsystem", []):
-        if "facade" not in record or "interface" not in record:
-            continue
-        generated.append(
-            (root / record["interface"], interface_text(root, files, manifest, record, problems))
-        )
+    for directory in directories:
+        generated.append((
+            root / f"{directory}INTERFACE.md",
+            interface_text(root, files, directories, directory, problems),
+        ))
     return generated, problems
 
 

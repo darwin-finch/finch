@@ -4,9 +4,8 @@ Generated from [`src/programs/mod.rs`](mod.rs) by `scripts/generate_interfaces.p
 
 - **Facade:** `src/programs/mod.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
-- **May depend on:** `vm`. Debt: `config`, `runtime`.
 
-Everything below is what callers outside this subsystem can reach. Implementation modules are private; their contents are deliberately absent.
+Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
 
 ## Types
 

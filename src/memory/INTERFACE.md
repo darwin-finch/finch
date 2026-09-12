@@ -4,9 +4,8 @@ Generated from [`src/memory/mod.rs`](mod.rs) by `scripts/generate_interfaces.py`
 
 - **Facade:** `src/memory/mod.rs`
 - **Capsule:** [`AGENTS.md`](AGENTS.md)
-- **May depend on:** nothing. Debt: `programs`.
 
-Everything below is what callers outside this subsystem can reach. Implementation modules are private; their contents are deliberately absent.
+Everything below is what callers outside this module can reach. Implementation modules are private; their contents are deliberately absent.
 
 ## Types
 
