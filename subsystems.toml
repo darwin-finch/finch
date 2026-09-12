@@ -90,6 +90,8 @@ name = "MemTree memory and retrieval"
 layer = 1
 paths = ["src/memory/", "src/memory_status.rs", "src/workbook.rs"]
 instructions = ["src/memory/AGENTS.md"]
+facade = "src/memory/mod.rs"
+interface = "src/memory/INTERFACE.md"
 depends_on = []
 debt = [
   { to = "programs", issue = 541 },
