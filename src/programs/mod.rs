@@ -35,27 +35,33 @@ pub const LANGUAGE_SCHEMA: &str = include_str!("../../vocabulary/language/schema
 /// approvals, and host-effect failures deliberately do not match: callers must
 /// never turn retrying model output into implicit effect replay.
 pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
-    matches!(
-        diagnostic,
-        value if value.starts_with("E-READ-")
-            || value.starts_with("E-TYPE-")
-            || value.starts_with("E-STACK-")
-            || value.starts_with("E-LISP-")
-            || value.starts_with("E-FORTH-")
-            || value.starts_with("E-LINK-")
-            || value.starts_with("E-CAP-")
-            || value.starts_with("E-WIRE-")
-    )
+    // Read the code rather than the whole string: a diagnostic may arrive as one line from
+    // `Display` or as a rendered report that begins `error[CODE]`, and a prefix test on the raw
+    // text silently stops matching the moment the rendering changes.
+    let Some(code) = wire_diagnostic_code(diagnostic) else {
+        return false;
+    };
+    [
+        "E-READ-", "E-TYPE-", "E-STACK-", "E-LISP-", "E-FORTH-", "E-LINK-", "E-CAP-", "E-WIRE-",
+    ]
+    .iter()
+    .any(|prefix| code.starts_with(prefix))
 }
 
 /// Return the stable leading diagnostic code without retaining the diagnostic
 /// prose in conformance metrics.
 pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> {
-    diagnostic
-        .split_once(':')
-        .map(|(code, _)| code.trim())
-        .filter(|code| code.starts_with("E-"))
-        .map(str::to_string)
+    let head = diagnostic.lines().next()?;
+    // Both spellings are in use: `E-LINK-002: message` from `Display`, and
+    // `error[E-LINK-002]: message` from the rendered report a model is shown.
+    let code = match head
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+    {
+        Some((code, _)) => code.trim(),
+        None => head.split_once(':')?.0.trim(),
+    };
+    code.starts_with("E-").then(|| code.to_string())
 }
 
 /// Classify a rejected provider submission for aggregate conformance metrics.
@@ -1010,6 +1016,45 @@ fn leading_documentation(source: &str, language: ProgramLanguage) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_rendered_diagnostics_stay_repairable_and_classifiable() {
+        // The renderer prefixes the code with `error[` and adds lines under it. A prefix test on
+        // the raw text stops matching the moment that happens, and the repair path silently never
+        // fires again — which is exactly what this asserts cannot happen.
+        let rendered = "error[E-LINK-002]: unknown Co-Forth word 'dupp'\n \
+--> direct-cli.forth:1:1\n  |\n1 | dupp\n  | ^^^^\n  = hint: did you mean `dup`?";
+        assert_eq!(
+            Some("E-LINK-002".to_string()),
+            wire_diagnostic_code(rendered),
+            "the code must be read out of a rendered report, not just a one-line Display"
+        );
+        assert!(
+            is_repairable_wire_diagnostic(rendered),
+            "a rendered link error is still repairable: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_one_line_diagnostics_still_parse() {
+        // `Display` is unchanged and still used in error chains, so both spellings must work.
+        assert_eq!(
+            Some("E-TYPE-002".to_string()),
+            wire_diagnostic_code("E-TYPE-002: expected int, found string")
+        );
+        assert!(is_repairable_wire_diagnostic(
+            "E-TYPE-002: expected int, found string"
+        ));
+    }
+
+    #[test]
+    fn test_a_non_diagnostic_string_has_no_code_and_is_not_repairable() {
+        assert_eq!(None, wire_diagnostic_code("VM program ended as Failed"));
+        assert!(!is_repairable_wire_diagnostic("VM program ended as Failed"));
+        assert!(!is_repairable_wire_diagnostic(
+            "error[X-OTHER-001]: not ours"
+        ));
+    }
+
     use super::*;
     use crate::vm::{TypedExecutionStatus, TypedRuntime};
 
