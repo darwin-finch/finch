@@ -12,6 +12,13 @@ outcome need not be user-visible: deletion, refactoring, and enabling work are v
 Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost proportional to the change; otherwise remove it.
 Tooling is advisory mechanical lint, never an authority engine.
 
+## Pick the next item by cost and benefit
+
+Order ready work by `(value × certainty × (1 + unblocking)) / cost`, scored 1–5 per axis and
+recorded on the item. Cheap, certain, unblocking changes merge first; review attention is the
+scarce resource. See [picking the next item](references/queue.md) for the axes, the two guards that
+keep the score honest, what makes an item ready, and the five numbers to record per change.
+
 ## Say the tier out loud, then run only that tier
 
 Proportionality fails by being thorough. Name the tier in the first message about a change, and run
@@ -53,6 +60,8 @@ bookkeeping, terminal events, and frontier tracking.
    Small, obvious changes should have small contracts. Add detail only for actual risk.
 4. Check current branches, worktrees, pull requests, and the procedural claim record for overlap.
    Preserve unrelated and unpushed work.
+5. Record the four queue scores and one sentence of justification before starting, and re-score
+   if actual cost passes double the estimate.
 
 Readiness, a candidate implementation, and a review finding answer different questions. A green
 check or severe finding does not redefine the issue. People remain accountable for readiness,
