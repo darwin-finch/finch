@@ -54,7 +54,7 @@ pub use vocabulary::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
     capability_grant_entry_type, core_vocabulary, core_word_documentation, core_word_registry,
     core_word_spec, tree_entry_type, tree_listing_type, CoreHostBinding, CoreWordDocumentation,
-    CoreWordImplementation,
+    CoreWordImplementation, CoreWordSpec,
 };
 
 /// Version of the typed VM contract and serialized IR family.

@@ -289,8 +289,19 @@ class SubsystemManifestTests(unittest.TestCase):
         (self.fixture.root / "src/app/AGENTS.md").symlink_to("CLAUDE.md")
         self.assert_error("src/app/AGENTS.md must not be a symlink: Finch's tree-list rejects symlinks")
 
-    def test_facade_file_may_not_declare_public_modules(self) -> None:
+    def add_facade(self) -> None:
+        self.fixture.write("src/vm/INTERFACE.md", "# vm — public interface\n")
+        self.fixture.edit(
+            "subsystems.toml", 'docs = ["src/vm/VM.md"]',
+            'docs = ["src/vm/VM.md"]\nfacade = "src/vm/mod.rs"\ninterface = "src/vm/INTERFACE.md"',
+        )
+
+    def test_facade_requires_a_generated_interface(self) -> None:
         self.fixture.edit("subsystems.toml", 'docs = ["src/vm/VM.md"]', 'docs = ["src/vm/VM.md"]\nfacade = "src/vm/mod.rs"')
+        self.assert_error("subsystem 'vm': a subsystem with a facade needs a generated interface")
+
+    def test_facade_file_may_not_declare_public_modules(self) -> None:
+        self.add_facade()
         self.fixture.edit("src/vm/mod.rs", "pub struct Value;", "mod ir;\n// pub mod commented;\nconst S: &str = \"pub mod quoted;\";\npub struct Value;")
         self.fixture.write("src/vm/ir.rs", "pub struct Ir;\n")
         self.assert_clean()
@@ -300,7 +311,8 @@ class SubsystemManifestTests(unittest.TestCase):
                 self.assert_error(f"src/vm/mod.rs:2: public module `ir` in the 'vm' facade")
 
     def test_facade_must_name_a_tracked_file(self) -> None:
-        self.fixture.edit("subsystems.toml", 'docs = ["src/vm/VM.md"]', 'docs = ["src/vm/VM.md"]\nfacade = "src/vm/lib.rs"')
+        self.fixture.write("src/vm/INTERFACE.md", "# vm — public interface\n")
+        self.fixture.edit("subsystems.toml", 'docs = ["src/vm/VM.md"]', 'docs = ["src/vm/VM.md"]\nfacade = "src/vm/lib.rs"\ninterface = "src/vm/INTERFACE.md"')
         self.assert_error("subsystem 'vm': facade must name a tracked file; actual='src/vm/lib.rs'")
 
     def test_excluded_entries_need_a_reason(self) -> None:

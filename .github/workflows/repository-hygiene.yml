@@ -26,6 +26,10 @@ jobs:
         run: python3 scripts/check_no_ssh_surface.py
       - name: Run removed SSH surface regressions
         run: python3 scripts/test_no_ssh_surface.py
+      - name: Check generated subsystem interfaces
+        run: |
+          python3 scripts/generate_interfaces.py
+          python3 scripts/test_generate_interfaces.py
       - name: Check subsystem ownership and dependency record
         run: |
           python3 scripts/check_subsystems.py

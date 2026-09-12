@@ -445,6 +445,12 @@ def facade_errors(manifest: dict, files: list[str], root: Path) -> list[str]:
         if not isinstance(facade, str) or facade not in files:
             errors.append(f"subsystem {owner!r}: facade must name a tracked file; actual={facade!r}")
             continue
+        interface = record.get("interface")
+        if not isinstance(interface, str) or interface not in files:
+            errors.append(
+                f"subsystem {owner!r}: a subsystem with a facade needs a generated interface; "
+                f"add `interface = \"<path>\"` and run scripts/generate_interfaces.py --write"
+            )
         text = blank_comments_and_literals((root / facade).read_text(errors="replace"))
         for match in PUBLIC_MODULE.finditer(text):
             line = text.count("\n", 0, match.start()) + 1
