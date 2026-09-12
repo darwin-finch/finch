@@ -24,9 +24,9 @@ SUPPORTED_VERSION = 1
 GLOBAL = "global"
 EXCLUDED = "excluded"
 
-CRATE_PATH = re.compile(r"\bcrate::([a-z_][a-z0-9_]*)")
+CRATE_PATH = re.compile(r"\bcrate::((?:[a-z_][a-z0-9_]*)(?:::[a-z_][a-z0-9_]*)*)")
 CRATE_GROUP = re.compile(r"\bcrate::\s*\{")
-GROUP_ITEM = re.compile(r"\s*([a-z_][a-z0-9_]*)")
+GROUP_ITEM = re.compile(r"\s*((?:[a-z_][a-z0-9_]*)(?:::[a-z_][a-z0-9_]*)*)")
 RAW_STRING = re.compile(r'[bc]?r(#*)"')
 CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
 ROUTING_HEADING = "### Subsystem capsules"
@@ -251,7 +251,11 @@ def strip_comments_and_tests(text: str) -> str:
 
 
 def crate_references(text: str) -> list[tuple[int, str]]:
-    """(offset, top-level module) for `crate::m` paths and each item of `crate::{a::x, b}`."""
+    """(offset, module path) for `crate::a::b` paths and each item of `crate::{a::x, b}`.
+
+    The whole lower-case chain is kept, not just its first segment, so a subsystem declared on a
+    nested path such as `src/tools/mcp/` can be told apart from its parent.
+    """
     found = [(match.start(), match.group(1)) for match in CRATE_PATH.finditer(text)]
     for group in CRATE_GROUP.finditer(text):
         depth, index, item_start = 1, group.end(), group.end()
@@ -293,20 +297,21 @@ def observed_edges(
     sources = {path: (root / path).read_text(errors="replace") for path in rust}
     test_files = test_module_files(sources)
 
-    # Edge targets are attributed by top-level module, so a module split across owners would
-    # misattribute edges; refuse that until the scan resolves deeper paths.
-    owners_by_module: dict[str, set[str]] = defaultdict(set)
-    for path in rust:
-        parts = path.split("/")
-        module = parts[1][:-3] if len(parts) == 2 else parts[1]
-        owner, _ = resolve(path, entries)
-        if owner:
-            owners_by_module[module].add(owner)
-    module_owner: dict[str, str] = {}
-    for module, owners in sorted(owners_by_module.items()):
-        if len(owners) > 1 and module != "bin":
-            errors.append(f"src/{module}: top-level module is split across owners {sorted(owners)}")
-        module_owner[module] = sorted(owners)[0]
+    # A reference is attributed to the owner of the deepest module file the path names, so
+    # `crate::tools::mcp::McpClient` reaches a subsystem declared on `src/tools/mcp/` while
+    # `crate::tools::ToolRegistry` still reaches the parent. Trailing type and function names
+    # have no file, and fall back to the longest prefix that does.
+    tracked = set(rust)
+
+    def module_owner(module_path: str) -> str | None:
+        parts = module_path.split("::")
+        for depth in range(len(parts), 0, -1):
+            stem = "src/" + "/".join(parts[:depth])
+            for candidate in (f"{stem}.rs", f"{stem}/mod.rs"):
+                if candidate in tracked:
+                    owner, _ = resolve(candidate, entries)
+                    return owner
+        return None
 
     edges: dict[tuple[str, str], list[str]] = defaultdict(list)
     for path in rust:
@@ -318,7 +323,7 @@ def observed_edges(
             continue
         text = strip_comments_and_tests(sources[path])
         for offset, module in crate_references(text):
-            target = module_owner.get(module)
+            target = module_owner(module)
             if target in (None, GLOBAL, EXCLUDED, owner):
                 continue
             line = text.count("\n", 0, offset) + 1
