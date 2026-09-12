@@ -2276,12 +2276,12 @@ impl Repl {
         // Child agents share the currently selected generator through this
         // resolver, and share the same persistent VM runtime as the root.
         let scheduler_phase = crate::startup::phase(crate::startup::PHASE_SCHEDULER_INIT);
-        let provider_resolver = crate::runtime::scheduler::ProviderResolver::with_config(
+        let provider_resolver = crate::scheduler::ProviderResolver::with_config(
             Arc::clone(&claude_gen),
             self._config.clone(),
             self.daemon_client.clone(),
         );
-        let agent_scheduler = crate::runtime::scheduler::AgentScheduler::new(
+        let agent_scheduler = crate::scheduler::AgentScheduler::new(
             provider_resolver.clone(),
             Arc::clone(&self.program_runtime),
         );

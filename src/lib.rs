@@ -104,6 +104,7 @@ pub mod review; // Local reviewed-changeset projection
 pub mod router;
 pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
 pub mod samples; // Sample spreadsheet generator (finch samples)
+pub mod scheduler; // Child-agent orchestration: chooses providers and models, runs tasks
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
 pub mod startup; // Startup phase timing: #364, instrument and reduce

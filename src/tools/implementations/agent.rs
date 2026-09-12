@@ -1,6 +1,6 @@
 //! Structured provider tools for bounded child-agent fork/join.
 
-use crate::runtime::scheduler::{
+use crate::scheduler::{
     AgentBudget, AgentContextReference, AgentIdentity, AgentRole, AgentScheduler, AgentTaskSpec,
 };
 use crate::tools::registry::Tool;

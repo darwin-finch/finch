@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::cli::tui::activity::{ActivityRow, ActivityRows, ActivityState, ActivityUpdate};
-use crate::runtime::scheduler::{AgentEvent, AgentTaskSnapshot, AgentTaskStatus};
+use crate::scheduler::{AgentEvent, AgentTaskSnapshot, AgentTaskStatus};
 use crate::tools::todo::{TodoList, TodoPriority, TodoStatus};
 
 /// The session todo list, presented as rows the renderer can poll.

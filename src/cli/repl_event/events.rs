@@ -147,7 +147,7 @@ pub enum ReplEvent {
     },
 
     /// A child-agent lifecycle update for the live task projection.
-    AgentLifecycle(crate::runtime::scheduler::AgentEvent),
+    AgentLifecycle(crate::scheduler::AgentEvent),
 
     /// User requested query cancellation (Ctrl+C)
     CancelQuery,
