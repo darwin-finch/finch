@@ -152,8 +152,12 @@ fn load_config() -> Result<Config> {
 - **Manual verification does not replace regression coverage** — document any manual evidence, but
   keep the issue and branch unmerged until the failure has a deterministic automated regression.
 - **Every agreed-upon behavior must be covered** — if it's worth discussing, it's worth testing.
-- **Unit tests live in the same file** as the code they test (`#[cfg(test)] mod tests { ... }`);
-  production-boundary and executable-level regressions may live under `tests/` with shared fixtures.
+- **Unit tests live in the same module** as the code they test — inline
+  (`#[cfg(test)] mod tests { ... }`) or, when the file is large enough that its tests bury it, a
+  sibling file the module declares (`#[cfg(test)] mod tests;` beside `thing.rs` in `thing/tests.rs`).
+  Rust treats both as the same module, so `use super::*` still reaches private items either way.
+  Do not mix the two in one file. Production-boundary and executable-level regressions may live
+  under `tests/` with shared fixtures.
 - **Naming:** `test_<thing>_<behavior>` e.g. `test_peer_cannot_restart`
 - **Mocks for trait contracts** — use `#[ignore]` for tests requiring real model downloads
 - **Stubs must have tests** confirming they return errors (not panic)
