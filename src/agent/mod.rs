@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
-use crate::config::{persona::Persona, Config};
+use crate::config::{Config, Persona};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
 use crate::tools::implementations::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
@@ -257,7 +257,7 @@ impl AgentLoop {
         for _ in 0..MAX_TURNS {
             let request = MessageRequest {
                 model: model.clone(),
-                max_tokens: crate::config::constants::DEFAULT_MAX_TOKENS,
+                max_tokens: crate::config::DEFAULT_MAX_TOKENS,
                 messages: messages.clone(),
                 system: Some(system.clone()),
                 tools: Some(tool_defs.clone()),

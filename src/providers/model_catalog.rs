@@ -298,7 +298,7 @@ pub async fn refresh_from_config(
             "provider profile '{profile_name}' does not have a supported named-credential catalogue transport"
         ),
     };
-    let credentials = crate::config::credential::credential_index(config.credentials())?;
+    let credentials = crate::config::credential_index(config.credentials())?;
     let metadata = credentials
         .get(credential.credential_ref.as_str())
         .expect("Config::validate checked the named credential reference");

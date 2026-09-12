@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use super::lifecycle::DaemonLifecycle;
 use crate::errors;
 
-use crate::config::constants::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
+use crate::config::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
 
 /// Ensure daemon is running, spawning if necessary
 ///

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::claude::types::{Message, MessageRequest};
 use crate::claude::ClaudeClient;
-use crate::config::persona::Persona;
+use crate::config::Persona;
 
 /// Sends completed task summaries to the teacher API and patches the persona file
 pub struct ReflectionEngine {
@@ -111,7 +111,7 @@ pub(crate) fn patch_persona_file(path: &Path, new_prompt: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::persona::Persona;
+    use crate::config::Persona;
     use std::fs;
     use tempfile::NamedTempFile;
 

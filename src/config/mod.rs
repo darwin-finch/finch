@@ -3,8 +3,8 @@
 
 mod backend;
 mod colors;
-pub mod constants;
-pub mod credential;
+mod constants;
+mod credential;
 mod loader;
 mod notice_state;
 
@@ -41,8 +41,8 @@ pub fn forget_notice_suppression() {
     }
 }
 
-pub mod persona;
-pub mod provider;
+mod persona;
+mod provider;
 mod settings;
 
 #[allow(deprecated)]
@@ -52,6 +52,12 @@ pub use colors::{
     ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageBand, MessageColors, StatusColors,
     UiColors,
 };
+pub use constants::{
+    DEFAULT_BRAIN_TLS_PORT, DEFAULT_CLAUDE_MODEL, DEFAULT_DAEMON_ADDR, DEFAULT_HTTP_ADDR,
+    DEFAULT_MAX_TOKENS, DEFAULT_WORKER_ADDR,
+};
+pub(crate) use credential::LifecycleRevocation;
+pub use credential::{credential_index, validate_binding};
 pub use credential::{
     AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle, CredentialProvider,
     CredentialResolver, EndpointFamily, EnvironmentCredentialResolver, ProviderCredential,

@@ -1786,7 +1786,7 @@ async fn saved_oauth_tokens_project_through_174_binding_and_resolve_only_exact_a
         account: Some("account-one".into()),
         required_scopes: dialect.descriptor.scopes.clone(),
     };
-    crate::config::credential::validate_binding(
+    crate::config::validate_binding(
         CredentialProvider::ChatgptSubscription,
         None,
         &binding,
