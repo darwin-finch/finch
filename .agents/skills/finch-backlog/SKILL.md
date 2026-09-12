@@ -164,6 +164,13 @@ and attribution should not imply accountability an agent cannot hold. Say this e
 delegating: subagents imitate git history, and one session's trailers propagated into another
 tool's commits before anyone noticed.
 
+**A macOS build does not prove an import is unused.** `cargo check` here compiles only the
+`cfg` branches this platform selects, so an import that looks dead on a Mac may be the one thing
+holding up the Linux, FreeBSD or Windows arm of the same file. Before deleting an import that the
+compiler calls unused, grep the file for its symbols; if they appear inside a `cfg` block this
+platform excludes, re-import under that same guard rather than unconditionally. Four Linux CI jobs
+failed on a move that was clean locally, and the fix was one `#[cfg(any(...))]` above a `use`.
+
 **Never stop a process by pattern.** No `pkill -f`, no `killall`: the pattern matches another
 session's server, another worktree's daemon, or the user's own editor. Kill a recorded PID or a
 named container, or let the supervisor in `scripts/test_brains.sh` reap its own process group.
