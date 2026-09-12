@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Run the repository's gates for one stage, cheapest first, one ok/FAIL line each.
+#
+# Packets and handoffs name a stage; they do not recite which checker to run, in which order,
+# with which wrapper. That recitation is what drifts.
+#
+# Usage: scripts/factory/gates <stage> [test-filter...]
+#
+#   docs      prose, links, and the process references          (seconds)
+#   arch      subsystem ownership, facades, interfaces          (seconds)
+#   ci        workflow allocation and repository hygiene        (seconds)
+#   rust      formatting, then compile, then the named tests    (minutes)
+#   full      every stage above, plus the whole test suite      (long)
+#
+# Every cargo command goes through the repository Cargo slot, and every test run goes through
+# scripts/test_brains.sh, so a gate run cannot race another build or leak a Brain.
+
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+cd "$root" || exit 1
+slot=".agents/skills/finch-backlog/scripts/with-cargo-slot"
+
+stage="${1:-}"
+shift || true
+filter=("$@")
+
+failures=0
+log="$(mktemp -t finch-gates)"
+trap 'rm -f "$log"' EXIT
+
+gate() {
+  local name="$1"
+  shift
+  if "$@" >"$log" 2>&1; then
+    printf 'ok   %s\n' "$name"
+  else
+    printf 'FAIL %s\n' "$name"
+    sed 's/^/     /' "$log" | tail -20
+    failures=$((failures + 1))
+  fi
+}
+
+run_docs() {
+  gate "docs links and claims" python3 scripts/check_docs.py
+  gate "docs checker self-test" python3 scripts/check_docs.py --self-test
+  gate "process references" .agents/skills/finch-backlog/scripts/test-review-protocol "$root"
+}
+
+run_arch() {
+  gate "subsystem ownership and dependencies" python3 scripts/check_subsystems.py
+  gate "subsystem checker tests" python3 scripts/test_check_subsystems.py
+  gate "generated interfaces" python3 scripts/generate_interfaces.py
+  gate "interface generator tests" python3 scripts/test_generate_interfaces.py
+}
+
+run_ci() {
+  gate "workflow allocation" python3 scripts/check_ci_workflow_manifest.py
+  gate "workflow checker tests" python3 scripts/test_ci_workflow_manifest.py
+  gate "tracked tree" python3 scripts/check_repository_hygiene.py
+  gate "repository hygiene tests" python3 scripts/test_repository_hygiene.py
+  gate "removed SSH surface" python3 scripts/check_no_ssh_surface.py
+}
+
+run_rust() {
+  gate "formatting" $slot cargo fmt --check
+  gate "compiles (all targets)" $slot cargo check --all-targets
+  if [[ ${#filter[@]} -gt 0 ]]; then
+    gate "tests ${filter[*]}" ./scripts/test_brains.sh cargo test --lib -- "${filter[@]}"
+  else
+    printf 'skip tests: no filter given; pass one, or use the full stage\n'
+  fi
+}
+
+case "$stage" in
+  docs) run_docs ;;
+  arch) run_arch ;;
+  ci) run_ci ;;
+  rust) run_rust ;;
+  full)
+    run_docs
+    run_arch
+    run_ci
+    gate "formatting" $slot cargo fmt --check
+    gate "compiles (all targets)" $slot cargo check --all-targets
+    gate "library tests" ./scripts/test_brains.sh cargo test --lib
+    ;;
+  *)
+    printf 'usage: scripts/factory/gates <docs|arch|ci|rust|full> [test-filter...]\n' >&2
+    exit 2
+    ;;
+esac
+
+if [[ $failures -gt 0 ]]; then
+  printf '%d gate(s) failed\n' "$failures" >&2
+  exit 1
+fi
+printf 'all %s gates passed\n' "$stage"
