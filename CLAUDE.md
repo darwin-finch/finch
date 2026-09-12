@@ -51,7 +51,7 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 - **Scrollback deduplication: each message written via `insert_before()` exactly once** — check `scrollback.get_message(msg_id).is_none()` before calling (tests in `src/cli/tui/scrollback.rs`)
 - **Dialog virtual rows stable after Other-row activation** — `test_multiselect_submit_button_emits_selection`, `test_o_key_moves_cursor_to_other_row` in `src/cli/tui/dialog.rs`
-- **Contractions and sentence-ending periods route to NL, not Forth** — `test_contraction_dont`, `test_period_attached_to_word` in `src/cli/repl_event/event_loop.rs`
+- **Contractions and sentence-ending periods must never be taken as Forth** — currently unenforced: the REPL takes its language from the explicit `--forth`, `--lisp` and `--exec` modes, there is no detector to test, and the two tests this line used to cite no longer exist. Whether the invariant is obsolete or merely untested is #571.
 
 ### Context
 

@@ -292,6 +292,46 @@ def check_truth_claims(
     return errors
 
 
+CODE_IDENTIFIER = re.compile(r"`([a-z][a-z0-9_]*)`")
+RUST_DEFINITION = re.compile(
+    r"\b(?:fn|struct|enum|trait|const|static|type|mod|union|macro_rules!)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+RUST_FIELD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?([a-z_][a-z0-9_]*)\s*:", re.M)
+
+
+def defined_identifiers(root: Path) -> set[str]:
+    """Every name `src/` and `tests/` define, as items or as struct fields."""
+    names: set[str] = set()
+    for directory in ("src", "tests"):
+        for path in (root / directory).rglob("*.rs"):
+            text = path.read_text(errors="replace")
+            names.update(RUST_DEFINITION.findall(text))
+            names.update(RUST_FIELD.findall(text))
+    return names
+
+
+def check_cited_identifiers(document: Path, text: str, defined: set[str]) -> list[str]:
+    """A citation next to a source path must name something the code still defines.
+
+    An invariant is only as good as the test it names. When a test is renamed or deleted, the
+    claim above it keeps reading as enforced, which is worse than saying nothing — so a citation
+    on a line that also names a `.rs` file has to resolve. Only lines that name a file are checked:
+    prose about a tool or a mode is not a claim about a symbol.
+    """
+    errors = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if ".rs" not in line:
+            continue
+        for name in CODE_IDENTIFIER.findall(line):
+            if "_" not in name or name in defined:
+                continue
+            errors.append(
+                f"{document}:{number} cites `{name}` beside a source path, but nothing in src/ or "
+                "tests/ defines it; fix the citation or remove the claim it supports"
+            )
+    return errors
+
+
 def check_stale_claims(text: str) -> list[str]:
     normalized = text.casefold()
     errors = [
@@ -450,6 +490,7 @@ def self_test() -> int:
     if TRANSPORT_DOCUMENT not in CURRENT_DOCS:
         errors.append("native ChatGPT transport guide is not enrolled in CURRENT_DOCS")
 
+    defined = defined_identifiers(ROOT)
     documents = {
         TRANSPORT_DOCUMENT: (ROOT / TRANSPORT_DOCUMENT).read_text(),
         OAUTH_DOCUMENT: (ROOT / OAUTH_DOCUMENT).read_text(),
@@ -460,6 +501,17 @@ def self_test() -> int:
     for control in ("Finch supports GPT-5.6 Sol.", "GPT-5.6 is verified."):
         if not check_truth_claims(Path("docs/example.md"), control):
             errors.append(f"unsupported broad GPT-5.6 control escaped: {control!r}")
+
+    # A citation beside a source path must resolve, or an invariant keeps reading as enforced
+    # after its test is renamed away. Both directions, because a checker that flags everything is
+    # as useless as one that flags nothing.
+    example = Path("docs/example.md")
+    if not check_cited_identifiers(example, "claim — `test_no_such_thing` in `src/x.rs`", defined):
+        errors.append("a citation naming a test that does not exist escaped")
+    if check_cited_identifiers(example, "claim — `is_readonly_bash` in `src/x.rs`", defined):
+        errors.append("a citation naming a real definition was rejected")
+    if check_cited_identifiers(example, "the `gui_click` primitive is internal", defined):
+        errors.append("prose with no source path was treated as a citation")
 
     for control in (
         'model = "gpt-5.6-sol"',
@@ -544,6 +596,7 @@ def self_test() -> int:
 def main() -> int:
     errors: list[str] = []
     combined = ""
+    defined = defined_identifiers(ROOT)
     for document in CURRENT_DOCS:
         path = ROOT / document
         if not path.is_file():
@@ -554,6 +607,7 @@ def main() -> int:
         errors.extend(check_links(document, text))
         errors.extend(check_shell_fences(document, text))
         errors.extend(check_truth_claims(document, text))
+        errors.extend(check_cited_identifiers(document, text, defined))
     errors.extend(check_design_index(*design_index_texts()))
 
     # The package description is published to package indexes and mirrored far
