@@ -19,6 +19,7 @@ add none.
 **Language is not decided here.** `ProgramLanguage` lives in `vm` and is re-exported for
 compatibility; a program's meaning belongs to the VM frontends, never to a second evaluator here.
 
-**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- programs:: poset::`. Run the full
+**Focused tests:** `./scripts/test_brains.sh cargo test --lib -- programs::`. (`src/poset/`
+looks adjacent but belongs to `runtime`.) Run the full
 suite when changing a re-exported `pub` item, the script envelope, or the corpus format, because
 the CLI, runtime, and live parity tests consume them.

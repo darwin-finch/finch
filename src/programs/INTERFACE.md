@@ -40,9 +40,6 @@ pub struct VmManifest { … }
 pub enum WireCorpusAttempt { FirstPass, Repair }
 pub struct WireCorpusAudit { … }
 pub struct WireCorpusCounts { … }
-/// One raw text response exactly as received from a provider.
-pub struct WireCorpusEntry { … }
-pub struct WireCorpusLogger { … }
 ```
 
 ## Functions
