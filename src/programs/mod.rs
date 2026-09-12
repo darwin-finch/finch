@@ -15,7 +15,7 @@ use uuid::Uuid;
 mod corpus;
 pub use corpus::{
     audit, capture_from_env, capture_with_runtime_from_env, WireCorpusAttempt, WireCorpusAudit,
-    WireCorpusCounts, WireCorpusEntry, WireCorpusLogger,
+    WireCorpusCounts,
 };
 
 /// Version of the model/runtime vocabulary handshake.
