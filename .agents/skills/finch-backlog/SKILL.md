@@ -12,6 +12,22 @@ outcome need not be user-visible: deletion, refactoring, and enabling work are v
 Every process step must demonstrably reduce defect risk or improve shipping confidence at a cost proportional to the change; otherwise remove it.
 Tooling is advisory mechanical lint, never an authority engine.
 
+## Say the tier out loud, then run only that tier
+
+Proportionality fails by being thorough. Name the tier in the first message about a change, and run
+that tier's process and no more.
+
+| Tier | What it is | Process |
+|------|-----------|---------|
+| **1 — trivial** | prose, comments, a rename with no behaviour change, a one-line non-behavioural fix | no contract, no packet, no review round. Run the gate stage the change touches, then merge. |
+| **2 — ordinary** | a bounded code change with a clear approach and a test that fails before it | a short contract in the issue, one review round on the tip, gate stages the scope touches. |
+| **3 — risky** | authority, credentials, persistence, wire or checkpoint formats, process lifecycle, concurrency, release, or anything a user can lose data to | full contract with an independent contract review, a production-boundary regression, an independent review of the candidate that will merge, and the full gate matrix. |
+
+A tier is about blast radius, not diff size: a two-line change to a permission check is tier 3, and
+a five-hundred-line docs move is tier 1. When two tiers look defensible, pick the lower one and say
+why; the cost of the heavier process is real and is paid in review attention, which is the scarce
+resource.
+
 ## Two layers
 
 The generic engineering loop is: understand the accepted outcome; design and make a focused
