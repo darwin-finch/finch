@@ -395,7 +395,9 @@ pub struct ProgramRuntime {
     /// take the exclusive side before they can return to their caller.
     authority_use_gate: Arc<RwLock<()>>,
     authority_sink: Arc<RwLock<Option<ProgramRuntimeAuthoritySink>>>,
-    agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
+    // A capability handed in from above, never a scheduler this module names: running a child
+    // agent means choosing a provider and a model, which is the host's job.
+    agent_scheduler: RwLock<Weak<dyn agents::AgentSpawning>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
     /// the UI. Approval and resumption use this exact verified program state.
     pending_typed: Mutex<HashMap<uuid::Uuid, PendingTypedExecution>>,
@@ -455,7 +457,7 @@ struct PendingTypedExecution {
     source: String,
     intent: String,
     effect: ExecutionEffect,
-    caller: Option<scheduler::AgentIdentity>,
+    caller: Option<agents::AgentIdentity>,
     output: String,
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::HostSideEffect>,
@@ -696,7 +698,7 @@ impl ProgramRuntime {
             capability_policy: Arc::new(RwLock::new(default_capability_policy())),
             authority_use_gate: Arc::new(RwLock::new(())),
             authority_sink: Arc::new(RwLock::new(None)),
-            agent_scheduler: RwLock::new(Weak::new()),
+            agent_scheduler: RwLock::new(Weak::<agents::NoAgentSpawning>::new()),
             pending_typed: Mutex::new(HashMap::new()),
             revision_history: Mutex::new(vec![VmRevisionSnapshot {
                 revision: 0,
@@ -1418,7 +1420,7 @@ impl ProgramRuntime {
 
     pub(crate) fn effective_grants_for(
         &self,
-        caller: Option<&scheduler::AgentIdentity>,
+        caller: Option<&agents::AgentIdentity>,
     ) -> Result<EffectSet> {
         let context = self.authorization_context_for(caller)?;
         let ledger = self
@@ -1465,7 +1467,7 @@ impl ProgramRuntime {
     /// caller scope, expiry/revocation, and the caller's existing ceiling.
     pub(crate) fn resolve_capability_grant_subset(
         &self,
-        caller: Option<&scheduler::AgentIdentity>,
+        caller: Option<&agents::AgentIdentity>,
         grant_ids: &[uuid::Uuid],
     ) -> Result<EffectSet> {
         let context = self.authorization_context_for(caller)?;
@@ -1501,7 +1503,7 @@ impl ProgramRuntime {
 
     fn authorization_context_for(
         &self,
-        caller: Option<&scheduler::AgentIdentity>,
+        caller: Option<&agents::AgentIdentity>,
     ) -> Result<AuthorizationContext> {
         Ok(AuthorizationContext {
             now_unix_ms: unix_time_ms(),
@@ -2470,11 +2472,12 @@ impl ProgramRuntime {
         })
     }
 
-    pub fn attach_agent_scheduler(&self, scheduler: &Arc<scheduler::AgentScheduler>) {
+    pub fn attach_agent_scheduler<S: agents::AgentSpawning + 'static>(&self, scheduler: &Arc<S>) {
         *self
             .agent_scheduler
             .write()
-            .expect("agent scheduler lock poisoned") = Arc::downgrade(scheduler);
+            .expect("agent scheduler lock poisoned") =
+            Arc::downgrade(scheduler) as Weak<dyn agents::AgentSpawning>;
     }
 
     pub fn manifest_generation(&self) -> u64 {
@@ -2830,7 +2833,7 @@ impl ProgramRuntime {
     pub async fn submit_as_typed_only(
         &self,
         submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
             submission,
@@ -2848,7 +2851,7 @@ impl ProgramRuntime {
     pub async fn submit_as_typed_only_with_typed_effect_sink(
         &self,
         submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
         effect_sink: TypedEffectSink,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
@@ -2901,7 +2904,7 @@ impl ProgramRuntime {
     pub(crate) async fn submit_tool_program(
         &self,
         submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         defer_program_effects: bool,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
@@ -2948,7 +2951,7 @@ impl ProgramRuntime {
     pub async fn submit_as_with_typed_effect_sink(
         &self,
         submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
         effect_sink: TypedEffectSink,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_typed_only_with_typed_effect_sink(submission, caller, effect_sink)
@@ -2958,7 +2961,7 @@ impl ProgramRuntime {
     pub async fn submit_as(
         &self,
         submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_typed_only(submission, caller).await
     }
@@ -2966,7 +2969,7 @@ impl ProgramRuntime {
     async fn submit_as_with_optional_typed_effect_sink(
         &self,
         submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         grant_ceiling: Option<EffectSet>,
@@ -3212,7 +3215,7 @@ impl ProgramRuntime {
         intent: &str,
         context: &ExecutionContext,
         declared_capabilities: &[CapabilityRequirement],
-        caller: Option<scheduler::AgentIdentity>,
+        caller: Option<agents::AgentIdentity>,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         effect_audit: Option<crate::server::RunnerEffectAuditControl>,
@@ -3715,7 +3718,7 @@ impl TypedHostHandler {
 fn typed_agent_task_spec(
     value: &TypedValue,
     origin: &SourceOrigin,
-) -> std::result::Result<scheduler::AgentTaskSpec, VmDiagnostic> {
+) -> std::result::Result<agents::AgentTaskSpec, VmDiagnostic> {
     let TypedValue::Record(fields) = value else {
         return Err(host_binding_error(
             origin,
@@ -3754,10 +3757,10 @@ fn typed_agent_task_spec(
         )),
     };
     let role = match string("role")?.as_str() {
-        "general" => scheduler::AgentRole::General,
-        "explore" => scheduler::AgentRole::Explore,
-        "research" => scheduler::AgentRole::Research,
-        "code" => scheduler::AgentRole::Code,
+        "general" => agents::AgentRole::General,
+        "explore" => agents::AgentRole::Explore,
+        "research" => agents::AgentRole::Research,
+        "code" => agents::AgentRole::Code,
         role => {
             return Err(host_binding_error(
                 origin,
@@ -3797,7 +3800,7 @@ fn typed_agent_task_spec(
                             )
                         })
                 };
-                Ok(scheduler::AgentContextReference {
+                Ok(agents::AgentContextReference {
                     kind: string_field("kind")?,
                     id: string_field("id")?,
                     sha256: string_field("sha256")?,
@@ -3844,7 +3847,7 @@ fn typed_agent_task_spec(
             ))
         }
     };
-    Ok(scheduler::AgentTaskSpec {
+    Ok(agents::AgentTaskSpec {
         task: string("task")?,
         role,
         background: optional(string("background")?),
@@ -3852,7 +3855,7 @@ fn typed_agent_task_spec(
         model: optional(string("model")?),
         context,
         capability_grant_ids: Some(capability_grant_ids),
-        budget: scheduler::AgentBudget {
+        budget: agents::AgentBudget {
             max_turns,
             timeout_ms,
             max_output_bytes,
@@ -3860,27 +3863,27 @@ fn typed_agent_task_spec(
     })
 }
 
-fn agent_task_status_name(status: scheduler::AgentTaskStatus) -> &'static str {
+fn agent_task_status_name(status: agents::AgentTaskStatus) -> &'static str {
     match status {
-        scheduler::AgentTaskStatus::Queued => "queued",
-        scheduler::AgentTaskStatus::Running => "running",
-        scheduler::AgentTaskStatus::Completed => "completed",
-        scheduler::AgentTaskStatus::Failed => "failed",
-        scheduler::AgentTaskStatus::Cancelled => "cancelled",
+        agents::AgentTaskStatus::Queued => "queued",
+        agents::AgentTaskStatus::Running => "running",
+        agents::AgentTaskStatus::Completed => "completed",
+        agents::AgentTaskStatus::Failed => "failed",
+        agents::AgentTaskStatus::Cancelled => "cancelled",
     }
 }
 
-fn agent_role_name(role: scheduler::AgentRole) -> &'static str {
+fn agent_role_name(role: agents::AgentRole) -> &'static str {
     match role {
-        scheduler::AgentRole::General => "general",
-        scheduler::AgentRole::Explore => "explore",
-        scheduler::AgentRole::Research => "research",
-        scheduler::AgentRole::Code => "code",
+        agents::AgentRole::General => "general",
+        agents::AgentRole::Explore => "explore",
+        agents::AgentRole::Research => "research",
+        agents::AgentRole::Code => "code",
     }
 }
 
 fn typed_agent_task_result(
-    result: scheduler::AgentTaskResult,
+    result: agents::AgentTaskResult,
     origin: &SourceOrigin,
 ) -> std::result::Result<TypedValue, VmDiagnostic> {
     let turns = i64::try_from(result.turns)
@@ -4027,16 +4030,16 @@ fn typed_memory_index_status(
 }
 
 fn typed_agent_task_snapshot(
-    snapshot: scheduler::AgentTaskSnapshot,
+    snapshot: agents::AgentTaskSnapshot,
     origin: &SourceOrigin,
 ) -> std::result::Result<TypedValue, VmDiagnostic> {
     let depth = i64::try_from(snapshot.identity.depth)
         .map_err(|_| host_binding_error(origin, "agent depth exceeds VM integer range"))?;
     let complete = matches!(
         snapshot.status,
-        scheduler::AgentTaskStatus::Completed
-            | scheduler::AgentTaskStatus::Failed
-            | scheduler::AgentTaskStatus::Cancelled
+        agents::AgentTaskStatus::Completed
+            | agents::AgentTaskStatus::Failed
+            | agents::AgentTaskStatus::Cancelled
     );
     let value = TypedValue::Record(vec![
         (
@@ -5140,7 +5143,7 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
                     let TypedValue::String(task) = argument else {
                         return Err(host_binding_error(origin, "agent-spawn requires one task"));
                     };
-                    scheduler::AgentTaskSpec {
+                    agents::AgentTaskSpec {
                         task: task.clone(),
                         role: Default::default(),
                         background: None,
@@ -7206,7 +7209,7 @@ fn approval_prompts(
     source: &str,
     intent: &str,
     suspension: Option<&TypedSuspension>,
-    caller: Option<&scheduler::AgentIdentity>,
+    caller: Option<&agents::AgentIdentity>,
 ) -> Vec<ApprovalPrompt> {
     let program_hash = hash_program_source(source);
     let agent_ancestry = agent_ancestry(caller);
@@ -7266,7 +7269,7 @@ fn hash_program_source(source: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn agent_ancestry(caller: Option<&scheduler::AgentIdentity>) -> Vec<uuid::Uuid> {
+fn agent_ancestry(caller: Option<&agents::AgentIdentity>) -> Vec<uuid::Uuid> {
     caller.map_or_else(Vec::new, |caller| {
         let mut ancestry = vec![caller.root_agent_id];
         if let Some(parent) = caller.parent_agent_id {
@@ -8087,7 +8090,7 @@ mod tests {
         let runtime = ProgramRuntime::new();
         let root_agent_id = uuid::Uuid::new_v4();
         let parent_agent_id = uuid::Uuid::new_v4();
-        let caller = scheduler::AgentIdentity {
+        let caller = agents::AgentIdentity {
             agent_id: uuid::Uuid::new_v4(),
             task_id: uuid::Uuid::new_v4(),
             parent_agent_id: Some(parent_agent_id),
@@ -8155,7 +8158,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let identity = |task_id| scheduler::AgentIdentity {
+        let identity = |task_id| agents::AgentIdentity {
             agent_id: uuid::Uuid::new_v4(),
             task_id,
             parent_agent_id: None,
@@ -8193,7 +8196,7 @@ mod tests {
     async fn child_grant_ceiling_blocks_later_ambient_expansion_but_allows_task_approval() {
         let runtime = ProgramRuntime::new();
         let task_id = uuid::Uuid::new_v4();
-        let child = scheduler::AgentIdentity {
+        let child = agents::AgentIdentity {
             agent_id: uuid::Uuid::new_v4(),
             task_id,
             parent_agent_id: None,
