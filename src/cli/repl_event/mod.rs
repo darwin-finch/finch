@@ -27,6 +27,7 @@
 //! `ReplEvent::ToolResult` message.  The event loop collects all results for
 //! a query and sends the next LLM turn once every pending tool has resolved.
 
+pub mod activity_view;
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;

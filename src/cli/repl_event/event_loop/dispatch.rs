@@ -435,7 +435,9 @@ impl EventLoop {
                     }
                     _ => None,
                 };
-                self.tui_renderer.lock().await.apply_agent_event(&event);
+                self.tui_renderer.lock().await.apply_activity(
+                    crate::cli::repl_event::activity_view::agent_activity(&event),
+                );
                 if let Some(result) = finished {
                     let summary = if result.final_message.trim().is_empty() {
                         result.diagnostics.join("; ")
