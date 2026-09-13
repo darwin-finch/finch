@@ -261,6 +261,9 @@ impl VmDiagnostic {
 ///
 /// Spelling separators differently (`str_cat` for `str-cat`) is the most common near miss and is
 /// not a typo at all, so it is matched first and exactly, before any edit-distance work.
+/// Return bounded spelling suggestions for the workspace language compilers.
+///
+/// This unpublished compiler-support seam is not stable application API.
 pub fn nearest_names<'a>(target: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<String> {
     fn squashed(name: &str) -> String {
         name.chars()

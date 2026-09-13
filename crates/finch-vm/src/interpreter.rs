@@ -1,22 +1,9 @@
-use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
-use super::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
-use super::ir::{BlockId, Instruction};
-use super::types::{Type, TypedValue};
-use super::verifier::VerifiedModule;
-use super::vocabulary::{core_word_spec, CoreWordImplementation};
+use finch_vm_core::{
+    core_word_spec, BlockId, CapabilityKind, CapabilityRequirement, CoreWordImplementation,
+    DiagnosticPhase, EffectSet, Instruction, ResourceSelector, SourceOrigin, Type, TypedValue,
+    UiOperation, VerifiedModule, VmDiagnostic, VM_TYPE_SYSTEM_VERSION,
+};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UiOperation {
-    Create,
-    Append,
-    Replace,
-    Status,
-    Progress,
-    Complete,
-    Fail,
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HostSideEffect {
@@ -70,7 +57,7 @@ pub struct VmSideEffect {
 }
 
 fn side_effect_protocol_version() -> u32 {
-    super::VM_TYPE_SYSTEM_VERSION
+    VM_TYPE_SYSTEM_VERSION
 }
 
 /// Validate a host resume payload against the output row already verified for
@@ -2215,7 +2202,7 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 _ => "./**",
             };
             let selector =
-                super::effects::FileSelector::parse(selector_source).map_err(|error| {
+                finch_vm_core::FileSelector::parse(selector_source).map_err(|error| {
                     VmDiagnostic::error(
                         "E-PATH-001",
                         DiagnosticPhase::Interpretation,
@@ -2473,10 +2460,8 @@ fn runtime_underflow(origin: &SourceOrigin, trace: Vec<String>) -> VmDiagnostic 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, Function, LocatedInstruction, Module};
-    use crate::signature::{StackRow, StackSignature};
-    use crate::types::Type;
     use crate::{core_vocabulary, Verifier};
+    use crate::{BasicBlock, Function, LocatedInstruction, Module, StackRow, StackSignature, Type};
     use std::collections::BTreeMap;
 
     #[derive(Default)]
@@ -2647,8 +2632,8 @@ mod tests {
 
     #[test]
     fn every_pure_core_word_has_an_interpreter_implementation() {
-        for (name, spec) in crate::vocabulary::core_word_registry() {
-            if spec.implementation != crate::vocabulary::CoreWordImplementation::Interpreter {
+        for (name, spec) in crate::core_word_registry() {
+            if spec.implementation != crate::CoreWordImplementation::Interpreter {
                 continue;
             }
             let mut stack = Vec::new();
@@ -2780,7 +2765,7 @@ mod tests {
         let network = CapabilityRequirement {
             capability: CapabilityKind::NetworkConnect,
             selector: ResourceSelector::NetworkTemplate {
-                template: crate::effects::NetworkSelectorTemplate {
+                template: crate::NetworkSelectorTemplate {
                     host_argument: 0,
                     port_argument: 1,
                     allowed_hosts: vec!["example.test".into()],
@@ -2807,7 +2792,7 @@ mod tests {
         let process = CapabilityRequirement {
             capability: CapabilityKind::ProcessRun,
             selector: ResourceSelector::ProcessTemplate {
-                template: crate::effects::ProcessSelectorTemplate {
+                template: crate::ProcessSelectorTemplate {
                     executable_argument: 0,
                     allowed_executables: vec!["git".into()],
                 },

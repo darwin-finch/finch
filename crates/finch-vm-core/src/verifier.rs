@@ -932,8 +932,9 @@ fn apply_signature(
 
 /// Apply a word signature to a concrete virtual stack. Frontends use the same
 /// unification logic as the verifier while deriving a submitted program's
-/// output signature.
-pub(crate) fn apply_signature_types(
+/// output signature. This unpublished compiler-support seam is not stable
+/// application API.
+pub fn apply_signature_types(
     signature: &StackSignature,
     stack: &mut Vec<Type>,
     origin: &SourceOrigin,
@@ -945,7 +946,8 @@ pub(crate) fn apply_signature_types(
 /// without mutating the frontend's virtual stack. Awaited host effects carry
 /// this concrete row in their portable ABI, so a host result such as
 /// `option<string>` is not incorrectly compared with `option<A>` on resume.
-pub(crate) fn instantiate_signature_types(
+/// This unpublished compiler-support seam is not stable application API.
+pub fn instantiate_signature_types(
     signature: &StackSignature,
     stack: &[Type],
     origin: &SourceOrigin,

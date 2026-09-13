@@ -1,0 +1,1 @@
+{"type":"record","value":[["message",{"type":"string","value":"hello"}],["numbers",{"type":"list","value":{"element_type":{"kind":"int"},"values":[{"type":"int","value":-2},{"type":"int","value":7}]}}]]}

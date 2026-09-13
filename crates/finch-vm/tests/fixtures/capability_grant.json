@@ -1,0 +1,1 @@
+{"id":"11111111-2222-4333-8444-555555555555","requirement":{"capability":"file_read","selector":{"kind":"file","selector":{"root":{"kind":"project"},"pattern":"docs/**"}}},"scope":{"scope":"project","project_id":"finch"},"policy_hash":"policy-v3","created_by":"fixture","created_at_unix_ms":1725000000000,"expires_at_unix_ms":1725003600000,"revoked_at_unix_ms":null}

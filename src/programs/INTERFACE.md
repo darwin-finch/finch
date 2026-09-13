@@ -39,7 +39,7 @@ impl ProgramDefinition {
     /// Load one plain-text `.forth` or `.lisp` file as a canonical definition.
     pub fn from_source_file(path: &Path, root: &Path, scope: ProgramScope) -> Result<Self>;
 }
-/// Language in which a stored program's canonical source is written. Re-exported from `finch-vm`.
+/// Language in which a stored program's canonical source is written. Re-exported from `finch-vm-core`.
 pub enum ProgramLanguage { Forth, Lisp }
 /// Immutable address of a stored program version.
 pub struct ProgramRef { … }

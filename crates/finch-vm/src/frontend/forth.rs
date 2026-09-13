@@ -1,11 +1,8 @@
-use crate::diagnostic::{DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic};
-use crate::effects::EffectSet;
-use crate::interpreter::UiOperation;
-use crate::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
-use crate::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
-use crate::types::{Type, TypedValue};
-use crate::verifier::{
-    apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
+use finch_vm_core::{
+    apply_signature_types, instantiate_signature_types, nearest_names, BasicBlock, ControlEffect,
+    DiagnosticPhase, EffectSet, Function, Instruction, LocatedInstruction, Module, SourceLanguage,
+    SourceOrigin, SourceSpan, StackRow, StackSignature, SuspensionSignature, Type, TypedValue,
+    UiOperation, VerifiedModule, Verifier, VmDiagnostic, Vocabulary,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -2326,10 +2323,7 @@ fn lower_forth_ast_body_with_locals(
                             format!("unknown Co-Forth word '{word}'"),
                             Some(origin),
                         );
-                        let nearest = crate::diagnostic::nearest_names(
-                            &word,
-                            vocabulary.keys().map(String::as_str),
-                        );
+                        let nearest = nearest_names(&word, vocabulary.keys().map(String::as_str));
                         if !nearest.is_empty() {
                             diagnostic.hints.push(format!(
                                 "did you mean {}?",
