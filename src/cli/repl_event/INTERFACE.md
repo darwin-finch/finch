@@ -12,14 +12,20 @@ Everything below is what callers outside this module can reach. Implementation m
 ```rust
 /// Result of a tool execution confirmation prompt
 pub enum ConfirmationResult { ApproveOnce, ApproveExactSession, ApprovePatternSession, ApproveExactPersistent, ApprovePatternPersistent, ApproveWithInput, Deny }
+/// How much history to carry, and when to compact it.
+pub struct ContextLimits { … }
+/// How this frontend reaches a daemon, and why it could not.
+pub struct DaemonParts { … }
 /// Main event loop for concurrent REPL
 pub struct EventLoop { … }
 impl EventLoop {
     /// Run the event loop
     pub async fn run(&mut self) -> Result<()>;
     /// Create a new event loop with unified generators
-    pub fn new(conversation: Arc<RwLock<ConversationHistory>>, active_persona: Arc<RwLock<crate::config::Persona>>, _cloud_gen: Arc<dyn Generator>, qwen_gen: Arc<dyn Generator>, router: Arc<Router>, generator_state: Arc<RwLock<GeneratorState>>, tool_definitions: Vec<ToolDefinition>, tool_executor: Arc<Mutex<ToolExecutor>>, program_runtime: Arc<crate::runtime::ProgramRuntime>, tui_renderer: TuiRenderer, output_manager: Arc<OutputManager>, status_bar: Arc<StatusBar>, streaming_enabled: bool, local_generator: Arc<RwLock<LocalGenerator>>, tokenizer: Arc<TextTokenizer>, ipc_client: Option<crate::ipc::IpcClient>, daemon_ipc_error: Option<String>, mode: Arc<RwLock<ReplMode>>, memory_system: Option<Arc<crate::memory::MemorySystem>>, session_label: String, session_uuid: Uuid, available_providers: Vec<crate::config::ProviderEntry>, active_provider_index: usize, daemon_client: Option<Arc<crate::client::DaemonClient>>, context_lines: usize, max_verbatim_messages: usize, context_recall_k: usize, todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>, todo_journal_target: crate::tools::todo::TodoJournalTarget, todo_journal_receiver: crate::tools::todo::TodoJournalReceiver, enable_summarization: bool, auto_compact_enabled: bool, daemon_base_url: Option<String>, provider_resolver: crate::scheduler::ProviderResolver, agent_scheduler: Arc<crate::scheduler::AgentScheduler>) -> Self;
+    pub fn new(session: crate::cli::repl_event::parts::SessionParts, generation: crate::cli::repl_event::parts::GenerationParts, ui: crate::cli::repl_event::parts::UiParts, tools: crate::cli::repl_event::parts::ToolParts, daemon: crate::cli::repl_event::parts::DaemonParts, limits: crate::cli::repl_event::parts::ContextLimits, runtime: crate::cli::repl_event::parts::RuntimeParts) -> Self;
 }
+/// What produces tokens, and which provider is currently chosen.
+pub struct GenerationParts { … }
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
 pub struct LlmLoop { … }
 impl LlmLoop {
@@ -73,6 +79,10 @@ impl QueryStateManager {
 }
 /// Events that flow through the REPL event loop
 pub enum ReplEvent { UserInput, QueryComplete, QueryFailed, ToolResult, ToolCallsStarted, ToolApprovalNeeded, VmApprovalNeeded, OutputReady, VmEffect, VmOutputComplete, VmEffectJournalComplete, TypedProgramComplete, StreamingComplete, StatsUpdate, AgentLifecycle, CancelQuery, Shutdown, ShowDialog, PosetComplete, LispResult, RemoteBrainMessage, RemoteBrainError, RemoteBrainDisconnected, HomeBrainMessage, HomeBrainWatchFailed, ReconnectHomeBrain, ReconnectHomeRunner, RunnerLeaseStatus, NamedBrainProgramRequested, NamedBrainTurnRequested, NamedBrainMemoryProjectionRequested, NamedBrainRunCancelRequested, NamedBrainProgramFinished, FrontendRestartReady }
+/// What executes typed programs and remembers.
+pub struct RuntimeParts { … }
+/// Who is talking, as what, and in which mode.
+pub struct SessionParts { … }
 /// Coordinates concurrent tool execution for the event loop
 pub struct ToolExecutionCoordinator { … }
 impl ToolExecutionCoordinator {
@@ -85,6 +95,10 @@ impl ToolExecutionCoordinator {
     /// Wire the Co-Forth poset so every tool call auto-records a trace node.
     pub fn with_poset(mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) -> Self;
 }
+/// Tools the model may call, and the task list it keeps.
+pub struct ToolParts { … }
+/// Everything that draws.
+pub struct UiParts { … }
 ```
 
 ## Modules
@@ -95,6 +109,7 @@ pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
 pub(crate) mod model_selection;
+pub mod parts;
 pub mod plan_handler;
 pub mod query_processor;
 pub mod query_state;

@@ -2321,46 +2321,65 @@ impl Repl {
         // Create EventLoop with all dependencies. Encloses the
         // `input_captured` mark: the terminal reader is installed inside it.
         let event_loop_phase = crate::startup::phase(crate::startup::PHASE_EVENT_LOOP_NEW);
+        use crate::cli::repl_event::parts::{
+            ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts,
+            UiParts,
+        };
         let mut event_loop = EventLoop::new(
-            Arc::clone(&self.conversation),
-            Arc::clone(&self.active_persona),
-            claude_gen,
-            qwen_gen,
-            Arc::new(self.router.clone()),
-            generator_state,
-            tool_definitions,
-            Arc::clone(&self.tool_executor),
-            Arc::clone(&self.program_runtime),
-            tui_renderer,
-            Arc::new(self.output_manager.clone()),
-            Arc::new(self.status_bar.clone()),
-            self.streaming_enabled,
-            Arc::clone(&self.local_generator),
-            Arc::clone(&self.tokenizer),
-            self.ipc_client.take(),
-            self.daemon_ipc_error.take(),
-            mode,
-            self.memory_system.clone(),
-            self.session_label.clone(),
-            self.session_uuid,
-            self.available_providers.clone(),
-            initial_provider_index,
-            self.daemon_client.clone(),
-            self.memory_context_lines,
-            self.max_verbatim_messages,
-            self.context_recall_k,
-            Arc::clone(&self.todo_list),
-            self.todo_journal_target.clone(),
-            self.todo_journal_receiver
-                .take()
-                .expect("task journal receiver is consumed by one event loop"),
-            self.enable_summarization,
-            self.auto_compact_enabled,
-            self.daemon_client
-                .as_ref()
-                .map(|c| c.base_url().to_string()),
-            provider_resolver,
-            agent_scheduler,
+            SessionParts {
+                conversation: Arc::clone(&self.conversation),
+                active_persona: Arc::clone(&self.active_persona),
+                mode,
+                label: self.session_label.clone(),
+                uuid: self.session_uuid,
+            },
+            GenerationParts {
+                generator: qwen_gen,
+                router: Arc::new(self.router.clone()),
+                state: generator_state,
+                local: Arc::clone(&self.local_generator),
+                tokenizer: Arc::clone(&self.tokenizer),
+                resolver: provider_resolver,
+                available: self.available_providers.clone(),
+                active_index: initial_provider_index,
+            },
+            UiParts {
+                renderer: tui_renderer,
+                output: Arc::new(self.output_manager.clone()),
+                status_bar: Arc::new(self.status_bar.clone()),
+                streaming_enabled: self.streaming_enabled,
+            },
+            ToolParts {
+                definitions: tool_definitions,
+                executor: Arc::clone(&self.tool_executor),
+                todo_list: Arc::clone(&self.todo_list),
+                todo_journal_target: self.todo_journal_target.clone(),
+                todo_journal_receiver: self
+                    .todo_journal_receiver
+                    .take()
+                    .expect("task journal receiver is consumed by one event loop"),
+            },
+            DaemonParts {
+                ipc_client: self.ipc_client.take(),
+                ipc_error: self.daemon_ipc_error.take(),
+                client: self.daemon_client.clone(),
+                base_url: self
+                    .daemon_client
+                    .as_ref()
+                    .map(|c| c.base_url().to_string()),
+            },
+            ContextLimits {
+                lines: self.memory_context_lines,
+                max_verbatim_messages: self.max_verbatim_messages,
+                recall_k: self.context_recall_k,
+                enable_summarization: self.enable_summarization,
+                auto_compact: self.auto_compact_enabled,
+            },
+            RuntimeParts {
+                program_runtime: Arc::clone(&self.program_runtime),
+                agent_scheduler,
+                memory_system: self.memory_system.clone(),
+            },
         );
         drop(event_loop_phase);
 
