@@ -162,6 +162,8 @@ capnpc = "0.24"
 
 [dev-dependencies]
 semver = "1"
+unicode-width = "0.2"  # Display-cell widths for the independent test terminal model
+vte = "0.15"  # ANSI/VT byte parser for production console-writer regressions
 h2 = "0.4.16"  # Raw HTTP/2 protocol fixtures for transport-boundary regressions
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }  # Raw WSS protocol fixtures for TLS transport-boundary regressions
 mockito = "1.2"

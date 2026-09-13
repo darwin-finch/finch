@@ -49,6 +49,8 @@ mod shadow_buffer; // kept – good architecture for future diffing
 mod status_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
+#[cfg(test)]
+mod vt_oracle;
 
 use accordion::{AccordionState, RenderedTranscriptLine};
 
@@ -3917,7 +3919,14 @@ fn terminal_char_width(ch: char) -> usize {
 mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
+    use crate::cli::diff::{summarize_files, DiffColorMode, FileDiff};
     use crate::cli::messages::{Message, MessageRef, WorkUnit};
+    use crate::cli::tui::vt_oracle::{VtColor, VtOracle, VtStyle};
+    use crate::theme::ColorTheme;
+
+    fn assert_vt(condition: bool, message: &str, terminal: &VtOracle) {
+        assert!(condition, "{message}\n{}", terminal.diagnostic());
+    }
 
     #[test]
     fn startup_header_is_plain_scrollback_content() {
@@ -5199,6 +5208,250 @@ mod tests {
             rows.iter().any(|row| row.contains("jade-river")),
             "the session separator must be part of the frame; frame rows were {rows:?}"
         );
+    }
+
+    #[test]
+    fn test_vt_oracle_production_live_writer_emits_exact_editable_cells_styles_and_cursor() {
+        let width = 24;
+        let input = vec!["alpha".to_string(), "bravo".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let mut inputs = live_inputs(width, 12, &input, "idle");
+        inputs.input_cursor = (1, 3);
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+        let mut bytes = Vec::new();
+        write_live_frame(&mut bytes, &frame, width).unwrap();
+
+        let mut terminal = VtOracle::new(width, 12);
+        terminal.feed(&bytes);
+        let expected = [
+            "──  ~/re…  jade-river ──",
+            "❯ alpha",
+            "  bravo",
+            "────────────────────────",
+            "idle",
+        ];
+        for (row, expected) in expected.iter().enumerate() {
+            assert_vt(
+                terminal.row(row) == *expected,
+                &format!("editable frame row {row} must equal {expected:?}"),
+                &terminal,
+            );
+        }
+        let prompt_style = terminal.cell(1, 0).style;
+        let colored_prompt = VtStyle {
+            foreground: VtColor::Indexed(14),
+            bold: false,
+            reverse: false,
+        };
+        assert_vt(
+            prompt_style == VtStyle::default() || prompt_style == colored_prompt,
+            "the editable prompt must be either the exact cyan production style or the exact \
+             terminal-default NO_COLOR style",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cell(1, 1).style == VtStyle::default(),
+            "prompt styling must reset before the draft",
+            &terminal,
+        );
+        let expected_secondary = if prompt_style == colored_prompt {
+            VtStyle {
+                foreground: VtColor::Indexed(8),
+                bold: false,
+                reverse: false,
+            }
+        } else {
+            VtStyle::default()
+        };
+        assert_vt(
+            terminal.cell(0, 0).style == expected_secondary
+                && terminal.cell(3, 0).style == expected_secondary
+                && terminal.cell(4, 0).style == expected_secondary,
+            "separator and status styles must consistently match the selected production color \
+             profile",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cursor() == (2, 5, true),
+            "the visible cursor must return after the third character of the second draft row",
+            &terminal,
+        );
+    }
+
+    #[test]
+    fn test_vt_oracle_live_writer_expands_horizontal_tab_to_eight_column_stop() {
+        let width = 16;
+        let frame = LiveFrame {
+            lines: vec!["a\tb".to_string()],
+            cursor_row: 0,
+            cursor_col: 9,
+            cursor_visible: true,
+            trailing_newline: false,
+            visible_live: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        write_live_frame(&mut bytes, &frame, width).unwrap();
+
+        let mut terminal = VtOracle::new(width, 2);
+        terminal.feed(&bytes);
+        assert_vt(
+            terminal.row(0) == "a       b",
+            "HT must advance from column 1 to the standard column-8 tab stop before painting b",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cell(0, 8).character == 'b',
+            "the character after HT must occupy display column 8",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cursor() == (0, 9, true),
+            "the writer's input cursor must land one cell after b at display column 9",
+            &terminal,
+        );
+    }
+
+    #[test]
+    fn test_vt_oracle_structured_file_diff_approval_reaches_terminal_cells_and_styles() {
+        let width = 48;
+        let height = 20;
+        let diff = FileDiff::from_texts("src/oracle.rs", "before\nkeep\n", "after\nkeep\n");
+        let colors = ColorTheme::Dark.to_scheme();
+        let mut dialog =
+            Dialog::tool_approval("Edit", &summarize_files(std::slice::from_ref(&diff)));
+        // This is the production assembly contract: FileDiff owns sanitizing untrusted content,
+        // then its SGR-bearing result is assigned directly so the dialog does not strip the theme.
+        dialog.body = Some(diff.render(&colors, DiffColorMode::Theme));
+        let input = vec!["draft stays hidden".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let mut inputs = live_inputs(width, height, &input, "approval pending");
+        inputs.dialog = Some(&dialog);
+        let frame = plan_live_frame(&inputs, &mut autocomplete);
+        let mut bytes = Vec::new();
+        write_live_frame(&mut bytes, &frame, width).unwrap();
+
+        let mut terminal = VtOracle::new(width, height + 1);
+        terminal.feed(&bytes);
+        let removed_row = terminal.find_row("- before").unwrap_or_else(|| {
+            panic!(
+                "removal row must remain decision-visible\n{}",
+                terminal.diagnostic()
+            )
+        });
+        let added_row = terminal.find_row("+ after").unwrap_or_else(|| {
+            panic!(
+                "addition row must remain decision-visible\n{}",
+                terminal.diagnostic()
+            )
+        });
+        let yes_row = terminal.find_row("1. Yes").unwrap_or_else(|| {
+            panic!(
+                "approval option must remain decision-visible\n{}",
+                terminal.diagnostic()
+            )
+        });
+        let removed_col = terminal.row(removed_row).find("- before").unwrap();
+        let added_col = terminal.row(added_row).find("+ after").unwrap();
+        assert_vt(
+            terminal.cell(removed_row, removed_col).style.foreground == VtColor::Rgb(255, 123, 114),
+            "the structured removal must use the dark-theme removal color",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cell(added_row, added_col).style.foreground == VtColor::Rgb(126, 231, 135),
+            "the structured addition must use the dark-theme addition color",
+            &terminal,
+        );
+        let selected_style = terminal.cell(yes_row, 4).style;
+        let colored_selected = VtStyle {
+            foreground: VtColor::Indexed(14),
+            bold: true,
+            reverse: false,
+        };
+        assert_vt(
+            selected_style == VtStyle::default() || selected_style == colored_selected,
+            "the selected option must be either exact bold cyan or exact terminal-default \
+             NO_COLOR styling; diff styling must not leak into it",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cursor().2 == false,
+            "approval frames must hide the terminal cursor",
+            &terminal,
+        );
+    }
+
+    #[test]
+    fn test_vt_oracle_persistent_update_and_dialog_close_clear_rows_and_restore_cursor() {
+        let width = 48;
+        let height = 24;
+        let mut terminal = VtOracle::new(width, height + 2);
+        let input = vec!["first draft".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        let first = plan_live_frame(
+            &live_inputs(width, height, &input, "obsolete status row"),
+            &mut autocomplete,
+        );
+        let mut bytes = Vec::new();
+        let first_rows = write_live_frame(&mut bytes, &first, width).unwrap();
+        terminal.feed(&bytes);
+
+        bytes.clear();
+        write_live_area_erase(&mut bytes, first_rows, first.cursor_row).unwrap();
+        let diff = FileDiff::from_texts("src/old.rs", "gone\n", "shown\n");
+        let colors = ColorTheme::Dark.to_scheme();
+        let mut dialog = Dialog::tool_approval("Edit", "src/old.rs  +1 -1");
+        dialog.body = Some(diff.render(&colors, DiffColorMode::Theme));
+        let mut dialog_inputs = live_inputs(width, height, &input, "obsolete status row");
+        dialog_inputs.dialog = Some(&dialog);
+        let dialog_frame = plan_live_frame(&dialog_inputs, &mut autocomplete);
+        let dialog_rows = write_live_frame(&mut bytes, &dialog_frame, width).unwrap();
+        terminal.feed(&bytes);
+        assert_vt(
+            terminal.find_row("- gone").is_some() && !terminal.cursor().2,
+            "the persistent model must observe the intermediate approval paint",
+            &terminal,
+        );
+
+        bytes.clear();
+        write_live_area_erase(&mut bytes, dialog_rows, dialog_frame.cursor_row).unwrap();
+        let closed_input = vec!["final".to_string()];
+        let mut closed_inputs = live_inputs(width, height, &closed_input, "ready");
+        closed_inputs.input_cursor = (0, 5);
+        let closed = plan_live_frame(&closed_inputs, &mut autocomplete);
+        write_live_frame(&mut bytes, &closed, width).unwrap();
+        terminal.feed(&bytes);
+
+        assert_vt(
+            terminal.find_row("gone").is_none()
+                && terminal.find_row("shown").is_none()
+                && terminal.find_row("obsolete status row").is_none(),
+            "dialog and superseded editable rows must be cleared after close",
+            &terminal,
+        );
+        let final_row = terminal.find_row("❯ final").unwrap_or_else(|| {
+            panic!(
+                "closed dialog must repaint the draft\n{}",
+                terminal.diagnostic()
+            )
+        });
+        assert_vt(
+            terminal.cell(final_row, 2).style == VtStyle::default(),
+            "dialog colors must not leak into the repainted input",
+            &terminal,
+        );
+        assert_vt(
+            terminal.cursor() == (final_row, 7, true),
+            "dialog close must restore the visible input cursor after the final draft",
+            &terminal,
+        );
+        for row in closed.physical_rows(width)..height {
+            assert_vt(
+                terminal.row(row).is_empty(),
+                &format!("row {row} below the closed frame must remain cleared"),
+                &terminal,
+            );
+        }
     }
 
     #[test]
