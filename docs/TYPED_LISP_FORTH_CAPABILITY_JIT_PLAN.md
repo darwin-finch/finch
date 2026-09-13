@@ -297,12 +297,17 @@ fiber<Y,R>       deferred producer that may yield Y repeatedly and returns R onc
 resource<K>      generation-bound runtime handle
 capability<C>    unforgeable grant handle; never synthesized from text
 dynamic          explicitly tagged escape hatch
+unique<T>        library-defined sole owner of heap storage
+shared<T>        library-defined strong reference-counted owner
+weak<T>          non-owning shared-storage handle; checked upgrade
 ```
 
 Integers, booleans, floats, characters, and small handles should remain unboxed where the target
-ABI permits it. Strings, collections, closure environments, and larger records use managed handles.
-`dynamic` carries a tag and requires checked narrowing. Static code must not pay dynamic dispatch
-cost merely because the Lisp frontend exists.
+ABI permits it. Strings, collections, closure environments, and larger records use an explicit
+ownership carrier when they outlive an inline frame value. Storage policy is independent of value
+type: safe heap storage is always uniquely or sharedly owned, while a plain lexical value remains
+frame-owned. `dynamic` carries a tag and requires checked narrowing. Static code must not pay
+dynamic dispatch cost merely because the Lisp frontend exists.
 
 The serialized `ProgramValue` form is the wire/checkpoint representation, not necessarily the
 in-memory stack layout.
@@ -313,13 +318,19 @@ Signatures use row polymorphism so a word states what it consumes while preservi
 beneath it:
 
 ```text
-dup          forall A S. (S A -- S A A) ! pure
-drop         forall A S. (S A -- S) ! pure
+dup          forall A: Copy, S. (S A -- S A A) ! CopyEffects<A>
+drop         forall A: Drop, S. (S A -- S) ! DropEffects<A>
 +            forall S.   (S int int -- S int) ! pure
 file.read    forall R S. (S path<R> -- S bytes) ! fs.read<R> | throws<IoError>
 agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! agent.await
 yield        forall Y Resume S. (S Y -- S Resume) ! yields<Y,Resume>
 ```
+
+The stack arrow describes values retained or removed from the logical operand stack; each input
+also has a borrow or take mode. A borrowing input leaves its owner in the row, while a taking input
+consumes that owner. `dup` therefore requires explicit `Copy` evidence (and retaining a `Shared<T>`
+is its copy operation); it cannot duplicate a `Unique<T>`. The surface signature grammar must make
+those modes visible rather than relying on a word's spelling or implementation.
 
 `!` introduces one canonical typed effect row. Capability requirements, exceptions, suspension,
 mutation, nondeterminism, and other observable behavior are distinct tagged members of that row,
@@ -688,18 +699,18 @@ Quotations are typed callable values:
 [ int -- int ! pure | 1 + ]
 ```
 
-An escaping quotation is closure-converted into an immutable code reference plus a managed captured
-environment. Calls use `call`/`tail-call`; they do not create an untyped anonymous stack.
+An escaping quotation is closure-converted into an immutable code reference plus an owner-carrying
+captured environment. Calls use `call`/`tail-call`; they do not create an untyped anonymous stack.
 
 ### Closure conversion and capture ownership
 
 Closure conversion is a concrete lowering pass, not a second evaluator. The frontend resolves each
-free lexical name to the nearest immutable binding, orders captures deterministically by resolved
-binding identity, emits the capture loads in that order, and emits `MakeClosure(function,
+free lexical name to the nearest binding, orders captures deterministically by resolved binding
+identity, emits the capture operations in that order, and emits `MakeClosure(function,
 capture_count, signature)`. The generated function has a typed capture vector and reads it only
 through `CaptureGet`; parameters become frame locals in normal call order. A closure therefore
-captures values, never an alias to a caller operand stack, mutable frame, grant, or ambient host
-authority.
+captures a proven scoped borrow or an owner, never an unchecked alias to a caller operand stack,
+mutable frame, grant, or ambient host authority.
 
 For example, this Lisp:
 
@@ -727,21 +738,23 @@ lambda$0 captures: [int], locals: [int] # n is capture[0], x is local[0]
   return
 ```
 
-The runtime consumes the closure for `CallClosure`, creates a fresh frame with a private operand
-window above the caller boundary, copies the immutable captures into that frame, and destroys the
-frame on return. Only the signature-declared results cross back into the caller window. This is
-also why `(defer :cpu (lambda () ...))` is safe: it serializes/snapshots the closure's immutable
-captures into a separate CPU task and never shares the parent stack.
+The target runtime, once the ownership model is implemented, consumes or borrows the closure
+according to its call signature, creates a fresh frame
+with a private operand window above the caller boundary, projects its captures into that frame, and
+destroys the frame on return. Only the signature-declared results cross back into the caller window.
+This is also why `(defer :cpu (lambda () ...))` is safe: it moves unique captures and retains shared
+captures into a separate CPU task and never shares a borrowed parent stack location.
 
-**Initial representation and allocation rule.** Primitive captures (`int`, `bool`, `float`,
-`char`, symbols, small opaque handles) are copied inline in the closure value. Immutable structural
-values may be reference-counted/managed handles; copying the closure copies the handle, not a
-mutable payload. The initial interpreter may represent a short-lived closure as an owned
+**Target representation and allocation rule.** Copyable primitive captures (`int`, `bool`,
+`float`, `char`, symbols, small opaque handles) are copied inline in the closure value. A
+non-escaping closure may borrow a non-copyable capture when local dataflow proves its extent. An
+escaping closure must acquire an owner: capturing a unique value moves it; capturing a shared value
+retains a handle. The initial interpreter may represent a short-lived closure as an owned
 `TypedValue::Closure` and needs no tracing heap. It must not manufacture a heap environment for a
 non-escaping direct call merely for frontend convenience. Later escape analysis may stack-allocate
 or inline a closure that is immediately called and never stored, returned, deferred, or passed to
 an unknown callee; that optimization is semantics-preserving and optional. A closure is treated as
-escaping, and its environment gets stable managed ownership, when it is returned, stored in a
+escaping, and its environment gets stable explicit ownership, when it is returned, stored in a
 collection/record/dictionary, placed on the persistent VM stack, passed through `dynamic`, used by
 `defer`, or handed to a host boundary.
 
@@ -796,6 +809,17 @@ but they cannot erase an execute-once journal entry or claim that an external mu
 If a guard fails while another exception is active, retain both with deterministic primary and
 suppressed diagnostics rather than losing the original cause.
 
+Implicit drops and explicit guards occupy one lexical cleanup stack. Constructing an owned value
+registers its drop at that point; registering a later guard places that guard above the drop. Scope
+exit runs eligible cleanup records in reverse registration order, so a guard may use values that
+were alive when it was registered and every owned value is still destroyed exactly once. Suspension
+preserves this stack without running it. Drop itself cannot suspend or replace an active diagnostic.
+A move transfers the source's cleanup obligation to the destination and disarms the source record;
+it never registers a second drop for the same owner. Partially initialized records drop only their
+initialized fields, in reverse field-initialization order. A guard that borrows a value holds a
+checked loan until it runs or is dismissed, preventing that owner from moving or dropping first; an
+escaping guard must instead move or retain its captures under the ordinary closure rules.
+
 ### Dynamic and unsafe boundaries
 
 Reflection and legacy words may be retained behind explicit boundaries:
@@ -807,6 +831,252 @@ legacy.eval        unclassified; interpreted only; explicit approval
 ```
 
 Unsafe/dynamic words cannot be silently inlined into a verified pure definition.
+
+## Shared type, ownership, and lifetime model
+
+This section is a normative target for both source syntaxes. CoLisp and Co-Forth must be able to
+state every rule below and must lower equivalent programs to equivalent ownership-bearing typed IR.
+The model separates three questions that class hierarchies and many smart-pointer APIs conflate:
+whether a call borrows or takes a value, which object owns its storage, and whether behavior uses
+static or dynamic dispatch.
+
+### Borrowing and taking
+
+An ordinary parameter borrows for the invocation. A taking parameter receives ownership and may
+store, return, destroy, or transfer the value beyond that invocation. `take` grants permission to
+escape; it does not promise that the callee will store the value and does not itself select stack,
+heap, unique, or reference-counted storage. Illustrative syntax is:
+
+```text
+inspect(x: Foo)                         # borrow; x cannot escape the invocation
+retain(take x: static Owner<Foo>)       # take an owner; x may escape
+retain-open(take x: dyn Owner<Foo>)     # same contract with an erased carrier
+```
+
+There is no hidden `take Foo` shorthand in the initial grammar. A taking signature states its
+carrier dispatch so the parameter's representation is always knowable. Every ordinary owned value
+`T` supplies intrinsic inline `Owner<T>` evidence through the lifecycle kernel; `Unique<T>`,
+`Shared<T>`, and user-defined indirect carriers supply explicit implementations. In the static form
+the hidden generic carrier type `O : Owner<T>` is inferred solely from the argument, the parameter
+storage is `O`, and operations on `T` use its checked borrow projection. Storing or returning the
+parameter stores or returns `O`, not an imaginary unwrapped `T`. The dynamic form receives the
+declared erased envelope. Expected results never participate in this choice.
+
+The call site does not need a ceremonial `move` marker when the parameter already says it takes:
+
+```lisp
+(begin
+  (let foo (Foo ...))
+  (retain foo)
+  (inspect foo)) ; error: foo was moved by the preceding taking call
+```
+
+Passing a uniquely owned value to a taking parameter moves it and invalidates the source binding.
+Passing a shared owner retains another strong handle, so the source remains usable. Passing either
+kind to an ordinary parameter borrows through the owner without transferring or retaining it. An
+explicit move of a shared handle may transfer that handle without incrementing its count and then
+invalidates the source. Temporaries transfer directly because no source binding can be reused.
+
+The transfer is unconditional from the caller's perspective. A callee that conditionally decides
+not to retain a taken value still owns and must drop, return, or transfer it. It cannot make the
+caller's moved state depend on a runtime branch. Control-flow joins track `available`, `borrowed`,
+`exclusively borrowed`, and `moved` states; a value moved on only some incoming paths is not usable
+after the join unless every path reinitializes it. A use-after-move is a compile error whose
+diagnostic points both to the use and the taking call.
+
+Readonly borrows may coexist. A mutable borrow is exclusive and temporarily prevents all use of its
+owner. Borrows normally end at their last use, but the analysis is intraprocedural and directional:
+the compiler does not solve general lifetime variables backward through callers. A borrowed value
+cannot cross its proven owner boundary: it cannot be stored in an escaping value, returned without
+a locally tracked input-owner relationship, captured by an escaping closure, placed in persistent
+VM state, handed to an unknown host, or remain live across suspension. The ownership `borrow`
+projection and range/item projections are narrowly defined borrowed results tied to exactly one
+input receiver. Their origin remains in HIR, their use is checked within the caller, and they cannot
+be erased, generalized, or exported as an unconstrained reference. Such an escaping boundary must
+receive ownership instead.
+
+### Library ownership carriers and the compiler lifecycle kernel
+
+Unique ownership is the default for ordinary resource-bearing values. Copyability is an explicit
+property of a type, not an assumption that every value may be duplicated. The compiler understands
+only a small, general lifecycle kernel:
+
+- definite initialization, moves, borrows, and last use;
+- whether a type is movable, copyable, or immovable;
+- non-suspending, non-throwing copy and drop hooks with declared effect rows;
+- exactly-once reverse-order destruction on normal scope exit and structured unwind;
+- the standard borrow projection used to lend a contained value.
+
+The compiler does not hard-code `Unique`, `Shared`, reference counts, control blocks, or a particular
+allocator. The standard library defines them as ordinary parameterized value types implementing the
+lifecycle and ownership concepts, conceptually:
+
+```text
+concept Lifecycle {
+    associated CopyEffects = effects
+    associated DropEffects = effects
+    operation drop = take Self -> unit ! DropEffects
+}
+
+concept Owner<T> : Lifecycle {
+    # Borrowed result is tied to this receiver and cannot independently escape.
+    operation borrow = &Self -> scoped &T
+}
+
+concept ShareableOwner<T> : Owner<T> {
+    operation retain = &Self -> Self
+}
+
+Unique<T> : Owner<T>                 # movable, not copyable
+Shared<T> : ShareableOwner<T>        # copying retains a strong handle
+Weak<T>                              # upgrade returns option<Shared<T>>
+```
+
+These mappings use the same explicit concept-evidence mechanism as ranges and other generic code;
+they are not name-based duck typing. User-defined arenas, pools, foreign handles, and ownership
+carriers may implement the same public contracts. A carrier's trusted implementation may use raw
+allocation primitives, but ordinary code sees its checked lifecycle behavior.
+
+Copy and drop effects are part of generic evidence and every callable's inferred effect row,
+including implicit cleanup edges. They may perform bounded deterministic lifecycle work but cannot
+suspend, throw, acquire ambient authority, or hide an externally fallible mutation. Resource
+release authority travels with the owner that acquired the resource. General I/O, commit, flush,
+and protocol shutdown belong in explicit `close`/`finish` operations or scope guards. Dynamic owner
+evidence binds a fixed compatible cleanup effect row; erasure cannot conceal it.
+
+An ownership-taking API should not need to name `Shared<T>` merely because one caller uses shared
+storage. If the callee only needs to hold and eventually release one owner, it accepts an ownership
+carrier. If it must manufacture additional owners, its signature honestly requires
+`ShareableOwner<T>`. Carrier dispatch is explicit just like behavioral concept dispatch:
+
+```text
+store(take x: static Owner<Foo>)       # carrier remains statically known/specializable
+store-runtime(take x: dyn Owner<Foo>)  # erased owner for factories/open runtime sets
+duplicate(take x: ShareableOwner<Foo>) # operation genuinely needs another owner
+```
+
+The static form retains checked parametric HIR and may specialize for `Unique<Foo>`, `Shared<Foo>`,
+or another carrier. The dynamic form is one versioned ownership envelope containing sufficient
+evidence to borrow and destroy the held value. It is appropriate for heterogeneous containers and
+runtime factories. The compiler must not eagerly generate all ownership/behavior dispatch
+combinations, infer dispatch from an expected result, or make separate overloads that the caller
+cannot distinguish. A baseline evidence-table ABI permits one checked generic body; selective
+specialization is an optimization.
+
+### Stack, heap, and deterministic destruction
+
+A plain lexical value is stack/frame-owned unless an explicit storage operation moves it elsewhere;
+an optimizer may change physical placement only when that is unobservable. Safe heap allocation
+always names an ownership policy. The `new unique`, `new shared`, and `share` spellings below lower
+to standard-library carrier/allocator constructors; they do not give those types compiler-owned
+layouts:
+
+```lisp
+(let local (Foo ...))
+(let unique-foo (new unique Foo ...))
+(let shared-foo (new shared Foo ...))
+(let promoted (share local)) ; allocates shared storage and moves local
+```
+
+There is no safe unqualified owning heap pointer. Constructing `Shared<T>` from `&local` or any
+other stack borrow is a compile error; promotion consumes the stack value and invalidates its old
+binding. A raw pointer is a non-owning unsafe/FFI primitive and never acquires cleanup behavior by
+accident.
+
+All constructed values may define deterministic destruction. A stack/frame value is dropped when
+its owning scope unwinds. A unique heap pointee is destroyed and deallocated when its `Unique`
+owner drops. A shared heap pointee is destroyed and deallocated when the final strong `Shared`
+owner drops; `Weak` handles do not keep the pointee alive. Consequently safe code cannot create a
+heap object whose destructor is silently unreachable merely because no ownership policy was
+attached to its allocation. Shared cycles can retain memory and must be broken with weak edges or a
+different ownership policy; they are a diagnosable leak risk, not memory unsafety.
+
+Drop is for deterministic, non-suspending cleanup. Fallible or asynchronous shutdown belongs in an
+explicit operation such as `close`, `finish`, or `join`; drop may provide a safe fallback but cannot
+hide its failure. Cancellation and typed exception unwinding run owned drops exactly once. A hard
+process abort is not required to run user code.
+
+### Safe-code boundary, subtyping, and variance
+
+Ordinary verified CoLisp and Co-Forth have no undefined behavior. A definitely invalid operation is
+a compile error. When a dynamic fact cannot be proven cheaply, checked code emits a defined runtime
+trap carrying its source origin. Operations capable of violating the model—raw-pointer arithmetic,
+unchecked access, manual allocation, and unverifiable FFI contracts—require an explicit unsafe
+boundary. Every such construct is compiler-identifiable, warnable, searchable, and optionally
+forbidden by project policy; a warning alone never turns an unsafe operation into safe code.
+
+Subtyping follows capability and mutation rather than class layout. Function inputs are
+contravariant and results covariant. Readonly borrows and readonly owner views may be covariant;
+mutable borrows and mutable ownership containers are invariant. A dynamic implementation may upcast
+to a concept whose requirements are a subset, immutable records may support explicit width
+subtyping, and a callable with fewer effects is a subtype of one permitting more. Core CoLisp and
+Co-Forth have no class inheritance, implicit implementation inheritance, or storage-layout diamond.
+Composition, explicit delegation, variants, and concept evidence provide reuse and polymorphism.
+
+`Shared<T>` lends readonly access by default. Possessing one handle can never prove alias-wide
+exclusive access, so it does not directly provide a mutable borrow of `T`. Mutation requires a
+library type whose evidence enforces the rule—an atomic, mutex, actor, transactional cell, or an
+operation that proves sole ownership and recovers a unique carrier. Moving a unique owner between
+workers requires `Transfer<T>` evidence. Retaining a shared owner across workers additionally
+requires `ShareAcrossWorkers<T>` evidence, normally derived only for immutable values or explicitly
+synchronized containers. Reference counting alone is not a thread-safety claim.
+
+### Borrowed results, ranges, closures, and suspension
+
+A borrowed view, range, iterator, or slice may remain allocation-free inside the scope that owns its
+source. It cannot escape that ownership boundary without becoming owner-carrying. A returned or
+stored range therefore owns its source carrier, retains a shared source, materializes its contents,
+or uses an explicit dynamic owner envelope. This permits Voldemort adaptor types and fused
+stack-local pipelines without exporting Rust-style lifetime parameters.
+
+A non-escaping closure may borrow captures only while the compiler proves the closure remains within
+the invocation and never suspends. An escaping, stored, returned, deferred, or dynamically erased
+closure must capture owners: unique captures move and shared captures retain. The same rule applies
+to async state machines and continuations. No borrowed reference survives a checkpoint, worker
+migration, or host-effect suspension.
+
+These restrictions intentionally trade a small amount of Rust's most general borrowed-return
+expressiveness for bounded local dataflow analysis, predictable compilation time, and errors at the
+operation that moved or attempted to escape a value. They preserve static types, native layout, and
+specializable calls; convenience never falls back to JavaScript/Python-style runtime duck typing.
+
+### Transactions, checkpoints, and persistent values
+
+Copyability, shareability, and checkpointability are independent concepts. `Shared<T>` is not
+serializable merely because its process-local handle can be retained, and a live `Unique<T>` cannot
+be duplicated to preserve both a working revision and a rollback snapshot. Values crossing a
+persistent VM revision, checkpoint, replay, process, or durable task boundary must provide explicit
+`Checkpointable` evidence defining a versioned value encoding and reconstruction semantics.
+
+The initial durable stack accepts immutable serializable values and generation-checked host resource
+handles, not arbitrary heap pointers or live unique resources. A non-checkpointable unique value is
+execution-local and must be consumed, explicitly closed, converted to a checkpointable value/host
+handle, or dropped before suspension or commit. A shared carrier crosses only when both the carrier
+and pointee contract define checkpoint behavior; replay reconstructs a new owner and never promises
+the same address or reference count.
+
+Transactions retain an immutable committed revision and build a separate owned delta. Commit moves
+checkpointable results into the new revision. Rollback drops newly created execution-local owners
+and restores the unchanged committed values; it does not resurrect a resource that user code has
+already destroyed or claim that an external effect was undone. Retains created specifically for a
+durable revision are explicit cleanup obligations of that revision and release when the revision is
+retired. This keeps final-drop timing deterministic relative to revision ownership rather than an
+invisible snapshot copy.
+
+### Co-Forth parity and IR verification
+
+Every ownership construct exposed by CoLisp must have a direct typed Co-Forth spelling or word:
+borrowing, taking, unique/shared/weak construction, promotion, static/dynamic owner evidence, drop,
+and unsafe boundaries. Co-Forth stack effects record whether an input is borrowed or consumed, so
+its direct operation mapping to typed IR loses no source-level guarantee. CoLisp lowers the same
+semantics rather than routing through Co-Forth text.
+
+The common IR records moves, owner/evidence erasure, borrows where relevant to verification, and
+cleanup edges. Its verifier rejects use-after-move, double drop, leaked required ownership, escaping
+borrows, mutable aliasing, and borrows live across suspension. The interpreter and future Cranelift
+backend consume those already-verified decisions; native lowering never reruns source inference or
+invents a different lifetime model. A shared conformance corpus must express each ownership behavior
+in both syntaxes and compare accepted IR, diagnostics, traps, drops, and observable results.
 
 ## Typed Lisp language definition
 
@@ -1057,9 +1327,10 @@ Module
     instructions with SourceOrigin
 
 Instruction examples
-  Const, Dup, Drop, Pick
+  Const, Copy, Move, Drop, Pick
   LocalGet, LocalSet, CaptureGet
   RecordNew, FieldGet, VariantNew
+  BorrowShared, BorrowExclusive, OwnerErase, OwnerRetain
   Call, CallClosure, TailCall, Return
   Branch, CondBranch, Match
   CheckedAdd, CheckedDiv, Convert
@@ -1080,6 +1351,9 @@ The verifier proves:
 - compatible stack rows at control-flow merges;
 - loop invariants;
 - initialized locals and valid captures;
+- ownership-state agreement at control-flow joins;
+- exactly-once destruction of owned values and absence of use after move;
+- no escaping borrow, mutable alias, or borrow live across suspension;
 - signature agreement on every return;
 - transitive effects and capability selector containment;
 - valid immutable dependency versions;
@@ -1318,11 +1592,13 @@ original version. Revocation removes the promoted name from future manifests wit
 already-audited historical executions. Providers discover the relevant vocabulary manifest rather
 than receiving arbitrary model-authored words implicitly.
 
-Managed values initially use Rust-owned reference-counted immutable objects and uniquely owned
-builders for efficient construction. Cyclic mutable structures should either be excluded initially
-or placed in a per-runtime tracing heap with explicit safepoints. Do not add a process-wide collector
-lock. If tracing GC is introduced, prefer per-runtime/per-arena collection plus immutable cross-arena
-handles, and document which operations are safepoints.
+The initial Rust runtime may implement Finch `Unique`, `Shared`, and `Weak` carriers with Rust
+ownership internally, but that is an implementation of the language contracts above rather than the
+language's memory model. Immutable shared objects and uniquely owned builders are useful initial
+policies. Cyclic mutable structures should either be excluded initially, use weak edges, or be
+placed in an explicitly selected per-runtime tracing arena with safepoints. Do not add a process-wide
+collector lock. If tracing collection is introduced, expose it as another ownership policy, prefer
+per-runtime/per-arena collection plus immutable cross-arena handles, and document its safepoints.
 
 Builders are first-class implementation APIs for strings, bytes, lists, diagnostics, and patches.
 Compilation and rendering must not repeatedly replace or concatenate whole strings for incremental
@@ -1613,6 +1889,9 @@ every valid instantiation by default.
 - Lower verified Finch IR blocks into CLIF blocks and map virtual stack slots to CLIF SSA values.
 - Spill only across calls, control-flow merges, suspension points, and register pressure.
 - Eliminate `dup`, `swap`, `over`, and local stack shuffles in SSA when possible.
+- Lower verified move/borrow state directly; do not rerun source lifetime inference in the backend.
+- Emit cleanup blocks and stable borrow/drop/retain/release runtime hooks for owner carriers whose
+  operations cannot be inlined, preserving exactly-once destruction across return and unwind.
 - Lower checked arithmetic with explicit overflow/division side exits according to language policy.
 - Call stable Rust runtime shims for allocation, capability requests, task operations, and complex
   managed-value operations.
@@ -1738,7 +2017,8 @@ host loop is swapped.
 
 Later C interoperability should use versioned typed `extern` declarations and generated ABI shims.
 Safe wrappers describe argument/result layout, ownership, callback lifetime, thread affinity, and
-effects; opaque C pointers remain generation-checked resources. Calling an unverified symbol,
+effects; they never expose a raw owning pointer, and opaque C pointers remain generation-checked
+resources or explicit foreign ownership carriers. Calling an unverified symbol,
 passing a raw pointer/integer descriptor, variadic calls, and unchecked shared-memory access require
 an explicit unsafe-FFI capability. The same declarations feed interpreter bindings and Cranelift
 AOT lowering so FFI does not become a second language semantic path.
@@ -1888,6 +2168,9 @@ Every phase adds tests at the layer where its invariant is enforced:
   loop-invariant tests;
 - concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
   equivalence, and runtime-factory tests;
+- paired CoLisp/Co-Forth ownership cases for borrowing, unique moves, use-after-move diagnostics,
+  shared retain/final release, weak upgrade, destructor ordering, owner variance, and static/dynamic
+  carrier evidence;
 - range-refinement preservation, opaque adaptor result, and explicit-erasure tests;
 - effect derivation, selector normalization, containment, intersection, and adversarial path tests;
 - compile-fail fixtures with stable diagnostic codes, primary spans, expansion ancestry, and
@@ -1899,7 +2182,7 @@ Every phase adds tests at the layer where its invariant is enforced:
 - fuzzing for readers, IR decoder, verifier, selectors, and capability request decoding;
 - provider conformance tasks using only the supplied language package;
 - interpreter/Lisp-lowering differential tests during migration;
-- interpreter/JIT differential tests when the JIT exists;
+- interpreter/JIT differential tests when the JIT exists, including cleanup and unwind paths;
 - UI snapshots for approval, denial, compile error, runtime trap, child failure, and revocation;
 - platform security tests for symlinks, races, Unicode paths, case sensitivity, and root changes.
 
