@@ -1359,7 +1359,7 @@ pub struct TuiRenderer {
     is_active: bool,
     pub(crate) needs_full_refresh: bool,
     pub(crate) last_render_error: Option<String>,
-    pub pending_feedback: Option<crate::feedback::FeedbackRating>,
+    pub pending_feedback: Option<activity::Verdict>,
     pub pending_cancellation: bool,
     pub pending_dialog_result: Option<DialogResult>,
 

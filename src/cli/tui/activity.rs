@@ -73,6 +73,17 @@ pub enum ActivityUpdate {
     },
 }
 
+/// What the viewer signalled about the last response.
+///
+/// The renderer reports the gesture; what it is worth, and whether it is recorded at all, belongs
+/// to whoever is listening. A terminal framework that names Finch's feedback weights could not be
+/// used by anything that stores feedback differently, or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Approve,
+    Reject,
+}
+
 /// A polled source, held by the renderer for as long as it is attached.
 pub type SharedActivityRows = Arc<dyn ActivityRows>;
 
