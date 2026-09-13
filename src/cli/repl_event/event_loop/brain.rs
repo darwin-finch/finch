@@ -1,4 +1,5 @@
 use super::*;
+use crate::tools::executor::ToolExecutor;
 
 impl EventLoop {
     #[cfg(test)]
@@ -23,42 +24,59 @@ impl EventLoop {
             provider_resolver.clone(),
             Arc::clone(&program_runtime),
         );
+        use crate::cli::repl_event::parts::{
+            ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts,
+            UiParts,
+        };
         Self::new(
-            Arc::new(RwLock::new(ConversationHistory::new())),
-            Arc::new(RwLock::new(crate::config::Persona::default())),
-            Arc::clone(&generator),
-            generator,
-            Arc::new(Router::new(crate::models::ThresholdRouter::new())),
-            Arc::new(RwLock::new(GeneratorState::NotAvailable)),
-            tool_definitions,
-            tool_executor,
-            program_runtime,
-            tui_renderer,
-            output_manager,
-            status_bar,
-            false,
-            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
-            Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
-            None,
-            None,
-            Arc::new(RwLock::new(ReplMode::Normal)),
-            None,
-            "audit-test".into(),
-            Uuid::new_v4(),
-            Vec::new(),
-            0,
-            None,
-            0,
-            0,
-            0,
-            todo_list,
-            todo_target,
-            todo_receiver,
-            false,
-            false,
-            None,
-            provider_resolver,
-            agent_scheduler,
+            SessionParts {
+                conversation: Arc::new(RwLock::new(ConversationHistory::new())),
+                active_persona: Arc::new(RwLock::new(crate::config::Persona::default())),
+                mode: Arc::new(RwLock::new(ReplMode::Normal)),
+                label: "audit-test".into(),
+                uuid: Uuid::new_v4(),
+            },
+            GenerationParts {
+                generator,
+                router: Arc::new(Router::new(crate::models::ThresholdRouter::new())),
+                state: Arc::new(RwLock::new(GeneratorState::NotAvailable)),
+                local: Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+                tokenizer: Arc::new(crate::models::TextTokenizer::stub().expect("stub tokenizer")),
+                resolver: provider_resolver,
+                available: Vec::new(),
+                active_index: 0,
+            },
+            UiParts {
+                renderer: tui_renderer,
+                output: output_manager,
+                status_bar,
+                streaming_enabled: false,
+            },
+            ToolParts {
+                definitions: tool_definitions,
+                executor: tool_executor,
+                todo_list,
+                todo_journal_target: todo_target,
+                todo_journal_receiver: todo_receiver,
+            },
+            DaemonParts {
+                ipc_client: None,
+                ipc_error: None,
+                client: None,
+                base_url: None,
+            },
+            ContextLimits {
+                lines: 0,
+                max_verbatim_messages: 0,
+                recall_k: 0,
+                enable_summarization: false,
+                auto_compact: false,
+            },
+            RuntimeParts {
+                program_runtime,
+                agent_scheduler,
+                memory_system: None,
+            },
         )
     }
 

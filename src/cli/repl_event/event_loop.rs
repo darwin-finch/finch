@@ -30,13 +30,10 @@ use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::{spawn_input_task, TuiRenderer};
 use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackRating};
 use crate::generators::Generator;
-use crate::local::LocalGenerator;
 use crate::memory::NeuralEmbeddingEngine;
 use crate::models::bootstrap::GeneratorState;
-use crate::models::tokenizer::TextTokenizer;
 use crate::review::store::DiffStore;
 use crate::router::Router;
-use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
 use super::events::{LlmRequest, ReplEvent, RunnerReconnectTarget};
@@ -1659,42 +1656,64 @@ impl EventLoop {
     /// Create a new event loop with unified generators
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        conversation: Arc<RwLock<ConversationHistory>>,
-        active_persona: Arc<RwLock<crate::config::Persona>>,
-        _cloud_gen: Arc<dyn Generator>,
-        qwen_gen: Arc<dyn Generator>,
-        router: Arc<Router>,
-        generator_state: Arc<RwLock<GeneratorState>>,
-        tool_definitions: Vec<ToolDefinition>,
-        tool_executor: Arc<Mutex<ToolExecutor>>,
-        program_runtime: Arc<crate::runtime::ProgramRuntime>,
-        tui_renderer: TuiRenderer,
-        output_manager: Arc<OutputManager>,
-        status_bar: Arc<StatusBar>,
-        streaming_enabled: bool,
-        local_generator: Arc<RwLock<LocalGenerator>>,
-        tokenizer: Arc<TextTokenizer>,
-        ipc_client: Option<crate::ipc::IpcClient>,
-        daemon_ipc_error: Option<String>,
-        mode: Arc<RwLock<ReplMode>>,
-        memory_system: Option<Arc<crate::memory::MemorySystem>>,
-        session_label: String,
-        session_uuid: Uuid,
-        available_providers: Vec<crate::config::ProviderEntry>,
-        active_provider_index: usize,
-        daemon_client: Option<Arc<crate::client::DaemonClient>>,
-        context_lines: usize,
-        max_verbatim_messages: usize,
-        context_recall_k: usize,
-        todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
-        todo_journal_target: crate::tools::todo::TodoJournalTarget,
-        todo_journal_receiver: crate::tools::todo::TodoJournalReceiver,
-        enable_summarization: bool,
-        auto_compact_enabled: bool,
-        daemon_base_url: Option<String>,
-        provider_resolver: crate::scheduler::ProviderResolver,
-        agent_scheduler: Arc<crate::scheduler::AgentScheduler>,
+        session: crate::cli::repl_event::parts::SessionParts,
+        generation: crate::cli::repl_event::parts::GenerationParts,
+        ui: crate::cli::repl_event::parts::UiParts,
+        tools: crate::cli::repl_event::parts::ToolParts,
+        daemon: crate::cli::repl_event::parts::DaemonParts,
+        limits: crate::cli::repl_event::parts::ContextLimits,
+        runtime: crate::cli::repl_event::parts::RuntimeParts,
     ) -> Self {
+        // Unpacked to the names the body already uses, so the grouping is visible at the boundary
+        // and invisible below it.
+        let crate::cli::repl_event::parts::SessionParts {
+            conversation,
+            active_persona,
+            mode,
+            label: session_label,
+            uuid: session_uuid,
+        } = session;
+        let crate::cli::repl_event::parts::GenerationParts {
+            generator: qwen_gen,
+            router,
+            state: generator_state,
+            local: local_generator,
+            tokenizer,
+            resolver: provider_resolver,
+            available: available_providers,
+            active_index: active_provider_index,
+        } = generation;
+        let crate::cli::repl_event::parts::UiParts {
+            renderer: tui_renderer,
+            output: output_manager,
+            status_bar,
+            streaming_enabled,
+        } = ui;
+        let crate::cli::repl_event::parts::ToolParts {
+            definitions: tool_definitions,
+            executor: tool_executor,
+            todo_list,
+            todo_journal_target,
+            todo_journal_receiver,
+        } = tools;
+        let crate::cli::repl_event::parts::DaemonParts {
+            ipc_client,
+            ipc_error: daemon_ipc_error,
+            client: daemon_client,
+            base_url: daemon_base_url,
+        } = daemon;
+        let crate::cli::repl_event::parts::ContextLimits {
+            lines: context_lines,
+            max_verbatim_messages,
+            recall_k: context_recall_k,
+            enable_summarization,
+            auto_compact: auto_compact_enabled,
+        } = limits;
+        let crate::cli::repl_event::parts::RuntimeParts {
+            program_runtime,
+            agent_scheduler,
+            memory_system,
+        } = runtime;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         todo_journal_receiver.spawn();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
