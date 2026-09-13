@@ -35,15 +35,17 @@ to its own rendering model and validates handle ownership/generation before proj
 
 ### Wire syntax and self-contained scripts
 
-The provider wire protocol has a deliberately cheap dispatch rule: a response whose first
-non-whitespace byte is `(` is Finch Lisp; every other response is Co-Forth. The dispatcher does
-not guess from prose and the provider prompt says that user-visible prose must be emitted by a VM
-operation such as `"hello" say`, never written outside the program. Empty responses and Markdown
+The canonical submission envelope carries an explicit `language: "forth" | "lisp"` field; that
+metadata defines language identity for storage, tools, IPC, and non-provider transports. A compact
+streaming model response that deliberately omits the envelope may use a cheap shorthand: first
+non-whitespace byte `(` selects Finch Lisp and every other response selects Co-Forth. This shorthand
+never overrides an explicit tag and is not part of either language's source identity. The dispatcher
+does not guess from prose and the provider prompt says that user-visible prose must be emitted by a
+VM operation such as `"hello" say`, never written outside the program. Empty responses and Markdown
 fences are explicit malformed-wire diagnostics with corrective guidance, not accidental Co-Forth
-words. An explicit `language` field in a stored script/tool submission overrides this compact
-streaming discriminator. Co-Forth is therefore the natural streaming form: the receiver can parse
-and render complete tokens while waiting for later tokens, whereas Lisp remains preferable when
-nested structure makes the leading `(` worth it.
+words. Co-Forth is therefore the natural streaming form: the receiver can parse and render complete
+tokens while waiting for later tokens, whereas Lisp remains preferable when nested structure makes
+the leading `(` worth it.
 
 Bare `"text"` is the preferred short escaped-string literal in Co-Forth. `s"text"` remains a
 Forth-compatible equivalent and has no implicit leading space: both `s"text"` and conventional
@@ -51,39 +53,45 @@ Forth-compatible equivalent and has no implicit leading space: both `s"text"` an
 the literal or is composed explicitly (for example `space`, `str-cat`, or separate `say` events).
 `"""..."""` is the preferred raw multiline/prose literal; compatible `s"""..."""` also works.
 It preserves its contents verbatim until the next triple quote, avoiding fragile quote escaping in
-user-visible text. Co-Forth uses `\\` line comments. Parenthesized Co-Forth comments are allowed only after a
-Co-Forth token: at the start of a wire response, `(` selects Lisp. The normative language definition
-must give exact escaping and raw-delimiter examples.
+user-visible text. Co-Forth uses `\\` line comments. In an untagged compact provider stream,
+parenthesized Co-Forth comments are allowed only after a Co-Forth token because leading `(` is the
+Lisp shorthand. Explicitly tagged Co-Forth has no such transport ambiguity and may begin with a
+parenthesized comment. The normative language definition must give exact escaping and raw-delimiter
+examples.
 
 Finch scripts are portable, self-contained source artifacts rather than shell wrappers. A script
-may begin with a normal Finch shebang such as `#!/usr/bin/env finch --exec`; `finch --exec` selects
-the strict typed frontend and must never silently fall back to the legacy Forth or Lisp
-interpreters. Scripts may choose Lisp or Co-Forth using the same first-token rule. Imports and
+may carry an explicit language in its shebang/launcher metadata, for example
+`#!/usr/bin/env -S finch --exec --language=lisp`; the launcher removes the shebang before the chosen
+frontend receives source. `finch --exec` selects the strict typed runtime and must never silently
+fall back to legacy interpreters. A script without language metadata must be supplied an explicit
+CLI/tool language rather than borrowing the compact provider-stream shorthand. Imports and
 namespaces are a later package feature: model-emitted one-off scripts should normally be complete
 and auditable in one file. Bash, Python, and other external scripts remain valid *proposal
 artifacts* when they are the appropriate user-editable delivery format; Finch scripts do not
 remove that capability.
 
-### Single-pass parsing, modules, and packages
+### One parse boundary, modules, and packages
 
-Single-pass parsing is a hard language constraint. Each Lisp or Co-Forth module's source byte
-stream is lexed/read exactly once into span-carrying syntax or direct lowering events. Subsequent
-macro expansion, name resolution, type inference, optimization, linking, and independent IR
-verification operate on retained structured data; none may rescan the source or serialize code and
-reparse it. The independent verifier remains mandatory because it proves the produced IR rather
-than interpreting source a second time.
+Each Lisp or Co-Forth module's source bytes cross one authoritative parse boundary into an explicit
+span-bearing frontend AST. This is a representation and pipeline constraint, not a requirement to
+stream lexer tokens directly into IR or to forbid bounded lookahead, token buffering, or declaration
+indexing inside the parser. After that boundary, macro expansion, name resolution, type inference,
+optimization, linking, and independent IR verification operate on retained structured data; none
+may rescan source, serialize transformed code, and reparse it. The independent verifier remains
+mandatory because it proves the produced IR rather than interpreting source a second time.
 
-Source order is independent from this parsing constraint. During the one parse, the frontend
-registers every top-level declaration skeleton before semantic jobs require its body, so later
-definitions are valid forward references. The dependency scheduler resolves them on demand.
+Source order is independent from this parsing constraint. During parsing, the frontend registers a
+top-level declaration skeleton as soon as its header is stable and publishes its body node when that
+region is complete. A job may then wait for a skeleton encountered later, so later definitions are
+valid forward references. The dependency scheduler resolves them on demand.
 Explicit signatures are required for exported module interfaces, genuinely ambiguous inference,
 or cycles that cannot otherwise reach `SignatureReady`—not merely because a callee appears later
 in the file. Macros are bounded structured transformations, not context-sensitive token
 reinterpretation. A parser never guesses and revisits an earlier token after discovering a later
 declaration; the retained AST and symbol registry carry that information into semantic analysis.
 
-Single-pass parsing does not mean emitting final IR directly from lexer tokens. Each frontend must
-produce an explicit, span-preserving syntax tree in that one source pass. Lisp already has the
+The parse-once rule does not mean emitting final IR directly from lexer tokens. Each frontend must
+produce an explicit, span-preserving syntax tree. Lisp already has the
 beginnings of this boundary in `Val` and `SpannedVal`. Co-Forth now performs one tokenization into a
 span-preserving module tree whose definition and top-level bodies retain an ordered node sequence
 and lower against the original source; it no longer copies/masks and re-tokenizes those bodies.
@@ -94,14 +102,46 @@ nodes in the same source pass, so IR emission no longer discovers literals by re
 text. Every other body element is retained as an explicit unresolved-word node rather than a
 generic atom. Elaboration must turn those words into structured control nodes and resolved
 local/call references before this gate closes. Syntactic sugar, macros, and other rewrites
-operate on those nodes, and one post-order semantic lowering emits the common typed stack IR.
+operate on those nodes, and one semantic lowering stage emits the common typed stack IR in
+evaluation order. A cached parametric body may be instantiated or lowered more than once when its
+layout or specialization requires it; “one lowering stage” does not require one physical visit to
+each source node.
 Generated syntax retains both its call-site and definition origin and is never converted to text
 and reparsed.
+
+Lisp and Co-Forth are the first two frontends, not a closed set. A future language frontend may
+parse its own source once and submit its elaborated, span-bearing AST through a versioned semantic-
+construction protocol. That protocol is a typed builder surface—operations such as declaring a
+function, resolving a call, and constructing a match, closure, generic instantiation, or effect—not
+a public HIR-node ABI. Compiler-owned builders may change internal AST/HIR representation without
+making independent frontends clients of compiler internals. A frontend may reuse CoLisp's ordinary
+syntax, macro, concept, and CTFE libraries by constructing their structured inputs directly, but it
+must not emit CoLisp text and invoke another reader. This makes Finch a practical compiler substrate
+without turning CoLisp into a second semantic waist or losing the foreign language's source origins
+and diagnostics.
+
+Every frontend submits the same types, ownership transitions, effects, and capability requirements
+through common elaboration/checking before independent IR verification. A frontend is an untrusted
+producer of builder calls and claimed source origins: the construction protocol exposes no way to
+mint internal HIR nodes, `FunctionCertified`, `ModuleSealed`, or `ModuleVerified`, and the common
+checkers derive or validate every security-relevant fact. Typed stack IR remains the stable
+executable/verification representation; compatibility of the frontend protocol is versioned
+separately from internal HIR layout.
+
+The retained tree is elaboratable rather than permanently syntax-only. A node keeps its stable
+source identity and expansion ancestry while acquiring only the semantic facts needed to lower it:
+a resolved symbol, instantiated signature and concept evidence, inferred type/effect summary,
+ownership transformation, control-flow successors, or merge-stack contract. For example, an
+`UnresolvedWord("foo")` becomes a resolved call/local/control node, an `if` gains typed branches and
+its merge row, and a generic call gains definition/evidence identities. Implementations may use
+phase-indexed nodes, side tables, or immutable replacement nodes. They should avoid copying a
+complete tree for every phase unless a measured performance, concurrency, or semantic need justifies
+it. Final typed IR is emitted only after the relevant semantic facts are resolved.
 
 Keep that pipeline deliberately short:
 
 ```text
-source bytes -- one reader/parser pass --> frontend AST
+source bytes -- one authoritative parse boundary --> frontend AST
 frontend AST --> declarations + typed module interfaces
 frontend AST -- elaboration/expansion --> parametric HIR (only where required)
 elaborated AST/HIR -- instantiation + post-order lowering --> typed stack IR
@@ -114,7 +154,7 @@ justify one small shared parametric HIR: a concrete typed runtime instruction st
 retain generic parameters, constraints, an unresolved reusable body, module-interface references,
 and expansion provenance. The HIR may instead be an explicitly elaborated AST if no separate node
 family is useful. It must not become an excuse for a succession of mandatory compiler passes.
-Optimization may traverse retained IR and never changes the one-pass source contract.
+Optimization may traverse retained IR and never changes the one-parse source contract.
 
 Modules are compilation units, never textual includes. A module has an immutable identity, typed
 imports and exports, a namespace, a compiled interface, IR, source map, and content hash. Importing
@@ -123,11 +163,17 @@ or confer capabilities. Self-contained model-authored scripts remain the default
 would make an artifact harder to audit.
 
 Semantic analysis should be dependency-driven rather than implemented as repeated whole-module
-passes. After the one parser pass registers declaration skeletons, each symbol and generic
-instantiation owns a bounded semantic job with monotonic readiness phases:
+passes. As soon as the parser publishes a stable declaration/body node, its symbol may own a bounded
+semantic job even while later source is still being parsed. A job blocked on a later declaration
+waits for that skeleton. Reaching EOF closes the parse frontier, but not necessarily the declaration
+frontier: visibility-eligible macro expansions and imported interfaces may still publish structured
+declarations through the same registry. Absence is diagnosed only after that bounded expansion and
+declaration frontier closes. Dependencies among expansions use the same phase-aware cycle detection
+rather than schedule-dependent early failure. Each symbol and generic instantiation advances
+through monotonic readiness phases:
 
 ```text
-Declared -> SignatureReady -> BodyTyped -> Lowered
+Declared -> SignatureReady -> BodyTyped -> Lowered -> FunctionCertified
 ```
 
 A job that requires another symbol at a particular phase yields an explicit compiler continuation
@@ -144,8 +190,58 @@ scheduler](https://github.com/snazzy-d/sdc/blob/master/src/d/semantic/scheduler.
 stackful fibers to make `require(symbol, phase)` read synchronously while dependent symbols advance
 on demand. Finch should initially implement the same dependency semantics with explicit resumable
 compiler jobs rather than native fiber stacks. That preserves deterministic scheduling, cycle
-diagnostics, fuel limits, and straightforward tests/serialization. Compiler continuations are an
-internal frontend mechanism and are not language-level `fiber<Y,R>` values.
+diagnostics, fuel limits, and straightforward tests/serialization without making the Rust bootstrap
+depend on a second stack runtime.
+
+The eventual self-hosted compiler may express those same jobs directly as typed CoLisp fibers over
+the shared resumable-execution primitive, conceptually
+`fiber<CompilerNeed,CompilerResolution,T>`. A semantic function calls `require(symbol, phase)` in
+direct style; that operation yields `CompilerNeed`, the dependency scheduler advances or diagnoses
+the requested job, and resumption supplies `CompilerResolution`. The VM performs the continuation
+lowering, so compiler source does not manually encode every semantic state transition. This is a
+compiler use of the public typed fiber mechanism, not a second scheduler, OS thread, or LLM-agent
+abstraction; it must produce the same deterministic job graph and diagnostics as the explicit
+bootstrap implementation.
+
+Compilation may therefore be pipelined rather than separated by whole-module barriers:
+
+```text
+source -> parsed AST regions -> dependency-ready semantic jobs -> typed IR functions -> verifier
+```
+
+Lowering consumes resolved syntax in evaluation order and produces compact typed stack
+transformations; local verification of a completed function does not require retaining unrelated
+source bodies. It checks the function's instructions, control-flow, stack and ownership invariants,
+and calls against exact immutable dependency summaries. Parsing may continue while earlier jobs
+elaborate, and completed definitions may lower and enter `FunctionCertified` while others wait
+for signatures or evidence. Synchronization occurs at real semantic boundaries: macro visibility,
+signatures, evidence and layouts, closed control-flow graphs and merge rows, inferred recursive
+summaries, imports, and the final module interface. Publication remains atomic and requires the
+complete module composition/security verifier result, including transitive effects, capability
+requirements, dependency versions, interface agreement, and a certificate keyed to the final module
+hash. A partially compiled module is never externally visible or executable.
+
+Use security-explicit names for these compilation states. `FunctionCertified` means the local structural,
+type, stack, ownership, and exact-dependency checks above passed; it permits quarantined downstream
+compilation but never execution. `ModuleSealed` means the declaration/expansion graph is closed,
+exports and summaries are frozen, and content identity can be assigned. `ModuleVerified` means the
+independent composition/security verifier accepted that sealed module and issued its final
+certificate. Only `ModuleVerified` permits publication, import, or execution; the states are distinct
+types rather than interchangeable flags.
+
+Native lowering may begin from `FunctionCertified` IR only as a provisional cache artifact.
+Its key includes the exact function IR, dependency summaries, compiler/runtime ABI, target, and
+optimization policy; any changed input invalidates it. The artifact remains quarantined until the
+final module certificate validates its composition, and Cranelift still never consumes unchecked
+IR. An initial implementation may simply defer all JIT work until module verification if provisional
+compilation does not produce a measured win.
+
+Parallel scheduling is an optimization, not a semantic input. Stable identities derive from module
+and source structure rather than job completion order; diagnostics have deterministic ordering; and
+single-threaded, shuffled, and parallel schedules must produce byte-equivalent interfaces and IR.
+Jobs should be coarse enough to amortize scheduling cost, queues must apply bounded backpressure,
+and a small module may run serially. This preserves the speed goal without turning individual AST
+nodes into synchronization-heavy actors.
 
 Package retrieval is a separate later layer over modules. Dependency declarations identify a
 source locator and exact version or immutable content hash, and a checked-in lockfile fixes the
@@ -265,6 +361,14 @@ Traditional Forth implementations commonly compile text into threaded dictionary
 IR plays the same internal role while making types, control-flow blocks, source locations, effects,
 and capability requests explicit enough to verify and later lower to native code.
 
+The stack form is also a compiler-pipeline boundary, not merely an accommodation for Co-Forth. Each
+instruction compactly states its input/output rows, ownership transition, effect contribution,
+control successors, and source origin. Once a function's resolved syntax has been linearized into
+those transformations, local verification, serialization, interpretation, and SSA lowering no
+longer need its unrelated frontend tree. This makes functions natural bounded producer/consumer
+units for dependency-driven and parallel compilation while preserving deterministic evaluation
+order.
+
 The runtime retains canonical source in the authored language. Compiled IR, verifier summaries,
 and native code are rebuildable caches keyed by source, compiler, vocabulary, dependency, target,
 and policy hashes.
@@ -293,7 +397,7 @@ word<S,E>        callable word with stack signature S and effects E
 fn(A...)->R ! E  lexical closure
 task<T>          scheduler-owned child/task handle
 stream<T>        scheduler-owned lazy sequence/cursor handle
-fiber<Y,R>       deferred producer that may yield Y repeatedly and returns R once
+fiber<Y,Resume,R> resumable producer that yields Y, accepts Resume, and returns R once
 resource<K>      generation-bound runtime handle
 capability<C>    unforgeable grant handle; never synthesized from text
 dynamic          explicitly tagged escape hatch
@@ -387,8 +491,11 @@ sugar only if they normalize into that same row value.
 Exceptions are not value types or source-written members of this effect row. `throw` is a control-
 flow edge carrying an ordinary typed value. The compiler infers the set of values that may escape
 each callable and records a compact exception summary in HIR, IR, and compiled module interfaces for
-handler checking, diagnostics, and optimization. Ordinary source does not declare `throws<E>` lists.
-Only an explicit `nothrow` guarantee requires proof that no exceptional edge escapes the callable.
+handler checking, diagnostics, and optimization. Private source normally declares no exception list.
+A published callable must choose `nothrow`, an explicit `throws A | B` upper bound, or an explicit
+`throws infer` contract that accepts its exact inferred set. This clause is control-flow/interface
+metadata, not a value type, generic `throws<E>`, or effect-row member. Publication proves the
+inferred escaping set is contained by the declared bound.
 
 The signature includes:
 
@@ -437,7 +544,7 @@ diagnostic.
 
 That registry is an implementation substrate, not a promise that these constructs have the same
 language semantics. A `task<T>` yields one terminal result, a `stream<T>` exposes a bounded cursor,
-a `fiber<Y,R>` exposes producer progress plus a terminal result, and an agent is a separate
+a `fiber<Y,Resume,R>` exposes producer progress, typed resumption, and a terminal result, and an agent is a separate
 ProgramRun with its own authority and provider protocol. No construct shares a parent operand
 stack or Rust thread/channel handle merely because it shares lifecycle machinery.
 
@@ -468,23 +575,114 @@ resumable instance always starts a private stack from explicit arguments and imm
 normal calls remain the way to operate on the current stack. Shared `cell<T>`, atomics, mutexes, or
 channels are separate explicit memory resources, not implicit fiber communication.
 
-`fiber<Y,R>` is the currently implemented cooperative producer view over the shared typed `yield`
-control effect, exposing a pullable sequence plus a final return:
+The general resumable handle uses linear typestates. Generator, coroutine, fiber, thread, task, and
+custom-scheduler APIs wrap these transitions rather than defining new continuation representations:
 
 ```text
-defer closure       : fiber<Y,R>                  create a pure producer and return immediately
-yield value         : unit                        publish one Y and continue when advanced
-fiber-next fiber    : result<Y,variant{end(R)}>  ok(Y), or err(end(R)) at terminal return
-fiber-join fiber    : R                           discard yields and advance to terminal return
-fiber-cancel fiber  : unit                        make later use fail deterministically
+ready-fiber<Y,Resume,R>       dormant, not yet advanced
+suspended-fiber<Y,Resume,R>   stopped at one yield
+fiber-step<Y,Resume,R>        yielded(Y, suspended-fiber<Y,Resume,R>) | Done(R)
+fiber-state<H,R>              pending(H,FiberStatus) | Done(R)
+
+defer        : take closure -> ready-fiber<Y,Resume,R>        ; throws ResumableLimit
+yield        : take Y -> Resume
+fiber-start  : take ready-fiber<Y,Resume,R> -> fiber-step<Y,Resume,R>
+fiber-resume : take suspended-fiber<Y,Resume,R>, take Resume -> fiber-step<Y,Resume,R>
+fiber-next   : take ready-or-suspended<Y,unit,R> -> fiber-step<Y,unit,R>
+fiber-join   : take Done<R> -> R                              ; ordinary library unwrap
+fiber-cancel : take ready-or-suspended<Y,Resume,R> -> unit    ; throws CleanupFailure
+fiber-try-join : take dynamic-handle<R> -> fiber-state<dynamic-handle<R>,R>
 ```
+
+Here `take` is a parameter mode in the illustrative signature, not a mandatory token at every call
+site. Parameters borrow by default. Supplying a unique/affine value to a taking parameter moves it;
+an eligible copy/shared owner uses its ordinary copy/retain operation so the caller remains valid,
+unless the caller explicitly chooses `move` to transfer that existing handle instead.
+
+`defer` reserves the scheduler-registry/reaper accounting described below and creates a dormant
+ready handle without running it in the background. It is non-suspending and throws the published
+`ResumableLimit` value if capacity is unavailable; a scheduler policy may separately offer an
+awaiting admission operation. `fiber-cancel` similarly publishes `CleanupFailure` as its stable
+upper bound. Exceptions from the resumed callable itself remain inferred through start/resume/next
+like ordinary calls. Each advance consumes the previous handle and returns either the sole next
+suspended handle with its yielded value or ordinary standard-library `Done<R>`. The caller must
+pattern-match that result.
+Only `Done<R>` is accepted by `fiber-join`, so safe statically typed code cannot pass it incomplete
+work. `Done` is no more compiler-special than `Result`: its library `join` operation simply unwraps
+`R`. Constructing another `Done(value)` cannot forge a continuation because the VM's ready/suspended
+handle has already been consumed separately. An erased/runtime `try-join` consumes its handle and
+returns either `Done<R>` or `pending(handle,status)`, preserving the sole handle on an incomplete
+path. It never advances, waits, copies a unique `R`, or throws merely because work is incomplete.
+
+Reaching a yield is progress, not proof that the producer consumed all input or reached terminal
+`R`; no operation silently advances while discarding `Y`. A caller explicitly loops over the
+returned handle, uses a `collect`/`fold` policy that accounts for every yield, or transfers the handle
+plus a typed yield-to-resume policy into a scheduler. Yield and resume cross private-stack ownership
+boundaries: non-copyable values move, copyable/shared values use ordinary copy/retain evidence, and
+an escaping borrow is rejected.
+
+The shared primitive supports distinct policies without conflating them:
+
+| Policy | Progress owner | Yield/resume contract | Completion |
+|---|---|---|---|
+| generator | calling consumer | `Y` / `unit` | match `Done`, then join/unwrap |
+| coroutine | calling peer | `Y` / typed `Resume` | match `Done`, then join/unwrap |
+| green thread | cooperative scheduler | scheduling/event yield / policy response | poll or explicitly await task |
+| async task | event-loop scheduler | private await request / event result | typed task result |
+| custom fiber scheduler | declared policy implementation | declared `Y` / `Resume` | the same `Done<R>` terminal value |
+
+These policies belong in the standard library wherever semantics permit. The compiler/runtime kernel
+owns only operations that ordinary code cannot safely synthesize: capture verified frames, suspend
+with typed `Y`, resume with typed `Resume`, cancel/unwind the private execution, and mint unforgeable
+linear ready/suspended handles whose terminal transition consumes the handle and returns `R`. The
+standard library defines `Done`, `Generator`, `Coroutine`,
+green-thread and async-task adapters, collection/fold helpers, and scheduler policy concepts as
+ordinary parameterized types with explicit mappings to those intrinsics. User schedulers may
+implement the same concepts. Selective specialization and JIT inlining follow resolved evidence and
+IR behavior rather than privileged standard-library type names.
+
+A scheduler policy consumes the direct handle and becomes its only progress owner. It returns a
+task/observer surface appropriate to that policy; the original binding is unavailable, so two
+callers cannot race to advance it. A `poll` returns status-only `pending`/`complete` or a borrowed
+terminal view; it never moves an owned `R` from a borrowed task.
+`await take task<R>` explicitly consumes the task handle and suspends until the scheduler produces
+terminal `R`; `join` only unwraps an already-produced `Done<R>`. Custom policies map yielded values
+to resume decisions through explicit concept evidence and cannot inspect or forge private
+continuation frames. OS worker threads are merely one execution policy for verified resumable state
+and require ordinary cross-worker transfer evidence.
+
+For a compiler semantic fiber, the scheduler consumes every `CompilerNeed`, advances the dependency,
+and supplies one `CompilerResolution`; none of those values are presentation-only progress that may
+be dropped. If an advance reaches a host await, the owning ProgramRun suspends through the normal
+typed effect/resume path rather than blocking an OS thread. A thrown failure propagates only after
+fiber and coordinator cleanup obligations run.
+
+Dropping an unfinished affine handle does not synchronously unwind it: the handle's nonthrowing,
+non-suspending drop atomically transfers the owned execution and cleanup stack to a scheduler reaper
+in `CancelRequested` state. Creation of resumable execution reserves an entry and bounded cleanup
+accounting in the owning ProgramRun's scheduler registry; creation backpressures or fails with a
+structured resource-limit value before that quota is exhausted. Drop therefore marks and transfers
+an already-accounted record without allocating or growing an unbounded queue. The reaper drives
+cancellation with fair scheduling and per-origin limits, and records exactly one terminal outcome.
+It has reserved cleanup fuel/time/await allowances independent of exhausted user work budgets so
+ordinary cancellation can finish. If a suspending guard exceeds those bounds, the runtime records a
+suppressed cleanup/resource-limit diagnostic, continues mandatory non-suspending drops, and
+terminalizes the record rather than retrying forever. An embedder must drain or durably hand off the
+owned registry before clean shutdown; hard process abort retains the ordinary no-cleanup guarantee.
+Explicit
+`fiber-cancel` is stronger: it consumes the handle and cooperatively suspends as needed until cleanup
+is terminal, then returns `unit` or propagates the structured cleanup diagnostic.
+
+Scheduler ancestry detects self-wait and dependency cycles instead of waiting forever. Before
+reporting a cycle, it terminalizes the affected scheduler-owned jobs, unwinds each execution exactly
+once, and releases their handles; diagnosed work is never stranded in the registry.
 
 The source program never writes a continuation. A fiber `yield value` may occur any number of
 times; the VM records remaining frames as an internal resumable-execution record and advances it
 through the current owner. `defer` reifies/transfers ownership of that record into a handle; it must
 not clone or reconstruct generator semantics in a second scheduler implementation.
 This uses the same typed `yield` instruction as ordinary ProgramRuns, not a second fiber-only
-primitive: its function/fiber contract declares `Y` and the resume value (initially `unit`), and
+primitive: its function/fiber contract declares `Y` and the resume value, and
 the scheduler records both in the same typed suspension record used by every `MaySuspend` word.
 Callable signatures and first-class closure types retain this as `yields<Y,unit>` metadata. The
 frontends infer it transitively from direct yields and calls, while the independent verifier derives
@@ -494,7 +692,7 @@ callable. VM storage may use the ordinary tagged `TypedValue` representation, bu
 wrappers statically establish `Y` and `Resume`; a raw boxed escape hatch must never make routine
 generator/coroutine code `dynamic`. `Resume = unit` is the present generator profile. A typed
 `require(name, phase) -> Symbol` can later yield a structured compiler request and receive the
-resolved symbol through the same channel. `defer`, `next`, `resume`, `join`, scheduler registration,
+resolved symbol through the same channel. `defer`, `next`, `resume`, scheduler registration,
 and event-loop handling remain ordinary generated vocabulary/library policies over one runtime
 record, not privileged multi-return conventions. A resumable producer can be adapted to the
 future effectful stream/range concepts through visible library code; it is not the definition of a
@@ -544,6 +742,12 @@ perform host effects. A range adaptor should be an ordinary composed value; it n
 producer, own a scheduler record, or erase its concrete type merely because the type is inconvenient
 to spell.
 
+Parsing over a range must make consumption explicit. A prefix parser returns the parsed value plus
+the remaining range/cursor; it does not claim whole-document success. A document parser consumes
+permitted trailing whitespace and proves end-of-input before returning success, otherwise it reports
+the first trailing token with its span. Dropping a range or observing one syntactically complete
+value never implies that unconsumed input was accepted.
+
 An adaptor may therefore return an opaque existential such as `some Range<Item=T>`. This
 "Voldemort type" hides the private concrete adaptor name from source and module consumers while
 retaining that one concrete type and its static evidence for optimization. It is distinct from
@@ -588,10 +792,13 @@ their contracts in the registry; user source cannot manufacture arbitrary IR or 
 Everything above that substrate—including collection algorithms and range iteration—remains
 ordinary vocabulary that can be inspected, replaced, composed, and optimized.
 
-### Effects are capability requirements
+### Capability effects are authority requirements
 
-A type describes values. An effect describes an observable action or authority requirement.
-The target replaces a single ordered `ExecutionEffect` with a set of parameterized requirements:
+A type describes values. The canonical effect row describes observable semantic behavior, including
+mutation, suspension, nondeterminism, and capability-bearing host operations. A capability effect is
+the subset that requests authority; the broker ignores non-authority members while the verifier,
+scheduler, and optimizer consume the members relevant to them. For authority, the target replaces a
+single ordered `ExecutionEffect` with a set of parameterized requirements:
 
 ```text
 {}
@@ -612,6 +819,9 @@ authorization rule is:
 ```text
 inferred requirements ⊆ submitted declaration ⊆ effective grants
 ```
+
+Implementations may index or cache row members by kind for fast consumers without exposing parallel
+annotation systems or changing the single source-level union algebra.
 
 The coarse effect classification remains temporarily as a UI risk summary derived from the set;
 it is not the enforcement model.
@@ -850,10 +1060,22 @@ rules as every other continuation value.
 Calls propagate exceptional exits automatically. The compiler infers their possible value types
 through the call graph, recursive strongly connected components, generics, and dynamic evidence; it
 does not require source annotations or `result` plumbing in intermediary functions. Private and
-recursive inference remains bounded and monotonic. Published module interfaces freeze the inferred
-summary for downstream checking without requiring the author to repeat it in source. A dynamic call
-without stronger evidence is conservatively considered capable of throwing any permitted exception
-value.
+recursive inference remains bounded and monotonic. Published module interfaces freeze the selected
+exception contract for downstream checking. Widening that public bound is a breaking interface
+change because exhaustive handlers and `nothrow` proofs must be rechecked; narrowing an
+implementation's inferred set within an unchanged explicit bound is not. With `throws infer`, the
+exact set is the contract, so adding an escaping type is breaking while removing one is compatible
+but still changes the content/interface hash. A dynamic call without stronger evidence is
+conservatively considered capable of throwing any value permitted by its published contract.
+
+Exception sets and explicit bounds are canonical subtype antichains, not flat nominal lists. An
+inferred exception `E` is covered by a published bound when some declared `D` satisfies `E <: D`.
+The canonical form removes any member already covered by a broader member and orders the remainder
+by stable type identity, so `{IoError, FileNotFound}` is `{IoError}` when
+`FileNotFound <: IoError`. Interface hashing, widening checks, dynamic-call summaries, handler
+subtraction, and exhaustiveness all operate on that same canonical form. Diagnostics may retain the
+more specific inferred type and source origin even when its contract representation normalizes to a
+broader bound.
 
 `nothrow` is the explicit checked guarantee. A default callable may propagate an exception. A
 `nothrow` callable may call such code, but every possible exceptional edge must be caught and
@@ -1274,10 +1496,10 @@ definition that allocates mutable state, captures a capability, suspends, or oth
 observable effect remains monomorphic unless its type parameters are explicit. Recursive and
 public definitions, effect and capability-selector boundaries, refinements, and FFI require
 declared signatures; publication validates and freezes the declaration rather than exporting an
-accidentally inferred contract. Exception sets are the exception to that source-annotation rule:
-the compiler infers and freezes their interface summary without requiring a declared list. A source
-`nothrow` qualifier is an optional stronger guarantee that publication verifies against the inferred
-control-flow graph. Concepts, parameter packs, ranges, overload resolution, and bounded CTFE should
+accidentally inferred contract. Exception flow remains inferred throughout the body, but a published
+definition chooses `nothrow`, an explicit exception upper bound, or `throws infer` to make its API
+stability policy visible. Private/intermediary definitions omit that clause. Concepts, parameter
+packs, ranges, overload resolution, and bounded CTFE should
 make routine code feel as direct as Python or JavaScript while retaining a static, optimizable
 execution path. Do not achieve convenience by silently inserting `dynamic`, unchecked coercions, or
 an interpreter-only fallback.
@@ -1511,7 +1733,8 @@ Module
   imports by immutable ProgramRef
   functions
     signature
-    inferred exception summary and optional nothrow guarantee
+    inferred_exception_set
+    published_exception_contract = nothrow | upper_bound(types) | infer(types)
     locals/captures
     basic blocks
     instructions with SourceOrigin
@@ -1545,10 +1768,13 @@ The verifier proves:
 - exactly-once destruction of owned values and absence of use after move;
 - no escaping borrow, mutable alias, or borrow live across suspension;
 - signature agreement on every return;
-- inferred exceptional successors cover every throw and throwing call edge;
+- the canonical inferred exception antichain is derived from every throw and throwing call edge and
+  equals the function's stored `inferred_exception_set`;
 - catch patterns are well ordered and narrow/bind only valid payload layouts;
 - cleanup edges run before handler entry and an unmatched catch resumes the original unwind;
-- no exceptional successor escapes a callable declared `nothrow`;
+- the published exception contract is proved against that derived set: it is empty for `nothrow`,
+  every inferred member is a subtype of some explicit upper-bound member, and `throws infer` stores
+  exactly the same canonical antichain;
 - transitive effects and capability selector containment;
 - valid immutable dependency versions;
 - bounded static limits where available;
@@ -1738,7 +1964,7 @@ typed results/events through a daemon-owned handle; `join` resumes the parent ru
 returned value on its private working stack before it commits. This preserves no-GIL concurrency
 without turning positional Forth stack state into a data race.
 
-`fiber<Y,R>` and `task<R>` are first-class persistent values: their serialized form is a stable
+`fiber<Y,Resume,R>` and `task<R>` are first-class persistent values: their serialized form is a stable
 daemon task ID plus Brain/environment identity, owner/ancestry, expected types, creation revision,
 budget, and policy reference—not a Rust channel, OS thread handle, or child stack. A later program
 may keep such a handle on the persistent Brain stack, inspect/poll it, consume yielded values, join
@@ -2202,11 +2428,70 @@ ordinary FFI. Keep the reader framing, artifact loader, verifier, effect boundar
 runtime as a deliberately small stage-0 trusted implementation rather than requiring an existing
 self-hosted compiler to validate arbitrary input.
 
-Bootstrap reproducibility is mandatory. Check in a content-addressed verified compiler artifact,
-use stage 0 to compile the Finch compiler source into stage 1, use stage 1 to produce stage 2, and
-require normalized stage-1/stage-2 IR or native artifacts to agree. Record compiler source, module
-graph, runtime ABI, target, and dependency hashes. Self-hosting must not introduce a privileged AST,
-type, CTFE, or code-generation path unavailable to the inspectable language modules it exercises.
+The eventual compiler distribution may be a self-bootstrapping staged image. A tiny audited native
+stage 0 validates a bounded canonical manifest and loads a minimal Co-Forth compiler module; later
+content-addressed stages use only the language/compiler surface exported by the preceding stage,
+progressively adding the retained AST, semantic scheduler, CoLisp frontend, concepts/macros,
+optimization, and native backend. The image is a manifest-delimited container, not one source
+module whose grammar mutates halfway through parsing.
+
+The minimal Co-Forth bootstrap stage may implement semantic jobs as explicit resumable state
+machines. Once the preceding stage provides the CoLisp frontend, generalized typed-fiber lowering,
+and the scheduler bridge that owns/resumes those handles, the next stage may re-express the same
+scheduler and compiler passes as compact direct-style CoLisp fibers; subsequent self-compilation
+proves the fiber-written compiler can reproduce itself. This staged rewrite changes source
+ergonomics, not dependency semantics or the compiler-service contract. Track compiler source size,
+explicit state-machine boilerplate, generated IR size, cold/cached compile latency, and diagnostic
+equivalence against the bootstrap implementation.
+
+Manifest entries declare their artifact kind, required compiler/IR/runtime versions, dependencies,
+hash, and target where applicable. Each source module crosses its own authoritative parse boundary
+under the preceding `StageVerified` compiler-service generation, whose constituent modules remain
+individually `ModuleVerified`. Typed-IR entries use the canonical decoder and must
+reach `ModuleVerified`; checkpoint entries validate their schema/generation and reverify every
+referenced module; native entries are usable only when their derivation/cache key matches
+`ModuleVerified` IR and the exact platform ABI. That metadata does not prove source correspondence:
+received native bytes are only rebuild hints and must be regenerated locally and, when deterministic,
+byte-compared before use. A trusted local cache may reuse bytes only when the local compiler assigned
+the key after successful generation and the cache's integrity boundary remains intact; admitting a
+remote native builder would explicitly expand the TCB and require a separate attestation policy. A
+stage may contain several modules. It becomes publishable only after every module reaches
+`ModuleVerified` and a separate stage verifier validates the canonical manifest, referenced module
+hashes, dependency closure, composition constraints, compiler-service interface, and native cache
+bindings. That verifier alone mints the distinct `StageVerified` publication token. Native bytes
+are never a substitute for verified IR.
+
+Stage replacement is transactional publication through a small versioned compiler-service
+interface, not in-place mutation of executing machine code. Minting `StageVerified` is the
+publication linearization point: it atomically changes the default generation used by subsequently
+created root compilation transactions. Each root and every descendant
+job/frame/continuation remain bound to one
+immutable compiler-service generation, including children created after a newer generation becomes
+default. Durable suspension persists that generation hash and pins its modules, dependencies, and
+native artifacts across restart. Reclamation waits until no live or durable reference remains. A
+failed decode, parse, verification, compilation, or publication leaves the prior default active.
+This permits the compiler to interpret early functionality, JIT later functionality, and replace
+components as it boots without making scheduling order or partially installed code observable.
+
+ELF may be one Linux packaging target, with equivalent Mach-O, PE, library, or portable-image
+containers elsewhere; the language contract is the embedded staged manifest rather than an object-
+file format. Release artifacts may carry verified native code or a checkpointed compiler image for
+fast startup, but retain hashes of the canonical source/IR and must be reproducibly rebuildable from
+stage 0. Measure cold bootstrap, cached bootstrap, per-stage compile time, peak retained state, and
+stage replacement latency so self-hosting remains a speed feature rather than ceremony.
+
+Bootstrap reproducibility is mandatory, but a hash proves integrity rather than source
+correspondence or publisher authenticity. The genesis TCB must be explicit: either stage 0 includes
+a separately audited minimal source-to-IR seed translator, or a small canonical seed IR is admitted
+and audited as part of the TCB. Signatures/provenance identify who published an artifact; they do not
+prove what source produced it. Check in a content-addressed verified compiler artifact, use the
+audited seed to compile Finch compiler source into stage 1, use stage 1 to produce stage 2, and
+require normalized stage-1/stage-2 IR or native artifacts to agree. Release trust claims additionally
+require diverse double compilation, or an equivalent independently implemented source-
+correspondence procedure, against that audited seed path to address a compromised self-reproducing
+compiler. Record compiler source, module graph, runtime ABI, target, dependencies, publisher
+provenance, and all artifact hashes. Self-hosting must not introduce a privileged AST, type, CTFE,
+or code-generation path unavailable to the inspectable language modules it exercises.
 
 ### Later AOT compiler target
 
@@ -2396,6 +2681,15 @@ without changing language behavior.
 Every phase adds tests at the layer where its invariant is enforced:
 
 - parser and source-span golden tests for both syntaxes;
+- submission-envelope tests proving the explicit language tag is canonical and the first-byte rule
+  applies only to untagged compact provider streams;
+- parse/elaboration pipeline tests that vary chunking and valid job schedules while producing
+  byte-equivalent interfaces, IR, source origins, and deterministically ordered diagnostics,
+  including macro-generated declarations after EOF and distinct `FunctionCertified`, `ModuleSealed`,
+  and `ModuleVerified` boundaries that make pre-verification execution unrepresentable;
+- foreign-frontend tests that use the versioned builder protocol without source-to-source text or
+  direct HIR construction, preserve original spans through diagnostics, and produce IR equivalent
+  to native frontends;
 - type inference, value-restriction, no-cross-binding-back-solving, stack-row, branch-merge, and
   loop-invariant tests;
 - concept mapping, associated-output, coherence, shared/static-specialized/dynamic dispatch
@@ -2406,7 +2700,8 @@ Every phase adds tests at the layer where its invariant is enforced:
 - paired CoLisp/Co-Forth ownership cases for borrowing, unique moves, use-after-move diagnostics,
   shared retain/final release, weak upgrade, destructor ordering, owner variance, and static/dynamic
   carrier evidence;
-- range-refinement preservation, opaque adaptor result, and explicit-erasure tests;
+- range-refinement preservation, opaque adaptor result, explicit-erasure, prefix-parser remainder,
+  and whole-document trailing-input tests;
 - effect derivation, selector normalization, containment, intersection, and adversarial path tests;
 - compile-fail fixtures with stable diagnostic codes, primary spans, expansion ancestry, and
   constraint/specialization related spans;
@@ -2414,12 +2709,18 @@ Every phase adds tests at the layer where its invariant is enforced:
   moved payloads, invalid discriminants, and stable FFI/persistence representations;
 - error-model tests proving `result` remains an ordinary value, exception sets are inferred,
   default callers propagate without annotations, `nothrow` rejects only escaping exceptional
-  edges, and exhaustive handlers satisfy it;
+  edges, exhaustive handlers satisfy it, explicit public exception bounds reject widening, and
+  implementation narrowing preserves an unchanged declared interface;
 - match/catch tests for disjoint-arm reordering, specific-before-general diagnostics, ambiguous and
   shadowed patterns, `as` binding, partial catch propagation, and ordinary-match exhaustiveness;
 - unwind tests for cleanup-before-catch, reverse scope-guard/drop order, moved cleanup obligations,
   handler-thrown errors, and primary/suppressed diagnostic preservation;
 - transaction rollback, stale revision, suspension/resumption, and external-effect journal tests;
+- typed-fiber tests for initial start, non-unit resume values, unit-profile `next`/`Done` unwrapping,
+  static rejection of raw-handle join, dynamic `try-join` ownership preservation, affine scheduler
+  transfer, self/dependency-cycle diagnostics, cancellation, and checkpoint/restart preservation;
+- scheduler-reaper tests for reservation exhaustion/backpressure, create/drop storms, fair per-origin
+  progress, bounded suspending cleanup, restart/replay, and exact-once terminalization;
 - child authority attenuation and cross-branch authorization tests;
 - serialization compatibility and corrupted IR/manifest rejection tests;
 - property tests generating well-typed and deliberately ill-typed IR;
@@ -2428,6 +2729,11 @@ Every phase adds tests at the layer where its invariant is enforced:
 - interpreter/Lisp-lowering differential tests during migration;
 - interpreter/JIT differential tests when the JIT exists, including handler selection, thrown-value
   provenance, cleanup/unwind paths, `nothrow`, and trap/exception separation;
+- staged-bootstrap tests for canonical manifest/artifact-kind validation, per-module parse boundaries,
+  rejection before every module is `ModuleVerified`, unforgeable `StageVerified` publication,
+  failed-publication rollback, root/descendant generation pinning across replacement and restart,
+  explicit-job versus CoLisp-fiber semantic equivalence, diverse source-to-stage reproducibility,
+  and cached-versus-cold compiler-image equivalence;
 - UI snapshots for approval, denial, compile error, runtime trap, child failure, and revocation;
 - platform security tests for symlinks, races, Unicode paths, case sensitivity, and root changes.
 
