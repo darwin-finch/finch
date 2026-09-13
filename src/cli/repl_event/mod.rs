@@ -44,7 +44,8 @@ pub use event_loop::EventLoop;
 pub use events::{ConfirmationResult, LlmRequest, ReplEvent};
 pub use llm_loop::LlmLoop;
 pub use parts::{
-    ContextLimits, DaemonParts, GenerationParts, RuntimeParts, SessionParts, ToolParts, UiParts,
+    ContextLimits, DaemonParts, GenerationParts, LlmChannels, LlmGeneration, LlmRuntime,
+    LlmSession, LlmTools, LlmUi, RuntimeParts, SessionParts, ToolParts, UiParts,
 };
 pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
 pub use tool_execution::ToolExecutionCoordinator;

@@ -1619,36 +1619,53 @@ mod input;
 impl EventLoop {
     fn start_llm_worker(&mut self) {
         let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
+        use crate::cli::repl_event::parts::{
+            ContextLimits, LlmChannels, LlmGeneration, LlmRuntime, LlmSession, LlmTools, LlmUi,
+        };
         let llm_loop = LlmLoop::new(
-            llm_rx,
-            self.event_tx.clone(),
-            self.model_selection.generator_handle(),
-            Arc::clone(&self.qwen_gen),
-            Arc::clone(&self.router),
-            Arc::clone(&self.generator_state),
-            Arc::clone(&self.tool_definitions),
-            self.tool_coordinator.clone(),
-            Arc::clone(&self.program_runtime),
-            Arc::clone(&self.tool_call_history),
-            Arc::clone(&self.conversation),
-            Arc::clone(&self.query_states),
-            Arc::clone(&self.mode),
-            Arc::clone(&self.output_manager),
-            Arc::clone(&self.status_bar),
-            Arc::clone(&self.tui_renderer),
-            Arc::clone(&self.active_tool_uses),
-            self.memory_system.clone(),
-            Arc::clone(&self.current_graph),
-            Arc::clone(&self.active_persona),
-            self.session_label.clone(),
-            self.cwd.clone(),
-            self.context_lines,
-            self.max_verbatim_messages,
-            self.context_recall_k,
-            self.streaming_enabled,
-            self.enable_summarization,
-            self.auto_compact_enabled,
-            self.metrics_logger.clone(),
+            LlmChannels {
+                requests: llm_rx,
+                events: self.event_tx.clone(),
+            },
+            LlmGeneration {
+                cloud: self.model_selection.generator_handle(),
+                local: Arc::clone(&self.qwen_gen),
+                router: Arc::clone(&self.router),
+                state: Arc::clone(&self.generator_state),
+            },
+            LlmTools {
+                definitions: Arc::clone(&self.tool_definitions),
+                coordinator: self.tool_coordinator.clone(),
+                call_history: Arc::clone(&self.tool_call_history),
+                active_uses: Arc::clone(&self.active_tool_uses),
+            },
+            LlmUi {
+                output: Arc::clone(&self.output_manager),
+                status_bar: Arc::clone(&self.status_bar),
+                renderer: Arc::clone(&self.tui_renderer),
+                streaming_enabled: self.streaming_enabled,
+            },
+            LlmSession {
+                conversation: Arc::clone(&self.conversation),
+                active_persona: Arc::clone(&self.active_persona),
+                mode: Arc::clone(&self.mode),
+                query_states: Arc::clone(&self.query_states),
+                label: self.session_label.clone(),
+                cwd: self.cwd.clone(),
+            },
+            LlmRuntime {
+                program_runtime: Arc::clone(&self.program_runtime),
+                memory_system: self.memory_system.clone(),
+                current_graph: Arc::clone(&self.current_graph),
+                wire_metrics_logger: self.metrics_logger.clone(),
+            },
+            ContextLimits {
+                lines: self.context_lines,
+                max_verbatim_messages: self.max_verbatim_messages,
+                recall_k: self.context_recall_k,
+                enable_summarization: self.enable_summarization,
+                auto_compact: self.auto_compact_enabled,
+            },
         );
         tokio::spawn(llm_loop.run());
     }
