@@ -143,7 +143,9 @@ pub struct AgentIdentity {
     /// Canonical durable run for this child when it was spawned from a named
     /// Brain turn/program. Absent for legacy local-only agent tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brain_run_id: Option<crate::brain::store::RunId>,
+    /// The durable run this agent belongs to, if a host is recording one. Held as a plain id
+    /// because what a run *is* belongs to the host, not to the runtime.
+    pub brain_run_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

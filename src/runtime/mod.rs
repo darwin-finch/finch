@@ -5,6 +5,7 @@ pub mod agents;
 pub mod archive_store;
 pub mod automation;
 pub mod context;
+pub mod effect_audit;
 pub mod effect_log;
 mod hostio;
 mod mcp;
@@ -461,7 +462,7 @@ struct PendingTypedExecution {
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
-    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     deferred_host_effects: DeferredHostEffects,
     /// An execution-specific authority ceiling, used by durable scheduled
     /// callbacks. Ordinary interactive runs intentionally pick up newly
@@ -2813,7 +2814,7 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
         grant_ceiling: Option<EffectSet>,
-        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
             submission,
@@ -2906,7 +2907,7 @@ impl ProgramRuntime {
         caller: Option<agents::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         defer_program_effects: bool,
-        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         let deferred_host_effects = if defer_program_effects && caller.is_none() {
             DeferredHostEffects::ProgramInvocations
@@ -2972,7 +2973,7 @@ impl ProgramRuntime {
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         grant_ceiling: Option<EffectSet>,
-        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
@@ -3217,7 +3218,7 @@ impl ProgramRuntime {
         caller: Option<agents::AgentIdentity>,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
-        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let resource_roots = Arc::clone(&self.resource_roots);
@@ -3448,7 +3449,7 @@ struct TypedHostHandler {
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
     deferred_host_effects: DeferredHostEffects,
-    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     authorization_attempt: Option<HostAuthorizationAttempt>,
 }
 
@@ -3487,7 +3488,7 @@ impl TypedHostHandler {
         network_grants: EffectSet,
         typed_effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
-        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+        effect_audit: Option<crate::runtime::effect_audit::RunnerEffectAuditControl>,
     ) -> Self {
         Self {
             automation,
@@ -4454,10 +4455,10 @@ impl crate::vm::CapabilityHandler for TypedHostHandler {
 
         if let Some(permit) = permit {
             let outcome = match &values {
-                Ok(values) => crate::server::RunnerHostEffectOutcome::Acknowledged {
+                Ok(values) => crate::runtime::effect_audit::RunnerHostEffectOutcome::Acknowledged {
                     values: values.clone(),
                 },
-                Err(_) => crate::server::RunnerHostEffectOutcome::FailedPartial {
+                Err(_) => crate::runtime::effect_audit::RunnerHostEffectOutcome::FailedPartial {
                     detail: "host binding failed after physical dispatch was authorized"
                         .to_string(),
                 },
