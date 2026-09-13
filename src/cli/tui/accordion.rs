@@ -40,6 +40,28 @@ impl AccordionState {
             .unwrap_or(row.default_expanded)
     }
 
+    /// What a row is currently showing as, for a toggle that has only the row's
+    /// identity to work from.
+    ///
+    /// A choice the user already made is authoritative — it is exactly what
+    /// [`Self::is_expanded`] will resolve to on the next projection.
+    /// `visible_expanded` is only the last painted frame's resolution, so it is
+    /// consulted second, and `false` is reached only for a row that has never
+    /// been painted and never been toggled.
+    ///
+    /// Both toggle paths used to read `visible_expanded` alone, which
+    /// `rebuild_hit_regions` wiped on every frame. A row the viewport clipped —
+    /// and every row on the ≤3-row path, which rebuilds from an empty slice —
+    /// was reported collapsed whatever it was really showing, so toggling an
+    /// open work unit opened it again instead of closing it.
+    fn resolved_expanded(&self, row_id: &TranscriptRowId) -> bool {
+        self.expanded
+            .get(row_id)
+            .or_else(|| self.visible_expanded.get(row_id))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn render_message(
         &self,
         message: &MessageRef,
@@ -136,7 +158,10 @@ impl AccordionState {
     ) {
         self.hit_regions.clear();
         self.visible_order.clear();
-        self.visible_expanded.clear();
+        // `visible_expanded` is not cleared: it is the last resolved state per
+        // row, and a row that is merely off-screen this frame has not changed.
+        // Wiping it made a clipped row indistinguishable from a collapsed one.
+
         let mut y = top;
         for line in lines {
             let rows = super::shadow_buffer::physical_rows(&line.text, width.max(1));
@@ -183,11 +208,7 @@ impl AccordionState {
         };
         match key.code {
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let current = self
-                    .visible_expanded
-                    .get(&focused)
-                    .copied()
-                    .unwrap_or(false);
+                let current = self.resolved_expanded(&focused);
                 self.expanded.insert(focused.clone(), !current);
                 self.visible_expanded.insert(focused, !current);
                 true
@@ -227,7 +248,7 @@ impl AccordionState {
         // Clear keyboard focus so clicking never leaves a persistent `> `
         // marker on a differently indented row.
         self.focused = None;
-        let current = self.visible_expanded.get(&row_id).copied().unwrap_or(false);
+        let current = self.resolved_expanded(&row_id);
         self.expanded.insert(row_id.clone(), !current);
         self.visible_expanded.insert(row_id, !current);
         true
@@ -268,6 +289,99 @@ mod tests {
             work.transcript_row(&colors).unwrap().children[0].id
         );
         assert_ne!(first, expanded);
+    }
+
+    /// A completed work unit whose tool reported a summary: collapsed by default.
+    fn collapsed_work_unit() -> (Arc<WorkUnit>, MessageRef) {
+        let work = Arc::new(WorkUnit::new("Tools"));
+        let call = work.add_row("bash(echo hi)");
+        work.complete_row_with_body(call, "1 line", vec!["hi".into()]);
+        work.set_complete();
+        let message: MessageRef = work.clone();
+        (work, message)
+    }
+
+    #[test]
+    fn test_toggle_inverts_the_state_the_row_is_actually_in() {
+        // Regression: both toggle paths read `visible_expanded`, a cache that
+        // `rebuild_hit_regions` wipes on every frame and repopulates only from
+        // the lines that were painted. A row the viewport clipped — or any row
+        // at all on the ≤3-row path, which rebuilds from an empty slice — was
+        // therefore absent, and `unwrap_or(false)` claimed it was collapsed.
+        // Toggling an *open* work unit then opened it again, so it stayed open
+        // and needed a second press to close: work units that would not shut,
+        // seemingly at random, because it depended on whether the row happened
+        // to be painted in the preceding frame.
+        let colors = ColorScheme::default();
+        let (work, message) = collapsed_work_unit();
+        let mut state = AccordionState::default();
+        let lines = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&lines, 0, 80);
+        let root = work.transcript_row(&colors).unwrap();
+
+        state.focused = Some(root.id.clone());
+        assert!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "the first toggle must be handled; focused row was {:?}",
+            state.focused
+        );
+        assert!(
+            state.is_expanded(&root),
+            "toggling a collapsed row must open it"
+        );
+
+        // A frame in which this row is not painted: clipped by the viewport
+        // budget, or a terminal too short to host a live area at all.
+        state.rebuild_hit_regions(&[], 0, 80);
+
+        state.focused = Some(root.id.clone());
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(
+            !state.is_expanded(&root),
+            "toggling an open row must close it, whatever the last frame happened to \
+             paint; the row resolved as expanded={} before the toggle",
+            true
+        );
+    }
+
+    #[test]
+    fn test_click_inverts_the_state_the_row_is_actually_in() {
+        // Same defect through the mouse path, which is how a work unit is
+        // usually opened.
+        let colors = ColorScheme::default();
+        let (work, message) = collapsed_work_unit();
+        let mut state = AccordionState::default();
+        let lines = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&lines, 0, 80);
+        let root = work.transcript_row(&colors).unwrap();
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: state.hit_regions[0].top,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(state.handle_mouse(click), "the header must be clickable");
+        assert!(state.is_expanded(&root), "the click must open the row");
+
+        // The next frame rebuilds from lines projected before the toggle was
+        // applied — the renderer plans a frame from the snapshot it holds, and
+        // input is drained separately. The cache then says "collapsed" about a
+        // row the user just opened.
+        state.rebuild_hit_regions(&lines, 0, 80);
+
+        let click_again = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: state.hit_regions[0].top,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(state.handle_mouse(click_again));
+        assert!(
+            !state.is_expanded(&root),
+            "clicking an open work unit must close it; it reopened instead, which is the \
+             work unit that will not stay shut"
+        );
     }
 
     #[test]
