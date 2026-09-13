@@ -305,6 +305,13 @@ Design intent, not current fact. The program, its phases, and its measurable gat
 
 - **One binary.** The root package stays the only composition root and produces the single
   `finch` binary, with one workspace lockfile and shared build caching.
+- **One language contract.** CoLisp and CoForth expose the same static type, ownership, concept,
+  effect, and metaprogramming facilities and lower them to the same verified typed IR. Ordinary
+  parameters borrow; a taking parameter accepts an ownership carrier, automatically moving a
+  unique value or retaining a shared value. Unique/shared/weak heap policies remain library-defined
+  types over compiler-enforced move, copy, borrow, and deterministic-drop hooks. Static and dynamic
+  ownership/concept dispatch stay explicit so compilation remains bounded and native lowering does
+  not depend on source-language inference.
 - **No junk drawer.** Each port or data type belongs to its consuming domain; there is no generic
   contracts crate, and not every directory becomes a crate.
 - **Mechanical moves.** Code moves never carry behavior, wire, persistence, checkpoint, or schema
